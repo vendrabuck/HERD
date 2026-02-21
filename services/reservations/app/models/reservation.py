@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from herd_common.enums import TopologyType
 from sqlalchemy import JSON, DateTime, Enum, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -10,11 +11,6 @@ from app.config import settings
 from app.database import Base
 
 _schema = settings.db_schema or None
-
-
-class TopologyType(str, enum.Enum):
-    PHYSICAL = "PHYSICAL"
-    CLOUD = "CLOUD"
 
 
 class ReservationStatus(str, enum.Enum):

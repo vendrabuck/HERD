@@ -1,9 +1,9 @@
-.PHONY: up down build test migrate logs shell-auth shell-inventory shell-reservations
+.PHONY: up down build restart test migrate logs shell-auth shell-inventory shell-reservations lint format
 
 # ── Docker Compose ──────────────────────────────────────────────────────────
 
 up:
-	docker compose up -d
+	docker compose up --build -d
 
 down:
 	docker compose down
@@ -36,18 +36,18 @@ migrate-reservations:
 # ── Testing ──────────────────────────────────────────────────────────────────
 
 test:
-	docker compose exec auth pytest tests/ -v
-	docker compose exec inventory pytest tests/ -v
-	docker compose exec reservations pytest tests/ -v
+	cd services/auth && uv run pytest tests/ -v
+	cd services/inventory && uv run pytest tests/ -v
+	cd services/reservations && uv run pytest tests/ -v
 
 test-auth:
-	docker compose exec auth pytest tests/ -v
+	cd services/auth && uv run pytest tests/ -v
 
 test-inventory:
-	docker compose exec inventory pytest tests/ -v
+	cd services/inventory && uv run pytest tests/ -v
 
 test-reservations:
-	docker compose exec reservations pytest tests/ -v
+	cd services/reservations && uv run pytest tests/ -v
 
 # ── Dev shells ───────────────────────────────────────────────────────────────
 
@@ -63,13 +63,23 @@ shell-reservations:
 # ── Local dev (without Docker) ───────────────────────────────────────────────
 
 install:
-	uv sync
+	uv sync --all-extras
 
 frontend-install:
 	cd frontend && npm install
 
 frontend-dev:
 	cd frontend && npm run dev
+
+# ── Lint and format ──────────────────────────────────────────────────────────
+
+lint:
+	uv run ruff check services/
+	cd frontend && npx eslint src
+
+format:
+	uv run ruff format services/
+	uv run ruff check --fix services/
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 

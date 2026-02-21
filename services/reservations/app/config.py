@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     cors_origins: str = ""
     inventory_service_url: str = "http://inventory:8000"
     nats_url: str = "nats://nats:4222"
+    internal_api_token: str = ""
 
     model_config = {"env_file": ".env", "case_sensitive": False}
 

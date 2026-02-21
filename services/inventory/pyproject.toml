@@ -12,7 +12,11 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "pydantic-settings>=2.3.0",
     "python-multipart>=0.0.9",
+    "herd-common",
 ]
+
+[tool.uv.sources]
+herd-common = { workspace = true }
 
 [project.optional-dependencies]
 dev = [

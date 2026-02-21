@@ -4,12 +4,11 @@ WORKDIR /app
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-COPY pyproject.toml .
-COPY app/ app/
-COPY conftest.py .
-COPY tests/ tests/
+COPY services/common/ /app/common/
+COPY services/inventory/pyproject.toml .
+COPY services/inventory/app/ app/
 
-RUN uv pip install --system -e ".[dev]"
+RUN uv pip install --system -e /app/common && uv pip install --system -e .
 
 RUN useradd --no-create-home --shell /bin/false appuser
 USER appuser

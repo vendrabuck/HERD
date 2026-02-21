@@ -2,6 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
+from herd_common.enums import TopologyType
 from sqlalchemy import JSON, DateTime, Enum, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -17,11 +18,6 @@ class DeviceType(str, enum.Enum):
     ROUTER = "ROUTER"
     TRAFFIC_SHAPER = "TRAFFIC_SHAPER"
     OTHER = "OTHER"
-
-
-class TopologyType(str, enum.Enum):
-    PHYSICAL = "PHYSICAL"
-    CLOUD = "CLOUD"
 
 
 class DeviceStatus(str, enum.Enum):

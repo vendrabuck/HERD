@@ -147,3 +147,28 @@ async def test_user_cannot_delete_device(client):
 async def test_user_can_list_devices(user_client):
     resp = await user_client.get("/devices")
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_internal_status_update(client):
+    create_resp = await client.post("/devices", json=DEVICE_PAYLOAD)
+    device_id = create_resp.json()["id"]
+    resp = await client.post(
+        f"/devices/{device_id}/status",
+        json={"status": "RESERVED"},
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "RESERVED"
+
+
+@pytest.mark.asyncio
+async def test_internal_status_update_bad_token(client):
+    create_resp = await client.post("/devices", json=DEVICE_PAYLOAD)
+    device_id = create_resp.json()["id"]
+    resp = await client.post(
+        f"/devices/{device_id}/status",
+        json={"status": "RESERVED"},
+        headers={"X-Internal-Token": "wrong-token"},
+    )
+    assert resp.status_code == 403

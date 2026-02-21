@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -7,12 +8,33 @@ from app.config import settings
 from app.database import Base, engine
 from app.routers.reservations import router as reservations_router
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Connect to NATS (non-fatal if unavailable)
+    app.state.nats = None
+    try:
+        import nats
+
+        nc = await nats.connect(settings.nats_url)
+        app.state.nats = nc
+        logger.info("Connected to NATS at %s", settings.nats_url)
+    except Exception:
+        logger.warning("NATS unavailable at %s, events will be skipped", settings.nats_url)
+
     yield
+
+    # Close NATS connection on shutdown
+    if app.state.nats is not None:
+        try:
+            await app.state.nats.close()
+        except Exception:
+            logger.warning("Error closing NATS connection", exc_info=True)
 
 
 app = FastAPI(

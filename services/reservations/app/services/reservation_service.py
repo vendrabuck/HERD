@@ -6,10 +6,13 @@ Key rules enforced here:
 2. All devices must share the same topology_type (no mixing PHYSICAL + CLOUD).
 3. No time-window overlap with existing active reservations for the same devices.
 4. On success, emit a NATS event to notify downstream services.
+5. On create/cancel/release, update device statuses in inventory (best-effort).
 """
 
+import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from datetime import datetime
 
@@ -21,12 +24,14 @@ from app.config import settings
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.schemas.reservation import ReservationCreate
 
+logger = logging.getLogger(__name__)
+
 
 async def _fetch_devices(device_ids: list[uuid.UUID], token: str) -> list[dict]:
-    """Fetch device info from Inventory service. Returns list of device dicts."""
+    """Fetch device info from Inventory service concurrently."""
     async with httpx.AsyncClient() as client:
-        results = []
-        for device_id in device_ids:
+
+        async def fetch_one(device_id: uuid.UUID) -> dict:
             resp = await client.get(
                 f"{settings.inventory_service_url}/devices/{device_id}",
                 headers={"Authorization": f"Bearer {token}"},
@@ -35,8 +40,9 @@ async def _fetch_devices(device_ids: list[uuid.UUID], token: str) -> list[dict]:
             if resp.status_code == 404:
                 raise ValueError(f"Device {device_id} not found in inventory")
             resp.raise_for_status()
-            results.append(resp.json())
-        return results
+            return resp.json()
+
+        return await asyncio.gather(*[fetch_one(did) for did in device_ids])
 
 
 async def _check_conflicts(
@@ -75,21 +81,43 @@ async def _check_conflicts(
     return list(set(conflicting_devices))
 
 
-async def _publish_nats_event(event: dict) -> None:
-    """Fire-and-forget NATS event. Errors are logged but do not fail the reservation."""
+async def _publish_nats_event(nc, event: dict) -> None:
+    """Publish a NATS event using the provided connection. Errors are logged, never raised."""
+    if nc is None:
+        return
     try:
-        import nats
-
-        nc = await nats.connect(settings.nats_url)
         js = nc.jetstream()
         await js.publish(
             "herd.reservations.created",
             json.dumps(event, default=str).encode(),
         )
-        await nc.close()
     except Exception:
-        # NATS unavailable should not break reservation creation
-        pass
+        logger.error("Failed to publish NATS event: %s", event.get("event"), exc_info=True)
+
+
+async def _update_device_statuses(
+    device_ids: list[uuid.UUID], status: str, token: str
+) -> None:
+    """Best-effort update of device statuses in the inventory service."""
+    if not settings.internal_api_token:
+        return
+
+    async with httpx.AsyncClient() as client:
+
+        async def update_one(device_id: uuid.UUID) -> None:
+            try:
+                await client.post(
+                    f"{settings.inventory_service_url}/devices/{device_id}/status",
+                    json={"status": status},
+                    headers={"X-Internal-Token": settings.internal_api_token},
+                    timeout=10.0,
+                )
+            except Exception:
+                logger.error(
+                    "Failed to update device %s status to %s", device_id, status, exc_info=True
+                )
+
+        await asyncio.gather(*[update_one(did) for did in device_ids])
 
 
 async def _acquire_device_locks(db: AsyncSession, device_ids: list[uuid.UUID]) -> None:
@@ -110,8 +138,9 @@ async def create_reservation(
     data: ReservationCreate,
     user_id: uuid.UUID,
     token: str,
+    nats_conn=None,
 ) -> Reservation:
-    # 1. Fetch all devices from inventory
+    # 1. Fetch all devices from inventory (concurrently)
     try:
         devices = await _fetch_devices(data.device_ids, token)
     except ValueError as exc:
@@ -159,8 +188,12 @@ async def create_reservation(
     await db.commit()
     await db.refresh(reservation)
 
-    # 7. Emit NATS event (non-blocking)
+    # 7. Mark devices as RESERVED in inventory (best-effort)
+    await _update_device_statuses(data.device_ids, "RESERVED", token)
+
+    # 8. Emit NATS event
     await _publish_nats_event(
+        nats_conn,
         {
             "event": "reservation.created",
             "reservation_id": str(reservation.id),
@@ -169,7 +202,7 @@ async def create_reservation(
             "topology_type": topology_type.value,
             "start_time": data.start_time.isoformat(),
             "end_time": data.end_time.isoformat(),
-        }
+        },
     )
 
     return reservation
@@ -197,7 +230,7 @@ async def get_reservation(
 
 
 async def cancel_reservation(
-    db: AsyncSession, reservation_id: uuid.UUID, user_id: uuid.UUID
+    db: AsyncSession, reservation_id: uuid.UUID, user_id: uuid.UUID, token: str = ""
 ) -> Reservation | None:
     reservation = await get_reservation(db, reservation_id, user_id)
     if not reservation:
@@ -207,11 +240,16 @@ async def cancel_reservation(
     reservation.status = ReservationStatus.CANCELLED
     await db.commit()
     await db.refresh(reservation)
+
+    # Mark devices as AVAILABLE in inventory (best-effort)
+    device_ids = [uuid.UUID(d) for d in reservation.device_ids]
+    await _update_device_statuses(device_ids, "AVAILABLE", token)
+
     return reservation
 
 
 async def release_reservation(
-    db: AsyncSession, reservation_id: uuid.UUID, user_id: uuid.UUID
+    db: AsyncSession, reservation_id: uuid.UUID, user_id: uuid.UUID, token: str = ""
 ) -> Reservation | None:
     reservation = await get_reservation(db, reservation_id, user_id)
     if not reservation:
@@ -221,4 +259,9 @@ async def release_reservation(
     reservation.status = ReservationStatus.COMPLETED
     await db.commit()
     await db.refresh(reservation)
+
+    # Mark devices as AVAILABLE in inventory (best-effort)
+    device_ids = [uuid.UUID(d) for d in reservation.device_ids]
+    await _update_device_statuses(device_ids, "AVAILABLE", token)
+
     return reservation

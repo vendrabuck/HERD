@@ -1,8 +1,10 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.models.device import DeviceStatus, DeviceType, TopologyType
@@ -12,10 +14,15 @@ from app.services.inventory_service import (
     delete_device,
     get_device,
     list_devices,
+    set_device_status,
     update_device,
 )
 
 router = APIRouter(tags=["devices"])
+
+
+class DeviceStatusUpdate(BaseModel):
+    status: DeviceStatus
 
 
 @router.get("/devices", response_model=list[DeviceResponse])
@@ -79,3 +86,19 @@ async def delete_device_by_id(
     deleted = await delete_device(db, device_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Device not found")
+
+
+@router.post("/devices/{device_id}/status", response_model=DeviceResponse)
+async def update_device_status_internal(
+    device_id: uuid.UUID,
+    body: DeviceStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Update device status. Internal service-to-service endpoint, guarded by token."""
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    device = await set_device_status(db, device_id, body.status)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return device

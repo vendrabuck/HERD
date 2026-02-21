@@ -28,8 +28,11 @@ async def create_new_reservation(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     user_id = uuid.UUID(payload["sub"])
+    nats_conn = getattr(request.app.state, "nats", None)
     try:
-        reservation = await create_reservation(db, body, user_id, credentials.credentials)
+        reservation = await create_reservation(
+            db, body, user_id, credentials.credentials, nats_conn=nats_conn
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except LookupError as exc:
@@ -66,9 +69,12 @@ async def cancel_reservation_by_id(
     reservation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     user_id = uuid.UUID(payload["sub"])
-    reservation = await cancel_reservation(db, reservation_id, user_id)
+    reservation = await cancel_reservation(
+        db, reservation_id, user_id, token=credentials.credentials
+    )
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
 
@@ -78,9 +84,12 @@ async def release_reservation_early(
     reservation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     user_id = uuid.UUID(payload["sub"])
-    reservation = await release_reservation(db, reservation_id, user_id)
+    reservation = await release_reservation(
+        db, reservation_id, user_id, token=credentials.credentials
+    )
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
     return reservation

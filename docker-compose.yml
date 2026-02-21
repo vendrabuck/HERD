@@ -12,10 +12,14 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - herd-net
+    restart: unless-stopped
     depends_on:
-      - auth
-      - inventory
-      - reservations
+      auth:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      reservations:
+        condition: service_healthy
 
   # --- PostgreSQL ---
   postgres:
@@ -31,6 +35,7 @@ services:
       - "5432:5432"
     networks:
       - herd-net
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-herd}"]
       interval: 10s
@@ -46,6 +51,7 @@ services:
       - "8222:8222"  # NATS monitoring
     networks:
       - herd-net
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
       interval: 10s
@@ -77,6 +83,13 @@ services:
       - "traefik.http.routers.auth.middlewares=auth-strip"
     networks:
       - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,14 +97,15 @@ services:
   # --- Inventory Service ---
   inventory:
     build:
-      context: ./services/inventory
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/inventory/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-herd}:${POSTGRES_PASSWORD:-herdpassword}@postgres:5432/${POSTGRES_DB:-herd}
       DB_SCHEMA: inventory
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.inventory.rule=PathPrefix(`/api/inventory`)"
@@ -101,6 +115,13 @@ services:
       - "traefik.http.routers.inventory.middlewares=inventory-strip"
     networks:
       - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -108,8 +129,8 @@ services:
   # --- Reservations Service ---
   reservations:
     build:
-      context: ./services/reservations
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/reservations/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-herd}:${POSTGRES_PASSWORD:-herdpassword}@postgres:5432/${POSTGRES_DB:-herd}
       DB_SCHEMA: reservations
@@ -118,6 +139,7 @@ services:
       INVENTORY_SERVICE_URL: http://inventory:8000
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.reservations.rule=PathPrefix(`/api/reservations`)"
@@ -127,13 +149,20 @@ services:
       - "traefik.http.routers.reservations.middlewares=reservations-strip"
     networks:
       - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_healthy
       inventory:
-        condition: service_started
+        condition: service_healthy
 
   # --- ACL Service (stub) ---
   acl:
@@ -151,6 +180,13 @@ services:
       - "traefik.http.routers.acl.middlewares=acl-strip"
     networks:
       - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # --- User Profile Service (stub) ---
   user-profile:
@@ -168,12 +204,19 @@ services:
       - "traefik.http.routers.user-profile.middlewares=user-profile-strip"
     networks:
       - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # --- Cabling Service ---
   cabling:
     build:
-      context: ./services/cabling
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/cabling/Dockerfile
     environment:
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -187,6 +230,13 @@ services:
       - "traefik.http.routers.cabling.middlewares=cabling-strip"
     networks:
       - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # --- Frontend ---
   frontend:
@@ -200,6 +250,13 @@ services:
       - "traefik.http.services.frontend.loadbalancer.server.port=80"
     networks:
       - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 networks:
   herd-net:

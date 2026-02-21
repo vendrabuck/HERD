@@ -89,6 +89,9 @@ async def test_create_reservation(client):
     ), patch(
         "app.services.reservation_service._publish_nats_event",
         new=AsyncMock(),
+    ), patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
     ):
         resp = await client.post(
             "/",
@@ -139,6 +142,9 @@ async def test_conflict_detection(client):
     ), patch(
         "app.services.reservation_service._publish_nats_event",
         new=AsyncMock(),
+    ), patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
     ):
         resp1 = await client.post(
             "/",
@@ -174,6 +180,9 @@ async def test_list_reservations(client):
     ), patch(
         "app.services.reservation_service._publish_nats_event",
         new=AsyncMock(),
+    ), patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
     ):
         await client.post(
             "/",
@@ -192,11 +201,18 @@ async def test_cancel_reservation(client):
     ), patch(
         "app.services.reservation_service._publish_nats_event",
         new=AsyncMock(),
+    ), patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
     ):
         create_resp = await client.post(
             "/",
             json={"device_ids": [DEVICE_A], "start_time": START, "end_time": END},
         )
     reservation_id = create_resp.json()["id"]
-    del_resp = await client.delete(f"/{reservation_id}")
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        del_resp = await client.delete(f"/{reservation_id}")
     assert del_resp.status_code == 204

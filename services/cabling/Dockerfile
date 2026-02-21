@@ -4,10 +4,11 @@ WORKDIR /app
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-COPY pyproject.toml .
-COPY app/ app/
+COPY services/common/ /app/common/
+COPY services/cabling/pyproject.toml .
+COPY services/cabling/app/ app/
 
-RUN uv pip install --system -e .
+RUN uv pip install --system -e /app/common && uv pip install --system -e .
 
 RUN useradd --no-create-home --shell /bin/false appuser
 USER appuser
