@@ -3,6 +3,8 @@ import { Toaster } from "react-hot-toast";
 import { LoginPage } from "@/pages/LoginPage";
 import { RegisterPage } from "@/pages/RegisterPage";
 import { DashboardPage } from "@/pages/DashboardPage";
+import { AdminPage } from "@/pages/AdminPage";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { useAuthStore } from "@/stores/authStore";
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
@@ -46,7 +48,19 @@ export default function App() {
           path="/dashboard"
           element={
             <AuthGuard>
-              <DashboardPage />
+              <ErrorBoundary>
+                <DashboardPage />
+              </ErrorBoundary>
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/admin"
+          element={
+            <AuthGuard>
+              <ErrorBoundary>
+                <AdminPage />
+              </ErrorBoundary>
             </AuthGuard>
           }
         />

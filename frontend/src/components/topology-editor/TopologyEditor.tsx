@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -12,6 +12,8 @@ import "@xyflow/react/dist/style.css";
 import toast from "react-hot-toast";
 
 import { useTopologyStore } from "@/stores/topologyStore";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { CreateReservationModal } from "@/components/reservations/CreateReservationModal";
 import { DeviceNode } from "./nodes/DeviceNode";
 import { LayerEdge } from "./edges/LayerEdge";
 import type { Device } from "@/types/device.types";
@@ -43,6 +45,12 @@ export function TopologyEditor() {
   } = useTopologyStore();
 
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showReserveModal, setShowReserveModal] = useState(false);
+
+  const selectedDeviceIds = nodes
+    .filter((n) => n.selected)
+    .map((n) => (n.data as DeviceNodeData).device.id);
 
   // Block connections between PHYSICAL and CLOUD nodes
   const isValidConnection = useCallback(
@@ -123,6 +131,8 @@ export function TopologyEditor() {
               key={layer}
               onClick={() => setSelectedEdgeLayer(layer)}
               title={LAYER_DESCRIPTIONS[layer]}
+              aria-label={`${layer}: ${LAYER_DESCRIPTIONS[layer]}`}
+              aria-pressed={selectedEdgeLayer === layer}
               className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
                 selectedEdgeLayer === layer
                   ? "bg-blue-600 text-white"
@@ -133,9 +143,16 @@ export function TopologyEditor() {
             </button>
           ))}
         </div>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
           <button
-            onClick={clearTopology}
+            onClick={() => setShowReserveModal(true)}
+            disabled={selectedDeviceIds.length === 0}
+            className="text-sm text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Reserve Selected ({selectedDeviceIds.length})
+          </button>
+          <button
+            onClick={() => setShowClearConfirm(true)}
             className="text-sm text-red-600 hover:text-red-800 px-2 py-1 rounded hover:bg-red-50"
           >
             Clear canvas
@@ -167,6 +184,27 @@ export function TopologyEditor() {
           />
         </ReactFlow>
       </div>
+
+      <ConfirmDialog
+        open={showClearConfirm}
+        title="Clear canvas?"
+        description="This will remove all devices and connections from the canvas."
+        confirmLabel="Clear"
+        destructive
+        onConfirm={() => {
+          clearTopology();
+          setShowClearConfirm(false);
+        }}
+        onCancel={() => setShowClearConfirm(false)}
+      />
+
+      {showReserveModal && (
+        <CreateReservationModal
+          open={showReserveModal}
+          deviceIds={selectedDeviceIds}
+          onClose={() => setShowReserveModal(false)}
+        />
+      )}
     </div>
   );
 }

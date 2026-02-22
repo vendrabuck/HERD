@@ -1,5 +1,7 @@
-import { useNavigate } from "react-router-dom";
+import { useEffect } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { useCurrentUser, useLogout } from "@/api/auth";
+import { useAuthStore } from "@/stores/authStore";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
 import { TopologyEditor } from "@/components/topology-editor/TopologyEditor";
 import { ReservationPanel } from "@/components/reservations/ReservationPanel";
@@ -8,6 +10,10 @@ export function DashboardPage() {
   const { data: user } = useCurrentUser();
   const logout = useLogout();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    useAuthStore.getState().setUser(user ?? null);
+  }, [user]);
 
   const handleLogout = async () => {
     await logout.mutateAsync();
@@ -23,6 +29,14 @@ export function DashboardPage() {
           <span className="text-gray-400 text-xs">Hardware Environment Replication and Deployment</span>
         </div>
         <div className="flex items-center gap-3">
+          {user && (user.role === "admin" || user.role === "superadmin") && (
+            <Link
+              to="/admin"
+              className="text-sm text-gray-400 hover:text-white px-2 py-1 rounded hover:bg-gray-700 transition-colors"
+            >
+              Admin
+            </Link>
+          )}
           {user && (
             <span className="text-sm text-gray-300">
               {user.username}

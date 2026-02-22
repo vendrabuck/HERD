@@ -1,4 +1,4 @@
-import { useCancelReservation, useReservations } from "@/api/reservations";
+import { useCancelReservation, useReleaseReservation, useReservations } from "@/api/reservations";
 import type { Reservation } from "@/types/reservation.types";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -10,6 +10,8 @@ const STATUS_COLORS: Record<string, string> = {
 
 function ReservationRow({ reservation }: { reservation: Reservation }) {
   const cancel = useCancelReservation();
+  const release = useReleaseReservation();
+  const shortId = reservation.id.slice(0, 8);
 
   const start = new Date(reservation.start_time).toLocaleDateString();
   const end = new Date(reservation.end_time).toLocaleDateString();
@@ -38,13 +40,24 @@ function ReservationRow({ reservation }: { reservation: Reservation }) {
       </div>
 
       {reservation.status === "ACTIVE" && (
-        <button
-          onClick={() => cancel.mutate(reservation.id)}
-          disabled={cancel.isPending}
-          className="text-xs text-red-600 hover:text-red-800 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-50"
-        >
-          Cancel
-        </button>
+        <div className="flex gap-1">
+          <button
+            onClick={() => release.mutate(reservation.id)}
+            disabled={release.isPending}
+            aria-label={`Release reservation ${shortId}`}
+            className="text-xs text-green-600 hover:text-green-800 px-2 py-1 rounded hover:bg-green-50 disabled:opacity-50"
+          >
+            Release
+          </button>
+          <button
+            onClick={() => cancel.mutate(reservation.id)}
+            disabled={cancel.isPending}
+            aria-label={`Cancel reservation ${shortId}`}
+            className="text-xs text-red-600 hover:text-red-800 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </div>
       )}
     </div>
   );
@@ -66,9 +79,9 @@ export function ReservationPanel() {
         </h2>
       </div>
 
-      <div className="overflow-y-auto max-h-40">
+      <div className="overflow-y-auto max-h-40" aria-label="My reservations">
         {isLoading && (
-          <p className="text-xs text-gray-400 text-center py-3">Loading...</p>
+          <p role="status" aria-live="polite" className="text-xs text-gray-400 text-center py-3">Loading...</p>
         )}
         {!isLoading && (!reservations || reservations.length === 0) && (
           <p className="text-xs text-gray-400 text-center py-3">No reservations yet</p>

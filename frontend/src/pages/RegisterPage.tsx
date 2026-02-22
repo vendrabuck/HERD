@@ -32,8 +32,9 @@ export function RegisterPage() {
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
+            <label htmlFor="reg-email" className="block text-sm font-medium text-gray-700 mb-1">Email</label>
             <input
+              id="reg-email"
               type="email"
               required
               value={form.email}
@@ -44,8 +45,9 @@ export function RegisterPage() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Username</label>
+            <label htmlFor="reg-username" className="block text-sm font-medium text-gray-700 mb-1">Username</label>
             <input
+              id="reg-username"
               type="text"
               required
               value={form.username}
@@ -56,8 +58,9 @@ export function RegisterPage() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+            <label htmlFor="reg-password" className="block text-sm font-medium text-gray-700 mb-1">Password</label>
             <input
+              id="reg-password"
               type="password"
               required
               value={form.password}
@@ -70,6 +73,7 @@ export function RegisterPage() {
           <button
             type="submit"
             disabled={register.isPending}
+            aria-busy={register.isPending}
             className="w-full bg-blue-600 text-white py-2 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
           >
             {register.isPending ? "Creating account..." : "Create account"}

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { persist, createJSONStorage } from "zustand/middleware";
 import {
   addEdge,
   applyEdgeChanges,
@@ -24,7 +25,7 @@ interface TopologyState {
   clearTopology: () => void;
 }
 
-export const useTopologyStore = create<TopologyState>((set) => ({
+export const useTopologyStore = create<TopologyState>()(persist((set) => ({
   nodes: [],
   edges: [],
   selectedEdgeLayer: "L2",
@@ -53,4 +54,12 @@ export const useTopologyStore = create<TopologyState>((set) => ({
   setSelectedEdgeLayer: (layer) => set({ selectedEdgeLayer: layer }),
 
   clearTopology: () => set({ nodes: [], edges: [] }),
+}), {
+  name: "herd-topology",
+  storage: createJSONStorage(() => localStorage),
+  partialize: (state) => ({
+    nodes: state.nodes,
+    edges: state.edges,
+    selectedEdgeLayer: state.selectedEdgeLayer,
+  }),
 }));

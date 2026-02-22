@@ -82,7 +82,9 @@ export function EquipmentBrowser() {
         <h2 className="text-sm font-semibold text-gray-800 mb-2">Equipment Browser</h2>
 
         {/* Type filter */}
+        <label htmlFor="eq-type-filter" className="sr-only">Device type filter</label>
         <select
+          id="eq-type-filter"
           value={typeFilter}
           onChange={(e) => setTypeFilter(e.target.value as DeviceType | "")}
           className="w-full text-xs border border-gray-300 rounded px-2 py-1 mb-1.5 bg-white"
@@ -96,7 +98,9 @@ export function EquipmentBrowser() {
         </select>
 
         {/* Topology filter */}
+        <label htmlFor="eq-topo-filter" className="sr-only">Topology type filter</label>
         <select
+          id="eq-topo-filter"
           value={topoFilter}
           onChange={(e) => setTopoFilter(e.target.value as TopologyType | "")}
           className="w-full text-xs border border-gray-300 rounded px-2 py-1 bg-white"
@@ -110,7 +114,7 @@ export function EquipmentBrowser() {
       {/* Device list */}
       <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
         {isLoading && (
-          <p className="text-xs text-gray-500 text-center py-4">Loading devices...</p>
+          <p role="status" aria-live="polite" className="text-xs text-gray-500 text-center py-4">Loading devices...</p>
         )}
         {isError && (
           <p className="text-xs text-red-500 text-center py-4">Failed to load devices</p>
