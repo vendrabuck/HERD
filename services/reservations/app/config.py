@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     inventory_service_url: str = "http://inventory:8000"
     nats_url: str = "nats://nats:4222"
     internal_api_token: str = ""
+    expiration_interval_seconds: int = 60
 
     model_config = {"env_file": ".env", "case_sensitive": False}
 

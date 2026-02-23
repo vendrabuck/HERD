@@ -188,6 +188,15 @@ async def create_reservation(
     await db.commit()
     await db.refresh(reservation)
 
+    logger.info(
+        "Reservation created: %s", reservation.id,
+        extra={
+            "action": "reservation_create",
+            "reservation_id": str(reservation.id),
+            "user_id": str(user_id),
+        },
+    )
+
     # 7. Mark devices as RESERVED in inventory (best-effort)
     await _update_device_statuses(data.device_ids, "RESERVED", token)
 
@@ -241,6 +250,15 @@ async def cancel_reservation(
     await db.commit()
     await db.refresh(reservation)
 
+    logger.info(
+        "Reservation cancelled: %s", reservation_id,
+        extra={
+            "action": "reservation_cancel",
+            "reservation_id": str(reservation_id),
+            "user_id": str(user_id),
+        },
+    )
+
     # Mark devices as AVAILABLE in inventory (best-effort)
     device_ids = [uuid.UUID(d) for d in reservation.device_ids]
     await _update_device_statuses(device_ids, "AVAILABLE", token)
@@ -259,6 +277,15 @@ async def release_reservation(
     reservation.status = ReservationStatus.COMPLETED
     await db.commit()
     await db.refresh(reservation)
+
+    logger.info(
+        "Reservation released: %s", reservation_id,
+        extra={
+            "action": "reservation_release",
+            "reservation_id": str(reservation_id),
+            "user_id": str(user_id),
+        },
+    )
 
     # Mark devices as AVAILABLE in inventory (best-effort)
     device_ids = [uuid.UUID(d) for d in reservation.device_ids]

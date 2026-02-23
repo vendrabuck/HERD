@@ -2,10 +2,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from herd_common.logging import RequestLoggingMiddleware, setup_logging
 
 from app.config import settings
 from app.database import Base, engine
 from app.routers.devices import router as devices_router
+
+setup_logging("inventory")
 
 
 @asynccontextmanager
@@ -29,6 +32,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(devices_router)
 

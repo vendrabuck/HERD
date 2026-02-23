@@ -10,7 +10,7 @@ providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false
-    network: herd-net
+    network: herd_herd-net
 
 log:
   level: INFO

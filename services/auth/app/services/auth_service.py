@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -7,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import RefreshToken, Role, User
 from app.utils.jwt import create_access_token, create_refresh_token, hash_token
+
+logger = logging.getLogger(__name__)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -64,6 +67,10 @@ async def create_user(
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    logger.info(
+        "User registered: %s", username,
+        extra={"action": "register", "email": email, "username": username},
+    )
     return user
 
 
@@ -85,9 +92,21 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> User
     user = await get_user_by_email(db, email)
     if not user:
         verify_password(password, _DUMMY_HASH)
+        logger.warning(
+            "Login failed: unknown email",
+            extra={"action": "login_failure", "email": email},
+        )
         return None
     if not verify_password(password, user.hashed_password):
+        logger.warning(
+            "Login failed: wrong password for %s", email,
+            extra={"action": "login_failure", "email": email},
+        )
         return None
+    logger.info(
+        "Login success: %s", user.username,
+        extra={"action": "login_success", "user_id": str(user.id), "email": email},
+    )
     return user
 
 

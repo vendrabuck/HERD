@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from herd_common.logging import RequestLoggingMiddleware, setup_logging
 
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
@@ -10,6 +11,7 @@ from app.models.user import Role
 from app.routers.admin import router as admin_router
 from app.routers.auth import router as auth_router
 
+setup_logging("auth")
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +74,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(auth_router)
 app.include_router(admin_router)

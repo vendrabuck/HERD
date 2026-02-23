@@ -8,7 +8,7 @@ COPY services/common/ /app/common/
 COPY services/reservations/pyproject.toml .
 COPY services/reservations/app/ app/
 
-RUN uv pip install --system -e /app/common && uv pip install --system -e .
+RUN uv pip install --system -e /app/common && uv pip install --system --no-sources -e .
 
 RUN useradd --no-create-home --shell /bin/false appuser
 USER appuser

@@ -1,7 +1,7 @@
 services:
   # --- Traefik (API Gateway) ---
   traefik:
-    image: traefik:v3.0
+    image: traefik:latest
     command:
       - "--configFile=/etc/traefik/traefik.yml"
     ports:
@@ -32,7 +32,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     networks:
       - herd-net
     restart: unless-stopped
@@ -61,8 +61,8 @@ services:
   # --- Auth Service ---
   auth:
     build:
-      context: ./services/auth
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/auth/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-herd}:${POSTGRES_PASSWORD:-herdpassword}@postgres:5432/${POSTGRES_DB:-herd}
       DB_SCHEMA: auth
@@ -70,7 +70,7 @@ services:
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
       REFRESH_TOKEN_EXPIRE_DAYS: ${AUTH_REFRESH_TOKEN_EXPIRE_DAYS:-7}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
       SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
       SUPERADMIN_USERNAME: ${SUPERADMIN_USERNAME:-}
       SUPERADMIN_PASSWORD: ${SUPERADMIN_PASSWORD:-}
@@ -104,7 +104,7 @@ services:
       DB_SCHEMA: inventory
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
     labels:
       - "traefik.enable=true"
@@ -138,7 +138,7 @@ services:
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       INVENTORY_SERVICE_URL: http://inventory:8000
       NATS_URL: ${NATS_URL:-nats://nats:4222}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
     labels:
       - "traefik.enable=true"
@@ -170,7 +170,7 @@ services:
       context: ./services/acl
       dockerfile: Dockerfile
     environment:
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.acl.rule=PathPrefix(`/api/acl`)"
@@ -194,7 +194,7 @@ services:
       context: ./services/user-profile
       dockerfile: Dockerfile
     environment:
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.user-profile.rule=PathPrefix(`/api/user-profile`)"
@@ -220,7 +220,7 @@ services:
     environment:
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.cabling.rule=PathPrefix(`/api/cabling`)"
@@ -252,7 +252,7 @@ services:
       - herd-net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
       interval: 15s
       timeout: 5s
       retries: 5

@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -17,6 +18,8 @@ from app.services.inventory_service import (
     set_device_status,
     update_device,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["devices"])
 
@@ -46,7 +49,12 @@ async def create_new_device(
     _: dict = Depends(require_admin),
 ):
     """Add a device to the inventory. Admin or superadmin only."""
-    return await create_device(db, body)
+    device = await create_device(db, body)
+    logger.info(
+        "Device created: %s", device.name,
+        extra={"action": "device_create", "device_id": str(device.id)},
+    )
+    return device
 
 
 @router.get("/devices/{device_id}", response_model=DeviceResponse)
@@ -73,6 +81,10 @@ async def update_device_by_id(
     device = await update_device(db, device_id, body)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    logger.info(
+        "Device updated: %s", device_id,
+        extra={"action": "device_update", "device_id": str(device_id)},
+    )
     return device
 
 
@@ -86,6 +98,10 @@ async def delete_device_by_id(
     deleted = await delete_device(db, device_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Device not found")
+    logger.info(
+        "Device deleted: %s", device_id,
+        extra={"action": "device_delete", "device_id": str(device_id)},
+    )
 
 
 @router.post("/devices/{device_id}/status", response_model=DeviceResponse)

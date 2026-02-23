@@ -1,9 +1,14 @@
-.PHONY: up down build restart test migrate logs shell-auth shell-inventory shell-reservations lint format
+.PHONY: up down build restart test migrate logs shell-auth shell-inventory shell-reservations lint format dev prod
 
 # ── Docker Compose ──────────────────────────────────────────────────────────
 
-up:
+up: dev
+
+dev:
 	docker compose up --build -d
+
+prod:
+	docker compose -f docker-compose.yml up --build -d
 
 down:
 	docker compose down
@@ -39,6 +44,7 @@ test:
 	cd services/auth && uv run pytest tests/ -v
 	cd services/inventory && uv run pytest tests/ -v
 	cd services/reservations && uv run pytest tests/ -v
+	cd services/cabling && uv run pytest tests/ -v
 
 test-auth:
 	cd services/auth && uv run pytest tests/ -v
@@ -48,6 +54,9 @@ test-inventory:
 
 test-reservations:
 	cd services/reservations && uv run pytest tests/ -v
+
+test-cabling:
+	cd services/cabling && uv run pytest tests/ -v
 
 # ── Dev shells ───────────────────────────────────────────────────────────────
 

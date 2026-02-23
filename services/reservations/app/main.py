@@ -1,13 +1,16 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from herd_common.logging import RequestLoggingMiddleware, setup_logging
 
 from app.config import settings
 from app.database import Base, engine
 from app.routers.reservations import router as reservations_router
 
+setup_logging("reservations")
 logger = logging.getLogger(__name__)
 
 
@@ -27,7 +30,21 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("NATS unavailable at %s, events will be skipped", settings.nats_url)
 
+    # Start expiration background task
+    from app.tasks.expiration import expiration_loop
+
+    expiration_task = asyncio.create_task(
+        expiration_loop(settings.expiration_interval_seconds)
+    )
+
     yield
+
+    # Cancel expiration task
+    expiration_task.cancel()
+    try:
+        await expiration_task
+    except asyncio.CancelledError:
+        pass
 
     # Close NATS connection on shutdown
     if app.state.nats is not None:
@@ -52,9 +69,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(reservations_router)
+app.add_middleware(RequestLoggingMiddleware)
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "reservations"}
+
+
+app.include_router(reservations_router)

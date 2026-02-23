@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -8,6 +9,8 @@ from app.dependencies.auth import require_role
 from app.models.user import Role, User
 from app.schemas.auth import SetRoleRequest, UserResponse
 from app.services.auth_service import get_all_users, get_user_by_id, set_user_role
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["admin"])
 
@@ -61,4 +64,13 @@ async def update_user_role(
         )
 
     updated = await set_user_role(db, user_id, body.role)
+    logger.info(
+        "Role changed: user %s set to %s by %s",
+        user_id, body.role.value, current_user.username,
+        extra={
+            "action": "role_change",
+            "user_id": str(user_id),
+            "role": body.role.value,
+        },
+    )
     return updated

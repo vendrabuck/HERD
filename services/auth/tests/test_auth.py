@@ -1,6 +1,10 @@
+import uuid
+
 import pytest
 from app.database import Base, get_db
+from app.dependencies.auth import get_current_user
 from app.main import app
+from app.models.user import Role, User
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -110,3 +114,99 @@ async def test_refresh(client):
     resp = await client.post("/refresh", json={"refresh_token": refresh_token})
     assert resp.status_code == 200
     assert "access_token" in resp.json()
+
+
+# --- Admin endpoint tests ---
+
+_superadmin_id = uuid.uuid4()
+_admin_id = uuid.uuid4()
+
+
+def _make_mock_user(user_id: uuid.UUID, role: Role, username: str = "mock") -> User:
+    user = User(
+        id=user_id,
+        email=f"{username}@test.com",
+        username=username,
+        hashed_password="fake",
+        is_active=True,
+        role=role,
+    )
+    return user
+
+
+@pytest.fixture
+async def superadmin_client():
+    """Client authenticated as superadmin for admin endpoint tests."""
+    mock_sa = _make_mock_user(_superadmin_id, Role.SUPERADMIN, "superadmin")
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: mock_sa
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+async def regular_client():
+    """Client authenticated as regular user for admin endpoint tests."""
+    mock_user = _make_mock_user(uuid.uuid4(), Role.USER, "regular")
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: mock_user
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_superadmin_can_list_users(superadmin_client):
+    resp = await superadmin_client.get("/users")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+
+@pytest.mark.asyncio
+async def test_superadmin_can_change_role(superadmin_client):
+    # Register a user first, then promote to admin
+    await superadmin_client.post(
+        "/register",
+        json={"email": "target@test.com", "username": "targetuser", "password": "password123"},
+    )
+    users_resp = await superadmin_client.get("/users")
+    target = [u for u in users_resp.json() if u["email"] == "target@test.com"][0]
+
+    resp = await superadmin_client.put(
+        f"/users/{target['id']}/role",
+        json={"role": "admin"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["role"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_cannot_set_superadmin_role(superadmin_client):
+    await superadmin_client.post(
+        "/register",
+        json={"email": "nosup@test.com", "username": "nosupuser", "password": "password123"},
+    )
+    users_resp = await superadmin_client.get("/users")
+    target = [u for u in users_resp.json() if u["email"] == "nosup@test.com"][0]
+
+    resp = await superadmin_client.put(
+        f"/users/{target['id']}/role",
+        json={"role": "superadmin"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_cannot_change_own_role(superadmin_client):
+    resp = await superadmin_client.put(
+        f"/users/{_superadmin_id}/role",
+        json={"role": "user"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_non_superadmin_gets_403(regular_client):
+    resp = await regular_client.get("/users")
+    assert resp.status_code == 403

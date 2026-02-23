@@ -14,10 +14,13 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from pydantic import BaseModel
 
 from app.config import settings
 from app.dependencies import get_current_user_payload, require_admin
+
+setup_logging("cabling")
 
 app = FastAPI(
     title="HERD Cabling Service",
@@ -32,6 +35,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(RequestLoggingMiddleware)
 
 # In-memory store; replaced by a database in a full implementation
 _connections: dict[str, dict] = {}
