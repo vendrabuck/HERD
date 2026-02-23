@@ -210,3 +210,92 @@ async def test_cannot_change_own_role(superadmin_client):
 async def test_non_superadmin_gets_403(regular_client):
     resp = await regular_client.get("/users")
     assert resp.status_code == 403
+
+
+# --- Logout and refresh revocation tests ---
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_refresh_token(client):
+    await client.post(
+        "/register",
+        json={"email": "logout@example.com", "username": "logoutuser", "password": "password123"},
+    )
+    login_resp = await client.post(
+        "/login", json={"email": "logout@example.com", "password": "password123"}
+    )
+    refresh_token = login_resp.json()["refresh_token"]
+    logout_resp = await client.post("/logout", json={"refresh_token": refresh_token})
+    assert logout_resp.status_code == 204
+    # Subsequent refresh should fail
+    refresh_resp = await client.post("/refresh", json={"refresh_token": refresh_token})
+    assert refresh_resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_refresh_with_revoked_token(client):
+    """After rotation, using the original refresh token should fail."""
+    await client.post(
+        "/register",
+        json={"email": "rotate@example.com", "username": "rotateuser", "password": "password123"},
+    )
+    login_resp = await client.post(
+        "/login", json={"email": "rotate@example.com", "password": "password123"}
+    )
+    original_token = login_resp.json()["refresh_token"]
+    # Rotate: original token is revoked, new token issued
+    rotate_resp = await client.post("/refresh", json={"refresh_token": original_token})
+    assert rotate_resp.status_code == 200
+    # Original token should now be invalid
+    retry_resp = await client.post("/refresh", json={"refresh_token": original_token})
+    assert retry_resp.status_code == 401
+
+
+# --- Registration validation tests ---
+
+
+@pytest.mark.asyncio
+async def test_register_duplicate_username(client):
+    payload = {"email": "first@example.com", "username": "sameuser", "password": "password123"}
+    await client.post("/register", json=payload)
+    resp = await client.post(
+        "/register",
+        json={"email": "second@example.com", "username": "sameuser", "password": "password123"},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_register_password_too_short(client):
+    resp = await client.post(
+        "/register",
+        json={"email": "short@example.com", "username": "shortpw", "password": "1234567"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_register_password_too_long(client):
+    resp = await client.post(
+        "/register",
+        json={"email": "long@example.com", "username": "longpw", "password": "x" * 73},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_register_username_too_short(client):
+    resp = await client.post(
+        "/register",
+        json={"email": "shortu@example.com", "username": "ab", "password": "password123"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_register_username_invalid_chars(client):
+    resp = await client.post(
+        "/register",
+        json={"email": "invalid@example.com", "username": "bad user!", "password": "password123"},
+    )
+    assert resp.status_code == 422

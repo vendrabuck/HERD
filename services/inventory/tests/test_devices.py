@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload
@@ -172,3 +174,57 @@ async def test_internal_status_update_bad_token(client):
         headers={"X-Internal-Token": "wrong-token"},
     )
     assert resp.status_code == 403
+
+
+# --- 404 tests ---
+
+
+@pytest.mark.asyncio
+async def test_get_device_not_found(client):
+    resp = await client.get(f"/devices/{uuid.uuid4()}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_device_not_found(client):
+    resp = await client.put(f"/devices/{uuid.uuid4()}", json={"status": "OFFLINE"})
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_device_not_found(client):
+    resp = await client.delete(f"/devices/{uuid.uuid4()}")
+    assert resp.status_code == 404
+
+
+# --- Internal status missing token ---
+
+
+@pytest.mark.asyncio
+async def test_internal_status_update_missing_token(client):
+    create_resp = await client.post("/devices", json=DEVICE_PAYLOAD)
+    device_id = create_resp.json()["id"]
+    resp = await client.post(
+        f"/devices/{device_id}/status",
+        json={"status": "RESERVED"},
+    )
+    assert resp.status_code == 422
+
+
+# --- Filter by status ---
+
+
+@pytest.mark.asyncio
+async def test_filter_by_status(client):
+    await client.post("/devices", json=DEVICE_PAYLOAD)
+    create2 = await client.post(
+        "/devices", json={**DEVICE_PAYLOAD, "name": "FW-02", "status": "AVAILABLE"}
+    )
+    device2_id = create2.json()["id"]
+    # Update second device to OFFLINE
+    await client.put(f"/devices/{device2_id}", json={"status": "OFFLINE"})
+    resp = await client.get("/devices?status=AVAILABLE")
+    assert resp.status_code == 200
+    devices = resp.json()
+    assert all(d["status"] == "AVAILABLE" for d in devices)
+    assert len(devices) == 1

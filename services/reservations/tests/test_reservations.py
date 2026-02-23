@@ -76,6 +76,32 @@ def make_device_response(device_id: str, topology_type: str = "PHYSICAL") -> dic
     }
 
 
+async def _create_test_reservation(client, device_ids=None, **overrides):
+    """Helper: creates a reservation with mocked external calls."""
+    if device_ids is None:
+        device_ids = [DEVICE_A]
+    devices = [make_device_response(did, overrides.pop("topology_type", "PHYSICAL")) for did in device_ids]
+    body = {
+        "device_ids": device_ids,
+        "purpose": "Test lab setup",
+        "start_time": START,
+        "end_time": END,
+        **overrides,
+    }
+    with patch(
+        "app.services.reservation_service._fetch_devices",
+        new=AsyncMock(return_value=devices),
+    ), patch(
+        "app.services.reservation_service._publish_nats_event",
+        new=AsyncMock(),
+    ), patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        resp = await client.post("/", json=body)
+    return resp
+
+
 @pytest.mark.asyncio
 async def test_create_reservation(client):
     with patch(
@@ -216,3 +242,119 @@ async def test_cancel_reservation(client):
     ):
         del_resp = await client.delete(f"/{reservation_id}")
     assert del_resp.status_code == 204
+
+
+# --- GET single reservation ---
+
+
+@pytest.mark.asyncio
+async def test_get_reservation(client):
+    create_resp = await _create_test_reservation(client, [DEVICE_A, DEVICE_B])
+    assert create_resp.status_code == 201
+    reservation_id = create_resp.json()["id"]
+    resp = await client.get(f"/{reservation_id}")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == reservation_id
+    assert resp.json()["purpose"] == "Test lab setup"
+
+
+@pytest.mark.asyncio
+async def test_get_reservation_not_found(client):
+    resp = await client.get(f"/{uuid.uuid4()}")
+    assert resp.status_code == 404
+
+
+# --- Cancel edge cases ---
+
+
+@pytest.mark.asyncio
+async def test_cancel_reservation_not_found(client):
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        resp = await client.delete(f"/{uuid.uuid4()}")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancel_already_cancelled(client):
+    create_resp = await _create_test_reservation(client)
+    assert create_resp.status_code == 201
+    reservation_id = create_resp.json()["id"]
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        first = await client.delete(f"/{reservation_id}")
+        assert first.status_code == 204
+        second = await client.delete(f"/{reservation_id}")
+        assert second.status_code == 204
+
+
+# --- Release tests ---
+
+
+@pytest.mark.asyncio
+async def test_release_reservation(client):
+    create_resp = await _create_test_reservation(client)
+    assert create_resp.status_code == 201
+    reservation_id = create_resp.json()["id"]
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        resp = await client.put(f"/{reservation_id}/release")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_release_reservation_not_found(client):
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        resp = await client.put(f"/{uuid.uuid4()}/release")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_release_non_active_reservation(client):
+    """Cancel, then try to release; should return reservation unchanged (still CANCELLED)."""
+    create_resp = await _create_test_reservation(client)
+    assert create_resp.status_code == 201
+    reservation_id = create_resp.json()["id"]
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        await client.delete(f"/{reservation_id}")
+        resp = await client.put(f"/{reservation_id}/release")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "CANCELLED"
+
+
+# --- Device not available ---
+
+
+@pytest.mark.asyncio
+async def test_device_not_available(client):
+    """Reservation creation should fail if a device is not AVAILABLE."""
+    reserved_device = make_device_response(DEVICE_A, "PHYSICAL")
+    reserved_device["status"] = "RESERVED"
+    with patch(
+        "app.services.reservation_service._fetch_devices",
+        new=AsyncMock(return_value=[reserved_device]),
+    ):
+        resp = await client.post(
+            "/",
+            json={
+                "device_ids": [DEVICE_A],
+                "purpose": "Test",
+                "start_time": START,
+                "end_time": END,
+            },
+        )
+    assert resp.status_code == 422
+    assert "not available" in resp.json()["detail"].lower()
