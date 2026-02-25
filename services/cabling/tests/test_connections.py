@@ -146,3 +146,53 @@ async def test_user_can_get_connection(admin_client, user_client):
 async def test_create_connection_missing_fields(admin_client):
     resp = await admin_client.post("/connections", json={"device_a_id": str(uuid.uuid4())})
     assert resp.status_code == 422
+
+
+# --- Edge cases ---
+
+
+@pytest.mark.asyncio
+async def test_list_connections_empty(admin_client):
+    """GET /connections with none created returns 200 + empty list."""
+    resp = await admin_client.get("/connections")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_create_connection_self_loop(admin_client):
+    """device_a_id == device_b_id; documents current behavior (201 accepted)."""
+    device_id = str(uuid.uuid4())
+    body = {
+        "device_a_id": device_id,
+        "port_a": "eth0",
+        "device_b_id": device_id,
+        "port_b": "eth1",
+        "connection_type": "ethernet",
+        "notes": "self loop",
+    }
+    resp = await admin_client.post("/connections", json=body)
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_connection_full_lifecycle(admin_client):
+    """Create, list (verify present), get by id, delete, get (verify 404)."""
+    body = _connection_body()
+    create_resp = await admin_client.post("/connections", json=body)
+    assert create_resp.status_code == 201
+    conn_id = create_resp.json()["id"]
+    # List
+    list_resp = await admin_client.get("/connections")
+    assert list_resp.status_code == 200
+    assert any(c["id"] == conn_id for c in list_resp.json())
+    # Get by id
+    get_resp = await admin_client.get(f"/connections/{conn_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["id"] == conn_id
+    # Delete
+    del_resp = await admin_client.delete(f"/connections/{conn_id}")
+    assert del_resp.status_code == 204
+    # Get to verify 404
+    gone_resp = await admin_client.get(f"/connections/{conn_id}")
+    assert gone_resp.status_code == 404
