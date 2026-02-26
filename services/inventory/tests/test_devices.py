@@ -228,3 +228,90 @@ async def test_filter_by_status(client):
     devices = resp.json()
     assert all(d["status"] == "AVAILABLE" for d in devices)
     assert len(devices) == 1
+
+
+# --- Query parameter tests ---
+
+
+@pytest.mark.asyncio
+async def test_filter_by_device_type(client):
+    await client.post("/devices", json=DEVICE_PAYLOAD)  # FIREWALL
+    await client.post(
+        "/devices", json={**DEVICE_PAYLOAD, "name": "SW-01", "device_type": "SWITCH"}
+    )
+    resp = await client.get("/devices?device_type=FIREWALL")
+    assert resp.status_code == 200
+    devices = resp.json()
+    assert len(devices) == 1
+    assert devices[0]["device_type"] == "FIREWALL"
+
+
+@pytest.mark.asyncio
+async def test_pagination_limit(client):
+    for i in range(3):
+        await client.post("/devices", json={**DEVICE_PAYLOAD, "name": f"FW-{i}"})
+    resp = await client.get("/devices?limit=2")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+
+@pytest.mark.asyncio
+async def test_pagination_skip(client):
+    for i in range(3):
+        await client.post("/devices", json={**DEVICE_PAYLOAD, "name": f"FW-{i}"})
+    resp = await client.get("/devices?skip=2")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_combined_filters(client):
+    await client.post("/devices", json=DEVICE_PAYLOAD)  # FIREWALL + PHYSICAL
+    await client.post(
+        "/devices",
+        json={
+            **DEVICE_PAYLOAD, "name": "SW-01",
+            "device_type": "SWITCH", "topology_type": "PHYSICAL",
+        },
+    )
+    await client.post(
+        "/devices",
+        json={
+            **DEVICE_PAYLOAD, "name": "Cloud-FW",
+            "device_type": "FIREWALL", "topology_type": "CLOUD",
+        },
+    )
+    resp = await client.get("/devices?device_type=FIREWALL&topology_type=PHYSICAL")
+    assert resp.status_code == 200
+    devices = resp.json()
+    assert len(devices) == 1
+    assert devices[0]["device_type"] == "FIREWALL"
+    assert devices[0]["topology_type"] == "PHYSICAL"
+
+
+@pytest.mark.asyncio
+async def test_filter_invalid_device_type(client):
+    resp = await client.get("/devices?device_type=INVALID")
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_device_full_lifecycle(client):
+    """Create, update name, GET (verify update), delete, GET (verify 404)."""
+    create_resp = await client.post("/devices", json=DEVICE_PAYLOAD)
+    assert create_resp.status_code == 201
+    device_id = create_resp.json()["id"]
+    # Update name
+    update_resp = await client.put(f"/devices/{device_id}", json={"name": "FW-RENAMED"})
+    assert update_resp.status_code == 200
+    assert update_resp.json()["name"] == "FW-RENAMED"
+    # GET to verify update
+    get_resp = await client.get(f"/devices/{device_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["name"] == "FW-RENAMED"
+    # Delete
+    del_resp = await client.delete(f"/devices/{device_id}")
+    assert del_resp.status_code == 204
+    # GET to verify 404
+    gone_resp = await client.get(f"/devices/{device_id}")
+    assert gone_resp.status_code == 404

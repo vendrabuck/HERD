@@ -299,3 +299,78 @@ async def test_register_username_invalid_chars(client):
         json={"email": "invalid@example.com", "username": "bad user!", "password": "password123"},
     )
     assert resp.status_code == 422
+
+
+# --- Auth edge cases ---
+
+
+@pytest.mark.asyncio
+async def test_login_nonexistent_email(client):
+    """Login with unregistered email returns 401."""
+    resp = await client.post(
+        "/login", json={"email": "nobody@example.com", "password": "password123"}
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_with_invalid_token(client):
+    """Logout with random refresh_token returns 204 (idempotent)."""
+    resp = await client.post("/logout", json={"refresh_token": "totally-bogus-token"})
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_me_without_token(client):
+    """GET /me with no Authorization header returns 401."""
+    resp = await client.get("/me")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_me_with_invalid_token(client):
+    """GET /me with Bearer garbage returns 401."""
+    resp = await client.get("/me", headers={"Authorization": "Bearer garbage"})
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_register_invalid_email(client):
+    """Register with invalid email format returns 422."""
+    resp = await client.post(
+        "/register",
+        json={"email": "notanemail", "username": "validuser", "password": "password123"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_full_auth_lifecycle(client):
+    """Register, login, GET /me, refresh, logout, verify refresh token revoked."""
+    # Register
+    reg = await client.post(
+        "/register",
+        json={"email": "lifecycle@example.com", "username": "lifecycle", "password": "password123"},
+    )
+    assert reg.status_code == 201
+    # Login
+    login = await client.post(
+        "/login", json={"email": "lifecycle@example.com", "password": "password123"}
+    )
+    assert login.status_code == 200
+    access = login.json()["access_token"]
+    refresh = login.json()["refresh_token"]
+    # GET /me
+    me = await client.get("/me", headers={"Authorization": f"Bearer {access}"})
+    assert me.status_code == 200
+    assert me.json()["email"] == "lifecycle@example.com"
+    # Refresh
+    ref = await client.post("/refresh", json={"refresh_token": refresh})
+    assert ref.status_code == 200
+    new_refresh = ref.json()["refresh_token"]
+    # Logout
+    logout = await client.post("/logout", json={"refresh_token": new_refresh})
+    assert logout.status_code == 204
+    # Verify refresh token revoked
+    retry = await client.post("/refresh", json={"refresh_token": new_refresh})
+    assert retry.status_code == 401

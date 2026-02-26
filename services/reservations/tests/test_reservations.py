@@ -80,7 +80,8 @@ async def _create_test_reservation(client, device_ids=None, **overrides):
     """Helper: creates a reservation with mocked external calls."""
     if device_ids is None:
         device_ids = [DEVICE_A]
-    devices = [make_device_response(did, overrides.pop("topology_type", "PHYSICAL")) for did in device_ids]
+    topo = overrides.pop("topology_type", "PHYSICAL")
+    devices = [make_device_response(did, topo) for did in device_ids]
     body = {
         "device_ids": device_ids,
         "purpose": "Test lab setup",
@@ -358,3 +359,126 @@ async def test_device_not_available(client):
         )
     assert resp.status_code == 422
     assert "not available" in resp.json()["detail"].lower()
+
+
+# --- Validation tests ---
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_empty_device_ids(client):
+    resp = await client.post(
+        "/",
+        json={
+            "device_ids": [],
+            "purpose": "Test",
+            "start_time": START,
+            "end_time": END,
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_end_before_start(client):
+    resp = await client.post(
+        "/",
+        json={
+            "device_ids": [DEVICE_A],
+            "purpose": "Test",
+            "start_time": END,
+            "end_time": START,
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_end_equals_start(client):
+    resp = await client.post(
+        "/",
+        json={
+            "device_ids": [DEVICE_A],
+            "purpose": "Test",
+            "start_time": START,
+            "end_time": START,
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_invalid_device_id(client):
+    resp = await client.post(
+        "/",
+        json={
+            "device_ids": ["not-a-uuid"],
+            "purpose": "Test",
+            "start_time": START,
+            "end_time": END,
+        },
+    )
+    assert resp.status_code == 422
+
+
+# --- Conflict edge cases ---
+
+
+@pytest.mark.asyncio
+async def test_adjacent_reservations_allowed(client):
+    """Reservation B starts exactly when A ends; no conflict (half-open interval)."""
+    a_start = START
+    a_end = END
+    resp_a = await _create_test_reservation(client, [DEVICE_A], start_time=a_start, end_time=a_end)
+    assert resp_a.status_code == 201
+    # B starts exactly at A's end
+    b_start = a_end
+    b_end = (NOW + timedelta(hours=5)).isoformat()
+    resp_b = await _create_test_reservation(client, [DEVICE_A], start_time=b_start, end_time=b_end)
+    assert resp_b.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_no_conflict_with_cancelled_reservation(client):
+    """Cancel reservation A, then rebook same device and window; expect 201."""
+    resp_a = await _create_test_reservation(client, [DEVICE_A])
+    assert resp_a.status_code == 201
+    reservation_id = resp_a.json()["id"]
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        await client.delete(f"/{reservation_id}")
+    resp_b = await _create_test_reservation(client, [DEVICE_A])
+    assert resp_b.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_conflict_then_cancel_then_rebook(client):
+    """Create A, attempt overlapping B (409), cancel A, create B again (201)."""
+    resp_a = await _create_test_reservation(client, [DEVICE_A])
+    assert resp_a.status_code == 201
+    reservation_id = resp_a.json()["id"]
+    # Overlapping B should conflict
+    with patch(
+        "app.services.reservation_service._fetch_devices",
+        new=AsyncMock(return_value=[make_device_response(DEVICE_A, "PHYSICAL")]),
+    ):
+        resp_conflict = await client.post(
+            "/",
+            json={
+                "device_ids": [DEVICE_A],
+                "purpose": "Overlapping",
+                "start_time": START,
+                "end_time": END,
+            },
+        )
+    assert resp_conflict.status_code == 409
+    # Cancel A
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        await client.delete(f"/{reservation_id}")
+    # Now B should succeed
+    resp_b = await _create_test_reservation(client, [DEVICE_A])
+    assert resp_b.status_code == 201

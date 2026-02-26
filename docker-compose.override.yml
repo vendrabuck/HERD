@@ -1,0 +1,29 @@
+services:
+  auth:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/auth/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
+  inventory:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/inventory/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
+  reservations:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/reservations/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
+  cabling:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/cabling/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
+  traefik:
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+      - "--log.level=DEBUG"
