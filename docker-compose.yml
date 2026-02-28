@@ -6,9 +6,12 @@ services:
       - "--configFile=/etc/traefik/traefik.yml"
     ports:
       - "80:80"
+      - "443:443"
       - "8080:8080"  # Traefik dashboard
     volumes:
       - ./infra/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./infra/traefik/certs:/etc/traefik/certs:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - herd-net
@@ -25,9 +28,9 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-herd}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-herdpassword}
-      POSTGRES_DB: ${POSTGRES_DB:-herd}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -64,20 +67,21 @@ services:
       context: .
       dockerfile: services/auth/Dockerfile
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-herd}:${POSTGRES_PASSWORD:-herdpassword}@postgres:5432/${POSTGRES_DB:-herd}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: auth
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
       REFRESH_TOKEN_EXPIRE_DAYS: ${AUTH_REFRESH_TOKEN_EXPIRE_DAYS:-7}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost,https://192.168.1.233}
       SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
       SUPERADMIN_USERNAME: ${SUPERADMIN_USERNAME:-}
       SUPERADMIN_PASSWORD: ${SUPERADMIN_PASSWORD:-}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.auth.rule=PathPrefix(`/api/auth`)"
-      - "traefik.http.routers.auth.entrypoints=web"
+      - "traefik.http.routers.auth.entrypoints=websecure"
+      - "traefik.http.routers.auth.tls=true"
       - "traefik.http.services.auth.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.auth-strip.stripprefix.prefixes=/api/auth"
       - "traefik.http.routers.auth.middlewares=auth-strip"
@@ -100,16 +104,17 @@ services:
       context: .
       dockerfile: services/inventory/Dockerfile
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-herd}:${POSTGRES_PASSWORD:-herdpassword}@postgres:5432/${POSTGRES_DB:-herd}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: inventory
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost,https://192.168.1.233}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.inventory.rule=PathPrefix(`/api/inventory`)"
-      - "traefik.http.routers.inventory.entrypoints=web"
+      - "traefik.http.routers.inventory.entrypoints=websecure"
+      - "traefik.http.routers.inventory.tls=true"
       - "traefik.http.services.inventory.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.inventory-strip.stripprefix.prefixes=/api/inventory"
       - "traefik.http.routers.inventory.middlewares=inventory-strip"
@@ -132,18 +137,19 @@ services:
       context: .
       dockerfile: services/reservations/Dockerfile
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-herd}:${POSTGRES_PASSWORD:-herdpassword}@postgres:5432/${POSTGRES_DB:-herd}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: reservations
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       INVENTORY_SERVICE_URL: http://inventory:8000
       NATS_URL: ${NATS_URL:-nats://nats:4222}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost,https://192.168.1.233}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.reservations.rule=PathPrefix(`/api/reservations`)"
-      - "traefik.http.routers.reservations.entrypoints=web"
+      - "traefik.http.routers.reservations.entrypoints=websecure"
+      - "traefik.http.routers.reservations.tls=true"
       - "traefik.http.services.reservations.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.reservations-strip.stripprefix.prefixes=/api/reservations"
       - "traefik.http.routers.reservations.middlewares=reservations-strip"
@@ -170,11 +176,12 @@ services:
       context: ./services/acl
       dockerfile: Dockerfile
     environment:
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost,https://192.168.1.233}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.acl.rule=PathPrefix(`/api/acl`)"
-      - "traefik.http.routers.acl.entrypoints=web"
+      - "traefik.http.routers.acl.entrypoints=websecure"
+      - "traefik.http.routers.acl.tls=true"
       - "traefik.http.services.acl.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.acl-strip.stripprefix.prefixes=/api/acl"
       - "traefik.http.routers.acl.middlewares=acl-strip"
@@ -194,11 +201,12 @@ services:
       context: ./services/user-profile
       dockerfile: Dockerfile
     environment:
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost,https://192.168.1.233}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.user-profile.rule=PathPrefix(`/api/user-profile`)"
-      - "traefik.http.routers.user-profile.entrypoints=web"
+      - "traefik.http.routers.user-profile.entrypoints=websecure"
+      - "traefik.http.routers.user-profile.tls=true"
       - "traefik.http.services.user-profile.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.user-profile-strip.stripprefix.prefixes=/api/user-profile"
       - "traefik.http.routers.user-profile.middlewares=user-profile-strip"
@@ -218,13 +226,16 @@ services:
       context: .
       dockerfile: services/cabling/Dockerfile
     environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: cabling
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost,http://192.168.1.233}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost,https://192.168.1.233}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.cabling.rule=PathPrefix(`/api/cabling`)"
-      - "traefik.http.routers.cabling.entrypoints=web"
+      - "traefik.http.routers.cabling.entrypoints=websecure"
+      - "traefik.http.routers.cabling.tls=true"
       - "traefik.http.services.cabling.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.cabling-strip.stripprefix.prefixes=/api/cabling"
       - "traefik.http.routers.cabling.middlewares=cabling-strip"
@@ -237,6 +248,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # --- Frontend ---
   frontend:
@@ -246,7 +260,8 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
-      - "traefik.http.routers.frontend.entrypoints=web"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls=true"
       - "traefik.http.services.frontend.loadbalancer.server.port=80"
     networks:
       - herd-net

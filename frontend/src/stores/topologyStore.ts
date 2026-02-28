@@ -1,5 +1,4 @@
 import { create } from "zustand";
-import { persist, createJSONStorage } from "zustand/middleware";
 import {
   addEdge,
   applyEdgeChanges,
@@ -10,7 +9,7 @@ import {
   type Node,
   type NodeChange,
 } from "@xyflow/react";
-import type { DeviceNodeData, LayerEdgeData, EdgeLayerType } from "@/types/topology.types";
+import type { CanvasData, DeviceNodeData, LayerEdgeData, EdgeLayerType } from "@/types/topology.types";
 
 interface TopologyState {
   nodes: Node<DeviceNodeData>[];
@@ -23,9 +22,10 @@ interface TopologyState {
   addDeviceNode: (node: Node<DeviceNodeData>) => void;
   setSelectedEdgeLayer: (layer: EdgeLayerType) => void;
   clearTopology: () => void;
+  loadCanvas: (data: CanvasData) => void;
 }
 
-export const useTopologyStore = create<TopologyState>()(persist((set) => ({
+export const useTopologyStore = create<TopologyState>()((set) => ({
   nodes: [],
   edges: [],
   selectedEdgeLayer: "L2",
@@ -53,13 +53,12 @@ export const useTopologyStore = create<TopologyState>()(persist((set) => ({
 
   setSelectedEdgeLayer: (layer) => set({ selectedEdgeLayer: layer }),
 
-  clearTopology: () => set({ nodes: [], edges: [] }),
-}), {
-  name: "herd-topology",
-  storage: createJSONStorage(() => localStorage),
-  partialize: (state) => ({
-    nodes: state.nodes,
-    edges: state.edges,
-    selectedEdgeLayer: state.selectedEdgeLayer,
-  }),
+  clearTopology: () => set({ nodes: [], edges: [], selectedEdgeLayer: "L2" }),
+
+  loadCanvas: (data) =>
+    set({
+      nodes: data.nodes ?? [],
+      edges: data.edges ?? [],
+      selectedEdgeLayer: data.selectedEdgeLayer ?? "L2",
+    }),
 }));

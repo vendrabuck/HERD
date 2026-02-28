@@ -6,10 +6,10 @@ These connections are made by administrators and are not visible to end-users as
 cable data; the frontend topology editor reflects them, but users cannot create or
 delete cabling entries directly.
 
-Current state: in-memory store (no database persistence).
-A full implementation would use a cabling schema in PostgreSQL with proper ORM models.
+Also manages topology persistence (canvas layouts saved to database).
 """
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -18,14 +18,25 @@ from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from pydantic import BaseModel
 
 from app.config import settings
+from app.database import Base, engine
 from app.dependencies import get_current_user_payload, require_admin
+from app.routes.topologies import router as topologies_router
 
 setup_logging("cabling")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
 
 app = FastAPI(
     title="HERD Cabling Service",
     description="Backend connection management between lab devices",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -122,3 +133,6 @@ async def delete_connection(
     if connection_id not in _connections:
         raise HTTPException(status_code=404, detail="Connection not found")
     del _connections[connection_id]
+
+
+app.include_router(topologies_router)

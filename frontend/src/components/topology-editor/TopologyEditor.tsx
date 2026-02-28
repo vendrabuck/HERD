@@ -93,7 +93,7 @@ export function TopologyEditor() {
       };
 
       const newNode: Node<DeviceNodeData> = {
-        id: crypto.randomUUID(),
+        id: self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
         type: "deviceNode",
         position,
         data: {

@@ -28,6 +28,7 @@ migrate:
 	docker compose exec auth alembic upgrade head
 	docker compose exec inventory alembic upgrade head
 	docker compose exec reservations alembic upgrade head
+	docker compose exec cabling alembic upgrade head
 
 migrate-auth:
 	docker compose exec auth alembic upgrade head
@@ -37,6 +38,9 @@ migrate-inventory:
 
 migrate-reservations:
 	docker compose exec reservations alembic upgrade head
+
+migrate-cabling:
+	docker compose exec cabling alembic upgrade head
 
 # ── Testing ──────────────────────────────────────────────────────────────────
 

@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql+asyncpg://herd:herdpassword@localhost:5432/herd"
+    database_url: str  # db login, password, and url go here via DATABASE_URL env var
     db_schema: str = "inventory"
     secret_key: str
     algorithm: str = "HS256"

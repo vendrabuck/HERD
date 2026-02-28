@@ -12,7 +12,7 @@ export function LoginPage() {
     e.preventDefault();
     try {
       await login.mutateAsync(form);
-      navigate("/dashboard");
+      navigate("/topology");
     } catch {
       toast.error("Invalid email or password");
     }
