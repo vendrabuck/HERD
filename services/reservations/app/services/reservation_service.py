@@ -587,6 +587,17 @@ async def update_reservation(
                     f"Found: {', '.join(topology_types)}"
                 )
 
+            # Re-validate topology connectivity when the device set changes on a
+            # reservation that references a topology. The cabling service walks the
+            # canvas edges against the physical Connection graph and raises if any
+            # edge is unreachable, so an edit that strands part of the topology is
+            # rejected here rather than silently breaking a live reservation. Runs
+            # before any inventory status mutation below, so a failure aborts with
+            # no side effects to unwind. Reservations without a topology are
+            # unaffected (this mirrors the create-path check).
+            if reservation.topology_id is not None:
+                await _validate_topology_connectivity(reservation.topology_id)
+
             # Check added exclusive devices are available and have no conflicts
             if added_ids:
                 added_devices = [
