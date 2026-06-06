@@ -54,6 +54,60 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Reservation updated")).toBeInTheDocument();
     expect(screen.getByText("Reservation cancelled")).toBeInTheDocument();
     expect(screen.getByText("Reservation completed")).toBeInTheDocument();
+    expect(screen.getByText("Reservation expiring soon")).toBeInTheDocument();
+  });
+
+  it("renders outbound channel toggles defaulting off", async () => {
+    server.use(
+      http.get("/api/notifications/notifications/preferences", () =>
+        HttpResponse.json(DEFAULT_PREFS),
+      ),
+    );
+    renderWithProviders(<SettingsPage />);
+    await waitFor(() =>
+      expect(screen.getByText("Notifications")).toBeInTheDocument(),
+    );
+    const email = screen.getByLabelText("Email") as HTMLInputElement;
+    const chat = screen.getByLabelText("Chat") as HTMLInputElement;
+    const webhook = screen.getByLabelText("Webhook") as HTMLInputElement;
+    // Prefs payload omits outbound channels, so the component defaults them off.
+    expect(email.checked).toBe(false);
+    expect(chat.checked).toBe(false);
+    expect(webhook.checked).toBe(false);
+  });
+
+  it("enabling an outbound channel sends it in the save payload", async () => {
+    let captured: unknown = null;
+    server.use(
+      http.get("/api/notifications/notifications/preferences", () =>
+        HttpResponse.json(DEFAULT_PREFS),
+      ),
+      http.put(
+        "/api/notifications/notifications/preferences",
+        async ({ request }) => {
+          const body = await request.json();
+          captured = body;
+          return HttpResponse.json(body);
+        },
+      ),
+    );
+    renderWithProviders(<SettingsPage />);
+    await waitFor(() =>
+      expect(screen.getByText("Notifications")).toBeInTheDocument(),
+    );
+    const email = screen.getByLabelText("Email") as HTMLInputElement;
+    fireEvent.click(email);
+    expect(email.checked).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(toastSuccess).toHaveBeenCalledWith("Preferences saved"),
+    );
+    const body = captured as { channels: Record<string, boolean> };
+    expect(body.channels.email).toBe(true);
+    expect(body.channels.in_app).toBe(true);
+    expect(body.channels.chat).toBe(false);
+    expect(body.channels.webhook).toBe(false);
   });
 
   it("toggling and saving sends the new payload to the API", async () => {
