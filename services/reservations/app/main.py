@@ -39,7 +39,9 @@ async def lifespan(app: FastAPI):
     # Start expiration background task
     from app.tasks.expiration import expiration_loop
 
-    expiration_task = asyncio.create_task(expiration_loop(settings.expiration_interval_seconds))
+    expiration_task = asyncio.create_task(
+        expiration_loop(settings.expiration_interval_seconds, nats_conn=app.state.nats)
+    )
 
     yield
 
