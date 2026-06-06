@@ -4,10 +4,12 @@
 Creates:
   - 50 admin users and 1000 regular users
   - 4 drivers: Network OS Management, Endpoint Management, L1 Switch Driver, L2 Switch Driver
-  - 15 DUT device templates (11 network-device series + 4 client OS) + 1 L1 switch + 1 L2 switch + 1 port template
-  - 3000 DUT devices distributed evenly across templates (variable port counts per template)
+  - 28 DUT device templates (24 generic network devices across 6 invented vendors
+    in 6 classes: router, switch, firewall, load balancer, server, storage + 4 client OS)
+  - 4 infra templates: 1 L1 switch, 2 L2 switch (incl. Cisco Catalyst 6509), 1 port template
+  - 5000 DUT devices distributed evenly across templates (variable port counts per template)
   - 29 L1 switches: 27 edge (9 per lab) + 2 hub, each with 256 backplane ports (0/slot/port)
-  - 6 L2 switches: 2 per lab, each with 48 access ports
+  - 30 L2 edge switches (10 per lab), each with 48 access ports
   - L1 cabling: DUT-to-edge (eth1-eth5/eth1-eth2) + 54 edge-to-hub + 1 hub-to-hub
   - L2 cabling: DUT-to-L2 (network-device eth6-eth7, client eth3) round-robin across L2 switches
   - 3 device groups: Lab Alpha, Lab Bravo, Lab Charlie (DUTs + L1 + L2 switches)
@@ -63,86 +65,59 @@ CLIENT_SECTIONS = [
 
 PORT_SECTIONS = [{"name": "Port Info", "fields": []}]
 
-_VENDOR = "Generic Networks"
+# Generic, invented hardware catalog. None of these vendors or models are real;
+# they exist so the seeded inventory looks like a heterogeneous lab without
+# referencing any real company's gear. Six invented vendors, each shipping one
+# model in four device classes (router, switch, firewall, load balancer, server,
+# storage), for 24 network-device templates. The 5000 DUT devices distribute
+# evenly across every template (see generate_devices), so adding or removing
+# entries here re-weights the fleet automatically.
+#
+# Each tuple is (vendor, device_class, model_code, name_prefix).
+GENERIC_CATALOG = [
+    ("Aerendir", "Router", "RTR-9000", "AER-RTR"),
+    ("Aerendir", "Switch", "SW-4800", "AER-SW"),
+    ("Aerendir", "Firewall", "FW-2200", "AER-FW"),
+    ("Aerendir", "Load Balancer", "LB-700", "AER-LB"),
+    ("Cobalt", "Router", "CR-8100", "COB-RTR"),
+    ("Cobalt", "Switch", "CS-3600", "COB-SW"),
+    ("Cobalt", "Server", "SRV-1U", "COB-SRV"),
+    ("Cobalt", "Storage", "STG-4000", "COB-STG"),
+    ("Meridian", "Router", "MX-7500", "MER-RTR"),
+    ("Meridian", "Switch", "MS-2400", "MER-SW"),
+    ("Meridian", "Firewall", "MF-1800", "MER-FW"),
+    ("Meridian", "Load Balancer", "ML-500", "MER-LB"),
+    ("Vantage", "Router", "VR-6200", "VAN-RTR"),
+    ("Vantage", "Switch", "VS-4810", "VAN-SW"),
+    ("Vantage", "Server", "VSV-2U", "VAN-SRV"),
+    ("Vantage", "Storage", "VST-8000", "VAN-STG"),
+    ("Helix", "Router", "HR-5400", "HLX-RTR"),
+    ("Helix", "Switch", "HS-1600", "HLX-SW"),
+    ("Helix", "Firewall", "HF-3300", "HLX-FW"),
+    ("Helix", "Load Balancer", "HL-900", "HLX-LB"),
+    ("Northwind", "Router", "NR-7700", "NW-RTR"),
+    ("Northwind", "Switch", "NS-4820", "NW-SW"),
+    ("Northwind", "Server", "NSV-4U", "NW-SRV"),
+    ("Northwind", "Storage", "NST-12000", "NW-STG"),
+]
 
+
+def _network_template(vendor: str, device_class: str, model: str) -> dict:
+    name = f"{vendor} {model}"
+    return {
+        "name": name,
+        "description": f"{vendor} {device_class}, {model}",
+        "vendor": vendor,
+        "model": model,
+        "sections": SECTIONS,
+    }
+
+
+# 24 generic network-device templates + 4 client OS templates.
 DEVICE_TEMPLATES = [
-    {
-        "name": "Network Device Model A",
-        "description": "Generic network device, Model A",
-        "vendor": _VENDOR,
-        "model": "Model A",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model B",
-        "description": "Generic network device, Model B",
-        "vendor": _VENDOR,
-        "model": "Model B",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model C",
-        "description": "Generic network device, Model C",
-        "vendor": _VENDOR,
-        "model": "Model C",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model D",
-        "description": "Generic network device, Model D",
-        "vendor": _VENDOR,
-        "model": "Model D",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model E",
-        "description": "Generic network device, Model E",
-        "vendor": _VENDOR,
-        "model": "Model E",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model F",
-        "description": "Generic network device, Model F",
-        "vendor": _VENDOR,
-        "model": "Model F",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model G",
-        "description": "Generic network device, Model G",
-        "vendor": _VENDOR,
-        "model": "Model G",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model H",
-        "description": "Generic network device, Model H",
-        "vendor": _VENDOR,
-        "model": "Model H",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model I",
-        "description": "Generic network device, Model I",
-        "vendor": _VENDOR,
-        "model": "Model I",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model J",
-        "description": "Generic network device, Model J",
-        "vendor": _VENDOR,
-        "model": "Model J",
-        "sections": SECTIONS,
-    },
-    {
-        "name": "Network Device Model K",
-        "description": "Generic network device, Model K",
-        "vendor": _VENDOR,
-        "model": "Model K",
-        "sections": SECTIONS,
-    },
+    _network_template(vendor, device_class, model)
+    for vendor, device_class, model, _prefix in GENERIC_CATALOG
+] + [
     {
         "name": "Windows 10 Client",
         "description": "Windows 10 endpoint",
@@ -173,24 +148,18 @@ DEVICE_TEMPLATES = [
     },
 ]
 
-# Device name prefixes for each template
+# Device name prefixes for each template.
 TEMPLATE_PREFIX = {
-    "Network Device Model A": "Network Device Model A",
-    "Network Device Model B": "Network Device Model B",
-    "Network Device Model C": "Network Device Model C",
-    "Network Device Model D": "Network Device Model D",
-    "Network Device Model E": "Network Device Model E",
-    "Network Device Model F": "Network Device Model F",
-    "Network Device Model G": "Network Device Model G",
-    "Network Device Model H": "Network Device Model H",
-    "Network Device Model I": "Network Device Model I",
-    "Network Device Model J": "Network Device Model J",
-    "Network Device Model K": "Network Device Model K",
-    "Windows 10 Client": "Win10",
-    "Windows 11 Client": "Win11",
-    "macOS Client": "macOS",
-    "Ubuntu Client": "Ubuntu",
+    f"{vendor} {model}": prefix for vendor, _class, model, prefix in GENERIC_CATALOG
 }
+TEMPLATE_PREFIX.update(
+    {
+        "Windows 10 Client": "Win10",
+        "Windows 11 Client": "Win11",
+        "macOS Client": "macOS",
+        "Ubuntu Client": "Ubuntu",
+    }
+)
 
 TOTAL_DEVICES = 5000
 NUM_ADMINS = 50
@@ -204,17 +173,16 @@ NUM_USERS = 1000
 # unpolled and show no health badge.
 POLL_INTERVAL_SECONDS = 60
 POLL_SUBSET_COUNTS = {
-    "Network Device Model A": 50,
-    "Network Device Model E": 50,
-    "Network Device Model K": 50,
+    "Aerendir RTR-9000": 50,
+    "Meridian MX-7500": 50,
+    "Northwind NR-7700": 50,
     "Windows 10 Client": 50,
 }
 
-# Port counts per template (default 32 for unlisted network-device series)
+# Port counts per template. Network-device models are unlisted and fall through
+# to DEFAULT_PORT_COUNT (32), which leaves room for the cabling pass to use
+# eth1-eth5 (L1) and eth6-eth7 (L2). Clients are small and listed explicitly.
 TEMPLATE_PORT_COUNTS = {
-    "Network Device Model A": 8,
-    "Network Device Model B": 8,
-    "Network Device Model C": 8,
     "Windows 10 Client": 10,  # 2 L1 + 1 L2
     "Windows 11 Client": 10,  # 2 L1 + 1 L2
     "macOS Client": 3,       # 2 L1 + 1 L2
@@ -863,9 +831,11 @@ def bulk_remove_from_group(
         done = min(start + batch_size, total)
         if resp.status_code == 200:
             data = resp.json()
-        print(f"    Batch {done}/{total}: removed={data['removed']}, not_found={data['not_found']}")
-    else:
-        print(f"    Batch {done}/{total}: failed ({resp.status_code})")
+            removed = data["removed"]
+            not_found = data["not_found"]
+            print(f"    Batch {done}/{total}: removed={removed}, not_found={not_found}")
+        else:
+            print(f"    Batch {done}/{total}: failed ({resp.status_code})")
 
 
 def bulk_remove_devices_from_group(
@@ -1603,7 +1573,7 @@ def main() -> None:
     total_l2_ports = NUM_L2_SWITCHES * L2_PORTS_TOTAL
     print(
         f"\nDone. {NUM_ADMINS + NUM_USERS} users, 4 drivers, "
-        f"{len(DEVICE_TEMPLATES) + 3} templates, "
+        f"{len(DEVICE_TEMPLATES) + 4} templates, "
         f"{TOTAL_DEVICES} DUT devices + {NUM_L1_SWITCHES} L1 + {NUM_L2_SWITCHES} L2 switches, "
         f"{total_dut_ports} DUT ports + {total_l1_ports} L1 ports + {total_l2_ports} L2 ports, "
         f"{num_connections} connections, "
