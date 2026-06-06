@@ -37,9 +37,11 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Exclusive vs non-exclusive flag** (Shipped): exclusive devices get conflict
   detection; shared infrastructure (such as switches) can take concurrent
   reservations.
-- **Bulk import and export** (Planned): CSV and JSON import-export for devices,
-  templates, and topologies. Targets migration between HERD instances and bulk
-  onboarding of existing inventory.
+- **Bulk import and export** (Shipped): CSV and JSON import-export for devices,
+  templates, and topologies, with a dry-run preview, per-row error reporting, and
+  cross-instance reference resolution by name. Targets migration between HERD
+  instances and bulk onboarding of existing inventory. Reservations, ACL grants,
+  and users are out of scope.
 
 ## Topology
 
@@ -130,7 +132,7 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **Reporting and analytics** (Shipped): admin-only utilization dashboards by user,
   device, topology type, day, and group, with CSV export.
-- **Notifications and dispatch channels** (Partial): durable NATS consumers turn
+- **Notifications and dispatch channels** (Shipped): durable NATS consumers turn
   reservation lifecycle and device-health events into per-user notifications. The
   in-app bell ships alongside opt-in email, chat (Slack-style), and outbound-webhook
   channels as peer dispatchers, with the webhook HMAC-signed. Outbound sends are
