@@ -33,10 +33,10 @@ HERD is a lab reservation and topology-management platform built as independent 
 
 - `Planned` Durable event delivery (transactional outbox). Commit reservation lifecycle events to an outbox in the same database transaction as the state change, with idempotent consumers, so a messaging outage cannot silently drop provisioning or notification events. This is treated as a reliability prerequisite for a 1.0.
 - `Planned` Health monitoring at fleet scale. Building on shipped per-device health polling and alerting: configurable batch sizes, bounded concurrency, and event-driven tiered poll intervals (frequent for in-use devices, relaxed for idle ones), with an optional split between the API and the poller for larger fleets.
-- `Planned` Bulk import and export. CSV and JSON import and export for devices, templates, and topologies, to support bulk onboarding and migration between HERD instances.
+- `Shipped` Bulk import and export. CSV and JSON import and export for devices, templates, and topologies, with a dry-run preview, per-row error reporting, and cross-instance reference resolution by name, to support bulk onboarding and migration between HERD instances. Reservations, ACL grants, and users are out of scope.
 - `Planned` External integration API and webhooks. A stable external API surface for CI/CD and test-automation systems to reserve and release resources programmatically, plus outbound webhooks on lifecycle events.
 - `Planned` Multi-tenancy and team workspaces. Organizational isolation layered on the access-control service, so independent teams can share an instance without seeing each other's resources.
-- `Partial` Notification dispatch channels. In-app notifications are shipped; outbound channels (email, chat, webhook) and an upcoming-expiry reminder scheduler are planned.
+- `Shipped` Notification dispatch channels. In-app notifications plus opt-in email, chat (Slack-style), and HMAC-signed outbound-webhook channels as peer dispatchers, with outbound sends deduped on NATS redelivery and per-channel failure isolation, and an upcoming-expiry reminder that fires once within a configurable lead window of a reservation's end time. Bidirectional chat and per-user channel credentials remain out of scope.
 - `Shipped` Reporting and analytics. Administrative utilization dashboards by user, device, topology type, day, and group, with CSV export.
 - `Shipped` Structured logging baseline. Per-service structured JSON logs with request-scoped context; richer observability builds on this and the audit-trail work above.
 
