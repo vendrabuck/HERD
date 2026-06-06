@@ -59,7 +59,7 @@ The images below are design-system mockups rendered from the HERD UI kit, not ca
 - Device group visibility controls: non-admin users only see devices in their assigned groups
 - Local or LDAP/Active Directory authentication (pluggable via `AUTH_METHOD`); LDAP users JIT-provision in HERD on first bind
 - Per-user preferences (saved filters, page sizes, notification settings) with a Settings page under the user menu
-- In-app notifications with a bell icon + unread badge, driven by a durable NATS consumer on reservation lifecycle events; per-user channel and per-event opt-outs
+- Notifications driven by durable NATS consumers on reservation lifecycle and device-health events, with an in-app bell + unread badge plus opt-in email, chat, and outbound-webhook channels (HMAC-signed), an upcoming-expiry reminder, and per-channel and per-event opt-outs
 - Save and load topology canvases for persistent lab diagrams; every save is versioned with preview, diff, and restore (restore is blocked while an active reservation references the topology)
 - Bulk import and export of devices, templates, and topologies as CSV or JSON, with a dry-run preview, per-row error reporting, and cross-instance reference resolution by name (see [docs/BULK_IMPORT_EXPORT.md](docs/BULK_IMPORT_EXPORT.md))
 - Paginated list views across all resources
@@ -393,11 +393,18 @@ in-app `notifications` table:
   of all admins and any users with an active reservation on the affected device.
 The recipient resolver fetches admins from auth's internal endpoint (cached in-process
 for 60s) and active reservation holders from reservations' internal endpoint (uncached,
-per-event). Pluggable `Dispatcher` protocol ships with `InAppDispatcher` today;
-email/Slack/webhook dispatchers slot in as peer dispatchers later. Per-user preferences
-live in `user_preferences.extras.notifications` (channel toggles + per-event opt-outs,
-including a `device.health_transition` toggle) and are read via user-profile's internal
-endpoint with a short in-process cache. REST API at `/api/notifications/notifications`
+per-event). The pluggable `Dispatcher` protocol ships four peer dispatchers: `InAppDispatcher`
+(the `notifications` table) plus `EmailDispatcher` (SMTP), `ChatDispatcher` (Slack-style
+incoming webhook), and `WebhookDispatcher` (HMAC-signed POST). Outbound channels are deduped
+on the source NATS stream+sequence via an `outbound_deliveries` ledger, and a send failure on
+one channel is isolated so it never blocks the others or in-app. Channel transport is
+instance-level config; outbound channels default off per user. A `reservation.expiring_soon`
+reminder is published by the reservations expiration task within a configurable lead window of
+`end_time`, deduped per reservation, and consumed through the existing reservations consumer.
+Per-user preferences live in `user_preferences.extras.notifications` (per-channel toggles +
+per-event opt-outs, including `device.health_transition` and `reservation.expiring_soon`) and
+are read via user-profile's internal endpoint with a short in-process cache. REST API at
+`/api/notifications/notifications`
 for list/mark-read/mark-all/delete plus a GET/PUT `/preferences` proxy. Frontend surfaces
 a bell icon with unread badge (30s polling) in the header and a Notifications section on
 the new `/settings` page.

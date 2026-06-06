@@ -3,6 +3,7 @@ import toast from "react-hot-toast";
 import {
   useNotificationPreferences,
   useUpdateNotificationPreferences,
+  type NotificationChannels,
 } from "@/api/notifications";
 
 const EVENT_LABELS: Array<{ key: string; label: string }> = [
@@ -10,24 +11,52 @@ const EVENT_LABELS: Array<{ key: string; label: string }> = [
   { key: "reservation.updated", label: "Reservation updated" },
   { key: "reservation.cancelled", label: "Reservation cancelled" },
   { key: "reservation.completed", label: "Reservation completed" },
+  { key: "reservation.expiring_soon", label: "Reservation expiring soon" },
 ];
+
+const OUTBOUND_CHANNELS: Array<{
+  key: "email" | "chat" | "webhook";
+  label: string;
+  hint: string;
+}> = [
+  { key: "email", label: "Email", hint: "Send notifications to your account email." },
+  { key: "chat", label: "Chat", hint: "Post notifications to the configured chat channel." },
+  { key: "webhook", label: "Webhook", hint: "POST notifications to the configured webhook." },
+];
+
+const DEFAULT_CHANNELS: NotificationChannels = {
+  in_app: true,
+  email: false,
+  chat: false,
+  webhook: false,
+};
 
 export function SettingsPage() {
   const { data: prefs, isLoading } = useNotificationPreferences();
   const update = useUpdateNotificationPreferences();
 
   const [overrides, setOverrides] = useState<{
-    inApp?: boolean;
+    channels?: Partial<NotificationChannels>;
     events?: Record<string, boolean>;
   }>({});
 
-  const inApp = overrides.inApp ?? prefs?.channels.in_app ?? true;
+  const channels: NotificationChannels = {
+    ...DEFAULT_CHANNELS,
+    ...(prefs?.channels ?? {}),
+    ...(overrides.channels ?? {}),
+  };
   const events = overrides.events ?? prefs?.events ?? {};
+
+  const setChannel = (key: keyof NotificationChannels, value: boolean) =>
+    setOverrides((prev) => ({
+      ...prev,
+      channels: { ...(prev.channels ?? {}), [key]: value },
+    }));
 
   const handleSave = async () => {
     try {
       await update.mutateAsync({
-        channels: { in_app: inApp },
+        channels,
         events,
       });
       setOverrides({});
@@ -52,10 +81,8 @@ export function SettingsPage() {
           <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"
-              checked={inApp}
-              onChange={(e) =>
-                setOverrides((prev) => ({ ...prev, inApp: e.target.checked }))
-              }
+              checked={channels.in_app}
+              onChange={(e) => setChannel("in_app", e.target.checked)}
             />
             <span>Show in-app notifications</span>
           </label>
@@ -63,6 +90,30 @@ export function SettingsPage() {
             Disable to stop the bell from showing new items. Existing notifications remain visible
             until you clear them.
           </p>
+        </div>
+
+        <div className="mb-4">
+          <div className="text-sm font-medium mb-2">Outbound channels</div>
+          <p className="text-xs text-gray-500 mb-2">
+            Off by default. Enable to also receive notifications outside the app. Transport is
+            configured by your administrator; a channel does nothing until both you opt in and the
+            transport is set up.
+          </p>
+          <div className="space-y-2">
+            {OUTBOUND_CHANNELS.map(({ key, label, hint }) => (
+              <div key={key}>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={channels[key]}
+                    onChange={(e) => setChannel(key, e.target.checked)}
+                  />
+                  <span>{label}</span>
+                </label>
+                <p className="text-xs text-gray-500 ml-6">{hint}</p>
+              </div>
+            ))}
+          </div>
         </div>
 
         <div className="mb-4">

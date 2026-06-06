@@ -7,6 +7,7 @@ from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from app.config import settings
 from app.database import Base, engine
 from app.models.notification import Notification  # noqa: F401
+from app.models.outbound_delivery import OutboundDelivery  # noqa: F401
 from app.routers.notifications import router as notifications_router
 from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
 

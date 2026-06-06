@@ -124,6 +124,37 @@ async def test_internal_admins_requires_token_header(internal_client):
 
 
 @pytest.mark.asyncio
+async def test_internal_user_contact_returns_email_and_username(internal_client):
+    uid = await _seed_user(role=Role.USER, username="alice")
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/contact", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["user_id"] == str(uid)
+    assert body["email"] == f"{uid}@example.com"
+    assert body["username"] == "alice"
+
+
+@pytest.mark.asyncio
+async def test_internal_user_contact_404_for_unknown_user(internal_client):
+    resp = await internal_client.get(
+        f"/internal/users/{uuid.uuid4()}/contact",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_internal_user_contact_requires_valid_token(internal_client):
+    uid = await _seed_user(role=Role.USER)
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/contact", headers={"X-Internal-Token": "wrong"}
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_internal_admins_503_when_token_not_configured(monkeypatch):
     """If the deployer has not set INTERNAL_API_TOKEN, the endpoint is
     deliberately unreachable rather than silently allowing any caller in.

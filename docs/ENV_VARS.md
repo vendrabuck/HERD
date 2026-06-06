@@ -252,13 +252,35 @@ Inventory also hosts the apply-job scheduler that runs scheduled device-config a
 | `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | Base URL for reservations' `/internal/active-users` endpoint, used to find users with an active reservation on a device that's transitioning. |
 | `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS` | `60` | In-process TTL for the cached list of admin user-ids used to fan out `device.health_transition` events. Admin list rarely changes so a longer TTL is fine. |
 
+### Outbound channels (ROADMAP #40)
+
+Transport config for the email, chat, and webhook dispatchers. All are instance-level: per-user opt-in is the channel toggle in `/settings`, not per-user credentials. A channel is "configured" only when its required settings are present; an unconfigured channel a user has opted into is a logged no-op, never an error. Outbound channels default off in preferences, so none of these need to be set for the in-app channel to keep working.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SMTP_HOST` | empty | SMTP server host. Email channel is configured only when `SMTP_HOST` and `EMAIL_FROM` are both set. |
+| `SMTP_PORT` | `587` | SMTP server port. |
+| `SMTP_USERNAME` | empty | SMTP auth username. When empty, no login is attempted (open relay or IP-allowlisted server). |
+| `SMTP_PASSWORD` | empty | SMTP auth password. Use a secrets mechanism, not a plaintext `.env`, in production. |
+| `SMTP_USE_TLS` | `true` | Issue STARTTLS before sending. |
+| `SMTP_TIMEOUT_SECONDS` | `10` | Socket timeout for the SMTP send. |
+| `EMAIL_FROM` | empty | From-address on outbound email. Required (with `SMTP_HOST`) to enable the email channel. |
+| `CHAT_WEBHOOK_URL` | empty | Slack-style incoming-webhook URL. The chat message is POSTed as `{"text": ...}`, which Slack, Mattermost, and Rocket.Chat all accept. Setting this enables the chat channel. |
+| `CHAT_TIMEOUT_SECONDS` | `10` | HTTP timeout for the chat POST. |
+| `OUTBOUND_WEBHOOK_URL` | empty | Destination for the outbound webhook. Webhook channel is configured only when this and `WEBHOOK_SIGNING_SECRET` are both set. |
+| `WEBHOOK_SIGNING_SECRET` | empty | HMAC-SHA256 key. The notification body is signed and sent as `X-HERD-Signature: sha256=<hex>`; the receiver recomputes the HMAC over the received bytes to authenticate the payload. An unsigned outbound webhook is never sent. |
+| `WEBHOOK_TIMEOUT_SECONDS` | `10` | HTTP timeout for the webhook POST. |
+
+`AUTH_SERVICE_URL` (above) also backs the email and chat dispatchers' recipient lookup via auth's `/internal/users/{id}/contact` endpoint, so `INTERNAL_API_TOKEN` must match on auth and notifications for outbound email and chat to resolve an address.
+
 The notifications service runs two durable NATS consumers: one on `herd.reservations.*` (DLQ `herd.reservations.dlq.notifications`) and one on `herd.health.*` (DLQ `herd.health.dlq.notifications`). Distinct durables so a stuck health-event subscriber cannot block reservation events and vice versa. Absence of NATS is non-fatal at startup; the REST API still works and the consumers reconnect when NATS returns.
 
 ## Reservations service
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `EXPIRATION_INTERVAL_SECONDS` | `60` | How often the expiration loop wakes up to activate `PENDING` reservations and complete `ACTIVE` ones whose windows closed. |
+| `EXPIRATION_INTERVAL_SECONDS` | `60` | How often the expiration loop wakes up to activate `PENDING` reservations, complete `ACTIVE` ones whose windows closed, and emit upcoming-expiry reminders. |
+| `EXPIRY_REMINDER_LEAD_SECONDS` | `3600` | Lead window before `end_time` in which the expiration task publishes a `reservation.expiring_soon` event onto `HERD_RESERVATIONS` (ROADMAP #40). An ACTIVE reservation whose `end_time` is within this many seconds of now, and still in the future, gets exactly one reminder, deduped via `expiry_reminder_sent_at`. `0` disables the reminder. |
 | `RESERVATION_START_GRACE_SECONDS` | `300` | On create, a `start_time` earlier than now minus this grace is rejected (422), so a user cannot book a window that already passed. The grace tolerates clock skew and "start now"; the expiration loop still activates PENDING reservations whose start has ticked past. |
 | `RESERVATION_MAX_DURATION_SECONDS` | `2592000` | On create, a window longer than this (default 30 days) is rejected (422), guarding against runaway or typo'd bookings. `0` disables the cap. |
 

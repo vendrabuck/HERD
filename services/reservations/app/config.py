@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     nats_url: str = "nats://nats:4222"
     internal_api_token: str = ""
     expiration_interval_seconds: int = 60
+    # ROADMAP #40: lead window before end_time in which the expiration task
+    # emits a reservation.expiring_soon reminder onto HERD_RESERVATIONS. An
+    # ACTIVE reservation whose end_time is within this many seconds of now (and
+    # still in the future) gets exactly one reminder, deduped via
+    # expiry_reminder_sent_at. 0 disables the reminder.
+    expiry_reminder_lead_seconds: int = 3600
 
     # Reservation create-time window validation.
     # A start_time earlier than now minus this grace is rejected, so a user
