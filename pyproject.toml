@@ -28,7 +28,7 @@ filterwarnings = ["error"]
 [dependency-groups]
 dev = [
     "ruff>=0.15.16",
-    "pip-audit>=2.7.0",
+    "pip-audit>=2.10.0",
     "selenium>=4.20",
     "pytest-timeout>=2.4.0",
     "locust>=2.43.4",
