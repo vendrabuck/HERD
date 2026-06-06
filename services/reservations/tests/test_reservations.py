@@ -2035,6 +2035,109 @@ async def test_update_reservation_remove_device(client):
 
 
 @pytest.mark.asyncio
+async def test_update_reservation_device_change_breaks_topology_rejected(client):
+    """Changing the device set on a topology-bound reservation re-validates
+    connectivity; an edit that strands an edge is rejected at 422."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A], topology_id=topo_id)
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    new_ids = [DEVICE_A, DEVICE_B]
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(d) for d in new_ids]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=AsyncMock(side_effect=ValueError("Topology has unreachable edges")),
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": new_ids})
+    # The PATCH route maps a ValueError to 400 (the POST/create route uses 422).
+    assert patch_resp.status_code == 400
+    assert "unreachable" in patch_resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_device_change_valid_topology_succeeds(client):
+    """A device change that keeps the topology connected passes re-validation
+    and the validator is invoked once with the reservation's topology id."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A], topology_id=topo_id)
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    new_ids = [DEVICE_A, DEVICE_B]
+    validate_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(d) for d in new_ids]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=validate_mock,
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": new_ids})
+    assert patch_resp.status_code == 200
+    assert len(patch_resp.json()["device_ids"]) == 2
+    validate_mock.assert_awaited_once_with(uuid.UUID(topo_id))
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_device_change_no_topology_skips_validation(client):
+    """A reservation without a topology does not re-validate connectivity on
+    a device change (mirrors the create-path behavior)."""
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A])
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+    assert resp.json()["topology_id"] is None
+
+    new_ids = [DEVICE_A, DEVICE_B]
+    validate_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(d) for d in new_ids]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=validate_mock,
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": new_ids})
+    assert patch_resp.status_code == 200
+    validate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_update_reservation_empty_device_ids_rejected(client):
     resp = await _create_test_reservation(client)
     assert resp.status_code == 201
