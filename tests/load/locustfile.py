@@ -1,9 +1,19 @@
 """Locust load test definitions for HERD.
 
-Three user classes simulating different usage patterns:
+Four user classes simulating different usage patterns:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices and templates
 - ACLChecker: batch checks permissions
+- NotificationUser: polls notifications and updates channel/event preferences
+
+Note on the outbound notification channels and expiry reminder (ROADMAP #40):
+the dispatch side is a NATS consumer with no synchronous request surface, so it
+cannot be driven directly by an HTTP load tool. Throughput there is bounded by
+NATS JetStream redelivery and the per-message DB writes, and is covered by the
+unit dedupe tests rather than load. What this load class exercises is the
+user-facing surface the feature added: the notification list/unread-count read
+path (polled by the bell on an interval, so the hottest read in the service) and
+the preferences read/write proxy that the /settings channel toggles drive.
 """
 
 import os
@@ -162,6 +172,51 @@ class InventoryBrowser(HerdUser):
     @task(2)
     def list_templates(self):
         self._auth_get("/api/inventory/templates")
+
+
+class NotificationUser(HerdUser):
+    """Simulates the notification read path and preference updates.
+
+    The bell polls unread-count and the list on an interval, so those reads are
+    the hottest in the notifications service; the preferences proxy is the write
+    path the /settings channel toggles drive. Outbound channels default off, so
+    flipping them here only round-trips the preference, no transport fires.
+    """
+
+    weight = 2
+    wait_time = between(1, 3)
+
+    def on_start(self):
+        self._login(USER_EMAIL, USER_PASSWORD)
+        self._toggle = False
+
+    @task(5)
+    def unread_count(self):
+        self._auth_get("/api/notifications/notifications/unread-count")
+
+    @task(3)
+    def list_notifications(self):
+        self._auth_get(
+            "/api/notifications/notifications",
+            params={"limit": 50, "offset": 0},
+        )
+
+    @task(1)
+    def update_preferences(self):
+        # Alternate the email channel opt-in so each call is a real write.
+        self._toggle = not self._toggle
+        self._auth_put(
+            "/api/notifications/notifications/preferences",
+            json={
+                "channels": {
+                    "in_app": True,
+                    "email": self._toggle,
+                    "chat": False,
+                    "webhook": False,
+                },
+                "events": {"reservation.expiring_soon": True},
+            },
+        )
 
 
 class ACLChecker(HerdUser):
