@@ -1,10 +1,13 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
+import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedTemplates, useDeleteTemplate, useCreateTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
+import { BulkImportExport } from "@/components/ui/BulkImportExport";
+import { exportTemplates, importTemplates } from "@/api/bulk";
 import type { DeviceTemplate } from "@/types/template.types";
 
 function fieldCount(template: DeviceTemplate): number {
@@ -42,6 +45,7 @@ export function TemplatesPage() {
   const createTemplate = useCreateTemplate();
   const user = useAuthStore((s) => s.user);
   const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const queryClient = useQueryClient();
 
   const [deleteTarget, setDeleteTarget] = useState<DeviceTemplate | null>(null);
 
@@ -108,12 +112,20 @@ export function TemplatesPage() {
             </select>
           </div>
           {isAdmin && (
-            <button
-              onClick={() => navigate("/templates/new")}
-              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
-            >
-              Create Template
-            </button>
+            <div className="flex items-center gap-3">
+              <BulkImportExport
+                resourceLabel="templates"
+                onExport={exportTemplates}
+                onImport={importTemplates}
+                onImported={() => queryClient.invalidateQueries({ queryKey: ["templates"] })}
+              />
+              <button
+                onClick={() => navigate("/templates/new")}
+                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
+              >
+                Create Template
+              </button>
+            </div>
           )}
         </div>
 
