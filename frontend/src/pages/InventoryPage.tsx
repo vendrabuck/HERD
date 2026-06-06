@@ -1,7 +1,10 @@
 import { useState, useRef, useEffect, useMemo, Fragment } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import toast from "react-hot-toast";
+import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedDevices, useCreateDevice, useDeleteDevice, useAllDeviceNames } from "@/api/inventory";
+import { BulkImportExport } from "@/components/ui/BulkImportExport";
+import { exportDevices, importDevices } from "@/api/bulk";
 import { fetchPorts, useCreatePort, usePorts } from "@/api/ports";
 import { useDeviceConnections } from "@/api/connections";
 import { useAuthStore } from "@/stores/authStore";
@@ -197,6 +200,7 @@ export function InventoryPage() {
   const deleteDevice = useDeleteDevice();
   const user = useAuthStore((s) => s.user);
   const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const queryClient = useQueryClient();
 
   const storedSearch = usePreferencesStore((s) =>
     (s.savedFilters.inventory as { search?: string } | undefined)?.search ?? "",
@@ -327,12 +331,22 @@ export function InventoryPage() {
     <div className="h-full overflow-y-auto">
       <div className="px-6 xl:px-12 2xl:px-16 py-6 space-y-6">
         <section>
-          <h2 className="text-lg font-semibold text-gray-900 mb-3">
-            All Devices
-            {data && (
-              <span className="ml-2 text-sm text-gray-400 font-normal">({total})</span>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-semibold text-gray-900">
+              All Devices
+              {data && (
+                <span className="ml-2 text-sm text-gray-400 font-normal">({total})</span>
+              )}
+            </h2>
+            {isAdmin && (
+              <BulkImportExport
+                resourceLabel="devices"
+                onExport={exportDevices}
+                onImport={importDevices}
+                onImported={() => queryClient.invalidateQueries({ queryKey: ["devices"] })}
+              />
             )}
-          </h2>
+          </div>
           <div className="mb-3">
             <input
               type="text"

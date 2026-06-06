@@ -269,3 +269,4 @@ The other nine services are candidates to merge into a single FastAPI app with m
 - [AI_GENERATE.md](AI_GENERATE.md) and [AI_ASSISTANT.md](AI_ASSISTANT.md) for the two AI surfaces.
 - [DRIVERS.md](DRIVERS.md) for the driver execution model.
 - [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md) for the canvas and connectivity validation.
+- [BULK_IMPORT_EXPORT.md](BULK_IMPORT_EXPORT.md) for the CSV/JSON file schemas and cross-instance reference resolution.

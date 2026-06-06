@@ -18,6 +18,7 @@ from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from app.config import settings
 from app.database import Base, engine
 from app.models import *  # noqa: F401, F403
+from app.routes.bulk import router as bulk_router
 from app.routes.connections import router as connections_router
 from app.routes.fabric import router as fabric_router
 from app.routes.pathfind import router as pathfind_router
@@ -52,6 +53,7 @@ app.add_middleware(
 
 app.add_middleware(RequestLoggingMiddleware)
 
+app.include_router(bulk_router)
 app.include_router(connections_router)
 app.include_router(fabric_router)
 app.include_router(pathfind_router)

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   usePaginatedTopologies,
   useCreateTopology,
@@ -10,6 +11,8 @@ import { useAuthStore } from "@/stores/authStore";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
+import { BulkImportExport } from "@/components/ui/BulkImportExport";
+import { exportTopologies, importTopologies } from "@/api/bulk";
 import type { Topology } from "@/types/topology.types";
 
 function TopologyRow({
@@ -68,6 +71,7 @@ function TopologyRow({
 
 export function TopologyPage() {
   const user = useAuthStore((s) => s.user);
+  const queryClient = useQueryClient();
   const createTopology = useCreateTopology();
   const deleteTopology = useDeleteTopology();
   const cloneTopology = useCloneTopology();
@@ -129,12 +133,20 @@ export function TopologyPage() {
               <span className="ml-2 text-sm text-gray-400 font-normal">({total})</span>
             )}
           </h2>
-          <button
-            onClick={() => setShowCreateModal(true)}
-            className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 transition-colors"
-          >
-            New Topology
-          </button>
+          <div className="flex items-center gap-3">
+            <BulkImportExport
+              resourceLabel="topologies"
+              onExport={exportTopologies}
+              onImport={importTopologies}
+              onImported={() => queryClient.invalidateQueries({ queryKey: ["topologies"] })}
+            />
+            <button
+              onClick={() => setShowCreateModal(true)}
+              className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 transition-colors"
+            >
+              New Topology
+            </button>
+          </div>
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">

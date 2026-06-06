@@ -61,6 +61,7 @@ The images below are design-system mockups rendered from the HERD UI kit, not ca
 - Per-user preferences (saved filters, page sizes, notification settings) with a Settings page under the user menu
 - Notifications driven by durable NATS consumers on reservation lifecycle and device-health events, with an in-app bell + unread badge plus opt-in email, chat, and outbound-webhook channels (HMAC-signed), an upcoming-expiry reminder, and per-channel and per-event opt-outs
 - Save and load topology canvases for persistent lab diagrams; every save is versioned with preview, diff, and restore (restore is blocked while an active reservation references the topology)
+- Bulk import and export of devices, templates, and topologies as CSV or JSON, with a dry-run preview, per-row error reporting, and cross-instance reference resolution by name (see [docs/BULK_IMPORT_EXPORT.md](docs/BULK_IMPORT_EXPORT.md))
 - Paginated list views across all resources
 - Structured JSON logging across all services with configurable log levels
 - Port cable validation in the topology editor with visual indicators for uncabled ports

@@ -26,6 +26,8 @@ in their JWT access token and enforced independently by each service.
 | Delete backend connections | | yes | yes |
 | Create topologies | yes | yes | yes |
 | Update, delete topologies (creator or admin) | creator | yes | yes |
+| Bulk export and import devices and templates | | yes | yes |
+| Bulk export and import topologies | yes | yes | yes |
 | View user groups and members | yes | yes | yes |
 | Create, update, delete groups | | yes | yes |
 | Add and remove group members | | yes | yes |
@@ -76,6 +78,7 @@ The `admin` role is granted by the superadmin. An admin has all user capabilitie
 - Add new devices to the inventory (`POST /api/inventory/devices`)
 - Update device details or status (`PUT /api/inventory/devices/{id}`)
 - Remove devices from the inventory (`DELETE /api/inventory/devices/{id}`)
+- Bulk export and import devices and templates (`GET /api/inventory/devices/export`, `POST /api/inventory/devices/import`, `GET /api/inventory/templates/export`, `POST /api/inventory/templates/import`)
 - Create backend connections between device ports (`POST /api/cabling/connections`)
 - Remove backend connections (`DELETE /api/cabling/connections/{id}`)
 - Create, update, and delete user groups (`POST/PUT/DELETE /api/auth/groups`)
