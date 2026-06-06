@@ -78,6 +78,11 @@ async def test_channel_preferences_round_trip(user_client):
     )
 
 
+# The reservations expiration loop emits the expiring_soon reminder on a 60s
+# tick, so this test must outlive at least one tick plus the time to provision
+# the reservation to ACTIVE. Override the global pytest --timeout=30 the way the
+# other slow integration tests do; the in-test 90s poll remains the real guard.
+@pytest.mark.timeout(150)
 async def test_expiring_soon_reminder_produces_single_notification(
     user_client, visible_fresh_device
 ):
