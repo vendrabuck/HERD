@@ -1,6 +1,6 @@
 # HERD: Hardware Environment Replication and Deployment
 
-A lab reservation and topology management platform built lab-first, not bent from a ticketing or asset-management tool.
+A lab reservation and topology management platform built lab-first, not built from a ticketing or asset-management tool.
 
 ## New here? Start with the [User Manual](https://vendrabuck.github.io/HERD/manual/)
 
