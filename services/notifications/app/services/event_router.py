@@ -64,6 +64,16 @@ def _render_completed(event: dict) -> tuple[str, str]:
     )
 
 
+def _render_expiring_soon(event: dict) -> tuple[str, str]:
+    return (
+        "Reservation expiring soon",
+        (
+            f"Reservation for {_device_summary(event.get('device_ids'))} ends at "
+            f"{_format_end_time(event.get('end_time'))}."
+        ),
+    )
+
+
 def _render_health_transition(event: dict) -> tuple[str, str]:
     name = event.get("device_name") or "device"
     new_status = event.get("new_status", "UNKNOWN")
@@ -84,6 +94,7 @@ _RENDERERS = {
     "reservation.updated": _render_updated,
     "reservation.cancelled": _render_cancelled,
     "reservation.completed": _render_completed,
+    "reservation.expiring_soon": _render_expiring_soon,
     "device.health_transition": _render_health_transition,
 }
 
