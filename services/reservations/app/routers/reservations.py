@@ -263,6 +263,37 @@ async def list_active_reservation_users_for_device(
     return list(user_ids)
 
 
+@router.get("/internal/by-topology/{topology_id}")
+async def list_reservations_for_topology(
+    topology_id: uuid.UUID,
+    x_internal_token: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """Return reservations referencing a topology, unfiltered by device visibility.
+
+    Internal-token-guarded service-to-service endpoint used by the cabling
+    service's reservation lock. The user-facing /calendar route is visibility-
+    filtered for non-admins, so a non-admin topology creator cannot see (and
+    would not be blocked by) a reservation held by another user on devices they
+    cannot see. This endpoint sees every reservation on the topology so the lock
+    holds across visibility boundaries. Declared before /internal/{reservation_id}
+    so the literal "by-topology" segment is not parsed as a reservation id.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    result = await db.execute(select(Reservation).where(Reservation.topology_id == topology_id))
+    return [
+        {
+            "id": str(r.id),
+            "user_id": str(r.user_id),
+            "topology_id": str(r.topology_id) if r.topology_id else None,
+            "status": r.status.value,
+            "end_time": r.end_time.isoformat(),
+        }
+        for r in result.scalars()
+    ]
+
+
 @router.get("/internal/{reservation_id}", response_model=ReservationInternalStatus)
 async def get_reservation_internal_status(
     reservation_id: uuid.UUID,
