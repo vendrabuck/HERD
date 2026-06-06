@@ -106,6 +106,56 @@ def test_settings_in_app_toggle_round_trip(admin_browser, base_url, restore_pref
     assert resp.json()["channels"]["in_app"] is after
 
 
+def test_settings_shows_outbound_channel_toggles(admin_browser, base_url):
+    """Settings page shows the three outbound channel toggles (ROADMAP #40)."""
+    _open_settings(admin_browser, base_url)
+    for label in ("Email", "Chat", "Webhook"):
+        matches = admin_browser.find_elements(
+            By.XPATH, f"//label[contains(., '{label}')]"
+        )
+        assert matches, f"missing outbound channel toggle for '{label}'"
+
+
+def test_settings_shows_expiring_soon_event_toggle(admin_browser, base_url):
+    """Settings page shows the expiring-soon event toggle (ROADMAP #40)."""
+    _open_settings(admin_browser, base_url)
+    matches = admin_browser.find_elements(
+        By.XPATH, "//label[contains(., 'Reservation expiring soon')]"
+    )
+    assert matches, "missing toggle for 'Reservation expiring soon'"
+
+
+def test_settings_email_channel_round_trip(admin_browser, base_url, restore_prefs):
+    """Enabling the email channel and saving persists channels.email (ROADMAP #40).
+
+    Outbound channels default off, so this proves opt-in round-trips to the
+    backend even though no SMTP transport is wired in the test stack.
+    """
+    _open_settings(admin_browser, base_url)
+
+    email_label = admin_browser.find_element(
+        By.XPATH, "//label[contains(., 'Email')]"
+    )
+    checkbox = email_label.find_element(By.CSS_SELECTOR, "input[type='checkbox']")
+    before = checkbox.is_selected()
+    checkbox.click()
+    after = checkbox.is_selected()
+    assert after != before
+
+    admin_browser.find_element(
+        By.XPATH, "//button[normalize-space()='Save']"
+    ).click()
+    WebDriverWait(admin_browser, WAIT).until(
+        EC.visibility_of_element_located(
+            (By.XPATH, "//*[contains(text(), 'Preferences saved')]")
+        )
+    )
+
+    time.sleep(0.5)
+    resp = api_request(admin_browser, "GET", PREFS_PATH)
+    assert resp.json()["channels"]["email"] is after
+
+
 def test_settings_event_toggle_round_trip(admin_browser, base_url, restore_prefs):
     """Toggling 'Reservation cancelled' off and saving persists to the backend."""
     _open_settings(admin_browser, base_url)
