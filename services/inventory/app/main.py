@@ -9,6 +9,7 @@ from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.routers.apply_jobs import router as apply_jobs_router
+from app.routers.bulk import router as bulk_router
 from app.routers.device_configs import router as device_configs_router
 from app.routers.device_groups import router as device_groups_router
 from app.routers.devices import router as devices_router
@@ -96,6 +97,7 @@ app.add_middleware(
 
 app.add_middleware(RequestLoggingMiddleware)
 
+app.include_router(bulk_router)
 app.include_router(apply_jobs_router)
 app.include_router(device_configs_router)
 app.include_router(device_groups_router)

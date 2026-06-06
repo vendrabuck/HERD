@@ -30,6 +30,16 @@ class DeviceStatusUpdate(BaseModel):
     status: DeviceStatus
 
 
+class ResolveByNameRequest(BaseModel):
+    names: list[str]
+
+
+class ResolveByNameResponse(BaseModel):
+    # name to device id; names with no match are omitted so the caller can
+    # report them as unresolved.
+    resolved: dict[str, uuid.UUID]
+
+
 class HealthConfigEntry(BaseModel):
     device_id: uuid.UUID
     resolved_interval_seconds: int
@@ -160,6 +170,28 @@ async def list_devices_health_config(
     return [
         HealthConfigEntry(device_id=row.id, resolved_interval_seconds=row.interval) for row in rows
     ]
+
+
+@router.post("/devices/resolve-by-name", response_model=ResolveByNameResponse)
+async def resolve_devices_by_name(
+    body: ResolveByNameRequest,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Resolve device names to this instance's device ids. Internal token only.
+
+    Used by the cabling service's topology import to rewrite cross-instance
+    device references (which travel as names, since UUIDs do not match across
+    instances) to local device ids. Names with no match are omitted from the
+    response so the caller can reject the referencing rows.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    names = list({n for n in body.names if n})
+    if not names:
+        return ResolveByNameResponse(resolved={})
+    rows = (await db.execute(select(Device).where(Device.name.in_(names)))).unique().scalars().all()
+    return ResolveByNameResponse(resolved={d.name: d.id for d in rows})
 
 
 @router.get("/devices/{device_id}", response_model=DeviceResponse)
