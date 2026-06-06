@@ -1,7 +1,7 @@
 import copy
 import uuid
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +19,7 @@ from app.schemas.topology import (
     TopologyValidationResponse,
 )
 from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths
+from app.services.reservation_guard import find_blocking_reservations
 
 router = APIRouter(prefix="/topologies", tags=["topologies"])
 
@@ -79,6 +80,7 @@ async def get_topology(
 async def update_topology(
     topology_id: uuid.UUID,
     body: TopologyUpdate,
+    request: Request,
     payload: dict = Depends(get_current_user_payload),
     db: AsyncSession = Depends(get_db),
 ):
@@ -88,10 +90,44 @@ async def update_topology(
 
     # Only creator or admin can update
     user_role = payload.get("role", "user")
-    if str(topology.created_by) != payload["sub"] and user_role not in ("admin", "superadmin"):
+    is_admin = user_role in ("admin", "superadmin")
+    if str(topology.created_by) != payload["sub"] and not is_admin:
         raise HTTPException(status_code=403, detail="Not authorized to update this topology")
 
     canvas_changed = body.canvas_data is not None and body.canvas_data != topology.canvas_data
+
+    # Reservation-scoped lock: a topology with a live reservation may only have
+    # its wiring changed by the reservation owner (or an admin). This is what
+    # makes "edit the running reservation's topology" safe: the owner editing
+    # their own live reservation is allowed and flows through to provisioning,
+    # while an unrelated user cannot mutate wiring out from under an active
+    # reservation. Name/description-only edits do not touch the live wiring, so
+    # they are not gated. The guard fails open if the reservations service is
+    # unreachable (see find_blocking_reservations).
+    if canvas_changed:
+        authorization = request.headers.get("authorization", "")
+        token = authorization.removeprefix("Bearer ").strip() if authorization else ""
+        if token and not is_admin:
+            blocking = await find_blocking_reservations(topology_id, token)
+            others = [b for b in blocking if str(b.get("user_id") or "") != payload["sub"]]
+            if others:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "Topology is in use by an active reservation owned by "
+                            "another user; editing its wiring is blocked"
+                        ),
+                        "reservations": [
+                            {
+                                "id": str(b.get("id")),
+                                "status": b.get("status"),
+                                "end_time": b.get("end_time"),
+                            }
+                            for b in others
+                        ],
+                    },
+                )
 
     if body.name is not None:
         topology.name = body.name

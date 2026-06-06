@@ -296,6 +296,107 @@ async def test_update_topology_canvas_only(user_client):
 
 
 @pytest.mark.asyncio
+async def test_update_topology_canvas_blocked_by_other_users_reservation(user_client):
+    """A canvas edit is blocked (409) when another user holds a live reservation
+    on the topology."""
+    create_resp = await user_client.post("/topologies", json={"name": "Reserved Lab"})
+    topology_id = create_resp.json()["id"]
+    new_canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+    blocking = [
+        {
+            "id": "r1",
+            "user_id": OTHER_USER_ID,
+            "status": "ACTIVE",
+            "end_time": "2026-12-01T00:00:00Z",
+        }
+    ]
+    with patch(
+        "app.routes.topologies.find_blocking_reservations",
+        return_value=blocking,
+    ):
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"canvas_data": new_canvas},
+            headers={"Authorization": "Bearer faketoken"},
+        )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reservations"][0]["id"] == "r1"
+
+
+@pytest.mark.asyncio
+async def test_update_topology_canvas_allowed_for_reservation_owner(user_client):
+    """The reservation owner may edit their own live topology's wiring."""
+    create_resp = await user_client.post("/topologies", json={"name": "My Live Lab"})
+    topology_id = create_resp.json()["id"]
+    new_canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+    # The blocking reservation is owned by the editing user (USER_ID), so allowed.
+    blocking = [
+        {
+            "id": "r1",
+            "user_id": USER_ID,
+            "status": "ACTIVE",
+            "end_time": "2026-12-01T00:00:00Z",
+        }
+    ]
+    with patch(
+        "app.routes.topologies.find_blocking_reservations",
+        return_value=blocking,
+    ):
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"canvas_data": new_canvas},
+            headers={"Authorization": "Bearer faketoken"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["canvas_data"] == new_canvas
+
+
+@pytest.mark.asyncio
+async def test_update_topology_canvas_admin_bypasses_reservation_lock(user_client):
+    """An admin may edit a reserved topology's wiring regardless of owner; the
+    guard is not even consulted for admins."""
+    create_resp = await user_client.post("/topologies", json={"name": "Admin Lab"})
+    topology_id = create_resp.json()["id"]
+    new_canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_current_user_payload] = _override_admin
+    app.dependency_overrides[require_admin] = _override_admin
+    app.dependency_overrides[get_db] = _override_get_db
+    guard = patch(
+        "app.routes.topologies.find_blocking_reservations",
+        return_value=[{"id": "r1", "user_id": OTHER_USER_ID, "status": "ACTIVE"}],
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        with guard as guard_mock:
+            resp = await ac.put(
+                f"/topologies/{topology_id}",
+                json={"canvas_data": new_canvas},
+                headers={"Authorization": "Bearer faketoken"},
+            )
+    assert resp.status_code == 200
+    guard_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_topology_name_only_skips_reservation_lock(user_client):
+    """A name-only edit does not touch live wiring, so the reservation lock is
+    not consulted even when a reservation exists."""
+    create_resp = await user_client.post("/topologies", json={"name": "Original"})
+    topology_id = create_resp.json()["id"]
+    with patch(
+        "app.routes.topologies.find_blocking_reservations",
+    ) as guard_mock:
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"name": "Renamed"},
+            headers={"Authorization": "Bearer faketoken"},
+        )
+    assert resp.status_code == 200
+    guard_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_update_topology_not_found(user_client):
     """PUT random UUID returns 404."""
     fake_id = str(uuid.uuid4())
