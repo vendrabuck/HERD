@@ -18,13 +18,20 @@ export interface NotificationList {
   unread: number;
 }
 
+export interface NotificationChannels {
+  in_app: boolean;
+  email: boolean;
+  chat: boolean;
+  webhook: boolean;
+}
+
 export interface NotificationPreferences {
-  channels: { in_app: boolean };
+  channels: NotificationChannels;
   events: Record<string, boolean>;
 }
 
 export interface NotificationPreferencesUpdate {
-  channels?: { in_app: boolean };
+  channels?: NotificationChannels;
   events?: Record<string, boolean>;
 }
 
