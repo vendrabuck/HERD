@@ -2974,3 +2974,232 @@ async def test_fetch_visible_device_ids_forwards_jwt_not_internal_token():
     assert headers["Authorization"] == "Bearer jwt-token-123"
     assert "X-Internal-Token" not in headers
     assert result == {DEVICE_A}
+
+
+# --- Live-edit: topology re-validation on device-set change (deeper coverage) ---
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_remove_only_revalidates_topology(client):
+    """A remove-only device change on a topology-bound reservation still
+    triggers connectivity re-validation; the existing tests only exercise the
+    add path. Removing a device can strand an edge just as adding one can."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(
+        client, device_ids=[DEVICE_A, DEVICE_B], topology_id=topo_id
+    )
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    validate_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=validate_mock,
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A]})
+    assert patch_resp.status_code == 200
+    validate_mock.assert_awaited_once_with(uuid.UUID(topo_id))
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_remove_only_breaks_topology_rejected(client):
+    """A remove-only edit that strands a topology edge is rejected at 400."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(
+        client, device_ids=[DEVICE_A, DEVICE_B], topology_id=topo_id
+    )
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=AsyncMock(side_effect=ValueError("Topology has unreachable edges")),
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A]})
+    assert patch_resp.status_code == 400
+    assert "unreachable" in patch_resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_end_time_only_skips_topology_validation(client):
+    """An end_time-only edit (no device-set change) does not re-validate the
+    topology, even when the reservation is topology-bound: validation is gated
+    on a membership change, not on every PATCH."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A], topology_id=topo_id)
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    new_end = (NOW + timedelta(hours=2)).isoformat()
+    validate_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=validate_mock,
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"end_time": new_end})
+    assert patch_resp.status_code == 200
+    validate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_purpose_only_skips_topology_validation(client):
+    """A purpose-only edit on a topology-bound reservation does not re-validate
+    connectivity (no device-set change)."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A], topology_id=topo_id)
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    validate_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=validate_mock,
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"purpose": "Re-purposed"})
+    assert patch_resp.status_code == 200
+    assert patch_resp.json()["purpose"] == "Re-purposed"
+    validate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_unchanged_device_set_skips_validation(client):
+    """Submitting device_ids identical to the current set is a no-op for the
+    membership diff, so no topology re-validation runs even though a topology
+    id is present. The validator gate is added_ids or removed_ids, not the
+    mere presence of device_ids in the body."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A], topology_id=topo_id)
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    validate_mock = AsyncMock()
+    fetch_mock = AsyncMock(return_value=[make_device_response(DEVICE_A)])
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=fetch_mock,
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=validate_mock,
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A]})
+    assert patch_resp.status_code == 200
+    validate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_cabling_unreachable_maps_to_503(client):
+    """When the cabling validator itself is unreachable it raises RuntimeError;
+    the PATCH route maps RuntimeError to 503 (distinct from the ValueError-to-400
+    unreachable-edges path)."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A], topology_id=topo_id)
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(d) for d in (DEVICE_A, DEVICE_B)]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service")),
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A, DEVICE_B]})
+    assert patch_resp.status_code == 503
+    assert "cabling" in patch_resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_multiple_unreachable_edges_in_message(client):
+    """The 400 detail surfaces every unreachable edge the validator reports, not
+    just the first, so the caller can see the full set of stranded edges."""
+    topo_id = str(uuid.uuid4())
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A], topology_id=topo_id)
+    assert resp.status_code == 201
+    res_id = resp.json()["id"]
+
+    message = "Topology has unreachable edges: edge-1 (no_path), edge-2 (no_path)"
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(d) for d in (DEVICE_A, DEVICE_B)]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=AsyncMock(side_effect=ValueError(message)),
+        ),
+        patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A, DEVICE_B]})
+    assert patch_resp.status_code == 400
+    detail = patch_resp.json()["detail"]
+    assert "edge-1" in detail
+    assert "edge-2" in detail

@@ -967,3 +967,138 @@ async def test_validate_topology_admin_can_validate_any(user_client, admin_clien
 
     resp = await admin_client.post(f"/topologies/{topology_id}/validate")
     assert resp.status_code == 200
+
+
+# --- Live-edit: reservation lock on canvas edits (deeper coverage) ---
+
+
+@pytest.mark.asyncio
+async def test_update_topology_canvas_superadmin_bypasses_reservation_lock(user_client):
+    """A superadmin (not just an admin) may edit a reserved topology's wiring;
+    the guard is not consulted, mirroring the admin bypass."""
+    create_resp = await user_client.post("/topologies", json={"name": "Superadmin Lab"})
+    topology_id = create_resp.json()["id"]
+    new_canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_current_user_payload] = _override_superadmin
+    app.dependency_overrides[require_admin] = _override_superadmin
+    app.dependency_overrides[get_db] = _override_get_db
+    guard = patch(
+        "app.routes.topologies.find_blocking_reservations",
+        return_value=[{"id": "r1", "user_id": OTHER_USER_ID, "status": "ACTIVE"}],
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        with guard as guard_mock:
+            resp = await ac.put(
+                f"/topologies/{topology_id}",
+                json={"canvas_data": new_canvas},
+                headers={"Authorization": "Bearer faketoken"},
+            )
+    assert resp.status_code == 200
+    guard_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_topology_canvas_fails_open_when_reservations_down(user_client):
+    """The guard fails open: when the reservations service is unreachable,
+    find_blocking_reservations returns [] and the canvas edit proceeds rather
+    than blocking the owner out of their own topology."""
+    create_resp = await user_client.post("/topologies", json={"name": "Degraded Lab"})
+    topology_id = create_resp.json()["id"]
+    new_canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+    # An empty list is exactly what the guard returns on any reservations-service
+    # failure (see reservation_guard.find_blocking_reservations).
+    with patch(
+        "app.routes.topologies.find_blocking_reservations",
+        return_value=[],
+    ) as guard_mock:
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"canvas_data": new_canvas},
+            headers={"Authorization": "Bearer faketoken"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["canvas_data"] == new_canvas
+    guard_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_topology_canvas_no_token_skips_reservation_lock(user_client):
+    """With no Authorization header the guard cannot call the reservations
+    service, so it is skipped and the edit proceeds. The token is required to
+    consult the lock."""
+    create_resp = await user_client.post("/topologies", json={"name": "No Token Lab"})
+    topology_id = create_resp.json()["id"]
+    new_canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+    with patch(
+        "app.routes.topologies.find_blocking_reservations",
+    ) as guard_mock:
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"canvas_data": new_canvas},
+        )
+    assert resp.status_code == 200
+    guard_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_topology_canvas_blocked_when_any_other_owner_in_mix(user_client):
+    """A blocking list mixing the editor's own reservation with another user's
+    still blocks: the guard filters to others and blocks if any remain."""
+    create_resp = await user_client.post("/topologies", json={"name": "Mixed Lab"})
+    topology_id = create_resp.json()["id"]
+    new_canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+    blocking = [
+        {
+            "id": "mine",
+            "user_id": USER_ID,
+            "status": "ACTIVE",
+            "end_time": "2026-12-01T00:00:00Z",
+        },
+        {
+            "id": "theirs",
+            "user_id": OTHER_USER_ID,
+            "status": "ACTIVE",
+            "end_time": "2026-12-02T00:00:00Z",
+        },
+    ]
+    with patch(
+        "app.routes.topologies.find_blocking_reservations",
+        return_value=blocking,
+    ):
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"canvas_data": new_canvas},
+            headers={"Authorization": "Bearer faketoken"},
+        )
+    assert resp.status_code == 409
+    # Only the other user's reservation is surfaced as a blocker; the editor's
+    # own reservation is filtered out.
+    blockers = resp.json()["detail"]["reservations"]
+    assert [b["id"] for b in blockers] == ["theirs"]
+
+
+@pytest.mark.asyncio
+async def test_update_topology_canvas_unchanged_skips_reservation_lock(user_client):
+    """Re-submitting the identical canvas is not a wiring change, so the guard
+    is not consulted even with a token and a live reservation present."""
+    create_resp = await user_client.post("/topologies", json={"name": "Idempotent Lab"})
+    topology_id = create_resp.json()["id"]
+    canvas = {"nodes": [{"id": "x"}], "edges": [{"id": "e1"}]}
+    # Seed the canvas first (as the owner, no guard interaction needed here).
+    await user_client.put(
+        f"/topologies/{topology_id}",
+        json={"canvas_data": canvas},
+    )
+    # Now PUT the exact same canvas back; canvas_changed is False.
+    with patch(
+        "app.routes.topologies.find_blocking_reservations",
+    ) as guard_mock:
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"canvas_data": canvas},
+            headers={"Authorization": "Bearer faketoken"},
+        )
+    assert resp.status_code == 200
+    guard_mock.assert_not_called()
