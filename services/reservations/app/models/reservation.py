@@ -73,6 +73,13 @@ class Reservation(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     modified_by: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    # ROADMAP #40: timestamp the expiration task stamps when it has emitted the
+    # upcoming-expiry reminder for this reservation. Null means "not yet sent".
+    # Dedupes the reminder per reservation across expiration ticks so a
+    # reservation in the lead window produces exactly one expiring_soon event.
+    expiry_reminder_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Devices live in the `reservation_devices` join table (single source of truth).
     # selectin eager-loads them with the parent so reading `device_ids` during async
