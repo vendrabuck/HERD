@@ -1,6 +1,5 @@
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -12,24 +11,27 @@ _BLOCKING_STATUSES = {"ACTIVE", "PENDING_PROVISION", "PENDING"}
 
 
 async def find_blocking_reservations(topology_id: uuid.UUID, bearer_token: str) -> list[dict]:
-    """Return any reservations currently referencing this topology.
+    """Return any reservations referencing this topology with a blocking status.
 
-    Queries the reservations calendar for a one-minute window around now. Any
-    reservation whose topology_id matches and whose status is ACTIVE,
-    PENDING_PROVISION, or PENDING is considered blocking. Returns an empty list
-    if the reservations service is unreachable (fail-open: we'd rather let a
-    restore proceed than block on a downed service).
+    Calls the reservations service's internal by-topology endpoint with the
+    X-Internal-Token rather than the visibility-filtered /calendar route: the
+    lock must see reservations held by ANY user, not just ones the editing user
+    can see, or a non-admin topology creator could rewire a topology out from
+    under another user's reservation (the /calendar route hides reservations on
+    devices the caller cannot see). bearer_token is retained for signature
+    compatibility but no longer used for this lookup.
+
+    A reservation is blocking when its status is ACTIVE, PENDING_PROVISION, or
+    PENDING. Returns an empty list if the reservations service is unreachable
+    (fail-open: we would rather let an edit proceed than block on a downed
+    service).
     """
-    now = datetime.now(timezone.utc)
-    url = f"{settings.reservations_service_url.rstrip('/')}/calendar"
-    params = {
-        "range_start": (now - timedelta(minutes=1)).isoformat(),
-        "range_end": (now + timedelta(minutes=1)).isoformat(),
-    }
-    headers = {"Authorization": f"Bearer {bearer_token}"}
+    del bearer_token  # intentionally unused; lookup is internal-token authed
+    url = f"{settings.reservations_service_url.rstrip('/')}/internal/by-topology/{topology_id}"
+    headers = {"X-Internal-Token": settings.internal_api_token}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url, params=params, headers=headers)
+            resp = await client.get(url, headers=headers)
             if resp.status_code >= 400:
                 logger.warning(
                     "reservation_guard_bad_response",

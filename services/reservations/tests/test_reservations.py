@@ -329,6 +329,7 @@ async def _insert_reservation_row(
     status: ReservationStatus = ReservationStatus.ACTIVE,
     start_offset: timedelta = timedelta(minutes=-30),
     end_offset: timedelta = timedelta(hours=1),
+    topology_id: uuid.UUID | None = None,
 ) -> str:
     """Insert a reservation row directly, bypassing the create router.
 
@@ -344,7 +345,7 @@ async def _insert_reservation_row(
                 user_id=uuid.UUID(USER_ID),
                 owner_name="testuser",
                 device_ids=[DEVICE_A],
-                topology_id=None,
+                topology_id=topology_id,
                 topology_type=TopologyType.PHYSICAL,
                 purpose="internal-status-test",
                 start_time=now + start_offset,
@@ -409,6 +410,45 @@ async def test_internal_status_bad_token_rejected(internal_client):
     rid = await _insert_reservation_row()
     resp = await internal_client.get(
         f"/internal/{rid}", headers={"X-Internal-Token": "wrong-token"}
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_internal_by_topology_returns_matching_reservation(internal_client):
+    """The by-topology lookup returns reservations on that topology, unfiltered."""
+    topo = uuid.uuid4()
+    rid = await _insert_reservation_row(status=ReservationStatus.ACTIVE, topology_id=topo)
+    resp = await internal_client.get(
+        f"/internal/by-topology/{topo}", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    items = resp.json()
+    assert len(items) == 1
+    assert items[0]["id"] == rid
+    assert items[0]["topology_id"] == str(topo)
+    assert items[0]["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_internal_by_topology_empty_for_unrelated_topology(internal_client):
+    """A topology with no reservations returns an empty list."""
+    await _insert_reservation_row(topology_id=uuid.uuid4())
+    other_topo = uuid.uuid4()
+    resp = await internal_client.get(
+        f"/internal/by-topology/{other_topo}",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_internal_by_topology_bad_token_rejected(internal_client):
+    topo = uuid.uuid4()
+    await _insert_reservation_row(topology_id=topo)
+    resp = await internal_client.get(
+        f"/internal/by-topology/{topo}", headers={"X-Internal-Token": "wrong-token"}
     )
     assert resp.status_code == 403
 
