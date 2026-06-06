@@ -136,13 +136,16 @@ If the button isn't there, the feature is off on this deployment (the backend's 
 
 ## Notifications
 
-A bell icon in the top-right of the header tracks in-app notifications driven by your reservations. It ticks up automatically when any reservation you own is created, updated, cancelled, or completed. The red badge counts unread items; clicking the bell opens a panel with the latest 20 where you can mark individual items read, delete them, or hit **Mark all read**. The unread count refreshes every 30 seconds while you're signed in.
+A bell icon in the top-right of the header tracks in-app notifications driven by your reservations. It ticks up automatically when any reservation you own is created, updated, cancelled, or completed, and it now also warns you before a reservation expires. The red badge counts unread items; clicking the bell opens a panel with the latest 20 where you can mark individual items read, delete them, or hit **Mark all read**. The unread count refreshes every 30 seconds while you're signed in.
+
+Beyond the in-app bell, you can also receive notifications on outbound channels: **Email**, **Chat**, and **Webhook**. These are off by default and you opt in per channel from Settings. Channel transport (the SMTP server, the chat channel, the webhook destination) is set up once by your administrator; until they wire it up, opting in is harmless and simply does nothing.
 
 If the feed feels noisy or too quiet:
 
 - Click the bell and choose **Settings** (or head to **Settings** from the top-right link) to open the Notifications section.
 - Toggle the **Show in-app notifications** channel off to silence the bell entirely without losing existing history.
-- Use the per-event checkboxes (Reservation confirmed / updated / cancelled / completed) to opt out of individual event types. Missing entries default to on, so you only need to uncheck the ones you don't want.
+- Under **Outbound channels**, toggle **Email**, **Chat**, or **Webhook** on to also receive notifications outside the app. They start off, so you only get what you opt into.
+- Use the per-event checkboxes (Reservation confirmed / updated / cancelled / completed / expiring soon) to opt out of individual event types. Missing entries default to on, so you only need to uncheck the ones you don't want. The expiring-soon reminder fires once, ahead of a reservation's end time.
 - Hit **Save**. The change applies to new events immediately; no restart needed.
 
 LDAP-authenticated and local accounts share the same notification prefs; they live under your profile in HERD, not in the directory.
