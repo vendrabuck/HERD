@@ -21,6 +21,35 @@ class Settings(BaseSettings):
     # small and slow-changing so a longer TTL is fine.
     health_notify_admin_cache_ttl_seconds: int = 60
 
+    # --- Outbound dispatch channels (ROADMAP #40) ---
+    # Instance-level transport config for the email, chat, and webhook
+    # dispatchers. Per-user opt-in lives in extras.notifications; these are
+    # the shared credentials/endpoints. A channel is "configured" only when
+    # its required transport settings are present; an unconfigured channel is
+    # skipped (logged once) rather than erroring, so a user can opt in before
+    # the operator wires up transport without breaking dispatch.
+
+    # Email (SMTP). email_from + smtp_host are the minimum to be configured.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    smtp_timeout_seconds: float = 10.0
+    email_from: str = ""
+
+    # Chat (Slack-style incoming webhook). A single instance-level URL; the
+    # message is posted as JSON. Configured when the URL is set.
+    chat_webhook_url: str = ""
+    chat_timeout_seconds: float = 10.0
+
+    # Outbound webhook. POSTs the notification as JSON, HMAC-signed with
+    # webhook_signing_secret (X-HERD-Signature: sha256=<hex>). Configured
+    # when both URL and secret are set.
+    outbound_webhook_url: str = ""
+    webhook_signing_secret: str = ""
+    webhook_timeout_seconds: float = 10.0
+
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "case_sensitive": False}

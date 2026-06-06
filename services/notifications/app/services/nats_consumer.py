@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 
 from app.config import settings
 from app.services import event_router
-from app.services.dispatchers import InAppDispatcher
+from app.services.dispatchers import default_dispatchers
 from app.services.dispatchers.base import Dispatcher, DispatchMessage
 from app.services.preferences_client import get_preferences_client
 
@@ -76,7 +76,7 @@ async def handle_event(
     dedupe_key: str | None = None,
     dispatchers: list[Dispatcher] | None = None,
 ) -> None:
-    dispatchers = dispatchers if dispatchers is not None else [InAppDispatcher()]
+    dispatchers = dispatchers if dispatchers is not None else default_dispatchers()
     messages = await event_router.build_messages(event)
     for message in messages:
         # Stamp the source-message dedupe key on every recipient row so a

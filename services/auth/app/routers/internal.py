@@ -10,12 +10,26 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
 from app.models.user import Role, User
+
+
+class UserContact(BaseModel):
+    """Minimal contact info for outbound notification channels.
+
+    Returned by the notifications service to address email and chat
+    messages. Only the fields an outbound dispatcher needs; no secrets.
+    """
+
+    user_id: uuid.UUID
+    email: str
+    username: str
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,3 +61,23 @@ async def list_admin_user_ids(
         )
     )
     return list(result.scalars().all())
+
+
+@router.get("/internal/users/{user_id}/contact", response_model=UserContact)
+async def get_user_contact(
+    user_id: uuid.UUID,
+    _: None = Depends(_require_internal_token),
+    db: AsyncSession = Depends(get_db),
+) -> UserContact:
+    """Return contact info (email, username) for a single user.
+
+    Used by the notifications service to address outbound email and chat
+    messages without holding a real JWT. Inactive users are still
+    resolvable, the dispatch decision is made by the caller. 404 when the
+    user does not exist so the caller can skip the channel cleanly.
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UserContact(user_id=user.id, email=user.email, username=user.username)
