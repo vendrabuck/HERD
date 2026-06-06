@@ -45,7 +45,10 @@
     },
     "NotificationChannels": {
       "properties": {
-        "in_app": "boolean"
+        "chat": "boolean",
+        "email": "boolean",
+        "in_app": "boolean",
+        "webhook": "boolean"
       },
       "required": [],
       "type": "object"
