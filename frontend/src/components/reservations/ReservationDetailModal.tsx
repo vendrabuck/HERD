@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useCancelReservation, useReleaseReservation } from "@/api/reservations";
@@ -43,6 +44,7 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
   const release = useReleaseReservation();
   const user = useAuthStore((s) => s.user);
   const { data: aiStatus } = useAIStatus();
+  const navigate = useNavigate();
 
   if (!reservation) return null;
 
@@ -80,12 +82,27 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
             </button>
           ))}
           {canEdit && activeTab !== "assistant" && (
-            <button
-              onClick={() => setEditDevicesOpen(true)}
-              className="ml-auto text-xs px-2.5 py-1.5 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
-            >
-              Edit Resources
-            </button>
+            <div className="ml-auto flex items-center gap-2">
+              {reservation.topology_id && (
+                <button
+                  onClick={() => {
+                    onClose();
+                    navigate(
+                      `/topology/${reservation.topology_id}?reservationId=${reservation.id}`,
+                    );
+                  }}
+                  className="text-xs px-2.5 py-1.5 rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
+                >
+                  Edit topology
+                </button>
+              )}
+              <button
+                onClick={() => setEditDevicesOpen(true)}
+                className="text-xs px-2.5 py-1.5 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+              >
+                Edit Resources
+              </button>
+            </div>
           )}
         </div>
 
