@@ -24,6 +24,16 @@ DEVICE_A = uuid.uuid4()
 DEVICE_B = uuid.uuid4()
 
 
+class _FakeRequest:
+    """Minimal stand-in for fastapi.Request when calling the route handler
+    directly. The reservation-lock guard only reads the Authorization header;
+    no header means no token, so the guard is skipped (these unit tests do
+    name-only updates that never touch the live wiring anyway)."""
+
+    def __init__(self, headers: dict | None = None):
+        self.headers = headers or {}
+
+
 @pytest.fixture(autouse=True)
 async def setup_db():
     async with engine.begin() as conn:
@@ -346,6 +356,7 @@ async def test_topology_update_direct():
         updated = await update_topology(
             topology_id=created.id,
             body=update_body,
+            request=_FakeRequest(),
             payload={"sub": str(USER_ID), "role": "admin"},
             db=db,
         )
@@ -363,6 +374,7 @@ async def test_topology_update_not_found():
             await update_topology(
                 topology_id=uuid.uuid4(),
                 body=TopologyUpdate(name="x"),
+                request=_FakeRequest(),
                 payload={"sub": str(USER_ID)},
                 db=db,
             )
@@ -387,6 +399,7 @@ async def test_topology_update_not_authorized():
             await update_topology(
                 topology_id=created.id,
                 body=TopologyUpdate(name="Nope"),
+                request=_FakeRequest(),
                 payload={"sub": other_user, "role": "user"},
                 db=db,
             )
