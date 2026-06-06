@@ -69,6 +69,14 @@
       "/topologies"
     ],
     [
+      "GET",
+      "/topologies/export"
+    ],
+    [
+      "POST",
+      "/topologies/import"
+    ],
+    [
       "DELETE",
       "/topologies/{topology_id}"
     ],
@@ -110,6 +118,36 @@
     ]
   ],
   "schemas": {
+    "Body_import_topologies_endpoint_topologies_import_post": {
+      "properties": {
+        "file": "string"
+      },
+      "required": [
+        "file"
+      ],
+      "type": "object"
+    },
+    "BulkImportReport": {
+      "properties": {
+        "created": "integer",
+        "dry_run": "boolean",
+        "rejected": "integer",
+        "rows": "array",
+        "skipped": "integer",
+        "total": "integer",
+        "updated": "integer"
+      },
+      "required": [
+        "created",
+        "dry_run",
+        "rejected",
+        "rows",
+        "skipped",
+        "total",
+        "updated"
+      ],
+      "type": "object"
+    },
     "ConnectionCreate": {
       "properties": {
         "connection_type": "string",
@@ -297,6 +335,19 @@
         "hop_count",
         "paths",
         "reachable"
+      ],
+      "type": "object"
+    },
+    "RowResult": {
+      "properties": {
+        "action": "string",
+        "identity": "anyOf",
+        "reason": "anyOf",
+        "row": "integer"
+      },
+      "required": [
+        "action",
+        "row"
       ],
       "type": "object"
     },

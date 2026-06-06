@@ -66,7 +66,19 @@
     ],
     [
       "GET",
+      "/devices/export"
+    ],
+    [
+      "GET",
       "/devices/health-config"
+    ],
+    [
+      "POST",
+      "/devices/import"
+    ],
+    [
+      "POST",
+      "/devices/resolve-by-name"
     ],
     [
       "DELETE",
@@ -189,6 +201,14 @@
       "/templates"
     ],
     [
+      "GET",
+      "/templates/export"
+    ],
+    [
+      "POST",
+      "/templates/import"
+    ],
+    [
       "DELETE",
       "/templates/{template_id}"
     ],
@@ -259,6 +279,24 @@
       ],
       "type": "object"
     },
+    "Body_import_devices_endpoint_devices_import_post": {
+      "properties": {
+        "file": "string"
+      },
+      "required": [
+        "file"
+      ],
+      "type": "object"
+    },
+    "Body_import_templates_endpoint_templates_import_post": {
+      "properties": {
+        "file": "string"
+      },
+      "required": [
+        "file"
+      ],
+      "type": "object"
+    },
     "Body_replace_driver_file_endpoint_drivers__driver_id__file_put": {
       "properties": {
         "file": "string"
@@ -274,6 +312,27 @@
       },
       "required": [
         "device_ids"
+      ],
+      "type": "object"
+    },
+    "BulkImportReport": {
+      "properties": {
+        "created": "integer",
+        "dry_run": "boolean",
+        "rejected": "integer",
+        "rows": "array",
+        "skipped": "integer",
+        "total": "integer",
+        "updated": "integer"
+      },
+      "required": [
+        "created",
+        "dry_run",
+        "rejected",
+        "rows",
+        "skipped",
+        "total",
+        "updated"
       ],
       "type": "object"
     },
@@ -789,6 +848,37 @@
         "name": "anyOf"
       },
       "required": [],
+      "type": "object"
+    },
+    "ResolveByNameRequest": {
+      "properties": {
+        "names": "array"
+      },
+      "required": [
+        "names"
+      ],
+      "type": "object"
+    },
+    "ResolveByNameResponse": {
+      "properties": {
+        "resolved": "object"
+      },
+      "required": [
+        "resolved"
+      ],
+      "type": "object"
+    },
+    "RowResult": {
+      "properties": {
+        "action": "string",
+        "identity": "anyOf",
+        "reason": "anyOf",
+        "row": "integer"
+      },
+      "required": [
+        "action",
+        "row"
+      ],
       "type": "object"
     },
     "SectionDefinition": {

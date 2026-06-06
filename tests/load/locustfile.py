@@ -97,8 +97,7 @@ class ReservationUser(HerdUser):
         if resp.status_code == 200:
             devices = resp.json()["items"]
             self._device_ids = [
-                d["id"] for d in devices
-                if d["status"] == "AVAILABLE" and d.get("exclusive", True)
+                d["id"] for d in devices if d["status"] == "AVAILABLE" and d.get("exclusive", True)
             ]
 
     @task(3)
@@ -162,6 +161,54 @@ class InventoryBrowser(HerdUser):
     @task(2)
     def list_templates(self):
         self._auth_get("/api/inventory/templates")
+
+
+class BulkExporter(HerdUser):
+    """Simulates operators exporting inventory and topologies.
+
+    Export is the read-heavy half of bulk import/export and the path most
+    likely to be hit repeatedly during a migration. Import is intentionally not
+    load-tested here: it writes rows and would pollute the stack's data set on
+    every iteration. The exports below serialize the full device, template, and
+    topology sets, so they are a useful stress signal for the serialization
+    path under concurrency.
+    """
+
+    weight = 1
+    wait_time = between(2, 5)
+
+    def on_start(self):
+        self._login(ADMIN_EMAIL, ADMIN_PASSWORD)
+
+    @task(3)
+    def export_devices_json(self):
+        self._auth_get("/api/inventory/devices/export", params={"format": "json"})
+
+    @task(2)
+    def export_devices_csv(self):
+        self._auth_get("/api/inventory/devices/export", params={"format": "csv"})
+
+    @task(2)
+    def export_templates_json(self):
+        self._auth_get("/api/inventory/templates/export", params={"format": "json"})
+
+    @task(2)
+    def export_topologies_json(self):
+        self._auth_get("/api/cabling/topologies/export", params={"format": "json"})
+
+    @task(1)
+    def dry_run_device_import(self):
+        # Dry-run writes nothing, so it is safe to repeat under load while still
+        # exercising the parse, validate, and reference-resolution path.
+        body = (
+            '[{"name": "load-dry", "template_name": "no-such-template", '
+            '"topology_type": "PHYSICAL", "status": "AVAILABLE", "field_data": {}}]'
+        )
+        self._auth_post(
+            "/api/inventory/devices/import",
+            params={"format": "json", "dry_run": "true"},
+            files={"file": ("d.json", body, "application/json")},
+        )
 
 
 class ACLChecker(HerdUser):
