@@ -130,9 +130,15 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **Reporting and analytics** (Shipped): admin-only utilization dashboards by user,
   device, topology type, day, and group, with CSV export.
-- **In-app notifications** (Partial): a durable NATS consumer turns reservation
-  lifecycle events into per-user in-app notifications, with per-user channel and
-  per-event opt-outs. Email, Slack, and webhook channels are planned.
+- **Notifications and dispatch channels** (Partial): durable NATS consumers turn
+  reservation lifecycle and device-health events into per-user notifications. The
+  in-app bell ships alongside opt-in email, chat (Slack-style), and outbound-webhook
+  channels as peer dispatchers, with the webhook HMAC-signed. Outbound sends are
+  deduped on NATS redelivery and a failure on one channel does not block the others
+  or in-app. An upcoming-expiry reminder fires once within a configurable lead window
+  of a reservation's end time. Per-channel and per-event opt-outs live in user
+  preferences; outbound channels default off. Bidirectional chat (slash commands,
+  replies) and per-user channel credentials remain out of scope.
 - **Structured JSON logging** (Shipped): every service emits JSON logs with request
   middleware and business-event logging; per-service log level configurable.
 - **Config service** (Shipped): zero-database web UI for configuring HERD on first
