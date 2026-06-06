@@ -26,6 +26,10 @@
     ],
     [
       "GET",
+      "/internal/by-topology/{topology_id}"
+    ],
+    [
+      "GET",
       "/internal/{reservation_id}"
     ],
     [
