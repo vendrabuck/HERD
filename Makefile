@@ -157,7 +157,7 @@ everything: clean
 	@echo ""
 	@echo "=== everything complete ==="
 
-# Seeds the running stack via seed_devices.py. Pulls SUPERADMIN_EMAIL/PASSWORD
+# Seeds the running stack via seed_devices_public.py. Pulls SUPERADMIN_EMAIL/PASSWORD
 # out of .env via grep (not `source`) so unquoted placeholder values elsewhere
 # in .env do not crash the recipe. Shell env still wins if SEED_* is set.
 _everything-seed:
@@ -167,7 +167,7 @@ _everything-seed:
 	 export SEED_PASSWORD="$${SEED_PASSWORD:-$$pw}"; \
 	 export SEED_BASE_URL="$${SEED_BASE_URL:-$${HERD_BASE_URL:-https://localhost/api}}"; \
 	 echo "Seeding $$SEED_BASE_URL as $$SEED_EMAIL"; \
-	 uv run python seed_devices.py
+	 uv run python seed_devices_public.py
 
 # Public alias so `make seed` works against an already-running stack.
 seed: _everything-seed

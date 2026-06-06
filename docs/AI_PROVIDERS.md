@@ -198,4 +198,4 @@ AI_TLS_VERIFY=true
 
 - **AI features work but responses are obviously low quality**: the model is too small for the surface. Try a larger model, especially for the reservation assistant which is the most demanding.
 
-- **`/api/ai/generate` returns "AI referenced unknown templates"**: the model proposed a template name that does not exist in your inventory. Either the stack is unseeded (`make seed` to populate; see [seed_devices.py](../seed_devices.py)) or your user account lacks visibility into the required device groups.
+- **`/api/ai/generate` returns "AI referenced unknown templates"**: the model proposed a template name that does not exist in your inventory. Either the stack is unseeded (`make seed` to populate; see [seed_devices_public.py](../seed_devices_public.py)) or your user account lacks visibility into the required device groups.
