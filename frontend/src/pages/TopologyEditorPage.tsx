@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -16,6 +16,7 @@ import "@xyflow/react/dist/style.css";
 import toast from "react-hot-toast";
 
 import { useTopology, useUpdateTopology, useRestoreVersion } from "@/api/topologies";
+import { useReservations, useUpdateReservation } from "@/api/reservations";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
 import { useTopologyStore } from "@/stores/topologyStore";
@@ -27,6 +28,7 @@ import { ConnectionModal } from "@/components/topology-editor/ConnectionModal";
 import { AIDialog } from "@/components/topology-editor/AIDialog";
 import { AICommitDialog } from "@/components/topology-editor/AICommitDialog";
 import { AIProposalBar } from "@/components/topology-editor/AIProposalBar";
+import { LiveEditBar } from "@/components/topology-editor/LiveEditBar";
 import { HistoryPanel } from "@/components/topology-editor/HistoryPanel";
 import { VersionDiffDialog } from "@/components/topology-editor/VersionDiffDialog";
 import { RestoreConfirmDialog } from "@/components/topology-editor/RestoreConfirmDialog";
@@ -68,9 +70,24 @@ const LAYER_DESCRIPTIONS: Record<EdgeLayerType, string> = {
 function TopologyEditorInner() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { screenToFlowPosition } = useReactFlow();
   const { data: topology, isLoading } = useTopology(id);
   const updateTopology = useUpdateTopology();
+
+  // Reservation-bound ("live edit") mode: entered via
+  // /topology/:id?reservationId=... from a reservation's detail modal. In this
+  // mode, committing the canvas also PATCHes the reservation's device set, which
+  // the backend turns into incremental provisioning of the running reservation.
+  const reservationId = searchParams.get("reservationId");
+  const { data: reservations } = useReservations();
+  const liveReservation = useMemo(
+    () => reservations?.find((r) => r.id === reservationId) ?? null,
+    [reservations, reservationId],
+  );
+  const isLiveEdit = !!reservationId;
+  const updateReservation = useUpdateReservation();
+  const [isCommitting, setIsCommitting] = useState(false);
 
   const {
     nodes,
@@ -397,6 +414,58 @@ function TopologyEditorInner() {
     toast.success("Topology saved");
   };
 
+  // Live-edit commit: persist the canvas, then re-point the reservation's device
+  // set at the canvas devices. The device PATCH is what triggers the backend's
+  // incremental provisioning (reservation.updated -> connect/disconnect ports,
+  // add/remove from VLAN). Blocked when any edge is unreachable; the backend
+  // enforces the same rule, this is the fast-fail UX path.
+  const handleCommitToReservation = useCallback(async () => {
+    if (!id || !reservationId) return;
+    if (hasInvalidEdges) {
+      toast.error("Fix unreachable edges before committing");
+      return;
+    }
+    setIsCommitting(true);
+    try {
+      await updateTopology.mutateAsync({
+        id,
+        canvas_data: { nodes, edges, selectedEdgeLayer },
+      });
+      await updateReservation.mutateAsync({
+        id: reservationId,
+        data: { device_ids: allDeviceIds },
+      });
+      toast.success("Reservation topology updated");
+      navigate("/reservations");
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
+        ?.detail;
+      const message =
+        typeof detail === "string"
+          ? detail
+          : (detail as { message?: string } | undefined)?.message ??
+            "Failed to update the reservation topology";
+      toast.error(message);
+    } finally {
+      setIsCommitting(false);
+    }
+  }, [
+    id,
+    reservationId,
+    hasInvalidEdges,
+    updateTopology,
+    nodes,
+    edges,
+    selectedEdgeLayer,
+    updateReservation,
+    allDeviceIds,
+    navigate,
+  ]);
+
+  const handleCancelLiveEdit = useCallback(() => {
+    navigate("/reservations");
+  }, [navigate]);
+
   const handlePreviewVersion = useCallback(
     async (version: TopologyVersion) => {
       if (!id) return;
@@ -498,6 +567,11 @@ function TopologyEditorInner() {
           <span className="text-sm font-medium text-gray-900 truncate">
             {topology?.name ?? "Topology"}
           </span>
+          {isLiveEdit && (
+            <span className="text-xs font-medium px-2 py-0.5 rounded bg-blue-100 text-blue-700">
+              Editing reservation{liveReservation ? ` (${liveReservation.purpose})` : ""}
+            </span>
+          )}
           <div className="w-px h-5 bg-gray-300" />
           <span className="text-sm font-medium text-gray-600">Edge layer:</span>
           <div className="flex gap-1">
@@ -527,34 +601,40 @@ function TopologyEditorInner() {
                 Use AI
               </button>
             )}
-            <button
-              onClick={() => setShowReserveModal(true)}
-              disabled={allDeviceIds.length === 0 || hasInvalidEdges}
-              title={
-                hasInvalidEdges
-                  ? `Cannot reserve: ${invalidEdges.length} edge${invalidEdges.length !== 1 ? "s" : ""} have no physical path or use uncabled ports`
-                  : undefined
-              }
-              className="text-sm text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              Reserve Topology ({allDeviceIds.length} device{allDeviceIds.length !== 1 ? "s" : ""})
-            </button>
-            <input
-              type="text"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Describe this change (optional)"
-              aria-label="Version description"
-              disabled={!!previewVersion}
-              className="text-sm border border-gray-300 rounded px-2 py-1 w-56 focus:outline-none focus:border-blue-500 disabled:bg-gray-100"
-            />
-            <button
-              onClick={handleSave}
-              disabled={updateTopology.isPending || !!previewVersion}
-              className="text-sm text-green-600 hover:text-green-800 px-2 py-1 rounded hover:bg-green-50 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {updateTopology.isPending ? "Saving..." : "Save"}
-            </button>
+            {!isLiveEdit && (
+              <button
+                onClick={() => setShowReserveModal(true)}
+                disabled={allDeviceIds.length === 0 || hasInvalidEdges}
+                title={
+                  hasInvalidEdges
+                    ? `Cannot reserve: ${invalidEdges.length} edge${invalidEdges.length !== 1 ? "s" : ""} have no physical path or use uncabled ports`
+                    : undefined
+                }
+                className="text-sm text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Reserve Topology ({allDeviceIds.length} device{allDeviceIds.length !== 1 ? "s" : ""})
+              </button>
+            )}
+            {!isLiveEdit && (
+              <input
+                type="text"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Describe this change (optional)"
+                aria-label="Version description"
+                disabled={!!previewVersion}
+                className="text-sm border border-gray-300 rounded px-2 py-1 w-56 focus:outline-none focus:border-blue-500 disabled:bg-gray-100"
+              />
+            )}
+            {!isLiveEdit && (
+              <button
+                onClick={handleSave}
+                disabled={updateTopology.isPending || !!previewVersion}
+                className="text-sm text-green-600 hover:text-green-800 px-2 py-1 rounded hover:bg-green-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {updateTopology.isPending ? "Saving..." : "Save"}
+              </button>
+            )}
             <button
               onClick={() => setShowHistory((v) => !v)}
               className="text-sm text-gray-700 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100"
@@ -602,6 +682,16 @@ function TopologyEditorInner() {
               onAccept={handleProposalAccept}
               onModify={handleProposalModify}
               onReject={handleProposalReject}
+            />
+          )}
+
+          {isLiveEdit && !pendingProposal && (
+            <LiveEditBar
+              deviceCount={allDeviceIds.length}
+              invalidEdgeCount={invalidEdges.length}
+              isCommitting={isCommitting}
+              onCommit={handleCommitToReservation}
+              onCancel={handleCancelLiveEdit}
             />
           )}
 
