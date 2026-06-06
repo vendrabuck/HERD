@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Equipment &amp; cabling (admin)</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html" class="active">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#add">Add your first device</a></li>
+      <li><a href="#ports">Give it ports</a></li>
+      <li><a href="#inspect">See ports in the table</a></li>
+      <li><a href="#cabling">Cabling things up</a></li>
+      <li><a href="#verify">Verify it went green</a></li>
+    </ul>
+    <p class="eyebrow">Admin track</p>
+    <ul>
+      <li><a href="admin-setup.html">A - First-day setup</a></li>
+      <li><a href="admin-equipment.html" class="active">B - Equipment &amp; cabling</a></li>
+      <li><a href="admin-reporting.html">C - Reporting</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker admin">Admin track - Setup B</span>
+    <h1 class="title">Your first device &amp; its cabling</h1>
+    <p class="dek">Templates and drivers exist (from <a href="admin-setup.html">first-day setup</a>). Now you'll add a real device, give it ports, and record the physical cabling between ports &mdash; the thing that makes topology edges turn green instead of red.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The shape of this</div>
+      <p>A <strong>device</strong> has <strong>ports</strong>. A <strong>cable</strong> connects one port to another port. HERD's pathfinder uses those cables to decide whether two DUTs can actually talk. No cabling recorded = red edges = no reservations. So this page is what unblocks your users' topologies.</p>
+    </div>
+
+    <h2 class="sec" id="add">Step one</h2>
+    <p class="sectitle">Add your first device</p>
+    <p>Go to <b>Inventory &rarr; Add device</b>. Pick a template; HERD shows the fields that template defined.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>Add device</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-field"><label class="hd-label">Template</label><div class="hd-select" data-anno="1" data-anno-pin="r" data-anno-arrow>Generic FW-600 (Management)</div></div>
+                <div class="hd-field"><label class="hd-label">Name</label><div class="hd-input" data-anno="2" data-anno-pin="r" data-anno-arrow>fw-edge-01</div></div>
+                <div class="hd-row2">
+                  <div class="hd-field"><label class="hd-label">Mgmt IP</label><div class="hd-input">10.0.4.11</div></div>
+                  <div class="hd-field"><label class="hd-label">Initial group</label><div class="hd-select" data-anno="3" data-anno-pin="l" data-anno-arrow data-anno-color="blue">lab-a</div></div>
+                </div>
+                <p class="hd-help">Leave the group blank and the device lands in <code>No Pool</code> until you move it.</p>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Add device</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The add-device form.</b> Fields come from the chosen template.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Template.</b> Decides the fields, the driver, and whether the device is exclusive or shared. No template = can't add the device (go back to <a href="admin-setup.html#templates">setup step 2</a>).</li>
+      <li><b>Name.</b> What everyone will see in inventory and on the canvas. Keep it recognisable.</li>
+      <li><b>Initial group.</b> Optionally drop it straight into a real device group so it's visible immediately.</li>
+      <li><b>Add device.</b> It appears in inventory right away.</li>
+    </ol>
+
+    <h2 class="sec" id="ports">Step two</h2>
+    <p class="sectitle">Give it ports</p>
+    <p>A device with no ports can't be cabled. Open the device's detail page and click <b>Add ports</b>. Pick a port template, fill the field data, submit. Bulk creation is supported &mdash; add a whole row of <code>ge-0 … ge-47</code> at once.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Ports are children of a device and use <code>port</code>-type templates (no driver). If you don't have one yet, make it the same way you made the device template &mdash; just pick "port" as the type.</p></div>
+    </div>
+
+    <h2 class="sec" id="inspect">Step three</h2>
+    <p class="sectitle">See ports right in the table</p>
+    <p>Back in Inventory, click the chevron on a row to expand it. You get audit info, group membership, and the device's ports &mdash; each with a <b>Connected To</b> link if it's cabled.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/inventory</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a class="active">Inventory</a><a>Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
+            <div class="hd-body">
+              <div class="hd-h1">All Devices <span class="count">(10)</span></div>
+              <div class="hd-card">
+                <table class="hd-table">
+                  <thead><tr><th></th><th>Name</th><th>Template</th><th>Topology</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td class="chev" data-anno="1" data-anno-pin="l" data-anno-arrow><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform:rotate(90deg)"><path d="m9 18 6-6-6-6"/></svg></td><td class="name">fw-edge-01</td><td><span class="tmpl"><span class="hd-glyph physical"></span>Generic FW-600</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td><span class="hd-badge available">AVAILABLE</span></td></tr>
+                    <tr class="hd-ports"><td colspan="5"><div class="hd-portgrid">
+                      <div class="pr"><span class="pp">eth1/1</span><span class="conn" data-anno="2" data-anno-pin="r" data-anno-arrow data-anno-color="blue">&rarr; l1-patch-mux : ge-0</span></div>
+                      <div class="pr"><span class="pp">eth1/2</span><span class="conn">&rarr; l1-patch-mux : ge-1</span></div>
+                      <div class="pr"><span class="pp">eth1/3</span><span class="none" data-anno="3" data-anno-pin="r" data-anno-arrow>not cabled</span></div>
+                    </div></td></tr>
+                    <tr><td class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></td><td class="name">leaf-sw-09</td><td><span class="tmpl"><span class="hd-glyph physical"></span>Arista 7050X</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td><span class="hd-badge maintenance">MAINTENANCE</span></td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>An expanded device row</b> showing its ports and what each is cabled to.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The chevron</b> expands and collapses the row's detail.</li>
+      <li><b>Connected To.</b> A cabled port shows the device and port on the other end &mdash; click through to it.</li>
+      <li><b>"not cabled".</b> This port has no physical connection recorded. Edges that try to use it go red with "uncabled port".</li>
+    </ol>
+
+    <h2 class="sec" id="cabling">The important part</h2>
+    <p class="sectitle">Cabling things up</p>
+    <p>Cabling is the physical-layer truth HERD reasons over. A connection record says "port A on device A is physically connected to port B on device B." You record one per real cable in your rack. Go to <b>Administration &rarr; Connections</b> and click <b>Create Connection</b>.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>Create Connection</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-field"><label class="hd-label">Device A</label>
+                  <div data-anno="1" data-anno-pin="r" data-anno-arrow style="display:flex;align-items:center;gap:10px;padding:2px 0;"><span style="font-size:14px;color:var(--gray-900)">fw-edge-01</span><span style="font-size:12px;color:var(--gray-500)">Change</span></div>
+                </div>
+                <div class="hd-field"><label class="hd-label">Port A</label><div class="hd-select" data-anno="2" data-anno-pin="r" data-anno-arrow>eth1/3</div></div>
+                <div class="hd-field"><label class="hd-label">Device B</label>
+                  <div style="display:flex;align-items:center;gap:10px;padding:2px 0;"><span style="font-size:14px;color:var(--gray-900)">l1-patch-mux</span><span style="font-size:12px;color:var(--gray-500)">Change</span></div>
+                </div>
+                <div class="hd-field"><label class="hd-label">Port B</label><div class="hd-select">ge-2</div></div>
+                <div class="hd-field"><label class="hd-label">Connection Type</label><div class="hd-input" data-anno="3" data-anno-pin="l" data-anno-arrow data-anno-color="blue">ethernet</div></div>
+                <div class="hd-field" style="margin-bottom:0;"><label class="hd-label">Notes</label><div class="hd-textarea" style="min-height:48px;color:var(--gray-500)">Rack 4, blue cable</div></div>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Create</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The Create Connection dialog</b> (Administration &rarr; Connections). Search to pick each device, then a port on each end.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Device A.</b> Type at least two characters to search, click the match. Picked devices show with a <b>Change</b> link.</li>
+      <li><b>Port A.</b> The dropdown unlocks once Device A is chosen, and lists that device's ports.</li>
+      <li><b>Connection Type.</b> Free text, defaults to <code>ethernet</code> &mdash; label the medium (e.g. <code>fiber</code>, <code>dac</code>) if it helps your records. <b>Notes</b> is optional free text.</li>
+      <li><b>Create.</b> The pathfinder picks it up immediately &mdash; any topology edge that needed this hop revalidates on the spot.</li>
+    </ol>
+
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
+      <div><span class="ttl">Cable to the switches, not DUT-to-DUT</span><p>DUTs rarely plug straight into each other &mdash; they plug into L1/L2 switches that route between them. Record the real cabling (DUT &rarr; switch port), and the pathfinder figures out the multi-hop route on its own. That's why a valid topology edge says "3 hops," not "1 cable."</p></div>
+    </div>
+
+    <h2 class="sec" id="verify">Closing the loop</h2>
+    <p class="sectitle">Verify it went green</p>
+    <p>The whole point of recording cabling is that users' topology edges turn green. To confirm your work:</p>
+    <div class="steps">
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">Open a topology that uses the devices you just cabled</h3><p>Or build a quick test one with two DUTs that should now have a path.</p></div></div>
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">Check the edge badges</h3><p><span class="badge available">green + "N hops"</span> means the pathfinder found a route through your cabling. A leftover <span class="badge failed">red</span> means a hop is still missing &mdash; trace the cable chain and look for the gap.</p></div></div>
+    </div>
+    <div class="callout danger">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">Still red after cabling?</span><p>Two usual causes: (1) a switch in the middle of the path isn't in inventory yet &mdash; add it and its cabling; (2) the two DUTs genuinely sit in physically isolated fabrics. For cross-site links, add a virtual tunnel device cabled into both fabrics. More fixes in <a href="troubleshooting.html#redge">Troubleshooting</a>.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Equipment &amp; cabling (admin)</p>
+      <div class="pagenav">
+        <a href="admin-setup.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> First-day setup</a>
+        <a href="admin-reporting.html">Reporting <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

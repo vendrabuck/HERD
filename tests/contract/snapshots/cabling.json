@@ -1,0 +1,530 @@
+{
+  "paths": [
+    [
+      "GET",
+      "/connections"
+    ],
+    [
+      "POST",
+      "/connections"
+    ],
+    [
+      "GET",
+      "/connections/internal"
+    ],
+    [
+      "DELETE",
+      "/connections/{connection_id}"
+    ],
+    [
+      "GET",
+      "/connections/{connection_id}"
+    ],
+    [
+      "GET",
+      "/fabric/internal"
+    ],
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "POST",
+      "/pathfind"
+    ],
+    [
+      "GET",
+      "/templates"
+    ],
+    [
+      "POST",
+      "/templates"
+    ],
+    [
+      "POST",
+      "/templates/from-topology/{topology_id}"
+    ],
+    [
+      "DELETE",
+      "/templates/{template_id}"
+    ],
+    [
+      "GET",
+      "/templates/{template_id}"
+    ],
+    [
+      "PUT",
+      "/templates/{template_id}"
+    ],
+    [
+      "POST",
+      "/templates/{template_id}/instantiate"
+    ],
+    [
+      "GET",
+      "/topologies"
+    ],
+    [
+      "POST",
+      "/topologies"
+    ],
+    [
+      "DELETE",
+      "/topologies/{topology_id}"
+    ],
+    [
+      "GET",
+      "/topologies/{topology_id}"
+    ],
+    [
+      "PUT",
+      "/topologies/{topology_id}"
+    ],
+    [
+      "POST",
+      "/topologies/{topology_id}/clone"
+    ],
+    [
+      "POST",
+      "/topologies/{topology_id}/validate"
+    ],
+    [
+      "POST",
+      "/topologies/{topology_id}/validate/internal"
+    ],
+    [
+      "GET",
+      "/topologies/{topology_id}/versions"
+    ],
+    [
+      "GET",
+      "/topologies/{topology_id}/versions/diff"
+    ],
+    [
+      "GET",
+      "/topologies/{topology_id}/versions/{version_id}"
+    ],
+    [
+      "POST",
+      "/topologies/{topology_id}/versions/{version_id}/restore"
+    ]
+  ],
+  "schemas": {
+    "ConnectionCreate": {
+      "properties": {
+        "connection_type": "string",
+        "device_a_id": "string",
+        "device_b_id": "string",
+        "notes": "anyOf",
+        "port_a": "string",
+        "port_b": "string"
+      },
+      "required": [
+        "device_a_id",
+        "device_b_id",
+        "port_a",
+        "port_b"
+      ],
+      "type": "object"
+    },
+    "ConnectionResponse": {
+      "properties": {
+        "connection_type": "string",
+        "created_at": "string",
+        "created_by": "string",
+        "device_a_id": "string",
+        "device_b_id": "string",
+        "id": "string",
+        "modified_by": "anyOf",
+        "notes": "anyOf",
+        "port_a": "string",
+        "port_b": "string",
+        "updated_at": "anyOf"
+      },
+      "required": [
+        "connection_type",
+        "created_at",
+        "created_by",
+        "device_a_id",
+        "device_b_id",
+        "id",
+        "notes",
+        "port_a",
+        "port_b"
+      ],
+      "type": "object"
+    },
+    "FabricResponse": {
+      "properties": {
+        "component_size": "integer",
+        "device_id": "string",
+        "fabric_id": "string"
+      },
+      "required": [
+        "component_size",
+        "device_id",
+        "fabric_id"
+      ],
+      "type": "object"
+    },
+    "InstantiateRequest": {
+      "properties": {
+        "name": "string",
+        "role_assignments": "object"
+      },
+      "required": [
+        "name",
+        "role_assignments"
+      ],
+      "type": "object"
+    },
+    "InvalidEdge": {
+      "properties": {
+        "edge_id": "string",
+        "layer": "anyOf",
+        "reason": "string",
+        "source_device_id": "anyOf",
+        "target_device_id": "anyOf"
+      },
+      "required": [
+        "edge_id",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ModifiedItem": {
+      "properties": {
+        "after": "object",
+        "before": "object",
+        "id": "string"
+      },
+      "required": [
+        "after",
+        "before",
+        "id"
+      ],
+      "type": "object"
+    },
+    "PaginatedConnectionResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedTemplateResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedTopologyResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedTopologyVersionResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PathHop": {
+      "properties": {
+        "device_id": "string",
+        "port_in": "anyOf",
+        "port_out": "anyOf"
+      },
+      "required": [
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "PathfindRequest": {
+      "properties": {
+        "source_device_id": "string",
+        "target_device_id": "string"
+      },
+      "required": [
+        "source_device_id",
+        "target_device_id"
+      ],
+      "type": "object"
+    },
+    "PathfindResponse": {
+      "properties": {
+        "hop_count": "integer",
+        "paths": "array",
+        "reachable": "boolean"
+      },
+      "required": [
+        "hop_count",
+        "paths",
+        "reachable"
+      ],
+      "type": "object"
+    },
+    "TemplateCreate": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "description": "anyOf",
+        "name": "string"
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "TemplateDetail": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "created_at": "string",
+        "created_by": "string",
+        "description": "anyOf",
+        "id": "string",
+        "name": "string",
+        "owner_name": "string",
+        "updated_at": "string"
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "id",
+        "name",
+        "owner_name",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "TemplateFromTopologyRequest": {
+      "properties": {
+        "description": "anyOf",
+        "name": "string"
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "TemplateResponse": {
+      "properties": {
+        "created_at": "string",
+        "created_by": "string",
+        "description": "anyOf",
+        "id": "string",
+        "name": "string",
+        "owner_name": "string",
+        "updated_at": "string"
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "id",
+        "name",
+        "owner_name",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "TemplateUpdate": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "description": "anyOf",
+        "name": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "TopologyClone": {
+      "properties": {
+        "name": "string"
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "TopologyCreate": {
+      "properties": {
+        "name": "string"
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "TopologyDetail": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "created_at": "string",
+        "created_by": "string",
+        "id": "string",
+        "modified_by": "anyOf",
+        "name": "string",
+        "owner_name": "string",
+        "updated_at": "string"
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "id",
+        "name",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "TopologyResponse": {
+      "properties": {
+        "created_at": "string",
+        "created_by": "string",
+        "id": "string",
+        "modified_by": "anyOf",
+        "name": "string",
+        "owner_name": "string",
+        "updated_at": "string"
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "id",
+        "name",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "TopologyRestoreRequest": {
+      "properties": {
+        "description": "anyOf",
+        "restore_name": "boolean"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "TopologyUpdate": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "description": "anyOf",
+        "name": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "TopologyValidationResponse": {
+      "properties": {
+        "invalid_edges": "array",
+        "valid": "boolean"
+      },
+      "required": [
+        "invalid_edges",
+        "valid"
+      ],
+      "type": "object"
+    },
+    "TopologyVersionDetail": {
+      "properties": {
+        "author_name": "string",
+        "canvas_data": "anyOf",
+        "created_at": "string",
+        "created_by": "string",
+        "description": "anyOf",
+        "id": "string",
+        "name": "string",
+        "restored_from_id": "anyOf",
+        "topology_id": "string",
+        "version_number": "integer"
+      },
+      "required": [
+        "author_name",
+        "created_at",
+        "created_by",
+        "id",
+        "name",
+        "topology_id",
+        "version_number"
+      ],
+      "type": "object"
+    },
+    "TopologyVersionDiff": {
+      "properties": {
+        "edges_added": "array",
+        "edges_modified": "array",
+        "edges_removed": "array",
+        "nodes_added": "array",
+        "nodes_modified": "array",
+        "nodes_removed": "array",
+        "version_a": "string",
+        "version_b": "string"
+      },
+      "required": [
+        "edges_added",
+        "edges_modified",
+        "edges_removed",
+        "nodes_added",
+        "nodes_modified",
+        "nodes_removed",
+        "version_a",
+        "version_b"
+      ],
+      "type": "object"
+    },
+    "TopologyVersionResponse": {
+      "properties": {
+        "author_name": "string",
+        "created_at": "string",
+        "created_by": "string",
+        "description": "anyOf",
+        "id": "string",
+        "name": "string",
+        "restored_from_id": "anyOf",
+        "topology_id": "string",
+        "version_number": "integer"
+      },
+      "required": [
+        "author_name",
+        "created_at",
+        "created_by",
+        "id",
+        "name",
+        "topology_id",
+        "version_number"
+      ],
+      "type": "object"
+    }
+  }
+}

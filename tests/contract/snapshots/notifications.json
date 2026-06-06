@@ -1,0 +1,115 @@
+{
+  "paths": [
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "GET",
+      "/notifications"
+    ],
+    [
+      "GET",
+      "/notifications/preferences"
+    ],
+    [
+      "PUT",
+      "/notifications/preferences"
+    ],
+    [
+      "POST",
+      "/notifications/read-all"
+    ],
+    [
+      "GET",
+      "/notifications/unread-count"
+    ],
+    [
+      "DELETE",
+      "/notifications/{notification_id}"
+    ],
+    [
+      "PATCH",
+      "/notifications/{notification_id}/read"
+    ]
+  ],
+  "schemas": {
+    "MarkAllReadResponse": {
+      "properties": {
+        "updated": "integer"
+      },
+      "required": [
+        "updated"
+      ],
+      "type": "object"
+    },
+    "NotificationChannels": {
+      "properties": {
+        "in_app": "boolean"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "NotificationList": {
+      "properties": {
+        "items": "array",
+        "total": "integer",
+        "unread": "integer"
+      },
+      "required": [
+        "items",
+        "total",
+        "unread"
+      ],
+      "type": "object"
+    },
+    "NotificationPreferences": {
+      "properties": {
+        "channels": "#/components/schemas/NotificationChannels",
+        "events": "object"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "NotificationPreferencesUpdate": {
+      "properties": {
+        "channels": "anyOf",
+        "events": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "NotificationResponse": {
+      "properties": {
+        "body": "string",
+        "created_at": "string",
+        "data": "object",
+        "event_type": "string",
+        "id": "string",
+        "read_at": "anyOf",
+        "title": "string",
+        "user_id": "string"
+      },
+      "required": [
+        "body",
+        "created_at",
+        "data",
+        "event_type",
+        "id",
+        "read_at",
+        "title",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "UnreadCount": {
+      "properties": {
+        "count": "integer"
+      },
+      "required": [
+        "count"
+      ],
+      "type": "object"
+    }
+  }
+}

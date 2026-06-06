@@ -1,0 +1,36 @@
+{
+  "driver": "mock_ios",
+  "action": "add_to_vlan",
+  "method_kwargs": {
+    "port": "GigabitEthernet0/1",
+    "vlan_id": 100,
+    "tag": "tagged"
+  },
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "interface GigabitEthernet0/1",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 2,
+      "command": "switchport mode trunk",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 3,
+      "command": "switchport trunk allowed vlan add 100",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 4,
+      "command": " exit",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

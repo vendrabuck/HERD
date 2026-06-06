@@ -1,0 +1,256 @@
+{
+  "paths": [
+    [
+      "GET",
+      "/"
+    ],
+    [
+      "POST",
+      "/"
+    ],
+    [
+      "GET",
+      "/calendar"
+    ],
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "GET",
+      "/internal/active"
+    ],
+    [
+      "GET",
+      "/internal/active-users"
+    ],
+    [
+      "GET",
+      "/internal/{reservation_id}"
+    ],
+    [
+      "GET",
+      "/reports/utilization"
+    ],
+    [
+      "GET",
+      "/reports/utilization.csv"
+    ],
+    [
+      "DELETE",
+      "/{reservation_id}"
+    ],
+    [
+      "GET",
+      "/{reservation_id}"
+    ],
+    [
+      "PATCH",
+      "/{reservation_id}"
+    ],
+    [
+      "PUT",
+      "/{reservation_id}/release"
+    ]
+  ],
+  "schemas": {
+    "DayBucket": {
+      "properties": {
+        "day": "string",
+        "hours": "number",
+        "reservation_count": "integer"
+      },
+      "required": [
+        "day",
+        "hours",
+        "reservation_count"
+      ],
+      "type": "object"
+    },
+    "DeviceBucket": {
+      "properties": {
+        "device_id": "string",
+        "hours": "number",
+        "reservation_count": "integer"
+      },
+      "required": [
+        "device_id",
+        "hours",
+        "reservation_count"
+      ],
+      "type": "object"
+    },
+    "GroupBucket": {
+      "properties": {
+        "group_id": "anyOf",
+        "group_name": "string",
+        "hours": "number",
+        "reservation_count": "integer"
+      },
+      "required": [
+        "group_id",
+        "group_name",
+        "hours",
+        "reservation_count"
+      ],
+      "type": "object"
+    },
+    "OwnsActiveResponse": {
+      "properties": {
+        "owns_active": "boolean"
+      },
+      "required": [
+        "owns_active"
+      ],
+      "type": "object"
+    },
+    "PaginatedReservationResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "ReservationCreate": {
+      "properties": {
+        "device_ids": "array",
+        "end_time": "string",
+        "purpose": "anyOf",
+        "start_time": "string",
+        "topology_id": "anyOf"
+      },
+      "required": [
+        "device_ids",
+        "end_time",
+        "start_time"
+      ],
+      "type": "object"
+    },
+    "ReservationInternalStatus": {
+      "properties": {
+        "end_time": "string",
+        "id": "string",
+        "is_active": "boolean",
+        "start_time": "string",
+        "status": "#/components/schemas/ReservationStatus"
+      },
+      "required": [
+        "end_time",
+        "id",
+        "is_active",
+        "start_time",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ReservationResponse": {
+      "properties": {
+        "created_at": "string",
+        "device_ids": "array",
+        "end_time": "string",
+        "id": "string",
+        "modified_by": "anyOf",
+        "owner_name": "string",
+        "purpose": "anyOf",
+        "start_time": "string",
+        "status": "#/components/schemas/ReservationStatus",
+        "topology_id": "anyOf",
+        "topology_type": "#/components/schemas/TopologyType",
+        "updated_at": "string",
+        "user_id": "string"
+      },
+      "required": [
+        "created_at",
+        "device_ids",
+        "end_time",
+        "id",
+        "purpose",
+        "start_time",
+        "status",
+        "topology_id",
+        "topology_type",
+        "updated_at",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "ReservationStatus": {
+      "properties": {},
+      "required": [],
+      "type": "string"
+    },
+    "ReservationUpdate": {
+      "properties": {
+        "device_ids": "anyOf",
+        "end_time": "anyOf",
+        "purpose": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "TopologyType": {
+      "properties": {},
+      "required": [],
+      "type": "string"
+    },
+    "TopologyTypeBucket": {
+      "properties": {
+        "hours": "number",
+        "reservation_count": "integer",
+        "topology_type": "#/components/schemas/TopologyType"
+      },
+      "required": [
+        "hours",
+        "reservation_count",
+        "topology_type"
+      ],
+      "type": "object"
+    },
+    "UserBucket": {
+      "properties": {
+        "hours": "number",
+        "owner_name": "string",
+        "reservation_count": "integer",
+        "user_id": "string"
+      },
+      "required": [
+        "hours",
+        "owner_name",
+        "reservation_count",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "UtilizationReport": {
+      "properties": {
+        "by_day": "array",
+        "by_device": "array",
+        "by_group": "array",
+        "by_topology_type": "array",
+        "by_user": "array",
+        "execution_run_count": "anyOf",
+        "total_hours": "number",
+        "total_reservations": "integer",
+        "window_end": "string",
+        "window_start": "string"
+      },
+      "required": [
+        "by_device",
+        "by_user",
+        "total_hours",
+        "total_reservations",
+        "window_end",
+        "window_start"
+      ],
+      "type": "object"
+    }
+  }
+}

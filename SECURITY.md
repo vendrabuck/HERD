@@ -1,0 +1,45 @@
+# Security Policy
+
+## Supported Versions
+
+HERD is released from `master`. There is no long-term-support branch today; please run a recent commit.
+
+| Version | Supported |
+| ------- | --------- |
+| master (latest commit) | yes |
+| older | no |
+
+If you are operating an older checkout, pull `master` before filing a security report so we're both working from the same code.
+
+## Reporting a Vulnerability
+
+Please do **not** open a public issue for suspected security vulnerabilities.
+
+Email a description of the issue and reproduction steps to the project maintainer (see repo `CODEOWNERS` or the contact in the repo's README). If you do not know where to send it, open a GitHub issue titled "Security contact request" and the maintainer will reach out privately.
+
+You can expect an acknowledgment within one week. We aim to triage and provide an initial assessment within two weeks. Accepted issues will be patched on `master`; a write-up is published after the fix ships.
+
+## What counts as a security issue
+
+- Authentication or authorization bypass.
+- Ability to read or modify another user's data when your role or device-group permissions should have blocked it.
+- Remote code execution via driver upload, AI-generated config, or any other input path.
+- Secrets leaked in logs, error responses, or the frontend.
+- Denial-of-service caused by a single authenticated request.
+
+Bugs that cause incorrect data but are gated behind admin or superadmin access are still worth reporting but are lower priority; file them as a regular issue unless you can escalate via a user-role account.
+
+## Threat model summary
+
+- **JWT**: signed with a shared `AUTH_SECRET_KEY`; every service verifies locally. Rotating the secret invalidates every live session.
+- **Internal service-to-service calls**: authenticated with `X-Internal-Token`. Endpoints that accept the internal token are named with `/internal`, `/internal-download`, or similar suffixes. Internal-token endpoints are not meant to be reachable from the public internet; Traefik routes them through `/api/<service>` like any other endpoint, so anyone with the token + HTTP access to the service can call them. Treat the token as a shared secret.
+- **AI-generated configs** (from the LLM) are validated against a small allowlist per connection type before any call to the execution service; unknown keys are rejected at the orchestrator boundary. See [docs/AI_GENERATE.md](docs/AI_GENERATE.md).
+- **Driver code** runs in a subprocess sandbox with a configurable timeout. The sandbox is NOT a full security boundary: driver code can read the device context (including credentials), make outbound network calls, and in principle do anything a Python process can do. Only upload drivers you trust.
+- **Reverse proxy**: Traefik terminates TLS with a custom PKI chain. Install `infra/traefik/certs/root-ca.crt` as a trusted root on client machines. Never expose the Traefik dashboard (`:8080`) publicly.
+
+## What is out of scope
+
+- Vulnerabilities in upstream dependencies (FastAPI, SQLAlchemy, React, etc.) unless HERD's usage amplifies them; please report those to the upstream project.
+- Attacks requiring an attacker-controlled admin or superadmin account. Admin and superadmin are trusted roles by definition.
+- Attacks requiring physical access to the deployment host.
+- Denial of service by overwhelming the backend with authenticated requests at expected rate limits.

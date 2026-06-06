@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: First boot &amp; signing in</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html" class="active">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#tour">The 30-second tour</a></li>
+      <li><a href="#signin">Signing in</a></li>
+      <li><a href="#register">Registering</a></li>
+      <li><a href="#empty">Why everything looks empty</a></li>
+      <li><a href="#nav">What each tab does</a></li>
+      <li><a href="#next">Where to go next</a></li>
+    </ul>
+    <p class="eyebrow">User track</p>
+    <ul>
+      <li><a href="quickstart.html" class="active">1 - First boot</a></li>
+      <li><a href="user-reservations.html">2 - Reservations</a></li>
+      <li><a href="user-topology.html">3 - Topology</a></li>
+      <li><a href="user-ai.html">4 - Generate with AI</a></li>
+      <li><a href="user-notifications.html">5 - Notifications</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker user">User track - Step 1</span>
+    <h1 class="title">First boot &amp; signing in</h1>
+    <p class="dek">You just got a link to HERD and a login. This page tells you exactly what you're looking at, gets you signed in, and explains the thing that confuses everyone on day one: why the screen looks empty.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> Before you message anyone</div>
+      <p>HERD is a <strong>lab reservation tool</strong>. You use it to claim real hardware (switches, firewalls, test servers) for a block of time, optionally draw how it's wired, then run your tests. That's the whole job. If a screen is empty or a button is missing, it's almost always a permissions or setup thing &mdash; not you breaking it. The fixes are on this page and in <a href="troubleshooting.html">Troubleshooting</a>.</p>
+    </div>
+
+    <h2 class="sec" id="tour">Orientation</h2>
+    <p class="sectitle">The 30-second tour</p>
+    <p>This is the sign-in screen &mdash; the first thing you'll see. Everything you need is in one card.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">https://herd.lab</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-login">
+              <div class="hd-logincard">
+                <div class="tile"><span>H</span></div>
+                <h1>HERD</h1>
+                <p class="tag">Hardware Environment Replication and Deployment</p>
+                <div class="hd-field"><label class="hd-label">Email</label><div class="hd-input" data-anno="2" data-anno-pin="r" data-anno-arrow>you@yourcompany.com</div></div>
+                <div class="hd-field"><label class="hd-label">Password</label><div class="hd-input" style="letter-spacing:3px;">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</div></div>
+                <div class="hd-btn primary block" data-anno="3" data-anno-pin="r" data-anno-arrow>Sign in</div>
+                <p class="reg">No account? <a style="color:var(--blue-600);font-weight:600;" data-anno="4" data-anno-pin="b" data-anno-arrow data-anno-color="blue">Register</a></p>
+                <span class="wrench" data-anno="1" data-anno-pin="bl" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The sign-in screen.</b> One card, four things that matter.</p>
+    </figure>
+
+    <ol class="legend blue">
+      <li><b>The wrench (admins only).</b> If HERD has never been configured, an admin uses this to do first-run setup. As a regular user you will never touch it &mdash; ignore it.</li>
+      <li><b>Email.</b> Your work email, <em>or</em> your directory username if your company wired HERD to its login system. If unsure, try email first.</li>
+      <li><b>Sign in.</b> Already have an account? Type your details and click here. Done.</li>
+      <li><b>Register.</b> No account yet? Click here first. (Unless it's greyed out &mdash; see below.)</li>
+    </ol>
+
+    <h2 class="sec" id="signin">Getting in</h2>
+    <p class="sectitle">Signing in</p>
+    <div class="steps">
+      <div class="stepblock"><div class="stepbody">
+        <h3 class="step">Open the address you were given</h3>
+        <p>Usually something like <code>https://herd.yourcompany.com</code>. For a local test install it's just <code>https://localhost</code>. Your browser may warn about the certificate on a local install &mdash; that's expected; continue through it.</p>
+      </div></div>
+      <div class="stepblock"><div class="stepbody">
+        <h3 class="step">Type your email and password, then <b>Sign in</b></h3>
+        <p>If your company uses LDAP / Active Directory, type your <strong>directory username</strong> (not necessarily your email) and your normal corporate password. HERD doesn't store that password &mdash; it checks it against the directory.</p>
+      </div></div>
+      <div class="stepblock"><div class="stepbody">
+        <h3 class="step">You land on the Reservations page</h3>
+        <p>That's home base. If it's empty, that's normal &mdash; <a href="#empty">jump to the empty-screen section</a>.</p>
+      </div></div>
+    </div>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">A banner about "not configured"?</span><p>That message is for administrators &mdash; it means the platform's first-run setup hasn't been finished. If the login form is greyed out, you can't fix this yourself: ping whoever installed HERD and point them at the <a href="admin-setup.html">first-day setup guide</a>. Then come back.</p></div>
+    </div>
+
+    <h2 class="sec" id="register">No account yet</h2>
+    <p class="sectitle">Registering</p>
+    <p>Click <b>Register</b> on the sign-in card. You'll get a short form; submit it and you're issued the default <code>user</code> role. That's enough to browse and reserve &mdash; admin powers are granted separately by a superadmin.</p>
+
+    <div class="accordion">
+      <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The Register button is greyed out</span><span class="hint">LDAP / AD shops</span></summary>
+      <div class="acc-body">
+        <p>If your company connected HERD to its corporate directory, self-registration is turned off on purpose. You don't need it: your HERD account is created <strong>automatically the first time you log in</strong> with your directory credentials. Just sign in &mdash; the account appears behind the scenes.</p>
+      </div>
+    </div>
+
+    <h2 class="sec" id="empty">The thing that confuses everyone</h2>
+    <p class="sectitle">Why everything looks empty</p>
+    <p>You logged in, clicked <b>Inventory</b> or <b>Topology</b>... and it's blank. Nothing's broken. New accounts start in a group called <span class="badge" style="background:var(--gray-100);color:var(--gray-600);">Not Grouped</span>, and a brand-new account can't see any equipment until an admin grants its group access to some devices.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/inventory</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top">
+              <span class="brand">HERD</span>
+              <span class="nav"><a class="active">Inventory</a><a>Topology</a><a>Reservations</a></span>
+              <span class="grow"></span>
+              <span class="right"><span class="bell"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span><span class="u">you</span><a>Logout</a></span>
+            </div>
+            <div class="hd-body">
+              <div class="hd-h1">All Devices <span class="count">(0)</span></div>
+              <div class="hd-card"><div class="hd-empty" data-anno="1" data-anno-pin="t" data-anno-shape="ellipse" data-anno-pad="14">No devices found</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>An empty inventory.</b> Not a bug &mdash; a permissions gap.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>"No devices found" with a count of (0)</b> means your user group hasn't been granted visibility to any device group yet. This is a one-line fix on the admin side.</li>
+    </ol>
+
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6M10 17v4M14 17v4"/></svg></span>
+      <div><span class="ttl">The exact thing to ask your admin</span><p>"Can you add my user group to the device group(s) for the gear I need to see?" That's the whole request. Once they do it, <strong>reload the page</strong> and the inventory and equipment palette fill in. Admins: this is covered in <a href="admin-setup.html#perms">first-day setup, step 8</a>.</p></div>
+    </div>
+
+    <h2 class="sec" id="nav">Getting your bearings</h2>
+    <p class="sectitle">What each tab does</p>
+    <p>The dark bar across the top is always there. Here's every tab, plain and short.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top" style="height:52px;">
+              <span class="brand" data-anno="1" data-anno-pin="b" data-anno-arrow data-anno-color="blue">HERD</span>
+              <span class="nav">
+                <a class="active" data-anno="2" data-anno-pin="b" data-anno-arrow>Inventory</a>
+                <a>Templates</a>
+                <a data-anno="3" data-anno-pin="b" data-anno-arrow>Topology</a>
+                <a data-anno="4" data-anno-pin="t" data-anno-arrow>Reservations</a>
+                <a data-anno="5" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Reporting</a>
+                <a>Administration</a>
+              </span>
+              <span class="grow"></span>
+              <span class="right"><span class="bell" data-anno="6" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span class="dot">3</span></span><a>Settings</a><span class="u">you</span><a>Logout</a></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The top navigation.</b> Some tabs (Reporting, Administration) only appear if you're an admin.</p>
+    </figure>
+
+    <ol class="legend blue">
+      <li><b>HERD wordmark</b> &mdash; click it any time to get back to home base. Lost? Start here.</li>
+      <li><b>Inventory</b> &mdash; the catalogue of equipment you're allowed to see. Browse and search here.</li>
+      <li><b>Topology</b> &mdash; the drag-and-drop canvas where you draw how devices are wired together.</li>
+      <li><b>Reservations</b> &mdash; your bookings, and the calendar of everyone's bookings. This is where you claim gear.</li>
+      <li><b>Reporting</b> <span class="badge admin-only">admin only</span> &mdash; utilization numbers for leadership. If you don't see it, you're not an admin (that's fine).</li>
+      <li><b>The bell</b> &mdash; notifications about your reservations. The number is your unread count.</li>
+    </ol>
+
+    <h2 class="sec" id="next">Keep going</h2>
+    <p class="sectitle">Where to go next</p>
+    <p>You're in and oriented. The natural next step is to actually reserve something.</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <a class="gcard" href="user-reservations.html">
+        <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span>
+        <h3>Reserve your first equipment</h3>
+        <p>Pick devices, set a time window, and claim them. Read every status colour.</p>
+      </a>
+      <a class="gcard" href="user-topology.html">
+        <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><path d="M9 6h6a3 3 0 0 1 3 3v6"/></svg></span>
+        <h3>Build a topology</h3>
+        <p>Drag devices onto the canvas and wire them at L1/L2/L3.</p>
+      </a>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Quick start</p>
+      <div class="pagenav">
+        <a href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Home</a>
+        <a href="user-reservations.html">Reservations <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+import uuid
+from datetime import datetime
+
+from sqlalchemy import JSON, DateTime, Integer, String, Text, Uuid, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.config import settings
+from app.database import Base
+
+_schema = settings.db_schema or None
+
+
+class ExecutionRun(Base):
+    __tablename__ = "execution_runs"
+    __table_args__ = {"schema": _schema} if _schema else {}
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
+    driver_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    driver_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    reservation_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    input_params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    port_a: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    port_b: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

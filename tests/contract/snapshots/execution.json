@@ -1,0 +1,190 @@
+{
+  "paths": [
+    [
+      "POST",
+      "/device-check"
+    ],
+    [
+      "GET",
+      "/device-health"
+    ],
+    [
+      "GET",
+      "/device-health/{device_id}"
+    ],
+    [
+      "POST",
+      "/execute"
+    ],
+    [
+      "POST",
+      "/execute/internal"
+    ],
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "GET",
+      "/runs"
+    ],
+    [
+      "GET",
+      "/runs/{run_id}"
+    ],
+    [
+      "GET",
+      "/runs/{run_id}/commands"
+    ],
+    [
+      "POST",
+      "/runs/{run_id}/retry"
+    ]
+  ],
+  "schemas": {
+    "CommandLogEntry": {
+      "properties": {
+        "command": "string",
+        "created_at": "string",
+        "duration_ms": "anyOf",
+        "exit_status": "string",
+        "id": "string",
+        "response": "anyOf",
+        "run_id": "string",
+        "seq": "integer"
+      },
+      "required": [
+        "command",
+        "created_at",
+        "exit_status",
+        "id",
+        "run_id",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "DeviceCheckRequest": {
+      "properties": {
+        "device_id": "string",
+        "user_id": "string"
+      },
+      "required": [
+        "device_id",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "DeviceCheckResponse": {
+      "properties": {
+        "device_id": "string",
+        "error": "anyOf",
+        "output": "anyOf",
+        "run_id": "string",
+        "status": "string"
+      },
+      "required": [
+        "device_id",
+        "run_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "DeviceHealthStatusResponse": {
+      "properties": {
+        "consecutive_failures": "integer",
+        "device_id": "string",
+        "last_polled_at": "anyOf",
+        "last_run_id": "anyOf",
+        "last_status": "string",
+        "next_poll_at": "anyOf"
+      },
+      "required": [
+        "consecutive_failures",
+        "device_id",
+        "last_status"
+      ],
+      "type": "object"
+    },
+    "ExecutionRunResponse": {
+      "properties": {
+        "action": "string",
+        "completed_at": "anyOf",
+        "created_at": "string",
+        "device_id": "string",
+        "driver_id": "string",
+        "driver_sha256": "string",
+        "duration_ms": "anyOf",
+        "error": "anyOf",
+        "id": "string",
+        "input_params": "object",
+        "output": "anyOf",
+        "port_a": "anyOf",
+        "port_b": "anyOf",
+        "reservation_id": "anyOf",
+        "started_at": "anyOf",
+        "status": "string",
+        "user_id": "string"
+      },
+      "required": [
+        "action",
+        "created_at",
+        "device_id",
+        "driver_id",
+        "driver_sha256",
+        "id",
+        "input_params",
+        "status",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "ManualExecuteRequest": {
+      "properties": {
+        "action": "string",
+        "device_id": "string",
+        "dry_run": "boolean",
+        "method_kwargs": "anyOf",
+        "port_a": "anyOf",
+        "port_b": "anyOf",
+        "reservation_id": "anyOf",
+        "user_id": "string"
+      },
+      "required": [
+        "action",
+        "device_id",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "PaginatedDeviceHealthResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedExecutionRunResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    }
+  }
+}

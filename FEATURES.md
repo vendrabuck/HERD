@@ -1,0 +1,172 @@
+# HERD Features
+
+This document tracks what HERD currently supports and what is on the roadmap.
+For the big-picture story of why HERD exists, see [README.md](README.md). For
+architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+**Status legend:**
+
+- **Shipped**: implemented and on the main branch.
+- **Partial**: a working subset is shipped; further iterations are planned.
+- **Planned**: not yet started.
+
+---
+
+## Identity and access
+
+- **Local authentication** (Shipped): username and password auth with bcrypt-hashed
+  passwords and JWT issuance with refresh-token rotation.
+- **LDAP / Active Directory authentication** (Shipped): pluggable via `AUTH_METHOD=ldap`.
+  Users JIT-provision on first successful bind; superadmin accounts remain local
+  regardless of auth source.
+- **Three-role RBAC** (Shipped): user, admin, superadmin. See
+  [docs/ROLES.md](docs/ROLES.md).
+- **User groups** (Shipped): organize users into teams with bulk member management.
+- **Resource-level ACL grants** (Shipped): group-based view and manage grants on
+  topologies and reservations.
+- **Device group visibility** (Shipped): non-admin users only see devices in their
+  assigned groups.
+
+## Inventory
+
+- **Device and port templates** (Shipped): user-defined templates with typed custom
+  fields (string, number, boolean, dropdown, password) and per-field defaults.
+- **Driver packages** (Shipped): standalone driver entities classified by connection
+  type (Management, Layer 1/2/3 Switch). Stored on local filesystem by default;
+  MinIO/S3-compatible storage supported when configured.
+- **Exclusive vs non-exclusive flag** (Shipped): exclusive devices get conflict
+  detection; shared infrastructure (such as switches) can take concurrent
+  reservations.
+- **Bulk import and export** (Planned): CSV and JSON import-export for devices,
+  templates, and topologies. Targets migration between HERD instances and bulk
+  onboarding of existing inventory.
+
+## Topology
+
+- **Drag-and-drop topology editor** (Shipped): floating equipment palette with search,
+  template, and topology-type filters; Layer 1/2/3 connection creation with port
+  selection modals.
+- **Physical and cloud topology separation** (Shipped): physical and cloud devices
+  cannot be mixed in a single topology, enforced at database, service, and UI
+  layers.
+- **Topology versioning and history** (Shipped): every save creates a version with
+  preview, diff, and restore. Restore is blocked while an active reservation
+  references the topology.
+- **Topology cloning and reusable templates** (Shipped): clone an existing topology
+  as a starting point; promote a topology to a reusable template.
+- **Shortest-path cable routing** (Shipped): on-demand BFS (minimum-hop) pathfinding through
+  Layer 1 switch infrastructure, with visual feedback on the canvas (green stroke
+  and hop-count badge when a path exists, red stroke when not).
+- **Port cable validation** (Shipped): the editor warns about uncabled ports before
+  connections are created.
+
+## Reservations
+
+- **Conflict detection** (Shipped): time-window conflict checks for exclusive devices.
+- **Automatic expiration** (Shipped): pending reservations activate and active
+  reservations complete on schedule.
+- **Live editing** (Shipped): modify device lists, extend end times, and update
+  purpose on an active reservation.
+- **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,
+  status filters, and click-to-view details.
+
+## AI features
+
+- **LLM-driven topology generation** (Shipped): natural-language prompts plus
+  optional PDFs, tarballs, or text files generate topology proposals as ghost
+  nodes for human review. Accept transactionally creates the topology and books
+  the reservation, with optional per-device config push. Feature-gated by the
+  presence of an AI provider configuration.
+- **Reservation assistant** (Shipped): a multi-turn tool-use loop lets the
+  reservation owner ask read-only questions about a running reservation
+  (device state, config history, paths, recent executions) and, when
+  `AI_WRITE_TOOLS_ENABLED=true`, propose and schedule config changes through
+  the existing apply pipeline. Every AI-initiated apply defaults to a
+  dry-run that captures the commands the driver would emit; the frontend
+  shows the transcript in a confirmation modal so the user reviews and
+  confirms before any real apply runs. ACL widening lets reservation owners
+  manage their own reserved devices for the duration of the window. Drivers
+  must opt into dry-run via a `driver_metadata.json` declaring
+  `supports_dry_run: true`; the inventory schedule endpoint, AI tool, and
+  execution sandbox all refuse dry-runs against drivers that did not opt in.
+- **Pluggable LLM provider** (Shipped): decouple the AI features from a single
+  proprietary provider. Set `AI_PROVIDER=openai_compat` and `AI_BASE_URL` to
+  point HERD at any OpenAI-compatible chat-completions endpoint (vLLM, Ollama,
+  LM Studio, OpenAI, Azure OpenAI, or an internal gateway); set
+  `AI_PROVIDER=anthropic` to keep the Anthropic SDK path. Unlocks fully local
+  deployments on self-hosted inference. See
+  [docs/ENV_VARS.md](docs/ENV_VARS.md) for the full env-var reference and
+  vLLM tool-call parser flags.
+
+## Device configuration
+
+- **Per-device config versioning** (Shipped): list, detail, unified diff, and
+  restore of device configuration snapshots.
+- **Scheduled config apply** (Shipped): schedule a config push to fire when a linked
+  reservation goes active. Owner or admin can cancel while pending. Optional
+  dry-run mode runs the driver in simulation, captures the commands it would
+  have emitted, and returns them via `GET /api/execution/runs/{id}/commands`
+  for review before promotion to a real apply.
+- **Per-command execution transcripts** (Shipped): drivers can opt into a
+  per-command transcript via the in-process `record_command` helper. Rows
+  persist to `execution_command_log` with sequence, command bytes, response,
+  duration, and exit status (real or simulated). The transcript backs the AI
+  apply-confirmation modal and provides a queryable audit trail for any
+  driver execution.
+- **Health monitoring** (Shipped): on-demand device health checks via driver-defined
+  `login`, `status`, `logout` are shipped, as is periodic scheduled polling.
+  Admins set `poll_interval_seconds` per device or per template; the execution
+  service polls each opted-in device on its cadence and stores the snapshot
+  (HEALTHY, DEGRADED, UNREACHABLE, UNKNOWN). The device detail page shows a
+  colored health badge with the last-poll timestamp. Failures past a threshold
+  back off exponentially so unreachable devices do not flood the audit log.
+  When a device crosses the failure threshold or recovers, an in-app
+  notification fans out to all admins and to any users with an active
+  reservation on that device. The emit-on-Nth-failure rule provides natural
+  flap dedupe: a device that never accumulates threshold consecutive failures
+  generates no notifications.
+
+## Operations and observability
+
+- **Reporting and analytics** (Shipped): admin-only utilization dashboards by user,
+  device, topology type, day, and group, with CSV export.
+- **In-app notifications** (Partial): a durable NATS consumer turns reservation
+  lifecycle events into per-user in-app notifications, with per-user channel and
+  per-event opt-outs. Email, Slack, and webhook channels are planned.
+- **Structured JSON logging** (Shipped): every service emits JSON logs with request
+  middleware and business-event logging; per-service log level configurable.
+- **Config service** (Shipped): zero-database web UI for configuring HERD on first
+  start. Environment variables in `.env` continue to take precedence.
+
+## Integration
+
+- **External integration API and webhooks** (Planned): a stable external API for
+  CI/CD pipelines and test automation to reserve devices, build topologies, and
+  query availability, plus outbound webhooks for reservation and topology events.
+
+## Multi-tenancy
+
+- **Team workspaces** (Planned): organizational isolation where teams have their own
+  device pools, topologies, and reservations. Builds on resource-level ACL to
+  provide workspace-level boundaries with cross-workspace sharing when
+  explicitly granted.
+
+## Future considerations
+
+Longer-term ideas under exploration; not yet committed to a near-term slot.
+
+- **Federated lab support**: connect multiple HERD instances across geographically
+  distributed labs into a unified view.
+- **Hardware-in-the-loop simulation**: integrate virtual or simulated devices
+  alongside physical hardware in the same topology.
+- **Mobile-friendly interface**: list and table pages are responsive today;
+  dedicated mobile views for on-the-go reservation management are a future
+  consideration.
+- **Audit logging service**: comprehensive, tamper-evident audit trail of user
+  actions and system events for compliance and troubleshooting.
+- **Plugin and extension system**: allow third-party or internal extensions for
+  custom device drivers, validators, or workflow automations.
+
+---
+
+To suggest a new feature, open an issue.

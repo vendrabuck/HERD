@@ -1,0 +1,161 @@
+"""LDAP / Active Directory bind support for the auth service.
+
+Flow (when settings.auth_method == "ldap"):
+
+1. Open a connection to settings.ldap_server_url with TLS as configured.
+2. Bind as the service account (settings.ldap_bind_dn + bind_password).
+3. Search settings.ldap_user_base_dn with the configured filter to resolve the
+   full user DN and the email/username attributes.
+4. Open a second connection and bind as that user DN with the submitted
+   password. Success here is proof the password is correct.
+
+Blocking ldap3 calls are dispatched to a worker thread so they do not stall
+the event loop.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+import anyio
+from ldap3 import ALL, SIMPLE, SUBTREE, Connection, Server, Tls
+from ldap3.core.exceptions import LDAPException
+from ldap3.utils.conv import escape_filter_chars
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LdapIdentity:
+    username: str
+    email: str
+    dn: str
+
+
+def _build_server() -> Server:
+    use_tls = settings.ldap_use_tls
+    # ldap3 auto-negotiates TLS for ldaps:// URLs; for plain ldap:// with
+    # use_tls=True we rely on the Connection.start_tls() call below.
+    tls = Tls() if use_tls else None
+    return Server(settings.ldap_server_url, get_info=ALL, tls=tls)
+
+
+def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
+    """Service-account bind, then search for the user. Returns (dn, attrs) or None."""
+    server = _build_server()
+    conn = Connection(
+        server,
+        user=settings.ldap_bind_dn or None,
+        password=settings.ldap_bind_password or None,
+        authentication=SIMPLE if settings.ldap_bind_dn else None,
+        auto_bind=False,
+        read_only=True,
+    )
+    try:
+        if settings.ldap_use_tls and not settings.ldap_server_url.lower().startswith("ldaps://"):
+            conn.start_tls()
+        if not conn.bind():
+            logger.warning(
+                "LDAP service-account bind failed",
+                extra={"action": "ldap_bind_failure", "dn": settings.ldap_bind_dn},
+            )
+            return None
+        safe_username = escape_filter_chars(username)
+        search_filter = settings.ldap_user_filter.format(username=safe_username)
+        ok = conn.search(
+            search_base=settings.ldap_user_base_dn,
+            search_filter=search_filter,
+            search_scope=SUBTREE,
+            attributes=[
+                settings.ldap_email_attribute,
+                settings.ldap_username_attribute,
+            ],
+        )
+        if not ok or not conn.entries:
+            return None
+        entry = conn.entries[0]
+        attrs = {
+            settings.ldap_email_attribute: list(entry[settings.ldap_email_attribute].values)
+            if settings.ldap_email_attribute in entry
+            else [],
+            settings.ldap_username_attribute: list(entry[settings.ldap_username_attribute].values)
+            if settings.ldap_username_attribute in entry
+            else [],
+        }
+        return entry.entry_dn, attrs
+    finally:
+        conn.unbind()
+
+
+def _bind_as_user(user_dn: str, password: str) -> bool:
+    server = _build_server()
+    conn = Connection(
+        server,
+        user=user_dn,
+        password=password,
+        authentication=SIMPLE,
+        auto_bind=False,
+        read_only=True,
+    )
+    try:
+        if settings.ldap_use_tls and not settings.ldap_server_url.lower().startswith("ldaps://"):
+            conn.start_tls()
+        if not conn.bind():
+            return False
+        return True
+    finally:
+        try:
+            conn.unbind()
+        except Exception:
+            pass
+
+
+def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
+    if not settings.ldap_server_url or not settings.ldap_user_base_dn:
+        logger.error("LDAP not fully configured; bind aborted")
+        return None
+    if not password:
+        # LDAP anonymous bind succeeds with an empty password; reject early.
+        return None
+    try:
+        found = _search_user(username)
+        if found is None:
+            logger.info(
+                "LDAP user search returned no results",
+                extra={"action": "ldap_user_not_found", "username": username},
+            )
+            return None
+        user_dn, attrs = found
+        if not _bind_as_user(user_dn, password):
+            logger.warning(
+                "LDAP user bind failed (wrong password?)",
+                extra={"action": "ldap_bind_failure", "dn": user_dn},
+            )
+            return None
+
+        email_values = attrs.get(settings.ldap_email_attribute) or []
+        username_values = attrs.get(settings.ldap_username_attribute) or []
+        email = str(email_values[0]) if email_values else ""
+        ldap_username = str(username_values[0]) if username_values else username
+        if not email:
+            logger.warning(
+                "LDAP user has no email attribute; cannot provision HERD account",
+                extra={"action": "ldap_missing_email", "dn": user_dn},
+            )
+            return None
+        return LdapIdentity(username=ldap_username, email=email, dn=user_dn)
+    except LDAPException as exc:
+        logger.warning(
+            "LDAP error during bind: %s",
+            exc,
+            extra={"action": "ldap_error", "username": username},
+        )
+        return None
+
+
+async def bind_user(username: str, password: str) -> LdapIdentity | None:
+    """Verify the user's password against LDAP and return their identity, or None."""
+    return await anyio.to_thread.run_sync(_bind_user_sync, username, password)

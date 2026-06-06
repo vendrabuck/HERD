@@ -1,0 +1,65 @@
+{
+  "paths": [
+    [
+      "POST",
+      "/apply"
+    ],
+    [
+      "POST",
+      "/change-password"
+    ],
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "POST",
+      "/login"
+    ],
+    [
+      "GET",
+      "/schema"
+    ],
+    [
+      "GET",
+      "/settings"
+    ],
+    [
+      "PUT",
+      "/settings"
+    ],
+    [
+      "GET",
+      "/status"
+    ]
+  ],
+  "schemas": {
+    "ChangePasswordRequest": {
+      "properties": {
+        "new_password": "string"
+      },
+      "required": [
+        "new_password"
+      ],
+      "type": "object"
+    },
+    "LoginRequest": {
+      "properties": {
+        "password": "string"
+      },
+      "required": [
+        "password"
+      ],
+      "type": "object"
+    },
+    "SaveSettingsRequest": {
+      "properties": {
+        "values": "object"
+      },
+      "required": [
+        "values"
+      ],
+      "type": "object"
+    }
+  }
+}

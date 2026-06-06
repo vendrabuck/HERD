@@ -1,0 +1,66 @@
+# HERD Roadmap and Planned Features
+
+This document is the forward-looking companion to [FEATURES.md](FEATURES.md). FEATURES.md describes what HERD does today; this file lays out where it is going: planned work, design directions that are agreed but not yet built, and longer-range considerations.
+
+Each item is tagged with a status:
+
+- `Shipped`: implemented and on the main branch.
+- `Partial`: a first iteration is shipped; later iterations are planned.
+- `Planned`: scoped and intended, not yet built.
+- `Exploring`: a direction under consideration, not yet committed.
+
+HERD is a lab reservation and topology-management platform built as independent FastAPI services behind a single gateway, with a React topology editor, PostgreSQL per service, and NATS JetStream for events. The roadmap below is organized by theme rather than release.
+
+## Extensibility and plugins
+
+- `Shipped` Device driver system. A plugin model for device behavior: user-authored Python driver packages, classified by connection type (Management, Layer 1/2/3), that the execution service loads and invokes at reservation lifecycle events. Packages may declare their own dependencies and capability metadata (for example, dry-run support). Driver storage is the local filesystem by default, with an S3-compatible backend when configured.
+- `Shipped` Pluggable LLM provider. An `LLMProvider` interface with two backends selected by configuration: a hosted-API backend and an OpenAI-compatible backend that works against self-hosted inference servers and gateways. This makes fully on-premise, air-gapped AI deployments possible.
+- `Planned` Layer 3 routing driver contract. The Management and Layer 1/2 driver contracts are live. The Layer 3 contract (route add and remove operations) is documented as a planned interface and will be promoted to a first-class connection type.
+- `Planned` Driver-published configuration schemas. Today a central registry validates per-device configuration before it reaches a driver. The plan is to let each driver advertise its own configuration schema through the execution service, so adding a device type does not require a central change.
+- `Exploring` General extension system. A broader extension surface for third-party or internal add-ons: custom validators, workflow automations, and integrations beyond device drivers.
+
+## Identity, security, and compliance
+
+- `Shipped` LDAP / Active Directory authentication. A pluggable authentication method with just-in-time user provisioning on first bind and strict separation between local and directory-sourced identities.
+- `Shipped` Resource-level access control. Group-based view and manage grants on topologies and reservations, providing the foundation for multi-tenant isolation.
+- `Planned` SAML / OIDC single sign-on. A third authentication method alongside local and directory auth, for federated enterprise identity.
+- `Planned` Directory group mapping and sync. Mirror directory groups into HERD groups and periodically reconcile membership, including deactivating users removed upstream.
+- `Planned` Encrypted-at-rest credential store. An access-controlled secret store for credentials that future provisioning features require, with fields encrypted at rest. This is a prerequisite for dynamic resource provisioning.
+- `Exploring` Audit logging service. A comprehensive, tamper-evident trail of user actions and system events, aimed at troubleshooting and compliance reporting.
+- `Exploring` Compliance posture (including FedRAMP alignment). Longer-range hardening toward recognized control frameworks: the audit trail, SSO, encrypted secrets, and least-privilege access above are the building blocks. FedRAMP-style alignment is an aspirational target that would shape configuration defaults, logging, and access controls rather than a near-term deliverable.
+
+## Scale, operations, and reliability
+
+- `Planned` Durable event delivery (transactional outbox). Commit reservation lifecycle events to an outbox in the same database transaction as the state change, with idempotent consumers, so a messaging outage cannot silently drop provisioning or notification events. This is treated as a reliability prerequisite for a 1.0.
+- `Planned` Health monitoring at fleet scale. Building on shipped per-device health polling and alerting: configurable batch sizes, bounded concurrency, and event-driven tiered poll intervals (frequent for in-use devices, relaxed for idle ones), with an optional split between the API and the poller for larger fleets.
+- `Planned` Bulk import and export. CSV and JSON import and export for devices, templates, and topologies, to support bulk onboarding and migration between HERD instances.
+- `Planned` External integration API and webhooks. A stable external API surface for CI/CD and test-automation systems to reserve and release resources programmatically, plus outbound webhooks on lifecycle events.
+- `Planned` Multi-tenancy and team workspaces. Organizational isolation layered on the access-control service, so independent teams can share an instance without seeing each other's resources.
+- `Partial` Notification dispatch channels. In-app notifications are shipped; outbound channels (email, chat, webhook) and an upcoming-expiry reminder scheduler are planned.
+- `Shipped` Reporting and analytics. Administrative utilization dashboards by user, device, topology type, day, and group, with CSV export.
+- `Shipped` Structured logging baseline. Per-service structured JSON logs with request-scoped context; richer observability builds on this and the audit-trail work above.
+
+## AI capabilities
+
+- `Shipped` LLM-driven topology generation. Describe a lab in natural language; the model proposes a topology resolved against real, available inventory (never invented devices), rendered as a reviewable proposal before a transactional commit that creates the topology and reservation together, with optional per-device configuration.
+- `Shipped` AI reservation assistant. A multi-turn assistant scoped to a single reservation, with read-only inspection tools (device, ports, current and historical config, reachability, recent executions) that run under the caller's own permissions. Optional write tools, off by default, can propose and schedule configuration changes through the existing apply pipeline with a dry-run-then-confirm flow.
+- `Planned` AI-assisted service-recipe authoring. As dynamic provisioning matures, let the assistant draft automation recipes (for example, configuration playbooks) for an administrator to review and approve, rather than authoring them by hand.
+
+## Topology and resource modeling
+
+- `Planned` Network element objects. Place non-device elements on the canvas, such as a shared VLAN segment or an external cloud, with many-to-one connections, so a topology can model shared infrastructure rather than only point-to-point device links.
+- `Planned` Editable reservation topologies. Give each reservation an editable fork of its parent topology: edit loosely during the reservation, reconcile on save, and capture an immutable as-built record at teardown, so the master template stays clean while reservations evolve.
+- `Planned` Dynamic resources. A dynamic template type backed by registered hypervisors, where service recipes run as sandboxed jobs to bring a resource into existence when a reservation starts and tear it down at the end. This depends on the encrypted credential store above.
+- `Planned` First-class Layer 3 routing. Promote Layer 3 routing to a dedicated connection type with a decoupled configuration model, replacing the current minimal representation. An initial version is shipped.
+
+## Future considerations
+
+These are directions of interest that are not yet scoped:
+
+- Federated labs: connect multiple HERD instances into a unified, searchable view.
+- Hardware-in-the-loop: model virtual or simulated devices alongside physical hardware in the same topology.
+- Mobile-friendly interface: dedicated mobile views beyond the already-responsive list and table pages.
+
+## How this maps to today
+
+For the full list of shipped capabilities and how to use them, see [FEATURES.md](FEATURES.md), the [docs](docs/) directory (architecture, drivers, AI providers, roles, operations), and the hosted user manual linked from the README.

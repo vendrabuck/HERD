@@ -1,0 +1,882 @@
+{
+  "paths": [
+    [
+      "DELETE",
+      "/apply-jobs/{job_id}"
+    ],
+    [
+      "GET",
+      "/apply-jobs/{job_id}"
+    ],
+    [
+      "POST",
+      "/apply-jobs/{job_id}/confirm"
+    ],
+    [
+      "GET",
+      "/device-groups"
+    ],
+    [
+      "POST",
+      "/device-groups"
+    ],
+    [
+      "GET",
+      "/device-groups/device/{device_id}"
+    ],
+    [
+      "GET",
+      "/device-groups/visible-devices"
+    ],
+    [
+      "DELETE",
+      "/device-groups/{group_id}"
+    ],
+    [
+      "GET",
+      "/device-groups/{group_id}"
+    ],
+    [
+      "PUT",
+      "/device-groups/{group_id}"
+    ],
+    [
+      "POST",
+      "/device-groups/{group_id}/devices/bulk"
+    ],
+    [
+      "POST",
+      "/device-groups/{group_id}/devices/bulk-remove"
+    ],
+    [
+      "POST",
+      "/device-groups/{group_id}/permissions/bulk"
+    ],
+    [
+      "POST",
+      "/device-groups/{group_id}/permissions/bulk-remove"
+    ],
+    [
+      "GET",
+      "/devices"
+    ],
+    [
+      "POST",
+      "/devices"
+    ],
+    [
+      "GET",
+      "/devices/health-config"
+    ],
+    [
+      "DELETE",
+      "/devices/{device_id}"
+    ],
+    [
+      "GET",
+      "/devices/{device_id}"
+    ],
+    [
+      "PUT",
+      "/devices/{device_id}"
+    ],
+    [
+      "GET",
+      "/devices/{device_id}/apply-jobs"
+    ],
+    [
+      "GET",
+      "/devices/{device_id}/config-versions"
+    ],
+    [
+      "POST",
+      "/devices/{device_id}/config-versions"
+    ],
+    [
+      "GET",
+      "/devices/{device_id}/config-versions/diff"
+    ],
+    [
+      "GET",
+      "/devices/{device_id}/config-versions/{version_id}"
+    ],
+    [
+      "POST",
+      "/devices/{device_id}/config-versions/{version_id}/apply"
+    ],
+    [
+      "POST",
+      "/devices/{device_id}/config-versions/{version_id}/restore"
+    ],
+    [
+      "POST",
+      "/devices/{device_id}/config-versions/{version_id}/schedule"
+    ],
+    [
+      "GET",
+      "/devices/{device_id}/internal"
+    ],
+    [
+      "GET",
+      "/devices/{device_id}/ports"
+    ],
+    [
+      "POST",
+      "/devices/{device_id}/ports"
+    ],
+    [
+      "POST",
+      "/devices/{device_id}/ports/bulk"
+    ],
+    [
+      "POST",
+      "/devices/{device_id}/status"
+    ],
+    [
+      "GET",
+      "/drivers"
+    ],
+    [
+      "POST",
+      "/drivers"
+    ],
+    [
+      "DELETE",
+      "/drivers/{driver_id}"
+    ],
+    [
+      "GET",
+      "/drivers/{driver_id}"
+    ],
+    [
+      "PUT",
+      "/drivers/{driver_id}"
+    ],
+    [
+      "GET",
+      "/drivers/{driver_id}/download"
+    ],
+    [
+      "PUT",
+      "/drivers/{driver_id}/file"
+    ],
+    [
+      "GET",
+      "/drivers/{driver_id}/internal-download"
+    ],
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "DELETE",
+      "/ports/{port_id}"
+    ],
+    [
+      "GET",
+      "/ports/{port_id}"
+    ],
+    [
+      "PUT",
+      "/ports/{port_id}"
+    ],
+    [
+      "GET",
+      "/templates"
+    ],
+    [
+      "POST",
+      "/templates"
+    ],
+    [
+      "DELETE",
+      "/templates/{template_id}"
+    ],
+    [
+      "GET",
+      "/templates/{template_id}"
+    ],
+    [
+      "PUT",
+      "/templates/{template_id}"
+    ],
+    [
+      "GET",
+      "/templates/{template_id}/internal"
+    ]
+  ],
+  "schemas": {
+    "ApplyJobResponse": {
+      "properties": {
+        "author_name": "string",
+        "created_at": "string",
+        "created_by": "string",
+        "device_id": "string",
+        "dry_run": "boolean",
+        "error": "anyOf",
+        "fired_at": "anyOf",
+        "id": "string",
+        "reservation_id": "anyOf",
+        "run_id": "anyOf",
+        "scheduled_for": "string",
+        "status": "string",
+        "version_id": "string"
+      },
+      "required": [
+        "author_name",
+        "created_at",
+        "created_by",
+        "device_id",
+        "id",
+        "scheduled_for",
+        "status",
+        "version_id"
+      ],
+      "type": "object"
+    },
+    "ApplyJobScheduleRequest": {
+      "properties": {
+        "dry_run": "boolean",
+        "reservation_id": "anyOf",
+        "scheduled_for": "string"
+      },
+      "required": [
+        "scheduled_for"
+      ],
+      "type": "object"
+    },
+    "Body_create_new_driver_drivers_post": {
+      "properties": {
+        "connection_type": "string",
+        "description": "anyOf",
+        "file": "string",
+        "name": "string"
+      },
+      "required": [
+        "connection_type",
+        "file",
+        "name"
+      ],
+      "type": "object"
+    },
+    "Body_replace_driver_file_endpoint_drivers__driver_id__file_put": {
+      "properties": {
+        "file": "string"
+      },
+      "required": [
+        "file"
+      ],
+      "type": "object"
+    },
+    "BulkDeviceIds": {
+      "properties": {
+        "device_ids": "array"
+      },
+      "required": [
+        "device_ids"
+      ],
+      "type": "object"
+    },
+    "BulkPortCreate": {
+      "properties": {
+        "field_data": "object",
+        "instances": "integer",
+        "name_prefix": "string",
+        "starting_index": "integer",
+        "template_id": "string"
+      },
+      "required": [
+        "instances",
+        "name_prefix",
+        "starting_index",
+        "template_id"
+      ],
+      "type": "object"
+    },
+    "BulkRemoveResult": {
+      "properties": {
+        "not_found": "integer",
+        "removed": "integer"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "BulkResult": {
+      "properties": {
+        "added": "integer",
+        "skipped": "integer"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "BulkUserGroupIds": {
+      "properties": {
+        "user_group_ids": "array"
+      },
+      "required": [
+        "user_group_ids"
+      ],
+      "type": "object"
+    },
+    "DeviceConfigApplyResponse": {
+      "properties": {
+        "error": "anyOf",
+        "run_id": "anyOf",
+        "status": "string",
+        "version_id": "string"
+      },
+      "required": [
+        "status",
+        "version_id"
+      ],
+      "type": "object"
+    },
+    "DeviceConfigDiff": {
+      "properties": {
+        "diff": "string",
+        "version_a": "string",
+        "version_b": "string"
+      },
+      "required": [
+        "diff",
+        "version_a",
+        "version_b"
+      ],
+      "type": "object"
+    },
+    "DeviceConfigRestoreRequest": {
+      "properties": {
+        "description": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "DeviceConfigVersionCreate": {
+      "properties": {
+        "config": "object",
+        "description": "anyOf"
+      },
+      "required": [
+        "config"
+      ],
+      "type": "object"
+    },
+    "DeviceConfigVersionDetail": {
+      "properties": {
+        "author_name": "string",
+        "config": "object",
+        "connection_type": "string",
+        "created_at": "string",
+        "created_by": "string",
+        "description": "anyOf",
+        "device_id": "string",
+        "id": "string",
+        "last_apply_run_id": "anyOf",
+        "restored_from_id": "anyOf",
+        "version_number": "integer"
+      },
+      "required": [
+        "author_name",
+        "config",
+        "connection_type",
+        "created_at",
+        "created_by",
+        "device_id",
+        "id",
+        "version_number"
+      ],
+      "type": "object"
+    },
+    "DeviceConfigVersionResponse": {
+      "properties": {
+        "author_name": "string",
+        "connection_type": "string",
+        "created_at": "string",
+        "created_by": "string",
+        "description": "anyOf",
+        "device_id": "string",
+        "id": "string",
+        "last_apply_run_id": "anyOf",
+        "restored_from_id": "anyOf",
+        "version_number": "integer"
+      },
+      "required": [
+        "author_name",
+        "connection_type",
+        "created_at",
+        "created_by",
+        "device_id",
+        "id",
+        "version_number"
+      ],
+      "type": "object"
+    },
+    "DeviceCreate": {
+      "properties": {
+        "field_data": "object",
+        "name": "string",
+        "poll_interval_seconds": "anyOf",
+        "status": "#/components/schemas/DeviceStatus",
+        "template_id": "string",
+        "topology_type": "#/components/schemas/TopologyType"
+      },
+      "required": [
+        "name",
+        "template_id",
+        "topology_type"
+      ],
+      "type": "object"
+    },
+    "DeviceGroupCreate": {
+      "properties": {
+        "description": "anyOf",
+        "name": "string"
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "DeviceGroupDetailResponse": {
+      "properties": {
+        "created_at": "string",
+        "created_by": "anyOf",
+        "description": "anyOf",
+        "device_count": "integer",
+        "devices": "array",
+        "id": "string",
+        "modified_by": "anyOf",
+        "name": "string",
+        "updated_at": "string",
+        "user_group_count": "integer",
+        "user_groups": "array"
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "description",
+        "id",
+        "name",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "DeviceGroupDeviceResponse": {
+      "properties": {
+        "added_at": "string",
+        "device_id": "string",
+        "device_name": "anyOf",
+        "template_name": "anyOf"
+      },
+      "required": [
+        "added_at",
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "DeviceGroupMembershipResponse": {
+      "properties": {
+        "description": "anyOf",
+        "id": "string",
+        "name": "string",
+        "user_groups": "array"
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "DeviceGroupPermissionResponse": {
+      "properties": {
+        "assigned_at": "string",
+        "assigned_by": "anyOf",
+        "user_group_id": "string",
+        "user_group_name": "anyOf"
+      },
+      "required": [
+        "assigned_at",
+        "user_group_id"
+      ],
+      "type": "object"
+    },
+    "DeviceGroupResponse": {
+      "properties": {
+        "created_at": "string",
+        "created_by": "anyOf",
+        "description": "anyOf",
+        "device_count": "integer",
+        "id": "string",
+        "modified_by": "anyOf",
+        "name": "string",
+        "updated_at": "string",
+        "user_group_count": "integer"
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "description",
+        "id",
+        "name",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "DeviceGroupUpdate": {
+      "properties": {
+        "description": "anyOf",
+        "name": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "DeviceResponse": {
+      "properties": {
+        "connection_type": "anyOf",
+        "created_at": "string",
+        "created_by": "anyOf",
+        "created_by_name": "anyOf",
+        "driver_id": "anyOf",
+        "driver_name": "anyOf",
+        "exclusive": "boolean",
+        "field_data": "object",
+        "id": "string",
+        "modified_by": "anyOf",
+        "modified_by_name": "anyOf",
+        "name": "string",
+        "poll_interval_seconds": "anyOf",
+        "resolved_poll_interval_seconds": "anyOf",
+        "status": "#/components/schemas/DeviceStatus",
+        "template_icon": "anyOf",
+        "template_id": "string",
+        "template_model": "anyOf",
+        "template_name": "anyOf",
+        "template_part_number": "anyOf",
+        "template_vendor": "anyOf",
+        "topology_type": "#/components/schemas/TopologyType",
+        "updated_at": "string"
+      },
+      "required": [
+        "created_at",
+        "field_data",
+        "id",
+        "name",
+        "status",
+        "template_id",
+        "topology_type",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "DeviceStatus": {
+      "properties": {},
+      "required": [],
+      "type": "string"
+    },
+    "DeviceStatusUpdate": {
+      "properties": {
+        "status": "#/components/schemas/DeviceStatus"
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "DeviceUpdate": {
+      "properties": {
+        "field_data": "anyOf",
+        "name": "anyOf",
+        "poll_interval_seconds": "anyOf",
+        "status": "anyOf",
+        "topology_type": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "DriverPackageInfo": {
+      "properties": {
+        "connection_type": "string",
+        "created_at": "string",
+        "description": "anyOf",
+        "filename": "string",
+        "id": "string",
+        "modified_by": "anyOf",
+        "name": "string",
+        "sha256": "string",
+        "size_bytes": "integer",
+        "supports_dry_run": "boolean",
+        "updated_at": "string",
+        "uploaded_by": "string"
+      },
+      "required": [
+        "connection_type",
+        "created_at",
+        "filename",
+        "id",
+        "name",
+        "sha256",
+        "size_bytes",
+        "updated_at",
+        "uploaded_by"
+      ],
+      "type": "object"
+    },
+    "DriverUpdate": {
+      "properties": {
+        "connection_type": "anyOf",
+        "description": "anyOf",
+        "name": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "FieldDefinition": {
+      "properties": {
+        "default": "anyOf",
+        "key": "string",
+        "label": "string",
+        "options": "anyOf",
+        "required": "boolean",
+        "type": "string"
+      },
+      "required": [
+        "key",
+        "label",
+        "type"
+      ],
+      "type": "object"
+    },
+    "HealthConfigEntry": {
+      "properties": {
+        "device_id": "string",
+        "resolved_interval_seconds": "integer"
+      },
+      "required": [
+        "device_id",
+        "resolved_interval_seconds"
+      ],
+      "type": "object"
+    },
+    "PaginatedApplyJobs": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedDeviceConfigVersions": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedDeviceGroupResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedDeviceResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedDriverResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedTemplateResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PortCreate": {
+      "properties": {
+        "field_data": "object",
+        "name": "string",
+        "template_id": "string"
+      },
+      "required": [
+        "name",
+        "template_id"
+      ],
+      "type": "object"
+    },
+    "PortResponse": {
+      "properties": {
+        "created_at": "string",
+        "device_id": "string",
+        "exclusive": "boolean",
+        "field_data": "object",
+        "id": "string",
+        "name": "string",
+        "template_icon": "anyOf",
+        "template_id": "string",
+        "template_name": "anyOf",
+        "updated_at": "string"
+      },
+      "required": [
+        "created_at",
+        "device_id",
+        "field_data",
+        "id",
+        "name",
+        "template_id",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "PortUpdate": {
+      "properties": {
+        "field_data": "anyOf",
+        "name": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "SectionDefinition": {
+      "properties": {
+        "fields": "array",
+        "name": "string"
+      },
+      "required": [
+        "fields",
+        "name"
+      ],
+      "type": "object"
+    },
+    "TemplateCreate": {
+      "properties": {
+        "description": "anyOf",
+        "driver_id": "anyOf",
+        "exclusive": "boolean",
+        "icon": "anyOf",
+        "model": "anyOf",
+        "name": "string",
+        "part_number": "anyOf",
+        "poll_interval_seconds": "anyOf",
+        "sections": "array",
+        "template_type": "string",
+        "vendor": "anyOf"
+      },
+      "required": [
+        "name",
+        "sections"
+      ],
+      "type": "object"
+    },
+    "TemplateResponse": {
+      "properties": {
+        "connection_type": "anyOf",
+        "created_at": "string",
+        "description": "anyOf",
+        "driver_id": "anyOf",
+        "driver_name": "anyOf",
+        "exclusive": "boolean",
+        "icon": "anyOf",
+        "id": "string",
+        "model": "string",
+        "modified_by": "anyOf",
+        "name": "string",
+        "part_number": "anyOf",
+        "poll_interval_seconds": "anyOf",
+        "sections": "array",
+        "template_type": "string",
+        "updated_at": "string",
+        "vendor": "string"
+      },
+      "required": [
+        "created_at",
+        "description",
+        "exclusive",
+        "icon",
+        "id",
+        "model",
+        "name",
+        "sections",
+        "template_type",
+        "updated_at",
+        "vendor"
+      ],
+      "type": "object"
+    },
+    "TemplateUpdate": {
+      "properties": {
+        "description": "anyOf",
+        "driver_id": "anyOf",
+        "exclusive": "anyOf",
+        "icon": "anyOf",
+        "model": "anyOf",
+        "name": "anyOf",
+        "part_number": "anyOf",
+        "poll_interval_seconds": "anyOf",
+        "sections": "anyOf",
+        "vendor": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "TopologyType": {
+      "properties": {},
+      "required": [],
+      "type": "string"
+    }
+  }
+}

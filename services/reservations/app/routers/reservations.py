@@ -1,0 +1,416 @@
+import logging
+import uuid
+from datetime import datetime, timezone
+
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import and_, exists, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.database import get_db
+from app.dependencies.auth import get_current_user_payload, require_admin
+from app.models.reservation import Reservation, ReservationDevice, ReservationStatus
+from app.schemas.reservation import (
+    OwnsActiveResponse,
+    PaginatedReservationResponse,
+    ReservationCreate,
+    ReservationInternalStatus,
+    ReservationResponse,
+    ReservationUpdate,
+    UtilizationReport,
+)
+from app.services.reporting_service import (
+    build_utilization_report,
+    fetch_execution_run_count,
+    fetch_user_groups_map,
+    report_to_csv,
+    rollup_by_group,
+)
+from app.services.reservation_service import (
+    cancel_reservation,
+    create_reservation,
+    get_reservation,
+    list_calendar_reservations,
+    list_user_reservations,
+    release_reservation,
+    update_reservation,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["reservations"])
+bearer_scheme = HTTPBearer()
+
+
+@router.post("/", response_model=ReservationResponse, status_code=status.HTTP_201_CREATED)
+async def create_new_reservation(
+    body: ReservationCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    user_id = uuid.UUID(payload["sub"])
+    username = payload.get("username", "")
+    role = payload.get("role", "user")
+
+    # Non-admin users can only reserve visible devices
+    if role not in ("admin", "superadmin"):
+        visible = await _fetch_visible_device_ids(user_id, credentials.credentials)
+        if visible is not None:
+            invisible = [str(d) for d in body.device_ids if str(d) not in visible]
+            if invisible:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not have access to one or more requested devices",
+                )
+
+    nats_conn = getattr(request.app.state, "nats", None)
+    try:
+        reservation = await create_reservation(
+            db, body, user_id, credentials.credentials, nats_conn=nats_conn, username=username
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return reservation
+
+
+@router.get("/", response_model=PaginatedReservationResponse)
+async def get_my_reservations(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    user_id = uuid.UUID(payload["sub"])
+    reservations, total = await list_user_reservations(db, user_id, skip=skip, limit=limit)
+    return PaginatedReservationResponse(
+        items=reservations,
+        total=total,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/calendar", response_model=list[ReservationResponse])
+async def get_calendar_reservations(
+    range_start: datetime = Query(...),
+    range_end: datetime = Query(...),
+    status: list[ReservationStatus] | None = Query(None),
+    device_id: uuid.UUID | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    role = payload.get("role", "user")
+    visible_device_ids = None
+    if role not in ("admin", "superadmin"):
+        user_id = uuid.UUID(payload["sub"])
+        visible = await _fetch_visible_device_ids(user_id, credentials.credentials)
+        if visible is not None:
+            visible_device_ids = visible
+
+    return await list_calendar_reservations(
+        db,
+        range_start=range_start,
+        range_end=range_end,
+        status_filter=status,
+        device_id=device_id,
+        visible_device_ids=visible_device_ids,
+    )
+
+
+@router.get("/reports/utilization", response_model=UtilizationReport)
+async def get_utilization_report(
+    request: Request,
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+    status: list[ReservationStatus] | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
+):
+    status_filter = status if status else [ReservationStatus.COMPLETED]
+    try:
+        report = await build_utilization_report(db, start, end, status_filter)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    auth_header = request.headers.get("Authorization")
+    report.execution_run_count = await fetch_execution_run_count(start, end, auth_header)
+    user_ids = [b.user_id for b in report.by_user]
+    user_groups = await fetch_user_groups_map(user_ids, auth_header)
+    report.by_group = rollup_by_group(report.by_user, user_groups)
+    return report
+
+
+@router.get("/reports/utilization.csv")
+async def get_utilization_report_csv(
+    start: datetime = Query(...),
+    end: datetime = Query(...),
+    section: str = Query("user", pattern="^(user|device)$"),
+    status: list[ReservationStatus] | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
+):
+    status_filter = status if status else [ReservationStatus.COMPLETED]
+    try:
+        report = await build_utilization_report(db, start, end, status_filter)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    body = report_to_csv(report, section)
+    filename = f"utilization-{section}-{start.date().isoformat()}-to-{end.date().isoformat()}.csv"
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/internal/active", response_model=OwnsActiveResponse)
+async def owns_active_reservation_for_device(
+    user_id: uuid.UUID = Query(...),
+    device_id: uuid.UUID = Query(...),
+    x_internal_token: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Does this user own an ACTIVE reservation containing this device?
+
+    Internal-token-guarded service-to-service endpoint. Used by inventory's
+    widened ACL helper so a reservation owner without an explicit `manage`
+    grant on a device can still author and schedule configs against devices
+    in their own currently-active reservation. Returns owns_active=False on
+    any failure or absence; closed-by-default.
+
+    Device membership is an indexed EXISTS over reservation_devices; the
+    time-window check stays in Python so naive timestamps from the SQLite
+    test backend are normalized to UTC consistently with Postgres.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(Reservation).where(
+            Reservation.user_id == user_id,
+            Reservation.status == ReservationStatus.ACTIVE,
+            exists().where(
+                and_(
+                    ReservationDevice.reservation_id == Reservation.id,
+                    ReservationDevice.device_id == device_id,
+                )
+            ),
+        )
+    )
+    for reservation in result.scalars():
+        start = reservation.start_time
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        end = reservation.end_time
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start <= now <= end:
+            return OwnsActiveResponse(owns_active=True)
+    return OwnsActiveResponse(owns_active=False)
+
+
+@router.get("/internal/active-users", response_model=list[uuid.UUID])
+async def list_active_reservation_users_for_device(
+    device_id: uuid.UUID = Query(...),
+    x_internal_token: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+) -> list[uuid.UUID]:
+    """Return user_ids of every active reservation that includes this device.
+
+    Used by notifications (ROADMAP #13 iter 2) to fan out device health
+    transition events to anyone currently using the device. Device membership
+    is an indexed EXISTS over reservation_devices; the time-window check stays
+    in Python so naive SQLite timestamps normalize to UTC consistently.
+
+    Deduplicates: a user with multiple active reservations on the same
+    device appears once.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(Reservation).where(
+            Reservation.status == ReservationStatus.ACTIVE,
+            exists().where(
+                and_(
+                    ReservationDevice.reservation_id == Reservation.id,
+                    ReservationDevice.device_id == device_id,
+                )
+            ),
+        )
+    )
+    user_ids: set[uuid.UUID] = set()
+    for reservation in result.scalars():
+        start = reservation.start_time
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        end = reservation.end_time
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start <= now <= end:
+            user_ids.add(reservation.user_id)
+    return list(user_ids)
+
+
+@router.get("/internal/{reservation_id}", response_model=ReservationInternalStatus)
+async def get_reservation_internal_status(
+    reservation_id: uuid.UUID,
+    x_internal_token: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Internal status lookup for service-to-service callers (e.g., apply scheduler).
+
+    Guarded by X-Internal-Token. Returns status + is_active boolean (status ACTIVE
+    AND within window) so callers do not need to replicate active-window logic.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    reservation = await db.get(Reservation, reservation_id)
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    # SQLite (test backend) drops tzinfo; Postgres preserves it. Treat naive as UTC.
+    start = reservation.start_time
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    end = reservation.end_time
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    is_active = reservation.status == ReservationStatus.ACTIVE and start <= now <= end
+    return ReservationInternalStatus(
+        id=reservation.id,
+        status=reservation.status,
+        is_active=is_active,
+        start_time=start,
+        end_time=end,
+    )
+
+
+@router.get("/{reservation_id}", response_model=ReservationResponse)
+async def get_reservation_by_id(
+    reservation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    user_id = uuid.UUID(payload["sub"])
+    reservation = await get_reservation(db, reservation_id, user_id)
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    return reservation
+
+
+@router.patch("/{reservation_id}", response_model=ReservationResponse)
+async def update_reservation_by_id(
+    reservation_id: uuid.UUID,
+    body: ReservationUpdate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    """Update a reservation (end_time, purpose, device_ids). Owner only, ACTIVE/PENDING only."""
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+
+    # Non-admin users can only add visible devices
+    if body.device_ids is not None and role not in ("admin", "superadmin"):
+        visible = await _fetch_visible_device_ids(user_id, credentials.credentials)
+        if visible is not None:
+            invisible = [str(d) for d in body.device_ids if str(d) not in visible]
+            if invisible:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not have access to one or more requested devices",
+                )
+
+    nats_conn = getattr(request.app.state, "nats", None)
+    try:
+        reservation = await update_reservation(
+            db,
+            reservation_id,
+            user_id,
+            body,
+            token=credentials.credentials,
+            nats_conn=nats_conn,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    return reservation
+
+
+@router.delete("/{reservation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_reservation_by_id(
+    reservation_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    user_id = uuid.UUID(payload["sub"])
+    nats_conn = getattr(request.app.state, "nats", None)
+    reservation = await cancel_reservation(
+        db, reservation_id, user_id, token=credentials.credentials, nats_conn=nats_conn
+    )
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+
+@router.put("/{reservation_id}/release", response_model=ReservationResponse)
+async def release_reservation_early(
+    reservation_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    user_id = uuid.UUID(payload["sub"])
+    nats_conn = getattr(request.app.state, "nats", None)
+    reservation = await release_reservation(
+        db, reservation_id, user_id, token=credentials.credentials, nats_conn=nats_conn
+    )
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    return reservation
+
+
+async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] | None:
+    """Fetch visible device IDs for a user from the inventory service.
+
+    Forwards the caller's JWT: the inventory /device-groups/visible-devices
+    endpoint is JWT-guarded (not internal-token), so the bearer token is what
+    authenticates this call and lets inventory resolve the user's groups as the
+    real user. Returns None on a genuine transport error (fail-open, do not
+    restrict); a None from here means the visibility filter is skipped.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{settings.inventory_service_url}/device-groups/visible-devices",
+                params={"user_id": str(user_id)},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return set(data.get("device_ids", []))
+            logger.warning("visible-devices returned %s for user %s", resp.status_code, user_id)
+    except Exception:
+        logger.warning("Failed to fetch visible devices for user %s", user_id)
+    return None

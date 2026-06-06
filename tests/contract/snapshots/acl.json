@@ -1,0 +1,149 @@
+{
+  "paths": [
+    [
+      "POST",
+      "/check"
+    ],
+    [
+      "POST",
+      "/check/batch"
+    ],
+    [
+      "GET",
+      "/grants"
+    ],
+    [
+      "POST",
+      "/grants"
+    ],
+    [
+      "DELETE",
+      "/grants/{grant_id}"
+    ],
+    [
+      "GET",
+      "/grants/{grant_id}"
+    ],
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "GET",
+      "/resources"
+    ]
+  ],
+  "schemas": {
+    "BatchCheckRequest": {
+      "properties": {
+        "permission": "string",
+        "resource_ids": "array",
+        "resource_type": "string",
+        "user_id": "string"
+      },
+      "required": [
+        "permission",
+        "resource_ids",
+        "resource_type",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "BatchCheckResponse": {
+      "properties": {
+        "results": "object"
+      },
+      "required": [
+        "results"
+      ],
+      "type": "object"
+    },
+    "CheckRequest": {
+      "properties": {
+        "permission": "string",
+        "resource_id": "string",
+        "resource_type": "string",
+        "user_id": "string"
+      },
+      "required": [
+        "permission",
+        "resource_id",
+        "resource_type",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "CheckResponse": {
+      "properties": {
+        "allowed": "boolean",
+        "grants": "array"
+      },
+      "required": [
+        "allowed"
+      ],
+      "type": "object"
+    },
+    "GrantCreateRequest": {
+      "properties": {
+        "group_id": "string",
+        "permission": "string",
+        "resource_id": "string",
+        "resource_type": "string"
+      },
+      "required": [
+        "group_id",
+        "permission",
+        "resource_id",
+        "resource_type"
+      ],
+      "type": "object"
+    },
+    "GrantResponse": {
+      "properties": {
+        "granted_at": "string",
+        "granted_by": "anyOf",
+        "group_id": "string",
+        "id": "string",
+        "permission": "string",
+        "resource_id": "string",
+        "resource_type": "string"
+      },
+      "required": [
+        "granted_at",
+        "granted_by",
+        "group_id",
+        "id",
+        "permission",
+        "resource_id",
+        "resource_type"
+      ],
+      "type": "object"
+    },
+    "PaginatedGrantResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "ResourceRef": {
+      "properties": {
+        "resource_id": "string",
+        "resource_type": "string"
+      },
+      "required": [
+        "resource_id",
+        "resource_type"
+      ],
+      "type": "object"
+    }
+  }
+}

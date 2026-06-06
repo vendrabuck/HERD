@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: First-day setup (admin)</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html" class="active">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#order">The order that matters</a></li>
+      <li><a href="#roles">Who can do what</a></li>
+      <li><a href="#drivers">1 - Upload a driver</a></li>
+      <li><a href="#templates">2 - Create a template</a></li>
+      <li><a href="#devices">3 - Create devices</a></li>
+      <li><a href="#groups">4 - Device &amp; user groups</a></li>
+      <li><a href="#perms">5 - Grant permissions</a></li>
+    </ul>
+    <p class="eyebrow">Admin track</p>
+    <ul>
+      <li><a href="admin-setup.html" class="active">A - First-day setup</a></li>
+      <li><a href="admin-equipment.html">B - Equipment &amp; cabling</a></li>
+      <li><a href="admin-reporting.html">C - Reporting</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker admin">Admin track - Setup A</span>
+    <h1 class="title">First-day setup</h1>
+    <p class="dek">You logged in and everything is empty. That's not a bug &mdash; HERD ships with nothing in it, and the order you fill it matters. Follow this chain top to bottom and by the end your users can log in, see gear, and reserve it.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> Why nothing works until you do this</div>
+      <p>A device needs a template. A template needs a driver. A user can't see a device until their <em>user group</em> has permission on the device's <em>group</em>. Skip a link in that chain and the next thing looks broken. Do them in order and each one unblocks the next.</p>
+    </div>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>This guide assumes the platform is already installed and the config service has run its first-time bootstrap (the wrench-icon flow or env vars). If services are crash-looping or the login form is greyed out, that's an install problem &mdash; finish the fresh-setup / config-service step first, then come back here.</p></div>
+    </div>
+
+    <h2 class="sec" id="order">The map</h2>
+    <p class="sectitle">The order that matters</p>
+    <p>The whole chain, at a glance. Each box depends on the one before it.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:20px 0 8px;">
+      <span class="badge admin-only" style="font-size:13px;padding:6px 12px;">Driver</span>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      <span class="badge admin-only" style="font-size:13px;padding:6px 12px;">Template</span>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      <span class="badge admin-only" style="font-size:13px;padding:6px 12px;">Device</span>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      <span class="badge admin-only" style="font-size:13px;padding:6px 12px;">Device group</span>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      <span class="badge admin-only" style="font-size:13px;padding:6px 12px;">Grant permission</span>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      <span class="badge available" style="font-size:13px;padding:6px 12px;">Users can reserve</span>
+    </div>
+
+    <h2 class="sec" id="roles">Before you start</h2>
+    <p class="sectitle">Who can do what</p>
+    <p>Three roles. Most of this page is <span class="badge admin-only">admin</span> work; promoting people is <span class="badge" style="background:#faf5ff;color:var(--proposal)">superadmin</span> only.</p>
+    <div class="hd-card" style="margin:18px 0;">
+      <table class="hd-table">
+        <thead><tr><th>Task</th><th style="text-align:center">User</th><th style="text-align:center">Admin</th><th style="text-align:center">Superadmin</th></tr></thead>
+        <tbody>
+          <tr><td>Register, log in, reserve own gear</td><td style="text-align:center">&check;</td><td style="text-align:center">&check;</td><td style="text-align:center">&check;</td></tr>
+          <tr><td>Upload drivers, create templates &amp; devices</td><td style="text-align:center;color:var(--gray-300)">&mdash;</td><td style="text-align:center">&check;</td><td style="text-align:center">&check;</td></tr>
+          <tr><td>Create groups &amp; assign permissions</td><td style="text-align:center;color:var(--gray-300)">&mdash;</td><td style="text-align:center">&check;</td><td style="text-align:center">&check;</td></tr>
+          <tr><td>Promote / demote a user's role</td><td style="text-align:center;color:var(--gray-300)">&mdash;</td><td style="text-align:center;color:var(--gray-300)">&mdash;</td><td style="text-align:center">&check;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="sec" id="drivers">The chain</h2>
+    <p class="sectitle">Step 1 &middot; Upload a driver</p>
+    <p>A driver is a Python package that teaches HERD how to log into and configure a real piece of hardware. Templates point at drivers, so this comes first. Go to <b>Administration &rarr; Drivers</b> and click <b>Upload</b>.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>Upload driver</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-field"><label class="hd-label">Name</label><div class="hd-input" data-anno="1" data-anno-pin="r" data-anno-arrow>juniper-fw-mgmt</div><p class="hd-help">Unique. You'll pick this from templates later.</p></div>
+                <div class="hd-field"><label class="hd-label">Connection type</label><div class="hd-select" data-anno="2" data-anno-pin="r" data-anno-arrow>Management</div><p class="hd-help">Management = DUTs. Layer 1/2/3 Switch = infrastructure.</p></div>
+                <div class="hd-field"><label class="hd-label">Package file</label><div style="border:1px dashed var(--gray-300);border-radius:var(--radius-lg);padding:14px;text-align:center;color:var(--gray-400);font-size:13px;" data-anno="3" data-anno-pin="l" data-anno-arrow data-anno-color="blue">juniper-fw-mgmt.tar.gz</div><p class="hd-help">.zip or .tar.gz, up to 10 MB.</p></div>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Upload</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The driver upload dialog.</b></p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Name.</b> Unique and descriptive &mdash; e.g. <code>juniper-fw-mgmt</code>. Templates reference it by this name.</li>
+      <li><b>Connection type.</b> The big decision: <code>Management</code> for DUTs you reserve, or <code>Layer 1/2/3 Switch</code> for infrastructure.</li>
+      <li><b>The package.</b> A <code>.zip</code> or <code>.tar.gz</code> (&le; 10 MB). Validated on first use.</li>
+      <li><b>Upload.</b> Stored locally (or in object storage if configured).</li>
+    </ol>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Drivers are reference-counted: you can't delete one while a template points at it. Remove or repoint the template first.</p></div>
+    </div>
+
+    <p class="sectitle" id="templates">Step 2 &middot; Create a template</p>
+    <p>A template defines the fields a class of device carries and points at the driver that runs it. Go to <b>Templates &rarr; New template</b>.</p>
+    <div class="steps">
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">Pick the template type</h3><p><code>device</code> templates describe a class of device and <strong>must reference a driver</strong>. <code>port</code> templates describe a class of port and have no driver.</p></div></div>
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">For a device template, pick the driver and set <b>exclusive</b></h3><p>Exclusive (the default) = one reservation at a time. Turn it off for shared infrastructure that many reservations use at once.</p></div></div>
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">Fill in vendor &amp; model</h3><p>e.g. <code>Juniper Networks</code> / <code>EX2300</code>. These identity fields also let the AI assistant ground itself in real hardware. <b>Suggest with AI</b> can infer them from the name &mdash; review before saving.</p></div></div>
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">Add typed fields, then save</h3><p>Fields can be string / number / boolean / password / dropdown, with optional defaults. Password fields are masked and excluded from search.</p></div></div>
+    </div>
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><p>Editing a template later is fine, but <b>a new required field with no default breaks existing devices' validation</b>. Prefer adding optional fields.</p></div>
+    </div>
+
+    <p class="sectitle" id="devices">Step 3 &middot; Create your devices</p>
+    <p>Now make the actual equipment. <b>Inventory &rarr; Add device</b>, pick a template, fill in the field data. (Full walkthrough with ports and cabling is in <a href="admin-equipment.html">Equipment &amp; cabling</a>.)</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>New devices auto-join the seeded <code>No Pool</code> group so nothing is ever unassigned. You move them into real groups in the next step.</p></div>
+    </div>
+
+    <p class="sectitle" id="groups">Step 4 &middot; Device groups &amp; user groups</p>
+    <p>These two are the heart of visibility. A <strong>device group</strong> collects devices; a <strong>user group</strong> collects people. You then grant a user group permission on a device group.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal wide">
+              <div class="mhead"><h2>Device group - lab-a</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-transfer">
+                  <div class="hd-tlist"><div class="tlh">Available</div>
+                    <div class="tli"><span class="hd-glyph physical"></span>traffic-gen-03</div>
+                    <div class="tli"><span class="hd-glyph cloud"></span>client-vm-22</div>
+                  </div>
+                  <div class="hd-xfer" data-anno="1" data-anno-pin="t" data-anno-arrow><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></span></div>
+                  <div class="hd-tlist" data-anno="2" data-anno-pin="r" data-anno-arrow data-anno-color="blue"><div class="tlh">In group</div>
+                    <div class="tli"><span class="hd-glyph physical"></span>fw-edge-01</div>
+                    <div class="tli"><span class="hd-glyph physical"></span>fw-edge-02</div>
+                    <div class="tli"><span class="hd-glyph physical"></span>leaf-sw-09</div>
+                  </div>
+                </div>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="3" data-anno-pin="t" data-anno-arrow>Save group</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>Building a device group.</b> Move devices from Available into the group.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The transfer arrows.</b> Shuttle devices between Available and In group.</li>
+      <li><b>In group.</b> Adding a device here auto-removes it from <code>No Pool</code>. A device can live in several groups at once.</li>
+      <li><b>Save.</b> The group exists; now grant access to it (next step).</li>
+    </ol>
+    <p>User groups are symmetrical: <b>User Groups &rarr; New group</b>, add members, save. New registrations auto-join <code>Not Grouped</code> until you move them.</p>
+
+    <p class="sectitle" id="perms">Step 5 &middot; Grant permissions (the unlock)</p>
+    <p>This is the line that makes everything visible to users. On the device group, attach the user groups that should see it.</p>
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
+      <div><span class="ttl">The mental model</span><p>"Give user group <code>networking</code> access to device group <code>lab-a</code>" means <strong>every user in <code>networking</code> can now see and reserve every device in <code>lab-a</code></strong>. Once you save this, tell your users to reload &mdash; their empty inventory fills in. That's the moment HERD comes alive.</p></div>
+    </div>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>To take access away, <strong>remove the permission from the device group</strong> &mdash; don't yank the user out of their user group. Admins always see every device regardless of groups.</p></div>
+    </div>
+
+    <hr class="rule" />
+    <p class="sectitle">That's the whole chain</p>
+    <p>Driver &rarr; template &rarr; device &rarr; group &rarr; permission. Users can now reserve. Next, the detailed walkthrough for adding real equipment and recording how it's cabled.</p>
+
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <a class="gcard" href="admin-equipment.html"><span class="ix admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/></svg></span><h3>Equipment &amp; cabling</h3><p>Add a device with ports and record the physical connections.</p></a>
+      <a class="gcard" href="admin-reporting.html"><span class="ix admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="13" y="8" width="3" height="10"/></svg></span><h3>Utilization reporting</h3><p>Show leadership who used what, for how long.</p></a>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; First-day setup (admin)</p>
+      <div class="pagenav">
+        <a href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Home</a>
+        <a href="admin-equipment.html">Equipment &amp; cabling <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

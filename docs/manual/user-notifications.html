@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Notifications &amp; settings</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#bell">The bell</a></li>
+      <li><a href="#panel">The notifications panel</a></li>
+      <li><a href="#settings">Tuning what you get</a></li>
+      <li><a href="#profile">Profile &amp; password</a></li>
+    </ul>
+    <p class="eyebrow">User track</p>
+    <ul>
+      <li><a href="quickstart.html">1 - First boot</a></li>
+      <li><a href="user-reservations.html">2 - Reservations</a></li>
+      <li><a href="user-topology.html">3 - Topology</a></li>
+      <li><a href="user-ai.html">4 - Generate with AI</a></li>
+      <li><a href="user-notifications.html" class="active">5 - Notifications</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker user">User track - Step 5</span>
+    <h1 class="title">Notifications &amp; settings</h1>
+    <p class="dek">The bell keeps you posted on your reservations. Out of the box it tells you everything; this page shows you how to make it tell you only what you care about &mdash; and where to change your account basics.</p>
+
+    <h2 class="sec" id="bell">Top-right corner</h2>
+    <p class="sectitle">The bell</p>
+    <p>The bell lives in the header. The red number is your unread count; it refreshes every 30 seconds while you're signed in.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top" style="height:52px;"><span class="brand">HERD</span><span class="nav"><a class="active">Inventory</a><a>Topology</a><a>Reservations</a></span><span class="grow"></span>
+              <span class="right"><span class="bell" data-anno="1" data-anno-pin="b" data-anno-arrow data-anno-shape="ellipse" data-anno-pad="9"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span class="dot">3</span></span><a data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">Settings</a><span class="u">sara.k</span><a>Logout</a></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The header bell and Settings link.</b></p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The bell.</b> Ticks up whenever a reservation you own is created, updated, cancelled, or completed. Click it to open the panel.</li>
+      <li><b>Settings.</b> Where you turn the noise up or down. Also reachable from inside the bell panel.</li>
+    </ol>
+
+    <h2 class="sec" id="panel">What's in there</h2>
+    <p class="sectitle">The notifications panel</p>
+    <p>Click the bell to open a panel of your latest 20 notifications.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd" style="padding:26px;display:flex;justify-content:center;background:var(--gray-100);">
+            <div class="hd-notif">
+              <div class="nh"><b>Notifications</b><span style="font-size:12px;color:var(--blue-600);font-weight:500;" data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue">Mark all read</span></div>
+              <div class="ni unread"><span class="ndot"></span><div><div class="ntext"><b>f1a2b3c4</b> is now ACTIVE.</div><div class="ntime">2 minutes ago</div></div></div>
+              <div class="ni unread" data-anno="1" data-anno-pin="l" data-anno-arrow><span class="ndot"></span><div><div class="ntext">Reservation <b>a9b8c7d6</b> confirmed.</div><div class="ntime">1 hour ago</div></div></div>
+              <div class="ni read"><span class="ndot"></span><div><div class="ntext"><b>deadbeef</b> completed; devices released.</div><div class="ntime">Yesterday</div></div></div>
+              <div style="padding:10px 16px;text-align:center;font-size:12px;color:var(--blue-600);font-weight:500;" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Settings</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The bell panel.</b> Blue-tinted rows are unread.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>A notification.</b> Click the dot to mark one read, or use the row controls to delete it.</li>
+      <li><b>Mark all read.</b> Clears the unread count in one shot.</li>
+      <li><b>Settings.</b> Jumps straight to the notifications settings (same as the header link).</li>
+    </ol>
+
+    <h2 class="sec" id="settings">Making it quieter (or louder)</h2>
+    <p class="sectitle">Tuning what you get</p>
+    <p>From <b>Settings</b>, open the Notifications section. Two levels of control:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/settings</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><a class="active" style="color:#fff">Settings</a><span class="u">sara.k</span></span></div>
+            <div class="hd-body">
+              <div class="hd-h1">Settings</div>
+              <div class="hd-card" style="max-width:560px;">
+                <div class="head">Notifications</div>
+                <div style="padding:16px 18px;">
+                  <div class="hd-toggle on" data-anno="1" data-anno-pin="r" data-anno-arrow style="justify-content:space-between;width:100%;flex-direction:row-reverse;"><span class="sw"></span><span style="font-weight:500;color:var(--gray-700)">Show in-app notifications</span></div>
+                  <p class="hd-help" style="margin:6px 0 16px;">The master switch. Off = the bell goes silent but keeps history.</p>
+                  <div style="border-top:1px solid var(--gray-100);padding-top:14px;" data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
+                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation confirmed</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation updated</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--gray-300);border-radius:4px"></span> Reservation cancelled</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation completed</div>
+                  </div>
+                  <div style="margin-top:14px;"><span class="hd-btn primary sm" data-anno="3" data-anno-pin="t" data-anno-arrow>Save</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The Notifications settings.</b> Master switch on top, per-event checkboxes below.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Show in-app notifications.</b> The master toggle. Turn it off to silence the bell entirely without deleting your history.</li>
+      <li><b>Per-event checkboxes.</b> Opt out of individual event types. Anything unchecked stops arriving; missing entries default to on.</li>
+      <li><b>Save.</b> Applies to new events immediately &mdash; no restart, no reload.</li>
+    </ol>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>LDAP and local accounts share the same notification prefs &mdash; they live in your HERD profile, not in your company directory.</p></div>
+    </div>
+
+    <h2 class="sec" id="profile">Account basics</h2>
+    <p class="sectitle">Profile &amp; password</p>
+    <ul class="list">
+      <li>Your profile holds the basics: email, username, role, and group memberships.</li>
+      <li><b>Changing your password:</b> use the profile page if your version exposes it. <strong>LDAP users change it in the company directory</strong> &mdash; HERD doesn't store one for you.</li>
+      <li><b>Forgot your password?</b> There's no self-serve reset today. Contact an admin.</li>
+    </ul>
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
+      <div><p>Your Inventory filters and page-size choices are already saved automatically &mdash; no setting needed. Set them once and they stick.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Notifications &amp; settings</p>
+      <div class="pagenav">
+        <a href="user-ai.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Generate with AI</a>
+        <a href="admin-setup.html">Admin setup <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

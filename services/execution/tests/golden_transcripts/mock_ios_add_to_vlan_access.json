@@ -1,0 +1,36 @@
+{
+  "driver": "mock_ios",
+  "action": "add_to_vlan",
+  "method_kwargs": {
+    "port": "GigabitEthernet0/2",
+    "vlan_id": 200,
+    "tag": "access"
+  },
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "interface GigabitEthernet0/2",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 2,
+      "command": "switchport mode access",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 3,
+      "command": "switchport access vlan 200",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 4,
+      "command": " exit",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

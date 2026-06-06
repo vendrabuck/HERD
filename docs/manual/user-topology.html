@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Building a topology</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html" class="active">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#open">Opening the editor</a></li>
+      <li><a href="#palette">The equipment palette</a></li>
+      <li><a href="#drag">Adding devices</a></li>
+      <li><a href="#connect">Drawing connections</a></li>
+      <li><a href="#edges">Red vs green edges</a></li>
+      <li><a href="#save">Saving &amp; history</a></li>
+    </ul>
+    <p class="eyebrow">User track</p>
+    <ul>
+      <li><a href="quickstart.html">1 - First boot</a></li>
+      <li><a href="user-reservations.html">2 - Reservations</a></li>
+      <li><a href="user-topology.html" class="active">3 - Topology</a></li>
+      <li><a href="user-ai.html">4 - Generate with AI</a></li>
+      <li><a href="user-notifications.html">5 - Notifications</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker user">User track - Step 3</span>
+    <h1 class="title">Building a topology</h1>
+    <p class="dek">The topology editor is a canvas where you draw how your lab is wired: drag devices on, connect them, and HERD checks every link against the real physical cabling. It's the signature feature &mdash; and it's less scary than it looks.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> What a topology is, in one breath</div>
+      <p>A saved diagram of which devices are connected to which, at which network layer. You build it once, then hand it to a reservation. Green links mean "this path physically exists." Red links mean "it doesn't &mdash; fix it before you reserve."</p>
+    </div>
+
+    <h2 class="sec" id="open">Getting there</h2>
+    <p class="sectitle">Opening the editor</p>
+    <p>Click <b>Topology</b> in the nav, then either pick a saved topology or hit <b>New topology</b>. You land on a dotted canvas with a floating palette in the corner and a toolbar across the top.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/topology</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a class="active">Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><span class="u">sara.k</span></span></div>
+            <div class="hd-canvas-toolbar">
+              <span class="lab">Edge layer:</span>
+              <span class="hd-seg" data-anno="3" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><span>L1</span><span class="active">L2</span><span>L3</span></span>
+              <span class="hd-btn ai sm" data-anno="4" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="3.5"/></svg> Use AI</span>
+              <span style="flex:1"></span>
+              <span class="hd-btn ghost sm" data-anno="5" data-anno-pin="b" data-anno-arrow>Reserve Topology (2)</span>
+              <span class="hd-btn danger sm">Clear canvas</span>
+            </div>
+            <div class="hd-canvas">
+              <script type="application/json" class="hd-edges">
+                [{"from":"#tn1","to":"#tn3","layer":"l2"},
+                 {"from":"#tn2","to":"#tn3","layer":"l2"},
+                 {"from":"#tn3","to":"#tn4","layer":"l1"},
+                 {"from":"#tn4","to":"#tn5","layer":"l3"}]
+              </script>
+              <div class="hd-palette" data-anno="1" data-anno-pin="r" data-anno-arrow data-anno-color="blue" data-anno-pad="4">
+                <div class="ph">Equipment <span class="min">&minus;</span></div>
+                <div class="pbody">
+                  <div class="psearch">Search&hellip;</div>
+                  <div class="hd-pdev"><span class="gl"></span><div><div class="pn">dut-server-14</div><div class="pt">Dell R760</div></div></div>
+                  <div class="hd-pdev"><span class="gl"></span><div><div class="pn">traffic-gen-03</div><div class="pt">Ixia XGS12</div></div></div>
+                </div>
+              </div>
+              <div class="hd-node sel" id="tn1" style="left:255px;top:60px;" data-anno="2" data-anno-pin="t" data-anno-arrow>
+                <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-01</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Generic FW-600</div>
+              </div>
+              <div class="hd-node sel" id="tn2" style="left:255px;top:300px;">
+                <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-02</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Generic FW-600</div>
+              </div>
+              <div class="hd-node" id="tn3" style="left:460px;top:180px;">
+                <span class="handle l"></span><span class="handle r"></span><div class="gl"></div><div class="nm">l1-patch-mux</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">MRV L1 Switch</div>
+              </div>
+              <div class="hd-node" id="tn4" style="left:665px;top:60px;">
+                <span class="handle l"></span><span class="handle b"></span><div class="gl"></div><div class="nm">leaf-sw-09</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Arista 7050X</div>
+              </div>
+              <div class="hd-node" id="tn5" style="left:665px;top:300px;">
+                <span class="handle t"></span><div class="gl"></div><div class="nm">dut-server-14</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Dell R760</div>
+              </div>
+              <span class="hd-elabel" style="left:360px;top:108px;"><span class="layer l2">L2</span><span class="port">eth1/1 - ge-0</span></span>
+              <span class="hd-elabel" style="left:360px;top:255px;"><span class="layer l2">L2</span><span class="port">eth1/1 - ge-1</span></span>
+              <span class="hd-elabel" style="left:600px;top:120px;"><span class="layer l1">L1</span><span class="hops">2 hops</span></span>
+              <span class="hd-elabel" style="left:739px;top:255px;"><span class="layer l3">L3</span><span class="hops">1 hop</span></span>
+              <div class="hd-zoom"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></span></div>
+              <div class="hd-minimap"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The topology editor.</b> A working canvas with five devices, L1/L2/L3 links, and live hop counts.</p>
+    </figure>
+
+    <ol class="legend blue">
+      <li><b>The equipment palette.</b> Your draggable devices. Covered next.</li>
+      <li><b>A device node.</b> One piece of equipment on the canvas. A yellow ring means it's selected.</li>
+      <li><b>Edge-layer switch (L1 / L2 / L3).</b> Sets which layer new connections are drawn at, and which layer's edges are highlighted.</li>
+      <li><b>Use AI.</b> Describe a lab and let Claude propose the wiring. Only appears if your admin enabled it &mdash; see the <a href="user-ai.html">AI guide</a>.</li>
+      <li><b>Reserve Topology.</b> Turns this diagram into a reservation. Disabled while any edge is red.</li>
+    </ol>
+
+    <h2 class="sec" id="palette">Your parts bin</h2>
+    <p class="sectitle">The equipment palette</p>
+    <p>The floating panel in the corner lists every DUT (Management-type device) you can see. Drag it by its title bar; collapse it with the <code>&minus;</code>.</p>
+    <ul class="list">
+      <li><b>Only DUTs appear here.</b> Infrastructure switches (L1/L2/L3) are wired in automatically by the routing system &mdash; you never drag them by hand.</li>
+      <li><b>Already-reserved exclusive devices are hidden</b> by default. Flip <b>Show reserved resources</b> to include them.</li>
+      <li><b>Devices already on the canvas disappear</b> from the palette. Delete a node and it comes back.</li>
+      <li><b>Search</b> matches device name and field values (passwords and <code>login</code> fields excluded).</li>
+    </ul>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">Palette completely empty?</span><p>You have no device visibility yet. That's the same permissions gap from <a href="quickstart.html#empty">first boot</a> &mdash; ask an admin to add your user group to a device group, then reload.</p></div>
+    </div>
+
+    <h2 class="sec" id="drag">Putting gear down</h2>
+    <p class="sectitle">Adding devices</p>
+    <div class="steps">
+      <div class="stepblock"><div class="stepbody"><h3 class="step">Drag a device card from the palette onto the canvas</h3><p>It drops in as a node with its name, a small type glyph, and a <span class="badge physical">PHYSICAL</span> or <span class="badge cloud">CLOUD</span> badge.</p></div></div>
+      <div class="stepblock"><div class="stepbody"><h3 class="step">Drag the node to position it</h3><p>Layout is yours. Positions are saved with the topology, so it reopens exactly as you left it.</p></div></div>
+      <div class="stepblock"><div class="stepbody"><h3 class="step">Dropping the same device twice does nothing</h3><p>HERD silently prevents duplicates &mdash; one node per device, always.</p></div></div>
+    </div>
+
+    <div class="callout danger">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6M9 9l6 6"/></svg></span>
+      <div><span class="ttl">"Can't drop the device here"</span><p>You're trying to mix a <span class="badge physical">PHYSICAL</span> device with a <span class="badge cloud">CLOUD</span> one in the same topology. HERD won't allow it &mdash; physical and cloud can't share a diagram. Make a separate topology for each type.</p></div>
+    </div>
+
+    <h2 class="sec" id="connect">Wiring it up</h2>
+    <p class="sectitle">Drawing connections</p>
+    <p>Drag from one device's handle (the little dot on its edge) to another's. A connection dialog opens.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>New connection</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-field"><label class="hd-label">Layer</label>
+                  <div class="hd-seg" data-anno="1" data-anno-pin="r" data-anno-arrow style="display:flex;"><span>L1</span><span class="active">L2</span><span>L3</span></div>
+                  <p class="hd-help">L1 = physical cabling - L2 = Ethernet/VLAN - L3 = IP/routing.</p>
+                </div>
+                <div class="hd-row2">
+                  <div class="hd-field"><label class="hd-label">Port on fw-edge-01</label><div class="hd-select" data-anno="2" data-anno-pin="b" data-anno-arrow>eth1/1</div></div>
+                  <div class="hd-field"><label class="hd-label">Port on l1-patch-mux</label><div class="hd-select">ge-0 <span style="color:var(--warn-fg)">(no cable)</span></div></div>
+                </div>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="3" data-anno-pin="t" data-anno-arrow>Create</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The connection dialog.</b> Pick a layer, a port on each end, and create.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Layer.</b> What kind of link this is. L2 and L3 are logical overlays; they still need a real physical path underneath to count.</li>
+      <li><b>Port on each device.</b> The dropdowns list every port. A <code>(no cable)</code> suffix warns that the port has no physical cabling recorded &mdash; pick another or it'll go red.</li>
+      <li><b>Create.</b> Adds the edge. HERD immediately checks it against the cabling graph and colours it.</li>
+    </ol>
+
+    <h2 class="sec" id="edges">The part everyone asks about</h2>
+    <p class="sectitle">Red vs green edges</p>
+    <p>Every edge gets checked against the real physical cabling. The badge on the edge tells you the verdict. Here's the full vocabulary:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-canvas" style="height:300px;">
+              <script type="application/json" class="hd-edges">
+                [{"from":"#en1","to":"#en2","layer":"l1","status":"ok"},
+                 {"from":"#en3","to":"#en4","layer":"l1","status":"nopath"}]
+              </script>
+              <div class="hd-node" id="en1" style="left:60px;top:120px;width:120px;"><span class="handle r"></span><div class="gl"></div><div class="nm">dut-a</div></div>
+              <div class="hd-node" id="en2" style="left:300px;top:120px;width:120px;"><span class="handle l"></span><div class="gl"></div><div class="nm">dut-b</div></div>
+              <div class="hd-node" id="en3" style="left:480px;top:60px;width:120px;"><span class="handle r"></span><div class="gl"></div><div class="nm">site-1-dut</div></div>
+              <div class="hd-node" id="en4" style="left:720px;top:180px;width:120px;"><span class="handle l"></span><div class="gl"></div><div class="nm">site-2-dut</div></div>
+              <span class="hd-elabel" style="left:240px;top:120px;"><span class="hops">3 hops</span></span>
+              <span class="hd-elabel" style="left:625px;top:120px;"><span class="nopath">no path</span></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>Left:</b> a valid link &mdash; a real route exists. <b>Right:</b> no physical path between two isolated DUTs.</p>
+    </figure>
+
+    <div class="hd-card" style="margin:22px 0;">
+      <table class="hd-table">
+        <thead><tr><th>What you see</th><th>What it means</th><th>What to do</th></tr></thead>
+        <tbody>
+          <tr><td><span style="color:var(--path-valid);font-weight:600;">Green + "N hops"</span></td><td>A route exists through the switch infrastructure. N is the hop count.</td><td>Nothing &mdash; you're good.</td></tr>
+          <tr><td><span style="color:var(--path-error);font-weight:600;">Red + "no path"</span></td><td>No route between the two devices. They're in isolated fabrics, or switches between them are missing from inventory.</td><td>See callout below.</td></tr>
+          <tr><td><span style="color:var(--path-error);font-weight:600;">Red + "uncabled port"</span></td><td>One of the chosen ports has no physical cable recorded. Beats the path check.</td><td>Pick a cabled port, or ask an admin to record the cabling.</td></tr>
+          <tr><td><span style="color:var(--gray-400);font-weight:600;">No badge yet</span></td><td>The check is still resolving.</td><td>Wait a beat; it'll settle.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout danger">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">A red edge blocks reservation</span><p>The <b>Reserve Topology</b> button is disabled while <em>any</em> edge is red &mdash; and the server enforces the same rule, so you can't sneak past it via the API. A red L1 edge usually means no physical cabling connects the two DUTs, or the switches between them aren't in inventory. Both are an <strong>admin cabling fix</strong>, covered in <a href="admin-equipment.html#cabling">Cabling things up</a>.</p></div>
+    </div>
+
+    <div class="accordion">
+      <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">I need a link between two physically isolated labs</span><span class="hint">advanced</span></summary>
+      <div class="acc-body">
+        <p>For something like an MPLS tunnel between two sites that share no cabling, add a <strong>virtual device representing the tunnel</strong> and cable it into both fabrics (in the cabling service). The validator then sees a real path and the edge goes green. This is an admin task.</p>
+      </div>
+    </div>
+
+    <h2 class="sec" id="save">Keeping your work</h2>
+    <p class="sectitle">Saving &amp; version history</p>
+    <div class="steps">
+      <div class="stepblock"><div class="stepbody"><h3 class="step">Click <b>Save</b> in the toolbar</h3><p>The first save asks for a topology name. After that, Save just updates it.</p></div></div>
+      <div class="stepblock"><div class="stepbody"><h3 class="step">Every meaningful save is a new version</h3><p>Open the <b>History</b> sidebar to see the list (newest first) with author and timestamp. <b>Preview</b> any version read-only; <b>Compare</b> two to see Added / Removed / Modified; <b>Restore</b> to roll back.</p></div></div>
+    </div>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p><b>Restore is blocked</b> while an active or pending reservation still references the topology. Cancel or wait for it to release, then restore.</p></div>
+    </div>
+
+    <div class="accordion">
+      <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Keyboard &amp; mouse cheat sheet</span></summary>
+      <div class="acc-body">
+        <ul class="list">
+          <li><b>Pan:</b> drag empty canvas</li>
+          <li><b>Select:</b> click a node - <b>Multi-select:</b> shift-click or drag a box</li>
+          <li><b>Delete selected:</b> <kbd>Delete</kbd> or <kbd>Backspace</kbd></li>
+          <li><b>Connect:</b> drag from a node handle to another node</li>
+          <li><b>Zoom:</b> mouse wheel, or the <kbd>+</kbd> / <kbd>&minus;</kbd> buttons by the minimap</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Building a topology</p>
+      <div class="pagenav">
+        <a href="user-reservations.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Reservations</a>
+        <a href="user-ai.html">Generate with AI <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

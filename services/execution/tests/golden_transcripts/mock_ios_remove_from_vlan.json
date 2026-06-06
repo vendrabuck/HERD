@@ -1,0 +1,29 @@
+{
+  "driver": "mock_ios",
+  "action": "remove_from_vlan",
+  "method_kwargs": {
+    "port": "GigabitEthernet0/1",
+    "vlan_id": 100
+  },
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "interface GigabitEthernet0/1",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 2,
+      "command": "switchport trunk allowed vlan remove 100",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 3,
+      "command": " exit",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

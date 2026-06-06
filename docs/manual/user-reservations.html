@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Reserving equipment</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html" class="active">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#list">Your reservations list</a></li>
+      <li><a href="#create">Create a reservation</a></li>
+      <li><a href="#status">Reading the status colours</a></li>
+      <li><a href="#exclusive">Exclusive vs shared</a></li>
+      <li><a href="#detail">The detail modal</a></li>
+      <li><a href="#calendar">The calendar</a></li>
+    </ul>
+    <p class="eyebrow">User track</p>
+    <ul>
+      <li><a href="quickstart.html">1 - First boot</a></li>
+      <li><a href="user-reservations.html" class="active">2 - Reservations</a></li>
+      <li><a href="user-topology.html">3 - Topology</a></li>
+      <li><a href="user-ai.html">4 - Generate with AI</a></li>
+      <li><a href="user-notifications.html">5 - Notifications</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker user">User track - Step 2</span>
+    <h1 class="title">Reserving equipment</h1>
+    <p class="dek">A reservation is a time-boxed claim on one or more devices. Making one is how you say "this gear is mine from Tuesday to Friday." This is the single most common thing you'll do in HERD.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The one-sentence version</div>
+      <p>Go to <strong>Reservations &rarr; New reservation</strong>, fill in a purpose, a start and end time, tick the devices you want, and submit. Everything below is just detail on top of that.</p>
+    </div>
+
+    <h2 class="sec" id="list">Home base</h2>
+    <p class="sectitle">Your reservations list</p>
+    <p>When you land on <b>Reservations</b>, you see your own bookings. Each row is one reservation, colour-coded by where it is in its life.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/reservations</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a class="active">Reservations</a></span><span class="grow"></span><span class="right"><span class="bell"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span><span class="u">sara.k</span><a>Logout</a></span></div>
+            <div class="hd-body">
+              <div class="hd-tabs">
+                <span class="hd-tab active" data-anno="2" data-anno-pin="t" data-anno-arrow>My Reservations</span>
+                <span class="hd-tab" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Calendar</span>
+                <span class="grow" style="flex:1"></span>
+                <span class="hd-btn primary sm" data-anno="1" data-anno-pin="l" data-anno-arrow><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg> New reservation</span>
+              </div>
+              <div class="hd-card">
+                <table class="hd-table">
+                  <thead><tr><th>ID</th><th>Status</th><th>Topology</th><th>Devices</th><th>Period</th><th>Purpose</th><th></th></tr></thead>
+                  <tbody>
+                    <tr><td class="mono">f1a2b3c4</td><td data-anno="4" data-anno-pin="l" data-anno-arrow><span class="hd-badge active">ACTIVE</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td>4 devices</td><td>May 28 &ndash; Jun 04</td><td>HA failover regression</td><td><span style="color:#16a34a;font-weight:500;margin-right:10px;">Release</span><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
+                    <tr><td class="mono">a9b8c7d6</td><td><span class="hd-badge pending">PENDING</span></td><td><span class="hd-badge cloud">CLOUD</span></td><td>2 devices</td><td>May 30 &ndash; May 31</td><td>VPC peering smoke test</td><td></td></tr>
+                    <tr><td class="mono">1234abcd</td><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td>6 devices</td><td>May 30 &ndash; Jun 02</td><td>Spine-leaf burn-in</td><td></td></tr>
+                    <tr><td class="mono">deadbeef</td><td><span class="hd-badge completed">COMPLETED</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td>3 devices</td><td>May 18 &ndash; May 25</td><td>Driver cert run</td><td></td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The reservations list.</b> Your bookings, newest behaviour on top.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>New reservation.</b> The button that starts everything. Opens the form in step <a href="#create">Create a reservation</a>.</li>
+      <li><b>My Reservations.</b> Just yours. This is the default view.</li>
+      <li><b>Calendar.</b> Everyone's bookings on a timeline &mdash; use it to <a href="#calendar">find a free window</a> before you book.</li>
+      <li><b>Status badge.</b> The colour tells you what's happening. Full key is <a href="#status">just below</a>.</li>
+    </ol>
+
+    <h2 class="sec" id="create">The main event</h2>
+    <p class="sectitle">Create a reservation</p>
+    <p>Click <b>New reservation</b>. You get this form. Nothing is reserved until you submit.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>New reservation</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-field"><label class="hd-label">Purpose</label><div class="hd-input" data-anno="1" data-anno-pin="r" data-anno-arrow>HA failover regression</div></div>
+                <div class="hd-row2">
+                  <div class="hd-field"><label class="hd-label">Start</label><div class="hd-input" data-anno="2" data-anno-pin="t" data-anno-arrow>2026-05-28 09:00</div></div>
+                  <div class="hd-field"><label class="hd-label">End</label><div class="hd-input">2026-06-04 18:00</div></div>
+                </div>
+                <div class="hd-field"><label class="hd-label">Devices</label>
+                  <div class="hd-card" data-anno="3" data-anno-pin="r" data-anno-arrow data-anno-pad="3" style="box-shadow:none;">
+                    <div class="hd-portgrid" style="padding:10px 14px;">
+                      <div class="pr" style="border:none;padding:5px 0;"><span style="width:16px;height:16px;border:2px solid var(--blue-600);border-radius:4px;background:var(--blue-600);"></span><span class="hd-glyph physical"></span><span style="font-weight:600;color:var(--gray-900)">fw-edge-01</span><span class="hd-badge available" style="margin-left:auto;">AVAILABLE</span></div>
+                      <div class="pr" style="border:none;padding:5px 0;"><span style="width:16px;height:16px;border:2px solid var(--blue-600);border-radius:4px;background:var(--blue-600);"></span><span class="hd-glyph physical"></span><span style="font-weight:600;color:var(--gray-900)">fw-edge-02</span><span class="hd-badge available" style="margin-left:auto;">AVAILABLE</span></div>
+                      <div class="pr" style="border:none;padding:5px 0;opacity:.5;"><span style="width:16px;height:16px;border:2px solid var(--gray-300);border-radius:4px;"></span><span class="hd-glyph physical"></span><span style="font-weight:600;color:var(--gray-900)">dut-server-14</span><span class="hd-badge reserved" style="margin-left:auto;">RESERVED</span></div>
+                    </div>
+                  </div>
+                  <p class="hd-help">Greyed-out rows are exclusive devices already booked for your window.</p>
+                </div>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Reserve</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The new-reservation form.</b> Devices you can't see, or can't book, simply don't appear as options.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Purpose.</b> A short human label so people (and the report) know what this booking was for. "HA failover regression," not "test."</li>
+      <li><b>Start &amp; end.</b> Your time window. The reservation is dormant until the start time passes, then activates on its own.</li>
+      <li><b>Devices.</b> Tick what you need. The list only shows gear you have visibility on; already-booked <em>exclusive</em> devices are greyed out so you can't double-book them.</li>
+      <li><b>Reserve.</b> Submit. The new reservation appears in your list immediately.</li>
+    </ol>
+
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
+      <div><span class="ttl">Conflict on submit?</span><p>If a device you picked is exclusive and already booked in your window, the reservation is rejected and HERD tells you <strong>exactly which devices</strong> clashed. Adjust your window (check the <a href="#calendar">calendar</a>) or drop the conflicting device, then resubmit.</p></div>
+    </div>
+
+    <h2 class="sec" id="status">The colour code</h2>
+    <p class="sectitle">Reading the status badges</p>
+    <p>Every reservation wears one badge. Most transitions happen automatically &mdash; you only ever trigger <b>Cancel</b> and <b>Release</b> yourself.</p>
+
+    <div class="hd-card" style="margin:22px 0;">
+      <table class="hd-table">
+        <thead><tr><th>Badge</th><th>What it means</th><th>Who moves it</th></tr></thead>
+        <tbody>
+          <tr><td><span class="hd-badge pending">PENDING</span></td><td>Booked for the future, not live yet.</td><td>Auto &rarr; ACTIVE at start time</td></tr>
+          <tr><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td>Row exists; HERD is confirming the devices. Usually seconds.</td><td>Auto, on create</td></tr>
+          <tr><td><span class="hd-badge active">ACTIVE</span></td><td>Live now. Exclusive devices are flipped to RESERVED and provisioning has fired.</td><td>You can <b>Release</b> early</td></tr>
+          <tr><td><span class="hd-badge completed">COMPLETED</span></td><td>End time passed; devices released back to the pool.</td><td>Auto, at end time</td></tr>
+          <tr><td><span class="hd-badge cancelled">CANCELLED</span></td><td>You or an admin stopped it before the end.</td><td>You, via <b>Cancel</b></td></tr>
+          <tr><td><span class="hd-badge failed">FAILED</span></td><td>Provisioning couldn't complete. <strong>No devices were actually reserved</strong> &mdash; the row is kept for audit.</td><td>Make a new one, or see Troubleshooting</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><span class="ttl">Cancel vs Release</span><p><b>Cancel</b> stops a future or current reservation and frees its devices. <b>Release</b> ends an <span class="badge active">ACTIVE</span> reservation <em>early</em> &mdash; you're done before your end time and want to hand the gear back now. Both free the devices immediately.</p></div>
+    </div>
+
+    <h2 class="sec" id="exclusive">A distinction that bites people</h2>
+    <p class="sectitle">Exclusive vs shared devices</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <div class="gcard" style="cursor:default;">
+        <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+        <h3>Exclusive</h3>
+        <p>DUTs and individual test instruments. <strong>One reservation at a time.</strong> Booking it for an overlapping window fails with a conflict. Status flips to <span class="badge reserved">RESERVED</span> while held.</p>
+      </div>
+      <div class="gcard" style="cursor:default;">
+        <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a3 3 0 1 0-2.8-4M6 8a3 3 0 1 1 2.8-4M12 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 20a5 5 0 0 1 9-3M21 20a5 5 0 0 0-9-3"/></svg></span>
+        <h3>Shared</h3>
+        <p>Network infrastructure (switches, shared fabrics). <strong>Many reservations at once.</strong> Status never changes on reserve or release &mdash; it's plumbing everyone uses.</p>
+      </div>
+    </div>
+    <p style="margin-top:16px;">Which bucket a device falls in is decided by its <a href="glossary.html">template</a>, not by you. You don't choose &mdash; you just see the effect when a conflict (or no conflict) happens.</p>
+
+    <h2 class="sec" id="detail">Drilling in</h2>
+    <p class="sectitle">The reservation detail modal</p>
+    <p>Click any row to open its detail view. Four tabs:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal wide">
+              <div class="mhead"><h2>Reservation f1a2b3c4</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-mtabs">
+                  <span class="hd-mtab active" data-anno="1" data-anno-pin="b" data-anno-arrow>Details</span>
+                  <span class="hd-mtab" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">Inventory</span>
+                  <span class="hd-mtab" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Routes</span>
+                  <span class="hd-mtab" data-anno="4" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Schedule</span>
+                </div>
+                <dl class="hd-dl">
+                  <dt>Status</dt><dd><span class="hd-badge active">ACTIVE</span></dd>
+                  <dt>Purpose</dt><dd>HA failover regression</dd>
+                  <dt>Period</dt><dd>May 28 09:00 &rarr; Jun 04 18:00</dd>
+                  <dt>Topology</dt><dd><span class="hd-badge physical">PHYSICAL</span> &middot; 9a81c0d2</dd>
+                  <dt>Devices</dt><dd>4</dd>
+                </dl>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Edit Resources</span><span class="hd-btn danger">Cancel reservation</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The detail modal, Details tab.</b></p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Details</b> &mdash; the basics: id, purpose, dates, status. The default tab.</li>
+      <li><b>Inventory</b> &mdash; the devices in this reservation. Expand a device to see its ports and what each is cabled to.</li>
+      <li><b>Routes</b> &mdash; for DUT-to-DUT pairs, the hop-by-hop path through the L1 switches. Green = reachable, red = not.</li>
+      <li><b>Schedule</b> &mdash; inline-edit the end time and purpose without rebooking.</li>
+    </ol>
+
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4z"/></svg></span>
+      <div><span class="ttl">Need to add a device mid-run?</span><p>You (the owner) or an admin can hit <b>Edit Resources</b> on an active reservation to add or remove devices on the fly. Added exclusive devices get a conflict check; removed ones are released back to <span class="badge available">AVAILABLE</span>.</p></div>
+    </div>
+
+    <h2 class="sec" id="calendar">Finding a free window</h2>
+    <p class="sectitle">The reservation calendar</p>
+    <p>Click the <b>Calendar</b> tab. It's a Gantt-style timeline of <strong>everyone's</strong> reservations (filtered to gear you can see), so you can spot a gap before you try to book.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/reservations#calendar</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a class="active">Reservations</a></span><span class="grow"></span><span class="right"><span class="u">sara.k</span></span></div>
+            <div class="hd-body">
+              <div class="hd-tabs"><span class="hd-tab">My Reservations</span><span class="hd-tab active">Calendar</span><span style="flex:1"></span>
+                <span class="hd-seg" data-anno="1" data-anno-pin="l" data-anno-arrow><span>Day</span><span class="active">Week</span><span>Month</span></span>
+              </div>
+              <div style="display:flex;gap:8px;margin-bottom:12px;" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">
+                <span class="hd-badge active">ACTIVE</span><span class="hd-badge pending">PENDING</span><span class="hd-badge completed" style="opacity:.5">COMPLETED</span><span class="hd-badge cancelled" style="opacity:.5">CANCELLED</span>
+              </div>
+              <div class="hd-card" style="padding:0;">
+                <div style="display:grid;grid-template-columns:120px repeat(7,1fr);font-size:11px;color:var(--gray-500);border-bottom:1px solid var(--gray-200);">
+                  <div style="padding:8px 12px;border-right:1px solid var(--gray-200);"></div>
+                  <div style="padding:8px;text-align:center;">Mon</div><div style="padding:8px;text-align:center;">Tue</div><div style="padding:8px;text-align:center;">Wed</div><div style="padding:8px;text-align:center;">Thu</div><div style="padding:8px;text-align:center;">Fri</div><div style="padding:8px;text-align:center;">Sat</div><div style="padding:8px;text-align:center;">Sun</div>
+                </div>
+                <div style="display:grid;grid-template-columns:120px repeat(7,1fr);align-items:center;border-bottom:1px solid var(--gray-100);">
+                  <div style="padding:10px 12px;font-size:12px;font-weight:600;color:var(--gray-700);border-right:1px solid var(--gray-200);">fw-edge-01</div>
+                  <div style="grid-column:2 / 5;margin:8px;height:22px;border-radius:5px;background:var(--res-active-bg);border:1px solid #86efac;color:#166534;font-size:11px;display:flex;align-items:center;padding:0 8px;">HA regression</div>
+                </div>
+                <div style="display:grid;grid-template-columns:120px repeat(7,1fr);align-items:center;border-bottom:1px solid var(--gray-100);">
+                  <div style="padding:10px 12px;font-size:12px;font-weight:600;color:var(--gray-700);border-right:1px solid var(--gray-200);">spine-sw-01</div>
+                  <div style="grid-column:5 / 8;margin:8px;height:22px;border-radius:5px;background:var(--res-pending-bg);border:1px solid #fde047;color:#854d0e;font-size:11px;display:flex;align-items:center;padding:0 8px;" data-anno="3" data-anno-pin="t" data-anno-arrow>Burn-in</div>
+                </div>
+                <div style="display:grid;grid-template-columns:120px repeat(7,1fr);align-items:center;">
+                  <div style="padding:10px 12px;font-size:12px;font-weight:600;color:var(--gray-700);border-right:1px solid var(--gray-200);">dut-server-14</div>
+                  <div style="grid-column:6 / 9;margin:8px;border:1px dashed var(--gray-300);border-radius:5px;height:22px;display:flex;align-items:center;justify-content:center;color:var(--gray-400);font-size:11px;">free &mdash; book me</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The calendar.</b> Coloured blocks are existing bookings; gaps are yours for the taking.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Day / Week / Month.</b> Zoom the timeline to the granularity you care about.</li>
+      <li><b>Status filter chips.</b> Dim out <span class="badge" style="background:var(--res-completed-bg);color:var(--res-completed-fg)">COMPLETED</span> and cancelled bookings to declutter and see what's actually live.</li>
+      <li><b>Click any block</b> to open that reservation's detail modal &mdash; even other people's, so you know who to ask if you need their slot.</li>
+    </ol>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Reserving equipment</p>
+      <div class="pagenav">
+        <a href="quickstart.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> First boot</a>
+        <a href="user-topology.html">Topology <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

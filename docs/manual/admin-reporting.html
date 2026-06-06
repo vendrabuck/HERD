@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Utilization reporting (admin)</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html" class="active">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#open">Where it lives</a></li>
+      <li><a href="#read">Reading the report</a></li>
+      <li><a href="#window">Choosing a window</a></li>
+      <li><a href="#tables">The five tables</a></li>
+      <li><a href="#csv">Exporting CSV</a></li>
+    </ul>
+    <p class="eyebrow">Admin track</p>
+    <ul>
+      <li><a href="admin-setup.html">A - First-day setup</a></li>
+      <li><a href="admin-equipment.html">B - Equipment &amp; cabling</a></li>
+      <li><a href="admin-reporting.html" class="active">C - Reporting</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker admin">Admin track - Setup C</span>
+    <h1 class="title">Utilization reporting</h1>
+    <p class="dek">When leadership asks "is the lab actually being used, and by whom?", this is the page that answers it &mdash; reservation-hours, broken out by user, device, team, type, and template, with CSV for the spreadsheet crowd.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> One job</div>
+      <p>Answer "who used what, for how long" over a date window. It's <span class="badge admin-only">admin only</span> &mdash; if you don't see <b>Reporting</b> in the nav, you're not an admin.</p>
+    </div>
+
+    <h2 class="sec" id="open">Finding it</h2>
+    <p class="sectitle">Where it lives</p>
+    <p>Click <b>Reporting</b> in the top nav. It defaults to a 30-day window.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/reporting</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a><a class="active">Reporting</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
+            <div class="hd-body">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+                <div class="hd-h1" style="margin:0;">Utilization</div>
+                <span class="hd-seg" data-anno="1" data-anno-pin="l" data-anno-arrow><span>7 days</span><span class="active">30 days</span><span>Custom</span></span>
+              </div>
+              <div class="hd-stats">
+                <div class="hd-stat" data-anno="2" data-anno-pin="t" data-anno-arrow data-anno-color="blue"><div class="k">Reservation-hours</div><div class="v">1,284</div></div>
+                <div class="hd-stat"><div class="k">Reservations</div><div class="v">47</div></div>
+                <div class="hd-stat"><div class="k">Execution runs</div><div class="v">312</div></div>
+              </div>
+              <div class="hd-card" style="margin-bottom:16px;">
+                <div class="head">Daily trend</div>
+                <div style="padding:12px 16px;">
+                  <div class="hd-chart" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">
+                    <div class="bar" style="height:40%"></div><div class="bar" style="height:62%"></div><div class="bar" style="height:48%"></div><div class="bar" style="height:80%"></div><div class="bar" style="height:55%"></div><div class="bar" style="height:30%"></div><div class="bar" style="height:18%"></div><div class="bar" style="height:70%"></div><div class="bar" style="height:90%"></div><div class="bar" style="height:60%"></div><div class="bar" style="height:44%"></div><div class="bar" style="height:75%"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="hd-card">
+                <div class="head">By user <span class="hd-btn secondary sm" data-anno="4" data-anno-pin="l" data-anno-arrow>Download CSV</span></div>
+                <table class="hd-table">
+                  <thead><tr><th>Owner</th><th>Hours</th><th>Reservations</th></tr></thead>
+                  <tbody>
+                    <tr><td class="name">sara.k</td><td>412</td><td>14</td></tr>
+                    <tr><td class="name">dmitri.r</td><td>286</td><td>9</td></tr>
+                    <tr><td class="name">li.wei</td><td>203</td><td>11</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The utilization report.</b> Headline cards, daily trend, then the breakdown tables.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Window picker.</b> 7 days, 30 days, or Custom (two date pickers, UTC-anchored so the numbers match the backend regardless of your timezone).</li>
+      <li><b>Headline cards.</b> Total reservation-hours, reservation count, and execution runs for the window.</li>
+      <li><b>Daily trend.</b> Reservation-hours per day. A booking spanning midnight is counted on both days correctly.</li>
+      <li><b>Download CSV.</b> Per-table export for the By User, By Device, and By Template tables.</li>
+    </ol>
+
+    <h2 class="sec" id="read">Two things to know first</h2>
+    <p class="sectitle">Reading the numbers honestly</p>
+    <ul class="list">
+      <li><b>Reservations are clamped to the window.</b> A 30-day booking seen through a 7-day window contributes 7 days, not 30. The numbers are about <em>this</em> period, not lifetime totals.</li>
+      <li><b>Cancelled and failed bookings are excluded</b> by default &mdash; only real usage counts.</li>
+      <li><b>"Execution runs" can read <code>n/a</code></b> if the execution service is briefly unreachable. The rest of the report still renders; that one card just can't be sourced.</li>
+    </ul>
+
+    <h2 class="sec" id="window">Scoping it</h2>
+    <p class="sectitle">Choosing a window</p>
+    <p>Pick <b>7 days</b> for a weekly standup number, <b>30 days</b> (the default) for a monthly review, or <b>Custom</b> for a quarter, a fiscal period, or a specific incident window. The date pickers are UTC-anchored, so what you select is exactly what the backend filters on &mdash; no off-by-a-day timezone surprises in the export.</p>
+
+    <h2 class="sec" id="tables">The breakdowns</h2>
+    <p class="sectitle">The five tables</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <div class="gcard" style="cursor:default;"><span class="num">01</span><h3>By User</h3><p>Owner name, hours, reservation count. "Who is the lab's heaviest user?"</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">02</span><h3>By Device</h3><p>Device (with template), hours, count. Spot the over- and under-used gear.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">03</span><h3>By Group (cost center)</h3><p>User-group hours. People in several groups count against each; ungrouped land in <code>Ungrouped</code>.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">04</span><h3>By Topology Type</h3><p><span class="badge physical">PHYSICAL</span> vs <span class="badge cloud">CLOUD</span> split of hours and count.</p></div>
+      <div class="gcard" style="cursor:default;grid-column:span 2;"><span class="num">05</span><h3>By Template</h3><p>Template name, hours, count. Devices deleted since their booking show up under template <code>Unknown</code> &mdash; expected, not a bug.</p></div>
+    </div>
+
+    <h2 class="sec" id="csv">For the spreadsheet</h2>
+    <p class="sectitle">Exporting CSV</p>
+    <p>Each of <b>By User</b>, <b>By Device</b>, and <b>By Template</b> has a <b>Download CSV</b> button. User and device exports come straight from the server; the template export is built in your browser from the same data the table shows.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Hitting the CSV endpoint directly with <code>section=template</code> returns a 422 on purpose &mdash; that rollup depends on inventory and is computed client-side. Use the button.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Utilization reporting (admin)</p>
+      <div class="pagenav">
+        <a href="admin-equipment.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Equipment &amp; cabling</a>
+        <a href="troubleshooting.html">Troubleshooting <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

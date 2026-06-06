@@ -1,0 +1,241 @@
+{
+  "paths": [
+    [
+      "POST",
+      "/commit"
+    ],
+    [
+      "POST",
+      "/generate"
+    ],
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "POST",
+      "/reservations/{reservation_id}/assistant"
+    ],
+    [
+      "GET",
+      "/status"
+    ],
+    [
+      "POST",
+      "/templates/suggest-identity"
+    ]
+  ],
+  "schemas": {
+    "AssistantRequest": {
+      "properties": {
+        "conversation_id": "anyOf",
+        "question": "string"
+      },
+      "required": [
+        "question"
+      ],
+      "type": "object"
+    },
+    "AssistantResponse": {
+      "properties": {
+        "answer": "string",
+        "conversation_id": "anyOf",
+        "input_tokens": "integer",
+        "model": "string",
+        "output_tokens": "integer",
+        "pending_apply": "anyOf",
+        "stop_reason": "string",
+        "tool_calls": "array",
+        "tool_iterations": "integer"
+      },
+      "required": [
+        "answer",
+        "input_tokens",
+        "model",
+        "output_tokens",
+        "stop_reason"
+      ],
+      "type": "object"
+    },
+    "Body_generate_generate_post": {
+      "properties": {
+        "files": "anyOf",
+        "prompt": "string"
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "CommitDevice": {
+      "properties": {
+        "config": "anyOf",
+        "connection_type": "anyOf",
+        "device_id": "string",
+        "position": "anyOf",
+        "role": "string"
+      },
+      "required": [
+        "device_id",
+        "role"
+      ],
+      "type": "object"
+    },
+    "CommitEdge": {
+      "properties": {
+        "layer": "string",
+        "source_role": "string",
+        "target_role": "string"
+      },
+      "required": [
+        "source_role",
+        "target_role"
+      ],
+      "type": "object"
+    },
+    "CommitRequest": {
+      "properties": {
+        "apply_configs": "boolean",
+        "devices": "array",
+        "edges": "array",
+        "end_time": "string",
+        "purpose": "anyOf",
+        "start_time": "string",
+        "topology_name": "string"
+      },
+      "required": [
+        "devices",
+        "end_time",
+        "start_time",
+        "topology_name"
+      ],
+      "type": "object"
+    },
+    "CommitResponse": {
+      "properties": {
+        "config_results": "array",
+        "reservation_id": "string",
+        "topology_id": "string"
+      },
+      "required": [
+        "reservation_id",
+        "topology_id"
+      ],
+      "type": "object"
+    },
+    "DeviceConfigResult": {
+      "properties": {
+        "device_id": "string",
+        "error": "anyOf",
+        "role": "string",
+        "run_id": "anyOf",
+        "status": "string"
+      },
+      "required": [
+        "device_id",
+        "role",
+        "status"
+      ],
+      "type": "object"
+    },
+    "GenerateResponse": {
+      "properties": {
+        "devices": "array",
+        "edges": "array",
+        "file_summaries": "array",
+        "notes": "string",
+        "purpose": "string"
+      },
+      "required": [
+        "devices",
+        "edges",
+        "purpose"
+      ],
+      "type": "object"
+    },
+    "PendingApply": {
+      "properties": {
+        "device_id": "string",
+        "dry_run": "boolean",
+        "job_id": "string",
+        "scheduled_for": "string",
+        "version_id": "string"
+      },
+      "required": [
+        "device_id",
+        "dry_run",
+        "job_id",
+        "scheduled_for",
+        "version_id"
+      ],
+      "type": "object"
+    },
+    "ProposedDevice": {
+      "properties": {
+        "config": "anyOf",
+        "device": "anyOf",
+        "role": "string",
+        "template_name": "string",
+        "topology_type": "string"
+      },
+      "required": [
+        "role",
+        "template_name"
+      ],
+      "type": "object"
+    },
+    "ProposedEdge": {
+      "properties": {
+        "layer": "string",
+        "source_role": "string",
+        "target_role": "string"
+      },
+      "required": [
+        "source_role",
+        "target_role"
+      ],
+      "type": "object"
+    },
+    "SuggestIdentityRequest": {
+      "properties": {
+        "description": "anyOf",
+        "name": "string",
+        "sections": "anyOf"
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "SuggestIdentityResponse": {
+      "properties": {
+        "confidence": "string",
+        "model": "string",
+        "part_number": "anyOf",
+        "reasoning": "string",
+        "vendor": "string"
+      },
+      "required": [
+        "confidence",
+        "model",
+        "reasoning",
+        "vendor"
+      ],
+      "type": "object"
+    },
+    "ToolCallSummary": {
+      "properties": {
+        "arguments_summary": "string",
+        "duration_ms": "integer",
+        "error": "anyOf",
+        "name": "string"
+      },
+      "required": [
+        "arguments_summary",
+        "duration_ms",
+        "name"
+      ],
+      "type": "object"
+    }
+  }
+}

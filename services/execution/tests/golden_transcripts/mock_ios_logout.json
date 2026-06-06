@@ -1,0 +1,20 @@
+{
+  "driver": "mock_ios",
+  "action": "logout",
+  "method_kwargs": {},
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "end",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 2,
+      "command": "exit",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

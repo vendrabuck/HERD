@@ -1,0 +1,526 @@
+services:
+  # --- Config Service ---
+  config:
+    build:
+      context: .
+      dockerfile: services/config/Dockerfile
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY}
+      AUTH_ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      AUTH_ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      AUTH_REFRESH_TOKEN_EXPIRE_DAYS: ${AUTH_REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      AUTH_METHOD: ${AUTH_METHOD:-local}
+      LDAP_SERVER_URL: ${LDAP_SERVER_URL:-}
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-}
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD:-}
+      LDAP_USER_BASE_DN: ${LDAP_USER_BASE_DN:-}
+      LDAP_USER_FILTER: ${LDAP_USER_FILTER:-(sAMAccountName={username})}
+      LDAP_EMAIL_ATTRIBUTE: ${LDAP_EMAIL_ATTRIBUTE:-mail}
+      LDAP_USERNAME_ATTRIBUTE: ${LDAP_USERNAME_ATTRIBUTE:-sAMAccountName}
+      LDAP_USE_TLS: ${LDAP_USE_TLS:-true}
+      SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
+      SUPERADMIN_USERNAME: ${SUPERADMIN_USERNAME:-}
+      SUPERADMIN_PASSWORD: ${SUPERADMIN_PASSWORD:-}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      AI_PROVIDER: ${AI_PROVIDER:-anthropic}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-claude-sonnet-4-6}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/data/herd-config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.config.rule=PathPrefix(`/api/config`)"
+      - "traefik.http.routers.config.entrypoints=websecure"
+      - "traefik.http.routers.config.tls=true"
+      - "traefik.http.services.config.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.config-strip.stripprefix.prefixes=/api/config"
+      - "traefik.http.routers.config.middlewares=config-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --- Traefik (API Gateway) ---
+  traefik:
+    image: traefik:latest
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Traefik dashboard
+    volumes:
+      - ./infra/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./infra/traefik/certs:/etc/traefik/certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - herd-net
+    restart: unless-stopped
+    depends_on:
+      config:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      reservations:
+        condition: service_healthy
+
+  # --- PostgreSQL ---
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-herd}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- NATS JetStream ---
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"  # NATS monitoring
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Auth Service ---
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    volumes:
+      - herd-config:/etc/herd:ro
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: auth
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${AUTH_REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
+      SUPERADMIN_USERNAME: ${SUPERADMIN_USERNAME:-}
+      SUPERADMIN_PASSWORD: ${SUPERADMIN_PASSWORD:-}
+      AUTH_METHOD: ${AUTH_METHOD:-local}
+      LDAP_SERVER_URL: ${LDAP_SERVER_URL:-}
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-}
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD:-}
+      LDAP_USER_BASE_DN: ${LDAP_USER_BASE_DN:-}
+      LDAP_USER_FILTER: ${LDAP_USER_FILTER:-(sAMAccountName={username})}
+      LDAP_EMAIL_ATTRIBUTE: ${LDAP_EMAIL_ATTRIBUTE:-mail}
+      LDAP_USERNAME_ATTRIBUTE: ${LDAP_USERNAME_ATTRIBUTE:-sAMAccountName}
+      LDAP_USE_TLS: ${LDAP_USE_TLS:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.auth.rule=PathPrefix(`/api/auth`)"
+      - "traefik.http.routers.auth.entrypoints=websecure"
+      - "traefik.http.routers.auth.tls=true"
+      - "traefik.http.services.auth.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.auth-strip.stripprefix.prefixes=/api/auth"
+      - "traefik.http.routers.auth.middlewares=auth-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- Inventory Service ---
+  inventory:
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: inventory
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - driver-storage:/data/drivers
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.inventory.rule=PathPrefix(`/api/inventory`)"
+      - "traefik.http.routers.inventory.entrypoints=websecure"
+      - "traefik.http.routers.inventory.tls=true"
+      - "traefik.http.services.inventory.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.inventory-strip.stripprefix.prefixes=/api/inventory"
+      - "traefik.http.routers.inventory.middlewares=inventory-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- Reservations Service ---
+  reservations:
+    build:
+      context: .
+      dockerfile: services/reservations/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: reservations
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      INVENTORY_SERVICE_URL: http://inventory:8000
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.reservations.rule=PathPrefix(`/api/reservations`)"
+      - "traefik.http.routers.reservations.entrypoints=websecure"
+      - "traefik.http.routers.reservations.tls=true"
+      - "traefik.http.services.reservations.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.reservations-strip.stripprefix.prefixes=/api/reservations"
+      - "traefik.http.routers.reservations.middlewares=reservations-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+
+  # --- ACL Service ---
+  acl:
+    build:
+      context: .
+      dockerfile: services/acl/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: acl
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      AUTH_SERVICE_URL: http://auth:8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.acl.rule=PathPrefix(`/api/acl`)"
+      - "traefik.http.routers.acl.entrypoints=websecure"
+      - "traefik.http.routers.acl.tls=true"
+      - "traefik.http.services.acl.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.acl-strip.stripprefix.prefixes=/api/acl"
+      - "traefik.http.routers.acl.middlewares=acl-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- User Profile Service ---
+  user-profile:
+    build:
+      context: .
+      dockerfile: services/user-profile/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: user_profile
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      AUTH_SERVICE_URL: http://auth:8000
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.user-profile.rule=PathPrefix(`/api/user-profile`)"
+      - "traefik.http.routers.user-profile.entrypoints=websecure"
+      - "traefik.http.routers.user-profile.tls=true"
+      - "traefik.http.services.user-profile.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.user-profile-strip.stripprefix.prefixes=/api/user-profile"
+      - "traefik.http.routers.user-profile.middlewares=user-profile-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- Notifications Service ---
+  notifications:
+    build:
+      context: .
+      dockerfile: services/notifications/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: notifications
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      USER_PROFILE_SERVICE_URL: http://user-profile:8000
+      AUTH_SERVICE_URL: http://auth:8000
+      RESERVATIONS_SERVICE_URL: http://reservations:8000
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.notifications.rule=PathPrefix(`/api/notifications`)"
+      - "traefik.http.routers.notifications.entrypoints=websecure"
+      - "traefik.http.routers.notifications.tls=true"
+      - "traefik.http.services.notifications.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.notifications-strip.stripprefix.prefixes=/api/notifications"
+      - "traefik.http.routers.notifications.middlewares=notifications-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      user-profile:
+        condition: service_healthy
+
+  # --- Cabling Service ---
+  cabling:
+    build:
+      context: .
+      dockerfile: services/cabling/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: cabling
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      ENFORCE_DEVICE_GROUP_BOUNDARIES: ${ENFORCE_DEVICE_GROUP_BOUNDARIES:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.cabling.rule=PathPrefix(`/api/cabling`)"
+      - "traefik.http.routers.cabling.entrypoints=websecure"
+      - "traefik.http.routers.cabling.tls=true"
+      - "traefik.http.services.cabling.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.cabling-strip.stripprefix.prefixes=/api/cabling"
+      - "traefik.http.routers.cabling.middlewares=cabling-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- Execution Service ---
+  execution:
+    build:
+      context: .
+      dockerfile: services/execution/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: execution
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      INVENTORY_SERVICE_URL: http://inventory:8000
+      CABLING_SERVICE_URL: http://cabling:8000
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - driver-cache:/data/driver-cache
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.execution.rule=PathPrefix(`/api/execution`)"
+      - "traefik.http.routers.execution.entrypoints=websecure"
+      - "traefik.http.routers.execution.tls=true"
+      - "traefik.http.services.execution.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.execution-strip.stripprefix.prefixes=/api/execution"
+      - "traefik.http.routers.execution.middlewares=execution-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      cabling:
+        condition: service_healthy
+
+  # --- AI Orchestrator Service ---
+  ai-orchestrator:
+    build:
+      context: .
+      dockerfile: services/ai-orchestrator/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: ai_orchestrator
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      AI_PROVIDER: ${AI_PROVIDER:-anthropic}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-claude-sonnet-4-6}
+      AI_TLS_VERIFY: ${AI_TLS_VERIFY:-true}
+      AI_CA_CERT: ${AI_CA_CERT:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AI_WRITE_TOOLS_ENABLED: ${AI_WRITE_TOOLS_ENABLED:-false}
+      AI_MAX_TOKENS: ${AI_MAX_TOKENS:-4096}
+      ASSISTANT_PER_CALL_TIMEOUT_S: ${ASSISTANT_PER_CALL_TIMEOUT_S:-20}
+      ASSISTANT_OVERALL_DEADLINE_S: ${ASSISTANT_OVERALL_DEADLINE_S:-90}
+      INVENTORY_SERVICE_URL: http://inventory:8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ai-orchestrator.rule=PathPrefix(`/api/ai`)"
+      - "traefik.http.routers.ai-orchestrator.entrypoints=websecure"
+      - "traefik.http.routers.ai-orchestrator.tls=true"
+      - "traefik.http.services.ai-orchestrator.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.ai-orchestrator-strip.stripprefix.prefixes=/api/ai"
+      - "traefik.http.routers.ai-orchestrator.middlewares=ai-orchestrator-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- Frontend ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_AI_CHAT_ENABLED: ${VITE_AI_CHAT_ENABLED:-false}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls=true"
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  herd-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  driver-storage:
+  driver-cache:
+  herd-config:

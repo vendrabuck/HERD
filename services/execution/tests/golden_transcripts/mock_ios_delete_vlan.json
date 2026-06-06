@@ -1,0 +1,16 @@
+{
+  "driver": "mock_ios",
+  "action": "delete_vlan",
+  "method_kwargs": {
+    "vlan_id": 100
+  },
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "no vlan 100",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

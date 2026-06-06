@@ -1,0 +1,74 @@
+services:
+  config:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/config/app:/app/app
+      - herd-config:/data/herd-config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  auth:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/auth/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
+  inventory:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/inventory/app:/app/app
+      - ./services/inventory/migrations:/app/migrations
+      - ./services/common/herd_common:/app/common/herd_common
+      - driver-storage:/data/drivers
+
+  reservations:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/reservations/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
+  cabling:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/cabling/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
+  execution:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./services/execution/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+      - driver-cache:/data/driver-cache
+
+  ai-orchestrator:
+    # Pinned CA for a self-signed openai_compat endpoint (e.g. an on-prem vLLM).
+    # Dev/demo-only: kept out of the base compose so it does not reference a
+    # gitignored file. Set AI_CA_CERT=/certs/spark-ca.pem to use it.
+    volumes:
+      - ./spark-ca.pem:/certs/spark-ca.pem:ro
+
+  traefik:
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+      - "--log.level=DEBUG"
+
+  selenium:
+    image: selenium/standalone-chrome:latest
+    environment:
+      - SE_NODE_MAX_SESSIONS=3
+      - SE_SESSION_REQUEST_TIMEOUT=300
+    ports:
+      - "4444:4444"
+      - "7900:7900"
+    shm_size: 2g
+    networks:
+      - herd-net
+    profiles:
+      - e2e
+
+volumes:
+  driver-storage:
+  driver-cache:
+  herd-config:
+
+networks:
+  herd-net:

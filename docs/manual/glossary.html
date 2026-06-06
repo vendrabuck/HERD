@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Glossary</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+<style>
+  dl.gloss{margin:24px 0 0;}
+  dl.gloss > div{padding:18px 0;border-bottom:1px solid var(--border);display:grid;grid-template-columns:200px 1fr;gap:24px;}
+  dl.gloss dt{font-size:17px;font-weight:600;color:var(--gray-900);letter-spacing:-.01em;}
+  dl.gloss dt .mono{font-family:var(--font-mono);font-size:14px;color:var(--gray-500);font-weight:400;display:block;margin-top:3px;}
+  dl.gloss dd{margin:0;font-size:16px;color:var(--gray-700);line-height:1.55;}
+  dl.gloss dd a{font-weight:500;}
+  @media(max-width:680px){dl.gloss > div{grid-template-columns:1fr;gap:6px;}}
+</style>
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html" class="active">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell solo">
+  <main class="main">
+    <span class="kicker shared">Shared reference</span>
+    <h1 class="title">Glossary</h1>
+    <p class="dek">The vocabulary HERD uses, in plain words. When a screen throws a term at you and you nod along pretending to know it &mdash; this is where you quietly look it up.</p>
+
+    <dl class="gloss">
+      <div><dt>DUT<span class="mono">Device Under Test</span></dt><dd>A device you reserve and run tests against &mdash; a firewall, a server, a traffic generator. In HERD terms these are <code>Management</code>-type devices, and they're the only things you drag onto the topology canvas.</dd></div>
+
+      <div><dt>Device</dt><dd>One piece of equipment in HERD. Created from a template, lives in inventory, can be reserved and placed on a canvas. Has ports.</dd></div>
+
+      <div><dt>Port</dt><dd>A connection point on a device (e.g. <code>eth1/1</code>). Cables connect one port to another. A port with no cable can't carry a topology link.</dd></div>
+
+      <div><dt>Template</dt><dd>A reusable schema that describes a class of device or port: which fields it has, their defaults, and (for devices) which driver runs it. You don't reserve a template &mdash; you reserve the devices made from it. <a href="admin-setup.html#templates">Creating templates &rarr;</a></dd></div>
+
+      <div><dt>Driver</dt><dd>A Python package that teaches HERD how to log into and configure a real piece of hardware. Templates point at drivers; admins upload them. <a href="admin-setup.html#drivers">Uploading drivers &rarr;</a></dd></div>
+
+      <div><dt>Connection type</dt><dd>A label on a driver that classifies the device: <code>Management</code> (a DUT), or <code>Layer 1 / 2 / 3 Switch</code> (infrastructure). It decides how the device behaves and which driver methods get called.</dd></div>
+
+      <div><dt>Topology</dt><dd>A saved diagram of devices and the connections between them. You build it on the canvas, then a reservation can use it. <a href="user-topology.html">Building a topology &rarr;</a></dd></div>
+
+      <div><dt>Reservation</dt><dd>A time-boxed claim on one or more devices, optionally tied to a topology. Making one is how you say "this gear is mine for this window." <a href="user-reservations.html">Reserving &rarr;</a></dd></div>
+
+      <div><dt>Exclusive device</dt><dd>A device only one reservation can hold at a time (DUTs, individual instruments). Its status flips to <span class="badge reserved">RESERVED</span> while held. Booking it for an overlapping window fails with a conflict.</dd></div>
+
+      <div><dt>Non-exclusive / shared device</dt><dd>Infrastructure that many reservations use at once (shared switches, fabrics). Its status never changes on reserve or release &mdash; it's plumbing everyone shares.</dd></div>
+
+      <div><dt>L1 / L2 / L3</dt><dd>The network layer of a connection. <b>L1</b> = physical cabling (gray, dashed). <b>L2</b> = Ethernet / VLAN (blue, solid). <b>L3</b> = IP / routing (green, dashed). L2 and L3 are logical overlays that still need a real L1 path underneath.</dd></div>
+
+      <div><dt>Pathfinding &amp; hops</dt><dd>HERD checks whether two devices can actually reach each other through the recorded cabling. A valid link shows <span class="badge available">"N hops"</span> (the number of switches in between); an impossible one shows <span class="badge failed">"no path"</span>.</dd></div>
+
+      <div><dt>Fabric</dt><dd>A connected cluster of L2 switches and the ports linking them. Used to keep VLAN ids unique <em>within</em> a fabric while letting isolated fabrics reuse the same ids.</dd></div>
+
+      <div><dt>Ghost / proposed node</dt><dd>A device the AI has <em>proposed</em> but you haven't committed yet &mdash; dashed border, semi-transparent, tagged <span class="badge" style="background:#faf5ff;color:var(--proposal)">PROPOSED</span>. Accept to make it real, reject to discard. <a href="user-ai.html#ghost">AI proposals &rarr;</a></dd></div>
+
+      <div><dt>Device group</dt><dd>A named collection of devices. Device groups control <strong>visibility</strong>: non-admin users only see devices in groups their user group has access to.</dd></div>
+
+      <div><dt>User group</dt><dd>A named collection of people. You grant a user group access to a device group, and everyone in it can then see and reserve that gear. <a href="admin-setup.html#groups">Groups &rarr;</a></dd></div>
+
+      <div><dt>No Pool / Not Grouped</dt><dd>The default landing groups. New <em>devices</em> auto-join <code>No Pool</code>; new <em>users</em> auto-join <code>Not Grouped</code> &mdash; so nothing is ever unassigned the moment it's created. You move them into real groups afterward.</dd></div>
+
+      <div><dt>Role</dt><dd>What you're allowed to do. <span class="badge" style="background:var(--gray-100);color:var(--gray-600)">user</span> reserves gear; <span class="badge admin-only">admin</span> manages devices, templates, groups; <span class="badge" style="background:#faf5ff;color:var(--proposal)">superadmin</span> additionally promotes/demotes other people.</dd></div>
+
+      <div><dt>Provisioning</dt><dd>The automatic backend work that fires when a reservation goes <span class="badge active">ACTIVE</span> &mdash; flipping exclusive devices to reserved, wiring L1 ports, setting up L2 VLANs. You don't trigger it; it just happens.</dd></div>
+    </dl>
+
+    <div class="callout tip" style="margin-top:32px;">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
+      <div><p>Still seeing a word that isn't here? It's probably a status badge &mdash; the full lifecycle key is in <a href="user-reservations.html#status">Reserving equipment</a>.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Glossary</p>
+      <div class="pagenav">
+        <a href="troubleshooting.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Troubleshooting</a>
+        <a href="index.html">Home <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+</body>
+</html>

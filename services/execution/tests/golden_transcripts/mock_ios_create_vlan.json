@@ -1,0 +1,22 @@
+{
+  "driver": "mock_ios",
+  "action": "create_vlan",
+  "method_kwargs": {
+    "vlan_id": 100
+  },
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "vlan 100",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 2,
+      "command": " exit",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

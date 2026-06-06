@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Troubleshooting</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html" class="active">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">Jump to</p>
+    <ul>
+      <li><a href="#login">Can't get in</a></li>
+      <li><a href="#empty">Everything's empty</a></li>
+      <li><a href="#resv">Reservation won't go</a></li>
+      <li><a href="#redge">Red topology edge</a></li>
+      <li><a href="#ai">AI weirdness</a></li>
+      <li><a href="#admin">Admin / driver issues</a></li>
+      <li><a href="#last">Genuinely stuck</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker shared">Shared reference</span>
+    <h1 class="title">Troubleshooting</h1>
+    <p class="dek">Find your symptom, get the fix. Almost everything here is something you can resolve yourself or with a one-line ask to an admin &mdash; no support ticket required. Organised by what you actually see on screen.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> How to use this page</div>
+      <p>Scan the headings for the thing that's happening to you, then open it. Each one tells you the likely cause and the exact next step. If a fix says "ask an admin," the precise sentence to send them is included.</p>
+    </div>
+
+    <h2 class="sec" id="login">Can't get in</h2>
+    <p class="sectitle">Login problems</p>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The login fields are greyed out, with a "not configured" banner</span></summary>
+      <div class="acc-body"><p>This is an <strong>admin/install</strong> issue, not yours: the platform's first-run config hasn't been written. You can't log in until it is. Send the admin to <a href="admin-setup.html">first-day setup</a> &mdash; they either populate the required values and restart, or use the wrench icon on the login page to finish setup. Then reload.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The Register button is disabled</span></summary>
+      <div class="acc-body"><p>Your company runs HERD against its corporate directory (LDAP/AD), so self-registration is off. You don't need it &mdash; just <strong>sign in with your directory username and password</strong>; your account is created automatically on first login.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">I was logged in, now everything errors / I get logged out</span></summary>
+      <div class="acc-body"><p>Your session token likely expired (30 minutes by default) and didn't refresh cleanly. <strong>Clear the site's local storage and log in fresh.</strong> If it keeps happening immediately after login, an admin may have rotated a key &mdash; everyone needs to re-login once after that.</p></div></details>
+
+    <h2 class="sec" id="empty">Everything's empty</h2>
+    <p class="sectitle">Inventory / palette shows nothing</p>
+
+    <details class="accordion" open><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Inventory says "No devices found"</span><span class="hint">most common</span></summary>
+      <div class="acc-body">
+        <p>Your user group hasn't been granted visibility to any device group yet. This is the number-one day-one confusion and it's a one-line admin fix.</p>
+        <div class="callout tip"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span><div><p><b>Send your admin exactly this:</b> "Can you add my user group to the device group(s) for the gear I need?" Then reload. (Admins: <a href="admin-setup.html#perms">setup step 5</a>.)</p></div></div>
+        <p>Less commonly: every device you <em>can</em> see is currently reserved and the palette's <b>Show reserved resources</b> toggle is off &mdash; flip it on.</p>
+      </div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The Inventory list has devices but the topology palette is empty</span></summary>
+      <div class="acc-body"><p>By design: the palette only shows <strong>DUTs</strong> (Management-type devices). If everything you can see is infrastructure switches, the palette stays empty &mdash; switches are wired in automatically by the routing system, not dragged by hand.</p></div></details>
+
+    <h2 class="sec" id="resv">Reservation won't go through</h2>
+    <p class="sectitle">Errors when booking</p>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"Time conflict: devices already reserved"</span></summary>
+      <div class="acc-body"><p>An <strong>exclusive</strong> device you picked is already held during your window. Three options: pick a different window (the <a href="user-reservations.html#calendar">calendar</a> shows the gaps), cancel the conflicting booking if it's yours, or swap in a different device. A device someone is mid-booking also counts as a conflict until they finish.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"The following devices are not available"</span></summary>
+      <div class="acc-body"><p>A device's status doesn't allow it. Exclusive devices must be <span class="badge available">AVAILABLE</span>; if one shows <span class="badge reserved">RESERVED</span> it's held elsewhere. <span class="badge" style="background:var(--status-offline-bg);color:var(--status-offline-fg)">OFFLINE</span> or <span class="badge" style="background:var(--status-maintenance-bg);color:var(--status-maintenance-fg)">MAINTENANCE</span> means an admin took it down on purpose &mdash; ask them if it shouldn't be.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"All devices must share the same topology type"</span></summary>
+      <div class="acc-body"><p>You mixed <span class="badge physical">PHYSICAL</span> and <span class="badge cloud">CLOUD</span> devices in one booking. Split it into two reservations, one per type.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">My reservation shows <span style="color:var(--res-failed-fg)">FAILED</span></span></summary>
+      <div class="acc-body"><p><strong>No devices were actually reserved</strong> &mdash; provisioning couldn't complete, and the row is kept only for audit. Just <strong>create a new reservation</strong> for the same devices and window; it usually succeeds on the retry once the backend is healthy. If it fails repeatedly, that's an admin-side service issue (an inventory or internal-token problem) &mdash; flag it.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Stuck in <span style="color:var(--res-pending-fg)">PENDING</span> past its start time</span></summary>
+      <div class="acc-body"><p>The activation task runs about once a minute, so give it up to 60 seconds of drift. If it's been much longer than that, the task may have stalled &mdash; tell an admin to restart the reservations service.</p></div></details>
+
+    <h2 class="sec" id="redge">A red topology edge</h2>
+    <p class="sectitle">The edge won't go green</p>
+
+    <details class="accordion" open><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Red + "no path"</span></summary>
+      <div class="acc-body"><p>No physical route exists between the two DUTs through known switches. Either they're genuinely in isolated fabrics, or the switches/cabling between them aren't recorded in inventory. <strong>Ask an admin to verify the cabling</strong> (or do it yourself via <a href="admin-equipment.html#cabling">Cabling things up</a>). For deliberate cross-site links, an admin adds a virtual tunnel device cabled into both fabrics.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Red + "uncabled port"</span></summary>
+      <div class="acc-body"><p>The specific port you chose has no physical cable recorded. <strong>Pick a different port</strong> in the connection dialog (cabled ports don't carry the <code>(no cable)</code> warning), or ask an admin to record that cable.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"Can't drop the device here"</span></summary>
+      <div class="acc-body"><p>You're trying to mix a <span class="badge physical">PHYSICAL</span> device with a <span class="badge cloud">CLOUD</span> one. They can't share a topology &mdash; start a separate one for the other type.</p></div></details>
+
+    <h2 class="sec" id="ai">AI weirdness</h2>
+    <p class="sectitle">AI generation problems</p>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">There's no "Use AI" button</span></summary>
+      <div class="acc-body"><p>The feature is turned off on this deployment (no API key configured). Nothing you can do as a user &mdash; ask your admin if it should be enabled. (Admins: set the key and restart the AI service.)</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"Inventory shifted during generation"</span></summary>
+      <div class="acc-body"><p>A device the AI wanted became unavailable between proposing and committing. Just <strong>regenerate</strong> &mdash; it'll plan against the current inventory.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">My device configs came back "admin required"</span></summary>
+      <div class="acc-body"><p>Pushing configs to devices is admin-only. Your topology and reservation were still created fine &mdash; only the config step failed. Either <strong>untick "Apply device configs"</strong> at commit, or have an admin apply them separately.</p></div></details>
+
+    <h2 class="sec" id="admin">Admin / driver issues</h2>
+    <p class="sectitle">Setting things up</p>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Driver upload fails with 422 or 409</span></summary>
+      <div class="acc-body"><p><b>422</b> = wrong file type or too big. Use a <code>.zip</code> or <code>.tar.gz</code> under 10 MB. <b>409</b> = the driver name is already taken; names are unique, pick another.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Can't delete a driver</span></summary>
+      <div class="acc-body"><p>A template still points at it &mdash; drivers are reference-counted. Remove or repoint the template first, then delete the driver.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">A user reports the bell never ticks up</span></summary>
+      <div class="acc-body"><p>Check that they're the reservation <strong>owner</strong> (only the owner is notified today), and that in <b>Settings</b> the in-app channel is on and the relevant event type is still checked. Deeper failures are NATS/consumer issues for ops &mdash; but the Settings check resolves most reports.</p></div></details>
+
+    <h2 class="sec" id="last">Genuinely stuck?</h2>
+    <p class="sectitle">When it really isn't you</p>
+    <p>If you've matched a symptom above and the fix didn't take, it's likely a backend/ops problem rather than something in the UI. Before escalating, gather the four things that make it a five-minute fix instead of a back-and-forth:</p>
+    <ol class="list">
+      <li>The <b>exact error message</b> (and the HTTP status if it's an API error).</li>
+      <li>Your <b>role</b> (user / admin / superadmin).</li>
+      <li><b>What you were trying to do</b> when it happened.</li>
+      <li>Roughly <b>when</b> it happened, so logs can be matched.</li>
+    </ol>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Every backend service exposes live API docs at <code>https://&lt;your-host&gt;/api/&lt;service&gt;/docs</code> (admin login required for most endpoints) &mdash; handy for confirming whether a problem is the UI or the service behind it.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Troubleshooting</p>
+      <div class="pagenav">
+        <a href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Home</a>
+        <a href="glossary.html">Glossary <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>
