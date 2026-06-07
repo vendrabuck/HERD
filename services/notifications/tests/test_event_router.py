@@ -63,6 +63,42 @@ async def test_updated_event_with_no_material_change_skips():
 
 
 @pytest.mark.asyncio
+async def test_updated_metadata_only_with_unchanged_end_time_skips():
+    # Mirrors the real producer payload for a metadata-only edit (e.g. purpose):
+    # the producer flags end_time_changed=False and nulls end_time, so the
+    # consumer must suppress a misleading "ends <time>" notification.
+    event = {
+        "event": "reservation.updated",
+        "reservation_id": str(uuid.uuid4()),
+        "user_id": _user(),
+        "device_ids": [str(uuid.uuid4())],
+        "added_device_ids": [],
+        "removed_device_ids": [],
+        "end_time_changed": False,
+        "end_time": None,
+    }
+    assert await event_router.build_messages(event) == []
+
+
+@pytest.mark.asyncio
+async def test_updated_event_with_changed_end_time_emits():
+    event = {
+        "event": "reservation.updated",
+        "reservation_id": str(uuid.uuid4()),
+        "user_id": _user(),
+        "device_ids": [str(uuid.uuid4())],
+        "added_device_ids": [],
+        "removed_device_ids": [],
+        "end_time_changed": True,
+        "end_time": "2026-04-21T00:00:00+00:00",
+    }
+    messages = await event_router.build_messages(event)
+    assert len(messages) == 1
+    assert "ends" in messages[0].body
+    assert "2026-04-21" in messages[0].body
+
+
+@pytest.mark.asyncio
 async def test_updated_event_with_added_devices_emits():
     event = {
         "event": "reservation.updated",
@@ -71,10 +107,14 @@ async def test_updated_event_with_added_devices_emits():
         "device_ids": [str(uuid.uuid4())],
         "added_device_ids": [str(uuid.uuid4())],
         "removed_device_ids": [],
+        "end_time_changed": False,
+        "end_time": None,
     }
     messages = await event_router.build_messages(event)
     assert len(messages) == 1
     assert "added 1" in messages[0].body
+    # Device-only change must not advertise an unchanged end time.
+    assert "ends" not in messages[0].body
 
 
 @pytest.mark.asyncio
