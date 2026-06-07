@@ -206,16 +206,24 @@ async def _update_device_statuses(
     status: str,
     *,
     raise_on_failure: bool = False,
-) -> None:
+    succeeded: set[uuid.UUID] | None = None,
+) -> list[uuid.UUID]:
     """Update device statuses in the inventory service via the internal token.
 
     Default behavior is best-effort: errors are logged and never raised. Pass
     raise_on_failure=True to raise RuntimeError if any device fails to update;
     callers on the create/cancel/release paths wrap this in retry_with_backoff
     and convert exhausted retries into a structured failure log.
+
+    The per-device POSTs run concurrently, so a partial failure leaves the
+    devices that DID succeed already flipped in inventory. Returns the list of
+    device ids whose update succeeded. Callers that need to compensate after an
+    exhausted retry (where the raised exception discards the return value) may
+    pass a mutable ``succeeded`` set; it is updated in place with every device
+    that has succeeded on any attempt, so the create path can revert them.
     """
     if not settings.internal_api_token:
-        return
+        return []
 
     async with httpx.AsyncClient() as client:
 
@@ -232,6 +240,12 @@ async def _update_device_statuses(
             *[update_one(did) for did in device_ids], return_exceptions=True
         )
 
+    succeeded_ids = [
+        did for did, exc in zip(device_ids, results) if not isinstance(exc, BaseException)
+    ]
+    if succeeded is not None:
+        succeeded.update(succeeded_ids)
+
     failed = [(did, exc) for did, exc in zip(device_ids, results) if isinstance(exc, BaseException)]
     for did, exc in failed:
         logger.error("Failed to update device %s status to %s: %s", did, status, exc, exc_info=exc)
@@ -241,6 +255,8 @@ async def _update_device_statuses(
             f"inventory status update failed for {len(failed)} device(s): "
             f"{[str(d) for d, _ in failed]}"
         )
+
+    return succeeded_ids
 
 
 async def _acquire_device_locks(db: AsyncSession, device_ids: list[uuid.UUID]) -> None:
@@ -362,10 +378,14 @@ async def create_reservation(
     #    devices stay AVAILABLE so no inventory call is needed. On exhausted retries
     #    the reservation is flipped to FAILED and no NATS event is emitted.
     if exclusive_uuid_ids:
+        # Track which devices actually reached RESERVED across all retry attempts.
+        # The POSTs run concurrently, so a partial failure leaves the succeeding
+        # devices flipped in inventory even when the call ultimately raises.
+        reserved_ok: set[uuid.UUID] = set()
         try:
             await retry_with_backoff(
                 lambda: _update_device_statuses(
-                    exclusive_uuid_ids, "RESERVED", raise_on_failure=True
+                    exclusive_uuid_ids, "RESERVED", raise_on_failure=True, succeeded=reserved_ok
                 ),
                 attempts=3,
                 initial_delay=0.5,
@@ -376,6 +396,25 @@ async def create_reservation(
             reservation.status = ReservationStatus.FAILED
             await db.commit()
             await db.refresh(reservation)
+            # Compensate: best-effort revert the devices that DID get set RESERVED
+            # back to AVAILABLE. A FAILED reservation is excluded from the conflict
+            # status set, so without this the succeeded devices would be orphaned
+            # (stuck RESERVED, unbookable) with nothing referencing them. Errors are
+            # swallowed and logged; there is no sweeper to clean these up otherwise.
+            if reserved_ok:
+                try:
+                    await _update_device_statuses(sorted(reserved_ok), "AVAILABLE")
+                except Exception:
+                    logger.error(
+                        "Failed to revert RESERVED devices after provisioning failure: %s",
+                        reservation.id,
+                        extra={
+                            "action": "reservation_provision_revert_failed",
+                            "reservation_id": str(reservation.id),
+                            "device_ids": [str(d) for d in sorted(reserved_ok)],
+                        },
+                        exc_info=True,
+                    )
             logger.error(
                 "Reservation provisioning failed: %s",
                 reservation.id,

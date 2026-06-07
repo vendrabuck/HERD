@@ -628,6 +628,70 @@ async def test_create_reservation_fails_when_inventory_exhausts_retries():
 
 
 @pytest.mark.asyncio
+async def test_create_reservation_reverts_partially_reserved_devices_on_failure():
+    """Regression: on a partial RESERVED failure that exhausts retries, the devices
+    that DID get set RESERVED must be reverted to AVAILABLE so they are not orphaned
+    (FAILED reservations are excluded from the conflict set, so nothing references
+    them; without the compensating revert they stay RESERVED and unbookable).
+
+    DEVICE_A's RESERVED POST always fails; DEVICE_B's succeeds. The create path
+    should flip to FAILED, raise, and issue a compensating AVAILABLE POST for
+    DEVICE_B (and not for DEVICE_A, which never reached RESERVED).
+    """
+    async with TestSessionLocal() as db:
+        devices = [_make_device(DEVICE_A), _make_device(DEVICE_B)]
+        data = ReservationCreate(
+            device_ids=[DEVICE_A, DEVICE_B],
+            start_time=NOW + timedelta(hours=1),
+            end_time=NOW + timedelta(hours=3),
+        )
+
+        # Record every inventory status POST as (device_id_str, status).
+        posts: list[tuple[str, str]] = []
+
+        async def fake_post(url, json=None, headers=None, timeout=None):
+            device_id = url.rstrip("/").split("/")[-2]
+            status = json["status"]
+            posts.append((device_id, status))
+            resp = MagicMock()
+            if device_id == str(DEVICE_A) and status == "RESERVED":
+                # DEVICE_A never succeeds at reserving, which drives the failure.
+                resp.raise_for_status = MagicMock(side_effect=Exception("inventory 500"))
+            else:
+                resp.raise_for_status = MagicMock(return_value=None)
+            return resp
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(side_effect=fake_post)
+
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices",
+                new=AsyncMock(return_value=devices),
+            ),
+            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
+            patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+            # Collapse backoff delays so the test runs fast.
+            patch("herd_common.retry.asyncio.sleep", new=AsyncMock()),
+        ):
+            with pytest.raises(RuntimeError, match="Failed to reserve devices"):
+                await create_reservation(db, data, USER_ID, "token")
+
+        rows = (await db.execute(select(Reservation))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == ReservationStatus.FAILED
+
+        # The succeeded device (DEVICE_B) was reverted to AVAILABLE.
+        assert (str(DEVICE_B), "AVAILABLE") in posts
+        # DEVICE_B was set RESERVED at least once (the success the revert compensates).
+        assert (str(DEVICE_B), "RESERVED") in posts
+        # DEVICE_A never reached RESERVED, so it must not be reverted.
+        assert (str(DEVICE_A), "AVAILABLE") not in posts
+
+
+@pytest.mark.asyncio
 async def test_create_reservation_pending_provision_blocks_concurrent_create():
     """A PENDING_PROVISION row must conflict with a second create for the same device."""
     async with TestSessionLocal() as db:
