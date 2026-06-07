@@ -27,6 +27,10 @@
     [
       "POST",
       "/templates/suggest-identity"
+    ],
+    [
+      "GET",
+      "/usage"
     ]
   ],
   "schemas": {
