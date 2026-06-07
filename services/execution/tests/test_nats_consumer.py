@@ -785,6 +785,57 @@ async def test_process_message_dlq_publish_failure_does_not_propagate():
     msg.ack.assert_awaited_once()
 
 
+# --- regression (#74): DLQ subject must not match the consumer filter ---
+
+# The consumer subscribes with this filter; see start_nats_consumer's
+# js.subscribe("herd.reservations.*", ...). Kept here as a literal so the test
+# fails if the subscribe filter and the DLQ subject ever realign.
+CONSUMER_FILTER_SUBJECT = "herd.reservations.*"
+
+
+def _nats_subject_matches(subject: str, filter_subject: str) -> bool:
+    """Return whether `subject` matches a NATS `filter_subject`.
+
+    Implements the two NATS wildcards token by token: `*` matches exactly one
+    token, `>` matches one or more trailing tokens. Tokens are split on `.`.
+    """
+    subj_tokens = subject.split(".")
+    filt_tokens = filter_subject.split(".")
+    for i, ftok in enumerate(filt_tokens):
+        if ftok == ">":
+            # `>` is only valid as the final token and matches the rest.
+            return i < len(subj_tokens)
+        if i >= len(subj_tokens):
+            return False
+        if ftok != "*" and ftok != subj_tokens[i]:
+            return False
+    # No `>` consumed the tail, so token counts must match exactly.
+    return len(subj_tokens) == len(filt_tokens)
+
+
+def test_nats_subject_matcher_self_check():
+    """Sanity-check the matcher against the single-wildcard rule the bug hinges on."""
+    # `*` matches exactly one token, so the old 3-token DLQ subject DID match.
+    assert _nats_subject_matches("herd.reservations.dlq", "herd.reservations.*")
+    # A 4-token subject does NOT match the single-wildcard 3-token filter.
+    assert not _nats_subject_matches("herd.reservations.dlq.execution", "herd.reservations.*")
+    # Real lifecycle subjects still match (the consumer must keep receiving them).
+    assert _nats_subject_matches("herd.reservations.created", "herd.reservations.*")
+
+
+def test_dlq_subject_not_redelivered_to_consumer():
+    """#74: a DLQ'd message must not be redelivered to the execution consumer.
+
+    If NATS_DLQ_SUBJECT matched the consumer's filter, every DLQ publish would
+    loop back into the same consumer: a poison message forever, and a
+    max_deliver-exhausted message re-running the non-idempotent handler.
+    """
+    assert not _nats_subject_matches(NATS_DLQ_SUBJECT, CONSUMER_FILTER_SUBJECT)
+    # And it is strictly more specific (more tokens) than the wildcard filter,
+    # which is what guarantees the single-token `*` cannot reach it.
+    assert len(NATS_DLQ_SUBJECT.split(".")) > len(CONSUMER_FILTER_SUBJECT.split("."))
+
+
 # --- fetch helpers: transient (5xx / transport) vs genuine 404 ---
 
 
