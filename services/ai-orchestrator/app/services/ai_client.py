@@ -362,12 +362,14 @@ class AIClient:
         file_context: str = "",
         template_names: list[str] | None = None,
         repair_feedback: str = "",
-    ) -> dict[str, Any]:
-        """Call the model; return the parsed tool input dict.
+    ) -> tuple[dict[str, Any], Usage]:
+        """Call the model; return the parsed tool input dict and token usage.
 
         `template_names`, when given, constrains the tool's template_name field
         to that enum. `repair_feedback`, when given, is appended to the user
-        message so a retry can tell the model exactly what to fix.
+        message so a retry can tell the model exactly what to fix. The returned
+        Usage lets the caller meter this call against a per-user token quota;
+        it is accumulated across repair retries by the generator.
         """
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             inventory_block=inventory_block,
@@ -411,14 +413,14 @@ class AIClient:
                         "stop_reason": resp.stop_reason,
                     },
                 )
-                return block.input
+                return block.input, resp.usage
 
         # Fall back to parsing any text block as JSON (defensive; should not happen
         # when tool_choice forces a tool call).
         for block in resp.content:
             if isinstance(block, TextBlock):
                 try:
-                    return json.loads(block.text)
+                    return json.loads(block.text), resp.usage
                 except (ValueError, AttributeError):
                     continue
 
@@ -430,12 +432,14 @@ class AIClient:
         name: str,
         description: str | None = None,
         sections: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        """Force a single suggest_identity tool call; return the parsed dict.
+    ) -> tuple[dict[str, Any], Usage]:
+        """Force a single suggest_identity tool call; return the parsed dict
+        and token usage.
 
         Mirrors propose_topology's shape: single forced tool_use, structured
         JSON via input_schema. Used by the template editor's
-        "Suggest with AI" button. Never multi-turn.
+        "Suggest with AI" button. Never multi-turn. The returned Usage lets the
+        route meter this call against a per-user token quota.
         """
         user_parts = [f"<template_name>{name}</template_name>"]
         if description:
@@ -471,7 +475,7 @@ class AIClient:
                 )
                 result = dict(block.input)
                 result.setdefault("part_number", None)
-                return result
+                return result, resp.usage
 
         raise AIError("AI did not return a suggest_identity tool_use block")
 

@@ -1,20 +1,28 @@
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 from app import config as config_module
+from app.database import Base, engine
 from app.main import app
 from app.routes.generate import _inventory_provider
 from app.services import generator as generator_module
+from app.services import usage_repo
 from app.services.ai_client import AIError, get_ai_client
 from app.services.inventory_client import InventorySummary
+from app.services.llm_provider import Usage
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+_USER_ID = str(uuid.uuid4())
+_TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _user_token(role: str = "user") -> str:
     payload = {
-        "sub": "test-user",
+        "sub": _USER_ID,
         "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
     }
@@ -36,6 +44,18 @@ def set_api_key(monkeypatch):
     monkeypatch.setattr(config_module.settings, "anthropic_api_key", "sk-ant-fake")
     yield
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+async def setup_db():
+    # The generate route now opens a DB session (for the quota hooks); create
+    # the ai_usage table so quota-enabled tests can read and write it. Quota is
+    # disabled by default, so the hooks are no-ops unless a test sets it.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
 
 
 def _override_inventory(counts: dict[str, int]) -> None:
@@ -62,7 +82,7 @@ def _override_ai(response: dict[str, Any] | None = None, *, raises: Exception | 
             # so a repairable rejection still surfaces after retries exhaust.
             if raises is not None:
                 raise raises
-            return response
+            return response, Usage(input_tokens=10, output_tokens=20)
 
     app.dependency_overrides[get_ai_client] = lambda: StubAI()
 
@@ -88,7 +108,7 @@ def _override_ai_sequence(responses: list[dict[str, Any]]):
         ):
             idx = min(self._calls, len(responses) - 1)
             self._calls += 1
-            return responses[idx]
+            return responses[idx], Usage(input_tokens=10, output_tokens=20)
 
     app.dependency_overrides[get_ai_client] = lambda: SequenceAI()
 
@@ -362,11 +382,14 @@ async def test_generate_forwards_file_context_to_ai(async_client, monkeypatch):
             captured["inventory_block"] = inventory_block
             captured["user_prompt"] = user_prompt
             captured["file_context"] = file_context
-            return {
-                "purpose": "with-files",
-                "devices": [{"role": "a", "template_name": "EX3400"}],
-                "edges": [],
-            }
+            return (
+                {
+                    "purpose": "with-files",
+                    "devices": [{"role": "a", "template_name": "EX3400"}],
+                    "edges": [],
+                },
+                Usage(input_tokens=10, output_tokens=20),
+            )
 
     app.dependency_overrides[get_ai_client] = lambda: StubAI()
     _override_inventory({"EX3400": 4})
@@ -445,3 +468,48 @@ async def test_generate_works_without_files(async_client, monkeypatch):
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()["file_summaries"] == []
+
+
+async def test_generate_over_quota_returns_429_without_calling_provider(async_client, monkeypatch):
+    """At/over quota, the route returns 429 and never invokes the AI provider."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    async with _TestSessionLocal() as db:
+        await usage_repo.add_tokens(db, uuid.UUID(_USER_ID), input_tokens=100, output_tokens=0)
+
+    class ExplodingAI:
+        async def propose_topology(self, **kwargs):
+            raise AssertionError("provider must not be called when over quota")
+
+    app.dependency_overrides[get_ai_client] = lambda: ExplodingAI()
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "anything"}, headers=headers)
+    assert resp.status_code == 429
+    detail = resp.json()["detail"]
+    assert detail["limit"] == 100
+    assert detail["used"] == 100
+    assert detail["remaining"] == 0
+
+
+async def test_generate_records_usage_when_quota_enabled(async_client, monkeypatch):
+    """A successful generation books the provider's reported tokens against the quota."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "metered",
+            "devices": [{"role": "a", "template_name": "EX3400"}],
+            "edges": [],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    # _override_ai stubs Usage(input_tokens=10, output_tokens=20) -> 30 total.
+    async with _TestSessionLocal() as db:
+        assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 30

@@ -1,18 +1,23 @@
 """Tests for POST /api/ai/templates/suggest-identity."""
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from app import config as config_module
+from app.database import Base, engine
 from app.main import app
 from app.services.ai_client import AIError, get_ai_client
+from app.services.llm_provider import Usage
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
+
+_ADMIN_ID = str(uuid.uuid4())
 
 
 def _token(role: str = "admin") -> str:
     payload = {
-        "sub": "test-user",
+        "sub": _ADMIN_ID,
         "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
     }
@@ -36,12 +41,24 @@ def set_api_key(monkeypatch):
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+async def setup_db():
+    # The route opens a DB session for the quota hooks; create the ai_usage
+    # table so quota-enabled tests work. Quota is disabled by default, so the
+    # hooks are no-ops unless a test sets it.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
 def _override_ai_returning(suggestion: dict | None = None, *, raises: Exception | None = None):
     class StubAI:
         async def suggest_template_identity(self, **kwargs):
             if raises is not None:
                 raise raises
-            return suggestion
+            return suggestion, Usage(input_tokens=10, output_tokens=20)
 
     app.dependency_overrides[get_ai_client] = lambda: StubAI()
 

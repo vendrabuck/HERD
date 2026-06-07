@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     ai_api_key: str = ""
     ai_model: str = "claude-sonnet-4-6"
     ai_max_tokens: int = 4096
+    # Per-user daily token budget (input + output) across all AI features:
+    # topology generation, the reservation assistant, and template-identity
+    # suggestions. 0 (default) disables enforcement entirely and writes no
+    # usage rows, so behavior is unchanged until an operator opts in. When
+    # positive, a caller whose accumulated tokens for the current UTC day
+    # already meet or exceed this value is rejected with HTTP 429 before the
+    # provider is called. Counts reset implicitly on the UTC day boundary.
+    ai_daily_token_quota: int = 0
     # Verify the TLS cert of ai_base_url. Set false only for an on-prem
     # openai_compat endpoint behind a self-signed cert (e.g. a local vLLM
     # server); ignored for the anthropic provider.

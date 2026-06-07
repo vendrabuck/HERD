@@ -29,7 +29,7 @@ from app.schemas.assistant import (
     PendingApply,
     ToolCallSummary,
 )
-from app.services import conversation_repo
+from app.services import conversation_repo, usage_repo
 from app.services.ai_client import AIClient, AIError, ai_is_configured, get_ai_client
 from app.services.reservation_context import (
     ContextDeadlineExceededError,
@@ -97,6 +97,7 @@ async def reservation_assistant(
         )
 
     user_id = uuid.UUID(user["sub"])
+    await usage_repo.enforce_quota(db, user_id)
 
     # Resolve or create the conversation. A non-None conversation_id that
     # does not match (user_id, reservation_id) returns 404 to avoid leaking
@@ -167,6 +168,13 @@ async def reservation_assistant(
                 await conversation_repo.evict_to_budget(db, conversation=conversation)
                 await conversation_repo.touch(db, conversation=conversation)
                 await db.commit()
+
+                await usage_repo.record_usage(
+                    db,
+                    user_id,
+                    turn.usage,
+                    fallback_text=body.question + turn.answer,
+                )
 
                 # Surface the most recent scheduled_apply side-effect for the
                 # frontend confirmation modal; same contract as iter 3.

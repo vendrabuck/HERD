@@ -9,6 +9,7 @@ from app.schemas.generate import ExtractedFile, GenerateResponse
 from app.services.ai_client import AIClient, AIError
 from app.services.extractor import render_file_context
 from app.services.inventory_client import InventorySummary, fetch_available_devices
+from app.services.llm_provider import Usage
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ async def generate_topology(
     ai: AIClient,
     user_bearer_token: str,
     extracted_files: list[ExtractedFile] | None = None,
-) -> GenerateResponse:
+) -> tuple[GenerateResponse, Usage]:
     extracted_files = extracted_files or []
     file_context = render_file_context(extracted_files)
     template_names = sorted(inventory.template_names)
@@ -58,15 +59,20 @@ async def generate_topology(
     # non-repairable 409 race) happens only after a clean proposal.
     repair_feedback = ""
     response: GenerateResponse | None = None
+    # Accumulate token usage across every repair attempt: each attempt is a real
+    # provider call that spends tokens, so the quota must see the sum, not just
+    # the final successful call.
+    total_usage = Usage()
     for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
         try:
-            raw = await ai.propose_topology(
+            raw, attempt_usage = await ai.propose_topology(
                 inventory_block=inventory.to_prompt_block(),
                 user_prompt=prompt,
                 file_context=file_context,
                 template_names=template_names,
                 repair_feedback=repair_feedback,
             )
+            total_usage.add(attempt_usage)
         except AIError as e:
             logger.exception("ai_error")
             raise GeneratorError(502, f"AI returned no usable response: {e}") from e
@@ -100,7 +106,7 @@ async def generate_topology(
         {"filename": f.filename, "chars": len(f.text), "truncated": f.truncated}
         for f in extracted_files
     ]
-    return response
+    return response, total_usage
 
 
 def _repair_feedback(error_message: str, template_names: list[str]) -> str:

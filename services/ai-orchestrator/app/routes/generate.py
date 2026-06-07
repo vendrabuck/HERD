@@ -1,10 +1,14 @@
 import logging
+import uuid
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from herd_common.auth import make_auth_dependencies
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import get_db
 from app.schemas.generate import ExtractedFile, GenerateResponse
+from app.services import usage_repo
 from app.services.ai_client import AIClient, ai_is_configured, get_ai_client
 from app.services.extractor import ExtractionError, extract_files
 from app.services.generator import GeneratorError, generate_topology
@@ -62,10 +66,11 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
 async def generate(
     prompt: str = Form(..., min_length=1, max_length=20000),
     files: list[UploadFile] | None = File(None),
-    _user=Depends(get_current_user),
+    user=Depends(get_current_user),
     token: str = Depends(_bearer_token),
     inventory: InventorySummary = Depends(_inventory_provider),
     ai: AIClient = Depends(get_ai_client),
+    db: AsyncSession = Depends(get_db),
 ) -> GenerateResponse:
     if not ai_is_configured():
         raise HTTPException(
@@ -73,10 +78,13 @@ async def generate(
             "AI orchestrator is not configured",
         )
 
+    user_id = uuid.UUID(user["sub"])
+    await usage_repo.enforce_quota(db, user_id)
+
     extracted = await _read_uploads(files)
 
     try:
-        response = await generate_topology(
+        response, usage = await generate_topology(
             prompt=prompt,
             inventory=inventory,
             ai=ai,
@@ -85,6 +93,13 @@ async def generate(
         )
     except GeneratorError as e:
         raise HTTPException(e.status_code, e.message) from e
+
+    await usage_repo.record_usage(
+        db,
+        user_id,
+        usage,
+        fallback_text=prompt + response.model_dump_json(),
+    )
 
     logger.info(
         "ai_proposal_generated",
