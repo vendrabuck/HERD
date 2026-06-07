@@ -65,6 +65,15 @@ def _validate_filename(filename: str) -> None:
             status_code=422,
             detail=f"Invalid file type: must be one of {sorted(ALLOWED_EXTENSIONS)}",
         )
+    # The filename becomes part of the storage key (f"{driver_id}/{filename}"), so
+    # reject any path separators or traversal segments up front: a name like
+    # "../../etc/x" would otherwise let the upload escape the driver storage root.
+    # The storage layer also guards this, but failing here gives a clean 422.
+    if "/" in filename or "\\" in filename or ".." in filename or filename.startswith("~"):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid file name: path separators and traversal segments are not allowed",
+        )
 
 
 async def list_drivers(
