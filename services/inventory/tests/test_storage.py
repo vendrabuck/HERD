@@ -106,6 +106,56 @@ def test_delete_local_missing_no_error():
         storage.delete_object("nonexistent/file.bin")
 
 
+# --- path traversal (CWE-22): keys must not escape the storage root ---
+
+_TRAVERSAL_KEYS = [
+    "../escape.bin",
+    "../../etc/evil",
+    "a/../../escape.bin",
+    "/etc/passwd",
+    "sub/../../escape.bin",
+]
+
+
+@pytest.mark.parametrize("bad_key", _TRAVERSAL_KEYS)
+def test_upload_local_rejects_traversal_key(bad_key):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage._backend = "local"
+        storage._local_path = Path(tmpdir)
+        with pytest.raises(ValueError):
+            storage.upload_object(bad_key, b"owned")
+        # The escaping file must not have been written anywhere outside the root.
+        parent = Path(tmpdir).resolve().parent
+        assert not (parent / "escape.bin").exists()
+
+
+@pytest.mark.parametrize("bad_key", _TRAVERSAL_KEYS)
+def test_download_local_rejects_traversal_key(bad_key):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage._backend = "local"
+        storage._local_path = Path(tmpdir)
+        with pytest.raises(ValueError):
+            storage.download_object(bad_key)
+
+
+@pytest.mark.parametrize("bad_key", _TRAVERSAL_KEYS)
+def test_delete_local_rejects_traversal_key(bad_key):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage._backend = "local"
+        storage._local_path = Path(tmpdir)
+        with pytest.raises(ValueError):
+            storage.delete_object(bad_key)
+
+
+def test_upload_local_allows_normal_nested_key():
+    # The guard must not break legitimate nested keys like "<driver_id>/<file>".
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage._backend = "local"
+        storage._local_path = Path(tmpdir)
+        storage.upload_object("driver-123/pkg.zip", b"ok")
+        assert storage.download_object("driver-123/pkg.zip") == b"ok"
+
+
 # --- Uninitialized backend ---
 
 

@@ -56,6 +56,24 @@ def test_validate_filename_invalid():
     assert exc.value.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "../evil.zip",
+        "../../etc/evil.zip",
+        "sub/evil.zip",
+        "a\\b.zip",
+        "~/evil.zip",
+    ],
+)
+def test_validate_filename_rejects_path_traversal(bad_name):
+    # The filename becomes part of the storage key, so traversal segments and
+    # path separators must be rejected at the API boundary (CWE-22).
+    with pytest.raises(HTTPException) as exc:
+        _validate_filename(bad_name)
+    assert exc.value.status_code == 422
+
+
 def test_validate_connection_type_valid():
     _validate_connection_type("Management")  # should not raise
     _validate_connection_type("Layer 1 Switch")

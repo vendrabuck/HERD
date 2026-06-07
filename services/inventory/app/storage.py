@@ -11,6 +11,27 @@ _client = None  # Minio instance when using minio backend
 _local_path: Path | None = None
 
 
+def _resolve_local(key: str) -> Path:
+    """Resolve a storage key to an absolute path inside the local storage root.
+
+    Guards against path traversal: the key is caller-influenced (driver storage
+    keys are built from the uploaded filename), so a key like "../../etc/x" or an
+    absolute path would otherwise let upload_object/download_object/delete_object
+    write, read, or delete files outside the driver storage directory (CWE-22).
+    We resolve the joined path and require it to stay within the resolved root,
+    raising ValueError otherwise. This is the single chokepoint for every local
+    filesystem operation, so the check cannot be bypassed by an unsanitized
+    caller.
+    """
+    if _local_path is None:
+        raise RuntimeError("Storage not initialized; call init_storage() first")
+    root = _local_path.resolve()
+    candidate = (root / key).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"Invalid storage key escapes storage root: {key!r}")
+    return candidate
+
+
 def init_storage() -> None:
     global _backend, _client, _local_path
     if settings.minio_endpoint:
@@ -45,7 +66,7 @@ def upload_object(key: str, data: bytes, content_type: str = "application/octet-
             content_type=content_type,
         )
     elif _backend == "local":
-        dest = _local_path / key
+        dest = _resolve_local(key)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
     else:
@@ -61,7 +82,7 @@ def download_object(key: str) -> bytes:
             response.close()
             response.release_conn()
     elif _backend == "local":
-        dest = _local_path / key
+        dest = _resolve_local(key)
         if not dest.exists():
             raise FileNotFoundError(f"Driver file not found: {key}")
         return dest.read_bytes()
@@ -73,7 +94,7 @@ def delete_object(key: str) -> None:
     if _backend == "minio":
         _client.remove_object(settings.minio_bucket, key)
     elif _backend == "local":
-        dest = _local_path / key
+        dest = _resolve_local(key)
         if dest.exists():
             dest.unlink()
     else:
