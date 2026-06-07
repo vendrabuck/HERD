@@ -3,6 +3,7 @@ import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useCurrentUser, useLogout } from "@/api/auth";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
+import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
 
 const NAV_ITEMS = [
@@ -159,6 +160,15 @@ export function AppLayout() {
           </nav>
         </div>
         <div className="flex items-center gap-3">
+          <a
+            href="https://github.com/vendrabuck/HERD/blob/main/docs/USER_GUIDE.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Help"
+            className="text-gray-300 hover:text-white p-1 rounded hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <HelpCircle size={18} />
+          </a>
           <NotificationBell />
           <NavLink
             to="/settings"
