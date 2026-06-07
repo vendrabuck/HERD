@@ -36,6 +36,18 @@ def _render_created(event: dict) -> tuple[str, str]:
     return title, body
 
 
+def _end_time_changed(event: dict) -> bool:
+    """Whether a reservation.updated event actually moved the end time.
+
+    The producer sets an explicit ``end_time_changed`` flag and only carries a
+    non-null ``end_time`` when it changed. Older payloads lack the flag, so fall
+    back to the presence of ``end_time`` for backward compatibility.
+    """
+    if "end_time_changed" in event:
+        return bool(event["end_time_changed"])
+    return bool(event.get("end_time"))
+
+
 def _render_updated(event: dict) -> tuple[str, str]:
     added = event.get("added_device_ids") or []
     removed = event.get("removed_device_ids") or []
@@ -44,7 +56,7 @@ def _render_updated(event: dict) -> tuple[str, str]:
         parts.append(f"added {len(added)}")
     if removed:
         parts.append(f"removed {len(removed)}")
-    if event.get("end_time"):
+    if _end_time_changed(event):
         parts.append(f"ends {_format_end_time(event.get('end_time'))}")
     body = "Reservation updated: " + (", ".join(parts) if parts else "details changed.")
     return "Reservation updated", body
@@ -102,7 +114,7 @@ _RENDERERS = {
 def _should_emit_update(event: dict) -> bool:
     if event.get("added_device_ids") or event.get("removed_device_ids"):
         return True
-    if event.get("end_time"):
+    if _end_time_changed(event):
         return True
     return False
 

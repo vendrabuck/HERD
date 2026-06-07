@@ -511,6 +511,7 @@ async def update_reservation(
     if reservation.status not in (ReservationStatus.ACTIVE, ReservationStatus.PENDING):
         raise ValueError(f"Cannot update a {reservation.status.value} reservation")
 
+    end_time_changed = False
     if data.end_time is not None:
         # Normalize timezone awareness for comparison (SQLite returns naive datetimes)
         new_end = data.end_time.replace(tzinfo=None) if data.end_time.tzinfo else data.end_time
@@ -555,6 +556,7 @@ async def update_reservation(
                     f"in the extended window"
                 )
 
+        end_time_changed = new_end != old_end
         reservation.end_time = data.end_time
 
     if data.purpose is not None:
@@ -684,7 +686,10 @@ async def update_reservation(
             "device_ids": [str(d) for d in reservation.device_ids],
             "added_device_ids": [str(d) for d in added_ids],
             "removed_device_ids": [str(d) for d in removed_ids],
-            "end_time": reservation.end_time.isoformat(),
+            # Only signal the end time when it actually changed. A metadata-only
+            # edit (e.g. purpose) must not advertise an unchanged "ends <time>".
+            "end_time_changed": end_time_changed,
+            "end_time": reservation.end_time.isoformat() if end_time_changed else None,
         },
     )
 

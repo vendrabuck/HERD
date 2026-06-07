@@ -1180,3 +1180,98 @@ async def test_update_reservation_remove_non_exclusive_no_status_change():
         # No AVAILABLE call since removed device is non-exclusive
         available_calls = [c for c in mock_update_statuses.call_args_list if c[0][1] == "AVAILABLE"]
         assert len(available_calls) == 0
+
+
+# --- reservation.updated payload honesty (issue #79) ---
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_metadata_only_omits_end_time():
+    """A purpose-only edit must not advertise an unchanged end time.
+
+    The published reservation.updated payload should flag end_time_changed=False
+    and carry a null end_time so the notifications consumer suppresses the
+    misleading "ends <time>" notification.
+    """
+    from app.services.reservation_service import update_reservation
+
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, device_ids=[DEVICE_A])
+        original_end = res.end_time
+
+        mock_publish = AsyncMock()
+        with patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=mock_publish,
+        ):
+            result = await update_reservation(
+                db, res.id, USER_ID, ReservationUpdate(purpose="new purpose")
+            )
+
+        assert result is not None
+        assert result.end_time == original_end
+        payload = mock_publish.call_args.args[2]
+        assert payload["event"] == "reservation.updated"
+        assert payload["end_time_changed"] is False
+        assert payload["end_time"] is None
+        assert payload["added_device_ids"] == []
+        assert payload["removed_device_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_same_end_time_not_flagged_changed():
+    """Re-sending the existing end_time is not a change; flag stays False."""
+    from app.services.reservation_service import update_reservation
+
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, device_ids=[DEVICE_A])
+        same_end = res.end_time
+
+        mock_publish = AsyncMock()
+        with patch(
+            "app.services.reservation_service._publish_nats_event",
+            new=mock_publish,
+        ):
+            result = await update_reservation(
+                db, res.id, USER_ID, ReservationUpdate(end_time=same_end)
+            )
+
+        assert result is not None
+        payload = mock_publish.call_args.args[2]
+        assert payload["end_time_changed"] is False
+        assert payload["end_time"] is None
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_changed_end_time_is_flagged_and_carried():
+    """Extending the reservation flags the change and carries the new end_time."""
+    from app.services.reservation_service import update_reservation
+
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, device_ids=[DEVICE_A])
+        new_end = NOW + timedelta(hours=6)
+        non_excl_device = _make_device(DEVICE_A, exclusive=False)
+
+        mock_publish = AsyncMock()
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices",
+                new=AsyncMock(return_value=[non_excl_device]),
+            ),
+            patch(
+                "app.services.reservation_service._publish_nats_event",
+                new=mock_publish,
+            ),
+        ):
+            result = await update_reservation(
+                db,
+                res.id,
+                USER_ID,
+                ReservationUpdate(end_time=new_end),
+                token="fake",
+            )
+
+        assert result is not None
+        payload = mock_publish.call_args.args[2]
+        assert payload["end_time_changed"] is True
+        assert payload["end_time"] == result.end_time.isoformat()
