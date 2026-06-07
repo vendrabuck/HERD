@@ -24,7 +24,17 @@ EVENT_ACTIONS = {
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
 NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
-NATS_DLQ_SUBJECT = "herd.reservations.dlq"
+# DLQ subject is 4 tokens so the consumer's 3-token "herd.reservations.*" filter
+# (single-token wildcard matches exactly one token) does NOT match it. If it did,
+# every DLQ'd message would be redelivered to this same consumer: a poison message
+# would loop forever and a max_deliver-exhausted message would re-run the
+# non-idempotent handler. This mirrors the notifications service's
+# "herd.reservations.dlq.notifications". The HERD_RESERVATIONS stream is created
+# with subjects=["herd.reservations.*"], so this subject is not bound to that
+# stream; the publish is best-effort and _publish_to_dlq swallows the resulting
+# error, matching notifications. Breaking the redelivery loop is the fix; durable
+# DLQ retention would require a dedicated stream and is out of scope here.
+NATS_DLQ_SUBJECT = "herd.reservations.dlq.execution"
 
 
 class TransientUpstreamError(RuntimeError):
@@ -958,8 +968,8 @@ async def start_nats_consumer(app) -> None:
             logger.warning("Could not create/update NATS stream", exc_info=True)
 
         # Durable consumer with explicit retry policy: bounded redelivery + backoff.
-        # The DLQ subject is a sibling on the same stream (herd.reservations.*), so
-        # failed messages remain durably visible without a second stream.
+        # The DLQ subject (NATS_DLQ_SUBJECT) is intentionally outside this filter so
+        # DLQ'd messages are not redelivered to this consumer; see its definition.
         sub = await js.subscribe(
             "herd.reservations.*",
             durable="execution-consumer",
