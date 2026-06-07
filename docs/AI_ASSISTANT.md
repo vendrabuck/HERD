@@ -123,15 +123,17 @@ Note: the iter-1 413 response (rendered context exceeded a size ceiling) no long
 | Conversation idle TTL | 24 hours | `ASSISTANT_CONVERSATION_TTL_HOURS` |
 | Hard turn cap per conversation | 40 (user + assistant + tool messages combined; seed pinned) | `ASSISTANT_MAX_TURNS` |
 | History token budget per conversation | 60,000 input tokens (chars/4 estimate) | `ASSISTANT_HISTORY_TOKEN_BUDGET` |
+| Per-user daily token quota | disabled (0) | `AI_DAILY_TOKEN_QUOTA` |
 | Sweeper interval | 3600 seconds | `ASSISTANT_SWEEPER_INTERVAL_SECONDS` |
 
 When the iteration cap is hit, the orchestrator makes one final call with `tool_choice={"type": "none"}` and a nudge ("you have exhausted your tool budget; answer with what you know"), and returns the resulting text as a normal 200 response. The user always gets an answer, even if a degraded one.
 
 When either the turn cap or the token budget is exceeded, the repository evicts the oldest user+assistant pair (and any tool-result echo between them) until both bounds are satisfied. The position-0 seed message is pinned and never evicted; without it the model loses its grounding.
 
+The per-conversation budget above is separate from the optional per-user daily quota. `AI_DAILY_TOKEN_QUOTA` (default 0, disabled) caps the input + output tokens one user can spend per UTC day across all AI features (generation, the assistant, and template-identity suggestions). When the running daily total reaches the cap, the next billable call is rejected with HTTP 429 and a `{limit, used, remaining, reset_at}` body before the provider is called; the total resets on the UTC day boundary. `GET /api/ai/quota` returns the caller's current usage. See [ENV_VARS.md](ENV_VARS.md) for the full description.
+
 ## Future iterations
 
-- Per-user daily token quotas.
 - Web/docs lookup tools for vendor reference material.
 - Streaming responses (current responses are returned as a single completed turn).
 - Optional cross-reservation conversation memory for users who own multiple related reservations.

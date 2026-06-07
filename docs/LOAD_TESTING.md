@@ -53,7 +53,7 @@ Locust picks which class to spawn using the `weight` attribute. With the default
 ## Prerequisites
 
 - A running HERD stack (`make up`), reachable via HTTPS.
-- Seeded data so the user classes have devices and users to exercise. A seed script is not included in this repo; bring your own (or write one) that creates an admin user, a regular user, and a handful of templates plus devices. Once you have one, `make seed` is the standard invocation point.
+- Seeded data so the user classes have devices and users to exercise. The repo ships `seed_devices_public.py`, run via `make seed`, which creates admin and regular users, templates, devices, switches, cabling, groups, and demo topologies. It resolves its login from `SEED_EMAIL`/`SEED_PASSWORD`, then `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD`, then a generic `admin@example.com` default.
 - `locust` installed; it ships as a dev dependency in the workspace, so `make install` (or `uv sync --all-extras`) pulls it in.
 
 The admin credentials default to `SEED_EMAIL=admin@example.com` / `SEED_PASSWORD=<your-admin-password>`; the regular user defaults to `SEED_USER_EMAIL=user1@herd.dev` / `SEED_USER_PASSWORD=<your-user-password>`. Override via environment to match your seed. If the regular user does not exist the `ACLChecker` class will emit 401s; either seed that account or unset the class by reducing its weight.
