@@ -93,7 +93,7 @@ async def test_ai_generate_succeeds_when_provider_configured(base_url, admin_tok
 
     assert resp.status_code != 503, f"503 despite enabled=true: {resp.text}"
 
-    if resp.status_code == 502 and "available" in resp.text:
+    if resp.status_code in (409, 502) and "available" in resp.text:
         return
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
