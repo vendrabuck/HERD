@@ -2,22 +2,22 @@
 
 ## Supported Versions
 
-HERD is released from `master`. There is no long-term-support branch today; please run a recent commit.
+HERD is released from `main`. There is no long-term-support branch today; please run a recent commit.
 
 | Version | Supported |
 | ------- | --------- |
-| master (latest commit) | yes |
+| main (latest commit) | yes |
 | older | no |
 
-If you are operating an older checkout, pull `master` before filing a security report so we're both working from the same code.
+If you are operating an older checkout, pull `main` before filing a security report so we're both working from the same code.
 
 ## Reporting a Vulnerability
 
 Please do **not** open a public issue for suspected security vulnerabilities.
 
-Email a description of the issue and reproduction steps to the project maintainer (see repo `CODEOWNERS` or the contact in the repo's README). If you do not know where to send it, open a GitHub issue titled "Security contact request" and the maintainer will reach out privately.
+Use GitHub's private vulnerability reporting (the "Report a vulnerability" button under the repository's Security tab) to send a description of the issue and reproduction steps to the maintainer privately. If that is unavailable, open a GitHub issue titled "Security contact request" (no details) and the maintainer will reach out privately to take the report off the public tracker.
 
-You can expect an acknowledgment within one week. We aim to triage and provide an initial assessment within two weeks. Accepted issues will be patched on `master`; a write-up is published after the fix ships.
+You can expect an acknowledgment within one week. We aim to triage and provide an initial assessment within two weeks. Accepted issues will be patched on `main`; a write-up is published after the fix ships.
 
 ## What counts as a security issue
 
