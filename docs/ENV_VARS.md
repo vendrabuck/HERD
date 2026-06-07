@@ -70,6 +70,8 @@ LDAP groups are not mirrored automatically in v1.
 | `LDAP_EMAIL_ATTRIBUTE` | `mail` | Directory attribute providing the user's email. Users without this attribute cannot log in. |
 | `LDAP_USERNAME_ATTRIBUTE` | `sAMAccountName` | Directory attribute used as the HERD username. |
 | `LDAP_USE_TLS` | `true` | Require TLS. `ldaps://` URLs negotiate TLS implicitly; plain `ldap://` URLs use STARTTLS when this is true. |
+| `LDAP_TLS_VALIDATE` | `true` | Verify the directory server's TLS certificate. The bind transmits the service-account and every user's password, so leave this on: an unvalidated certificate lets an active network attacker MITM the connection and harvest credentials. Set `false` only for a lab directory behind a self-signed cert you cannot pin via `LDAP_CA_CERT`; this logs a startup warning. |
+| `LDAP_CA_CERT` | (empty) | Path (inside the container) to a CA bundle to verify the directory server against, e.g. a pinned internal CA. Used when `LDAP_TLS_VALIDATE=true`; when empty the system trust store is used. |
 
 Worked Active Directory example:
 
