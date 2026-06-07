@@ -46,6 +46,20 @@ class QuotaStatus:
     reset_at: datetime
 
 
+@dataclass(frozen=True)
+class UsageRow:
+    """One (user_id, usage_date) row of per-user daily AI token usage, for the
+    admin reporting view. Carries both the quota-bearing input/output counts and
+    the observability-only cache counters."""
+
+    user_id: uuid.UUID
+    usage_date: date
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+
+
 def _utc_today() -> date:
     return datetime.now(UTC).date()
 
@@ -125,6 +139,46 @@ async def get_status(db: AsyncSession, user_id: uuid.UUID) -> QuotaStatus:
         remaining=remaining,
         reset_at=_next_utc_midnight(_utc_today()),
     )
+
+
+async def query_usage(
+    db: AsyncSession,
+    *,
+    start: date,
+    end: date,
+) -> list[UsageRow]:
+    """Per-user daily AI token usage across [start, end] inclusive.
+
+    Drives the admin reporting view (GET /api/ai/usage). The table holds exactly
+    one row per (user_id, usage_date) thanks to the unique index, so this is a
+    range-filtered, deterministically ordered read rather than a GROUP BY. Both
+    bounds are inclusive UTC dates; an empty or inverted range yields []. Ordered
+    by usage_date then user_id for a stable response.
+    """
+    stmt = (
+        select(
+            AIUsage.user_id,
+            AIUsage.usage_date,
+            AIUsage.input_tokens,
+            AIUsage.output_tokens,
+            AIUsage.cache_creation_input_tokens,
+            AIUsage.cache_read_input_tokens,
+        )
+        .where(AIUsage.usage_date >= start, AIUsage.usage_date <= end)
+        .order_by(AIUsage.usage_date, AIUsage.user_id)
+    )
+    result = await db.execute(stmt)
+    return [
+        UsageRow(
+            user_id=row.user_id,
+            usage_date=row.usage_date,
+            input_tokens=row.input_tokens,
+            output_tokens=row.output_tokens,
+            cache_creation_input_tokens=row.cache_creation_input_tokens,
+            cache_read_input_tokens=row.cache_read_input_tokens,
+        )
+        for row in result.all()
+    ]
 
 
 async def enforce_quota(db: AsyncSession, user_id: uuid.UUID) -> None:
