@@ -19,6 +19,7 @@ from app.services.reservation_service import (
 logger = logging.getLogger(__name__)
 
 EXPIRING_SOON_SUBJECT = "herd.reservations.expiring_soon"
+COMPLETED_SUBJECT = "herd.reservations.completed"
 
 
 async def _run_reminder_cycle(nats_conn) -> None:
@@ -83,8 +84,23 @@ async def _run_reminder_cycle(nats_conn) -> None:
         await _publish_nats_event(nats_conn, EXPIRING_SOON_SUBJECT, event)
 
 
-async def _run_expiration_cycle() -> None:
-    """Single expiration cycle: activate pending, complete expired."""
+async def _run_expiration_cycle(nats_conn=None) -> None:
+    """Single expiration cycle: activate pending, complete expired.
+
+    Auto-completion is the normal end-of-life path for a reservation (most end by
+    reaching end_time, not by manual release). For each reservation it completes,
+    this emits a reservation.completed event on the same subject and with the same
+    payload shape as the manual release path (release_reservation), so the
+    execution service deprovisions (L1 disconnect, L2 VLAN teardown) and
+    notifications renders the completion. Without it the devices are flipped to
+    AVAILABLE in inventory while their config stays wired, letting a new
+    reservation be booked on top of stale, never-torn-down config.
+
+    The event is published after the transaction commits, once per completed
+    reservation. Publishing is best-effort (errors are logged, never raised by
+    _publish_nats_event); if nats_conn is None the publish is a no-op, consistent
+    with the rest of the service treating NATS as non-fatal.
+    """
     now = datetime.now(timezone.utc)
 
     async with AsyncSessionLocal() as db:
@@ -116,8 +132,25 @@ async def _run_expiration_cycle() -> None:
             )
         )
         expired = result.scalars().all()
+        # Snapshot the completion payload while the row (and its eager-loaded
+        # device_ids) is attached. Mirror the manual release_reservation payload
+        # exactly: same subject, event name, and fields, so execution and
+        # notifications consumers handle an auto-expiry identically to a manual
+        # release. device_ids is the reservation's full set (every device in the
+        # topology), not just the exclusive subset released in inventory below.
+        completed_events: list[dict] = []
         for res in expired:
             res.status = ReservationStatus.COMPLETED
+            completed_events.append(
+                {
+                    "event": "reservation.completed",
+                    "reservation_id": str(res.id),
+                    "user_id": str(res.user_id),
+                    "device_ids": [str(d) for d in res.device_ids],
+                    "topology_id": str(res.topology_id) if res.topology_id else None,
+                    "topology_type": res.topology_type.value,
+                }
+            )
             logger.info(
                 "Auto-completed reservation %s",
                 res.id,
@@ -146,20 +179,28 @@ async def _run_expiration_cycle() -> None:
         if exclusive_ids:
             await _update_device_statuses(exclusive_ids, "AVAILABLE")
 
+    # Emit a completion event per auto-completed reservation, after the commit,
+    # so consumers tear down the topology (execution deprovision/disconnect) and
+    # render the completion (notifications). Same helper the manual release path
+    # uses; best-effort, never raised.
+    for event in completed_events:
+        await _publish_nats_event(nats_conn, COMPLETED_SUBJECT, event)
+
 
 async def expiration_loop(interval_seconds: int = 60, nats_conn=None) -> None:
     """Run expiration cycles forever at the given interval.
 
     Each tick runs the state-machine cycle (activate/complete) and then the
-    upcoming-expiry reminder cycle. The reminder cycle needs the NATS connection
-    to publish reservation.expiring_soon; if NATS is unavailable (nats_conn is
-    None) the publish is a no-op and the reminder is skipped, consistent with
-    the rest of the service treating NATS as non-fatal.
+    upcoming-expiry reminder cycle. Both cycles need the NATS connection: the
+    expiration cycle publishes reservation.completed for auto-completed
+    reservations and the reminder cycle publishes reservation.expiring_soon. If
+    NATS is unavailable (nats_conn is None) the publishes are no-ops, consistent
+    with the rest of the service treating NATS as non-fatal.
     """
     logger.info("Expiration loop started, interval=%ds", interval_seconds)
     while True:
         try:
-            await _run_expiration_cycle()
+            await _run_expiration_cycle(nats_conn)
         except Exception:
             logger.error("Expiration cycle failed", exc_info=True)
         try:
