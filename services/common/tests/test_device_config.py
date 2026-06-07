@@ -20,7 +20,6 @@ from herd_common.device_config import (
     validate_device_config,
 )
 
-
 # --- Module-level registry invariants ----------------------------------------
 
 
@@ -31,9 +30,7 @@ def test_config_validation_error_is_value_error():
 
 
 def test_allowed_config_keys_is_sorted_union_of_schema_properties():
-    expected = sorted(
-        {key for schema in CONFIG_SCHEMAS.values() for key in schema["properties"]}
-    )
+    expected = sorted({key for schema in CONFIG_SCHEMAS.values() for key in schema["properties"]})
     assert ALLOWED_CONFIG_KEYS == expected
     # sorted() guarantees ascending order with no duplicates.
     assert ALLOWED_CONFIG_KEYS == sorted(set(ALLOWED_CONFIG_KEYS))
@@ -179,9 +176,7 @@ def test_layer3_interface_requires_name_and_zone():
 
 def test_layer3_interface_zone_must_be_in_enum():
     with pytest.raises(ConfigValidationError) as exc:
-        validate_device_config(
-            "Layer 3 Switch", {"interfaces": [{"name": "eth0", "zone": "wan"}]}
-        )
+        validate_device_config("Layer 3 Switch", {"interfaces": [{"name": "eth0", "zone": "wan"}]})
     assert "schema validation" in str(exc.value)
 
 
