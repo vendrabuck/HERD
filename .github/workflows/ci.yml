@@ -37,11 +37,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
+      # Scope mirrors the Makefile's lint/format targets: services/ plus the
+      # repo-root Python helper scripts (ROOT_PY), so a style violation in a
+      # root script fails CI the same way it fails `make lint` locally.
       - name: Lint
-        run: uv run ruff check services/
+        run: uv run ruff check services/ seed_devices_public.py
 
       - name: Format check
-        run: uv run ruff format --check services/
+        run: uv run ruff format --check services/ seed_devices_public.py
 
       # Single pass: pytest runs once with coverage across every service in the
       # Makefile's SERVICES list. This is the pass/fail signal AND the artifact
