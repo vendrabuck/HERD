@@ -29,23 +29,26 @@
     <ul>
       <li><a href="#bell">The bell</a></li>
       <li><a href="#panel">The notifications panel</a></li>
+      <li><a href="#events">What sets it off</a></li>
+      <li><a href="#channels">Email, chat &amp; webhooks</a></li>
       <li><a href="#settings">Tuning what you get</a></li>
       <li><a href="#profile">Profile &amp; password</a></li>
     </ul>
     <p class="eyebrow">User track</p>
     <ul>
-      <li><a href="quickstart.html">1 - First boot</a></li>
-      <li><a href="user-reservations.html">2 - Reservations</a></li>
-      <li><a href="user-topology.html">3 - Topology</a></li>
-      <li><a href="user-ai.html">4 - Generate with AI</a></li>
-      <li><a href="user-notifications.html" class="active">5 - Notifications</a></li>
+      <li><a href="quickstart.html">1 · First boot</a></li>
+      <li><a href="user-reservations.html">2 · Reservations</a></li>
+      <li><a href="user-topology.html">3 · Topology</a></li>
+      <li><a href="user-ai.html">4 · Generate with AI</a></li>
+      <li><a href="user-assistant.html">5 · AI assistant</a></li>
+      <li><a href="user-notifications.html" class="active">6 · Notifications</a></li>
     </ul>
   </aside>
 
   <main class="main">
-    <span class="kicker user">User track - Step 5</span>
+    <span class="kicker user">User track · Step 6</span>
     <h1 class="title">Notifications &amp; settings</h1>
-    <p class="dek">The bell keeps you posted on your reservations. Out of the box it tells you everything; this page shows you how to make it tell you only what you care about &mdash; and where to change your account basics.</p>
+    <p class="dek">The bell keeps you posted on your reservations &mdash; and, if you're an admin or hold a reservation on a sick device, on device health. Out of the box it tells you everything in-app; this page shows you how to route it to email or chat, get a heads-up before a reservation ends, and quiet down the events you don't care about.</p>
 
     <h2 class="sec" id="bell">Top-right corner</h2>
     <p class="sectitle">The bell</p>
@@ -65,7 +68,7 @@
     </figure>
 
     <ol class="legend">
-      <li><b>The bell.</b> Ticks up whenever a reservation you own is created, updated, cancelled, or completed. Click it to open the panel.</li>
+      <li><b>The bell.</b> Ticks up whenever a reservation you own changes state, when one is about to expire, or when a device you're using (or, for admins, any device) goes unhealthy. Click it to open the panel.</li>
       <li><b>Settings.</b> Where you turn the noise up or down. Also reachable from inside the bell panel.</li>
     </ol>
 
@@ -96,9 +99,41 @@
       <li><b>Settings.</b> Jumps straight to the notifications settings (same as the header link).</li>
     </ol>
 
+    <h2 class="sec" id="events">What fires a notification</h2>
+    <p class="sectitle">What sets it off</p>
+    <p>Three families of event reach the bell:</p>
+    <div class="cardgrid c3" style="margin-top:16px;">
+      <div class="gcard" style="cursor:default;"><span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span><h3>Reservation lifecycle</h3><p>Confirmed, activated, updated, completed, cancelled &mdash; for reservations you own.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><h3>Expiring soon</h3><p>A single reminder a configurable window before a reservation's end time, so a deadline doesn't sneak up.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="ix shared"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span><h3>Device health</h3><p>When a device crosses into unhealthy (or recovers). Goes to admins and to anyone with an active reservation on it. See <a href="admin-health-config.html#alerts">health monitoring</a>.</p></div>
+    </div>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>The expiry reminder fires <b>once</b> per reservation, and health alerts fire on the <b>threshold crossing</b>, not on every failed poll &mdash; so a flapping device won't bury you. You can switch any of these off individually below.</p></div>
+    </div>
+
+    <h2 class="sec" id="channels">Where it lands</h2>
+    <p class="sectitle">Email, chat &amp; webhooks</p>
+    <p>The bell is always there. On top of it, your deployment may offer three <strong>opt-in</strong> outbound channels &mdash; all <b>off by default</b>, each toggled per-user in settings:</p>
+    <div class="hd-card" style="margin:18px 0;">
+      <table class="hd-table">
+        <thead><tr><th>Channel</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td class="name">In-app bell</td><td>Always on. The header bell and its panel. Keeps history even if you mute it.</td></tr>
+          <tr><td class="name">Email</td><td>The same notifications, sent to your address. Good for things you'd miss while not in HERD.</td></tr>
+          <tr><td class="name">Chat</td><td>Posts to a Slack-style channel via an incoming webhook your admin configured.</td></tr>
+          <tr><td class="name">Webhook</td><td>A signed POST to an endpoint you own &mdash; for wiring HERD events into your own automation.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Channels are independent: if email is having a bad day, your bell and chat still fire. Whether a channel is even available (and where chat/webhooks point) is set by your admin at the deployment level &mdash; you control the on/off for <em>your</em> account.</p></div>
+    </div>
+
     <h2 class="sec" id="settings">Making it quieter (or louder)</h2>
     <p class="sectitle">Tuning what you get</p>
-    <p>From <b>Settings</b>, open the Notifications section. Two levels of control:</p>
+    <p>From <b>Settings</b>, open the Notifications section. Three levels of control &mdash; the master switch, which channels carry it, and which events you want at all:</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -113,13 +148,22 @@
                 <div style="padding:16px 18px;">
                   <div class="hd-toggle on" data-anno="1" data-anno-pin="r" data-anno-arrow style="justify-content:space-between;width:100%;flex-direction:row-reverse;"><span class="sw"></span><span style="font-weight:500;color:var(--gray-700)">Show in-app notifications</span></div>
                   <p class="hd-help" style="margin:6px 0 16px;">The master switch. Off = the bell goes silent but keeps history.</p>
-                  <div style="border-top:1px solid var(--gray-100);padding-top:14px;" data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
-                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation confirmed</div>
-                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation updated</div>
-                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--gray-300);border-radius:4px"></span> Reservation cancelled</div>
-                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation completed</div>
+                  <div style="border-top:1px solid var(--gray-100);padding:14px 0;" data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
+                    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--gray-400);margin-bottom:8px;">Channels</div>
+                    <div style="display:flex;gap:18px;flex-wrap:wrap;">
+                      <span class="hd-toggle on" style="gap:7px;"><span class="sw"></span>In-app</span>
+                      <span class="hd-toggle on" style="gap:7px;"><span class="sw"></span>Email</span>
+                      <span class="hd-toggle" style="gap:7px;"><span class="sw"></span>Chat</span>
+                      <span class="hd-toggle" style="gap:7px;"><span class="sw"></span>Webhook</span>
+                    </div>
                   </div>
-                  <div style="margin-top:14px;"><span class="hd-btn primary sm" data-anno="3" data-anno-pin="t" data-anno-arrow>Save</span></div>
+                  <div style="border-top:1px solid var(--gray-100);padding-top:14px;" data-anno="3" data-anno-pin="l" data-anno-arrow>
+                    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--gray-400);margin-bottom:8px;">Events</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation lifecycle</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation expiring soon</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--gray-300);border-radius:4px"></span> Device health changed</div>
+                  </div>
+                  <div style="margin-top:14px;"><span class="hd-btn primary sm" data-anno="4" data-anno-pin="t" data-anno-arrow>Save</span></div>
                 </div>
               </div>
             </div>
@@ -131,7 +175,8 @@
 
     <ol class="legend">
       <li><b>Show in-app notifications.</b> The master toggle. Turn it off to silence the bell entirely without deleting your history.</li>
-      <li><b>Per-event checkboxes.</b> Opt out of individual event types. Anything unchecked stops arriving; missing entries default to on.</li>
+      <li><b>Channels.</b> Per-channel on/off. In-app and email shown on here; chat and webhook off. Each is independent, and outbound ones start off until you enable them.</li>
+      <li><b>Per-event toggles.</b> Opt out of whole event families. Here, device-health is unchecked. Anything unchecked stops arriving; missing entries default to on.</li>
       <li><b>Save.</b> Applies to new events immediately &mdash; no restart, no reload.</li>
     </ol>
 
@@ -155,7 +200,7 @@
     <div class="foot">
       <p>HERD User Manual &middot; Notifications &amp; settings</p>
       <div class="pagenav">
-        <a href="user-ai.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Generate with AI</a>
+        <a href="user-assistant.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> AI assistant</a>
         <a href="admin-setup.html">Admin setup <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
       </div>
     </div>

@@ -70,7 +70,7 @@
       <a class="pickcard u" href="quickstart.html">
         <div class="lab">
           <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
-          <div><h3>I want to use the lab</h3><p class="who">Engineer - tester - "I just need to reserve some gear"</p></div>
+          <div><h3>I want to use the lab</h3><p class="who">Engineer · tester · "I just need to reserve some gear"</p></div>
         </div>
         <p>Someone already set HERD up. You log in, find equipment, book it, maybe draw a topology. <b>Start with the 5-minute quick start</b>, then follow the User track.</p>
         <span class="go">Take me to the quick start
@@ -79,7 +79,7 @@
       <a class="pickcard a" href="admin-setup.html">
         <div class="lab">
           <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
-          <div><h3>I have to set HERD up</h3><p class="who">Admin - the unlucky one holding the empty install</p></div>
+          <div><h3>I have to set HERD up</h3><p class="who">Admin · the unlucky one holding the empty install</p></div>
         </div>
         <p>You're staring at empty tables and a "not configured" banner. That's expected &mdash; nothing exists until you create it. <b>Follow the first-day setup chain in order</b> and the empties fill in.</p>
         <span class="go">Take me to first-day setup
@@ -109,12 +109,17 @@
     <a class="gcard" href="user-ai.html">
       <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v2M12 19v2M5 12H3M21 12h-2M6 6l1.5 1.5M16.5 16.5 18 18M18 6l-1.5 1.5M7.5 16.5 6 18"/><circle cx="12" cy="12" r="3.5"/></svg></span>
       <h3>4 &middot; Generate with AI</h3>
-      <p>Describe a lab in plain English; review Claude's proposed wiring before committing.</p>
+      <p>Describe a lab in plain English; review the AI's proposed wiring before committing.</p>
+    </a>
+    <a class="gcard" href="user-assistant.html">
+      <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2M20 14h2M9 14h.01M15 14h.01"/></svg></span>
+      <h3>5 &middot; The AI assistant</h3>
+      <p>Ask plain-English questions about a reservation &mdash; what's connected, current config, did the last apply work.</p>
     </a>
     <a class="gcard" href="user-notifications.html">
       <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span>
-      <h3>5 &middot; Notifications &amp; settings</h3>
-      <p>Tune the bell so it tells you what matters and shuts up about the rest.</p>
+      <h3>6 &middot; Notifications &amp; settings</h3>
+      <p>Tune the bell &mdash; route it to email or chat, get an expiry heads-up, and mute what you don't care about.</p>
     </a>
     <a class="gcard" href="user-reservations.html#calendar">
       <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v4M16 2v4M3 10h18"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M7 14h.01M11 14h.01M15 14h.01"/></svg></span>
@@ -136,9 +141,14 @@
       <h3>B &middot; Your first device + ports</h3>
       <p>Add real equipment, give it ports, and record the physical cabling between them.</p>
     </a>
+    <a class="gcard" href="admin-health-config.html">
+      <span class="ix admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
+      <h3>C &middot; Health &amp; config</h3>
+      <p>Poll devices for reachability, and version every config push with diff, restore &amp; dry-run.</p>
+    </a>
     <a class="gcard" href="admin-reporting.html">
       <span class="ix admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="13" y="8" width="3" height="10"/><rect x="19" y="5" width="0.01" height="0.01"/></svg></span>
-      <h3>C &middot; Utilization reporting</h3>
+      <h3>D &middot; Utilization reporting</h3>
       <p>Answer "who used what, for how long" for leadership. CSV included.</p>
     </a>
   </div>

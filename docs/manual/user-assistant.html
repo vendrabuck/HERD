@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: The AI reservation assistant</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#have">Do you have it?</a></li>
+      <li><a href="#open">Opening the assistant</a></li>
+      <li><a href="#ask">Asking a question</a></li>
+      <li><a href="#read">Reading the answer</a></li>
+      <li><a href="#sees">What it can see</a></li>
+      <li><a href="#multi">Follow-ups &amp; new threads</a></li>
+      <li><a href="#write">Asking it to change config</a></li>
+      <li><a href="#privacy">Privacy &amp; limits</a></li>
+    </ul>
+    <p class="eyebrow">User track</p>
+    <ul>
+      <li><a href="quickstart.html">1 · First boot</a></li>
+      <li><a href="user-reservations.html">2 · Reservations</a></li>
+      <li><a href="user-topology.html">3 · Topology</a></li>
+      <li><a href="user-ai.html">4 · Generate with AI</a></li>
+      <li><a href="user-assistant.html" class="active">5 · AI assistant</a></li>
+      <li><a href="user-notifications.html">6 · Notifications</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker user">User track · Step 5 · Optional</span>
+    <h1 class="title">The AI reservation assistant</h1>
+    <p class="dek">Every reservation has an <b>AI Assistant</b> tab: a chat that can answer questions about <em>that</em> reservation &mdash; what's connected to what, the current config of a device, whether your last apply worked, whether two devices can reach each other. It reads live data with your own permissions and, by default, only ever looks.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The headline</div>
+      <p>It's <strong>read-only out of the box</strong>. It can't reserve, cancel, cable, or change a device unless an admin has explicitly turned write tools on &mdash; and even then, every change is a <b>dry run you confirm</b> before anything real happens. It only sees what <em>you</em> are already allowed to see.</p>
+    </div>
+
+    <h2 class="sec" id="have">First things first</h2>
+    <p class="sectitle">Do you even have this feature?</p>
+    <p>The assistant uses the same AI provider as <a href="user-ai.html">topology generation</a>, so it's opt-in per deployment. Open any reservation's detail modal and look at the tab row:</p>
+    <div class="cardgrid c2" style="margin-top:16px;">
+      <div class="gcard" style="cursor:default;">
+        <span class="ix user" style="background:#faf5ff;color:var(--proposal)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8V4H8M4 12H2M22 12h-2M6.3 6.3 4.9 4.9M19.1 4.9l-1.4 1.4"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M9 14h.01M15 14h.01"/></svg></span>
+        <h3>You see an <span style="color:var(--proposal)">AI Assistant</span> tab</h3>
+        <p>It's enabled and you own this reservation. Go ahead.</p>
+      </div>
+      <div class="gcard" style="cursor:default;">
+        <span class="ix shared"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></svg></span>
+        <h3>No <b>AI Assistant</b> tab</h3>
+        <p>Either AI is off on this deployment, or you don't own this reservation. The assistant only ever runs against reservations that are yours.</p>
+      </div>
+    </div>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>The provider can be a hosted model or one your team self-hosts. The assistant is the most demanding AI surface in HERD &mdash; if your deployment runs a small local model, simple questions will be fine but deep multi-step diagnostics may be weaker than on a large model. That's a deployment choice, not something you set.</p></div>
+    </div>
+
+    <h2 class="sec" id="open">Getting there</h2>
+    <p class="sectitle">Opening the assistant</p>
+    <p>Go to <b>Reservations</b>, click a reservation you own to open its detail modal, then click the <b>AI Assistant</b> tab. It sits alongside Details, Inventory, Routes, and Schedule.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal wide">
+              <div class="mhead"><h2>Reservation f1a2b3c4</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-mtabs">
+                  <span class="hd-mtab">Details</span>
+                  <span class="hd-mtab">Inventory</span>
+                  <span class="hd-mtab">Routes</span>
+                  <span class="hd-mtab">Schedule</span>
+                  <span class="hd-mtab active" data-anno="1" data-anno-pin="t" data-anno-arrow>AI Assistant</span>
+                </div>
+                <div class="hd-chat">
+                  <div class="hd-msg user"><span class="av">you</span><div class="hd-bub">What devices are reserved here, and how are they connected?</div></div>
+                  <div class="hd-msg ai"><span class="av"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2M20 14h2M9 14h.01M15 14h.01"/></svg></span>
+                    <div style="min-width:0;">
+                      <div class="hd-bub" data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue">This reservation holds 3 devices: <span class="mono">fw-edge-01</span>, <span class="mono">spine-sw-01</span>, and <span class="mono">client-07</span>. <span class="mono">fw-edge-01</span> reaches <span class="mono">client-07</span> over an L2 path through <span class="mono">spine-sw-01</span> (2 hops). All ports on the path are cabled.</div>
+                      <div class="hd-toolpanel" data-anno="3" data-anno-pin="l" data-anno-arrow>
+                        <div class="tph"><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>3 tools called &middot; 0.4s</div>
+                        <div class="hd-toolrow"><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg><span class="tn">get_device_ports</span><span class="ta">device_id=fw-edge-01</span><span class="td">61&thinsp;ms</span></div>
+                        <div class="hd-toolrow"><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg><span class="tn">get_device_ports</span><span class="ta">device_id=spine-sw-01</span><span class="td">58&thinsp;ms</span></div>
+                        <div class="hd-toolrow"><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg><span class="tn">find_path</span><span class="ta">fw-edge-01 &rarr; client-07</span><span class="td">112&thinsp;ms</span></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="hd-chatinput">
+                  <div class="box" data-anno="4" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Ask about this reservation&hellip;</div>
+                  <span class="hd-btn primary">Send</span>
+                </div>
+              </div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The AI Assistant tab inside the reservation detail modal.</b> A grounded answer, the tools it called to get there, and the box to ask the next thing.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The tab.</b> Only here when AI is configured and the reservation is yours. Everything below is scoped to this one reservation.</li>
+      <li><b>The answer.</b> Grounded in live data &mdash; device names, real config, actual paths &mdash; not a guess. If it can't find something, it says so rather than inventing it.</li>
+      <li><b>The tool-call panel.</b> Collapsible. Shows exactly which read-only lookups the assistant made, with arguments and timing, so you can see <em>how</em> it reached the answer.</li>
+      <li><b>The input.</b> Type, then <kbd>Enter</kbd> to send or click <b>Send</b>.</li>
+    </ol>
+
+    <h2 class="sec" id="ask">Talking to it</h2>
+    <p class="sectitle">Asking a question</p>
+    <p>Type a question (up to <b>4000 characters</b>) and press <kbd>Enter</kbd> to send, or <kbd>Shift</kbd>&#8202;+&#8202;<kbd>Enter</kbd> for a newline. Plain language works; you don't need to know device ids or HERD jargon.</p>
+    <p>Good things to ask:</p>
+    <ul class="list">
+      <li>&ldquo;What devices are reserved and how are they connected?&rdquo;</li>
+      <li>&ldquo;What is the current config of my firewall?&rdquo;</li>
+      <li>&ldquo;Did the last apply on <span style="font-family:var(--font-mono);font-size:.9em">switch-a</span> succeed?&rdquo;</li>
+      <li>&ldquo;Is there an L2 path between my firewall and my client?&rdquo;</li>
+      <li>&ldquo;When does this reservation end?&rdquo; &mdash; answered instantly, with no lookups at all.</li>
+    </ul>
+
+    <h2 class="sec" id="read">How it actually answers</h2>
+    <p class="sectitle">Reading the answer</p>
+    <p>Behind the scenes the assistant is handed a thin <strong>seed</strong> when the conversation opens &mdash; the reservation's basics and a one-line summary of each device. If your question fits in that, it answers immediately with <b>zero tool calls</b>. If it needs more (a device's real config, the cable path, the last run's result), it calls one or more <strong>read-only tools</strong>, then answers. The tool-call panel under each answer is your receipt.</p>
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></span>
+      <div><span class="ttl">The panel is how you trust it</span><p>If an answer looks surprising, expand the tool panel. The named lookups and their arguments tell you whether the assistant actually checked the thing it's claiming &mdash; or whether it's reasoning from the seed alone.</p></div>
+    </div>
+
+    <h2 class="sec" id="sees">Its reach is your reach</h2>
+    <p class="sectitle">What the assistant can see</p>
+    <p>Every lookup the assistant makes runs <strong>as you</strong> &mdash; same login, same device-group visibility, same ownership rules. It can't see a device you can't see, or peek into someone else's reservation. There are seven read-only tools:</p>
+
+    <div class="hd-card" style="margin:18px 0;">
+      <table class="hd-table">
+        <thead><tr><th>Tool</th><th>What it answers</th></tr></thead>
+        <tbody>
+          <tr><td class="name">Device detail</td><td>Fields and metadata for one device. Password fields are stripped before the model ever sees them.</td></tr>
+          <tr><td class="name">Device ports</td><td>The device's ports and what each is cabled to.</td></tr>
+          <tr><td class="name">Current config</td><td>The latest config version on a device, plus who applied it and when.</td></tr>
+          <tr><td class="name">Config schema</td><td>Which config keys are valid for that device's type.</td></tr>
+          <tr><td class="name">Config history</td><td>Recent config versions (metadata only, newest first).</td></tr>
+          <tr><td class="name">Find path</td><td>Whether two devices in this reservation can reach each other, and over how many hops.</td></tr>
+          <tr><td class="name">Recent executions</td><td>The last driver runs for <em>this</em> reservation &mdash; the reservation is pinned server-side, so it can't be redirected at another one.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="sec" id="multi">Keeping the thread going</h2>
+    <p class="sectitle">Follow-ups &amp; new threads</p>
+    <ul class="list">
+      <li><b>Follow-ups remember.</b> Ask &ldquo;and on <span style="font-family:var(--font-mono);font-size:.9em">switch-b</span>?&rdquo; after a question about <span style="font-family:var(--font-mono);font-size:.9em">switch-a</span> and it carries the context. The thread shows your questions and its answers in order.</li>
+      <li><b>It survives a reopen.</b> Close the modal and reopen it in the same browser session and your conversation is still there. A long-idle thread (a day by default) is retired automatically, and your next question quietly starts fresh.</li>
+      <li><b>Start over anytime.</b> <b>Start new conversation</b> clears the thread and drops the old context, so the assistant isn't anchored on an earlier tangent.</li>
+    </ul>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Answers arrive as one complete reply, not word-by-word streaming, so a deep question that fans out into several lookups takes a beat. If it's working, you'll see it; if it stalls badly it times out with a message rather than hanging.</p></div>
+    </div>
+
+    <h2 class="sec" id="write">Beyond looking</h2>
+    <p class="sectitle">Asking it to change config</p>
+    <p>By default the assistant <strong>cannot change anything</strong>. If your admin has turned on write tools for the deployment, you can also ask it to <em>propose</em> a config change &mdash; but the safety rail is always the same: it builds the change as a <b>dry run</b> first, shows you exactly what the device would receive, and does nothing real until you confirm.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>Confirm proposed change</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <p style="font-size:14px;color:var(--gray-600);margin:0 0 14px;">The assistant prepared this as a <b>dry run</b> on <span style="font-family:var(--font-mono)">spine-sw-01</span>. These are the exact commands the driver would send. Nothing has been applied.</p>
+                <div class="hd-diff" data-anno="1" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
+                  <div class="dl ctx"><span class="gut">&nbsp;</span>interface Gig0/3</div>
+                  <div class="dl del"><span class="gut">-</span>  switchport access vlan 100</div>
+                  <div class="dl add"><span class="gut">+</span>  switchport access vlan 250</div>
+                  <div class="dl ctx"><span class="gut">&nbsp;</span>  no shutdown</div>
+                </div>
+                <div style="display:flex;align-items:flex-start;gap:10px;border:1px solid var(--warn-border);background:var(--warn-bg);border-radius:var(--radius-md);padding:11px 13px;margin-top:14px;">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="var(--warn-fg)" stroke-width="2" style="flex:none;margin-top:1px;"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg>
+                  <span style="font-size:13px;color:var(--warn-fg);line-height:1.45;">Confirming schedules a real apply against the device. Review the diff above before you proceed.</span>
+                </div>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="2" data-anno-pin="t" data-anno-arrow>Confirm &amp; apply</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The dry-run confirmation.</b> The assistant proposes; you read the exact diff; only <b>Confirm &amp; apply</b> makes it real.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The transcript.</b> The literal commands the driver simulated. This is what a real apply would send, line for line.</li>
+      <li><b>Confirm &amp; apply.</b> Your decision, not the model's. Cancel and nothing happened. Drivers that haven't opted into dry-run mode can't be driven this way at all.</li>
+    </ol>
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">No write tools? Then it's looking only</span><p>If your deployment hasn't enabled write tools, the assistant simply won't offer to change anything &mdash; it'll tell you what it would do and leave the doing to you. There is no way for it to apply a change without the confirm step.</p></div>
+    </div>
+
+    <h2 class="sec" id="privacy">The fine print that's actually reassuring</h2>
+    <p class="sectitle">Privacy &amp; limits</p>
+    <ul class="list">
+      <li><b>Your questions aren't logged.</b> HERD records that a question happened (length, timing, which tools ran) but never the text of what you asked or the data that came back.</li>
+      <li><b>Passwords never reach the model.</b> Password-typed fields are stripped server-side before any device detail is handed to the assistant.</li>
+      <li><b>It can't be tricked into other reservations.</b> The reservation is fixed when the chat opens; the executions tool won't accept a different one.</li>
+      <li><b>There are guardrails on length.</b> Very long answers get trimmed, the assistant caps how many lookups one question can trigger, and a question that's still working after a deadline returns a (possibly partial) answer rather than spinning forever.</li>
+    </ul>
+
+    <div class="accordion">
+      <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The tab is missing, or a question errored out</span></summary>
+      <div class="acc-body">
+        <ul class="list">
+          <li><b>No AI Assistant tab at all:</b> AI isn't configured on this deployment (same switch as the <a href="user-ai.html#have">Use AI</a> button) &mdash; ask your admin &mdash; or you're looking at a reservation you don't own.</li>
+          <li><b>&ldquo;Not configured&rdquo; / it refuses:</b> the AI provider isn't set up. Admin task, not yours.</li>
+          <li><b>It timed out:</b> a heavy question that fanned out into many lookups can hit the deadline. Ask something narrower, or break it into two questions.</li>
+          <li><b>It says it can't see a device:</b> that device isn't in your visibility. Same permissions fix as <a href="quickstart.html#empty">first boot</a> &mdash; the assistant is bounded by your access on purpose.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; The AI reservation assistant</p>
+      <div class="pagenav">
+        <a href="user-ai.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Generate with AI</a>
+        <a href="user-notifications.html">Notifications <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

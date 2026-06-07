@@ -1,4 +1,4 @@
-/* HERD manual: interactions: nav active state, copy buttons,
+/* HERD manual, interactions: nav active state, copy buttons,
    back-to-top, mobile nav, smooth anchor offset. */
 (function () {
   // ----- copy buttons on .cmd blocks -----

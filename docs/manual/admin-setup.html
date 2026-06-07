@@ -29,22 +29,23 @@
     <ul>
       <li><a href="#order">The order that matters</a></li>
       <li><a href="#roles">Who can do what</a></li>
-      <li><a href="#drivers">1 - Upload a driver</a></li>
-      <li><a href="#templates">2 - Create a template</a></li>
-      <li><a href="#devices">3 - Create devices</a></li>
-      <li><a href="#groups">4 - Device &amp; user groups</a></li>
-      <li><a href="#perms">5 - Grant permissions</a></li>
+      <li><a href="#drivers">1 · Upload a driver</a></li>
+      <li><a href="#templates">2 · Create a template</a></li>
+      <li><a href="#devices">3 · Create devices</a></li>
+      <li><a href="#groups">4 · Device &amp; user groups</a></li>
+      <li><a href="#perms">5 · Grant permissions</a></li>
     </ul>
     <p class="eyebrow">Admin track</p>
     <ul>
-      <li><a href="admin-setup.html" class="active">A - First-day setup</a></li>
-      <li><a href="admin-equipment.html">B - Equipment &amp; cabling</a></li>
-      <li><a href="admin-reporting.html">C - Reporting</a></li>
+      <li><a href="admin-setup.html" class="active">A · First-day setup</a></li>
+      <li><a href="admin-equipment.html">B · Equipment &amp; cabling</a></li>
+      <li><a href="admin-health-config.html">C · Health &amp; config</a></li>
+      <li><a href="admin-reporting.html">D · Reporting</a></li>
     </ul>
   </aside>
 
   <main class="main">
-    <span class="kicker admin">Admin track - Setup A</span>
+    <span class="kicker admin">Admin track · Setup A</span>
     <h1 class="title">First-day setup</h1>
     <p class="dek">You logged in and everything is empty. That's not a bug &mdash; HERD ships with nothing in it, and the order you fill it matters. Follow this chain top to bottom and by the end your users can log in, see gear, and reserve it.</p>
 
@@ -88,6 +89,11 @@
           <tr><td>Promote / demote a user's role</td><td style="text-align:center;color:var(--gray-300)">&mdash;</td><td style="text-align:center;color:var(--gray-300)">&mdash;</td><td style="text-align:center">&check;</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+      <div><span class="ttl">Where accounts come from</span><p>By default HERD keeps its own local username/password accounts. Your deployment may instead be wired to <b>LDAP / Active Directory</b> &mdash; in that case people sign in with their directory credentials and HERD creates their account automatically on first login. That's an install-time setting, not something you toggle here; either way, the roles and groups on this page work the same. The superadmin account always stays local.</p></div>
     </div>
 
     <h2 class="sec" id="drivers">The chain</h2>
@@ -153,7 +159,7 @@
         <div class="shot-stage">
           <div class="hd"><div class="hd-modal-bg">
             <div class="hd-modal wide">
-              <div class="mhead"><h2>Device group - lab-a</h2><span class="x">&times;</span></div>
+              <div class="mhead"><h2>Device group · lab-a</h2><span class="x">&times;</span></div>
               <div class="mbody">
                 <div class="hd-transfer">
                   <div class="hd-tlist"><div class="tlh">Available</div>
