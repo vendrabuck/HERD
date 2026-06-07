@@ -114,14 +114,26 @@ ToolChoice = ToolChoiceAuto | ToolChoiceNone | ToolChoiceRequired | ToolChoiceTo
 
 @dataclass
 class Usage:
-    """Token counts. Mutable so the orchestrator loop can accumulate across turns."""
+    """Token counts. Mutable so the orchestrator loop can accumulate across turns.
+
+    `input_tokens` is the UNCACHED input the model processed at full price; it is
+    the only input figure that counts toward the per-user daily quota. The two
+    cache fields are reported by Anthropic prompt caching for observability only
+    (cache writes cost ~1.25x base, reads ~0.1x) and are deliberately NOT metered
+    against the quota: they are logged and persisted separately. OpenAI-compat has
+    no prompt caching, so its provider leaves both cache fields at 0.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
     def add(self, other: "Usage") -> None:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens
+        self.cache_read_input_tokens += other.cache_read_input_tokens
 
 
 @dataclass(frozen=True)

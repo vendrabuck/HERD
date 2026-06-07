@@ -66,6 +66,113 @@ async def test_add_tokens_is_per_user():
         assert await usage_repo.get_today_total(db, other) == 0
 
 
+# --- cache-token columns (issue #65): persisted, but excluded from the quota total ---
+
+
+async def test_add_tokens_persists_cache_columns():
+    async with TestSessionLocal() as db:
+        await usage_repo.add_tokens(
+            db,
+            USER,
+            input_tokens=10,
+            output_tokens=5,
+            cache_creation_input_tokens=4096,
+            cache_read_input_tokens=2048,
+        )
+        row = (await db.execute(AIUsage.__table__.select().where(AIUsage.user_id == USER))).first()
+    assert row.input_tokens == 10
+    assert row.output_tokens == 5
+    assert row.cache_creation_input_tokens == 4096
+    assert row.cache_read_input_tokens == 2048
+
+
+async def test_add_tokens_upserts_cache_columns():
+    """A second add_tokens accumulates the cache counters via ON CONFLICT, just
+    like input/output."""
+    async with TestSessionLocal() as db:
+        await usage_repo.add_tokens(
+            db,
+            USER,
+            input_tokens=1,
+            output_tokens=1,
+            cache_creation_input_tokens=100,
+            cache_read_input_tokens=200,
+        )
+        await usage_repo.add_tokens(
+            db,
+            USER,
+            input_tokens=1,
+            output_tokens=1,
+            cache_creation_input_tokens=10,
+            cache_read_input_tokens=20,
+        )
+        row = (await db.execute(AIUsage.__table__.select().where(AIUsage.user_id == USER))).first()
+    assert row.cache_creation_input_tokens == 110
+    assert row.cache_read_input_tokens == 220
+
+
+async def test_cache_tokens_excluded_from_quota_total():
+    """Cache reads/writes are observability only: get_today_total sums input +
+    output and must ignore the cache columns entirely."""
+    async with TestSessionLocal() as db:
+        await usage_repo.add_tokens(
+            db,
+            USER,
+            input_tokens=10,
+            output_tokens=5,
+            cache_creation_input_tokens=9_000,
+            cache_read_input_tokens=9_000,
+        )
+        # 10 + 5 only; the 18_000 cache tokens are not metered.
+        assert await usage_repo.get_today_total(db, USER) == 15
+
+
+async def test_add_tokens_cache_columns_default_zero():
+    """Omitting the cache kwargs (the openai_compat path) leaves them at 0."""
+    async with TestSessionLocal() as db:
+        await usage_repo.add_tokens(db, USER, input_tokens=7, output_tokens=3)
+        row = (await db.execute(AIUsage.__table__.select().where(AIUsage.user_id == USER))).first()
+    assert row.cache_creation_input_tokens == 0
+    assert row.cache_read_input_tokens == 0
+
+
+async def test_record_usage_persists_cache_columns(set_quota):
+    """record_usage passes the provider-reported cache counts through; the quota
+    total still reflects only input + output."""
+    set_quota(1000)
+    async with TestSessionLocal() as db:
+        await usage_repo.record_usage(
+            db,
+            USER,
+            Usage(
+                input_tokens=30,
+                output_tokens=12,
+                cache_creation_input_tokens=500,
+                cache_read_input_tokens=700,
+            ),
+        )
+        row = (await db.execute(AIUsage.__table__.select().where(AIUsage.user_id == USER))).first()
+        assert await usage_repo.get_today_total(db, USER) == 42
+    assert row.cache_creation_input_tokens == 500
+    assert row.cache_read_input_tokens == 700
+
+
+async def test_enforce_quota_ignores_cache_tokens(set_quota):
+    """A user whose only large numbers are cache tokens is never blocked: the
+    gate compares the input+output total, not cache activity."""
+    set_quota(100)
+    async with TestSessionLocal() as db:
+        await usage_repo.add_tokens(
+            db,
+            USER,
+            input_tokens=10,
+            output_tokens=10,
+            cache_creation_input_tokens=10_000,
+            cache_read_input_tokens=10_000,
+        )
+        await usage_repo.enforce_quota(db, USER)  # 20 < 100, must not raise
+
+
 # --- enforce_quota ---
 
 
