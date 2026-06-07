@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed script: creates users, drivers, templates, devices, ports, L1/L2 switches, cabling, and groups.
+"""Seed script: users, drivers, templates, devices, ports, L1/L2 switches, cabling, groups.
 
 Creates:
   - 50 admin users and 1000 regular users
@@ -12,6 +12,9 @@ Creates:
   - 30 L2 edge switches (10 per lab), each with 48 access ports
   - L1 cabling: DUT-to-edge (eth1-eth5/eth1-eth2) + 54 edge-to-hub + 1 hub-to-hub
   - L2 cabling: DUT-to-L2 (network-device eth6-eth7, client eth3) round-robin across L2 switches
+  - 6 isolated demo devices (zero cabling, TEST-NET-1 IPs) as known-unreachable endpoints
+  - 60 demo lab topologies: 50 valid named shapes (chain, star, ring, mesh, dual-homed)
+    plus 10 deliberately invalid (no_path and missing_device) for editor demos
   - 3 device groups: Lab Alpha, Lab Bravo, Lab Charlie (DUTs + L1 + L2 switches)
   - 5 user groups: Lab Admins, Lab Managers, Lab Alpha Tier 1, Lab Bravo Tier 1, Lab Charlie Tier 1
   - Device group permissions: Lab Alpha Tier 1 to Lab Alpha, Lab Bravo Tier 1 to Lab Bravo,
@@ -31,8 +34,12 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE = os.environ.get("SEED_BASE_URL", "https://localhost/api")
-EMAIL = os.environ.get("SEED_EMAIL", "admin@example.com")
-PASSWORD = os.environ.get("SEED_PASSWORD", "admin123!")
+# Credential resolution mirrors the test harnesses (tests/integration/conftest.py,
+# tests/load/locustfile.py, tests/e2e/conftest.py): an explicit SEED_* takes priority
+# (the Makefile exports these), then the stack's actual bootstrap SUPERADMIN_* from .env,
+# then a generic non-personal placeholder. Never hardcode a real address here.
+EMAIL = os.environ.get("SEED_EMAIL") or os.environ.get("SUPERADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("SEED_PASSWORD") or os.environ.get("SUPERADMIN_PASSWORD", "admin123!")
 
 SECTIONS = [
     {
@@ -149,9 +156,7 @@ DEVICE_TEMPLATES = [
 ]
 
 # Device name prefixes for each template.
-TEMPLATE_PREFIX = {
-    f"{vendor} {model}": prefix for vendor, _class, model, prefix in GENERIC_CATALOG
-}
+TEMPLATE_PREFIX = {f"{vendor} {model}": prefix for vendor, _class, model, prefix in GENERIC_CATALOG}
 TEMPLATE_PREFIX.update(
     {
         "Windows 10 Client": "Win10",
@@ -185,8 +190,8 @@ POLL_SUBSET_COUNTS = {
 TEMPLATE_PORT_COUNTS = {
     "Windows 10 Client": 10,  # 2 L1 + 1 L2
     "Windows 11 Client": 10,  # 2 L1 + 1 L2
-    "macOS Client": 3,       # 2 L1 + 1 L2
-    "Ubuntu Client": 3,      # 2 L1 + 1 L2
+    "macOS Client": 3,  # 2 L1 + 1 L2
+    "Ubuntu Client": 3,  # 2 L1 + 1 L2
 }
 DEFAULT_PORT_COUNT = 32
 
@@ -206,8 +211,25 @@ NUM_L2_HUB_SWITCHES = 2
 L2_PORTS_TOTAL = 48
 L2_HUB_PORTS_TOTAL = 48
 L2_DUT_PORTS_MAX = 46  # reserve eth47, eth48 on edges for hub uplinks
-L2_PORTS_PER_PA = 6    # eth6, eth7 (after L1 ports eth1-eth5)
+L2_PORTS_PER_PA = 6  # eth6, eth7 (after L1 ports eth1-eth5)
 L2_PORTS_PER_CLIENT = 2  # eth3 (after L1 ports eth1-eth2)
+
+# Lab topology demo seeding. A topology is a first-class object in the cabling
+# service (a named React Flow canvas of device nodes and edges). We seed exactly
+# 50 valid named lab topologies plus 10 deliberately invalid ones so a fresh
+# environment shows what valid and invalid topologies look like and gives the
+# editor realistic demo content. Validity is decided server-side by BFS over the
+# physical connection graph: an edge is valid iff a path exists between its two
+# devices. The seeded fabric is one connected component (all L1/L2 edges share
+# the hub switches), so any two CABLED devices are reachable; to force an invalid
+# no_path edge we cable nothing to a small set of dedicated isolated demo devices
+# and use them as known-unreachable endpoints. A node with no device id forces
+# the other invalid reason, missing_device. Generation is pure index math (no
+# randomness) so the script stays re-runnable.
+VALID_TOPOLOGY_TARGET = 50
+INVALID_TOPOLOGY_TARGET = 10
+NUM_ISOLATED_DEMO_DEVICES = 6
+ISOLATED_DEMO_IP_BASE = "192.0.2."  # TEST-NET-1 (RFC 5737); disjoint from 10.x and 172.16.x
 
 
 def fetch_all_items(
@@ -956,7 +978,9 @@ def create_connections(
     edge_port_counters = [0] * len(edge_switch_ids)
 
     total_pa = len(pa_device_ids)
-    print(f"  Creating PA-to-edge connections ({total_pa} PA devices, {PORTS_PER_PA} ports each)...")
+    print(
+        f"  Creating PA-to-edge connections ({total_pa} PA devices, {PORTS_PER_PA} ports each)..."
+    )
     for i, dut_id in enumerate(pa_device_ids):
         edge_idx = i % len(edge_switch_ids)
         for port_idx in range(PORTS_PER_PA):
@@ -986,7 +1010,10 @@ def create_connections(
 
     total_clients = len(client_device_ids)
     pa_created = created
-    print(f"  Creating client-to-edge connections ({total_clients} client devices, {PORTS_PER_CLIENT} ports each)...")
+    print(
+        f"  Creating client-to-edge connections ({total_clients} client devices, "
+        f"{PORTS_PER_CLIENT} ports each)..."
+    )
     for i, dut_id in enumerate(client_device_ids):
         edge_idx = (total_pa + i) % len(edge_switch_ids)
         for port_idx in range(PORTS_PER_CLIENT):
@@ -1012,7 +1039,10 @@ def create_connections(
 
         done = i + 1
         if done % 200 == 0 or done == total_clients:
-            print(f"    Client connections: {done}/{total_clients} devices (created={created - pa_created})")
+            print(
+                f"    Client connections: {done}/{total_clients} devices "
+                f"(created={created - pa_created})"
+            )
 
     # Edge-to-hub: each edge connects to both hubs via slot 7
     print(f"  Creating edge-to-hub connections ({len(edge_switch_ids)} x {len(hub_switch_ids)})...")
@@ -1091,7 +1121,9 @@ def create_l2_connections(
 
     # PA devices: eth6, eth7 to L2 switches
     total_pa = len(pa_device_ids)
-    print(f"  Creating PA-to-L2 connections ({total_pa} PA devices, {L2_PORTS_PER_PA} ports each)...")
+    print(
+        f"  Creating PA-to-L2 connections ({total_pa} PA devices, {L2_PORTS_PER_PA} ports each)..."
+    )
     for i, dut_id in enumerate(pa_device_ids):
         l2_idx = i % len(l2_switch_ids)
         for port_idx in range(L2_PORTS_PER_PA):
@@ -1119,7 +1151,10 @@ def create_l2_connections(
     # Client devices: eth3 to L2 switches
     total_clients = len(client_device_ids)
     pa_l2_created = created
-    print(f"  Creating client-to-L2 connections ({total_clients} client devices, {L2_PORTS_PER_CLIENT} port each)...")
+    print(
+        f"  Creating client-to-L2 connections ({total_clients} client devices, "
+        f"{L2_PORTS_PER_CLIENT} port each)..."
+    )
     for i, dut_id in enumerate(client_device_ids):
         l2_idx = (total_pa + i) % len(l2_switch_ids)
         for port_idx in range(L2_PORTS_PER_CLIENT):
@@ -1142,7 +1177,10 @@ def create_l2_connections(
 
         done = i + 1
         if done % 200 == 0 or done == total_clients:
-            print(f"    Client L2 connections: {done}/{total_clients} devices (created={created - pa_l2_created})")
+            print(
+                f"    Client L2 connections: {done}/{total_clients} devices "
+                f"(created={created - pa_l2_created})"
+            )
 
     # Edge-to-hub: each L2 edge connects to both hubs via eth47, eth48
     n_edges = len(l2_switch_ids)
@@ -1183,6 +1221,244 @@ def create_l2_connections(
             created += 1
 
     return created
+
+
+def list_existing_topology_names(client: httpx.Client) -> set[str]:
+    """Return the set of all existing topology names (for idempotency)."""
+    items = fetch_all_items(client, f"{BASE}/cabling/topologies")
+    return {t["name"] for t in items}
+
+
+def get_or_create_topology(
+    client: httpx.Client,
+    name: str,
+    canvas_data: dict,
+    existing_names: set[str],
+    description: str | None = None,
+) -> str | None:
+    """Create a topology by name if absent, then set its canvas_data.
+
+    Returns the new topology id, or None if it already existed (skipped) or
+    creation failed. Mutates existing_names to include freshly created names.
+    """
+    if name in existing_names:
+        print(f"  Exists topology: {name}")
+        return None
+
+    resp = client.post(f"{BASE}/cabling/topologies", json={"name": name})
+    if resp.status_code != 201:
+        print(f"  Failed to create topology {name} ({resp.status_code}): {resp.text}")
+        return None
+    tid = resp.json()["id"]
+
+    put_body: dict = {"canvas_data": canvas_data}
+    if description is not None:
+        put_body["description"] = description
+    put_resp = client.put(f"{BASE}/cabling/topologies/{tid}", json=put_body)
+    if put_resp.status_code != 200:
+        print(f"  Created topology {name} but canvas PUT failed ({put_resp.status_code})")
+    else:
+        print(f"  Created topology: {name}")
+    existing_names.add(name)
+    return tid
+
+
+def build_canvas(
+    device_ids: list[str | None],
+    edges: list[tuple[int, int, str]],
+) -> dict:
+    """Build a React Flow canvas_data dict mirroring the editor output.
+
+    device_ids[i] is the device UUID for node i, or None to emit a node with
+    empty data (which forces missing_device on any edge touching it). edges is a
+    list of (source_index, target_index, layer) tuples. Node ids are React Flow
+    ids ("n0", "n1", ...), distinct from device UUIDs; edges reference node ids.
+    Positions are laid out on a deterministic grid so the canvas renders sanely.
+    """
+    nodes: list[dict] = []
+    for i, dev_id in enumerate(device_ids):
+        node: dict = {
+            "id": f"n{i}",
+            "position": {"x": 100 + (i % 4) * 200, "y": 100 + (i // 4) * 150},
+        }
+        node["data"] = {} if dev_id is None else {"device": {"id": dev_id}}
+        nodes.append(node)
+
+    edge_list: list[dict] = []
+    for j, (source, target, layer) in enumerate(edges):
+        edge_list.append(
+            {
+                "id": f"e{j}",
+                "source": f"n{source}",
+                "target": f"n{target}",
+                "data": {"layer": layer, "isProposal": False},
+            }
+        )
+    return {"nodes": nodes, "edges": edge_list}
+
+
+def _chain_edges(n: int, layer: str) -> list[tuple[int, int, str]]:
+    """Linear chain: 0-1-2-...-(n-1)."""
+    return [(i, i + 1, layer) for i in range(n - 1)]
+
+
+def _star_edges(n: int, layer: str) -> list[tuple[int, int, str]]:
+    """Star: node 0 is the hub, all others connect to it."""
+    return [(0, i, layer) for i in range(1, n)]
+
+
+def _ring_edges(n: int, layer: str) -> list[tuple[int, int, str]]:
+    """Ring: chain with a wrap-around edge back to node 0."""
+    return [(i, (i + 1) % n, layer) for i in range(n)]
+
+
+def _full_mesh_edges(n: int, layer: str) -> list[tuple[int, int, str]]:
+    """Full mesh: every pair of nodes connected once."""
+    return [(a, b, layer) for a in range(n) for b in range(a + 1, n)]
+
+
+def _dual_homed_edges(n: int, layer: str) -> list[tuple[int, int, str]]:
+    """Dual-homed: nodes 0,1 are cores; 2,3 are leaves, each to both cores."""
+    return [(2, 0, layer), (2, 1, layer), (3, 0, layer), (3, 1, layer)]
+
+
+# Curated named shapes: (name, node_count, edge_generator, layer). Expanded into
+# exactly VALID_TOPOLOGY_TARGET topologies by cycling sets and slicing the device
+# pool by a rolling offset, so each variant uses different devices.
+SHAPE_CATALOG = [
+    ("Dual-Homed Pair", 4, _dual_homed_edges, "L1"),
+    ("Linear Chain 3-Node", 3, _chain_edges, "L2"),
+    ("Linear Chain 5-Node", 5, _chain_edges, "L2"),
+    ("Star - Core Switch", 5, _star_edges, "L1"),
+    ("Star - Access Layer", 6, _star_edges, "L2"),
+    ("L2 Access Ring", 5, _ring_edges, "L2"),
+    ("Spine-Leaf 4-Node", 4, _dual_homed_edges, "L3"),
+    ("Three-Tier Web/App/DB", 3, _chain_edges, "L3"),
+    ("Firewall Sandwich", 3, _chain_edges, "L3"),
+    ("Full Mesh Quad", 4, _full_mesh_edges, "L2"),
+    ("Point-to-Point Link", 2, _chain_edges, "L1"),
+    ("Hub-and-Spoke 6", 6, _star_edges, "L1"),
+    ("Backbone Ring 6", 6, _ring_edges, "L2"),
+    ("Collapsed Core Pair", 2, _chain_edges, "L3"),
+    ("Edge-to-Hub Uplink", 2, _chain_edges, "L1"),
+    ("Leaf Triangle", 3, _ring_edges, "L2"),
+    ("Quad Mesh Core", 4, _full_mesh_edges, "L3"),
+    ("Two-Tier Distribution", 5, _star_edges, "L2"),
+]
+
+
+def seed_topologies(
+    client: httpx.Client,
+    edge_switch_ids: list[str],
+    hub_switch_ids: list[str],
+    l2_switch_ids: list[str],
+    l2_hub_switch_ids: list[str],
+    isolated_device_ids: list[str],
+) -> tuple[int, int]:
+    """Seed exactly 50 valid and 10 invalid demo lab topologies.
+
+    Returns (valid_count, invalid_count), counting intended topologies whether
+    freshly created or already present, so the summary is stable across re-runs.
+    """
+    existing_names = list_existing_topology_names(client)
+
+    # Pool of guaranteed-cabled, mutually reachable devices: switch infrastructure
+    # ONLY. Every L1/L2 edge and hub switch is deterministically cabled and the
+    # whole fabric is one connected component (verified live), so any two switches
+    # are mutually reachable. DUTs are deliberately NOT included: the L1 cabling
+    # pass exhausts edge-switch ports, so many DUTs (including front-of-list
+    # clients) end up uncabled and would make a "valid" topology validate as
+    # no_path. 61 switches is ample for 50 topologies of at most 6 nodes.
+    cabled_pool = edge_switch_ids + hub_switch_ids + l2_switch_ids + l2_hub_switch_ids
+    if len(cabled_pool) < 2:
+        print("  Skipping topologies: fewer than 2 cabled devices available")
+        return (0, 0)
+
+    pool_len = len(cabled_pool)
+    valid_count = 0
+    offset = 0
+    first_valid_id: str | None = None
+    for set_num in range(1, 99):
+        if valid_count >= VALID_TOPOLOGY_TARGET:
+            break
+        for base_name, n, gen, layer in SHAPE_CATALOG:
+            if valid_count >= VALID_TOPOLOGY_TARGET:
+                break
+            name = base_name if set_num == 1 else f"{base_name} (Set {set_num})"
+            node_devices: list[str | None] = [
+                cabled_pool[(offset + i) % pool_len] for i in range(n)
+            ]
+            canvas = build_canvas(node_devices, gen(n, layer))
+            tid = get_or_create_topology(
+                client, name, canvas, existing_names, description="Demo lab topology"
+            )
+            if first_valid_id is None and tid is not None:
+                first_valid_id = tid
+            valid_count += 1
+            offset = (offset + n) % pool_len
+
+    # Invalid topologies. no_path uses an isolated (uncabled) endpoint;
+    # missing_device uses a node with empty data (None slot).
+    invalid_specs: list[tuple[str, list[str | None], list[tuple[int, int, str]]]] = []
+
+    def _iso(i: int) -> str:
+        return isolated_device_ids[i % len(isolated_device_ids)]
+
+    if isolated_device_ids:
+        invalid_specs.extend(
+            [
+                (
+                    "BROKEN - Unreachable Cross-Fabric",
+                    [cabled_pool[0], _iso(0)],
+                    [(0, 1, "L2")],
+                ),
+                ("BROKEN - Isolated Leaf", [cabled_pool[1 % pool_len], _iso(1)], [(0, 1, "L1")]),
+                ("BROKEN - Orphan Node Link", [_iso(2), _iso(3)], [(0, 1, "L3")]),
+                ("BROKEN - Dangling Uplink", [cabled_pool[2 % pool_len], _iso(4)], [(0, 1, "L1")]),
+                (
+                    "BROKEN - Partial Mesh Gap",
+                    [cabled_pool[3 % pool_len], cabled_pool[4 % pool_len], _iso(5)],
+                    [(0, 1, "L2"), (1, 2, "L2")],
+                ),
+                ("BROKEN - Stranded Pair", [_iso(0), _iso(1)], [(0, 1, "L2")]),
+            ]
+        )
+    invalid_specs.extend(
+        [
+            ("BROKEN - Missing Device Ref", [cabled_pool[0], None], [(0, 1, "L2")]),
+            ("BROKEN - Empty Node", [None, cabled_pool[1 % pool_len]], [(0, 1, "L1")]),
+            ("BROKEN - Two Empty Nodes", [None, None], [(0, 1, "L3")]),
+            (
+                "BROKEN - Half-Wired Chain",
+                [cabled_pool[2 % pool_len], None, cabled_pool[3 % pool_len]],
+                [(0, 1, "L2"), (1, 2, "L2")],
+            ),
+        ]
+    )
+
+    invalid_count = 0
+    first_invalid_id: str | None = None
+    for name, node_devices, edges in invalid_specs[:INVALID_TOPOLOGY_TARGET]:
+        canvas = build_canvas(node_devices, edges)
+        tid = get_or_create_topology(
+            client, name, canvas, existing_names, description="Deliberately invalid demo topology"
+        )
+        if first_invalid_id is None and tid is not None:
+            first_invalid_id = tid
+        invalid_count += 1
+
+    # Best-effort self-check: validate one fresh sample of each kind.
+    if first_valid_id and first_invalid_id:
+        v = client.post(f"{BASE}/cabling/topologies/{first_valid_id}/validate")
+        iv = client.post(f"{BASE}/cabling/topologies/{first_invalid_id}/validate")
+        if v.status_code == 200 and iv.status_code == 200:
+            print(
+                f"  Self-check: sample valid -> valid={v.json()['valid']}, "
+                f"sample invalid -> valid={iv.json()['valid']}"
+            )
+
+    print(f"  {valid_count} valid, {invalid_count} invalid topologies")
+    return (valid_count, invalid_count)
 
 
 def create_users(client: httpx.Client) -> None:
@@ -1268,7 +1544,9 @@ def main() -> None:
     print("\n--- Templates ---")
     template_ids: dict[str, str] = {}
     for tmpl in DEVICE_TEMPLATES:
-        driver_id = endpoint_driver_id if tmpl["name"] in CLIENT_TEMPLATE_NAMES else network_driver_id
+        driver_id = (
+            endpoint_driver_id if tmpl["name"] in CLIENT_TEMPLATE_NAMES else network_driver_id
+        )
         template_ids[tmpl["name"]] = get_or_create_template(
             client,
             tmpl["name"],
@@ -1394,6 +1672,19 @@ def main() -> None:
 
     all_l2_ids = l2_switch_ids + l2_hub_switch_ids
 
+    # Isolated demo devices (zero cabling): known-unreachable endpoints for the
+    # invalid-topology demos. They reuse an existing DUT template and are kept out
+    # of every ports/cabling/group pass below, so they stay at zero connections.
+    print("\n--- Isolated Demo Devices ---")
+    isolated_device_ids: list[str] = []
+    isolated_template_id = template_ids[DEVICE_TEMPLATES[0]["name"]]
+    for i in range(1, NUM_ISOLATED_DEMO_DEVICES + 1):
+        name = f"Isolated-Demo-{i:02d}"
+        ip = f"{ISOLATED_DEMO_IP_BASE}{i}"
+        did = get_or_create_device(client, name, isolated_template_id, ip)
+        isolated_device_ids.append(did)
+    print(f"  Created {len(isolated_device_ids)} isolated demo devices")
+
     # DUT Ports (variable count per template type)
     print("\n--- DUT Ports ---")
     for i, (did, dev) in enumerate(zip(device_ids, DEVICES), 1):
@@ -1417,17 +1708,33 @@ def main() -> None:
 
     # Cabling connections (L1)
     print("\n--- L1 Cabling Connections ---")
-    num_l1_connections = create_connections(client, pa_device_ids, client_device_ids, edge_switch_ids, hub_switch_ids)
+    num_l1_connections = create_connections(
+        client, pa_device_ids, client_device_ids, edge_switch_ids, hub_switch_ids
+    )
     print(f"  Total L1 connections created: {num_l1_connections}")
 
     # Cabling connections (L2)
     print("\n--- L2 Cabling Connections ---")
     num_l2_connections = create_l2_connections(
-        client, pa_device_ids, client_device_ids,
-        l2_switch_ids, l2_hub_switch_ids,
+        client,
+        pa_device_ids,
+        client_device_ids,
+        l2_switch_ids,
+        l2_hub_switch_ids,
     )
     print(f"  Total L2 connections created: {num_l2_connections}")
     num_connections = num_l1_connections + num_l2_connections
+
+    # Lab topologies (demo/testing): requires the cabling fabric to exist
+    print("\n--- Lab Topologies ---")
+    num_valid_topos, num_invalid_topos = seed_topologies(
+        client,
+        edge_switch_ids,
+        hub_switch_ids,
+        l2_switch_ids,
+        l2_hub_switch_ids,
+        isolated_device_ids,
+    )
 
     # Device groups
     print("\n--- Device Groups ---")
@@ -1467,15 +1774,21 @@ def main() -> None:
 
     for i, (dg_id, name) in enumerate(zip(dg_ids, dg_names)):
         combined = (
-            pa_splits[i] + client_splits[i]
-            + edge_splits[i] + hub_switch_ids
-            + l2_splits[i] + l2_hub_switch_ids
+            pa_splits[i]
+            + client_splits[i]
+            + edge_splits[i]
+            + hub_switch_ids
+            + l2_splits[i]
+            + l2_hub_switch_ids
         )
         pa_n = len(pa_splits[i])
         cl_n = len(client_splits[i])
         l1_n = len(edge_splits[i]) + len(hub_switch_ids)
         l2_n = len(l2_splits[i]) + len(l2_hub_switch_ids)
-        print(f"  {name}: {pa_n} PA + {cl_n} client + {l1_n} L1 + {l2_n} L2 switches = {len(combined)} devices")
+        print(
+            f"  {name}: {pa_n} PA + {cl_n} client + {l1_n} L1 + {l2_n} L2 switches "
+            f"= {len(combined)} devices"
+        )
         bulk_add_devices_to_group(client, dg_id, combined)
 
     # User groups
@@ -1574,10 +1887,12 @@ def main() -> None:
     print(
         f"\nDone. {NUM_ADMINS + NUM_USERS} users, 4 drivers, "
         f"{len(DEVICE_TEMPLATES) + 4} templates, "
-        f"{TOTAL_DEVICES} DUT devices + {NUM_L1_SWITCHES} L1 + {NUM_L2_SWITCHES} L2 switches, "
+        f"{TOTAL_DEVICES} DUT devices + {NUM_L1_SWITCHES} L1 + {NUM_L2_SWITCHES} L2 switches "
+        f"+ {len(isolated_device_ids)} isolated demo devices, "
         f"{total_dut_ports} DUT ports + {total_l1_ports} L1 ports + {total_l2_ports} L2 ports, "
         f"{num_connections} connections, "
-        f"3 device groups, 5 user groups, 3 device group permissions."
+        f"3 device groups, 5 user groups, 3 device group permissions, "
+        f"{num_valid_topos} valid + {num_invalid_topos} invalid topologies."
     )
 
 
