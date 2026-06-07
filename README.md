@@ -413,7 +413,7 @@ the new `/settings` page.
 
 Over 2,000 backend unit tests across the 11 services, around 420 frontend tests via vitest, and roughly 100 cross-service integration tests (a handful skipped: VLAN-fabric cases plus LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). Around 100 E2E browser tests via Selenium (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against a local `osixia/openldap` container (see `docs/ENV_VARS.md` LDAP section).
 
-Coverage (target 85%+ per service): common 100%, auth 100%, inventory 87%, reservations 86%, cabling 95%, acl 87%, execution 87%, config 99%, ai-orchestrator 88%. Outstanding test gaps tracked in [docs/GAPS.md](docs/GAPS.md).
+Coverage targets 85%+ per backend service; run `make coverage` for the current per-service report (or `make coverage-<svc>` for one service with an HTML report). Outstanding test gaps are tracked in [docs/GAPS.md](docs/GAPS.md).
 
 ```bash
 # Backend unit tests (SQLite in-memory via aiosqlite)

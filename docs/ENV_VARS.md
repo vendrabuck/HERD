@@ -5,7 +5,7 @@ Every environment variable HERD reads, where it's consumed, and what it does. `.
 ## Precedence (highest to lowest)
 
 1. `os.environ` (shell / `.env` / docker compose environment block)
-2. `config.json` written by the config service at `/etc/herd/config.json`
+2. `config.json` written by the config service at `/data/herd-config/config.json` (the directory is overridable via `HERD_CONFIG_DATA_DIR`)
 3. In-code defaults (usually dev-friendly values)
 
 This means you can override a config-service setting temporarily via the shell, and the override wins until you remove it.

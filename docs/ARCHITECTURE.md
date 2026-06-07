@@ -243,8 +243,8 @@ HERD is built as 11 independent services rather than a modular monolith. This se
 ### What that costs
 
 - **Cross-service queries are HTTP, not SQL.** The reporting service's `by_group` rollup is N+1 (one call per distinct user) where a modular monolith would JOIN a single `auth.users` table once. The cross-service cost is paid in latency and code complexity.
-- **Eleven Alembic migration trees, eleven Dockerfiles, eleven service configurations.** Cross-cutting changes (a new common field, a logging format change, a dependency bump) touch multiple services. Integration tests are the only end-to-end validation path for cross-service flows.
-- **Operational surface.** A first-time deployer brings up a Postgres with 11 schemas, NATS with the `HERD_RESERVATIONS` and `HERD_HEALTH` streams plus three DLQ subjects, and 11 service containers behind Traefik. The `config` service mitigates this by handling first-start setup through the UI, but the surface itself is real.
+- **Nine Alembic migration trees, ten Dockerfiles, nine service configurations.** The nine DB-backed services each own a migration tree and an `app/config.py`; `config` ships a Dockerfile but has no database or Alembic tree, and `common` is a shared library with neither a Dockerfile nor a config. Cross-cutting changes (a new common field, a logging format change, a dependency bump) touch multiple services. Integration tests are the only end-to-end validation path for cross-service flows.
+- **Operational surface.** A first-time deployer brings up a Postgres with 9 schemas, NATS with the `HERD_RESERVATIONS` and `HERD_HEALTH` streams plus three DLQ subjects, and 10 service containers behind Traefik. The `config` service mitigates this by handling first-start setup through the UI, but the surface itself is real.
 - **For a single-deployer adoption, a modular monolith would have lower operational overhead.** That is a fair criticism and acknowledged here.
 
 ### When the microservice trade-off pays off
