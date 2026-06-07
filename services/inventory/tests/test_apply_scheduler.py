@@ -18,6 +18,8 @@ from app.services import apply_scheduler
 from app.services.apply_scheduler import (
     _due_jobs,
     _mark_failed_in_fresh_session,
+    _post_internal_execute,
+    _reservation_active,
     _resweep_stale_running,
     fire_job,
 )
@@ -405,6 +407,246 @@ async def test_mark_failed_in_fresh_session_records_failure():
         assert refreshed.status == "failed"
         assert refreshed.error == "scheduler crash"
         assert refreshed.fired_at is not None
+
+
+# --- _reservation_active direct branches ------------------------------------
+
+
+class _RaisingGetClient:
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def get(self, url, headers=None, timeout=None):
+        raise self._exc
+
+    async def post(self, url, json=None, headers=None, timeout=None):
+        raise self._exc
+
+
+class _MalformedJSONResponse:
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+        self.text = "<<not json>>"
+
+    def json(self):
+        raise ValueError("no json here")
+
+
+@pytest.mark.asyncio
+async def test_reservation_active_http_error_returns_false(monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    client = _RaisingGetClient(httpx.ConnectError("down"))
+    assert await _reservation_active(client, uuid.uuid4()) is False
+
+
+@pytest.mark.asyncio
+async def test_reservation_active_malformed_json_returns_false(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+
+    class _Client:
+        async def get(self, url, headers=None, timeout=None):
+            return _MalformedJSONResponse(200)
+
+    assert await _reservation_active(_Client(), uuid.uuid4()) is False
+
+
+# --- _post_internal_execute direct branches ---------------------------------
+
+
+def _make_job():
+    return DeviceConfigApplyJob(
+        device_id=uuid.uuid4(),
+        version_id=uuid.uuid4(),
+        scheduled_for=datetime.now(timezone.utc),
+        status="running",
+        created_by=uuid.uuid4(),
+        author_name="alice",
+        dry_run=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_internal_execute_http_error(monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    client = _RaisingGetClient(httpx.ConnectError("execution down"))
+    status, run_id, error = await _post_internal_execute(client, _make_job(), {"vlan": 1})
+    assert status == "failed"
+    assert run_id is None
+    assert "unreachable" in error
+
+
+@pytest.mark.asyncio
+async def test_post_internal_execute_error_body_not_json(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+
+    class _Client:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            return _MalformedJSONResponse(503)
+
+    status, run_id, error = await _post_internal_execute(_Client(), _make_job(), {})
+    assert status == "failed"
+    assert error.startswith("503")
+
+
+@pytest.mark.asyncio
+async def test_post_internal_execute_success_body_not_json(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+
+    class _Client:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            return _MalformedJSONResponse(200)
+
+    status, run_id, error = await _post_internal_execute(_Client(), _make_job(), {})
+    assert status == "failed"
+    assert "malformed JSON" in error
+
+
+@pytest.mark.asyncio
+async def test_post_internal_execute_malformed_run_id_degrades_to_none(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    client = FakeClient(
+        post_responses={
+            "/execute/internal": FakeResponse(200, {"id": "not-a-uuid", "status": "SUCCESS"}),
+        }
+    )
+    status, run_id, error = await _post_internal_execute(client, _make_job(), {})
+    assert status == "success"
+    assert run_id is None
+
+
+@pytest.mark.asyncio
+async def test_post_internal_execute_non_success_status(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    client = FakeClient(
+        post_responses={
+            "/execute/internal": FakeResponse(
+                200, {"id": None, "status": "FAILED", "error": "device unreachable"}
+            ),
+        }
+    )
+    status, run_id, error = await _post_internal_execute(client, _make_job(), {})
+    assert status == "failed"
+    assert error == "device unreachable"
+
+
+# --- _mark_failed_in_fresh_session swallows secondary errors ----------------
+
+
+@pytest.mark.asyncio
+async def test_mark_failed_in_fresh_session_swallows_session_error():
+    """If the fresh session itself raises, the recorder must not propagate."""
+
+    class _BoomSession:
+        async def __aenter__(self):
+            raise RuntimeError("cannot open session")
+
+        async def __aexit__(self, *a):
+            return False
+
+    def _factory():
+        return _BoomSession()
+
+    # Must not raise.
+    await _mark_failed_in_fresh_session(_factory, uuid.uuid4(), "crash")
+
+
+# --- run_scheduler_loop fires a due job -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_scheduler_loop_fires_due_jobs(monkeypatch):
+    """One healthy tick: a due job is fetched and fire_job is invoked for it,
+    then the loop is cancelled. Covers the due-job firing branch of the loop."""
+    real_sleep = asyncio.sleep
+    now = datetime.now(timezone.utc)
+    async with TestSessionLocal() as db:
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(seconds=5))
+        job_id = job.id
+
+    fired: list[uuid.UUID] = []
+
+    async def fake_resweep(db, now):
+        return 0
+
+    async def fake_fire(db, job, client):
+        fired.append(job.id)
+
+    async def fake_sleep(seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(apply_scheduler, "_resweep_stale_running", fake_resweep)
+    monkeypatch.setattr(apply_scheduler, "fire_job", fake_fire)
+    monkeypatch.setattr(apply_scheduler.asyncio, "sleep", fake_sleep)
+
+    task = asyncio.create_task(apply_scheduler.run_scheduler_loop(TestSessionLocal))
+    for _ in range(500):
+        await real_sleep(0.001)
+        if fired:
+            break
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert job_id in fired
+
+
+@pytest.mark.asyncio
+async def test_run_scheduler_loop_recovers_when_fire_job_crashes(monkeypatch):
+    """If fire_job raises for a due job, the loop logs it and records the failure
+    via the fresh-session recorder, then continues (covers the crash branch)."""
+    real_sleep = asyncio.sleep
+    now = datetime.now(timezone.utc)
+    async with TestSessionLocal() as db:
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(seconds=5))
+        job_id = job.id
+
+    recorded: list[uuid.UUID] = []
+
+    async def fake_resweep(db, now):
+        return 0
+
+    async def crashing_fire(db, job, client):
+        raise RuntimeError("driver blew up")
+
+    async def fake_mark_failed(session_factory, jid, error):
+        recorded.append(jid)
+
+    async def fake_sleep(seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(apply_scheduler, "_resweep_stale_running", fake_resweep)
+    monkeypatch.setattr(apply_scheduler, "fire_job", crashing_fire)
+    monkeypatch.setattr(apply_scheduler, "_mark_failed_in_fresh_session", fake_mark_failed)
+    monkeypatch.setattr(apply_scheduler.asyncio, "sleep", fake_sleep)
+
+    task = asyncio.create_task(apply_scheduler.run_scheduler_loop(TestSessionLocal))
+    for _ in range(500):
+        await real_sleep(0.001)
+        if recorded:
+            break
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert job_id in recorded
 
 
 @pytest.mark.asyncio

@@ -741,6 +741,133 @@ async def test_update_device_group_not_found(client):
     assert resp.status_code == 404
 
 
+# --- /device/{id} success-format path (resolves user-group names) ---
+
+
+@pytest.mark.asyncio
+@patch(
+    "app.routers.device_groups._fetch_user_group_names",
+    new_callable=AsyncMock,
+)
+async def test_device_groups_for_device_resolves_names(mock_names, client):
+    """When name resolution succeeds, the endpoint returns the group with its
+    user-group permissions and resolved names (the happy-path formatter)."""
+    template = await _create_template(client, "FmtTpl")
+    dev = await _create_device(client, template["id"], "fmt-dev")
+    group = await _create_device_group(client, "FmtGroup")
+    ug_id = uuid.uuid4()
+    await client.post(
+        f"/device-groups/{group['id']}/devices/bulk", json={"device_ids": [dev["id"]]}
+    )
+    await client.post(
+        f"/device-groups/{group['id']}/permissions/bulk",
+        json={"user_group_ids": [str(ug_id)]},
+    )
+
+    mock_names.return_value = {ug_id: "Network Engineers"}
+    resp = await client.get(f"/device-groups/device/{dev['id']}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["name"] == "FmtGroup"
+    assert body[0]["user_groups"][0]["user_group_id"] == str(ug_id)
+    assert body[0]["user_groups"][0]["user_group_name"] == "Network Engineers"
+
+
+# --- _fetch_user_group_ids / _fetch_user_group_names success branches ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_ids_success_parses_ids():
+    from app.routers.device_groups import _fetch_user_group_ids
+
+    gid = uuid.uuid4()
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return [{"id": str(gid), "name": "G"}]
+
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _Resp()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+        ids = await _fetch_user_group_ids(uuid.uuid4(), "Bearer t")
+    assert ids == [gid]
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_ids_missing_authorization_raises_500():
+    from app.routers.device_groups import _fetch_user_group_ids
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        await _fetch_user_group_ids(uuid.uuid4(), None)
+    assert exc.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_names_missing_authorization_raises_500():
+    from app.routers.device_groups import _fetch_user_group_names
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        await _fetch_user_group_names([uuid.uuid4()], None)
+    assert exc.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_names_success_maps_wanted_ids():
+    from app.routers.device_groups import _fetch_user_group_names
+
+    wanted = uuid.uuid4()
+    other = uuid.uuid4()
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            # Dict-with-items shape; only `wanted` should appear in the map.
+            return {
+                "items": [
+                    {"id": str(wanted), "name": "Wanted"},
+                    {"id": str(other), "name": "Other"},
+                ]
+            }
+
+    mock_client = AsyncMock()
+    mock_client.get.return_value = _Resp()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+        name_map = await _fetch_user_group_names([wanted], "Bearer t")
+    assert name_map == {wanted: "Wanted"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_names_connection_error_raises_502():
+    import httpx
+    from app.routers.device_groups import _fetch_user_group_names
+    from fastapi import HTTPException
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get.side_effect = httpx.ConnectError("down")
+
+    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+        with pytest.raises(HTTPException) as exc:
+            await _fetch_user_group_names([uuid.uuid4()], "Bearer t")
+    assert exc.value.status_code == 502
+    assert "unreachable" in exc.value.detail
+
+
 @pytest.mark.asyncio
 async def test_delete_device_group_not_found(client):
     """DELETE on a nonexistent device group returns 404."""

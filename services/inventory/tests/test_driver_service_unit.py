@@ -1,12 +1,17 @@
 """Unit tests for driver_service.py."""
 
+import io
+import json
+import tarfile
 import uuid
+import zipfile
 from unittest.mock import patch
 
 import pytest
 from app.database import Base
 from app.models.template import DeviceTemplate
 from app.services.driver_service import (
+    _parse_supports_dry_run,
     _validate_connection_type,
     _validate_filename,
     create_driver,
@@ -60,6 +65,83 @@ def test_validate_connection_type_invalid():
     with pytest.raises(HTTPException) as exc:
         _validate_connection_type("InvalidType")
     assert exc.value.status_code == 422
+
+
+# --- _parse_supports_dry_run ---
+
+
+def _zip_with_metadata(meta) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("driver_metadata.json", json.dumps(meta) if not isinstance(meta, str) else meta)
+    return buf.getvalue()
+
+
+def _targz_with_metadata(meta, *, include_file: bool = True) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        if include_file:
+            payload = (json.dumps(meta) if not isinstance(meta, str) else meta).encode("utf-8")
+            info = tarfile.TarInfo(name="driver_metadata.json")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+        else:
+            other = b"x"
+            info = tarfile.TarInfo(name="other.txt")
+            info.size = len(other)
+            tf.addfile(info, io.BytesIO(other))
+    return buf.getvalue()
+
+
+def test_parse_supports_dry_run_zip_true():
+    assert _parse_supports_dry_run("d.zip", _zip_with_metadata({"supports_dry_run": True})) is True
+
+
+def test_parse_supports_dry_run_zip_default_false_when_field_absent():
+    assert _parse_supports_dry_run("d.zip", _zip_with_metadata({"name": "x"})) is False
+
+
+def test_parse_supports_dry_run_zip_missing_metadata_returns_false():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("readme.txt", "hi")
+    assert _parse_supports_dry_run("d.zip", buf.getvalue()) is False
+
+
+def test_parse_supports_dry_run_targz_true():
+    data = _targz_with_metadata({"supports_dry_run": True})
+    assert _parse_supports_dry_run("d.tar.gz", data) is True
+
+
+def test_parse_supports_dry_run_targz_missing_metadata_returns_false():
+    data = _targz_with_metadata({}, include_file=False)
+    assert _parse_supports_dry_run("d.tgz", data) is False
+
+
+def test_parse_supports_dry_run_targz_metadata_is_directory_returns_false():
+    """A `driver_metadata.json` tar member that is a directory extracts to None."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="driver_metadata.json")
+        info.type = tarfile.DIRTYPE
+        tf.addfile(info)
+    assert _parse_supports_dry_run("d.tar.gz", buf.getvalue()) is False
+
+
+def test_parse_supports_dry_run_unrecognized_extension_returns_false():
+    assert _parse_supports_dry_run("d.txt", b"whatever") is False
+
+
+def test_parse_supports_dry_run_malformed_json_returns_false():
+    assert _parse_supports_dry_run("d.zip", _zip_with_metadata("{not json")) is False
+
+
+def test_parse_supports_dry_run_non_dict_metadata_returns_false():
+    assert _parse_supports_dry_run("d.zip", _zip_with_metadata([1, 2, 3])) is False
+
+
+def test_parse_supports_dry_run_corrupt_zip_returns_false():
+    assert _parse_supports_dry_run("d.zip", b"not a zip at all") is False
 
 
 # --- create_driver ---
@@ -242,7 +324,80 @@ async def test_replace_driver_file_success():
                 assert updated.size_bytes == len(b"newdata")
 
 
+@pytest.mark.asyncio
+async def test_replace_driver_file_too_large():
+    async with TestSessionLocal() as db:
+        with pytest.raises(HTTPException) as exc:
+            await replace_driver_file(
+                db,
+                uuid.uuid4(),
+                "new.zip",
+                b"x" * 100,
+                "admin",
+                10,
+            )
+        assert exc.value.status_code == 422
+        assert "too large" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_replace_driver_file_swallows_delete_error_for_old_key():
+    """A failing delete of the superseded object must not abort the replace."""
+    async with TestSessionLocal() as db:
+        with patch("app.services.driver_service.upload_object"):
+            driver = await create_driver(
+                db,
+                "Drv",
+                "desc",
+                "Management",
+                "old.zip",
+                b"old",
+                "admin",
+                10_000_000,
+            )
+        with (
+            patch("app.services.driver_service.upload_object"),
+            patch(
+                "app.services.driver_service.delete_object",
+                side_effect=RuntimeError("minio down"),
+            ),
+        ):
+            updated = await replace_driver_file(
+                db,
+                driver.id,
+                "new.zip",
+                b"newdata",
+                "admin",
+                10_000_000,
+            )
+        assert updated.filename == "new.zip"
+
+
 # --- delete_driver ---
+
+
+@pytest.mark.asyncio
+async def test_delete_driver_swallows_storage_delete_error():
+    """A storage delete failure must not block removing the DB row."""
+    async with TestSessionLocal() as db:
+        with patch("app.services.driver_service.upload_object"):
+            driver = await create_driver(
+                db,
+                "DelErr",
+                "desc",
+                "Management",
+                "del.zip",
+                b"data",
+                "admin",
+                10_000_000,
+            )
+        with patch(
+            "app.services.driver_service.delete_object",
+            side_effect=RuntimeError("minio down"),
+        ):
+            await delete_driver(db, driver.id)
+        with pytest.raises(HTTPException):
+            await get_driver(db, driver.id)
 
 
 @pytest.mark.asyncio
