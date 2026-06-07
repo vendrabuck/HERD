@@ -95,13 +95,34 @@ describe("EquipmentBrowser", () => {
     );
   });
 
-  it("shows the empty state when no devices come back", async () => {
+  it("shows the inventory-empty hint when nothing is seeded and no filter is active", async () => {
     stubTemplates();
     stubDevices([]);
 
     renderWithProviders(<EquipmentBrowser />);
 
+    expect(
+      await screen.findByText(/No devices in inventory\. Ask an admin to add devices/),
+    ).toBeInTheDocument();
+    // The generic "filter matched nothing" copy must NOT show in the empty case.
+    expect(screen.queryByText("No devices found")).not.toBeInTheDocument();
+  });
+
+  it("shows 'No devices found' when a search filter matches nothing", async () => {
+    stubTemplates();
+    stubDevices([]);
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    // Inventory-empty + no filter shows the hint first.
+    await screen.findByText(/No devices in inventory/);
+
+    // Typing a search term makes a filter active; an empty result now reads as
+    // "filter matched nothing", not "inventory empty".
+    await userEvent.type(screen.getByPlaceholderText("Search devices..."), "nomatch");
+
     expect(await screen.findByText("No devices found")).toBeInTheDocument();
+    expect(screen.queryByText(/No devices in inventory/)).not.toBeInTheDocument();
   });
 
   it("shows an error message when the devices request fails", async () => {

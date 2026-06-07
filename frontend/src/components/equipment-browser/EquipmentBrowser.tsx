@@ -84,6 +84,12 @@ export function EquipmentBrowser({ canvasDeviceIds = [] }: EquipmentBrowserProps
 
   const canvasIdSet = useMemo(() => new Set(canvasDeviceIds), [canvasDeviceIds]);
 
+  // Distinguish "inventory is genuinely empty" from "a filter matched nothing".
+  // deferredSearch mirrors the value the device query actually ran with.
+  const hasActiveFilter =
+    Boolean(templateFilter) || Boolean(topoFilter) || deferredSearch.trim().length > 0;
+  const inventoryEmpty = !devices || devices.length === 0;
+
   const filteredDevices = useMemo(() => {
     if (!devices) return [];
 
@@ -162,9 +168,17 @@ export function EquipmentBrowser({ canvasDeviceIds = [] }: EquipmentBrowserProps
         {isError && (
           <p className="text-xs text-red-500 text-center py-4">Failed to load devices</p>
         )}
-        {!isLoading && !isError && filteredDevices.length === 0 && (
-          <p className="text-xs text-gray-400 text-center py-4">No devices found</p>
+        {!isLoading && !isError && inventoryEmpty && !hasActiveFilter && (
+          <p className="text-xs text-gray-400 text-center py-4">
+            No devices in inventory. Ask an admin to add devices, or run the seed.
+          </p>
         )}
+        {!isLoading &&
+          !isError &&
+          filteredDevices.length === 0 &&
+          !(inventoryEmpty && !hasActiveFilter) && (
+            <p className="text-xs text-gray-400 text-center py-4">No devices found</p>
+          )}
         {filteredDevices.map((device) => (
           <DeviceCard key={device.id} device={device} />
         ))}
