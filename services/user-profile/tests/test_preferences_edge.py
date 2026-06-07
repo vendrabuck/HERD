@@ -7,7 +7,9 @@ import uuid
 import pytest
 from app.database import Base, get_db
 from app.main import app
+from app.models.preferences import UserPreferences
 from app.routers.preferences import get_current_user_payload
+from app.services import preferences_service
 from app.services.preferences_service import get_or_create, replace, reset
 from app.services.preferences_service import patch as svc_patch
 from httpx import ASGITransport, AsyncClient
@@ -335,6 +337,72 @@ async def test_service_reset_clears_existing_row():
     assert cleared.saved_filters == {}
     assert cleared.page_sizes == {}
     assert cleared.extras == {}
+
+
+# --- Concurrent first-access: idempotent create (regression for #81) ---
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_returns_existing_committed_row_without_raising():
+    """When a row already exists (committed by another writer), get_or_create
+    takes the read-existing path and returns it rather than inserting again."""
+    user_id = uuid.uuid4()
+    # Pre-insert and commit the row, simulating the winner of the race.
+    async with TestSessionLocal() as writer:
+        writer.add(
+            UserPreferences(
+                user_id=user_id,
+                saved_filters={"who": "winner"},
+                page_sizes={},
+                extras={},
+            )
+        )
+        await writer.commit()
+    async with TestSessionLocal() as session:
+        prefs = await get_or_create(session, user_id)
+    assert prefs.user_id == user_id
+    assert prefs.saved_filters == {"who": "winner"}
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_recovers_from_lost_insert_race(monkeypatch):
+    """Force the lost-race window: the initial SELECT returns None (so the
+    caller tries to INSERT) but a committed row already exists, so the commit
+    raises IntegrityError. get_or_create must roll back, re-read, and return the
+    existing row instead of propagating a 500."""
+    user_id = uuid.uuid4()
+    # The winner commits its row first.
+    async with TestSessionLocal() as writer:
+        writer.add(
+            UserPreferences(
+                user_id=user_id,
+                saved_filters={"who": "winner"},
+                page_sizes={},
+                extras={},
+            )
+        )
+        await writer.commit()
+
+    real_select = preferences_service._select_prefs
+    calls = {"n": 0}
+
+    async def fake_select(db, uid):
+        # First lookup pretends the row is absent (the lost-race read), so the
+        # caller proceeds to INSERT and hits the PK conflict. Later lookups
+        # (the post-rollback re-read) use the real query.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_select(db, uid)
+
+    monkeypatch.setattr(preferences_service, "_select_prefs", fake_select)
+
+    async with TestSessionLocal() as session:
+        prefs = await get_or_create(session, user_id)
+    assert prefs.user_id == user_id
+    assert prefs.saved_filters == {"who": "winner"}
+    # The except path must have run: initial None read plus the re-read.
+    assert calls["n"] >= 2
 
 
 # --- Cross-user isolation in the internal endpoint ---
