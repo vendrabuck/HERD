@@ -13,6 +13,10 @@
       "/health"
     ],
     [
+      "GET",
+      "/quota"
+    ],
+    [
       "POST",
       "/reservations/{reservation_id}/assistant"
     ],
