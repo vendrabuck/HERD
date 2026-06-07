@@ -27,6 +27,7 @@ from app.config import settings
 from app.database import Base, engine
 from app.routes.commit import router as commit_router
 from app.routes.generate import router as generate_router
+from app.routes.quota import router as quota_router
 from app.routes.reservation_assistant import router as reservation_assistant_router
 from app.routes.template_identity import router as template_identity_router
 from app.services.ai_client import ai_is_configured
@@ -90,6 +91,7 @@ app.include_router(generate_router)
 app.include_router(commit_router)
 app.include_router(reservation_assistant_router)
 app.include_router(template_identity_router)
+app.include_router(quota_router)
 
 
 @app.get("/health")

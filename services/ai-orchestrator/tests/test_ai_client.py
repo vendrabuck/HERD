@@ -90,8 +90,9 @@ async def test_propose_topology_returns_tool_input():
     proposal = {"purpose": "demo", "devices": [], "edges": []}
     provider = _FakeProvider(responses=[_resp([_tool_use("propose_topology", proposal)])])
     client = _make_client(provider)
-    out = await client.propose_topology(inventory_block="- Alpha: 1", user_prompt="hi")
+    out, usage = await client.propose_topology(inventory_block="- Alpha: 1", user_prompt="hi")
     assert out == proposal
+    assert (usage.input_tokens, usage.output_tokens) == (10, 20)
 
 
 @pytest.mark.asyncio
@@ -100,8 +101,9 @@ async def test_propose_topology_falls_back_to_text_json_block():
     payload = '{"purpose":"t","devices":[],"edges":[]}'
     provider = _FakeProvider(responses=[_resp([TextBlock(text=payload)])])
     client = _make_client(provider)
-    out = await client.propose_topology(inventory_block="", user_prompt="hi")
+    out, usage = await client.propose_topology(inventory_block="", user_prompt="hi")
     assert out == {"purpose": "t", "devices": [], "edges": []}
+    assert (usage.input_tokens, usage.output_tokens) == (10, 20)
 
 
 @pytest.mark.asyncio
@@ -118,7 +120,7 @@ async def test_propose_topology_prefers_tool_use_over_text():
         ]
     )
     client = _make_client(provider)
-    out = await client.propose_topology(inventory_block="", user_prompt="hi")
+    out, _usage = await client.propose_topology(inventory_block="", user_prompt="hi")
     assert out == proposal
 
 
@@ -494,7 +496,7 @@ async def test_suggest_template_identity_returns_parsed_tool_input():
     }
     provider = _FakeProvider(responses=[_resp([_tool_use("suggest_identity", proposed)])])
     client = _make_client(provider)
-    out = await client.suggest_template_identity(
+    out, usage = await client.suggest_template_identity(
         name="EX4300",
         description="Border firewall template",
         sections=None,
@@ -502,6 +504,7 @@ async def test_suggest_template_identity_returns_parsed_tool_input():
     assert out["vendor"] == "Juniper Networks"
     assert out["model"] == "EX4300"
     assert out["confidence"] == "high"
+    assert (usage.input_tokens, usage.output_tokens) == (10, 20)
 
 
 @pytest.mark.asyncio
@@ -514,7 +517,7 @@ async def test_suggest_template_identity_handles_low_confidence_path():
     }
     provider = _FakeProvider(responses=[_resp([_tool_use("suggest_identity", proposed)])])
     client = _make_client(provider)
-    out = await client.suggest_template_identity(name="Generic Firewall")
+    out, _usage = await client.suggest_template_identity(name="Generic Firewall")
     assert out["confidence"] == "low"
     assert out["part_number"] is None
 

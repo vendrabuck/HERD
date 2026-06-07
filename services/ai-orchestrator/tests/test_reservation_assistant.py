@@ -11,6 +11,7 @@ from app import config as config_module
 from app.database import Base, engine
 from app.main import app
 from app.routes.reservation_assistant import get_reservation_seed_dep
+from app.services import usage_repo
 from app.services.ai_client import AIError, AssistantTurnResult, TurnSegment, get_ai_client
 from app.services.llm_provider import TextBlock
 from app.services.reservation_context import (
@@ -20,6 +21,18 @@ from app.services.reservation_context import (
 from app.services.tools import ToolCallRecord
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+_TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+def _decode_sub(token: str) -> uuid.UUID:
+    payload = jwt.decode(
+        token,
+        config_module.settings.secret_key,
+        algorithms=[config_module.settings.algorithm],
+    )
+    return uuid.UUID(payload["sub"])
 
 
 @pytest.fixture(autouse=True)
@@ -149,6 +162,40 @@ async def test_503_when_api_key_blank(async_client, monkeypatch):
     async with async_client as client:
         resp = await client.post(_url(), json={"question": "hello"}, headers=headers)
     assert resp.status_code == 503
+
+
+async def test_over_quota_returns_429_without_calling_ai(async_client, monkeypatch):
+    """At/over quota, the assistant returns 429 and never invokes the AI provider."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    token = _user_token()
+    async with _TestSessionLocal() as db:
+        await usage_repo.add_tokens(db, _decode_sub(token), input_tokens=100, output_tokens=0)
+
+    class ExplodingAI:
+        async def answer_reservation_question_with_tools(self, **kwargs):
+            raise AssertionError("provider must not be called when over quota")
+
+    app.dependency_overrides[get_ai_client] = lambda: ExplodingAI()
+    _override_seed()
+    headers = {"Authorization": f"Bearer {token}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "hello"}, headers=headers)
+    assert resp.status_code == 429
+    assert resp.json()["detail"]["limit"] == 100
+
+
+async def test_assistant_records_usage_when_quota_enabled(async_client, monkeypatch):
+    """A successful assistant turn books the turn's reported tokens against the quota."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    token = _user_token()
+    _override_seed()
+    _override_ai(input_tokens=42, output_tokens=17)
+    headers = {"Authorization": f"Bearer {token}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "hello"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    async with _TestSessionLocal() as db:
+        assert await usage_repo.get_today_total(db, _decode_sub(token)) == 59
 
 
 # --- Happy path ---

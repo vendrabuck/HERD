@@ -7,13 +7,17 @@ ANTHROPIC_API_KEY: 503 when blank. Used by the template editor's
 """
 
 import logging
+import uuid
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from herd_common.auth import make_auth_dependencies
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import get_db
+from app.services import usage_repo
 from app.services.ai_client import AIClient, AIError, ai_is_configured, get_ai_client
 
 logger = logging.getLogger(__name__)
@@ -43,8 +47,9 @@ class SuggestIdentityResponse(BaseModel):
 @router.post("/suggest-identity", response_model=SuggestIdentityResponse)
 async def suggest_identity(
     body: SuggestIdentityRequest,
-    _admin=Depends(require_admin),
+    admin=Depends(require_admin),
     ai: AIClient = Depends(get_ai_client),
+    db: AsyncSession = Depends(get_db),
 ) -> SuggestIdentityResponse:
     if not ai_is_configured():
         raise HTTPException(
@@ -52,8 +57,11 @@ async def suggest_identity(
             "AI orchestrator is not configured",
         )
 
+    user_id = uuid.UUID(admin["sub"])
+    await usage_repo.enforce_quota(db, user_id)
+
     try:
-        result = await ai.suggest_template_identity(
+        result, usage = await ai.suggest_template_identity(
             name=body.name,
             description=body.description,
             sections=body.sections,
@@ -64,6 +72,13 @@ async def suggest_identity(
             status.HTTP_502_BAD_GATEWAY,
             f"AI suggestion failed: {e}",
         ) from e
+
+    await usage_repo.record_usage(
+        db,
+        user_id,
+        usage,
+        fallback_text=body.name + str(result),
+    )
 
     try:
         return SuggestIdentityResponse(**result)
