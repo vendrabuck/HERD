@@ -235,6 +235,59 @@ async def test_expiration_releases_all_device_ids_without_exclusivity_check():
 
 
 @pytest.mark.asyncio
+async def test_expiration_publishes_completed_event():
+    """Regression (#77): auto-completing an ACTIVE reservation publishes a
+    reservation.completed event on herd.reservations.completed, mirroring the
+    manual release path so execution deprovisions and notifications renders it."""
+    device_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    res_id = await _insert_reservation(
+        ReservationStatus.ACTIVE, PAST - timedelta(hours=2), PAST, device_ids=device_ids
+    )
+    res = await _get_reservation(res_id)
+    user_id = str(res.user_id)
+    nats = AsyncMock()
+    with patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()):
+        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
+            await _run_expiration_cycle(nats)
+    pub.assert_awaited_once()
+    conn, subject, event = pub.await_args[0]
+    assert conn is nats
+    assert subject == "herd.reservations.completed"
+    assert event["event"] == "reservation.completed"
+    assert event["reservation_id"] == str(res_id)
+    assert event["user_id"] == user_id
+    assert set(event["device_ids"]) == set(device_ids)
+    assert event["topology_type"] == "PHYSICAL"
+    assert "topology_id" in event
+
+
+@pytest.mark.asyncio
+async def test_expiration_publishes_one_completed_event_per_reservation():
+    """One reservation.completed event per auto-completed reservation."""
+    await _insert_reservation(ReservationStatus.ACTIVE, PAST - timedelta(hours=2), PAST)
+    await _insert_reservation(ReservationStatus.ACTIVE, PAST - timedelta(hours=2), PAST)
+    nats = AsyncMock()
+    with patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()):
+        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
+            await _run_expiration_cycle(nats)
+    assert pub.await_count == 2
+    for call in pub.await_args_list:
+        assert call[0][1] == "herd.reservations.completed"
+        assert call[0][2]["event"] == "reservation.completed"
+
+
+@pytest.mark.asyncio
+async def test_expiration_no_completed_event_when_only_activation():
+    """Activating a PENDING reservation (no completion) publishes no event."""
+    await _insert_reservation(ReservationStatus.PENDING, PAST, FUTURE)
+    nats = AsyncMock()
+    with patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()):
+        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
+            await _run_expiration_cycle(nats)
+    pub.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_expiration_no_device_release_when_only_activation():
     """When only PENDING reservations are activated (no completions),
     _update_device_statuses_internal should not be called."""
