@@ -4,12 +4,21 @@ Outbound channels share two concerns that the in-app channel does not:
 
 1. Idempotency. The in-app channel dedupes on the notifications table's
    partial-unique index. Outbound sends have no such row, so this module
-   provides a `reserve` / `commit` pair against the `outbound_deliveries`
-   ledger. `reserve` inserts a pending ledger row inside its own transaction;
-   if the unique index rejects it, the (channel, user, dedupe_key) was already
-   delivered and the caller skips the side effect. The reservation is committed
-   only after the side effect succeeds, so a failed send rolls back and is
-   retried on the next NATS delivery.
+   provides a reserve / release pair against the `outbound_deliveries`
+   ledger. `already_delivered` inserts and COMMITS the ledger row before the
+   send; if the unique index rejects the insert, the (channel, user,
+   dedupe_key) was already claimed and the caller skips the side effect. On a
+   send failure, `_release` deletes the row so a future redelivery retries.
+
+   Semantics note: this is reserve-then-release (claim before send), not
+   commit-after-send, so delivery is at-most-once. A normal send failure is
+   covered (the row is released and retried), but if the process crashes or the
+   task is cancelled (e.g. SIGTERM during stop_nats_consumer) in the window
+   after the ledger commit and before the release, the row persists and the
+   notification is permanently suppressed on retry. This is an accepted
+   tradeoff for outbound channels; moving to at-least-once would require a
+   pending/delivered status column so the row is only marked delivered after
+   the send returns. See issue #83.
 
 2. Failure isolation. `run_outbound` wraps the whole attempt so a transport
    error on one channel is logged and swallowed, never blocking the other
@@ -30,11 +39,14 @@ logger = logging.getLogger(__name__)
 
 
 async def already_delivered(session_factory, channel: str, message: DispatchMessage) -> bool:
-    """Reserve a ledger slot. Returns True if this send was already delivered.
+    """Reserve a ledger slot. Returns True if this send was already claimed.
 
     A null dedupe_key is never deduplicated (not event-sourced), so we return
-    False without writing a row. Otherwise we attempt to insert a pending row;
-    an IntegrityError means a prior delivery already claimed the slot.
+    False without writing a row. Otherwise we insert and commit the ledger row
+    now (before the send); an IntegrityError means a prior delivery already
+    claimed the slot, so the caller skips the side effect. The committed row is
+    released by _release if the send then fails. See the module docstring for
+    the at-most-once tradeoff this claim-before-send order implies.
     """
     if message.dedupe_key is None:
         return False
