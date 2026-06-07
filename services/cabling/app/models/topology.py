@@ -1,7 +1,17 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, Uuid, func
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.config import settings
@@ -34,7 +44,15 @@ _version_fk = f"{_schema}.topology_versions.id" if _schema else "topology_versio
 
 class TopologyVersion(Base):
     __tablename__ = "topology_versions"
-    __table_args__ = {"schema": _schema} if _schema else {}
+    # Mirrors migration 0005's uq_topology_versions_topology_version. Declaring it
+    # on the model keeps model-built schemas (e.g. the SQLite test DB) in sync with
+    # the migration so the version-number uniqueness invariant is enforced there too.
+    __table_args__ = (
+        UniqueConstraint(
+            "topology_id", "version_number", name="uq_topology_versions_topology_version"
+        ),
+        *(({"schema": _schema},) if _schema else ()),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     topology_id: Mapped[uuid.UUID] = mapped_column(
