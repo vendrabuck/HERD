@@ -152,6 +152,40 @@ async def test_put_preferences_defaults(user_client):
     assert data["extras"] == {}
 
 
+# --- Validation bounds ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_page_sizes",
+    [
+        {"inventory": 0},  # non-positive
+        {"inventory": -1},  # negative
+        {"inventory": 10_000},  # over the max
+        {"inventory": "25"},  # not an int
+        {"inventory": True},  # bool is not a page size
+    ],
+)
+async def test_put_preferences_rejects_invalid_page_sizes(user_client, bad_page_sizes):
+    resp = await user_client.put("/preferences", json={"page_sizes": bad_page_sizes})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_accepts_valid_page_size(user_client):
+    resp = await user_client.put("/preferences", json={"page_sizes": {"inventory": 500}})
+    assert resp.status_code == 200
+    assert resp.json()["page_sizes"] == {"inventory": 500}
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_rejects_oversized_blob(user_client):
+    # A single saved_filters value larger than the 64 KB serialized cap is rejected.
+    huge = {"inventory": {"search": "x" * 70_000}}
+    resp = await user_client.put("/preferences", json={"saved_filters": huge})
+    assert resp.status_code == 422
+
+
 # --- PATCH (merge) ---
 
 
