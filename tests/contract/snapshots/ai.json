@@ -13,6 +13,10 @@
       "/health"
     ],
     [
+      "GET",
+      "/quota"
+    ],
+    [
       "POST",
       "/reservations/{reservation_id}/assistant"
     ],
@@ -23,6 +27,10 @@
     [
       "POST",
       "/templates/suggest-identity"
+    ],
+    [
+      "GET",
+      "/usage"
     ]
   ],
   "schemas": {
