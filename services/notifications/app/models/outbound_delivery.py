@@ -19,11 +19,14 @@ class OutboundDelivery(Base):
     (channel, user_id, dedupe_key), so a NATS redelivery of the same source
     message is suppressed before the email/chat/webhook side effect fires.
 
-    A row is inserted before the side effect and committed only after it
-    succeeds, so a failed send leaves no ledger row and is retried on the next
-    delivery (matching the at-least-once posture of the in-app path). Rows with
-    a null dedupe_key are never written; such messages are not event-sourced
-    and are not deduplicated.
+    A row is inserted and committed BEFORE the side effect (reserve-then-send),
+    and `_release` deletes it if the send then fails so a redelivery retries.
+    This makes outbound delivery at-most-once: a crash or task cancellation in
+    the window after the commit and before the release leaves the row and
+    permanently suppresses the notification on retry. Rows with a null
+    dedupe_key are never written; such messages are not event-sourced and are
+    not deduplicated. See issue #83 for the at-least-once alternative
+    (a pending/delivered status column).
     """
 
     __tablename__ = "outbound_deliveries"
