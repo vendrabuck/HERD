@@ -30,6 +30,7 @@ from app.routes.generate import router as generate_router
 from app.routes.quota import router as quota_router
 from app.routes.reservation_assistant import router as reservation_assistant_router
 from app.routes.template_identity import router as template_identity_router
+from app.routes.usage import router as usage_router
 from app.services.ai_client import ai_is_configured
 from app.tasks.conversation_sweeper import conversation_sweeper_loop
 
@@ -92,6 +93,7 @@ app.include_router(commit_router)
 app.include_router(reservation_assistant_router)
 app.include_router(template_identity_router)
 app.include_router(quota_router)
+app.include_router(usage_router)
 
 
 @app.get("/health")
