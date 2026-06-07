@@ -225,10 +225,14 @@ async def import_devices(
     rows = parse_import(raw, fmt, DEVICE_CSV_COLUMNS)
     report = _empty_report(dry_run)
 
-    # Build a name -> template map once so reference resolution is O(1) per row
-    # and does not issue a query per row.
+    # Build a name -> template-id map once so reference resolution is O(1) per
+    # row and does not issue a query per row. We store the plain id, not the ORM
+    # instance: a per-row rollback (in the except branches below) expires every
+    # instance in the session identity map, so a cached ORM object read on a
+    # later row would trigger an implicit async lazy-refresh and raise. Only the
+    # id is needed downstream, so this sidesteps the problem entirely.
     template_rows = (await db.execute(select(DeviceTemplate))).scalars().all()
-    templates_by_name = {t.name: t for t in template_rows}
+    template_ids_by_name = {t.name: t.id for t in template_rows}
 
     for index, raw_row in enumerate(rows):
         name = (raw_row.get("name") or "").strip()
@@ -250,8 +254,8 @@ async def import_devices(
                     )
                 )
                 continue
-            template = templates_by_name.get(template_name)
-            if template is None:
+            template_id = template_ids_by_name.get(template_name)
+            if template_id is None:
                 report.rows.append(
                     RowResult(
                         row=index,
@@ -272,7 +276,7 @@ async def import_devices(
             if existing is None:
                 create = DeviceCreate(
                     name=name,
-                    template_id=template.id,
+                    template_id=template_id,
                     topology_type=raw_row.get("topology_type"),
                     status=raw_row.get("status") or "AVAILABLE",
                     field_data=field_data,
@@ -323,8 +327,12 @@ async def import_templates(
     rows = parse_import(raw, fmt, TEMPLATE_CSV_COLUMNS)
     report = _empty_report(dry_run)
 
+    # Store the plain driver id, not the ORM instance: a per-row rollback below
+    # expires every session-cached instance, so reading an attribute off a
+    # cached ORM object on a later row would trigger an async lazy-refresh and
+    # raise. Only the id is needed downstream.
     driver_rows = (await db.execute(select(DriverPackage))).scalars().all()
-    drivers_by_name = {d.name: d for d in driver_rows}
+    driver_ids_by_name = {d.name: d.id for d in driver_rows}
 
     for index, raw_row in enumerate(rows):
         name = (raw_row.get("name") or "").strip()
@@ -338,8 +346,8 @@ async def import_templates(
             driver_id: uuid.UUID | None = None
             driver_name = (raw_row.get("driver_name") or "").strip()
             if driver_name:
-                driver = drivers_by_name.get(driver_name)
-                if driver is None:
+                driver_id = driver_ids_by_name.get(driver_name)
+                if driver_id is None:
                     report.rows.append(
                         RowResult(
                             row=index,
@@ -349,7 +357,6 @@ async def import_templates(
                         )
                     )
                     continue
-                driver_id = driver.id
 
             sections = _coerce_json_cell(raw_row.get("sections"), [])
             poll = _coerce_int(raw_row.get("poll_interval_seconds"))

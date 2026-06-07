@@ -328,6 +328,100 @@ async def test_import_templates_duplicate_in_batch_rejects_via_http_exception(db
 
 
 @pytest.mark.asyncio
+async def test_import_devices_failing_row_before_valid_row_still_creates(db_setup):
+    """Regression for #76: a row that rolls back must not poison later valid
+    rows referencing the same preloaded template. The template id is cached as a
+    plain UUID, so the post-rollback lookup does not touch an expired ORM
+    instance (which would lazy-refresh and raise under async SQLAlchemy)."""
+    async with TestSessionLocal() as db:
+        await _seed_template(db, "SharedTpl")
+        report = await import_devices(
+            db,
+            _json_bytes(
+                [
+                    {
+                        "name": "BadStatusDev",
+                        "template_name": "SharedTpl",
+                        "topology_type": "PHYSICAL",
+                        "status": "NOT_A_REAL_STATUS",
+                        "field_data": {},
+                    },
+                    {
+                        "name": "GoodDev",
+                        "template_name": "SharedTpl",
+                        "topology_type": "PHYSICAL",
+                        "status": "AVAILABLE",
+                        "field_data": {},
+                    },
+                ]
+            ),
+            "json",
+            dry_run=False,
+            actor_id=uuid.uuid4(),
+            actor_name="admin",
+        )
+    assert report.created == 1
+    assert report.rejected == 1
+    created = [r for r in report.rows if r.action == "create"]
+    assert [r.identity for r in created] == ["GoodDev"]
+
+
+@pytest.mark.asyncio
+async def test_import_templates_failing_row_before_valid_row_still_creates(db_setup):
+    """Regression for #76: a row that rolls back must not poison later valid
+    rows referencing the same preloaded driver. The driver id is cached as a
+    plain UUID, so the post-rollback lookup does not touch an expired ORM
+    instance."""
+    section = {"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}
+    async with TestSessionLocal() as db:
+        driver = DriverPackage(
+            name="SharedDrv",
+            connection_type="Management",
+            filename="d.zip",
+            storage_key="k",
+            size_bytes=1,
+            sha256="abc",
+            uploaded_by="admin",
+        )
+        db.add(driver)
+        await db.commit()
+
+        report = await import_templates(
+            db,
+            _json_bytes(
+                [
+                    # First row fails: 'device' template type with no driver_name
+                    # fails TemplateCreate validation and rolls back.
+                    {
+                        "name": "BadDeviceTpl",
+                        "template_type": "device",
+                        "vendor": "A",
+                        "model": "M",
+                        "sections": [section],
+                    },
+                    # Second row is valid and references the same preloaded
+                    # driver map; it must still be created post-rollback.
+                    {
+                        "name": "GoodDeviceTpl",
+                        "template_type": "device",
+                        "driver_name": "SharedDrv",
+                        "vendor": "A",
+                        "model": "M",
+                        "sections": [section],
+                    },
+                ]
+            ),
+            "json",
+            dry_run=False,
+            actor_id=uuid.uuid4(),
+        )
+    assert report.created == 1
+    assert report.rejected == 1
+    created = [r for r in report.rows if r.action == "create"]
+    assert [r.identity for r in created] == ["GoodDeviceTpl"]
+
+
+@pytest.mark.asyncio
 async def test_import_templates_invalid_row_rolls_back_and_rejects(db_setup):
     """A row that fails schema validation during a live import is rejected with
     a rollback, not propagated, so the batch survives."""
