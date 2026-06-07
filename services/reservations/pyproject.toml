@@ -40,3 +40,12 @@ packages = ["app"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["error"]
+
+[tool.coverage.run]
+# FastAPI endpoint handlers run inside anyio worker threads under
+# ASGITransport, and SQLAlchemy's async engine drives them through greenlets.
+# Without tracing both, coverage records only the first line of each async
+# handler and the per-line result is order dependent, so async router lines
+# read as uncovered even when a passing test exercises them. Tracing thread
+# and greenlet contexts makes router coverage accurate and stable.
+concurrency = ["thread", "greenlet"]
