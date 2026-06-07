@@ -50,7 +50,7 @@ class AnthropicProvider:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "max_tokens": max_tokens,
-            "system": system,
+            "system": _system_to_anthropic(system),
             "messages": [_message_to_anthropic(m) for m in messages],
         }
         if not isinstance(tool_choice, ToolChoiceNone) and tools is not None:
@@ -66,6 +66,28 @@ class AnthropicProvider:
             raise AIError(f"AI call exceeded {timeout_s}s") from exc
 
         return _response_from_anthropic(sdk_msg, self._model)
+
+
+def _system_to_anthropic(system: str) -> list[dict[str, Any]]:
+    """Render the system prompt as a single cache-controlled text block.
+
+    Anthropic prompt caching is a PREFIX match over the rendered request in the
+    order tools -> system -> messages, so a cache_control breakpoint on the last
+    system block caches the tool schemas plus the system prompt together; the
+    per-request user content (live inventory, the user's question) stays in
+    `messages`, after the breakpoint, where it cannot invalidate the cached
+    prefix. The 5-minute ephemeral TTL is the default.
+
+    This only yields cache hits when the rendered prefix is byte-identical across
+    requests AND exceeds Anthropic's minimum cacheable prefix (4096 tokens for
+    Opus). The assistant and identity call sites pass a frozen system constant,
+    so they cache once the tool schemas push the prefix over that floor; the
+    topology call site interpolates live inventory into the system prompt, so its
+    prefix differs every request and caching is silently a no-op there (no error,
+    cache_creation_input_tokens stays 0). Marking the block unconditionally is
+    safe: a non-repeating prefix simply never reads back what it wrote.
+    """
+    return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
 
 def _message_to_anthropic(m: Message) -> dict[str, Any]:
@@ -118,6 +140,14 @@ def _response_from_anthropic(sdk_msg: Any, model: str) -> ProviderResponse:
         usage=Usage(
             input_tokens=getattr(sdk_msg.usage, "input_tokens", 0),
             output_tokens=getattr(sdk_msg.usage, "output_tokens", 0),
+            # Older SDK responses (and responses with no caching) omit these or
+            # report None; default to 0 so they never count toward the quota and
+            # never break arithmetic. Anthropic reports cache_read_input_tokens
+            # separately from input_tokens, so input_tokens already excludes any
+            # cached prefix and stays correct as the quota figure.
+            cache_creation_input_tokens=getattr(sdk_msg.usage, "cache_creation_input_tokens", 0)
+            or 0,
+            cache_read_input_tokens=getattr(sdk_msg.usage, "cache_read_input_tokens", 0) or 0,
         ),
         raw_model=model,
     )

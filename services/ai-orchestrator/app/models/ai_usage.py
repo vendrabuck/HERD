@@ -38,6 +38,13 @@ class AIUsage(Base):
     usage_date: Mapped[date] = mapped_column(Date, nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Anthropic prompt-caching counters, accumulated for observability only. They
+    # are NOT summed into the daily-quota total (get_today_total / enforce_quota
+    # use input_tokens + output_tokens), since cache reads/writes are billed at a
+    # fraction of base rate and metering them would distort the budget. Stays 0
+    # for the openai_compat provider, which has no prompt caching.
+    cache_creation_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_read_input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

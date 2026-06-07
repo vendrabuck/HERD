@@ -286,5 +286,83 @@ async def test_call_passes_max_tokens_and_system_through():
     )
     kwargs = create_mock.call_args.kwargs
     assert kwargs["max_tokens"] == 2048
-    assert kwargs["system"] == "be helpful"
+    # The system prompt is now rendered as a list of one cache-controlled text
+    # block (prompt-caching breakpoint) rather than a bare string.
+    assert kwargs["system"] == [
+        {"type": "text", "text": "be helpful", "cache_control": {"type": "ephemeral"}}
+    ]
     assert kwargs["model"] == "claude-opus-4-7"
+
+
+# --- Prompt caching (issue #65) ---
+
+
+@pytest.mark.asyncio
+async def test_call_sets_cache_control_on_system_block():
+    """The system prompt is sent as a single ephemeral cache-controlled block so
+    the tools + system prefix can be cached across requests."""
+    provider, create_mock = _provider_with_response([_sdk_text("ok")])
+    await provider.call(
+        system="frozen instruction prefix",
+        messages=[Message(role="user", content=[TextBlock(text="hi")])],
+        tools=[ToolSchema(name="x", description="x", input_schema={"type": "object"})],
+        tool_choice=ToolChoiceAuto(),
+        max_tokens=100,
+        timeout_s=None,
+    )
+    system = create_mock.call_args.kwargs["system"]
+    assert isinstance(system, list)
+    assert len(system) == 1
+    assert system[0]["type"] == "text"
+    assert system[0]["text"] == "frozen instruction prefix"
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_response_from_anthropic_reads_cache_token_fields():
+    """cache_creation_input_tokens and cache_read_input_tokens flow off the SDK
+    usage object into the neutral Usage; input_tokens stays the uncached figure."""
+    sdk_msg = SimpleNamespace(
+        content=[_sdk_text("answer")],
+        usage=SimpleNamespace(
+            input_tokens=12,
+            output_tokens=8,
+            cache_creation_input_tokens=4096,
+            cache_read_input_tokens=2048,
+        ),
+        stop_reason="end_turn",
+    )
+    resp = _response_from_anthropic(sdk_msg, "claude-test")
+    assert resp.usage.input_tokens == 12
+    assert resp.usage.output_tokens == 8
+    assert resp.usage.cache_creation_input_tokens == 4096
+    assert resp.usage.cache_read_input_tokens == 2048
+
+
+def test_response_from_anthropic_cache_fields_default_zero_when_absent():
+    """Older responses omit the cache fields; they default to 0, never None, so
+    they never count toward the quota or break arithmetic."""
+    sdk_msg = SimpleNamespace(
+        content=[_sdk_text("answer")],
+        usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+        stop_reason="end_turn",
+    )
+    resp = _response_from_anthropic(sdk_msg, "claude-test")
+    assert resp.usage.cache_creation_input_tokens == 0
+    assert resp.usage.cache_read_input_tokens == 0
+
+
+def test_response_from_anthropic_cache_fields_coerce_none_to_zero():
+    """A None on either cache field (some SDK shapes) is coerced to 0."""
+    sdk_msg = SimpleNamespace(
+        content=[_sdk_text("answer")],
+        usage=SimpleNamespace(
+            input_tokens=5,
+            output_tokens=3,
+            cache_creation_input_tokens=None,
+            cache_read_input_tokens=None,
+        ),
+        stop_reason="end_turn",
+    )
+    resp = _response_from_anthropic(sdk_msg, "claude-test")
+    assert resp.usage.cache_creation_input_tokens == 0
+    assert resp.usage.cache_read_input_tokens == 0

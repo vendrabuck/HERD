@@ -70,6 +70,8 @@ async def add_tokens(
     *,
     input_tokens: int,
     output_tokens: int,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
 ) -> None:
     """Atomically add tokens to (user_id, UTC today), inserting on first use.
 
@@ -77,6 +79,10 @@ async def add_tokens(
     increments safe without a read-modify-write round trip. The dialect is
     sniffed from the bound engine so the same code path works on Postgres
     (asyncpg) in prod and SQLite (aiosqlite) in tests.
+
+    The two cache counters are accumulated for observability only; they are NOT
+    part of the quota total (get_today_total sums input + output). They default
+    to 0 so the openai_compat path, which has no prompt caching, is unaffected.
     """
     dialect = db.bind.dialect.name if db.bind is not None else "sqlite"
     insert = pg_insert if dialect == "postgresql" else sqlite_insert
@@ -85,12 +91,20 @@ async def add_tokens(
         usage_date=_utc_today(),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=["user_id", "usage_date"],
         set_={
             "input_tokens": AIUsage.input_tokens + stmt.excluded.input_tokens,
             "output_tokens": AIUsage.output_tokens + stmt.excluded.output_tokens,
+            "cache_creation_input_tokens": (
+                AIUsage.cache_creation_input_tokens + stmt.excluded.cache_creation_input_tokens
+            ),
+            "cache_read_input_tokens": (
+                AIUsage.cache_read_input_tokens + stmt.excluded.cache_read_input_tokens
+            ),
             "updated_at": func.now(),
         },
     )
@@ -142,7 +156,9 @@ async def record_usage(
 
     Uses the provider-reported token counts. When both are zero (the provider
     omitted usage), fall back to a chars/4 estimate over fallback_text, booked
-    as output tokens; precision is not required for budget enforcement.
+    as output tokens; precision is not required for budget enforcement. The
+    cache counters pass straight through for observability and are never part of
+    the fallback estimate or the quota total.
     """
     if settings.ai_daily_token_quota <= 0:
         return
@@ -150,4 +166,13 @@ async def record_usage(
     output_tokens = usage.output_tokens
     if input_tokens == 0 and output_tokens == 0:
         output_tokens = max(1, len(fallback_text) // 4)
-    await add_tokens(db, user_id, input_tokens=input_tokens, output_tokens=output_tokens)
+    await add_tokens(
+        db,
+        user_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        # getattr-default so any duck-typed usage object missing the (optional)
+        # cache fields still meters cleanly; a real Usage always supplies them.
+        cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0),
+        cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0),
+    )
