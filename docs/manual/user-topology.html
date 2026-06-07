@@ -33,19 +33,21 @@
       <li><a href="#connect">Drawing connections</a></li>
       <li><a href="#edges">Red vs green edges</a></li>
       <li><a href="#save">Saving &amp; history</a></li>
+      <li><a href="#reuse">Cloning &amp; templates</a></li>
     </ul>
     <p class="eyebrow">User track</p>
     <ul>
-      <li><a href="quickstart.html">1 - First boot</a></li>
-      <li><a href="user-reservations.html">2 - Reservations</a></li>
-      <li><a href="user-topology.html" class="active">3 - Topology</a></li>
-      <li><a href="user-ai.html">4 - Generate with AI</a></li>
-      <li><a href="user-notifications.html">5 - Notifications</a></li>
+      <li><a href="quickstart.html">1 · First boot</a></li>
+      <li><a href="user-reservations.html">2 · Reservations</a></li>
+      <li><a href="user-topology.html" class="active">3 · Topology</a></li>
+      <li><a href="user-ai.html">4 · Generate with AI</a></li>
+      <li><a href="user-assistant.html">5 · AI assistant</a></li>
+      <li><a href="user-notifications.html">6 · Notifications</a></li>
     </ul>
   </aside>
 
   <main class="main">
-    <span class="kicker user">User track - Step 3</span>
+    <span class="kicker user">User track · Step 3</span>
     <h1 class="title">Building a topology</h1>
     <p class="dek">The topology editor is a canvas where you draw how your lab is wired: drag devices on, connect them, and HERD checks every link against the real physical cabling. It's the signature feature &mdash; and it's less scary than it looks.</p>
 
@@ -88,10 +90,10 @@
                 </div>
               </div>
               <div class="hd-node sel" id="tn1" style="left:255px;top:60px;" data-anno="2" data-anno-pin="t" data-anno-arrow>
-                <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-01</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Generic FW-600</div>
+                <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-01</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Palo PA-460</div>
               </div>
               <div class="hd-node sel" id="tn2" style="left:255px;top:300px;">
-                <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-02</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Generic FW-600</div>
+                <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-02</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Palo PA-460</div>
               </div>
               <div class="hd-node" id="tn3" style="left:460px;top:180px;">
                 <span class="handle l"></span><span class="handle r"></span><div class="gl"></div><div class="nm">l1-patch-mux</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">MRV L1 Switch</div>
@@ -164,7 +166,7 @@
               <div class="mbody">
                 <div class="hd-field"><label class="hd-label">Layer</label>
                   <div class="hd-seg" data-anno="1" data-anno-pin="r" data-anno-arrow style="display:flex;"><span>L1</span><span class="active">L2</span><span>L3</span></div>
-                  <p class="hd-help">L1 = physical cabling - L2 = Ethernet/VLAN - L3 = IP/routing.</p>
+                  <p class="hd-help">L1 = physical cabling · L2 = Ethernet/VLAN · L3 = IP/routing.</p>
                 </div>
                 <div class="hd-row2">
                   <div class="hd-field"><label class="hd-label">Port on fw-edge-01</label><div class="hd-select" data-anno="2" data-anno-pin="b" data-anno-arrow>eth1/1</div></div>
@@ -246,12 +248,24 @@
       <div><p><b>Restore is blocked</b> while an active or pending reservation still references the topology. Cancel or wait for it to release, then restore.</p></div>
     </div>
 
+    <h2 class="sec" id="reuse">Don't start from scratch</h2>
+    <p class="sectitle">Cloning &amp; reusable templates</p>
+    <p>Once you've wired a lab you like, you don't have to rebuild it next time. Two ways to reuse it:</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <div class="gcard" style="cursor:default;"><span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span><h3>Clone it</h3><p>Make a full copy of an existing topology as a fresh, editable starting point. The original is untouched; tweak the copy without fear.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></svg></span><h3>Promote to a template</h3><p>Mark a topology as a reusable template so it shows up as a named starting point for everyone &mdash; the canonical &ldquo;standard test rig,&rdquo; ready to clone.</p></div>
+    </div>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>A cloned or template-spawned topology still resolves its devices against <em>live</em> inventory when you open it, so you'll only ever wire gear that actually exists and you can see.</p></div>
+    </div>
+
     <div class="accordion">
       <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Keyboard &amp; mouse cheat sheet</span></summary>
       <div class="acc-body">
         <ul class="list">
           <li><b>Pan:</b> drag empty canvas</li>
-          <li><b>Select:</b> click a node - <b>Multi-select:</b> shift-click or drag a box</li>
+          <li><b>Select:</b> click a node · <b>Multi-select:</b> shift-click or drag a box</li>
           <li><b>Delete selected:</b> <kbd>Delete</kbd> or <kbd>Backspace</kbd></li>
           <li><b>Connect:</b> drag from a node handle to another node</li>
           <li><b>Zoom:</b> mouse wheel, or the <kbd>+</kbd> / <kbd>&minus;</kbd> buttons by the minimap</li>

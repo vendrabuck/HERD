@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Device health &amp; configuration</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#health">Health monitoring</a></li>
+      <li><a href="#enable">Turning polling on</a></li>
+      <li><a href="#states">Reading the badge</a></li>
+      <li><a href="#alerts">When a device goes bad</a></li>
+      <li><a href="#config">Config versions</a></li>
+      <li><a href="#diff">Diff &amp; restore</a></li>
+      <li><a href="#schedule">Scheduled apply &amp; dry run</a></li>
+    </ul>
+    <p class="eyebrow">Admin track</p>
+    <ul>
+      <li><a href="admin-setup.html">A · First-day setup</a></li>
+      <li><a href="admin-equipment.html">B · Equipment &amp; cabling</a></li>
+      <li><a href="admin-health-config.html" class="active">C · Health &amp; config</a></li>
+      <li><a href="admin-reporting.html">D · Reporting</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker admin">Admin track · Setup C</span>
+    <h1 class="title">Device health &amp; configuration</h1>
+    <p class="dek">Two things HERD does once your devices exist: it can <b>poll them</b> to tell you which ones are actually reachable, and it <b>versions every config it pushes</b> so you can see, diff, and roll back what changed. Neither is on by default &mdash; this page turns them on and explains what you'll see.</p>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Both features lean on <b>drivers</b> &mdash; the Python packages that know how to log into your hardware (see <a href="admin-setup.html#drivers">first-day setup</a>). Health polling uses a driver's <span style="font-family:var(--font-mono);font-size:.9em">login</span>/<span style="font-family:var(--font-mono);font-size:.9em">status</span>/<span style="font-family:var(--font-mono);font-size:.9em">logout</span> sequence; config apply uses the driver's apply path. A device whose driver can't do these simply won't participate.</p></div>
+    </div>
+
+    <h2 class="sec" id="health">Is it alive?</h2>
+    <p class="sectitle">Device health monitoring</p>
+    <p>Health monitoring asks each opted-in device, on a schedule, &ldquo;are you reachable and healthy?&rdquo; by running its driver's <span style="font-family:var(--font-mono);font-size:.9em">login &rarr; status &rarr; logout</span> sequence. The result becomes a coloured badge on the device's detail page and, when it changes for the worse, a notification.</p>
+
+    <h2 class="sec" id="enable">Opt a device in</h2>
+    <p class="sectitle">Turning polling on</p>
+    <p>Polling is off until you set a <strong>poll interval</strong>. You can set it on a single device, or on a template so every device of that type inherits it.</p>
+    <div class="steps">
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">Set <b>Poll interval (seconds)</b> on the device or its template</h3><p>Open the device (or template) and set how often HERD should check it. The floor is <b>30 seconds</b> &mdash; anything lower is rejected so a typo can't hammer your gear.</p></div></div>
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">Leave it blank to opt out</h3><p>No interval = no polling. Most labs poll a handful of always-on infrastructure devices and leave DUTs alone. Set it per-template for a whole class, or per-device for one-offs.</p></div></div>
+      <div class="stepblock admin"><div class="stepbody"><h3 class="step">The scheduler picks it up automatically</h3><p>No restart needed. The execution service runs each opted-in device on its own cadence from then on.</p></div></div>
+    </div>
+
+    <h2 class="sec" id="states">The colour code, again</h2>
+    <p class="sectitle">Reading the health badge</p>
+    <p>The device detail page shows the latest snapshot plus when it was last checked. Four states:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/inventory/spine-sw-01</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a class="active">Inventory</a><a>Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
+            <div class="hd-body">
+              <div class="hd-h1">spine-sw-01 <span class="count">Arista 7050X</span></div>
+              <div class="hd-card" style="max-width:560px;">
+                <div class="head">Device</div>
+                <div style="padding:16px 18px;">
+                  <dl class="hd-dl" style="grid-template-columns:150px 1fr;">
+                    <dt>Status</dt><dd><span class="hd-badge available">AVAILABLE</span></dd>
+                    <dt>Topology type</dt><dd><span class="hd-badge physical">PHYSICAL</span></dd>
+                    <dt>Health</dt><dd data-anno="1" data-anno-pin="r" data-anno-arrow><span class="hd-badge healthy"><span class="hd-dot healthy"></span>HEALTHY</span></dd>
+                    <dt>Last checked</dt><dd data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue" style="color:var(--gray-500);font-weight:400;">2 minutes ago &middot; polls every 60s</dd>
+                  </dl>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The health badge on a device detail page.</b> The state, plus the last-poll time and cadence.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The health badge.</b> One of four states (below). Only shown for devices that are opted in &mdash; no interval, no badge.</li>
+      <li><b>Last checked.</b> When the last poll ran and how often it repeats, so a stale badge is obvious.</li>
+    </ol>
+
+    <div class="hd-card" style="margin:18px 0;">
+      <table class="hd-table">
+        <thead><tr><th>Badge</th><th>Means</th></tr></thead>
+        <tbody>
+          <tr><td><span class="hd-badge healthy"><span class="hd-dot healthy"></span>HEALTHY</span></td><td>Last poll logged in, read status, and logged out cleanly.</td></tr>
+          <tr><td><span class="hd-badge degraded"><span class="hd-dot degraded"></span>DEGRADED</span></td><td>Reachable, but the driver reported something off &mdash; a partial or warning condition.</td></tr>
+          <tr><td><span class="hd-badge unreachable"><span class="hd-dot unreachable"></span>UNREACHABLE</span></td><td>The poll couldn't complete &mdash; login failed or the device didn't answer.</td></tr>
+          <tr><td><span class="hd-badge unknown"><span class="hd-dot unknown"></span>UNKNOWN</span></td><td>Not yet polled, or polling was just turned on. A transient starting state.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="sec" id="alerts">When it stops answering</h2>
+    <p class="sectitle">What happens when a device goes bad</p>
+    <ul class="list">
+      <li><b>It backs off, it doesn't spam.</b> After a few consecutive failures (three by default) HERD slows that device's polling with exponential backoff and jitter, so one dead box doesn't flood the audit log with identical errors.</li>
+      <li><b>The right people get told, once.</b> When a device crosses the failure threshold &mdash; or recovers &mdash; HERD sends an in-app notification to all admins and to anyone with an <span class="badge active">ACTIVE</span> reservation on that device. Because the alert fires on the threshold crossing, a device that flaps below the threshold generates no noise.</li>
+      <li><b>Recovery is an event too.</b> When a device comes back to zero failures, that transition also notifies, so you're not left wondering whether it's still down.</li>
+    </ul>
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span>
+      <div><p>Health alerts land in the same bell as reservation notifications, and users can opt out of them per-event in <a href="user-notifications.html#settings">notification settings</a>. They're on by default for admins.</p></div>
+    </div>
+
+    <hr class="rule" />
+
+    <h2 class="sec" id="config">Every change, kept</h2>
+    <p class="sectitle">Device configuration versions</p>
+    <p>Whenever a config is applied to a device &mdash; by hand, by a reservation, or by the <a href="user-assistant.html#write">AI assistant</a> &mdash; HERD snapshots it as a numbered <strong>version</strong>. The device's detail page lists them newest-first: who applied it, when, and the result.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-body" style="padding:18px;">
+              <div class="hd-card" style="max-width:600px;">
+                <div class="head">Configuration history <span style="font-weight:400;color:var(--gray-400);font-size:13px;">spine-sw-01</span></div>
+                <div class="hd-vrow"><span class="vn">v7</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">jordan</b> &middot; 2026-05-19 14:02 &middot; success</span><span class="vcur" data-anno="1" data-anno-pin="l" data-anno-arrow>CURRENT</span></div>
+                <div class="hd-vrow"><span class="vn">v6</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">sara.k</b> &middot; 2026-05-12 09:40 &middot; success</span><span class="hd-btn ghost sm" data-anno="2" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Diff</span></div>
+                <div class="hd-vrow"><span class="vn">v5</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">jordan</b> &middot; 2026-05-04 16:18 &middot; success</span><span class="hd-btn ghost sm" data-anno="3" data-anno-pin="r" data-anno-arrow>Restore</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>Configuration history.</b> Each apply is a version you can inspect, diff, or roll back to.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Current.</b> The version live on the device right now.</li>
+      <li><b>Diff.</b> Opens a unified diff between any version and the current one.</li>
+      <li><b>Restore.</b> Re-applies an older version as a new apply. (Blocked while an active reservation depends on the topology &mdash; same guard as topology restore.)</li>
+    </ol>
+
+    <h2 class="sec" id="diff">What changed</h2>
+    <p class="sectitle">Diff &amp; restore</p>
+    <p>The diff is a plain unified view &mdash; removed lines in red, added lines in green &mdash; so you can see precisely what one apply changed before you trust or revert it.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div style="padding:20px;background:var(--gray-100);">
+            <div class="hd-diff" style="max-width:560px;margin:0 auto;">
+              <div class="dl ctx"><span class="gut">&nbsp;</span>hostname spine-sw-01</div>
+              <div class="dl ctx"><span class="gut">&nbsp;</span>!</div>
+              <div class="dl ctx"><span class="gut">&nbsp;</span>interface Gig0/3</div>
+              <div class="dl del"><span class="gut">-</span>  switchport access vlan 100</div>
+              <div class="dl add"><span class="gut">+</span>  switchport access vlan 250</div>
+              <div class="dl del"><span class="gut">-</span>  description legacy-uplink</div>
+              <div class="dl add"><span class="gut">+</span>  description lab-segment-b</div>
+              <div class="dl ctx"><span class="gut">&nbsp;</span>  no shutdown</div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>A unified config diff</b> between v6 and the current version.</p>
+    </figure>
+
+    <h2 class="sec" id="schedule">Pushing config on a schedule</h2>
+    <p class="sectitle">Scheduled apply &amp; dry run</p>
+    <p>Instead of applying a config by hand, you can <strong>schedule</strong> it to fire automatically when a linked reservation goes <span class="badge active">ACTIVE</span> &mdash; so the lab is configured the moment it's yours.</p>
+    <ul class="list">
+      <li><b>Schedule against a reservation.</b> Queue a config push tied to a reservation; it runs when that reservation activates.</li>
+      <li><b>Cancel while it's pending.</b> The owner or an admin can call it off any time before it fires.</li>
+      <li><b>Dry-run first.</b> A scheduled (or assistant-proposed) apply can run in <strong>dry-run</strong> mode &mdash; the driver simulates the push and records the exact commands it <em>would</em> have sent, without touching the device. You review those commands, then promote it to a real apply.</li>
+    </ul>
+
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13l2 2 4-4"/></svg></span>
+      <div><span class="ttl">Per-command transcripts</span><p>When a driver opts in, each apply records a line-by-line transcript &mdash; every command, its response, how long it took, and whether it was real or simulated. That transcript is exactly what the <a href="user-assistant.html#write">AI assistant's confirm dialog</a> shows you, and it doubles as an audit trail for any apply.</p></div>
+    </div>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">Dry-run needs a willing driver</span><p>A driver has to declare that it supports dry-run before HERD will simulate against it. Drivers that haven't opted in can't be dry-run &mdash; the schedule endpoint, the AI tool, and the execution sandbox all refuse rather than guess. If you author drivers, see the driver guide in the repo.</p></div>
+    </div>
+
+    <div class="accordion">
+      <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">A device shows UNREACHABLE but I can reach it myself</span></summary>
+      <div class="acc-body">
+        <ul class="list">
+          <li><b>Check the credentials/fields</b> the driver uses to log in (IP, login, password). A health poll runs the same login a reservation would &mdash; if the poll can't authenticate, neither can a real run.</li>
+          <li><b>Mind the backoff.</b> After repeated failures the poll interval stretches out, so the badge can lag a recovery by a cycle or two. It'll catch up on the next successful poll.</li>
+          <li><b>UNKNOWN that never changes</b> usually means the driver's <span style="font-family:var(--font-mono);font-size:.9em">status</span> method isn't returning a clear result. That's a driver issue, not a HERD one.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Device health &amp; configuration</p>
+      <div class="pagenav">
+        <a href="admin-equipment.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Equipment &amp; cabling</a>
+        <a href="admin-reporting.html">Reporting <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

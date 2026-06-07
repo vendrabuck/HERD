@@ -76,6 +76,20 @@
       <div><dt>Role</dt><dd>What you're allowed to do. <span class="badge" style="background:var(--gray-100);color:var(--gray-600)">user</span> reserves gear; <span class="badge admin-only">admin</span> manages devices, templates, groups; <span class="badge" style="background:#faf5ff;color:var(--proposal)">superadmin</span> additionally promotes/demotes other people.</dd></div>
 
       <div><dt>Provisioning</dt><dd>The automatic backend work that fires when a reservation goes <span class="badge active">ACTIVE</span> &mdash; flipping exclusive devices to reserved, wiring L1 ports, setting up L2 VLANs. You don't trigger it; it just happens.</dd></div>
+
+      <div><dt>AI assistant</dt><dd>A chat on each reservation's <b>AI Assistant</b> tab that answers questions about <em>that</em> reservation by reading live data with your permissions. Read-only by default. <a href="user-assistant.html">The assistant &rarr;</a></dd></div>
+
+      <div><dt>Config version</dt><dd>A numbered snapshot of a device's configuration, captured every time one is applied. You can view, diff two versions, or restore an older one. <a href="admin-health-config.html#config">Config versions &rarr;</a></dd></div>
+
+      <div><dt>Dry run</dt><dd>A simulated config apply: the driver records the exact commands it <em>would</em> send without touching the device, so you can review them before promoting to a real apply. The driver has to support it. <a href="admin-health-config.html#schedule">Scheduled apply &rarr;</a></dd></div>
+
+      <div><dt>Device health</dt><dd>The result of HERD polling a device on a schedule &mdash; a badge of <span class="badge" style="background:var(--status-available-bg);color:var(--status-available-fg)">HEALTHY</span>, <span class="badge" style="background:var(--res-provision-bg);color:var(--res-provision-fg)">DEGRADED</span>, <span class="badge" style="background:var(--status-maintenance-bg);color:var(--status-maintenance-fg)">UNREACHABLE</span>, or <span class="badge" style="background:var(--status-offline-bg);color:var(--status-offline-fg)">UNKNOWN</span>. Opt in per device or template. <a href="admin-health-config.html#health">Health monitoring &rarr;</a></dd></div>
+
+      <div><dt>Notification channel</dt><dd>Where a notification is delivered: the always-on in-app <b>bell</b>, plus opt-in <b>email</b>, <b>chat</b> (Slack-style), and <b>webhook</b>. Outbound channels are off until you turn them on. <a href="user-notifications.html#channels">Channels &rarr;</a></dd></div>
+
+      <div><dt>Reusable topology template</dt><dd>A topology promoted to a named, ready-to-clone starting point for everyone &mdash; the canonical "standard rig." <b>Cloning</b> copies any topology as a fresh editable diagram. <a href="user-topology.html#reuse">Cloning &amp; templates &rarr;</a></dd></div>
+
+      <div><dt>LDAP / Active Directory</dt><dd>An optional sign-in method where people use their company directory credentials and HERD provisions their account on first login. A deployment setting; the superadmin always stays local.</dd></div>
     </dl>
 
     <div class="callout tip" style="margin-top:32px;">

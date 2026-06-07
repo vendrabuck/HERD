@@ -32,6 +32,7 @@
       <li><a href="#resv">Reservation won't go</a></li>
       <li><a href="#redge">Red topology edge</a></li>
       <li><a href="#ai">AI weirdness</a></li>
+      <li><a href="#health">Health &amp; config</a></li>
       <li><a href="#admin">Admin / driver issues</a></li>
       <li><a href="#last">Genuinely stuck</a></li>
     </ul>
@@ -114,6 +115,24 @@
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">My device configs came back "admin required"</span></summary>
       <div class="acc-body"><p>Pushing configs to devices is admin-only. Your topology and reservation were still created fine &mdash; only the config step failed. Either <strong>untick "Apply device configs"</strong> at commit, or have an admin apply them separately.</p></div></details>
 
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">There's no "AI Assistant" tab on my reservation</span></summary>
+      <div class="acc-body"><p>Two reasons it hides: AI isn't configured on this deployment (same switch as the <b>Use AI</b> button), or <strong>you don't own that reservation</strong> &mdash; the assistant only runs against reservations that are yours.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The assistant timed out or says it can't see a device</span></summary>
+      <div class="acc-body"><p><b>Timed out:</b> a heavy question fanned out into too many lookups &mdash; ask something narrower or split it in two. <b>"Can't see that device":</b> it's bounded by <em>your</em> visibility on purpose; if you can't see the device in inventory, neither can the assistant. Same permissions fix as <a href="#empty">an empty inventory</a>.</p></div></details>
+
+    <h2 class="sec" id="health">Health &amp; config</h2>
+    <p class="sectitle">Polling &amp; config pushes</p>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">A device shows UNREACHABLE but I can reach it</span></summary>
+      <div class="acc-body"><p>The health poll logs in exactly the way a real run would. If it can't authenticate (wrong IP / login / password in the device fields), it reports UNREACHABLE even though <em>you</em> can reach the box by other means. Fix the field data. Note also that after repeated failures the poll interval stretches out, so the badge can lag a recovery by a cycle.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">No health badge at all on a device</span></summary>
+      <div class="acc-body"><p>That device isn't opted into polling. Set a <b>poll interval</b> (minimum 30s) on the device or its template &mdash; see <a href="admin-health-config.html#enable">health monitoring</a>. No interval, no badge.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"Dry-run not supported" when scheduling a config apply</span></summary>
+      <div class="acc-body"><p>The device's driver hasn't declared dry-run support, so HERD refuses to simulate against it rather than guess. Either apply for real (carefully), or have the driver author add dry-run support. Restoring an old config version is also blocked while an active or pending reservation references the topology.</p></div></details>
+
     <h2 class="sec" id="admin">Admin / driver issues</h2>
     <p class="sectitle">Setting things up</p>
 
@@ -123,8 +142,11 @@
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Can't delete a driver</span></summary>
       <div class="acc-body"><p>A template still points at it &mdash; drivers are reference-counted. Remove or repoint the template first, then delete the driver.</p></div></details>
 
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">A bulk import rejected some rows</span></summary>
+      <div class="acc-body"><p>Read the per-row <b>reason</b> in the report &mdash; usually a reference that didn't resolve ("template not found by name"). Imports resolve references by <em>name</em>, so import <b>templates before devices</b> and <b>devices before topologies</b>. A reject never aborts the batch; fix the named rows and re-run. Always <b>dry-run</b> first to preview the whole thing.</p></div></details>
+
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">A user reports the bell never ticks up</span></summary>
-      <div class="acc-body"><p>Check that they're the reservation <strong>owner</strong> (only the owner is notified today), and that in <b>Settings</b> the in-app channel is on and the relevant event type is still checked. Deeper failures are NATS/consumer issues for ops &mdash; but the Settings check resolves most reports.</p></div></details>
+      <div class="acc-body"><p>Check in their <b>Settings &rarr; Notifications</b> that the in-app channel is on and the relevant event type is still checked. Reservation events go to the reservation <strong>owner</strong>; health events go to admins and anyone with an active reservation on the device. If they expect email or chat, those are separate <strong>opt-in</strong> channels &mdash; off until switched on. Deeper failures are NATS/consumer issues for ops.</p></div></details>
 
     <h2 class="sec" id="last">Genuinely stuck?</h2>
     <p class="sectitle">When it really isn't you</p>
