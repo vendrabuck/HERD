@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     ldap_email_attribute: str = "mail"
     ldap_username_attribute: str = "sAMAccountName"
     ldap_use_tls: bool = True
+    # Verify the directory server's TLS certificate. Defaults to True (the bind
+    # transmits the service-account and every user's password, so an unvalidated
+    # cert means an active network attacker can MITM and harvest credentials).
+    # Set False only for a lab directory behind a self-signed cert that you
+    # cannot pin via ldap_ca_cert; doing so logs a startup warning.
+    ldap_tls_validate: bool = True
+    # Optional path (inside the container) to a CA bundle to verify the directory
+    # server against, e.g. a pinned internal CA. Used when ldap_tls_validate is
+    # True; when empty the system trust store is used.
+    ldap_ca_cert: str = ""
 
     log_level: str = "INFO"
 

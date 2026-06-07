@@ -16,6 +16,7 @@ the event loop.
 from __future__ import annotations
 
 import logging
+import ssl
 from dataclasses import dataclass
 
 import anyio
@@ -28,6 +29,32 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _build_tls() -> Tls:
+    """Build the TLS config for LDAP connections.
+
+    Validates the directory server's certificate by default: the SIMPLE binds
+    below transmit the service-account password and every user's submitted
+    password, so an unvalidated certificate lets an active network attacker MITM
+    the connection and harvest credentials. ldap3's bare Tls() defaults to
+    CERT_NONE, which is why the validation must be set explicitly here. Disabling
+    validation (ldap_tls_validate=False) is an opt-in escape hatch for a lab
+    directory behind a self-signed cert and logs a warning.
+    """
+    if not settings.ldap_tls_validate:
+        logger.warning(
+            "LDAP TLS certificate validation is DISABLED; the connection is "
+            "vulnerable to man-in-the-middle credential capture. Set "
+            "ldap_tls_validate=True (and ldap_ca_cert for a private CA).",
+            extra={"action": "ldap_tls_validation_disabled"},
+        )
+        return Tls(validate=ssl.CERT_NONE)
+    return Tls(
+        validate=ssl.CERT_REQUIRED,
+        version=ssl.PROTOCOL_TLS_CLIENT,
+        ca_certs_file=settings.ldap_ca_cert or None,
+    )
+
+
 @dataclass(frozen=True)
 class LdapIdentity:
     username: str
@@ -38,8 +65,9 @@ class LdapIdentity:
 def _build_server() -> Server:
     use_tls = settings.ldap_use_tls
     # ldap3 auto-negotiates TLS for ldaps:// URLs; for plain ldap:// with
-    # use_tls=True we rely on the Connection.start_tls() call below.
-    tls = Tls() if use_tls else None
+    # use_tls=True we rely on the Connection.start_tls() call below. The Tls
+    # object validates the server certificate by default (see _build_tls).
+    tls = _build_tls() if use_tls else None
     return Server(settings.ldap_server_url, get_info=ALL, tls=tls)
 
 

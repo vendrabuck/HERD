@@ -6,6 +6,8 @@ ldap3 mock directory. The thin wrappers around ldap3 Connection are exercised
 in the integration stack, not here.
 """
 
+import ssl
+
 import pytest
 from app.config import settings
 from app.services import ldap_service
@@ -195,3 +197,41 @@ def test_no_start_tls_for_ldaps_url(monkeypatch):
     ldap_service._bind_as_user(_USER_DN, "correct-horse")
 
     assert "start_tls" not in calls
+
+
+# --- TLS certificate validation (the bind transmits passwords; the cert must
+#     be verified by default to prevent MITM credential capture) ---
+
+
+def test_build_tls_validates_certificate_by_default(monkeypatch):
+    monkeypatch.setattr(settings, "ldap_tls_validate", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_ca_cert", "", raising=False)
+    tls = ldap_service._build_tls()
+    assert tls.validate == ssl.CERT_REQUIRED
+
+
+def test_build_tls_uses_ca_cert_when_set(monkeypatch, tmp_path):
+    # ldap3.Tls validates that the CA file exists at construction, so point at a
+    # real file. A missing path failing loudly is itself desirable behavior.
+    ca_file = tmp_path / "ldap-ca.pem"
+    ca_file.write_text("-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n")
+    monkeypatch.setattr(settings, "ldap_tls_validate", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_ca_cert", str(ca_file), raising=False)
+    tls = ldap_service._build_tls()
+    assert tls.validate == ssl.CERT_REQUIRED
+    assert tls.ca_certs_file == str(ca_file)
+
+
+def test_build_tls_can_opt_out_of_validation(monkeypatch):
+    monkeypatch.setattr(settings, "ldap_tls_validate", False, raising=False)
+    tls = ldap_service._build_tls()
+    assert tls.validate == ssl.CERT_NONE
+
+
+def test_build_server_attaches_validating_tls_when_tls_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "ldap_use_tls", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_tls_validate", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_server_url", "ldaps://mock", raising=False)
+    server = ldap_service._build_server()
+    assert server.tls is not None
+    assert server.tls.validate == ssl.CERT_REQUIRED
