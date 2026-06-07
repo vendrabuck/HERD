@@ -6,7 +6,7 @@ from app.database import Base, get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
 from app.models.user import RefreshToken, Role, User
-from app.utils.jwt import hash_token
+from app.utils.jwt import create_access_token, hash_token
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -337,6 +337,19 @@ async def test_me_without_token(client):
 async def test_me_with_invalid_token(client):
     """GET /me with Bearer garbage returns 401."""
     resp = await client.get("/me", headers={"Authorization": "Bearer garbage"})
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_me_with_non_uuid_subject_returns_401(client):
+    """A validly-signed token whose sub is not a UUID must return 401, not 500.
+
+    uuid.UUID() on a non-UUID sub raises ValueError (not a JWTError); the
+    dependency must map that to the credentials 401 rather than letting it
+    surface as an unhandled 500.
+    """
+    token = create_access_token({"sub": "not-a-uuid"})
+    resp = await client.get("/me", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 401
 
 

@@ -27,10 +27,14 @@ async def get_current_user(
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
-    except JWTError:
+        # Parse the subject inside the try: a validly-signed token can still carry
+        # a non-UUID sub, and uuid.UUID() raises ValueError (not a JWTError), which
+        # would otherwise propagate as a 500 instead of a 401.
+        user_uuid = uuid.UUID(user_id)
+    except (JWTError, ValueError):
         raise credentials_exception
 
-    user = await get_user_by_id(db, uuid.UUID(user_id))
+    user = await get_user_by_id(db, user_uuid)
     if user is None or not user.is_active:
         raise credentials_exception
     return user
