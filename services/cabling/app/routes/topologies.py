@@ -20,6 +20,7 @@ from app.schemas.topology import (
 )
 from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths
 from app.services.reservation_guard import find_blocking_reservations
+from app.services.version_service import commit_with_new_version
 
 router = APIRouter(prefix="/topologies", tags=["topologies"])
 
@@ -136,25 +137,20 @@ async def update_topology(
     topology.modified_by = uuid.UUID(payload["sub"])
 
     if canvas_changed:
-        max_number = (
-            await db.execute(
-                select(func.max(TopologyVersion.version_number)).where(
-                    TopologyVersion.topology_id == topology.id
-                )
-            )
-        ).scalar() or 0
+        # version_number is allocated as max+1 under a unique constraint; serialize
+        # against concurrent writers with a bounded retry loop rather than risking a
+        # raw IntegrityError 500 (see commit_with_new_version).
         snapshot = TopologyVersion(
             topology_id=topology.id,
-            version_number=max_number + 1,
             canvas_data=body.canvas_data,
             name=topology.name,
             description=body.description,
             created_by=uuid.UUID(payload["sub"]),
             author_name=payload.get("username", ""),
         )
-        db.add(snapshot)
-
-    await db.commit()
+        await commit_with_new_version(db, topology, snapshot)
+    else:
+        await db.commit()
     await db.refresh(topology)
     return topology
 

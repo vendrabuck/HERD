@@ -358,3 +358,171 @@ async def test_version_detail_wrong_topology(user_client):
     # Looking up t1's version under t2 returns 404
     resp = await user_client.get(f"/topologies/{t2}/versions/{v_id}")
     assert resp.status_code == 404
+
+
+# --- Concurrent version_number allocation (regression for the max+1 race) ---
+
+
+def _version_numbers(items: list[dict]) -> list[int]:
+    return sorted(v["version_number"] for v in items)
+
+
+async def _insert_competing_version(topology_id: str, version_number: int) -> None:
+    """Insert a TopologyVersion at a specific number through an independent session,
+    simulating a concurrent writer that committed first."""
+    async with TestSessionLocal() as session:
+        from app.models.topology import TopologyVersion
+
+        session.add(
+            TopologyVersion(
+                topology_id=uuid.UUID(topology_id),
+                version_number=version_number,
+                canvas_data={"nodes": [{"id": "race"}], "edges": []},
+                name="Race Winner",
+                description="committed by a concurrent writer",
+                created_by=uuid.UUID(USER_ID),
+                author_name="racer",
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_update_topology_retries_on_version_number_conflict(user_client):
+    """A concurrent writer claims version_number=2 between our max-read and commit.
+
+    The unique constraint makes our commit raise IntegrityError; the handler must
+    roll back, recompute max+1 (now 3), and retry rather than surfacing a 500. The
+    final state is a contiguous, duplicate-free version sequence.
+    """
+    topology_id = await _make_topology(user_client)
+    # First save makes version 1.
+    await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n1"}], "edges": []})
+
+    from app.services import version_service
+
+    real_commit_with_new_version = version_service.commit_with_new_version
+    state = {"raced": False}
+
+    async def racing_commit(db, topology, snapshot):
+        # On the first call, a concurrent writer grabs version 2 (the number this
+        # call is about to allocate) before our commit lands.
+        if not state["raced"]:
+            state["raced"] = True
+            await _insert_competing_version(topology_id, 2)
+        return await real_commit_with_new_version(db, topology, snapshot)
+
+    with patch(
+        "app.routes.topologies.commit_with_new_version",
+        side_effect=racing_commit,
+    ):
+        resp = await user_client.put(
+            f"/topologies/{topology_id}",
+            json={"canvas_data": {"nodes": [{"id": "n2"}], "edges": []}},
+        )
+
+    assert resp.status_code == 200, resp.text
+
+    items = (await user_client.get(f"/topologies/{topology_id}/versions")).json()["items"]
+    numbers = _version_numbers(items)
+    # 1 (first save), 2 (the racing writer), 3 (our retried insert): no duplicates,
+    # no gaps, and definitely no 500.
+    assert numbers == [1, 2, 3]
+    assert len(numbers) == len(set(numbers))
+
+
+@pytest.mark.asyncio
+async def test_restore_retries_on_version_number_conflict(user_client):
+    """Same race on the restore path: a concurrent writer takes the next number
+    first, and restore must retry to the following number instead of 500ing."""
+    topology_id = await _make_topology(user_client)
+    canvas_a = {"nodes": [{"id": "n1"}], "edges": []}
+    await _save_canvas(user_client, topology_id, canvas_a)  # version 1
+
+    v_one_id = (await user_client.get(f"/topologies/{topology_id}/versions")).json()["items"][0][
+        "id"
+    ]
+
+    from app.services import version_service
+
+    real_commit_with_new_version = version_service.commit_with_new_version
+    state = {"raced": False}
+
+    async def racing_commit(db, topology, snapshot):
+        if not state["raced"]:
+            state["raced"] = True
+            await _insert_competing_version(topology_id, 2)
+        return await real_commit_with_new_version(db, topology, snapshot)
+
+    with patch(
+        "app.routes.versions.commit_with_new_version",
+        side_effect=racing_commit,
+    ):
+        resp = await user_client.post(
+            f"/topologies/{topology_id}/versions/{v_one_id}/restore", json={}
+        )
+
+    assert resp.status_code == 200, resp.text
+
+    items = (await user_client.get(f"/topologies/{topology_id}/versions")).json()["items"]
+    numbers = _version_numbers(items)
+    assert numbers == [1, 2, 3]
+    assert len(numbers) == len(set(numbers))
+    # The restore snapshot (the one we retried) carries the restored_from marker and
+    # restored canvas, proving the retry preserved the snapshot's other fields.
+    restored = [v for v in items if v["restored_from_id"] == v_one_id]
+    assert len(restored) == 1
+    assert restored[0]["version_number"] == 3
+    detail = (
+        await user_client.get(f"/topologies/{topology_id}/versions/{restored[0]['id']}")
+    ).json()
+    assert detail["canvas_data"] == canvas_a
+
+
+@pytest.mark.asyncio
+async def test_commit_with_new_version_exhausts_retries_and_raises(user_client):
+    """If contention never clears, the helper re-raises IntegrityError past the cap
+    rather than looping forever or silently swallowing the conflict.
+
+    Every commit attempt is forced to raise IntegrityError (a persistent concurrent
+    writer), so the bounded loop should give up after _MAX_ALLOCATE_RETRIES and the
+    exception should propagate. The number of commit attempts equals the cap.
+    """
+    import app.services.version_service as vs
+    from app.models.topology import Topology, TopologyVersion
+    from app.services.version_service import commit_with_new_version
+    from sqlalchemy.exc import IntegrityError
+
+    topology_id = await _make_topology(user_client)
+    await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n1"}], "edges": []})
+
+    async with TestSessionLocal() as session:
+        topology = await session.get(Topology, uuid.UUID(topology_id))
+        topology.canvas_data = {"nodes": [{"id": "n2"}], "edges": []}
+        snapshot = TopologyVersion(
+            topology_id=topology.id,
+            canvas_data=topology.canvas_data,
+            name=topology.name,
+            description="will collide forever",
+            created_by=uuid.UUID(USER_ID),
+            author_name="viewer",
+        )
+
+        attempts = {"n": 0}
+
+        async def always_conflict():
+            attempts["n"] += 1
+            raise IntegrityError("INSERT", {}, Exception("uq conflict"))
+
+        # rollback is a no-op here because no flush ever succeeded.
+        async def noop_rollback():
+            return None
+
+        with (
+            patch.object(session, "commit", side_effect=always_conflict),
+            patch.object(session, "rollback", side_effect=noop_rollback),
+        ):
+            with pytest.raises(IntegrityError):
+                await commit_with_new_version(session, topology, snapshot)
+
+        assert attempts["n"] == vs._MAX_ALLOCATE_RETRIES
