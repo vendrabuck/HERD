@@ -214,6 +214,47 @@ async def test_malformed_reservation_response_returns_false(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_malformed_acl_response_falls_through_to_reservations(monkeypatch):
+    """ValueError on the ACL response json() (non-JSON body) is treated as
+    'no explicit grant' (acl.py lines 51-52), so we still try the reservation
+    free pass rather than erroring."""
+    _patch_http(
+        monkeypatch,
+        acl_response=_Resp(200, "not json"),
+        res_response=_Resp(200, {"owns_active": True}),
+    )
+    result = await user_has_manage_or_owns_active_reservation(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        authorization=BEARER,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_reservations_non_200_returns_false(monkeypatch):
+    """Non-200 from the reservations /internal/active endpoint (acl.py line 80)
+    is treated as 'does not own', so with no ACL grant the result is False."""
+    _patch_http(
+        monkeypatch,
+        acl_response=_Resp(200, {"allowed": False}),
+        res_response=_Resp(503, {"error": "unavailable"}),
+    )
+    result = await user_has_manage_or_owns_active_reservation(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        authorization=BEARER,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
 async def test_no_internal_token_skips_reservation_lookup(monkeypatch):
     """No internal token configured -> we cannot call the reservations endpoint,
     so the reservation-owner pass returns False."""
