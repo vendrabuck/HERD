@@ -173,6 +173,25 @@ async def test_create_ports_bulk_device_not_found():
 
 
 @pytest.mark.asyncio
+async def test_create_ports_bulk_template_not_found():
+    async with TestSessionLocal() as db:
+        driver = await _create_driver(db)
+        dev_tmpl = await _create_device_template(db, driver.id)
+        device = await _create_device(db, dev_tmpl.id)
+        data = BulkPortCreate(
+            name_prefix="eth",
+            starting_index=1,
+            instances=2,
+            template_id=uuid.uuid4(),
+            field_data={},
+        )
+        with pytest.raises(HTTPException) as exc:
+            await create_ports_bulk(db, device.id, data)
+        assert exc.value.status_code == 422
+        assert "Template not found" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_create_ports_bulk_naming():
     async with TestSessionLocal() as db:
         driver = await _create_driver(db)
