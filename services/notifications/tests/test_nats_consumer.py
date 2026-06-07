@@ -1,4 +1,7 @@
+import asyncio
 import json
+import sys
+import types
 import uuid
 from unittest.mock import AsyncMock
 
@@ -375,3 +378,263 @@ async def test_redelivered_message_creates_one_notification():
         )
     assert len(rows) == 1
     assert rows[0].dedupe_key == "HERD_RESERVATIONS:7"
+
+
+# --- start_nats_consumer / stop_nats_consumer (connection + subscription wiring) ---
+
+
+class _FakeApp:
+    """Minimal stand-in for the FastAPI app: just an attribute bag for state."""
+
+    def __init__(self):
+        self.state = types.SimpleNamespace()
+
+
+class _FakeSubscription:
+    """A JetStream pull-style subscription whose `.messages` yields a fixed
+    list once, then blocks forever (mirrors the real never-ending stream)."""
+
+    def __init__(self, msgs):
+        self._msgs = msgs
+
+    @property
+    def messages(self):
+        async def _gen():
+            for m in self._msgs:
+                yield m
+            # The real subscription never ends; block so the loop task stays
+            # alive until the test cancels it (as stop_nats_consumer would).
+            await asyncio.Event().wait()
+
+        return _gen()
+
+
+class _FakeJetStream:
+    def __init__(self, subs_by_subject=None, add_stream_error=False):
+        self._subs = subs_by_subject or {}
+        self.added_streams = []
+        self.subscribe_calls = []
+        self.published = []
+        self._add_stream_error = add_stream_error
+
+    async def add_stream(self, name, subjects):
+        if self._add_stream_error:
+            raise RuntimeError("stream exists / cannot update")
+        self.added_streams.append((name, tuple(subjects)))
+
+    async def subscribe(self, subject_pattern, durable, manual_ack, config):
+        self.subscribe_calls.append(
+            {"subject": subject_pattern, "durable": durable, "config": config}
+        )
+        return self._subs.get(subject_pattern, _FakeSubscription([]))
+
+    async def publish(self, subject, payload):
+        self.published.append((subject, payload))
+
+
+class _FakeNatsConn:
+    def __init__(self, js):
+        self._js = js
+        self.closed = False
+
+    def jetstream(self):
+        return self._js
+
+    async def close(self):
+        self.closed = True
+
+
+def _install_fake_nats(monkeypatch, connect_impl):
+    """Inject fake `nats` and `nats.js.api` modules so the in-function imports
+    in start_nats_consumer resolve to our stubs (no real broker)."""
+    fake_nats = types.ModuleType("nats")
+    fake_nats.connect = connect_impl
+    fake_js = types.ModuleType("nats.js")
+    fake_js_api = types.ModuleType("nats.js.api")
+
+    class _ConsumerConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    fake_js_api.ConsumerConfig = _ConsumerConfig
+    monkeypatch.setitem(sys.modules, "nats", fake_nats)
+    monkeypatch.setitem(sys.modules, "nats.js", fake_js)
+    monkeypatch.setitem(sys.modules, "nats.js.api", fake_js_api)
+    return _ConsumerConfig
+
+
+@pytest.mark.asyncio
+async def test_start_nats_consumer_wires_both_subscriptions(monkeypatch):
+    js = _FakeJetStream()
+    conn = _FakeNatsConn(js)
+
+    async def _connect(url):
+        return conn
+
+    _install_fake_nats(monkeypatch, _connect)
+
+    app = _FakeApp()
+    await nats_consumer.start_nats_consumer(app)
+    try:
+        # Both streams created, both durable consumers subscribed.
+        assert (nats_consumer.NATS_STREAM, (nats_consumer.NATS_SUBJECT_PATTERN,)) in (
+            js.added_streams
+        )
+        assert (nats_consumer.HEALTH_STREAM, (nats_consumer.HEALTH_SUBJECT_PATTERN,)) in (
+            js.added_streams
+        )
+        durables = {c["durable"] for c in js.subscribe_calls}
+        assert durables == {nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE}
+        # Both background loop tasks are running.
+        assert not app.state.nats_consumer_task.done()
+        assert not app.state.nats_health_consumer_task.done()
+        assert app.state.nats is conn
+    finally:
+        await nats_consumer.stop_nats_consumer(app)
+
+    assert app.state.nats_consumer_task.cancelled()
+    assert conn.closed
+
+
+@pytest.mark.asyncio
+async def test_start_nats_consumer_loop_processes_a_message(monkeypatch):
+    """A message delivered on the subscription is run through process_message,
+    which dispatches an in-app notification and acks."""
+    user_id = str(uuid.uuid4())
+    payload = json.dumps(
+        {
+            "event": "reservation.created",
+            "user_id": user_id,
+            "device_ids": [str(uuid.uuid4())],
+            "end_time": "2026-04-21T00:00:00+00:00",
+        }
+    ).encode()
+    msg = _FakeMsg(payload, stream_seq=11)
+
+    res_sub = _FakeSubscription([msg])
+    js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: res_sub})
+    conn = _FakeNatsConn(js)
+
+    async def _connect(url):
+        return conn
+
+    _install_fake_nats(monkeypatch, _connect)
+
+    # The session factory built inside start_nats_consumer imports
+    # AsyncSessionLocal from app.database; point it at this suite's in-memory
+    # engine so the dispatched row lands in the DB we then query.
+    import app.database as app_db
+
+    monkeypatch.setattr(app_db, "AsyncSessionLocal", _SessionLocal)
+
+    app = _FakeApp()
+    await nats_consumer.start_nats_consumer(app)
+    try:
+        # Let the loop task pull and process the single queued message.
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if msg.ack.await_count:
+                break
+        msg.ack.assert_awaited_once()
+    finally:
+        await nats_consumer.stop_nats_consumer(app)
+
+    async with _SessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Notification).where(Notification.user_id == uuid.UUID(user_id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_nats_consumer_loop_swallows_unexpected_errors(monkeypatch):
+    """If process_message itself raises, the loop logs and keeps draining rather
+    than crashing the task."""
+    bad_msg = _FakeMsg(b"{}", stream_seq=1)
+    sub = _FakeSubscription([bad_msg])
+    js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: sub})
+    conn = _FakeNatsConn(js)
+
+    async def _connect(url):
+        return conn
+
+    _install_fake_nats(monkeypatch, _connect)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(nats_consumer, "process_message", _boom)
+
+    app = _FakeApp()
+    await nats_consumer.start_nats_consumer(app)
+    try:
+        # Give the loop several turns to pull the message and hit the raising
+        # process_message; the except arm must swallow it.
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+        # The loop task must still be alive (error swallowed, not propagated).
+        assert not app.state.nats_consumer_task.done()
+    finally:
+        await nats_consumer.stop_nats_consumer(app)
+
+
+@pytest.mark.asyncio
+async def test_start_nats_consumer_tolerates_add_stream_failure(monkeypatch):
+    """add_stream failing (stream already exists) is logged and the subscribe
+    still proceeds."""
+    js = _FakeJetStream(add_stream_error=True)
+    conn = _FakeNatsConn(js)
+
+    async def _connect(url):
+        return conn
+
+    _install_fake_nats(monkeypatch, _connect)
+
+    app = _FakeApp()
+    await nats_consumer.start_nats_consumer(app)
+    try:
+        # add_stream raised for both, but both subscriptions were still created.
+        assert len(js.subscribe_calls) == 2
+    finally:
+        await nats_consumer.stop_nats_consumer(app)
+
+
+@pytest.mark.asyncio
+async def test_start_nats_consumer_swallows_connect_failure(monkeypatch):
+    """A broker that is unreachable is logged; the app boots without consumers."""
+
+    async def _connect(url):
+        raise RuntimeError("connection refused")
+
+    _install_fake_nats(monkeypatch, _connect)
+
+    app = _FakeApp()
+    # Must not raise: notifications degrades to no event-driven delivery.
+    await nats_consumer.start_nats_consumer(app)
+    assert not hasattr(app.state, "nats_consumer_task")
+
+
+@pytest.mark.asyncio
+async def test_stop_nats_consumer_is_noop_when_nothing_started():
+    app = _FakeApp()
+    # No tasks, no connection: stop must be a clean no-op.
+    await nats_consumer.stop_nats_consumer(app)
+
+
+@pytest.mark.asyncio
+async def test_stop_nats_consumer_swallows_close_failure():
+    app = _FakeApp()
+
+    class _BadConn:
+        async def close(self):
+            raise RuntimeError("already closed")
+
+    app.state.nats = _BadConn()
+    # Close failure is logged, not raised.
+    await nats_consumer.stop_nats_consumer(app)

@@ -22,6 +22,7 @@ from app.services.contact_client import ContactClient, UserContact, set_contact_
 from app.services.dispatchers.base import DispatchMessage
 from app.services.dispatchers.chat import ChatDispatcher
 from app.services.dispatchers.email import EmailDispatcher
+from app.services.dispatchers.outbound import _release, run_outbound
 from app.services.dispatchers.webhook import WebhookDispatcher, sign_body
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -256,3 +257,43 @@ async def test_null_dedupe_key_is_not_deduplicated():
             await WebhookDispatcher().send(_session_factory, _msg(user_id, dedupe_key=None))
     assert client.post.await_count == 2
     assert await _ledger_count("webhook") == 0
+
+
+# --- run_outbound / _release directly ---
+
+
+@pytest.mark.asyncio
+async def test_run_outbound_releases_reserved_slot_on_send_failure():
+    """A reserved ledger slot is dropped when the send raises so a later
+    redelivery retries (covers the failure -> _release -> return path)."""
+    msg = _msg(dedupe_key="HERD_RESERVATIONS:42")
+
+    async def _boom():
+        raise RuntimeError("transport down")
+
+    await run_outbound(_session_factory, "email", msg, _boom)
+    # The reserved row was released: nothing left in the ledger.
+    assert await _ledger_count("email") == 0
+
+
+@pytest.mark.asyncio
+async def test_release_is_noop_for_null_dedupe_key():
+    """A null dedupe_key never wrote a ledger row, so release returns early
+    without touching the DB."""
+    msg = _msg(dedupe_key=None)
+    # Must not raise and must not write/delete anything.
+    await _release(_session_factory, "email", msg)
+    assert await _ledger_count("email") == 0
+
+
+@pytest.mark.asyncio
+async def test_release_swallows_session_failure():
+    """If acquiring or using the session raises, _release logs and swallows it
+    rather than crashing the consumer loop."""
+
+    def _broken_session_factory():
+        raise RuntimeError("db connection pool exhausted")
+
+    msg = _msg(dedupe_key="HERD_RESERVATIONS:99")
+    # Best-effort cleanup: the error is swallowed, not propagated.
+    await _release(_broken_session_factory, "email", msg)
