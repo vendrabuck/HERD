@@ -115,8 +115,11 @@ def test_write_tool_definitions_shape():
         "description",
     ]
     schedule = next(t for t in WRITE_TOOL_DEFINITIONS if t["name"] == "schedule_config_apply")
-    # Critically: delay_seconds and dry_run have defaults, so they are NOT required.
+    # delay_seconds has a default, so it is NOT required.
     assert schedule["input_schema"]["required"] == ["device_id", "version_id"]
+    # Critically: dry_run is NOT exposed to the model. The AI can never schedule a
+    # real apply, so there is no parameter to promote a dry-run.
+    assert "dry_run" not in schedule["input_schema"]["properties"]
 
 
 # --- _flatten_password_keys_present helper ---
@@ -349,6 +352,56 @@ async def test_schedule_config_apply_defaults_dry_run_true():
     assert body["dry_run"] is True
     assert captured["body"]["dry_run"] is True
     assert captured["body"]["reservation_id"] == str(RESERVATION_ID)
+
+
+@pytest.mark.asyncio
+async def test_schedule_config_apply_ignores_attacker_supplied_dry_run_false():
+    """Security: a model (or prompt-injected) args dict carrying dry_run=false must
+    NOT reach inventory as a real apply. The orchestrator forces dry_run=true
+    regardless of what args contains, so the human-confirmation flow is never bypassed.
+    """
+    captured = {}
+
+    def post_handler(req: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(req.content)
+        return httpx.Response(
+            201,
+            json={
+                "id": JOB_ID,
+                "device_id": str(DEVICE_ID),
+                "version_id": VERSION_ID,
+                "scheduled_for": captured["body"]["scheduled_for"],
+                "reservation_id": str(RESERVATION_ID),
+                "dry_run": captured["body"]["dry_run"],
+                "status": "pending",
+                "created_by": "00000000-0000-0000-0000-000000000001",
+                "author_name": "ai",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    routes = [
+        (
+            lambda r: (
+                r.method == "POST"
+                and r.url.path.endswith(f"/config-versions/{VERSION_ID}/schedule")
+            ),
+            post_handler,
+        ),
+    ]
+    async with _dispatcher_with(routes) as dispatcher:
+        result = await dispatcher.dispatch(
+            "schedule_config_apply",
+            {
+                "device_id": str(DEVICE_ID),
+                "version_id": VERSION_ID,
+                "dry_run": False,  # attacker / injected attempt to force a real apply
+            },
+        )
+
+    assert result["is_error"] is False
+    # The forwarded body to inventory must still be a dry-run.
+    assert captured["body"]["dry_run"] is True
 
 
 @pytest.mark.asyncio

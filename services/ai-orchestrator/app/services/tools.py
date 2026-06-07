@@ -219,13 +219,13 @@ WRITE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "schedule_config_apply",
         "description": (
-            "Schedule a config-version apply job. Defaults to dry_run=true; "
-            "the scheduler runs the driver in simulation mode and persists "
-            "the transcript for user review. The user must explicitly "
-            "confirm via the UI before any real apply runs; you cannot "
-            "promote a dry-run yourself. Pass delay_seconds (default 30, "
-            "5 to 600) to control when the dry-run fires; the server stamps "
-            "the absolute time."
+            "Schedule a config-version apply job. This ALWAYS runs as a dry-run: "
+            "the scheduler runs the driver in simulation mode and persists the "
+            "transcript for user review. You cannot run a real apply; the user "
+            "must explicitly confirm via the UI before any real apply runs, and "
+            "there is no parameter that lets you promote a dry-run. Pass "
+            "delay_seconds (default 30, 5 to 600) to control when the dry-run "
+            "fires; the server stamps the absolute time."
         ),
         "input_schema": {
             "type": "object",
@@ -238,7 +238,6 @@ WRITE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "maximum": 600,
                     "default": 30,
                 },
-                "dry_run": {"type": "boolean", "default": True},
             },
             "required": ["device_id", "version_id"],
             "additionalProperties": False,
@@ -588,7 +587,13 @@ class ToolDispatcher:
         delay_seconds = int(args.get("delay_seconds", 30))
         if not 5 <= delay_seconds <= 600:
             raise ToolError("delay_seconds must be between 5 and 600")
-        dry_run = bool(args.get("dry_run", True))
+        # The AI can only ever schedule a dry-run. This is forced server-side and
+        # not read from args: the model must never be able to promote a dry-run to
+        # a real apply (the human confirms in the UI via a separate endpoint).
+        # The tool schema no longer exposes dry_run, but we hard-set it here too so
+        # a prompt-injected or malformed args dict cannot smuggle dry_run=false
+        # past the schema into a real device configuration apply.
+        dry_run = True
 
         # Server stamps the absolute time so the model never has to reason about
         # wall-clock. The inventory schedule endpoint rejects past timestamps,
