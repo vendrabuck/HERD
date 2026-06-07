@@ -323,6 +323,28 @@ async def test_generate_returns_409_when_inventory_shifts(async_client, monkeypa
     assert "Inventory shifted" in resp.json()["detail"]
 
 
+async def test_generate_409_when_inventory_has_no_templates(async_client, monkeypatch):
+    # No templates at all: guard must fire before the AI is ever called.
+    _override_inventory({})
+    _override_ai(raises=AssertionError("AI must not be called on empty inventory"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 409
+    assert "No device templates with available devices" in resp.json()["detail"]
+
+
+async def test_generate_409_when_templates_have_no_available_devices(async_client, monkeypatch):
+    # Templates exist but every available count is 0: still an impossible prompt.
+    _override_inventory({"EX3400": 0, "Ubuntu Client": 0})
+    _override_ai(raises=AssertionError("AI must not be called when nothing is available"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 409
+    assert "No device templates with available devices" in resp.json()["detail"]
+
+
 async def test_generate_forwards_file_context_to_ai(async_client, monkeypatch):
     """Uploaded text must appear in the AI prompt and the response summary."""
     captured: dict[str, str] = {}

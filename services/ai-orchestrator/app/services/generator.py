@@ -41,6 +41,17 @@ async def generate_topology(
     file_context = render_file_context(extracted_files)
     template_names = sorted(inventory.template_names)
 
+    # Guard the impossible case: no template has an available device. Without
+    # this the model is handed a "(no templates available)" prompt, dutifully
+    # returns nothing usable, and the failure surfaces as an opaque empty
+    # result (or a downstream 409 from _resolve_devices). Fail loudly instead.
+    if not any(count > 0 for count in inventory.template_counts.values()):
+        raise GeneratorError(
+            409,
+            "No device templates with available devices in inventory. "
+            "Add devices (or run the seed) before generating a topology.",
+        )
+
     # Propose -> schema-validate -> inventory-validate, retrying with corrective
     # feedback when the model produces a repairable mistake (unknown template,
     # over-count, duplicate role, dangling edge). Resolution (which can raise a
