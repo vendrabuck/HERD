@@ -1,5 +1,22 @@
 @import "tailwindcss";
 
+/*
+ * Safelist for color utilities that only ever appear inside JavaScript
+ * object-map values (for example TOPOLOGY_COLORS / STATUS_COLORS in
+ * DeviceNode, TopoBadge, DeviceDetailModal, DevicePage, UserManagementTable)
+ * and are composed into className strings at runtime. Tailwind v4 automatic
+ * content detection does scan these literals today, but a refactor that splits
+ * a class across variables (for example "bg-" plus a shade) would silently
+ * drop the utility from the build, leaving white boxes with no text (issue
+ * #106). This explicit safelist pins the topology and status color set so those
+ * utilities are always emitted regardless of how the class string is assembled.
+ */
+@source inline("bg-{blue,purple}-{50,100,200}");
+@source inline("border-{blue,purple}-400");
+@source inline("text-{blue,purple}-{700,800,900}");
+@source inline("bg-{green,yellow,red,gray}-100");
+@source inline("text-{green,yellow,red,gray}-{600,700,800}");
+
 :root {
   --background: 0 0% 100%;
   --foreground: 222.2 84% 4.9%;
