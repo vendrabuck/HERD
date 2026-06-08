@@ -16,6 +16,7 @@ from app.config import settings
 from app.services.tools import (
     TOOL_DEFINITIONS,
     WRITE_TOOL_DEFINITIONS,
+    WRITE_TOOL_NAMES,
     ToolDispatcher,
     _flatten_password_keys_present,
     get_active_tool_definitions,
@@ -26,6 +27,16 @@ DEVICE_ID = uuid.UUID("33333333-3333-3333-3333-333333333333")
 TEMPLATE_ID = "tpl-fw"
 VERSION_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 JOB_ID = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+
+@pytest.fixture(autouse=True)
+def _write_tools_enabled(monkeypatch):
+    """This module exercises the write-tool dispatch path, so enable the flag by
+    default. dispatch() now enforces the gate at the execution boundary (issue
+    #113); without the flag on, every write-tool dispatch would be refused. The
+    gate-off behavior is covered explicitly below in the gate tests and in the
+    get_active_tool_definitions flag tests (which patch the setting themselves)."""
+    monkeypatch.setattr(settings, "ai_write_tools_enabled", True)
 
 
 def _make_handler(routes):
@@ -519,3 +530,110 @@ def test_baseline_tool_count_unchanged():
     tool, bringing the count to 7.
     """
     assert len(TOOL_DEFINITIONS) == 7
+
+
+# --- Gate enforcement at the execution boundary (issue #113) ---
+
+
+def test_write_tool_names_derived_from_definitions():
+    """The dispatch gate must use WRITE_TOOL_DEFINITIONS as the single source of
+    truth, not a hardcoded list. If a write tool is added, this set tracks it."""
+    assert WRITE_TOOL_NAMES == {d["name"] for d in WRITE_TOOL_DEFINITIONS}
+    assert WRITE_TOOL_NAMES == {"propose_config_change", "schedule_config_apply"}
+
+
+@pytest.mark.asyncio
+async def test_propose_config_change_blocked_when_flag_off(monkeypatch):
+    """Security: with the flag off, dispatch must refuse to run the write tool and
+    must NOT make any HTTP call to inventory (no version authored)."""
+    monkeypatch.setattr(settings, "ai_write_tools_enabled", False)
+    calls: list[httpx.Request] = []
+
+    def record(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(201, json={})
+
+    # Route everything to the recorder so any leaked call is caught.
+    routes = [(lambda r: True, record)]
+    async with _dispatcher_with(routes) as dispatcher:
+        result = await dispatcher.dispatch(
+            "propose_config_change",
+            {
+                "device_id": str(DEVICE_ID),
+                "config_payload": {"vlan": 200},
+                "description": "set mgmt vlan",
+            },
+        )
+    assert result["is_error"] is True
+    body = json.loads(result["content"])
+    assert body["message"] == "write tools are disabled"
+    # No HTTP call reached inventory: no device fetch, no template fetch, no POST.
+    assert calls == []
+    # The rejected attempt is still recorded for observability.
+    assert dispatcher.call_log[-1].name == "propose_config_change"
+    assert dispatcher.call_log[-1].error == "write tools are disabled"
+
+
+@pytest.mark.asyncio
+async def test_schedule_config_apply_blocked_when_flag_off(monkeypatch):
+    monkeypatch.setattr(settings, "ai_write_tools_enabled", False)
+    calls: list[httpx.Request] = []
+
+    def record(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(201, json={})
+
+    routes = [(lambda r: True, record)]
+    async with _dispatcher_with(routes) as dispatcher:
+        result = await dispatcher.dispatch(
+            "schedule_config_apply",
+            {"device_id": str(DEVICE_ID), "version_id": VERSION_ID},
+        )
+    assert result["is_error"] is True
+    body = json.loads(result["content"])
+    assert body["message"] == "write tools are disabled"
+    assert calls == []
+    assert dispatcher.side_effects == []
+    assert dispatcher.call_log[-1].name == "schedule_config_apply"
+    assert dispatcher.call_log[-1].error == "write tools are disabled"
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_dispatches_when_flag_off(monkeypatch):
+    """The gate must only affect write tools: read-only tools work in both states."""
+    monkeypatch.setattr(settings, "ai_write_tools_enabled", False)
+    routes = [
+        (
+            lambda r: r.method == "GET" and r.url.path.endswith(f"/devices/{DEVICE_ID}"),
+            httpx.Response(200, json=_device()),
+        ),
+        (
+            lambda r: r.method == "GET" and r.url.path.endswith(f"/templates/{TEMPLATE_ID}"),
+            httpx.Response(200, json=_template_with_password_fields()),
+        ),
+    ]
+    async with _dispatcher_with(routes) as dispatcher:
+        result = await dispatcher.dispatch("get_device", {"device_id": str(DEVICE_ID)})
+    assert result["is_error"] is False
+    body = json.loads(result["content"])
+    assert body["id"] == str(DEVICE_ID)
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_dispatches_when_flag_on(monkeypatch):
+    monkeypatch.setattr(settings, "ai_write_tools_enabled", True)
+    routes = [
+        (
+            lambda r: r.method == "GET" and r.url.path.endswith(f"/devices/{DEVICE_ID}"),
+            httpx.Response(200, json=_device()),
+        ),
+        (
+            lambda r: r.method == "GET" and r.url.path.endswith(f"/templates/{TEMPLATE_ID}"),
+            httpx.Response(200, json=_template_with_password_fields()),
+        ),
+    ]
+    async with _dispatcher_with(routes) as dispatcher:
+        result = await dispatcher.dispatch("get_device", {"device_id": str(DEVICE_ID)})
+    assert result["is_error"] is False
+    body = json.loads(result["content"])
+    assert body["id"] == str(DEVICE_ID)
