@@ -194,4 +194,54 @@ describe("hydrateCanvasNodes", () => {
     // The 404 node keeps its thin reference (id only), still present.
     expect((hydrated.nodes[1].data as DeviceNodeData).device.name).toBeUndefined();
   });
+
+  it("sets type 'deviceNode' on a typeless device node so it renders, not as a blank box", async () => {
+    server.use(
+      http.get("/api/inventory/devices/dev-1", () =>
+        HttpResponse.json(device({ id: "dev-1", name: "Repaired" })),
+      ),
+    );
+
+    // A topology persisted before the seed fix: device-backed node with type null.
+    const canvas = {
+      nodes: [
+        {
+          id: "n0",
+          type: null,
+          position: { x: 0, y: 0 },
+          data: { device: { id: "dev-1" } } as unknown as DeviceNodeData,
+        },
+      ],
+      edges: [],
+    } as unknown as CanvasData;
+
+    const hydrated = await hydrateCanvasNodes(canvas);
+
+    expect(hydrated.nodes[0].type).toBe("deviceNode");
+    expect((hydrated.nodes[0].data as DeviceNodeData).device.name).toBe("Repaired");
+  });
+
+  it("sets type 'deviceNode' even when the device fetch fails (typeless 404 node)", async () => {
+    server.use(
+      http.get("/api/inventory/devices/gone", () => new HttpResponse(null, { status: 404 })),
+    );
+
+    const canvas = {
+      nodes: [
+        {
+          id: "n0",
+          type: null,
+          position: { x: 0, y: 0 },
+          data: { device: { id: "gone" } } as unknown as DeviceNodeData,
+        },
+      ],
+      edges: [],
+    } as unknown as CanvasData;
+
+    const hydrated = await hydrateCanvasNodes(canvas);
+
+    // Even with no fresh data, the node must render through DeviceNode, not the
+    // blank default renderer, so the discriminator is set regardless.
+    expect(hydrated.nodes[0].type).toBe("deviceNode");
+  });
 });
