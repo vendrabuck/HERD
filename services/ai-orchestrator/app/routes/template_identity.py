@@ -2,8 +2,8 @@
 
 Single forced tool_use call to the AI model; returns vendor, model,
 optional part_number, confidence, and reasoning. Feature-gated by
-ANTHROPIC_API_KEY: 503 when blank. Used by the template editor's
-"Suggest with AI" button.
+ai_is_configured(): 503 when the provider is unconfigured. Used by the
+template editor's "Suggest with AI" button.
 """
 
 import logging

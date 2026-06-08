@@ -74,7 +74,7 @@ def async_client():
 
 @pytest.fixture(autouse=True)
 def set_api_key(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "sk-ant-fake")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-ant-fake")
     yield
     app.dependency_overrides.clear()
 
@@ -155,7 +155,8 @@ async def test_requires_auth(async_client):
 
 
 async def test_503_when_api_key_blank(async_client, monkeypatch):
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
     _override_seed()
     _override_ai()
     headers = {"Authorization": f"Bearer {_user_token()}"}

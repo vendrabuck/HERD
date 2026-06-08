@@ -46,6 +46,25 @@ def _provider_with_response(
     return provider, create_mock
 
 
+def test_init_keyless_local_endpoint_does_not_raise():
+    """A blank api_key plus a base_url targets a local Anthropic-compatible
+    endpoint (e.g. vLLM); the blank key becomes the "EMPTY" placeholder so the
+    SDK constructor does not reject it."""
+    provider = AnthropicProvider(api_key="", base_url="https://vllm:8000/v1", model="claude-test")
+    assert provider._model == "claude-test"
+
+
+def test_init_sets_explicit_client_timeout():
+    """The SDK refuses a non-streaming request when it computes that max_tokens
+    could exceed its default-timeout ceiling ("Streaming is required for
+    operations that may take longer than 10 minutes"), which trips for large
+    max_tokens against a reasoning model. An explicit long client timeout clears
+    that pre-flight guard; the real per-call bound stays asyncio.wait_for in
+    call(). Pin the timeout so the guard fix does not silently regress."""
+    provider = AnthropicProvider(api_key="sk-ant-fake", model="claude-test")
+    assert provider._client.timeout == 1800.0
+
+
 def _sdk_tool_use(name="t", args=None, block_id="toolu_001"):
     return SimpleNamespace(type="tool_use", id=block_id, name=name, input=args or {})
 

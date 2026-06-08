@@ -634,21 +634,17 @@ def _tool_definition_to_schema(t: dict[str, Any]) -> ToolSchema:
     )
 
 
-def _effective_api_key() -> str:
-    """Resolve the API key from the canonical setting, falling back to the
-    deprecated ANTHROPIC_API_KEY for one release."""
-    return settings.ai_api_key or settings.anthropic_api_key
-
-
 def ai_is_configured() -> bool:
     """True when the orchestrator has enough configuration to call an LLM.
 
-    Anthropic: an API key is required.
+    Anthropic: an API key OR a base URL is enough. A local keyless
+    Anthropic-compatible endpoint (e.g. vLLM) needs only a base_url; the
+    hosted Anthropic API needs a key.
     OpenAI-compat: a base URL is required; local servers (vLLM, Ollama) may
     not require a key.
     """
     if settings.ai_provider == "anthropic":
-        return bool(_effective_api_key())
+        return bool(settings.ai_api_key or settings.ai_base_url)
     if settings.ai_provider == "openai_compat":
         return bool(settings.ai_base_url)
     return False
@@ -656,12 +652,17 @@ def ai_is_configured() -> bool:
 
 def get_ai_client() -> AIClient:
     """Dependency provider. Tests override this via app.dependency_overrides."""
-    api_key = _effective_api_key()
     if settings.ai_provider == "anthropic":
-        provider: LLMProvider = AnthropicProvider(api_key=api_key, model=settings.ai_model)
+        provider: LLMProvider = AnthropicProvider(
+            api_key=settings.ai_api_key,
+            model=settings.ai_model,
+            base_url=settings.ai_base_url or None,
+            verify_tls=settings.ai_tls_verify,
+            ca_cert=settings.ai_ca_cert or None,
+        )
     elif settings.ai_provider == "openai_compat":
         provider = OpenAICompatProvider(
-            api_key=api_key,
+            api_key=settings.ai_api_key,
             base_url=settings.ai_base_url or None,
             model=settings.ai_model,
             verify_tls=settings.ai_tls_verify,

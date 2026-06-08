@@ -36,7 +36,7 @@ def async_client():
 
 @pytest.fixture(autouse=True)
 def set_api_key(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "sk-ant-fake")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-ant-fake")
     yield
     app.dependency_overrides.clear()
 
@@ -64,7 +64,8 @@ def _override_ai_returning(suggestion: dict | None = None, *, raises: Exception 
 
 
 async def test_suggest_identity_503_when_key_blank(async_client, monkeypatch):
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
     headers = {"Authorization": f"Bearer {_token('admin')}"}
     body = {"name": "EX4300"}
     async with async_client as client:
