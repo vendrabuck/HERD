@@ -10,7 +10,9 @@ import {
   useDevices,
   usePaginatedDevices,
   useAllDeviceNames,
+  hydrateCanvasNodes,
 } from "@/api/inventory";
+import type { CanvasData, DeviceNodeData } from "@/types/topology.types";
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
@@ -97,5 +99,99 @@ describe("inventory api hooks", () => {
     expect(calls).toBe(1);
     expect(result.current.data?.get("a")).toBe("aa");
     expect(result.current.data?.get("b")).toBe("bb");
+  });
+});
+
+// Build a canvas with thin nodes ({ device: { id } }), mirroring an old seeded
+// or stale persisted topology, to exercise the load-time hydration.
+function canvasWith(nodeDevices: Array<Record<string, unknown> | undefined>): CanvasData {
+  return {
+    nodes: nodeDevices.map((d, i) => ({
+      id: `n${i}`,
+      type: "deviceNode",
+      position: { x: 0, y: 0 },
+      data: (d ? { device: d } : {}) as unknown as DeviceNodeData,
+    })),
+    edges: [],
+  } as CanvasData;
+}
+
+describe("hydrateCanvasNodes", () => {
+  it("fills thin nodes with the fetched name, topology_type, and label", async () => {
+    server.use(
+      http.get("/api/inventory/devices/dev-1", () =>
+        HttpResponse.json(device({ id: "dev-1", name: "L1-Edge-01", topology_type: "CLOUD" })),
+      ),
+    );
+
+    const hydrated = await hydrateCanvasNodes(canvasWith([{ id: "dev-1" }]));
+
+    const data = hydrated.nodes[0].data as DeviceNodeData;
+    expect(data.device.name).toBe("L1-Edge-01");
+    expect(data.device.topology_type).toBe("CLOUD");
+    // label/topologyType are refreshed so the node reads correctly on the canvas.
+    expect(data.label).toBe("L1-Edge-01");
+    expect(data.topologyType).toBe("CLOUD");
+  });
+
+  it("dedupes repeated device ids into a single fetch", async () => {
+    let calls = 0;
+    server.use(
+      http.get("/api/inventory/devices/dev-1", () => {
+        calls += 1;
+        return HttpResponse.json(device({ id: "dev-1", name: "Shared" }));
+      }),
+    );
+
+    const hydrated = await hydrateCanvasNodes(canvasWith([{ id: "dev-1" }, { id: "dev-1" }]));
+
+    expect(calls).toBe(1);
+    expect((hydrated.nodes[0].data as DeviceNodeData).device.name).toBe("Shared");
+    expect((hydrated.nodes[1].data as DeviceNodeData).device.name).toBe("Shared");
+  });
+
+  it("keeps a node whose device was deleted (404) without throwing", async () => {
+    server.use(
+      http.get("/api/inventory/devices/gone", () => new HttpResponse(null, { status: 404 })),
+    );
+
+    const original = canvasWith([{ id: "gone", name: "stale-name" }]);
+    const hydrated = await hydrateCanvasNodes(original);
+
+    // Node is retained with its persisted (stale) data, not dropped or blanked.
+    expect(hydrated.nodes).toHaveLength(1);
+    const data = hydrated.nodes[0].data as DeviceNodeData;
+    expect((data.device as unknown as Record<string, unknown>).id).toBe("gone");
+    expect((data.device as unknown as Record<string, unknown>).name).toBe("stale-name");
+  });
+
+  it("leaves empty (missing-device) nodes untouched and does not fetch", async () => {
+    let calls = 0;
+    server.use(
+      http.get("/api/inventory/devices/:id", () => {
+        calls += 1;
+        return HttpResponse.json(device());
+      }),
+    );
+
+    const hydrated = await hydrateCanvasNodes(canvasWith([undefined]));
+
+    expect(calls).toBe(0);
+    expect(hydrated.nodes[0].data).toEqual({});
+  });
+
+  it("hydrates surviving nodes even when a sibling device 404s", async () => {
+    server.use(
+      http.get("/api/inventory/devices/ok", () =>
+        HttpResponse.json(device({ id: "ok", name: "Alive" })),
+      ),
+      http.get("/api/inventory/devices/gone", () => new HttpResponse(null, { status: 404 })),
+    );
+
+    const hydrated = await hydrateCanvasNodes(canvasWith([{ id: "ok" }, { id: "gone" }]));
+
+    expect((hydrated.nodes[0].data as DeviceNodeData).device.name).toBe("Alive");
+    // The 404 node keeps its thin reference (id only), still present.
+    expect((hydrated.nodes[1].data as DeviceNodeData).device.name).toBeUndefined();
   });
 });

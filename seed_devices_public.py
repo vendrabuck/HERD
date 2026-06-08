@@ -1263,9 +1263,37 @@ def get_or_create_topology(
     return tid
 
 
+# Device-record fields the frontend DeviceNode reads. Mirrors the DeviceNodeData
+# shape so seeded nodes are indistinguishable from hand-built (live-dropped) ones.
+CANVAS_DEVICE_FIELDS = (
+    "id",
+    "name",
+    "topology_type",
+    "template_name",
+    "template_icon",
+    "status",
+)
+
+
+def _node_device_payload(device: dict) -> dict:
+    """Project a full inventory device record onto the canvas device shape.
+
+    Keeps only the fields DeviceNode renders, falling back to safe defaults for
+    any the API omits so the node never carries a null where the component
+    expects a value (name span, topology color, status badge).
+    """
+    payload = {field: device.get(field) for field in CANVAS_DEVICE_FIELDS}
+    payload["id"] = device.get("id")
+    payload["name"] = device.get("name") or ""
+    payload["topology_type"] = device.get("topology_type") or "PHYSICAL"
+    payload["status"] = device.get("status") or "AVAILABLE"
+    return payload
+
+
 def build_canvas(
     device_ids: list[str | None],
     edges: list[tuple[int, int, str]],
+    device_lookup: dict[str, dict] | None = None,
 ) -> dict:
     """Build a React Flow canvas_data dict mirroring the editor output.
 
@@ -1274,14 +1302,39 @@ def build_canvas(
     list of (source_index, target_index, layer) tuples. Node ids are React Flow
     ids ("n0", "n1", ...), distinct from device UUIDs; edges reference node ids.
     Positions are laid out on a deterministic grid so the canvas renders sanely.
+
+    device_lookup maps device UUID to the full inventory record. When present,
+    each non-None node gets the full device payload (name, topology_type,
+    template_name, status, ...) plus the same label/topologyType the live drop
+    path sets, and "type": "deviceNode" so React Flow renders the custom
+    DeviceNode instead of its blank default node. A node whose device id is None
+    (or missing from the lookup) emits an empty- or thin-data node, still typed
+    "deviceNode"; a None slot intentionally forces missing_device on any edge
+    touching it.
     """
+    device_lookup = device_lookup or {}
     nodes: list[dict] = []
     for i, dev_id in enumerate(device_ids):
         node: dict = {
             "id": f"n{i}",
+            "type": "deviceNode",
             "position": {"x": 100 + (i % 4) * 200, "y": 100 + (i // 4) * 150},
         }
-        node["data"] = {} if dev_id is None else {"device": {"id": dev_id}}
+        if dev_id is None:
+            node["data"] = {}
+        else:
+            device = device_lookup.get(dev_id)
+            if device is None:
+                # No record available: keep a thin reference so the load-time
+                # hydration in the editor can still fill it in by id.
+                node["data"] = {"device": {"id": dev_id}}
+            else:
+                payload = _node_device_payload(device)
+                node["data"] = {
+                    "device": payload,
+                    "label": payload["name"],
+                    "topologyType": payload["topology_type"],
+                }
         nodes.append(node)
 
     edge_list: list[dict] = []
@@ -1362,6 +1415,15 @@ def seed_topologies(
     """
     existing_names = list_existing_topology_names(client)
 
+    # Build an id to full-record lookup once, so every canvas node carries the
+    # device fields the frontend DeviceNode renders (name, topology_type,
+    # template_name, status). The inventory API is the source of truth here, the
+    # same data the editor's load-time hydration fetches. Devices missing from
+    # the map degrade to a thin {"device": {"id": ...}} node (still hydratable).
+    device_lookup: dict[str, dict] = {
+        d["id"]: d for d in fetch_all_items(client, f"{BASE}/inventory/devices")
+    }
+
     # Pool of guaranteed-cabled, mutually reachable devices: switch infrastructure
     # ONLY. Every L1/L2 edge and hub switch is deterministically cabled and the
     # whole fabric is one connected component (verified live), so any two switches
@@ -1388,7 +1450,7 @@ def seed_topologies(
             node_devices: list[str | None] = [
                 cabled_pool[(offset + i) % pool_len] for i in range(n)
             ]
-            canvas = build_canvas(node_devices, gen(n, layer))
+            canvas = build_canvas(node_devices, gen(n, layer), device_lookup)
             tid = get_or_create_topology(
                 client, name, canvas, existing_names, description="Demo lab topology"
             )
@@ -1439,7 +1501,7 @@ def seed_topologies(
     invalid_count = 0
     first_invalid_id: str | None = None
     for name, node_devices, edges in invalid_specs[:INVALID_TOPOLOGY_TARGET]:
-        canvas = build_canvas(node_devices, edges)
+        canvas = build_canvas(node_devices, edges, device_lookup)
         tid = get_or_create_topology(
             client, name, canvas, existing_names, description="Deliberately invalid demo topology"
         )
