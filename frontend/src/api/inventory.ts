@@ -86,10 +86,17 @@ export async function hydrateCanvasNodes(data: CanvasData): Promise<CanvasData> 
     const nodeData = node.data as DeviceNodeData | undefined;
     const id = nodeData?.device?.id;
     if (!id) return node;
+    // Any node backed by a device must render through the custom DeviceNode, so
+    // it needs type "deviceNode". Topologies persisted before the seed fix (or
+    // any thin save) carry type null, which makes React Flow fall back to its
+    // blank default node. Set the discriminator here even when the live device
+    // fetch fails, so the node still renders as a DeviceNode with its existing
+    // data rather than a blank box.
     const device = fresh.get(id);
-    if (!device) return node;
+    if (!device) return { ...node, type: "deviceNode" } as Node<DeviceNodeData>;
     return {
       ...node,
+      type: "deviceNode",
       data: {
         ...nodeData,
         device,
