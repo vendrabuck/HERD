@@ -30,11 +30,39 @@ from app.services.llm_provider import (
     ToolUseBlock,
     Usage,
 )
+from app.services.providers.openai_provider import _build_http_client
 
 
 class AnthropicProvider:
-    def __init__(self, *, api_key: str, model: str) -> None:
-        self._client = AsyncAnthropic(api_key=api_key)
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+        verify_tls: bool = True,
+        ca_cert: str | None = None,
+    ) -> None:
+        # AsyncAnthropic rejects blank api_key strings; a local Anthropic-compatible
+        # endpoint (e.g. vLLM) typically ignores auth, so "EMPTY" is the conventional
+        # placeholder, mirroring OpenAICompatProvider. base_url lets that local server
+        # be targeted instead of Anthropic's hosted API, and the shared httpx client
+        # carries the same self-signed-TLS handling the OpenAI path uses.
+        #
+        # Explicit long client timeout: the SDK refuses a non-streaming request when
+        # it computes that max_tokens could exceed its default-timeout ceiling
+        # (raising "Streaming is required for operations that may take longer than 10
+        # minutes"), which trips for large max_tokens with a reasoning model. The real
+        # per-call bound is enforced upstream by asyncio.wait_for(timeout_s) in call(),
+        # so a generous SDK timeout here just clears that pre-flight guard without
+        # changing the effective deadline.
+        http_client = _build_http_client(verify_tls=verify_tls, ca_cert=ca_cert)
+        self._client = AsyncAnthropic(
+            api_key=api_key or "EMPTY",
+            base_url=base_url,
+            http_client=http_client,
+            timeout=1800.0,
+        )
         self._model = model
 
     async def call(

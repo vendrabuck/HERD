@@ -38,13 +38,6 @@ setup_logging("ai-orchestrator", level=settings.log_level)
 
 logger = logging.getLogger(__name__)
 
-if settings.anthropic_api_key and not settings.ai_api_key:
-    logger.warning(
-        "ANTHROPIC_API_KEY is deprecated; set AI_API_KEY instead. "
-        "The legacy variable will be removed in the next release.",
-        extra={"event": "anthropic_api_key_deprecated"},
-    )
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

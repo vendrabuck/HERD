@@ -27,8 +27,8 @@ class Settings(BaseSettings):
     ai_provider: Literal["anthropic", "openai_compat"] = "anthropic"
     # Required when ai_provider="openai_compat"; ignored otherwise.
     ai_base_url: str = ""
-    # Canonical AI credential. If blank, ANTHROPIC_API_KEY is honored as a
-    # fallback for one release with a deprecation warning at startup.
+    # Canonical AI credential. Required for the hosted Anthropic API; a local
+    # keyless Anthropic-compatible endpoint (vLLM) needs only ai_base_url.
     ai_api_key: str = ""
     ai_model: str = "claude-sonnet-4-6"
     ai_max_tokens: int = 4096
@@ -49,10 +49,6 @@ class Settings(BaseSettings):
     # ai_tls_verify: when set, verification stays on and fails closed, which is
     # preferable to ai_tls_verify=false for a known on-prem endpoint.
     ai_ca_cert: str = ""
-
-    # Deprecated; honored as a fallback for ai_api_key when the canonical var
-    # is blank. Remove in the release after this one.
-    anthropic_api_key: str = ""
 
     upload_max_file_bytes: int = 5 * 1024 * 1024
     upload_max_files: int = 5

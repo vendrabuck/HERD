@@ -14,7 +14,7 @@ def async_client():
 async def test_status_enabled_when_anthropic_key_set(async_client, monkeypatch):
     monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
     monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-ant-real")
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
     async with async_client as client:
         resp = await client.get("/status")
     assert resp.status_code == 200
@@ -28,7 +28,7 @@ async def test_status_enabled_when_anthropic_key_set(async_client, monkeypatch):
 async def test_status_disabled_when_anthropic_key_blank(async_client, monkeypatch):
     monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
     monkeypatch.setattr(config_module.settings, "ai_api_key", "")
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
     async with async_client as client:
         resp = await client.get("/status")
     assert resp.status_code == 200
@@ -38,11 +38,11 @@ async def test_status_disabled_when_anthropic_key_blank(async_client, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_status_honors_deprecated_anthropic_api_key_fallback(async_client, monkeypatch):
-    """ANTHROPIC_API_KEY is still honored when AI_API_KEY is blank (one-release alias)."""
+async def test_status_enabled_for_anthropic_keyless_local_endpoint(async_client, monkeypatch):
+    """A local keyless Anthropic-compatible endpoint (vLLM) is configured by base_url alone."""
     monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
     monkeypatch.setattr(config_module.settings, "ai_api_key", "")
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "sk-ant-legacy")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "https://vllm:8000/v1")
     async with async_client as client:
         resp = await client.get("/status")
     assert resp.status_code == 200
@@ -55,7 +55,6 @@ async def test_status_enabled_for_openai_compat_with_base_url(async_client, monk
     monkeypatch.setattr(config_module.settings, "ai_provider", "openai_compat")
     monkeypatch.setattr(config_module.settings, "ai_base_url", "http://vllm:8000/v1")
     monkeypatch.setattr(config_module.settings, "ai_api_key", "")
-    monkeypatch.setattr(config_module.settings, "anthropic_api_key", "")
     async with async_client as client:
         resp = await client.get("/status")
     assert resp.status_code == 200
