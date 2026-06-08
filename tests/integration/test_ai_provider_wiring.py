@@ -15,12 +15,11 @@ of the new config surface itself:
 - The status payload's `model` and `provider` values reflect what the
   orchestrator was started with. This is a drift detector for the case
   where someone edits .env without recreating the ai-orchestrator container.
-- When the host's resolved AI key is present via the deprecated
-  ANTHROPIC_API_KEY fallback (canonical AI_API_KEY blank), the orchestrator
-  still reports enabled=true. We cannot mutate the running container's env,
-  so we run this assertion conditionally: only when the env truly uses the
-  fallback path on this host. On a fully-configured host with both keys set,
-  the test skips with an informative message.
+- When AI_BASE_URL targets a local Anthropic-compatible endpoint (e.g. vLLM)
+  with AI_API_KEY blank, the orchestrator still reports enabled=true. We cannot
+  mutate the running container's env, so we run this assertion conditionally:
+  only when the env truly uses the keyless-local path on this host. On a host
+  configured with a hosted-API key, the test skips with an informative message.
 
 All tests run against the live stack at https://localhost; tests that need
 the live AI follow the same gating idiom as test_ai_assistant_tools.py.
@@ -170,39 +169,35 @@ async def test_assistant_returns_503_when_provider_not_configured(base_url, user
     assert "not configured" in resp.json().get("detail", "").lower()
 
 
-# --- Deprecated ANTHROPIC_API_KEY fallback ---
+# --- Keyless anthropic against a local endpoint ---
 
 
-async def test_anthropic_api_key_fallback_keeps_provider_enabled(base_url):
-    """When the canonical AI_API_KEY is blank but ANTHROPIC_API_KEY is set,
-    the orchestrator still reports enabled=true under provider=anthropic.
+async def test_anthropic_enabled_with_base_url_and_no_key(base_url):
+    """Anthropic is configured when AI_BASE_URL targets a local
+    Anthropic-compatible endpoint (e.g. vLLM), even with AI_API_KEY blank.
 
-    The .env on this stack may already supply both keys; in that case the
-    fallback path is not exercised and we skip with a clear message. The
-    test still serves the file's purpose as a self-documenting reference
-    for the deprecation path the next release removes.
+    The .env on this stack may supply a key (hosted API) instead; in that case
+    the keyless-local path is not exercised and we skip with a clear message.
     """
     provider = (os.getenv("AI_PROVIDER", "").strip() or "anthropic").lower()
     if provider != "anthropic":
-        pytest.skip("Stack is not in anthropic mode; fallback only applies there")
+        pytest.skip("Stack is not in anthropic mode; keyless-local only applies there")
 
-    canonical = os.getenv("AI_API_KEY", "").strip()
-    fallback = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if canonical:
+    key = os.getenv("AI_API_KEY", "").strip()
+    base = os.getenv("AI_BASE_URL", "").strip()
+    if key:
         pytest.skip(
-            "AI_API_KEY is set on this host; the deprecated ANTHROPIC_API_KEY "
-            "fallback path is not exercised. Clear AI_API_KEY and recreate "
+            "AI_API_KEY is set on this host; the keyless-local path is not "
+            "exercised. Clear AI_API_KEY (leaving AI_BASE_URL set) and recreate "
             "the ai-orchestrator container to exercise this branch."
         )
-    if not fallback:
-        pytest.skip(
-            "Neither AI_API_KEY nor ANTHROPIC_API_KEY is set; nothing to validate"
-        )
+    if not base:
+        pytest.skip("Neither AI_API_KEY nor AI_BASE_URL is set; nothing to validate")
 
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
         body = (await client.get(f"{base_url}/ai/status")).json()
     assert body["enabled"] is True, (
-        "ANTHROPIC_API_KEY is set but /api/ai/status reports disabled. "
-        "The deprecated fallback should keep enabled=true for one release."
+        "AI_BASE_URL is set with no key but /api/ai/status reports disabled. "
+        "Anthropic against a local endpoint should be enabled on base_url alone."
     )
     assert body["provider"] == "anthropic"

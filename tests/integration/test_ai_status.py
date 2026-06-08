@@ -5,8 +5,8 @@ feature state without requiring an AI provider configuration, and that
 /api/ai/generate returns 503 when no provider is configured (or a valid
 non-503 when one is).
 
-Honors the deprecation fallback: AI_API_KEY is the canonical credential;
-ANTHROPIC_API_KEY is honored for one release.
+AI_API_KEY is the credential for the hosted Anthropic API; anthropic against a
+local Anthropic-compatible endpoint is configured on AI_BASE_URL alone.
 """
 
 import httpx
