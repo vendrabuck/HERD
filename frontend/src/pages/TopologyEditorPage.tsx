@@ -19,6 +19,7 @@ import { useTopology, useUpdateTopology, useRestoreVersion } from "@/api/topolog
 import { useReservations, useUpdateReservation } from "@/api/reservations";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
+import { hydrateCanvasNodes } from "@/api/inventory";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
 import { FloatingPanel } from "@/components/ui/FloatingPanel";
@@ -193,12 +194,22 @@ function TopologyEditorInner() {
   const restoreVersion = useRestoreVersion(id);
   const createTemplate = useCreateTemplateFromTopology();
 
-  // Load canvas data from backend when topology loads
+  // Load canvas data from backend when topology loads. Hydrate each node's
+  // device from a fresh inventory fetch first, so the editor is resilient to
+  // thin or stale persisted nodes (a deleted/missing device degrades to its
+  // persisted data and is flagged by validation, never throwing). Loading the
+  // persisted canvas first would flash blank/white nodes, so we await hydration
+  // before the single loadCanvas call.
   useEffect(() => {
     if (topology && !initializedRef.current) {
       initializedRef.current = true;
       if (topology.canvas_data) {
-        loadCanvas(topology.canvas_data);
+        const persisted = topology.canvas_data;
+        hydrateCanvasNodes(persisted)
+          .then((hydrated) => loadCanvas(hydrated))
+          // hydrateCanvasNodes already swallows per-device failures; this guards
+          // a total fetch outage so the editor still shows the persisted canvas.
+          .catch(() => loadCanvas(persisted));
       } else {
         clearTopology();
       }

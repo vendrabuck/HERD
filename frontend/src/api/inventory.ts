@@ -1,6 +1,8 @@
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
+import type { Node } from "@xyflow/react";
 import type { Device, DeviceCreate, DeviceUpdate, DeviceFilters } from "@/types/device.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
+import type { CanvasData, DeviceNodeData } from "@/types/topology.types";
 import apiClient from "./client";
 
 // Query-key factory. Splits the "devices" namespace into list queries (paginated,
@@ -41,6 +43,63 @@ async function fetchDevices(filters?: DeviceFilters): Promise<Device[]> {
 export async function fetchDevice(id: string): Promise<Device> {
   const resp = await apiClient.get<Device>(`/inventory/devices/${id}`);
   return resp.data;
+}
+
+// Re-fetch each referenced device and rebuild the canvas nodes' device payload
+// from inventory, so a topology loaded from persisted data is resilient to thin
+// seeded nodes ({ device: { id } } with no name/topology_type) and to devices
+// that were renamed/retyped after the canvas was saved. Defense in depth: the
+// seed now writes full payloads, but persisted/stale canvases predate that.
+//
+// A node whose device was deleted (fetch fails) is kept as-is rather than
+// dropped, so the editor still shows it and validation can flag it as missing.
+// A node with no device id (an intentional empty/missing-device slot) is left
+// untouched. Fetches run in parallel and individual failures never throw.
+export async function hydrateCanvasNodes(data: CanvasData): Promise<CanvasData> {
+  const nodes = data.nodes ?? [];
+
+  const ids = Array.from(
+    new Set(
+      nodes
+        .map((n) => (n.data as DeviceNodeData | undefined)?.device?.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0),
+    ),
+  );
+  if (ids.length === 0) return data;
+
+  const entries = await Promise.all(
+    ids.map(async (id): Promise<[string, Device | null]> => {
+      try {
+        return [id, await fetchDevice(id)];
+      } catch {
+        // Deleted or unreachable device: leave the node's existing data in place.
+        return [id, null];
+      }
+    }),
+  );
+  const fresh = new Map<string, Device>();
+  for (const [id, device] of entries) {
+    if (device) fresh.set(id, device);
+  }
+
+  const hydratedNodes = nodes.map((node) => {
+    const nodeData = node.data as DeviceNodeData | undefined;
+    const id = nodeData?.device?.id;
+    if (!id) return node;
+    const device = fresh.get(id);
+    if (!device) return node;
+    return {
+      ...node,
+      data: {
+        ...nodeData,
+        device,
+        label: device.name,
+        topologyType: device.topology_type,
+      },
+    } as Node<DeviceNodeData>;
+  });
+
+  return { ...data, nodes: hydratedNodes };
 }
 
 async function updateDevice({ id, data }: { id: string; data: DeviceUpdate }): Promise<Device> {
