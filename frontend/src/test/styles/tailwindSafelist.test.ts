@@ -43,11 +43,26 @@ async function compileIndexCss(): Promise<string> {
   return result.css;
 }
 
+function isClassNameChar(ch: string): boolean {
+  return /[A-Za-z0-9-]/.test(ch);
+}
+
 function ruleExists(css: string, className: string): boolean {
-  // Match a standalone utility rule like `.bg-blue-100` while avoiding partial
-  // matches such as bg-blue-1000 by requiring a non class-name char after it.
-  const escaped = className.replace(/[-]/g, "\\-");
-  return new RegExp(`\\.${escaped}(?![A-Za-z0-9-])`).test(css);
+  // Detect a standalone utility rule like `.bg-blue-100` while avoiding partial
+  // matches such as bg-blue-1000. We scan for the literal `.<className>` and
+  // require the next character not to continue the class name. This uses plain
+  // string search (no regex built from interpolated input), so the class names
+  // (which contain only letters, digits, and hyphens) need no escaping.
+  const needle = `.${className}`;
+  let from = css.indexOf(needle);
+  while (from !== -1) {
+    const next = css[from + needle.length];
+    if (next === undefined || !isClassNameChar(next)) {
+      return true;
+    }
+    from = css.indexOf(needle, from + 1);
+  }
+  return false;
 }
 
 describe("Tailwind color safelist (issue #106 build-output guard)", () => {
