@@ -2,7 +2,7 @@
 
 The 'Use AI' button should only render when /api/ai/status reports the feature
 as enabled. These tests check the live state against the rendered UI so
-flipping ANTHROPIC_API_KEY in either direction still gives consistent results.
+flipping the AI configuration in either direction still gives consistent results.
 """
 
 import uuid
@@ -91,14 +91,14 @@ def test_use_ai_button_matches_status(
 
 
 @pytest.mark.skipif(
-    True,  # documentation-only; toggling the real key needs a stack restart
-    reason="Requires live ANTHROPIC_API_KEY toggle and container restart, outside e2e scope",
+    True,  # documentation-only; toggling the real config needs a stack restart
+    reason="Requires live AI config toggle and container restart, outside e2e scope",
 )
 def test_use_ai_button_toggles_with_key_change():  # pragma: no cover
     """Placeholder for a manual flip test.
 
-    To exercise by hand: set ANTHROPIC_API_KEY=sk-... in .env, `make restart`,
-    reload the topology editor, confirm the button appears; then blank the key,
-    restart, confirm it disappears. Automating the restart is out of scope for
-    the standard e2e suite.
+    To exercise by hand: set AI_API_KEY=sk-... (or AI_BASE_URL for a local
+    endpoint) in .env, `make restart`, reload the topology editor, confirm the
+    button appears; then blank the config, restart, confirm it disappears.
+    Automating the restart is out of scope for the standard e2e suite.
     """

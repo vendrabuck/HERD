@@ -28,10 +28,12 @@ def _chat_ui_enabled() -> bool:
 
 
 def _ai_provider_configured() -> bool:
-    """Same gate as tests/integration/_ai_helpers.py: skip if there's no key."""
+    """Same gate as tests/integration/_ai_helpers.py: anthropic needs a key OR a
+    base URL (a local Anthropic-compatible endpoint needs only the base URL);
+    openai_compat needs a base URL."""
     if os.environ.get("AI_PROVIDER", "anthropic") == "openai_compat":
         return bool(os.environ.get("AI_BASE_URL"))
-    return bool(os.environ.get("AI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"))
+    return bool(os.environ.get("AI_API_KEY") or os.environ.get("AI_BASE_URL"))
 
 
 def _open_reservations(driver, base_url):
