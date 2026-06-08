@@ -20,7 +20,7 @@ The admin password on the config page itself is unchanged: it stays `admin123!` 
 
 The wrench-icon config editor shows every schema field that is present in the config container's environment even when `config.json` is missing the key; secrets sourced from env are still rendered as `********`. If a field is set both in `config.json` and in the environment, the file value wins in the editor (it represents an explicit save). Runtime services continue to read `os.environ` directly, so the precedence ladder above still applies to the actual behavior of the stack.
 
-For the config service to see these env vars, `docker-compose.yml` maps them into the container via the `environment:` block (see the `POSTGRES_*`, `AUTH_*`, `SUPERADMIN_*`, `INTERNAL_API_TOKEN`, `CORS_ORIGINS`, `NATS_URL`, `ANTHROPIC_API_KEY`, `LOG_LEVEL` passthroughs added in commit `1e9fd09`).
+For the config service to see these env vars, `docker-compose.yml` maps them into the container via the `environment:` block (see the `POSTGRES_*`, `AUTH_*`, `SUPERADMIN_*`, `INTERNAL_API_TOKEN`, `CORS_ORIGINS`, `NATS_URL`, `AI_API_KEY`, `LOG_LEVEL` passthroughs).
 
 ## Required
 
@@ -129,19 +129,18 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 
 ## AI orchestrator
 
-The orchestrator supports two backends via `AI_PROVIDER`: `anthropic` (the AsyncAnthropic SDK against the Anthropic API) and `openai_compat` (the AsyncOpenAI SDK against any compatible chat-completions endpoint, including vLLM, Ollama, LM Studio, OpenAI proper, and Azure OpenAI). All three AI endpoints gate on `ai_is_configured()` and return 503 when the active provider is not configured.
+The orchestrator supports two backends via `AI_PROVIDER`: `anthropic` (the AsyncAnthropic SDK, against either the hosted Anthropic API with `AI_API_KEY`, or a local Anthropic-compatible endpoint via `AI_BASE_URL` with no key) and `openai_compat` (the AsyncOpenAI SDK against any compatible chat-completions endpoint, including vLLM, Ollama, LM Studio, OpenAI proper, and Azure OpenAI). All three AI endpoints gate on `ai_is_configured()` and return 503 when the active provider is not configured: `anthropic` is configured when either `AI_API_KEY` or `AI_BASE_URL` is set; `openai_compat` needs `AI_BASE_URL`.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `AI_PROVIDER` | `anthropic` | Backend selector: `anthropic` or `openai_compat`. |
-| `AI_BASE_URL` | (empty) | Endpoint URL when `AI_PROVIDER=openai_compat`, e.g. `http://vllm:8000/v1` or `http://ollama:11434/v1`. Ignored when `AI_PROVIDER=anthropic`. |
-| `AI_API_KEY` | (empty) | Canonical API key. Local servers (vLLM, Ollama, LM Studio) typically accept any non-empty placeholder; the orchestrator sends `EMPTY` when this is blank under `openai_compat`. |
+| `AI_BASE_URL` | (empty) | Endpoint URL for a non-hosted backend. For `openai_compat`, include the `/v1` suffix, e.g. `http://vllm:8000/v1`. For `anthropic` pointed at a local Anthropic-compatible endpoint (e.g. a vLLM serving `/v1/messages`), use the server ROOT with no `/v1` suffix (the Anthropic SDK appends `/v1/messages` itself). Leave blank for the hosted Anthropic API. |
+| `AI_API_KEY` | (empty) | API key for the hosted Anthropic API. Leave blank for a local server (vLLM, Ollama, LM Studio) that ignores auth: the orchestrator sends an `EMPTY` placeholder when this is blank, for both `openai_compat` and `anthropic` pointed at a local `AI_BASE_URL`. |
 | `AI_MODEL` | `claude-sonnet-4-6` | Model identifier passed to the provider. Format is provider-specific: `claude-*` for `anthropic`; provider-and-deployment-specific for `openai_compat` (e.g. `Qwen/Qwen3-35B-Instruct` on vLLM, `gpt-4o-mini` on OpenAI proper). |
 | `AI_MAX_TOKENS` | `4096` | Per-call token cap. |
 | `AI_DAILY_TOKEN_QUOTA` | `0` | Per-user daily budget of AI tokens (input + output) across all AI features (topology generation, the reservation assistant, and template-identity suggestions). `0` (default) disables enforcement and writes no usage rows, so behavior is unchanged until an operator opts in. When positive, a caller whose accumulated tokens for the current UTC day already meet or exceed this value is rejected with HTTP 429 and a `{limit, used, remaining, reset_at}` body, without calling the provider; the boundary call that crosses the limit is allowed and the next one is blocked. Counts reset implicitly on the UTC day boundary. Provider-reported usage is used when present, with a chars/4 estimate as a fallback. `GET /api/ai/quota` returns the caller's current usage. |
-| `AI_TLS_VERIFY` | `true` | Verify the TLS certificate of `AI_BASE_URL`. Set `false` only for an `openai_compat` endpoint behind a self-signed certificate (e.g. an on-prem vLLM server); the connection otherwise fails certificate verification before auth. Ignored for the `anthropic` provider. Prefer `AI_CA_CERT` over this for a known on-prem endpoint. |
-| `AI_CA_CERT` | (empty) | Path (inside the container) to a CA bundle to verify `AI_BASE_URL` against, e.g. a pinned self-signed on-prem certificate. Takes precedence over `AI_TLS_VERIFY`: verification stays on and fails closed, which is preferable to disabling verification. Mount the cert into the orchestrator container (see `docker-compose.yml`) and set this to its in-container path. Ignored for the `anthropic` provider. |
-| `ANTHROPIC_API_KEY` | (empty) | **Deprecated.** Use `AI_API_KEY` instead. Honored as a fallback for `AI_API_KEY` for one release with a startup warning; removed in the next release. |
+| `AI_TLS_VERIFY` | `true` | Verify the TLS certificate of `AI_BASE_URL`. Set `false` only for an endpoint behind a self-signed certificate (e.g. an on-prem vLLM server); the connection otherwise fails certificate verification before auth. Applies whenever `AI_BASE_URL` is set, including `anthropic` pointed at a local Anthropic-compatible endpoint. Prefer `AI_CA_CERT` over this for a known on-prem endpoint. |
+| `AI_CA_CERT` | (empty) | Path (inside the container) to a CA bundle to verify `AI_BASE_URL` against, e.g. a pinned self-signed on-prem certificate. Takes precedence over `AI_TLS_VERIFY`: verification stays on and fails closed, which is preferable to disabling verification. Mount the cert into the orchestrator container (see `docker-compose.yml`) and set this to its in-container path. Applies whenever `AI_BASE_URL` is set. |
 | `UPLOAD_MAX_FILE_BYTES` | `5242880` (5 MB) | Per-file cap for AI reference uploads. |
 | `UPLOAD_MAX_FILES` | `5` | Max files per AI request. |
 | `UPLOAD_MAX_EXTRACTED_CHARS` | `80000` | Aggregate text extracted from all files; per-file `truncated` flag appears in the response. |
