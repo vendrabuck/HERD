@@ -246,6 +246,12 @@ WRITE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
+# Single source of truth for which tool names are write tools. Derived from
+# WRITE_TOOL_DEFINITIONS so dispatch() never hardcodes the names; the gate stays
+# correct if a write tool is added or renamed.
+WRITE_TOOL_NAMES: frozenset[str] = frozenset(d["name"] for d in WRITE_TOOL_DEFINITIONS)
+
+
 def get_active_tool_definitions() -> list[dict[str, Any]]:
     """Return the tool set the assistant should advertise, honoring the
     ai_write_tools_enabled flag. Read-only tools are always present; write
@@ -332,6 +338,14 @@ class ToolDispatcher:
         error: str | None = None
         content: Any
         try:
+            # Enforce the write-tools gate at the execution boundary. Hiding a
+            # write tool from get_active_tool_definitions() is not enough: a model
+            # can still emit the call by name. Refuse to run it here so the gate
+            # holds even when the flag is off. The ToolError flows through the
+            # except branch below into an is_error result the model can recover
+            # from, and the finally block still records the attempt in call_log.
+            if tool_name in WRITE_TOOL_NAMES and not settings.ai_write_tools_enabled:
+                raise ToolError("write tools are disabled")
             handler = getattr(self, f"_tool_{tool_name}", None)
             if handler is None:
                 raise ToolError(f"unknown tool: {tool_name}")
