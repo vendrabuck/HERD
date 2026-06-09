@@ -21,6 +21,7 @@ from app.models import *  # noqa: F401, F403
 from app.routes.bulk import router as bulk_router
 from app.routes.connections import router as connections_router
 from app.routes.fabric import router as fabric_router
+from app.routes.forks import router as forks_router
 from app.routes.pathfind import router as pathfind_router
 from app.routes.templates import router as templates_router
 from app.routes.topologies import router as topologies_router
@@ -56,6 +57,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.include_router(bulk_router)
 app.include_router(connections_router)
 app.include_router(fabric_router)
+app.include_router(forks_router)
 app.include_router(pathfind_router)
 app.include_router(templates_router)
 app.include_router(topologies_router)
