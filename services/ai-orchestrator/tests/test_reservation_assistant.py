@@ -1,6 +1,7 @@
 """Tests for the iteration-2 reservation-assistant route."""
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -535,3 +536,134 @@ async def test_second_turn_with_other_users_conversation_id_returns_404(async_cl
             headers={"Authorization": f"Bearer {user_b_token}"},
         )
     assert b_resp.status_code == 404
+
+
+# --- Streaming endpoint (SSE) ---
+
+
+def _override_streaming_ai(events, *, raises: Exception | None = None):
+    """Override get_ai_client with a stub whose streaming method yields `events`.
+
+    `events` is a list of AssistantStatus/AssistantToken/AssistantDone instances
+    (built in-test), letting a route test assert the exact SSE framing without a
+    real provider.
+    """
+
+    class StreamStubAI:
+        async def answer_reservation_question_streaming(
+            self, *, messages, dispatcher, max_iterations=8, per_call_timeout_s=20.0
+        ):
+            if raises is not None:
+                raise raises
+            for ev in events:
+                yield ev
+
+    app.dependency_overrides[get_ai_client] = lambda: StreamStubAI()
+
+
+def _parse_sse(text: str) -> list[tuple[str, dict]]:
+    """Parse an SSE body into (event, json-data) pairs."""
+    out = []
+    for chunk in text.strip().split("\n\n"):
+        if not chunk.strip():
+            continue
+        event = None
+        data = None
+        for line in chunk.splitlines():
+            if line.startswith("event: "):
+                event = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data = json.loads(line[len("data: ") :])
+        out.append((event, data))
+    return out
+
+
+def _stream_url() -> str:
+    return f"/reservations/{RESERVATION_ID}/assistant/stream"
+
+
+async def test_stream_emits_status_tokens_then_done(async_client):
+    from app.services.ai_client import AssistantDone, AssistantStatus, AssistantToken
+
+    done = AssistantDone(
+        result=AssistantTurnResult(
+            answer="eth1/6 is down.",
+            usage=SimpleNamespace(input_tokens=12, output_tokens=8),
+            stop_reason="end_turn",
+            iteration=1,
+            segments=[TurnSegment(assistant_blocks=[TextBlock(text="eth1/6 is down.")])],
+        )
+    )
+    _override_seed()
+    _override_streaming_ai(
+        [
+            AssistantStatus(message="analyzing"),
+            AssistantToken(text="eth1/6 "),
+            AssistantToken(text="is down."),
+            done,
+        ]
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "what's wrong?"}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    events = _parse_sse(resp.text)
+    types = [e for e, _ in events]
+    assert types == ["status", "token", "token", "done"]
+    tokens = [d["text"] for e, d in events if e == "token"]
+    assert tokens == ["eth1/6 ", "is down."]
+    done_data = events[-1][1]
+    assert done_data["answer"] == "eth1/6 is down."
+    assert done_data["conversation_id"]
+    assert done_data["output_tokens"] == 8
+
+
+async def test_stream_persists_conversation(async_client):
+    """After the stream completes, the conversation exists and a follow-up turn
+    on the same conversation_id is accepted (proves persistence ran)."""
+    from app.services.ai_client import AssistantDone, AssistantToken
+
+    done = AssistantDone(
+        result=AssistantTurnResult(
+            answer="Answer one.",
+            usage=SimpleNamespace(input_tokens=5, output_tokens=3),
+            stop_reason="end_turn",
+            iteration=1,
+            segments=[TurnSegment(assistant_blocks=[TextBlock(text="Answer one.")])],
+        )
+    )
+    _override_seed()
+    _override_streaming_ai([AssistantToken(text="Answer one."), done])
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "q1"}, headers=headers)
+        conv_id = _parse_sse(resp.text)[-1][1]["conversation_id"]
+        # Buffered follow-up on the same conversation must resolve (404 would mean
+        # the streamed turn did not persist).
+        _override_ai(answer="Answer two.")
+        follow = await client.post(
+            _url(),
+            json={"question": "q2", "conversation_id": conv_id},
+            headers=headers,
+        )
+    assert follow.status_code == 200
+
+
+async def test_stream_emits_error_event_on_ai_failure(async_client):
+    _override_seed()
+    _override_streaming_ai([], raises=AIError("model exploded"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "q"}, headers=headers)
+    # The HTTP status is 200 (stream opened); the failure rides an error event.
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    assert events[-1][0] == "error"
+    assert "model exploded" in events[-1][1]["message"]
+
+
+async def test_stream_requires_auth(async_client):
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "hello"})
+    assert resp.status_code == 401

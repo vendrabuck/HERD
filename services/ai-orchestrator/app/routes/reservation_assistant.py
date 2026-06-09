@@ -14,10 +14,13 @@ after persistence; the seed is pinned so the model never loses grounding.
 """
 
 import asyncio
+import json
 import logging
 import uuid
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 from herd_common.auth import make_auth_dependencies
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -80,23 +83,21 @@ def get_reservation_seed_dep(
     return _gather
 
 
-@router.post("/{reservation_id}/assistant", response_model=AssistantResponse)
-async def reservation_assistant(
+async def _prepare_turn(
+    *,
     reservation_id: uuid.UUID,
     body: AssistantRequest,
-    user=Depends(get_current_user),
-    token: str = Depends(_bearer_token),
-    ai: AIClient = Depends(get_ai_client),
-    db: AsyncSession = Depends(get_db),
-    seed_gatherer=Depends(get_reservation_seed_dep),
-) -> AssistantResponse:
-    if not ai_is_configured():
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "AI orchestrator is not configured",
-        )
+    user_id: uuid.UUID,
+    db: AsyncSession,
+    seed_gatherer,
+):
+    """Shared setup for both the buffered and streaming endpoints.
 
-    user_id = uuid.UUID(user["sub"])
+    Enforces quota, resolves or creates the conversation, appends the new user
+    turn, and returns (conversation, messages) ready for the tool loop. Raises
+    HTTPException on 404/quota exactly as before so both endpoints behave the
+    same up to the point where one buffers and the other streams.
+    """
     await usage_repo.enforce_quota(db, user_id)
 
     # Resolve or create the conversation. A non-None conversation_id that
@@ -139,6 +140,73 @@ async def reservation_assistant(
     await db.refresh(conversation)
 
     messages = await conversation_repo.load_messages(db, conversation_id=conversation.id)
+    return conversation, messages
+
+
+async def _persist_turn(
+    *,
+    db: AsyncSession,
+    conversation,
+    turn,
+    user_id: uuid.UUID,
+    question: str,
+    dispatcher: ToolDispatcher,
+) -> PendingApply | None:
+    """Persist a completed turn's segments, evict to budget, record usage, and
+    surface any pending scheduled-apply. Shared by both endpoints so the
+    persistence shape is identical whether the answer was buffered or streamed.
+    """
+    for segment in turn.segments:
+        await conversation_repo.append_assistant_turn(
+            db,
+            conversation=conversation,
+            assistant_blocks=segment.assistant_blocks,
+            tool_result_blocks=segment.tool_result_blocks or None,
+        )
+    await conversation_repo.evict_to_budget(db, conversation=conversation)
+    await conversation_repo.touch(db, conversation=conversation)
+    await db.commit()
+
+    await usage_repo.record_usage(db, user_id, turn.usage, fallback_text=question + turn.answer)
+
+    pending_apply: PendingApply | None = None
+    for entry in reversed(dispatcher.side_effects):
+        if entry.get("kind") == "scheduled_apply":
+            pending_apply = PendingApply(
+                job_id=entry["job_id"],
+                version_id=entry["version_id"],
+                device_id=entry["device_id"],
+                dry_run=entry["dry_run"],
+                scheduled_for=entry["scheduled_for"],
+            )
+            break
+    return pending_apply
+
+
+@router.post("/{reservation_id}/assistant", response_model=AssistantResponse)
+async def reservation_assistant(
+    reservation_id: uuid.UUID,
+    body: AssistantRequest,
+    user=Depends(get_current_user),
+    token: str = Depends(_bearer_token),
+    ai: AIClient = Depends(get_ai_client),
+    db: AsyncSession = Depends(get_db),
+    seed_gatherer=Depends(get_reservation_seed_dep),
+) -> AssistantResponse:
+    if not ai_is_configured():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "AI orchestrator is not configured",
+        )
+
+    user_id = uuid.UUID(user["sub"])
+    conversation, messages = await _prepare_turn(
+        reservation_id=reservation_id,
+        body=body,
+        user_id=user_id,
+        db=db,
+        seed_gatherer=seed_gatherer,
+    )
 
     pending_apply: PendingApply | None = None
     try:
@@ -154,40 +222,14 @@ async def reservation_assistant(
                     max_iterations=settings.assistant_max_tool_iterations,
                     per_call_timeout_s=settings.assistant_per_call_timeout_s,
                 )
-
-                # Persist every iteration of the loop as its own assistant
-                # turn (plus tool_result echo when present). Ordering matters
-                # so the next turn replays the same shape.
-                for segment in turn.segments:
-                    await conversation_repo.append_assistant_turn(
-                        db,
-                        conversation=conversation,
-                        assistant_blocks=segment.assistant_blocks,
-                        tool_result_blocks=segment.tool_result_blocks or None,
-                    )
-                await conversation_repo.evict_to_budget(db, conversation=conversation)
-                await conversation_repo.touch(db, conversation=conversation)
-                await db.commit()
-
-                await usage_repo.record_usage(
-                    db,
-                    user_id,
-                    turn.usage,
-                    fallback_text=body.question + turn.answer,
+                pending_apply = await _persist_turn(
+                    db=db,
+                    conversation=conversation,
+                    turn=turn,
+                    user_id=user_id,
+                    question=body.question,
+                    dispatcher=dispatcher,
                 )
-
-                # Surface the most recent scheduled_apply side-effect for the
-                # frontend confirmation modal; same contract as iter 3.
-                for entry in reversed(dispatcher.side_effects):
-                    if entry.get("kind") == "scheduled_apply":
-                        pending_apply = PendingApply(
-                            job_id=entry["job_id"],
-                            version_id=entry["version_id"],
-                            device_id=entry["device_id"],
-                            dry_run=entry["dry_run"],
-                            scheduled_for=entry["scheduled_for"],
-                        )
-                        break
                 call_log = list(dispatcher.call_log)
     except asyncio.TimeoutError as exc:
         raise HTTPException(
@@ -237,6 +279,129 @@ async def reservation_assistant(
         tool_iterations=turn.iteration,
         conversation_id=str(conversation.id),
         pending_apply=pending_apply,
+    )
+
+
+def _sse(event: str, data: dict) -> str:
+    """Frame one Server-Sent Event. `data` is JSON; the client reads e.data."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@router.post("/{reservation_id}/assistant/stream")
+async def reservation_assistant_stream(
+    reservation_id: uuid.UUID,
+    body: AssistantRequest,
+    user=Depends(get_current_user),
+    token: str = Depends(_bearer_token),
+    ai: AIClient = Depends(get_ai_client),
+    db: AsyncSession = Depends(get_db),
+    seed_gatherer=Depends(get_reservation_seed_dep),
+) -> StreamingResponse:
+    """Streaming twin of POST .../assistant.
+
+    Emits Server-Sent Events: `status` (analyzing / running tools, with an
+    `interim` flag telling the client to discard provisional tokens before a
+    tool turn), `token` (final-answer text as it streams), `done` (the full
+    AssistantResponse payload), and `error` (a failure after streaming began,
+    where an HTTP status can no longer be set). Setup (auth, quota, conversation
+    resolution) happens BEFORE the stream so 404/503/quota still surface as real
+    HTTP statuses; only post-setup failures become an `error` event.
+    """
+    if not ai_is_configured():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "AI orchestrator is not configured",
+        )
+
+    user_id = uuid.UUID(user["sub"])
+    conversation, messages = await _prepare_turn(
+        reservation_id=reservation_id,
+        body=body,
+        user_id=user_id,
+        db=db,
+        seed_gatherer=seed_gatherer,
+    )
+
+    async def _event_stream() -> AsyncIterator[str]:
+        try:
+            async with asyncio.timeout(settings.assistant_overall_deadline_s):
+                async with ToolDispatcher(
+                    token=token,
+                    reservation_id=reservation_id,
+                    char_cap=settings.assistant_tool_result_char_cap,
+                ) as dispatcher:
+                    turn = None
+                    async for ev in ai.answer_reservation_question_streaming(
+                        messages=messages,
+                        dispatcher=dispatcher,
+                        max_iterations=settings.assistant_max_tool_iterations,
+                        per_call_timeout_s=settings.assistant_per_call_timeout_s,
+                    ):
+                        if ev.type == "status":
+                            yield _sse(
+                                "status",
+                                {"message": ev.message, "tools": ev.tools, "interim": ev.interim},
+                            )
+                        elif ev.type == "token":
+                            yield _sse("token", {"text": ev.text})
+                        elif ev.type == "done":
+                            turn = ev.result
+
+                    if turn is None:
+                        yield _sse("error", {"message": "Assistant produced no answer"})
+                        return
+
+                    # Persist inside the generator: this is the only scope where
+                    # the assembled turn (from the done event), the open
+                    # ToolDispatcher, and the db session all coexist. The
+                    # async-with blocks close once the generator returns, so the
+                    # write must happen here, before the final done frame.
+                    pending_apply = await _persist_turn(
+                        db=db,
+                        conversation=conversation,
+                        turn=turn,
+                        user_id=user_id,
+                        question=body.question,
+                        dispatcher=dispatcher,
+                    )
+                    payload = AssistantResponse(
+                        answer=turn.answer,
+                        model=settings.ai_model,
+                        input_tokens=turn.usage.input_tokens,
+                        output_tokens=turn.usage.output_tokens,
+                        stop_reason=turn.stop_reason,
+                        tool_calls=[
+                            ToolCallSummary(
+                                name=rec.name,
+                                arguments_summary=rec.arguments_summary,
+                                duration_ms=rec.duration_ms,
+                                error=rec.error,
+                            )
+                            for rec in dispatcher.call_log
+                        ],
+                        tool_iterations=turn.iteration,
+                        conversation_id=str(conversation.id),
+                        pending_apply=pending_apply,
+                    )
+                    yield _sse("done", payload.model_dump(mode="json"))
+        except asyncio.TimeoutError:
+            yield _sse(
+                "error",
+                {
+                    "message": (
+                        f"Assistant did not respond within "
+                        f"{settings.assistant_overall_deadline_s:.0f}s"
+                    )
+                },
+            )
+        except AIError as exc:
+            logger.exception("ai_assistant_stream_failed")
+            yield _sse("error", {"message": f"Assistant call failed: {exc}"})
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

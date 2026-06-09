@@ -10,6 +10,7 @@ This is the ONLY file in the orchestrator that imports `anthropic`.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Any
 
 from anthropic import AsyncAnthropic
@@ -20,7 +21,10 @@ from app.services.llm_provider import (
     Message,
     ProviderResponse,
     StopReason,
+    StreamDone,
+    StreamEvent,
     TextBlock,
+    TextDelta,
     ToolChoice,
     ToolChoiceNone,
     ToolChoiceRequired,
@@ -65,7 +69,7 @@ class AnthropicProvider:
         )
         self._model = model
 
-    async def call(
+    def _build_kwargs(
         self,
         *,
         system: str,
@@ -73,8 +77,7 @@ class AnthropicProvider:
         tools: list[ToolSchema] | None,
         tool_choice: ToolChoice,
         max_tokens: int,
-        timeout_s: float | None,
-    ) -> ProviderResponse:
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "max_tokens": max_tokens,
@@ -86,7 +89,25 @@ class AnthropicProvider:
             anthropic_choice = _tool_choice_to_anthropic(tool_choice)
             if anthropic_choice is not None:
                 kwargs["tool_choice"] = anthropic_choice
+        return kwargs
 
+    async def call(
+        self,
+        *,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSchema] | None,
+        tool_choice: ToolChoice,
+        max_tokens: int,
+        timeout_s: float | None,
+    ) -> ProviderResponse:
+        kwargs = self._build_kwargs(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+        )
         coro = self._client.messages.create(**kwargs)
         try:
             sdk_msg = await (asyncio.wait_for(coro, timeout_s) if timeout_s is not None else coro)
@@ -94,6 +115,56 @@ class AnthropicProvider:
             raise AIError(f"AI call exceeded {timeout_s}s") from exc
 
         return _response_from_anthropic(sdk_msg, self._model)
+
+    async def call_stream(
+        self,
+        *,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSchema] | None,
+        tool_choice: ToolChoice,
+        max_tokens: int,
+        timeout_s: float | None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream one turn, yielding TextDelta for real text then StreamDone.
+
+        Uses the SDK's `messages.stream()` context manager. Only `text` content
+        deltas are forwarded; a reasoning model's leading `thinking` deltas are
+        dropped so the orchestrator and client never see chain-of-thought. The
+        terminal StreamDone carries the same ProviderResponse `call()` would
+        return (assembled from `get_final_message()`), so usage, stop_reason, and
+        multi-turn persistence are identical to the buffered path.
+
+        The per-call deadline is enforced as a wall-clock budget across the whole
+        stream: each delta await is bounded so a stalled stream cannot hang the
+        turn, matching the asyncio.wait_for bound on call().
+        """
+        kwargs = self._build_kwargs(
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+        )
+        deadline = (asyncio.get_event_loop().time() + timeout_s) if timeout_s is not None else None
+
+        try:
+            async with self._client.messages.stream(**kwargs) as stream:
+                async for event in stream:
+                    if deadline is not None and asyncio.get_event_loop().time() > deadline:
+                        raise AIError(f"AI call exceeded {timeout_s}s")
+                    # The SDK surfaces text-only deltas via this typed event; it
+                    # excludes thinking/tool_use input deltas, which is exactly
+                    # the filter we want (forward real answer text only).
+                    if getattr(event, "type", None) == "text":
+                        text = getattr(event, "text", "")
+                        if text:
+                            yield TextDelta(text=text)
+                final = await stream.get_final_message()
+        except asyncio.TimeoutError as exc:
+            raise AIError(f"AI call exceeded {timeout_s}s") from exc
+
+        yield StreamDone(response=_response_from_anthropic(final, self._model))
 
 
 def _system_to_anthropic(system: str) -> list[dict[str, Any]]:

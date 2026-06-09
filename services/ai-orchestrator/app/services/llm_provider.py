@@ -151,6 +151,36 @@ class ProviderResponse:
     raw_model: str
 
 
+@dataclass(frozen=True)
+class TextDelta:
+    """An incremental chunk of assistant TEXT during a streamed turn.
+
+    Streaming only forwards real `text` content. A reasoning model (e.g. Qwen
+    via a local Anthropic-compatible endpoint) emits a leading `thinking` block;
+    providers MUST drop thinking deltas here so the orchestrator and client never
+    see raw chain-of-thought, exactly as the buffered path keeps only TextBlock.
+    """
+
+    text: str
+    type: Literal["text_delta"] = "text_delta"
+
+
+@dataclass(frozen=True)
+class StreamDone:
+    """Terminal event of a streamed turn, carrying the fully-assembled turn.
+
+    `response` is byte-for-byte what `call()` would have returned for the same
+    request, so the orchestrator's tool-loop, usage accounting, and multi-turn
+    persistence work identically whether the turn was streamed or buffered.
+    """
+
+    response: ProviderResponse
+    type: Literal["stream_done"] = "stream_done"
+
+
+StreamEvent = TextDelta | StreamDone
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """One LLM-turn primitive. All orchestration (multi-turn loops, timeouts,
@@ -167,3 +197,10 @@ class LLMProvider(Protocol):
         max_tokens: int,
         timeout_s: float | None,
     ) -> ProviderResponse: ...
+
+    # call_stream is OPTIONAL: a provider that omits it simply does not support
+    # streaming, and AIClient falls back to the buffered call(). Implementers
+    # yield TextDelta events for real text content (dropping thinking/tool_use
+    # deltas) and a final StreamDone carrying the assembled ProviderResponse.
+    # Declared here for documentation; presence is checked with hasattr, not by
+    # the Protocol, so non-streaming providers still satisfy LLMProvider.

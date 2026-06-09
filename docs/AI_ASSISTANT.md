@@ -99,6 +99,21 @@ Errors:
 
 Note: the iter-1 413 response (rendered context exceeded a size ceiling) no longer exists. Per-tool-result truncation handles oversized payloads instead, with a `... [truncated: N chars omitted]` marker appended to the affected tool result.
 
+## Streaming endpoint (SSE)
+
+`POST /api/ai/reservations/{id}/assistant/stream`
+
+Same request body, auth, ownership, quota, and persistence as the buffered endpoint above; the difference is the response is a `text/event-stream` (Server-Sent Events) so the answer renders as it is produced instead of arriving in one payload. Setup failures (401, 404, 422, 503, quota 429) still surface as real HTTP status codes before the stream opens; a failure after streaming has begun arrives as an `error` event, since the HTTP status is already committed.
+
+Event types (each frame is `event: <type>` then `data: <json>`):
+
+- `status`: a progress signal, `{ "message": "analyzing" | "running tools", "tools": ["list_ports", ...], "interim": false }`. `interim` is `true` on the status that follows a tool turn's narration text, the client's cue to discard the provisional tokens streamed so far in that turn before the tools run.
+- `token`: one chunk of the final answer text, `{ "text": "..." }`. Only real answer text is streamed; a reasoning model's internal thinking is dropped.
+- `done`: the fully-assembled turn, carrying the same JSON object the buffered endpoint returns (`answer`, `model`, token counts, `stop_reason`, `tool_calls`, `tool_iterations`, `conversation_id`, `pending_apply`).
+- `error`: `{ "message": "..." }` for a failure after the stream opened (timeout or LLM failure).
+
+The conversation is persisted after the stream completes, so a `conversation_id` from a streamed `done` event can be passed to either endpoint to continue the thread. The buffered endpoint remains available; streaming is opt-in per request by calling the `/stream` path.
+
 ## Privacy and safety
 
 - The question text is **not** logged. The per-request structured log entry records reservation id, model, token counts, stop reason, question length, `tool_iterations`, and `tool_call_count`, never the question content itself.
