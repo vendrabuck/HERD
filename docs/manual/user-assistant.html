@@ -50,11 +50,11 @@
   <main class="main">
     <span class="kicker user">User track · Step 5 · Optional</span>
     <h1 class="title">The AI reservation assistant</h1>
-    <p class="dek">Every reservation has an <b>AI Assistant</b> tab: a chat that can answer questions about <em>that</em> reservation &mdash; what's connected to what, the current config of a device, whether your last apply worked, whether two devices can reach each other. It reads live data with your own permissions and, by default, only ever looks.</p>
+    <p class="dek">Every reservation has an <b>AI Assistant</b> tab: a chat that can answer questions about <em>that</em> reservation; what's connected to what, the current config of a device, whether your last apply worked, whether two devices can reach each other. It reads live data with your own permissions and, by default, only ever looks.</p>
 
     <div class="lost">
       <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The headline</div>
-      <p>It's <strong>read-only out of the box</strong>. It can't reserve, cancel, cable, or change a device unless an admin has explicitly turned write tools on &mdash; and even then, every change is a <b>dry run you confirm</b> before anything real happens. It only sees what <em>you</em> are already allowed to see.</p>
+      <p>It's <strong>read-only out of the box</strong>. It can't reserve, cancel, cable, or change a device unless an admin has explicitly turned write tools on; and even then, every change is a <b>dry run you confirm</b> before anything real happens. It only sees what <em>you</em> are already allowed to see.</p>
     </div>
 
     <h2 class="sec" id="have">First things first</h2>
@@ -74,7 +74,7 @@
     </div>
     <div class="callout calm">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
-      <div><p>The provider can be a hosted model or one your team self-hosts. The assistant is the most demanding AI surface in HERD &mdash; if your deployment runs a small local model, simple questions will be fine but deep multi-step diagnostics may be weaker than on a large model. That's a deployment choice, not something you set.</p></div>
+      <div><p>The provider can be a hosted model or one your team self-hosts. The assistant is the most demanding AI surface in HERD; if your deployment runs a small local model, simple questions will be fine but deep multi-step diagnostics may be weaker than on a large model. That's a deployment choice, not something you set.</p></div>
     </div>
 
     <h2 class="sec" id="open">Getting there</h2>
@@ -104,7 +104,7 @@
                         <div class="tph"><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>3 tools called &middot; 0.4s</div>
                         <div class="hd-toolrow"><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg><span class="tn">get_device_ports</span><span class="ta">device_id=fw-edge-01</span><span class="td">61&thinsp;ms</span></div>
                         <div class="hd-toolrow"><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg><span class="tn">get_device_ports</span><span class="ta">device_id=spine-sw-01</span><span class="td">58&thinsp;ms</span></div>
-                        <div class="hd-toolrow"><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg><span class="tn">find_path</span><span class="ta">fw-edge-01 &rarr; client-07</span><span class="td">112&thinsp;ms</span></div>
+                        <div class="hd-toolrow"><svg class="ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg><span class="tn">find_path</span><span class="ta">fw-edge-01 to client-07</span><span class="td">112&thinsp;ms</span></div>
                       </div>
                     </div>
                   </div>
@@ -123,7 +123,7 @@
 
     <ol class="legend">
       <li><b>The tab.</b> Only here when AI is configured and the reservation is yours. Everything below is scoped to this one reservation.</li>
-      <li><b>The answer.</b> Grounded in live data &mdash; device names, real config, actual paths &mdash; not a guess. If it can't find something, it says so rather than inventing it.</li>
+      <li><b>The answer.</b> Grounded in live data; device names, real config, actual paths; not a guess. If it can't find something, it says so rather than inventing it.</li>
       <li><b>The tool-call panel.</b> Collapsible. Shows exactly which read-only lookups the assistant made, with arguments and timing, so you can see <em>how</em> it reached the answer.</li>
       <li><b>The input.</b> Type, then <kbd>Enter</kbd> to send or click <b>Send</b>.</li>
     </ol>
@@ -137,20 +137,20 @@
       <li>&ldquo;What is the current config of my firewall?&rdquo;</li>
       <li>&ldquo;Did the last apply on <span style="font-family:var(--font-mono);font-size:.9em">switch-a</span> succeed?&rdquo;</li>
       <li>&ldquo;Is there an L2 path between my firewall and my client?&rdquo;</li>
-      <li>&ldquo;When does this reservation end?&rdquo; &mdash; answered instantly, with no lookups at all.</li>
+      <li>&ldquo;When does this reservation end?&rdquo;; answered instantly, with no lookups at all.</li>
     </ul>
 
     <h2 class="sec" id="read">How it actually answers</h2>
     <p class="sectitle">Reading the answer</p>
-    <p>Behind the scenes the assistant is handed a thin <strong>seed</strong> when the conversation opens &mdash; the reservation's basics and a one-line summary of each device. If your question fits in that, it answers immediately with <b>zero tool calls</b>. If it needs more (a device's real config, the cable path, the last run's result), it calls one or more <strong>read-only tools</strong>, then answers. The tool-call panel under each answer is your receipt.</p>
+    <p>Behind the scenes the assistant is handed a thin <strong>seed</strong> when the conversation opens; the reservation's basics and a one-line summary of each device. If your question fits in that, it answers immediately with <b>zero tool calls</b>. If it needs more (a device's real config, the cable path, the last run's result), it calls one or more <strong>read-only tools</strong>, then answers. The tool-call panel under each answer is your receipt.</p>
     <div class="callout tip">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></span>
-      <div><span class="ttl">The panel is how you trust it</span><p>If an answer looks surprising, expand the tool panel. The named lookups and their arguments tell you whether the assistant actually checked the thing it's claiming &mdash; or whether it's reasoning from the seed alone.</p></div>
+      <div><span class="ttl">The panel is how you trust it</span><p>If an answer looks surprising, expand the tool panel. The named lookups and their arguments tell you whether the assistant actually checked the thing it's claiming; or whether it's reasoning from the seed alone.</p></div>
     </div>
 
     <h2 class="sec" id="sees">Its reach is your reach</h2>
     <p class="sectitle">What the assistant can see</p>
-    <p>Every lookup the assistant makes runs <strong>as you</strong> &mdash; same login, same device-group visibility, same ownership rules. It can't see a device you can't see, or peek into someone else's reservation. There are seven read-only tools:</p>
+    <p>Every lookup the assistant makes runs <strong>as you</strong>; same login, same device-group visibility, same ownership rules. It can't see a device you can't see, or peek into someone else's reservation. There are seven read-only tools:</p>
 
     <div class="hd-card" style="margin:18px 0;">
       <table class="hd-table">
@@ -162,7 +162,7 @@
           <tr><td class="name">Config schema</td><td>Which config keys are valid for that device's type.</td></tr>
           <tr><td class="name">Config history</td><td>Recent config versions (metadata only, newest first).</td></tr>
           <tr><td class="name">Find path</td><td>Whether two devices in this reservation can reach each other, and over how many hops.</td></tr>
-          <tr><td class="name">Recent executions</td><td>The last driver runs for <em>this</em> reservation &mdash; the reservation is pinned server-side, so it can't be redirected at another one.</td></tr>
+          <tr><td class="name">Recent executions</td><td>The last driver runs for <em>this</em> reservation; the reservation is pinned server-side, so it can't be redirected at another one.</td></tr>
         </tbody>
       </table>
     </div>
@@ -181,7 +181,7 @@
 
     <h2 class="sec" id="write">Beyond looking</h2>
     <p class="sectitle">Asking it to change config</p>
-    <p>By default the assistant <strong>cannot change anything</strong>. If your admin has turned on write tools for the deployment, you can also ask it to <em>propose</em> a config change &mdash; but the safety rail is always the same: it builds the change as a <b>dry run</b> first, shows you exactly what the device would receive, and does nothing real until you confirm.</p>
+    <p>By default the assistant <strong>cannot change anything</strong>. If your admin has turned on write tools for the deployment, you can also ask it to <em>propose</em> a config change; but the safety rail is always the same: it builds the change as a <b>dry run</b> first, shows you exactly what the device would receive, and does nothing real until you confirm.</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -216,7 +216,7 @@
     </ol>
     <div class="callout warn">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
-      <div><span class="ttl">No write tools? Then it's looking only</span><p>If your deployment hasn't enabled write tools, the assistant simply won't offer to change anything &mdash; it'll tell you what it would do and leave the doing to you. There is no way for it to apply a change without the confirm step.</p></div>
+      <div><span class="ttl">No write tools? Then it's looking only</span><p>If your deployment hasn't enabled write tools, the assistant simply won't offer to change anything; it'll tell you what it would do and leave the doing to you. There is no way for it to apply a change without the confirm step.</p></div>
     </div>
 
     <h2 class="sec" id="privacy">The fine print that's actually reassuring</h2>
@@ -232,10 +232,10 @@
       <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The tab is missing, or a question errored out</span></summary>
       <div class="acc-body">
         <ul class="list">
-          <li><b>No AI Assistant tab at all:</b> AI isn't configured on this deployment (same switch as the <a href="user-ai.html#have">Use AI</a> button) &mdash; ask your admin &mdash; or you're looking at a reservation you don't own.</li>
+          <li><b>No AI Assistant tab at all:</b> AI isn't configured on this deployment (same switch as the <a href="user-ai.html#have">Use AI</a> button); ask your admin; or you're looking at a reservation you don't own.</li>
           <li><b>&ldquo;Not configured&rdquo; / it refuses:</b> the AI provider isn't set up. Admin task, not yours.</li>
           <li><b>It timed out:</b> a heavy question that fanned out into many lookups can hit the deadline. Ask something narrower, or break it into two questions.</li>
-          <li><b>It says it can't see a device:</b> that device isn't in your visibility. Same permissions fix as <a href="quickstart.html#empty">first boot</a> &mdash; the assistant is bounded by your access on purpose.</li>
+          <li><b>It says it can't see a device:</b> that device isn't in your visibility. Same permissions fix as <a href="quickstart.html#empty">first boot</a>; the assistant is bounded by your access on purpose.</li>
         </ul>
       </div>
     </div>

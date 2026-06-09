@@ -623,9 +623,12 @@ cabling or reservations.
 The schema registry lives in
 `services/common/herd_common/device_config.py` (the `config_validator` module
 in the ai-orchestrator service is a thin re-export of it). Adding a new
-connection type's allowlist is a one-file change there; a future iteration
-can let each driver publish its own method schema via the execution service
-instead.
+connection type's allowlist is a one-file change there. Drivers can also publish
+their own config schema: a `config_schema()` classmethod on the `Driver` class
+returning a JSON Schema dict is extracted (without instantiating the driver) via
+the execution service and used to validate device configs, falling back to this
+registry when a driver omits it (issue #23). A full driver-authoring section for
+the classmethod contract lands with that feature's docs slice.
 
 ## Packaging quickstart
 
