@@ -21,6 +21,10 @@
       "/reservations/{reservation_id}/assistant"
     ],
     [
+      "POST",
+      "/reservations/{reservation_id}/assistant/stream"
+    ],
+    [
       "GET",
       "/status"
     ],
