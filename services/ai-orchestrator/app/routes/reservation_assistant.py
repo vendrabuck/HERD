@@ -237,10 +237,12 @@ async def reservation_assistant(
             f"Assistant did not respond within {settings.assistant_overall_deadline_s:.0f}s",
         ) from exc
     except AIError as exc:
+        # Log the exception detail server-side; return a generic message so a
+        # backend exception string is never exposed to the client (CWE-209).
         logger.exception("ai_assistant_failed")
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
-            f"Assistant call failed: {exc}",
+            "Assistant call failed",
         ) from exc
 
     tool_calls = [
@@ -394,9 +396,12 @@ async def reservation_assistant_stream(
                     )
                 },
             )
-        except AIError as exc:
+        except AIError:
+            # Log the exception detail server-side; the client-facing error frame
+            # carries a generic message so no backend exception string leaks
+            # (CWE-209 stack-trace exposure).
             logger.exception("ai_assistant_stream_failed")
-            yield _sse("error", {"message": f"Assistant call failed: {exc}"})
+            yield _sse("error", {"message": "Assistant call failed"})
 
     return StreamingResponse(
         _event_stream(),

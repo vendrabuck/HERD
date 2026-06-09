@@ -660,7 +660,10 @@ async def test_stream_emits_error_event_on_ai_failure(async_client):
     assert resp.status_code == 200
     events = _parse_sse(resp.text)
     assert events[-1][0] == "error"
-    assert "model exploded" in events[-1][1]["message"]
+    # The client-facing message is generic; the raw exception text must NOT leak
+    # (CWE-209), it is logged server-side instead.
+    assert events[-1][1]["message"] == "Assistant call failed"
+    assert "model exploded" not in events[-1][1]["message"]
 
 
 async def test_stream_requires_auth(async_client):
