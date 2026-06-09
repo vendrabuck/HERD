@@ -98,6 +98,7 @@ Transitions (from state, to state, trigger):
 - `FAILED` rows persist for audit but hold no devices.
 - `CANCELLED` and `COMPLETED` are terminal states.
 - `_check_conflicts` treats `PENDING`, `PENDING_PROVISION`, and `ACTIVE` as conflicting; two concurrent creates for the same exclusive device race safely.
+- On reaching `ACTIVE`, if the reservation has a topology, the cabling service creates an editable per-reservation fork of it (pinning the parent's current version) for later live edits (issue #25, partial: fork creation only so far). This is best-effort: a fork-create failure is logged and does not strand the activated reservation.
 
 ## Topology separation
 
