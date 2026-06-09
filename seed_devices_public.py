@@ -1557,6 +1557,104 @@ def create_users(client: httpx.Client) -> None:
             )
 
 
+# --- ACL test fixtures (dedicated, scoped-visibility demo) -------------------
+# A regular user ("scuser") that can see only a single "Santa Clara" device
+# group, plus an unscoped admin ("scadmin") that sees everything. Used to
+# exercise non-admin device-group ACL filtering by hand. Kept separate from the
+# bulk users so it does not entangle with the 1000-user load fixtures.
+ACL_TEST_USERS = [
+    {"username": "scuser", "email": "scuser@herd.dev", "password": "scuser123", "role": None},
+    {"username": "scadmin", "email": "scadmin@herd.dev", "password": "scadmin123", "role": "admin"},
+]
+SANTA_CLARA_DEVICE_GROUP = "Santa Clara"
+SANTA_CLARA_USER_GROUP = "Santa Clara Techs"
+SANTA_CLARA_DEVICE_COUNT = 3
+
+
+def register_acl_user(client: httpx.Client, spec: dict) -> str | None:
+    """Idempotently register one user; set admin role if requested. Returns user id."""
+    resp = client.post(
+        f"{BASE}/auth/register",
+        json={
+            "email": spec["email"],
+            "username": spec["username"],
+            "password": spec["password"],
+        },
+    )
+    if resp.status_code == 201:
+        uid = resp.json()["id"]
+        print(f"  Created user: {spec['username']} ({uid})")
+    elif resp.status_code == 409:
+        uid = get_user_id(client, spec["username"])
+        print(f"  Exists user: {spec['username']} ({uid})")
+    else:
+        print(f"  Failed to register {spec['username']}: {resp.status_code} {resp.text}")
+        return None
+    if spec["role"] == "admin" and uid:
+        client.put(f"{BASE}/auth/users/{uid}/role", json={"role": "admin"})
+    return uid
+
+
+def pick_dut_template(client: httpx.Client) -> str | None:
+    """Pick a device template backed by a Management-connection driver (a DUT).
+
+    The non-admin device list is dut_only: it shows only devices whose driver
+    connection_type is Management. A switch-backed template would be filtered out
+    of a scoped user's view, so the Santa Clara demo devices must be DUTs. Falls
+    back to the first device template if no Management driver is found.
+    """
+    drivers = client.get(f"{BASE}/inventory/drivers", params={"limit": 500}).json().get("items", [])
+    mgmt_driver_ids = {d["id"] for d in drivers if d.get("connection_type") == "Management"}
+    listing = client.get(
+        f"{BASE}/inventory/templates",
+        params={"template_type": "device", "limit": 500},
+    )
+    items = listing.json().get("items", [])
+    for t in items:
+        if t.get("driver_id") in mgmt_driver_ids:
+            return t["id"]
+    return items[0]["id"] if items else None
+
+
+def seed_acl_test_fixtures(client: httpx.Client) -> None:
+    """Stage the Santa Clara ACL demo: scoped user, unscoped admin, one device group."""
+    print("\n--- ACL Test Fixtures (Santa Clara) ---")
+    template_id = pick_dut_template(client)
+    if not template_id:
+        print("  No device template available; skipping ACL fixtures")
+        return
+
+    # Dedicated devices, grouped only under Santa Clara, so scuser sees exactly these.
+    device_ids = []
+    for i in range(1, SANTA_CLARA_DEVICE_COUNT + 1):
+        name = f"santa-clara-{i:02d}"
+        device_ids.append(get_or_create_device(client, name, template_id, ip=f"10.70.0.{i}"))
+    print(f"  {len(device_ids)} Santa Clara devices")
+
+    dg_id = get_or_create_device_group(
+        client, SANTA_CLARA_DEVICE_GROUP, "Santa Clara lab resources (ACL test)"
+    )
+    bulk_add_devices_to_group(client, dg_id, device_ids)
+
+    ug_id = get_or_create_group(
+        client, SANTA_CLARA_USER_GROUP, "Santa Clara technicians (ACL test)"
+    )
+    bulk_add_permissions_to_device_group(client, dg_id, [ug_id])
+
+    scuser_id = None
+    for spec in ACL_TEST_USERS:
+        uid = register_acl_user(client, spec)
+        if uid and spec["username"] == "scuser":
+            scuser_id = uid
+    if scuser_id:
+        add_group_member(client, ug_id, scuser_id)
+        print(f"  Added scuser to {SANTA_CLARA_USER_GROUP}")
+    print(
+        "  ACL fixtures ready. Login by email: scuser@herd.dev / scuser123 "
+        f"(sees only {SANTA_CLARA_DEVICE_GROUP}); scadmin@herd.dev / scadmin123 (admin, sees all)."
+    )
+
+
 def main() -> None:
     client = httpx.Client(verify=False, timeout=30.0)
     token = login(client)
@@ -1941,6 +2039,9 @@ def main() -> None:
         else:
             print(f"  {dg_name}: no matching user groups")
 
+    # Dedicated ACL test users + Santa Clara device group (scoped-visibility demo)
+    seed_acl_test_fixtures(client)
+
     total_dut_ports = sum(
         TEMPLATE_PORT_COUNTS.get(d["template"], DEFAULT_PORT_COUNT) for d in DEVICES
     )
@@ -1959,4 +2060,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # `--acl-only` stages just the Santa Clara ACL fixtures against an already
+    # seeded stack, so they can be (re)applied without the full ~20 min seed.
+    if "--acl-only" in sys.argv:
+        acl_client = httpx.Client(verify=False, timeout=30.0)
+        acl_token = login(acl_client)
+        acl_client.headers["Authorization"] = f"Bearer {acl_token}"
+        seed_acl_test_fixtures(acl_client)
+    else:
+        main()
