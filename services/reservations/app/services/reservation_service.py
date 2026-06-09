@@ -137,6 +137,85 @@ async def _validate_topology_connectivity(topology_id: uuid.UUID) -> None:
     )
 
 
+async def _create_reservation_fork(
+    reservation_id: uuid.UUID,
+    topology_id: uuid.UUID | None,
+) -> None:
+    """Create the editable per-reservation fork in cabling at activation (issue #25).
+
+    Cabling owns the fork (deep-copies the parent canvas, snapshots its relevant
+    physical wiring, writes fork_versions v1). We pass parent_version_id=None and
+    let cabling pin the parent's current max TopologyVersion itself (Decision 3
+    Case B): provisioning already runs at activation against current inventory, so
+    the wiring is pinned to the same instant.
+
+    Authenticated as a service-to-service call via X-Internal-Token: the booking
+    user does not necessarily own the parent topology.
+
+    Fail-open: a fork-create failure must NOT strand a successfully-provisioned
+    reservation. The caller wraps this in retry_with_backoff and, on exhaustion,
+    logs and continues, leaving fork_id null. The reservation is still usable; the
+    editable bench is created lazily on first edit or by a sweeper (a later PR).
+    """
+    if topology_id is None:
+        # Decision 3 Case A: no parent topology, create the fork lazily on first
+        # edit rather than manufacturing an empty fork at activation.
+        return
+    if not settings.internal_api_token:
+        logger.warning(
+            "internal_api_token not configured; skipping fork creation for %s",
+            reservation_id,
+        )
+        return
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{settings.cabling_service_url}/internal/forks",
+            headers={"X-Internal-Token": settings.internal_api_token},
+            json={
+                "reservation_id": str(reservation_id),
+                "parent_topology_id": str(topology_id),
+                "parent_version_id": None,
+            },
+            timeout=10.0,
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
+
+
+async def _create_reservation_fork_best_effort(
+    reservation_id: uuid.UUID,
+    topology_id: uuid.UUID | None,
+) -> None:
+    """Run _create_reservation_fork with bounded retry and log-and-continue.
+
+    Fork creation is best-effort at activation: it must never raise out of
+    create_reservation and strand a provisioned reservation. Exhausted retries are
+    logged structured and swallowed, leaving the reservation ACTIVE with no fork.
+    """
+    if topology_id is None:
+        return
+    try:
+        await retry_with_backoff(
+            lambda: _create_reservation_fork(reservation_id, topology_id),
+            attempts=3,
+            initial_delay=0.5,
+            factor=2.0,
+            max_delay=5.0,
+        )
+    except Exception:
+        logger.error(
+            "Fork creation failed for reservation %s; leaving fork_id null",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_create_failed",
+                "reservation_id": str(reservation_id),
+                "topology_id": str(topology_id),
+            },
+            exc_info=True,
+        )
+
+
 async def _check_conflicts(
     db: AsyncSession,
     device_ids: list[uuid.UUID],
@@ -433,7 +512,13 @@ async def create_reservation(
         await db.commit()
         await db.refresh(reservation)
 
-    # 8. Emit NATS event (only on successful provisioning)
+    # 8. Create the editable per-reservation fork in cabling now that the
+    #    reservation is ACTIVE (issue #25). Best-effort: a fork-create failure must
+    #    not strand the provisioned reservation, so this never raises. Skipped when
+    #    there is no parent topology (Case A lazy-create).
+    await _create_reservation_fork_best_effort(reservation.id, reservation.topology_id)
+
+    # 9. Emit NATS event (only on successful provisioning)
     await _publish_nats_event(
         nats_conn,
         "herd.reservations.created",

@@ -16,6 +16,8 @@ from app.schemas.reservation import ReservationCreate, ReservationUpdate
 from app.services.reservation_service import (
     _acquire_device_locks,
     _check_conflicts,
+    _create_reservation_fork,
+    _create_reservation_fork_best_effort,
     _fetch_devices,
     _fetch_devices_best_effort,
     _publish_nats_event,
@@ -1339,3 +1341,137 @@ async def test_update_reservation_changed_end_time_is_flagged_and_carried():
         payload = mock_publish.call_args.args[2]
         assert payload["end_time_changed"] is True
         assert payload["end_time"] == result.end_time.isoformat()
+
+
+# --- fork-on-activation (issue #25) ---
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_fork_skips_when_no_topology():
+    """No parent topology means no fork at activation (Decision 3 Case A skip).
+
+    The cabling client must not even be constructed.
+    """
+    with patch("app.services.reservation_service.httpx.AsyncClient") as mock_client:
+        await _create_reservation_fork(uuid.uuid4(), None)
+    mock_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_fork_posts_to_cabling():
+    """With a topology, we POST /internal/forks with parent_version_id null so
+    cabling pins the parent's current version itself (Decision 3 Case B)."""
+    reservation_id = uuid.uuid4()
+    topology_id = uuid.uuid4()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 201
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("app.services.reservation_service.settings") as mock_settings,
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cabling:8000"
+        await _create_reservation_fork(reservation_id, topology_id)
+
+    mock_client.post.assert_awaited_once()
+    _, kwargs = mock_client.post.call_args
+    assert kwargs["json"]["reservation_id"] == str(reservation_id)
+    assert kwargs["json"]["parent_topology_id"] == str(topology_id)
+    assert kwargs["json"]["parent_version_id"] is None
+    assert kwargs["headers"]["X-Internal-Token"] == "tok"
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_fork_no_token_skips():
+    with patch("app.services.reservation_service.settings") as mock_settings:
+        mock_settings.internal_api_token = ""
+        # Should return without raising and without an HTTP client.
+        with patch("app.services.reservation_service.httpx.AsyncClient") as mock_client:
+            await _create_reservation_fork(uuid.uuid4(), uuid.uuid4())
+        mock_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_fork_raises_on_4xx():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 500
+    mock_resp.text = "boom"
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("app.services.reservation_service.settings") as mock_settings,
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cabling:8000"
+        with pytest.raises(RuntimeError, match="500"):
+            await _create_reservation_fork(uuid.uuid4(), uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_fork_best_effort_swallows_exhausted_retries():
+    """A fork-create that fails every retry is logged and swallowed: it must NOT
+    raise out and strand the provisioned reservation."""
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(side_effect=RuntimeError("cabling down")),
+    ):
+        # No exception escapes.
+        await _create_reservation_fork_best_effort(uuid.uuid4(), uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_fork_best_effort_skips_no_topology():
+    """No topology means the best-effort wrapper short-circuits without retrying."""
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(),
+    ) as mock_fork:
+        await _create_reservation_fork_best_effort(uuid.uuid4(), None)
+    mock_fork.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_invokes_fork_when_topology_present():
+    """End-to-end: an ACTIVE reservation with a topology fires fork creation once."""
+    topology_id = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        devices = [_make_device(DEVICE_A, exclusive=False)]
+        data = ReservationCreate(
+            device_ids=[DEVICE_A],
+            topology_id=topology_id,
+            start_time=NOW + timedelta(hours=1),
+            end_time=NOW + timedelta(hours=3),
+        )
+        fork_mock = AsyncMock()
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices",
+                new=AsyncMock(return_value=devices),
+            ),
+            patch(
+                "app.services.reservation_service._validate_topology_connectivity",
+                new=AsyncMock(),
+            ),
+            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
+            patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
+            patch(
+                "app.services.reservation_service._create_reservation_fork_best_effort",
+                new=fork_mock,
+            ),
+        ):
+            res = await create_reservation(db, data, USER_ID, "token")
+        assert res.status == ReservationStatus.ACTIVE
+        fork_mock.assert_awaited_once()
+        called_args = fork_mock.call_args.args
+        assert called_args[0] == res.id
+        assert called_args[1] == topology_id
