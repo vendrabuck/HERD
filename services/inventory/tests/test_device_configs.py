@@ -728,3 +728,138 @@ async def test_cancel_already_cancelled_job(client):
     await client.delete(f"/apply-jobs/{job_id}")
     second = await client.delete(f"/apply-jobs/{job_id}")
     assert second.status_code == 409
+
+
+# ---- driver-published config schema (issue #23, slice 4) ----
+#
+# create/restore prefer the driver-published schema over the registry, with a
+# fail-open fallback to the registry when execution is unreachable. We patch the
+# resolver (published_schema_for_device) at the router boundary so these stay
+# pure unit tests with no execution service.
+
+# A published schema narrower than the Management registry: only hostname,
+# additionalProperties:false. The registry would accept `vlan`/`ip`; this does
+# not, which is how we prove the published schema overrides the registry.
+_PUBLISHED_MGMT_SCHEMA = {
+    "type": "object",
+    "properties": {"hostname": {"type": "string", "maxLength": 16}},
+    "additionalProperties": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_create_uses_published_schema_accept(client):
+    device_id = await _create_device(client)
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=_PUBLISHED_MGMT_SCHEMA),
+    ):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions",
+            json={"config": {"hostname": "fw-1"}},
+        )
+    assert resp.status_code == 201
+    assert resp.json()["config"] == {"hostname": "fw-1"}
+
+
+@pytest.mark.asyncio
+async def test_create_published_schema_overrides_registry_reject(client):
+    """`vlan` is accepted by the Management registry but NOT by the published
+    schema (additionalProperties:false), so the published schema rejects it."""
+    device_id = await _create_device(client)
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=_PUBLISHED_MGMT_SCHEMA),
+    ):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions",
+            json={"config": {"vlan": 100}},
+        )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # role-prefixed, schema-validation wording
+    assert "schema validation" in detail
+
+
+@pytest.mark.asyncio
+async def test_create_falls_back_to_registry_when_no_published_schema(client):
+    """has_schema:False resolves to None; validation uses the registry, which
+    accepts `vlan` and `ip`."""
+    device_id = await _create_device(client)
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=None),
+    ):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions",
+            json={"config": {"vlan": 100, "ip": "10.0.0.1"}},
+        )
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_create_fails_open_to_registry_when_execution_unreachable(client):
+    """If the resolver returns None because execution was unreachable, the write
+    still succeeds against the registry rather than 503-ing."""
+    device_id = await _create_device(client)
+    # published_schema_for_device already fails open to None internally; emulate
+    # that here. The write must succeed against the registry.
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=None),
+    ):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions",
+            json={"config": {"vlan": 4094}},
+        )
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_create_unsafe_published_schema_falls_back_to_registry(client):
+    """A hostile published schema (remote $ref) must not break the write; the
+    router catches PublishedSchemaError and falls back to the registry."""
+    device_id = await _create_device(client)
+    hostile = {
+        "type": "object",
+        "properties": {"x": {"$ref": "http://169.254.169.254/latest/"}},
+    }
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=hostile),
+    ):
+        # registry accepts {"vlan": 10}; the hostile published schema is rejected
+        # and we fall back to the registry, so this succeeds.
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions",
+            json={"config": {"vlan": 10}},
+        )
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_restore_re_validates_against_published_schema(client):
+    """A previously-saved config that the now-tightened published schema rejects
+    must 422 on restore, not silently restore an invalid config."""
+    device_id = await _create_device(client)
+    # First save passes the registry (no published schema yet).
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=None),
+    ):
+        created = await client.post(
+            f"/devices/{device_id}/config-versions",
+            json={"config": {"vlan": 100}},
+        )
+    vid = created.json()["id"]
+
+    # Driver later publishes a schema that forbids `vlan`; restore must 422.
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=_PUBLISHED_MGMT_SCHEMA),
+    ):
+        restore = await client.post(
+            f"/devices/{device_id}/config-versions/{vid}/restore",
+            json={},
+        )
+    assert restore.status_code == 422

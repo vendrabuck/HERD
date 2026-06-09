@@ -154,6 +154,68 @@ def read_driver_metadata(driver_dir: Path) -> dict:
         return dict(DEFAULT_DRIVER_METADATA)
 
 
+def extract_config_schema_json(driver_dir: Path) -> str | None:
+    """Extract the driver-published config schema and return it JSON-encoded.
+
+    Runs the `__config_schema__` sentinel in the sandbox (which reads
+    Driver.config_schema() on the class object, never instantiating it). Returns
+    the JSON-encoded schema dict, or None when the driver published no schema,
+    returned a non-dict, or the extraction failed/timed out. This is fail-open
+    by design: a broken config_schema() must never block a driver load; the
+    validation path falls back to the registry. See issue #23.
+    """
+    # Imported lazily so unit tests that exercise extract/validate without the
+    # sandbox do not pull in the subprocess machinery at import time.
+    from app.services.driver_sandbox import extract_config_schema
+
+    try:
+        result = extract_config_schema(str(driver_dir))
+    except Exception as exc:  # defensive: the wrapper should not raise
+        logger.warning("Config-schema extraction raised for %s: %s", driver_dir, exc)
+        return None
+    if not result.get("success"):
+        logger.warning(
+            "Config-schema extraction failed for %s: %s",
+            driver_dir,
+            result.get("error"),
+        )
+        return None
+    output = result.get("output") or {}
+    if not output.get("has_schema"):
+        return None
+    schema = output.get("schema")
+    if not isinstance(schema, dict):
+        logger.warning(
+            "Driver at %s published a non-dict config schema (%s); ignoring",
+            driver_dir,
+            type(schema).__name__,
+        )
+        return None
+    return json.dumps(schema)
+
+
+async def get_driver_config_schema(db: AsyncSession, driver_id: uuid.UUID) -> dict | None:
+    """Return the cached driver-published config schema for a driver_id, or None.
+
+    Reads `DriverCache.config_schema_json`. Returns None if the driver is not
+    cached, published no schema, or the cached value is malformed. Callers that
+    need the freshest schema must call `load_driver` first (which populates the
+    cache as a side effect). None signals "no published schema; use the
+    registry".
+    """
+    result = await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id))
+    entry = result.scalar_one_or_none()
+    if entry is None or not entry.config_schema_json:
+        return None
+    try:
+        data = json.loads(entry.config_schema_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 async def get_driver_metadata(db: AsyncSession, driver_id: uuid.UUID) -> dict:
     """Return the cached driver_metadata.json for a driver_id.
 
@@ -220,6 +282,11 @@ async def load_driver(
     metadata = read_driver_metadata(dest_dir)
     metadata_json = json.dumps(metadata)
 
+    # Capture the driver-published config schema (issue #23). Fail-open: a
+    # driver that omits config_schema(), ships a broken one, or times out
+    # yields None and we degrade to the registry at validation time.
+    config_schema_json = extract_config_schema_json(dest_dir)
+
     # Update cache
     result = await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id))
     existing = result.scalar_one_or_none()
@@ -227,12 +294,14 @@ async def load_driver(
         existing.sha256 = driver_sha256
         existing.local_path = str(dest_dir)
         existing.metadata_json = metadata_json
+        existing.config_schema_json = config_schema_json
     else:
         cache_entry = DriverCache(
             driver_id=driver_id,
             sha256=driver_sha256,
             local_path=str(dest_dir),
             metadata_json=metadata_json,
+            config_schema_json=config_schema_json,
         )
         db.add(cache_entry)
     await db.commit()

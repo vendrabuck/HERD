@@ -283,6 +283,30 @@ def execute_driver_method(
             os.unlink(transcript_file)
 
 
+def extract_config_schema(driver_path: str, timeout: int | None = None) -> dict:
+    """Extract a driver's published config schema in the sandbox.
+
+    Invokes the `__config_schema__` sentinel action, which reads
+    `Driver.config_schema()` on the class object without instantiating the
+    driver (so a credential-dependent __init__ never runs). The classmethod is
+    still untrusted code, so it runs under the same rlimit subprocess and the
+    short status timeout.
+
+    Returns the standard execute_driver_method result dict. On success its
+    `output` is `{"has_schema": bool, "schema": dict | None}`. Callers must
+    treat a non-dict schema, a failed run, or a timeout as "no usable schema"
+    and fall back to the registry; this helper never raises.
+    """
+    if timeout is None:
+        timeout = settings.status_check_timeout_seconds
+    return execute_driver_method(
+        driver_path,
+        action="__config_schema__",
+        context={},
+        timeout=timeout,
+    )
+
+
 def _read_transcript(path: str | None) -> list[dict]:
     """Parse the transcript JSONL file the subprocess wrote to.
 

@@ -3,6 +3,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
+from herd_common.device_config import CONFIG_SCHEMAS
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -18,6 +19,7 @@ from app.services.driver_service import (
     replace_driver_file,
     update_driver,
 )
+from app.services.published_schema import published_schema_for_driver
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,38 @@ async def get_driver_by_id(
 ):
     """Get driver package metadata. Available to all authenticated users."""
     return await get_driver(db, driver_id)
+
+
+@router.get("/drivers/{driver_id}/config-schema")
+async def get_driver_config_schema_proxy(
+    driver_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(get_current_user_payload),
+) -> dict:
+    """Return the schema used to validate this driver's device configs.
+
+    Prefers the driver-published config schema (proxied from execution); falls
+    back to the hardcoded registry entry for the driver's connection_type when
+    the driver publishes nothing or execution is unreachable (fail-open). Drives
+    the config-editor UI. Available to all authenticated users; the validation
+    write path uses the same resolver, not this HTTP route.
+    """
+    package = await get_driver(db, driver_id)
+    published = await published_schema_for_driver(package)
+    if published is not None:
+        return {
+            "driver_id": str(driver_id),
+            "connection_type": package.connection_type,
+            "schema": published,
+            "source": "driver",
+        }
+    registry = CONFIG_SCHEMAS.get(package.connection_type)
+    return {
+        "driver_id": str(driver_id),
+        "connection_type": package.connection_type,
+        "schema": registry,
+        "source": "registry" if registry is not None else "none",
+    }
 
 
 @router.post(

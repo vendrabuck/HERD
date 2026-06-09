@@ -591,3 +591,51 @@ async def test_non_admin_forced_dut_only(mock_up, client):
     assert resp.status_code == 200
     names = [d["name"] for d in resp.json()["items"]]
     assert "Hidden Device" not in names
+
+
+# --- config-schema proxy route (issue #23, slice 3) ---
+
+
+@pytest.mark.asyncio
+@patch("app.services.driver_service.upload_object", side_effect=mock_upload_object)
+async def test_config_schema_proxy_returns_published(mock_up, client):
+    create = await create_driver_package(client, "Pub Driver")
+    driver_id = create.json()["id"]
+    published = {
+        "type": "object",
+        "properties": {"hostname": {"type": "string", "maxLength": 16}},
+        "additionalProperties": False,
+    }
+    with patch(
+        "app.routers.drivers.published_schema_for_driver",
+        new=AsyncMock(return_value=published),
+    ):
+        resp = await client.get(f"/drivers/{driver_id}/config-schema")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "driver"
+    assert body["schema"] == published
+    assert body["connection_type"] == "Management"
+
+
+@pytest.mark.asyncio
+@patch("app.services.driver_service.upload_object", side_effect=mock_upload_object)
+async def test_config_schema_proxy_falls_back_to_registry(mock_up, client):
+    create = await create_driver_package(client, "Reg Driver")
+    driver_id = create.json()["id"]
+    with patch(
+        "app.routers.drivers.published_schema_for_driver",
+        new=AsyncMock(return_value=None),
+    ):
+        resp = await client.get(f"/drivers/{driver_id}/config-schema")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "registry"
+    # Management registry entry exposes vlan/ip/hostname/description.
+    assert "vlan" in body["schema"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_config_schema_proxy_unknown_driver_404(client):
+    resp = await client.get(f"/drivers/{uuid.uuid4()}/config-schema")
+    assert resp.status_code == 404

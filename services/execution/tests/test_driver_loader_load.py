@@ -13,6 +13,7 @@ from app.models.driver_cache import DriverCache
 from app.services.driver_loader import (
     download_driver_package,
     extract_driver_package,
+    get_driver_config_schema,
     load_driver,
 )
 from sqlalchemy import select
@@ -45,6 +46,36 @@ class Driver:
     def logout(self): return {"success": True}
     def connect_ports(self, a, b): return {"success": True}
     def disconnect_ports(self, a, b): return {"success": True}
+    def status(self): return {"reachable": True}
+"""
+
+
+MGMT_DRIVER_WITH_SCHEMA = """
+class Driver:
+    def __init__(self, context):
+        self.context = context
+    @classmethod
+    def config_schema(cls):
+        return {
+            "type": "object",
+            "properties": {"hostname": {"type": "string", "maxLength": 64}},
+            "additionalProperties": False,
+        }
+    def login(self): return {"success": True}
+    def logout(self): return {"success": True}
+    def configure(self, **kwargs): return {"success": True}
+    def backup(self): return {"success": True}
+    def status(self): return {"reachable": True}
+"""
+
+MGMT_DRIVER_NO_SCHEMA = """
+class Driver:
+    def __init__(self, context):
+        self.context = context
+    def login(self): return {"success": True}
+    def logout(self): return {"success": True}
+    def configure(self, **kwargs): return {"success": True}
+    def backup(self): return {"success": True}
     def status(self): return {"reachable": True}
 """
 
@@ -201,6 +232,86 @@ class Driver:
             mock_settings.internal_api_token = "token"
             with pytest.raises(ValueError, match="validation failed"):
                 await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
+
+
+# --- config_schema_json capture (issue #23) ---
+
+
+@pytest.mark.asyncio
+async def test_load_driver_persists_published_config_schema(db):
+    """A Management driver shipping config_schema() has its schema cached and
+    readable via get_driver_config_schema."""
+    driver_id = uuid.uuid4()
+    zip_bytes = _make_zip(MGMT_DRIVER_WITH_SCHEMA)
+
+    with tempfile.TemporaryDirectory() as cache_root:
+        with (
+            patch(
+                "app.services.driver_loader.download_driver_package",
+                new=AsyncMock(return_value=zip_bytes),
+            ),
+            patch("app.services.driver_loader.settings") as mock_settings,
+        ):
+            mock_settings.driver_cache_path = cache_root
+            mock_settings.inventory_service_url = "http://test"
+            mock_settings.internal_api_token = "token"
+            # status_check_timeout_seconds is read by the sandbox wrapper.
+            mock_settings.status_check_timeout_seconds = 10
+            mock_settings.execution_timeout_seconds = 30
+            mock_settings.allow_driver_pip_install = False
+            mock_settings.driver_rlimit_as_bytes = 0
+            mock_settings.driver_rlimit_cpu_seconds = 0
+            mock_settings.driver_rlimit_nofile = 0
+            mock_settings.driver_rlimit_nproc = 0
+            await load_driver(db, driver_id, "sha", "driver.zip", "Management")
+
+    row = (
+        await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id))
+    ).scalar_one()
+    assert row.config_schema_json is not None
+
+    schema = await get_driver_config_schema(db, driver_id)
+    assert schema is not None
+    assert schema["properties"]["hostname"]["maxLength"] == 64
+
+
+@pytest.mark.asyncio
+async def test_load_driver_no_schema_leaves_column_null(db):
+    """A Management driver without config_schema() caches NULL; the helper
+    returns None so validation falls back to the registry."""
+    driver_id = uuid.uuid4()
+    zip_bytes = _make_zip(MGMT_DRIVER_NO_SCHEMA)
+
+    with tempfile.TemporaryDirectory() as cache_root:
+        with (
+            patch(
+                "app.services.driver_loader.download_driver_package",
+                new=AsyncMock(return_value=zip_bytes),
+            ),
+            patch("app.services.driver_loader.settings") as mock_settings,
+        ):
+            mock_settings.driver_cache_path = cache_root
+            mock_settings.inventory_service_url = "http://test"
+            mock_settings.internal_api_token = "token"
+            mock_settings.status_check_timeout_seconds = 10
+            mock_settings.execution_timeout_seconds = 30
+            mock_settings.allow_driver_pip_install = False
+            mock_settings.driver_rlimit_as_bytes = 0
+            mock_settings.driver_rlimit_cpu_seconds = 0
+            mock_settings.driver_rlimit_nofile = 0
+            mock_settings.driver_rlimit_nproc = 0
+            await load_driver(db, driver_id, "sha", "driver.zip", "Management")
+
+    row = (
+        await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id))
+    ).scalar_one()
+    assert row.config_schema_json is None
+    assert await get_driver_config_schema(db, driver_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_driver_config_schema_missing_driver_returns_none(db):
+    assert await get_driver_config_schema(db, uuid.uuid4()) is None
 
 
 @pytest.mark.asyncio

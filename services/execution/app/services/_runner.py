@@ -50,6 +50,20 @@ def main():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
+    # Sentinel action: read the driver's published config schema WITHOUT
+    # instantiating Driver(context). config_schema() is a classmethod that
+    # describes the driver class, not a device session, so it must not require
+    # live credentials. Some drivers' __init__ reads context["HERD_ip_address"]
+    # and would crash here; calling on the class object sidesteps that.
+    if action == "__config_schema__":
+        fn = getattr(module.Driver, "config_schema", None)
+        result = {"has_schema": False, "schema": None}
+        if callable(fn):
+            schema = fn()  # classmethod: no instance, no context
+            result = {"has_schema": True, "schema": schema}
+        print(json.dumps(result, default=str))
+        return
+
     # Instantiate Driver
     driver = module.Driver(context)
 

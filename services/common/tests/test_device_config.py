@@ -17,7 +17,9 @@ from herd_common.device_config import (
     ALLOWED_CONFIG_KEYS,
     CONFIG_SCHEMAS,
     ConfigValidationError,
+    PublishedSchemaError,
     validate_device_config,
+    validate_device_config_with_schema,
 )
 
 # --- Module-level registry invariants ----------------------------------------
@@ -207,3 +209,132 @@ def test_schema_failure_chains_original_validation_error():
     with pytest.raises(ConfigValidationError) as exc:
         validate_device_config("Management", {"vlan": 99999})
     assert isinstance(exc.value.__cause__, jsonschema.ValidationError)
+
+
+# --- validate_device_config_with_schema: golden backward-compat (schema=None) -
+#
+# With schema=None the new function must be byte-for-byte the old behavior. We
+# assert identical outcomes AND identical 422 wording across every branch the
+# old validator has, so the registry path is provably unchanged.
+
+_PUBLISHED = {
+    "type": "object",
+    "properties": {"hostname": {"type": "string", "maxLength": 8}},
+    "additionalProperties": False,
+}
+
+
+@pytest.mark.parametrize("empty", [None, {}])
+def test_with_schema_none_empty_is_noop(empty):
+    assert validate_device_config_with_schema("Management", empty, schema=None) is None
+
+
+def test_with_schema_none_matches_registry_accept():
+    config = {"vlan": 100, "hostname": "mgmt-sw"}
+    assert validate_device_config_with_schema("Management", config, schema=None) is None
+
+
+def test_with_schema_none_missing_connection_type_same_wording():
+    with pytest.raises(ConfigValidationError) as new_exc:
+        validate_device_config_with_schema(None, {"vlan": 10}, schema=None)
+    with pytest.raises(ConfigValidationError) as old_exc:
+        validate_device_config(None, {"vlan": 10})
+    assert str(new_exc.value) == str(old_exc.value)
+
+
+def test_with_schema_none_unknown_connection_type_same_wording():
+    with pytest.raises(ConfigValidationError) as new_exc:
+        validate_device_config_with_schema("Firewall 9000", {"vlan": 10}, schema=None)
+    with pytest.raises(ConfigValidationError) as old_exc:
+        validate_device_config("Firewall 9000", {"vlan": 10})
+    assert str(new_exc.value) == str(old_exc.value)
+
+
+def test_with_schema_none_schema_failure_same_wording():
+    with pytest.raises(ConfigValidationError) as new_exc:
+        validate_device_config_with_schema("Management", {"vlan": 99999}, schema=None, role="sw1")
+    with pytest.raises(ConfigValidationError) as old_exc:
+        validate_device_config("Management", {"vlan": 99999}, role="sw1")
+    assert str(new_exc.value) == str(old_exc.value)
+
+
+# --- validate_device_config_with_schema: published-schema path ----------------
+
+
+def test_with_published_schema_accepts():
+    assert (
+        validate_device_config_with_schema("Management", {"hostname": "short"}, schema=_PUBLISHED)
+        is None
+    )
+
+
+@pytest.mark.parametrize("empty", [None, {}])
+def test_with_published_schema_empty_is_noop(empty):
+    assert validate_device_config_with_schema("Management", empty, schema=_PUBLISHED) is None
+
+
+def test_with_published_schema_rejects_with_role_prefix():
+    with pytest.raises(ConfigValidationError) as exc:
+        validate_device_config_with_schema(
+            "Management", {"hostname": "way-too-long"}, schema=_PUBLISHED, role="edge-1"
+        )
+    msg = str(exc.value)
+    assert msg.startswith("device 'edge-1'")
+    assert "schema validation" in msg
+
+
+def test_with_published_schema_overrides_registry():
+    """The published schema forbids `ip`, which the Management registry allows.
+    A config the registry would accept must be REJECTED by the published schema,
+    proving the published schema wins."""
+    # Registry accepts ip; the published schema (additionalProperties: False,
+    # only hostname) rejects it.
+    assert validate_device_config("Management", {"ip": "10.0.0.1"}) is None
+    with pytest.raises(ConfigValidationError):
+        validate_device_config_with_schema("Management", {"ip": "10.0.0.1"}, schema=_PUBLISHED)
+
+
+# --- validate_device_config_with_schema: SSRF / malformed-schema guard --------
+
+
+def test_published_schema_with_remote_ref_is_rejected():
+    hostile = {"type": "object", "properties": {"x": {"$ref": "http://169.254.169.254/"}}}
+    with pytest.raises(PublishedSchemaError) as exc:
+        validate_device_config_with_schema("Management", {"x": 1}, schema=hostile)
+    assert "non-local $ref" in str(exc.value)
+
+
+def test_published_schema_local_ref_is_allowed():
+    schema = {
+        "type": "object",
+        "$defs": {"name": {"type": "string", "maxLength": 4}},
+        "properties": {"hostname": {"$ref": "#/$defs/name"}},
+        "additionalProperties": False,
+    }
+    assert (
+        validate_device_config_with_schema("Management", {"hostname": "ok"}, schema=schema) is None
+    )
+    with pytest.raises(ConfigValidationError):
+        validate_device_config_with_schema("Management", {"hostname": "toolong"}, schema=schema)
+
+
+def test_published_schema_id_is_stripped():
+    """A non-local $id must not establish a remote base URI; it is stripped and
+    validation still works against the rest of the schema."""
+    schema = {
+        "$id": "http://evil.example/schema",
+        "type": "object",
+        "properties": {"hostname": {"type": "string", "maxLength": 4}},
+        "additionalProperties": False,
+    }
+    assert (
+        validate_device_config_with_schema("Management", {"hostname": "ok"}, schema=schema) is None
+    )
+    with pytest.raises(ConfigValidationError):
+        validate_device_config_with_schema("Management", {"hostname": "toolong"}, schema=schema)
+
+
+def test_published_schema_invalid_schema_is_rejected():
+    not_a_schema = {"type": "not-a-real-type"}
+    with pytest.raises(PublishedSchemaError):
+        validate_device_config_with_schema("Management", {"x": 1}, schema=not_a_schema)
