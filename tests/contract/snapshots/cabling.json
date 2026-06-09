@@ -30,6 +30,10 @@
     ],
     [
       "POST",
+      "/internal/forks"
+    ],
+    [
+      "POST",
       "/pathfind"
     ],
     [
@@ -202,6 +206,28 @@
         "component_size",
         "device_id",
         "fabric_id"
+      ],
+      "type": "object"
+    },
+    "ForkCreate": {
+      "properties": {
+        "parent_topology_id": "anyOf",
+        "parent_version_id": "anyOf",
+        "reservation_id": "string"
+      },
+      "required": [
+        "reservation_id"
+      ],
+      "type": "object"
+    },
+    "ForkCreateResponse": {
+      "properties": {
+        "fork_id": "string",
+        "version_number": "integer"
+      },
+      "required": [
+        "fork_id",
+        "version_number"
       ],
       "type": "object"
     },
