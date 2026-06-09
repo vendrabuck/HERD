@@ -555,3 +555,119 @@ def test_tool_choice_none_is_instantiable():
     today never passes it; left here so future write-tool iterations have a
     test scaffolding hook)."""
     assert ToolChoiceNone().kind == "none"
+
+
+# --- answer_reservation_question_streaming (SSE tool loop) ---
+
+from app.services.llm_provider import StreamDone, TextDelta  # noqa: E402
+
+
+class _StreamingFakeProvider:
+    """LLMProvider with call_stream. Each turn is (deltas, final_response):
+    yields a TextDelta per delta, then a StreamDone with the final response."""
+
+    def __init__(self, turns: list[tuple[list[str], ProviderResponse]]) -> None:
+        self._turns = list(turns)
+        self.stream_calls = 0
+
+    async def call(self, **kwargs: Any) -> ProviderResponse:
+        raise AssertionError("streaming path must use call_stream")
+
+    async def call_stream(self, **kwargs: Any):
+        self.stream_calls += 1
+        if not self._turns:
+            raise AssertionError("streaming turn sequence exhausted")
+        deltas, final = self._turns.pop(0)
+        for d in deltas:
+            yield TextDelta(text=d)
+        yield StreamDone(response=final)
+
+
+async def _collect_stream(client, **kwargs):
+    return [ev async for ev in client.answer_reservation_question_streaming(**kwargs)]
+
+
+@pytest.mark.asyncio
+async def test_streaming_single_turn_streams_tokens_then_done():
+    final = _resp([TextBlock(text="Reservation ends 17:00.")])
+    provider = _StreamingFakeProvider(turns=[(["Reser", "vation ", "ends 17:00."], final)])
+    client = _make_client(provider)
+    events = await _collect_stream(
+        client,
+        messages=_msgs("<reservation>r1</reservation>", "When does it end?"),
+        dispatcher=_FakeDispatcher(),
+    )
+    types = [e.type for e in events]
+    # analyzing status, three live tokens, then done.
+    assert types == ["status", "token", "token", "token", "done"]
+    assert [e.text for e in events if e.type == "token"] == ["Reser", "vation ", "ends 17:00."]
+    done = events[-1]
+    assert done.result.answer == "Reservation ends 17:00."
+    assert done.result.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_turn_marks_interim_then_final_answer():
+    """A tool turn that emits narration tokens before the tool_use must flag the
+    following status interim=True so the client discards the provisional tokens;
+    the final turn's tokens are the real answer."""
+    provider = _StreamingFakeProvider(
+        turns=[
+            (
+                ["Let me check"],
+                _resp(
+                    [TextBlock(text="Let me check"), _tool_use("list_ports", {})],
+                    stop_reason="tool_use",
+                ),
+            ),
+            (["eth1/6 ", "is down."], _resp([TextBlock(text="eth1/6 is down.")])),
+        ]
+    )
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher()
+    events = await _collect_stream(
+        client,
+        messages=_msgs("<reservation>r1</reservation>", "What's wrong?"),
+        dispatcher=dispatcher,
+    )
+    # The tool-turn status carries interim=True and the tool name.
+    statuses = [e for e in events if e.type == "status"]
+    tool_status = [s for s in statuses if s.tools]
+    assert tool_status and tool_status[0].tools == ["list_ports"]
+    assert tool_status[0].interim is True
+    # The dispatcher ran the tool, and the final answer is the second turn's text.
+    assert dispatcher.dispatch_calls == [("list_ports", {})]
+    done = events[-1]
+    assert done.type == "done"
+    assert done.result.answer == "eth1/6 is down."
+    # Final-answer tokens streamed live (the second turn's deltas).
+    final_tokens = [e.text for e in events if e.type == "token"]
+    assert "eth1/6 " in final_tokens and "is down." in final_tokens
+
+
+@pytest.mark.asyncio
+async def test_streaming_falls_back_when_provider_lacks_call_stream():
+    """A provider without call_stream (e.g. openai_compat today) still works:
+    the buffered loop runs and its answer is emitted as token(s) + done."""
+    provider = _FakeProvider(responses=[_resp([TextBlock(text="Buffered answer.")])])
+    client = _make_client(provider)
+    events = await _collect_stream(
+        client,
+        messages=_msgs("<reservation>r1</reservation>", "Q?"),
+        dispatcher=_FakeDispatcher(),
+    )
+    assert events[-1].type == "done"
+    assert events[-1].result.answer == "Buffered answer."
+    assert any(e.type == "token" and e.text == "Buffered answer." for e in events)
+
+
+@pytest.mark.asyncio
+async def test_streaming_empty_final_text_raises():
+    provider = _StreamingFakeProvider(turns=[([], _resp([], stop_reason="end_turn"))])
+    client = _make_client(provider)
+    with pytest.raises(AIError, match="no text content"):
+        await _collect_stream(
+            client,
+            messages=_msgs("<reservation>r1</reservation>", "Q?"),
+            dispatcher=_FakeDispatcher(),
+        )

@@ -3,10 +3,13 @@
 // behind VITE_AI_CHAT_ENABLED for rollback). The tab owns the conversation
 // state internally; the parent modal only consumes setPendingApply so the
 // AIApplyConfirmModal can mount when the model schedules a dry-run.
-import { isAxiosError } from "axios";
 import { useCallback, useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
-import { useReservationAssistant } from "@/api/ai";
+import {
+  AssistantStreamError,
+  streamReservationAssistant,
+  type AssistantStreamEvent,
+} from "@/api/ai";
 import { AI_CHAT_ENABLED } from "@/config/featureFlags";
 import type { ChatMessage, PendingApply, ToolCall } from "@/types/ai.types";
 import { AIAssistantTabLegacy } from "./AIAssistantTabLegacy";
@@ -43,9 +46,14 @@ function ChatAssistant({
   setToolCalls,
   setToolIterations,
 }: Props) {
-  const ask = useReservationAssistant();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+  // The assistant answer streams in: isStreaming gates the input, statusText
+  // shows the current "analyzing" / "running tools" phase, and streamingText
+  // is the partial answer growing token by token in a live bubble.
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [statusText, setStatusText] = useState<string>("");
+  const [streamingText, setStreamingText] = useState<string>("");
   const [conversationId, setConversationId] = useState<string | null>(() => {
     try {
       return sessionStorage.getItem(sessionStorageKey(reservationId));
@@ -55,13 +63,13 @@ function ChatAssistant({
   });
   const threadRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll the thread to the bottom on each new message.
+  // Auto-scroll the thread to the bottom as messages and streamed text grow.
   useEffect(() => {
     const el = threadRef.current;
     if (el) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages.length, ask.isPending]);
+  }, [messages.length, isStreaming, streamingText, statusText]);
 
   const persistConversationId = useCallback(
     (id: string | null) => {
@@ -87,6 +95,14 @@ function ChatAssistant({
     setPendingApply?.(null);
   }, [persistConversationId, setPendingApply]);
 
+  const pushErrorBubble = useCallback((errorText: string) => {
+    toast.error(errorText);
+    setMessages((prev) => [
+      ...prev,
+      { id: makeLocalId(), role: "assistant", text: "", errorText },
+    ]);
+  }, []);
+
   const handleSubmit = async () => {
     const trimmed = input.trim();
     if (!trimmed) {
@@ -100,74 +116,88 @@ function ChatAssistant({
     };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
+    setIsStreaming(true);
+    setStatusText("");
+    setStreamingText("");
+
+    // Accumulate streamed tokens here; an interim status (a tool turn's
+    // pre-tool narration) resets it so only the final answer's text remains.
+    let accumulated = "";
+
+    const onEvent = (ev: AssistantStreamEvent) => {
+      if (ev.type === "status") {
+        if (ev.interim) {
+          // Discard provisional tokens streamed before a tool turn.
+          accumulated = "";
+          setStreamingText("");
+        }
+        setStatusText(
+          ev.tools.length > 0 ? `Running ${ev.tools.join(", ")}` : "Analyzing",
+        );
+      } else if (ev.type === "token") {
+        accumulated += ev.text;
+        setStreamingText(accumulated);
+      } else if (ev.type === "done") {
+        const result = ev.result;
+        const newConvId = result.conversation_id ?? null;
+        if (newConvId && newConvId !== conversationId) {
+          setConversationId(newConvId);
+          persistConversationId(newConvId);
+        }
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: makeLocalId(),
+            role: "assistant",
+            text: result.answer,
+            toolCalls: result.tool_calls,
+            toolIterations: result.tool_iterations,
+            pendingApply: result.pending_apply ?? null,
+          },
+        ]);
+        // Bridge the lifted state the parent modal reads for AIApplyConfirmModal
+        // and the legacy tool-call panel; the chat owns its own message list.
+        setAnswer?.(result.answer);
+        setToolCalls?.(result.tool_calls);
+        setToolIterations?.(result.tool_iterations);
+        setPendingApply?.(result.pending_apply ?? null);
+      } else if (ev.type === "error") {
+        // A failure after the stream opened (timeout or LLM failure).
+        pushErrorBubble(ev.message || "Assistant failed");
+      }
+    };
 
     try {
-      const result = await ask.mutateAsync({
-        reservationId,
-        question: trimmed,
-        conversationId,
-      });
-
-      const newConvId = result.conversation_id ?? null;
-      if (newConvId && newConvId !== conversationId) {
-        setConversationId(newConvId);
-        persistConversationId(newConvId);
-      }
-
-      const assistantMsg: ChatMessage = {
-        id: makeLocalId(),
-        role: "assistant",
-        text: result.answer,
-        toolCalls: result.tool_calls,
-        toolIterations: result.tool_iterations,
-        pendingApply: result.pending_apply ?? null,
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
-
-      // Sync the lifted state the parent modal reads for the AIApplyConfirmModal
-      // (planText) and the legacy tool-call panel. The chat owns its own
-      // message-list state for rendering; these setters are a bridge so the
-      // confirmation modal can mount with the most recent assistant text.
-      setAnswer?.(result.answer);
-      setToolCalls?.(result.tool_calls);
-      setToolIterations?.(result.tool_iterations);
-
-      if (setPendingApply) {
-        setPendingApply(result.pending_apply ?? null);
-      }
+      await streamReservationAssistant(reservationId, trimmed, conversationId, onEvent);
     } catch (err) {
-      let detail: string | undefined;
+      // Pre-stream failure (the request never opened a stream): map the status
+      // the same way the buffered path does.
       let errorText = "Failed to ask the assistant";
-      if (isAxiosError(err)) {
-        const status = err.response?.status;
-        detail = err.response?.data?.detail;
+      if (err instanceof AssistantStreamError) {
+        const { status, detail } = err;
         if (status === 503) {
           errorText = "AI feature is not configured";
         } else if (status === 404 && detail?.toLowerCase().includes("conversation")) {
-          // Conversation expired or never existed; reset and let the user
-          // start fresh. This is the recoverable end-of-TTL path.
+          // Conversation expired or never existed; reset and start fresh.
           errorText = "Conversation expired; starting a new one";
           resetConversation();
         } else if (status === 404) {
           errorText = "Reservation not found";
-        } else if (status === 413) {
-          errorText = detail || "Reservation is too large for the assistant";
+        } else if (status === 429) {
+          errorText = detail || "Daily AI limit reached";
+        } else if (status === 422) {
+          errorText = detail || "Question was rejected";
         } else if (status === 504) {
           errorText = "Assistant timed out; try again";
         } else if (status === 502) {
           errorText = detail || "Assistant failed";
         }
       }
-      toast.error(errorText);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: makeLocalId(),
-          role: "assistant",
-          text: "",
-          errorText,
-        },
-      ]);
+      pushErrorBubble(errorText);
+    } finally {
+      setIsStreaming(false);
+      setStatusText("");
+      setStreamingText("");
     }
   };
 
@@ -186,7 +216,7 @@ function ChatAssistant({
         className="flex-1 min-h-0 overflow-y-auto space-y-3 pr-1"
         data-testid="assistant-thread"
       >
-        {messages.length === 0 && !ask.isPending && (
+        {messages.length === 0 && !isStreaming && (
           <div className="text-gray-400 italic">
             Ask anything about this reservation. The assistant will use only
             this reservation's data.
@@ -195,9 +225,30 @@ function ChatAssistant({
         {messages.map((m) => (
           <ChatBubble key={m.id} message={m} />
         ))}
-        {ask.isPending && (
-          <div className="text-gray-400 italic" data-testid="assistant-pending">
-            Waiting for the assistant...
+        {isStreaming && (
+          <div className="flex justify-start" data-testid="assistant-streaming">
+            <div className="space-y-1">
+              {statusText && (
+                <div
+                  className="text-xs text-gray-400 italic ml-1"
+                  data-testid="assistant-status"
+                >
+                  {statusText}...
+                </div>
+              )}
+              {streamingText ? (
+                <div className="max-w-[80%] bg-gray-50 border border-gray-200 text-gray-800 px-3 py-2 rounded-lg whitespace-pre-wrap">
+                  {streamingText}
+                  <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-gray-400 animate-pulse align-middle" />
+                </div>
+              ) : (
+                !statusText && (
+                  <div className="text-gray-400 italic" data-testid="assistant-pending">
+                    Waiting for the assistant...
+                  </div>
+                )
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -210,7 +261,7 @@ function ChatAssistant({
           placeholder="Type your question. Enter to send, Shift+Enter for a new line."
           rows={2}
           className="w-full text-sm px-2 py-1.5 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-gray-900"
-          disabled={ask.isPending}
+          disabled={isStreaming}
           data-testid="assistant-input"
         />
         <div className="flex items-center justify-between text-xs">
@@ -231,7 +282,7 @@ function ChatAssistant({
             <button
               type="button"
               onClick={resetConversation}
-              disabled={ask.isPending || (!conversationId && messages.length === 0)}
+              disabled={isStreaming || (!conversationId && messages.length === 0)}
               className="text-xs px-2 py-1 rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
               data-testid="assistant-reset"
             >
@@ -240,11 +291,11 @@ function ChatAssistant({
             <button
               type="button"
               onClick={handleSubmit}
-              disabled={ask.isPending || !input.trim()}
+              disabled={isStreaming || !input.trim()}
               className="text-sm px-3 py-1.5 rounded bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
               data-testid="assistant-send"
             >
-              {ask.isPending ? "Asking..." : "Send"}
+              {isStreaming ? "Asking..." : "Send"}
             </button>
           </div>
         </div>

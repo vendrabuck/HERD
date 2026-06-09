@@ -294,7 +294,7 @@ describe("AIAssistantTab", () => {
 });
 
 
-// --- Branch 3: chat-style assistant ---
+// --- Branch 3: chat-style assistant (now streaming over SSE) ---
 
 import { AIAssistantChat } from "@/components/reservations/AIAssistantTab";
 
@@ -302,7 +302,38 @@ function ChatHarness({ onPendingApply }: { onPendingApply?: (p: unknown) => void
   return <AIAssistantChat reservationId="res-1" setPendingApply={onPendingApply} />;
 }
 
-describe("AIAssistantChat (Branch 3)", () => {
+const STREAM_URL = "/api/ai/reservations/res-1/assistant/stream";
+
+/** Build a text/event-stream Response body from a list of (event, data) frames. */
+function sseStream(frames: Array<{ event: string; data: unknown }>): Response {
+  const body = frames
+    .map((f) => `event: ${f.event}\ndata: ${JSON.stringify(f.data)}\n\n`)
+    .join("");
+  return new HttpResponse(body, {
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
+/** A done frame's AssistantResponse payload with sensible defaults. */
+function doneFrame(overrides: Record<string, unknown> = {}) {
+  return {
+    event: "done",
+    data: {
+      answer: "answer",
+      model: "m",
+      input_tokens: 1,
+      output_tokens: 1,
+      stop_reason: "end_turn",
+      tool_calls: [],
+      tool_iterations: 1,
+      conversation_id: "conv-1",
+      pending_apply: null,
+      ...overrides,
+    },
+  };
+}
+
+describe("AIAssistantChat (Branch 3, streaming)", () => {
   beforeEach(() => {
     try {
       sessionStorage.clear();
@@ -312,25 +343,22 @@ describe("AIAssistantChat (Branch 3)", () => {
     toastError.mockClear();
   });
 
-  it("appends user and assistant messages on send", async () => {
+  it("streams tokens then appends the final assistant message on send", async () => {
     server.use(
-      http.post("/api/ai/reservations/res-1/assistant", () =>
-        HttpResponse.json({
-          answer: "first turn answer",
-          model: "m",
-          input_tokens: 1,
-          output_tokens: 1,
-          stop_reason: "end_turn",
-          tool_calls: [],
-          tool_iterations: 1,
-          conversation_id: "conv-1",
-        }),
+      http.post(STREAM_URL, () =>
+        sseStream([
+          { event: "status", data: { message: "analyzing", tools: [], interim: false } },
+          { event: "token", data: { text: "first " } },
+          { event: "token", data: { text: "turn answer" } },
+          doneFrame({ answer: "first turn answer" }),
+        ]),
       ),
     );
 
     renderWithProviders(<ChatHarness />);
-    const input = screen.getByTestId("assistant-input");
-    fireEvent.change(input, { target: { value: "what do I have?" } });
+    fireEvent.change(screen.getByTestId("assistant-input"), {
+      target: { value: "what do I have?" },
+    });
     fireEvent.click(screen.getByTestId("assistant-send"));
 
     await waitFor(() => expect(screen.getByText("first turn answer")).toBeInTheDocument());
@@ -342,25 +370,20 @@ describe("AIAssistantChat (Branch 3)", () => {
   it("captures conversation_id and resends it on the second turn", async () => {
     let secondRequestBody: { question?: string; conversation_id?: string } = {};
     server.use(
-      http.post("/api/ai/reservations/res-1/assistant", async ({ request }) => {
+      http.post(STREAM_URL, async ({ request }) => {
         const body = (await request.json()) as {
           question?: string;
           conversation_id?: string;
         };
         const isFirst = !body.conversation_id;
-        if (!isFirst) {
-          secondRequestBody = body;
-        }
-        return HttpResponse.json({
-          answer: isFirst ? "first answer" : "second answer",
-          model: "m",
-          input_tokens: 1,
-          output_tokens: 1,
-          stop_reason: "end_turn",
-          tool_calls: [],
-          tool_iterations: 1,
-          conversation_id: "conv-42",
-        });
+        if (!isFirst) secondRequestBody = body;
+        return sseStream([
+          { event: "token", data: { text: isFirst ? "first answer" : "second answer" } },
+          doneFrame({
+            answer: isFirst ? "first answer" : "second answer",
+            conversation_id: "conv-42",
+          }),
+        ]);
       }),
     );
 
@@ -381,17 +404,8 @@ describe("AIAssistantChat (Branch 3)", () => {
 
   it("Start new conversation resets the thread and the conversation id", async () => {
     server.use(
-      http.post("/api/ai/reservations/res-1/assistant", () =>
-        HttpResponse.json({
-          answer: "answer",
-          model: "m",
-          input_tokens: 1,
-          output_tokens: 1,
-          stop_reason: "end_turn",
-          tool_calls: [],
-          tool_iterations: 1,
-          conversation_id: "conv-99",
-        }),
+      http.post(STREAM_URL, () =>
+        sseStream([doneFrame({ conversation_id: "conv-99" })]),
       ),
     );
 
@@ -412,24 +426,19 @@ describe("AIAssistantChat (Branch 3)", () => {
   it("surfaces pending_apply up to the parent", async () => {
     const onPendingApply = vi.fn();
     server.use(
-      http.post("/api/ai/reservations/res-1/assistant", () =>
-        HttpResponse.json({
-          answer: "scheduled the dry-run",
-          model: "m",
-          input_tokens: 1,
-          output_tokens: 1,
-          stop_reason: "end_turn",
-          tool_calls: [],
-          tool_iterations: 1,
-          conversation_id: "conv-1",
-          pending_apply: {
-            job_id: "job-abc",
-            version_id: "v-1",
-            device_id: "d-1",
-            dry_run: true,
-            scheduled_for: "2026-05-29T03:00:00Z",
-          },
-        }),
+      http.post(STREAM_URL, () =>
+        sseStream([
+          doneFrame({
+            answer: "scheduled the dry-run",
+            pending_apply: {
+              job_id: "job-abc",
+              version_id: "v-1",
+              device_id: "d-1",
+              dry_run: true,
+              scheduled_for: "2026-05-29T03:00:00Z",
+            },
+          }),
+        ]),
       ),
     );
 
@@ -445,26 +454,25 @@ describe("AIAssistantChat (Branch 3)", () => {
     expect((lastCall as { job_id: string }).job_id).toBe("job-abc");
   });
 
-  it("renders the per-turn tool-call collapsible inside the assistant bubble", async () => {
+  it("shows a tool status while tools run and discards interim tokens", async () => {
     server.use(
-      http.post("/api/ai/reservations/res-1/assistant", () =>
-        HttpResponse.json({
-          answer: "with tools",
-          model: "m",
-          input_tokens: 1,
-          output_tokens: 1,
-          stop_reason: "end_turn",
-          tool_calls: [
-            {
-              name: "get_device",
-              arguments_summary: "device_id=abc",
-              duration_ms: 23,
-              error: null,
-            },
-          ],
-          tool_iterations: 2,
-          conversation_id: "conv-1",
-        }),
+      http.post(STREAM_URL, () =>
+        sseStream([
+          // Pre-tool narration that must be discarded when the tool status fires.
+          { event: "token", data: { text: "let me check" } },
+          {
+            event: "status",
+            data: { message: "running tools", tools: ["get_device"], interim: true },
+          },
+          { event: "token", data: { text: "with tools" } },
+          doneFrame({
+            answer: "with tools",
+            tool_calls: [
+              { name: "get_device", arguments_summary: "device_id=abc", duration_ms: 23, error: null },
+            ],
+            tool_iterations: 2,
+          }),
+        ]),
       ),
     );
 
@@ -475,15 +483,17 @@ describe("AIAssistantChat (Branch 3)", () => {
     fireEvent.click(screen.getByTestId("assistant-send"));
 
     await waitFor(() => expect(screen.getByText("with tools")).toBeInTheDocument());
+    // The interim narration must not survive into the final bubble.
+    expect(screen.queryByText("let me check")).not.toBeInTheDocument();
     expect(screen.getByText(/Tool calls \(1\)/)).toBeInTheDocument();
     expect(screen.getByText("get_device")).toBeInTheDocument();
     expect(screen.getByText(/2 iterations/)).toBeInTheDocument();
   });
 
-  it("shows an error bubble and toasts when the request fails", async () => {
+  it("shows an error bubble and toasts on an error event mid-stream", async () => {
     server.use(
-      http.post("/api/ai/reservations/res-1/assistant", () =>
-        HttpResponse.json({ detail: "boom" }, { status: 502 }),
+      http.post(STREAM_URL, () =>
+        sseStream([{ event: "error", data: { message: "boom" } }]),
       ),
     );
     renderWithProviders(<ChatHarness />);
@@ -493,7 +503,21 @@ describe("AIAssistantChat (Branch 3)", () => {
     fireEvent.click(screen.getByTestId("assistant-send"));
 
     await waitFor(() => expect(toastError).toHaveBeenCalled());
-    // An error bubble was appended to the thread.
     expect(screen.getByText(/boom/)).toBeInTheDocument();
+  });
+
+  it("toasts a mapped message on a pre-stream 503", async () => {
+    server.use(
+      http.post(STREAM_URL, () =>
+        HttpResponse.json({ detail: "not configured" }, { status: 503 }),
+      ),
+    );
+    renderWithProviders(<ChatHarness />);
+    fireEvent.change(screen.getByTestId("assistant-input"), {
+      target: { value: "anything" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("AI feature is not configured"));
   });
 });

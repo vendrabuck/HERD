@@ -5,13 +5,16 @@ AIClient sits above the LLMProvider Protocol (app/services/llm_provider.py)
 and does not import any SDK directly. Provider implementations under
 app/services/providers/ translate to and from their respective SDK shapes.
 
-Three public methods:
+Four public methods:
 - propose_topology: forced single tool_use against a per-request topology tool
   (see build_topology_tool); template_name is enum-constrained to live inventory.
 - suggest_template_identity: forced single tool_use against IDENTITY_SUGGEST_TOOL.
 - answer_reservation_question_with_tools: multi-turn loop dispatching read-only
   HERD tools via ToolDispatcher; the loop logic, tool-result echoing, and
   iteration cap all live here, not in the provider.
+- answer_reservation_question_streaming: streaming twin of the above; yields
+  AssistantStatus / AssistantToken / AssistantDone events for a live SSE UI,
+  falling back to the buffered method when the provider has no call_stream.
 
 AIError is re-exported from llm_provider for backward compatibility with
 existing route and test imports.
@@ -20,6 +23,7 @@ existing route and test imports.
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -83,6 +87,49 @@ class AssistantTurnResult:
     stop_reason: str
     iteration: int
     segments: list[TurnSegment]
+
+
+@dataclass(frozen=True)
+class AssistantStatus:
+    """A coarse progress signal during the streamed tool loop (not answer text).
+
+    Emitted while the model is reasoning or running tools, so the client can show
+    "analyzing" / "running list_ports" instead of a bare spinner. `tools` lists
+    the tool names about to be dispatched, empty for a generic thinking phase.
+    `interim` is True on the status that follows a tool turn's narration tokens:
+    it tells the client to DISCARD the provisional tokens streamed so far in this
+    turn (they were pre-tool musings, not the answer) before showing tool status.
+    """
+
+    message: str
+    tools: list[str] = field(default_factory=list)
+    interim: bool = False
+    type: str = "status"
+
+
+@dataclass(frozen=True)
+class AssistantToken:
+    """One chunk of the FINAL answer text, streamed to the client as it lands."""
+
+    text: str
+    type: str = "token"
+
+
+@dataclass(frozen=True)
+class AssistantDone:
+    """Terminal event: the fully-assembled turn, mirroring AssistantTurnResult.
+
+    The route persists `segments` as conversation messages and surfaces
+    `answer/usage/stop_reason/iteration` exactly as the buffered path does, so
+    multi-turn history is identical whether the turn streamed or not.
+    """
+
+    result: AssistantTurnResult
+    type: str = "done"
+
+
+# What answer_reservation_question_streaming yields.
+AssistantStreamEvent = AssistantStatus | AssistantToken | AssistantDone
 
 
 logger = logging.getLogger(__name__)
@@ -612,6 +659,186 @@ class AIClient:
             stop_reason=final_stop_reason,
             iteration=iteration,
             segments=segments,
+        )
+
+    async def answer_reservation_question_streaming(
+        self,
+        *,
+        messages: list[Message],
+        dispatcher: "ToolDispatcher",
+        max_iterations: int = 8,
+        per_call_timeout_s: float = 20.0,
+    ) -> "AsyncIterator[AssistantStreamEvent]":
+        """Streaming twin of answer_reservation_question_with_tools.
+
+        Same multi-turn tool loop, but yields incremental events:
+        - AssistantStatus while reasoning or before dispatching tools,
+        - AssistantToken for the FINAL answer's text as it streams,
+        - AssistantDone carrying the assembled AssistantTurnResult (identical
+          shape to the buffered path, so the route persists and responds the
+          same way).
+
+        Tokens stream LIVE as they arrive in every iteration (real streaming, not
+        buffer-then-flush). We can't know a turn is final until stop_reason, so a
+        tool turn may emit a few interim narration tokens first; when that turn
+        resolves to tool_use we emit a status event carrying `interim=True`, the
+        client's cue to clear those provisional tokens before the tools run. The
+        final (non-tool_use) turn's tokens are the real answer and are kept. If
+        the provider lacks call_stream, fall back to the buffered method and emit
+        its result as a single done event.
+        """
+        if not hasattr(self._provider, "call_stream"):
+            result = await self.answer_reservation_question_with_tools(
+                messages=messages,
+                dispatcher=dispatcher,
+                max_iterations=max_iterations,
+                per_call_timeout_s=per_call_timeout_s,
+            )
+            for block in result.segments[-1].assistant_blocks:
+                if isinstance(block, TextBlock) and block.text:
+                    yield AssistantToken(text=block.text)
+            yield AssistantDone(result=result)
+            return
+
+        working_messages: list[Message] = list(messages)
+        segments: list[TurnSegment] = []
+        aggregated = Usage()
+        final_stop_reason = ""
+        iteration = 0
+        neutral_tools = [_tool_definition_to_schema(t) for t in get_active_tool_definitions()]
+
+        while iteration < max_iterations:
+            iteration += 1
+            yield AssistantStatus(message="analyzing")
+            emitted_tokens = False
+            resp: ProviderResponse | None = None
+            try:
+                async for ev in self._provider.call_stream(
+                    system=reservation_assistant_system_prompt(),
+                    messages=working_messages,
+                    tools=neutral_tools,
+                    tool_choice=ToolChoiceAuto(),
+                    max_tokens=self._max_tokens,
+                    timeout_s=per_call_timeout_s,
+                ):
+                    if ev.type == "text_delta":
+                        # Stream live. If this turn turns out to be a tool turn,
+                        # an interim status below tells the client to discard
+                        # these provisional tokens.
+                        if ev.text:
+                            emitted_tokens = True
+                            yield AssistantToken(text=ev.text)
+                    elif ev.type == "stream_done":
+                        resp = ev.response
+            except AIError:
+                raise
+            except Exception as exc:
+                raise AIError(f"LLM provider stream failed: {type(exc).__name__}: {exc}") from exc
+
+            if resp is None:
+                raise AIError("AI stream ended without a final message")
+            aggregated.add(resp.usage)
+            final_stop_reason = resp.stop_reason
+            tool_use_blocks = [b for b in resp.content if isinstance(b, ToolUseBlock)]
+            logger.info(
+                "ai_assistant_stream_iteration",
+                extra={
+                    "iteration": iteration,
+                    "stop_reason": final_stop_reason,
+                    "tool_call_count": len(tool_use_blocks),
+                },
+            )
+
+            if final_stop_reason != "tool_use" or not tool_use_blocks:
+                # Final answer: tokens already streamed live above.
+                answer = _extract_text(resp.content)
+                if not answer:
+                    raise AIError("AI returned no text content")
+                segments.append(TurnSegment(assistant_blocks=list(resp.content)))
+                yield AssistantDone(
+                    result=AssistantTurnResult(
+                        answer=answer,
+                        usage=aggregated,
+                        stop_reason=final_stop_reason,
+                        iteration=iteration,
+                        segments=segments,
+                    )
+                )
+                return
+
+            # Tool turn: any tokens streamed this iteration were pre-tool
+            # narration. Tell the client to discard them (interim=True) and show
+            # which tools are running.
+            yield AssistantStatus(
+                message="running tools",
+                tools=[b.name for b in tool_use_blocks],
+                interim=emitted_tokens,
+            )
+            working_messages.append(Message(role="assistant", content=list(resp.content)))
+            dispatch_coros = [
+                dispatcher.dispatch(block.name, block.input or {}) for block in tool_use_blocks
+            ]
+            results = await asyncio.gather(*dispatch_coros)
+            tool_result_blocks: list[ContentBlock] = [
+                ToolResultBlock(
+                    tool_use_id=block.id,
+                    content=dispatched["content"],
+                    is_error=dispatched["is_error"],
+                )
+                for block, dispatched in zip(tool_use_blocks, results)
+            ]
+            working_messages.append(Message(role="user", content=tool_result_blocks))
+            segments.append(
+                TurnSegment(
+                    assistant_blocks=list(resp.content),
+                    tool_result_blocks=tool_result_blocks,
+                )
+            )
+
+        # Iteration cap hit: force a final answer with tools disabled (buffered,
+        # the forced close is short and not worth streaming).
+        working_messages.append(
+            Message(
+                role="user",
+                content=[
+                    TextBlock(
+                        text=(
+                            "You have exhausted your tool budget. Answer the question now "
+                            "with what you already know, or explain plainly what could not "
+                            "be determined."
+                        )
+                    )
+                ],
+            )
+        )
+        final = await self._call_provider(
+            system=RESERVATION_ASSISTANT_TOOL_SYSTEM_PROMPT,
+            messages=working_messages,
+            tools=None,
+            tool_choice=ToolChoiceAuto(),
+            max_tokens=self._max_tokens,
+            timeout_s=per_call_timeout_s,
+        )
+        aggregated.add(final.usage)
+        final_stop_reason = final.stop_reason or final_stop_reason
+        answer = _extract_text(final.content)
+        if not answer:
+            raise AIError(f"AI exhausted {max_iterations} tool iterations and returned no text")
+        # The forced close was buffered (not streamed), so these tokens flush at
+        # once rather than arriving live like the normal final turn above. The
+        # close is short enough that the one-shot flush is acceptable.
+        for block in final.content:
+            if isinstance(block, TextBlock) and block.text:
+                yield AssistantToken(text=block.text)
+        segments.append(TurnSegment(assistant_blocks=list(final.content)))
+        yield AssistantDone(
+            result=AssistantTurnResult(
+                answer=answer,
+                usage=aggregated,
+                stop_reason=final_stop_reason,
+                iteration=iteration,
+                segments=segments,
+            )
         )
 
 

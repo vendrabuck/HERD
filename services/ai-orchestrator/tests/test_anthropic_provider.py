@@ -385,3 +385,123 @@ def test_response_from_anthropic_cache_fields_coerce_none_to_zero():
     resp = _response_from_anthropic(sdk_msg, "claude-test")
     assert resp.usage.cache_creation_input_tokens == 0
     assert resp.usage.cache_read_input_tokens == 0
+
+
+# --- Streaming (call_stream) ---
+
+
+class _FakeStream:
+    """Mimics the SDK's messages.stream() async context manager.
+
+    Yields the given events when iterated and returns final_message from
+    get_final_message(), matching how AnthropicProvider.call_stream drives it.
+    """
+
+    def __init__(self, events, final_message):
+        self._events = events
+        self._final = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def __aiter__(self):
+        for ev in self._events:
+            yield ev
+
+    async def get_final_message(self):
+        return self._final
+
+
+def _stream_text_event(text):
+    """The SDK's text-only delta event (type == 'text', carries .text)."""
+    return SimpleNamespace(type="text", text=text)
+
+
+def _stream_thinking_event(text):
+    """A reasoning model's thinking delta; call_stream MUST drop these."""
+    return SimpleNamespace(type="thinking", thinking=text)
+
+
+def _provider_with_stream(events, final_content, stop_reason="end_turn"):
+    provider = AnthropicProvider(api_key="sk-ant-fake", model="claude-opus-4-7")
+    final_message = SimpleNamespace(
+        content=final_content,
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+        stop_reason=stop_reason,
+    )
+    stream_factory = lambda **kwargs: _FakeStream(events, final_message)  # noqa: E731
+    provider._client = SimpleNamespace(messages=SimpleNamespace(stream=stream_factory))
+    return provider
+
+
+async def _drain(provider, **kwargs):
+    kwargs.setdefault("system", "sys")
+    kwargs.setdefault("messages", [Message(role="user", content=[TextBlock(text="q")])])
+    kwargs.setdefault("tools", None)
+    kwargs.setdefault("tool_choice", ToolChoiceAuto())
+    kwargs.setdefault("max_tokens", 256)
+    kwargs.setdefault("timeout_s", None)
+    return [ev async for ev in provider.call_stream(**kwargs)]
+
+
+@pytest.mark.asyncio
+async def test_call_stream_yields_text_deltas_then_done():
+    provider = _provider_with_stream(
+        events=[_stream_text_event("Hel"), _stream_text_event("lo")],
+        final_content=[_sdk_text("Hello")],
+    )
+    events = await _drain(provider)
+    # Text deltas in order, then exactly one terminal StreamDone last.
+    assert [e.type for e in events] == ["text_delta", "text_delta", "stream_done"]
+    assert [e.text for e in events[:2]] == ["Hel", "lo"]
+    done = events[-1]
+    assert done.response.stop_reason == "end_turn"
+    assert done.response.content[0].text == "Hello"
+    assert done.response.usage.output_tokens == 7
+
+
+@pytest.mark.asyncio
+async def test_call_stream_drops_thinking_deltas():
+    """A reasoning model's leading thinking deltas must not reach the client;
+    only real text deltas are forwarded, matching the buffered path."""
+    provider = _provider_with_stream(
+        events=[
+            _stream_thinking_event("Let me think"),
+            _stream_thinking_event(" about it"),
+            _stream_text_event("Answer"),
+        ],
+        final_content=[_sdk_text("Answer")],
+    )
+    events = await _drain(provider)
+    assert [e.type for e in events] == ["text_delta", "stream_done"]
+    assert events[0].text == "Answer"
+
+
+@pytest.mark.asyncio
+async def test_call_stream_skips_empty_text_deltas():
+    provider = _provider_with_stream(
+        events=[_stream_text_event(""), _stream_text_event("x")],
+        final_content=[_sdk_text("x")],
+    )
+    events = await _drain(provider)
+    assert [e.type for e in events] == ["text_delta", "stream_done"]
+    assert events[0].text == "x"
+
+
+@pytest.mark.asyncio
+async def test_call_stream_done_carries_tool_use_for_loop():
+    """When the streamed turn ends in tool_use, StreamDone.response carries the
+    tool_use block and stop_reason so the orchestrator loop can dispatch it."""
+    provider = _provider_with_stream(
+        events=[_stream_text_event("checking")],
+        final_content=[_sdk_text("checking"), _sdk_tool_use(name="list_ports")],
+        stop_reason="tool_use",
+    )
+    events = await _drain(provider)
+    done = events[-1]
+    assert done.type == "stream_done"
+    assert done.response.stop_reason == "tool_use"
+    assert any(isinstance(b, ToolUseBlock) for b in done.response.content)
