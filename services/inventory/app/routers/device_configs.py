@@ -4,7 +4,12 @@ import uuid
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.acl import user_has_manage_or_owns_active_reservation
-from herd_common.device_config import ConfigValidationError, validate_device_config
+from herd_common.device_config import (
+    ConfigValidationError,
+    PublishedSchemaError,
+    validate_device_config,
+    validate_device_config_with_schema,
+)
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +28,7 @@ from app.schemas.device_config import (
     PaginatedDeviceConfigVersions,
 )
 from app.services.config_diff import render_unified_diff
+from app.services.published_schema import published_schema_for_device
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,41 @@ def _connection_type_for(device: Device) -> str:
             detail="Device has no driver-defined connection_type; cannot validate config",
         )
     return driver.connection_type
+
+
+async def _validate_config_for_device(
+    device: Device,
+    connection_type: str,
+    config: dict | None,
+) -> None:
+    """Validate a device config, preferring the driver-published schema.
+
+    Resolution order (issue #23):
+      1. driver-published schema (proxied from execution), if any, else
+      2. the hardcoded CONFIG_SCHEMAS registry (today's behavior).
+
+    published_schema_for_device already fails open to None when execution is
+    unreachable, so an outage degrades to the registry rather than 503-ing the
+    write. A published schema that is itself unsafe or invalid raises
+    PublishedSchemaError from the validator; we log it and fall back to the
+    registry too, never breaking the write. Raises ConfigValidationError (mapped
+    to 422 by the caller) on a genuine validation failure.
+    """
+    published = await published_schema_for_device(device)
+    if published is not None:
+        try:
+            validate_device_config_with_schema(
+                connection_type, config, schema=published, role=device.name
+            )
+            return
+        except PublishedSchemaError as exc:
+            logger.warning(
+                "Driver-published schema for device %s is unusable (%s); "
+                "falling back to the registry",
+                device.name,
+                exc,
+            )
+    validate_device_config(connection_type, config, role=device.name)
 
 
 async def _load_version(
@@ -203,7 +244,7 @@ async def create_config_version(
     connection_type = _connection_type_for(device)
 
     try:
-        validate_device_config(connection_type, body.config, role=device.name)
+        await _validate_config_for_device(device, connection_type, body.config)
     except ConfigValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -240,7 +281,7 @@ async def restore_config_version(
     authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
-    await _load_device(db, device_id)
+    device = await _load_device(db, device_id)
 
     if not _is_admin(payload):
         allowed = await _user_can_manage_device(payload["sub"], device_id, authorization)
@@ -253,6 +294,15 @@ async def restore_config_version(
             )
 
     source = await _load_version(db, device_id, version_id)
+
+    # Re-validate the source config against the CURRENT schema before restoring.
+    # The driver-published schema may have tightened since the source version
+    # was written (e.g. the driver file was replaced), so a restore is a fresh
+    # write that must satisfy today's schema, not the one in force historically.
+    try:
+        await _validate_config_for_device(device, source.connection_type, source.config)
+    except ConfigValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     description = body.description
     if description is None:

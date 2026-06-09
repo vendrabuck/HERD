@@ -20,6 +20,7 @@ from app.schemas.execution import (
     ManualExecuteRequest,
     PaginatedExecutionRunResponse,
 )
+from app.services.driver_loader import get_driver_config_schema, load_driver
 from app.services.execution_service import (
     fetch_device,
     fetch_template,
@@ -196,6 +197,51 @@ async def list_run_commands(
         raise HTTPException(status_code=404, detail="Execution run not found")
     await _authorize_run_read(run, payload, authorization)
     return await list_command_log(db, run_id)
+
+
+@router.get("/drivers/{driver_id}/config-schema")
+async def get_driver_config_schema_endpoint(
+    driver_id: uuid.UUID,
+    sha256: str = Query(...),
+    filename: str = Query(...),
+    connection_type: str = Query(...),
+    _: None = Depends(_require_internal_token),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return a driver's published config schema. Internal token auth.
+
+    Inventory owns the driver's sha256/filename/connection_type and passes them
+    as query params (matching how run_driver_action already receives them), so
+    this endpoint can resolve the cache via load_driver (a SHA256 hit avoids any
+    re-download). The schema is captured once per SHA256 at load time; this just
+    reads it back.
+
+    Fail-open: if loading the driver fails (download/extract/validate error), we
+    return has_schema=False rather than 5xx so inventory degrades to the
+    registry instead of blocking a config write on a transient driver issue.
+    """
+    response = {
+        "driver_id": str(driver_id),
+        "sha256": sha256,
+        "has_schema": False,
+        "schema": None,
+        "source": "none",
+    }
+    try:
+        await load_driver(db, driver_id, sha256, filename, connection_type)
+    except (ValueError, RuntimeError) as exc:
+        logger.warning(
+            "Could not load driver %s to read config schema: %s",
+            driver_id,
+            exc,
+        )
+        return response
+    schema = await get_driver_config_schema(db, driver_id)
+    if schema is not None:
+        response["has_schema"] = True
+        response["schema"] = schema
+        response["source"] = "driver"
+    return response
 
 
 @router.post("/device-check", response_model=DeviceCheckResponse)
