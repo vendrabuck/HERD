@@ -98,7 +98,7 @@ Transitions (from state, to state, trigger):
 - `FAILED` rows persist for audit but hold no devices.
 - `CANCELLED` and `COMPLETED` are terminal states.
 - `_check_conflicts` treats `PENDING`, `PENDING_PROVISION`, and `ACTIVE` as conflicting; two concurrent creates for the same exclusive device race safely.
-- On reaching `ACTIVE`, if the reservation has a topology, the cabling service creates an editable per-reservation fork of it (pinning the parent's current version) for later live edits (issue #25, partial: fork creation only so far). This is best-effort: a fork-create failure is logged and does not strand the activated reservation.
+- On reaching `ACTIVE`, if the reservation has a topology, the reservations service calls `POST /api/cabling/internal/forks` (guarded by `X-Internal-Token`) to create an editable per-reservation fork of the parent topology, pinned to the parent's current version (issue #25, partial: fork creation only so far). The fork is owned by the cabling service in three tables: `reservation_fork` (fork identity and canvas, keyed by a bare `reservation_id` UUID, no cross-schema FK), `fork_connections` (the wiring snapshot for the lease, separate from the physical `connections` table), and `fork_versions` (immutable saves numbered sequentially per fork). The endpoint is idempotent on `reservation_id`, so a retried activation returns the existing fork rather than creating a duplicate. This is best-effort: a fork-create failure is logged and does not strand the activated reservation.
 
 ## Topology separation
 
