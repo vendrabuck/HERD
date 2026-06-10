@@ -13,6 +13,10 @@
       "/device-health/{device_id}"
     ],
     [
+      "GET",
+      "/drivers/{driver_id}/config-schema"
+    ],
+    [
       "POST",
       "/execute"
     ],
