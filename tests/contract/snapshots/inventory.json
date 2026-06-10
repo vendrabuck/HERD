@@ -166,6 +166,10 @@
     ],
     [
       "GET",
+      "/drivers/{driver_id}/config-schema"
+    ],
+    [
+      "GET",
       "/drivers/{driver_id}/download"
     ],
     [
