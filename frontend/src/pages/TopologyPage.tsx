@@ -94,7 +94,13 @@ export function TopologyPage() {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newName.trim()) return;
-    const topology = await createTopology.mutateAsync({ name: newName.trim() });
+    let topology;
+    try {
+      topology = await createTopology.mutateAsync({ name: newName.trim() });
+    } catch {
+      // onError already toasted; keep the modal open so the user can retry.
+      return;
+    }
     setNewName("");
     setShowCreateModal(false);
     navigate(`/topology/${topology.id}`);
@@ -102,7 +108,12 @@ export function TopologyPage() {
 
   const handleDelete = async () => {
     if (!deleteId) return;
-    await deleteTopology.mutateAsync(deleteId);
+    try {
+      await deleteTopology.mutateAsync(deleteId);
+    } catch {
+      // onError already toasted; leave the confirm dialog state as-is.
+      return;
+    }
     setDeleteId(null);
   };
 
@@ -114,10 +125,16 @@ export function TopologyPage() {
   const handleCloneSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!cloneSource || !cloneName.trim()) return;
-    const clone = await cloneTopology.mutateAsync({
-      id: cloneSource.id,
-      name: cloneName.trim(),
-    });
+    let clone;
+    try {
+      clone = await cloneTopology.mutateAsync({
+        id: cloneSource.id,
+        name: cloneName.trim(),
+      });
+    } catch {
+      // onError already toasted; keep the clone modal open for retry.
+      return;
+    }
     setCloneSource(null);
     setCloneName("");
     navigate(`/topology/${clone.id}`);

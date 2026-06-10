@@ -2,7 +2,15 @@ import { http, HttpResponse } from "msw";
 import { renderHook, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { toastSuccess, toastError } = vi.hoisted(() => ({
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
+}));
+vi.mock("react-hot-toast", () => ({
+  default: { success: toastSuccess, error: toastError },
+}));
 
 import { server } from "../mocks/server";
 import {
@@ -12,6 +20,7 @@ import {
   useCreateTopology,
   useUpdateTopology,
   useDeleteTopology,
+  useCloneTopology,
 } from "@/api/topologies";
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -123,5 +132,81 @@ describe("topologies api hooks", () => {
       await result.current.mutateAsync("t1");
     });
     expect(capturedUrl).toMatch(/\/topologies\/t1$/);
+  });
+});
+
+describe("topology mutation error toasts (#135)", () => {
+  beforeEach(() => {
+    toastSuccess.mockClear();
+    toastError.mockClear();
+  });
+
+  it("useUpdateTopology toasts the server detail on a failed save", async () => {
+    server.use(
+      http.put("/api/cabling/topologies/t1", () =>
+        HttpResponse.json({ detail: "stale version conflict" }, { status: 409 }),
+      ),
+    );
+    const { result } = renderHook(() => useUpdateTopology(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "t1", description: "x" }).catch(() => {});
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toastError).toHaveBeenCalledWith("stale version conflict");
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it("useUpdateTopology falls back to a generic save error message", async () => {
+    server.use(
+      http.put("/api/cabling/topologies/t1", () => HttpResponse.json({}, { status: 500 })),
+    );
+    const { result } = renderHook(() => useUpdateTopology(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "t1", description: "x" }).catch(() => {});
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toastError).toHaveBeenCalledWith("Failed to save topology");
+  });
+
+  it("useCreateTopology toasts on failure", async () => {
+    server.use(
+      http.post("/api/cabling/topologies", () =>
+        HttpResponse.json({ detail: "name already exists" }, { status: 409 }),
+      ),
+    );
+    const { result } = renderHook(() => useCreateTopology(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ name: "dup" }).catch(() => {});
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toastError).toHaveBeenCalledWith("name already exists");
+  });
+
+  it("useDeleteTopology toasts on failure", async () => {
+    server.use(
+      http.delete("/api/cabling/topologies/t1", () =>
+        HttpResponse.json({}, { status: 500 }),
+      ),
+    );
+    const { result } = renderHook(() => useDeleteTopology(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync("t1").catch(() => {});
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toastError).toHaveBeenCalledWith("Failed to delete topology");
+  });
+
+  it("useCloneTopology toasts on failure", async () => {
+    server.use(
+      http.post("/api/cabling/topologies/t1/clone", () =>
+        HttpResponse.json({}, { status: 500 }),
+      ),
+    );
+    const { result } = renderHook(() => useCloneTopology(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "t1", name: "copy" }).catch(() => {});
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toastError).toHaveBeenCalledWith("Failed to clone topology");
   });
 });
