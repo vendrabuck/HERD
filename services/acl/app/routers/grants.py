@@ -3,7 +3,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from herd_common.auth import make_auth_dependencies
+from herd_common.auth import ADMIN_ROLES, make_auth_dependencies
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,6 +39,23 @@ get_current_user_payload, require_admin = make_auth_dependencies(
 
 router = APIRouter(tags=["grants"])
 bearer_scheme = HTTPBearer()
+
+
+def _authorize_subject(payload: dict, target_user_id: uuid.UUID) -> None:
+    """Enforce that a permission query is for the caller's own identity.
+
+    The /check, /check/batch, and /resources endpoints answer "what can this
+    user access", which is self-service per docs/ROLES.md. Without this guard a
+    user could pass any user_id and enumerate another user's access (IDOR).
+    Admins and superadmins may introspect any user. Raises 403 otherwise.
+    """
+    if payload.get("role") in ADMIN_ROLES:
+        return
+    if str(target_user_id) != payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot query permissions for another user",
+        )
 
 
 @router.post("/grants", response_model=GrantResponse, status_code=status.HTTP_201_CREATED)
@@ -142,6 +159,7 @@ async def check_permission_endpoint(
     payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
+    _authorize_subject(payload, body.user_id)
     group_ids = await fetch_user_groups(
         settings.auth_service_url, body.user_id, credentials.credentials
     )
@@ -158,6 +176,7 @@ async def batch_check_endpoint(
     payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
+    _authorize_subject(payload, body.user_id)
     group_ids = await fetch_user_groups(
         settings.auth_service_url, body.user_id, credentials.credentials
     )
@@ -176,6 +195,7 @@ async def get_resources_endpoint(
     payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
+    _authorize_subject(payload, user_id)
     group_ids = await fetch_user_groups(settings.auth_service_url, user_id, credentials.credentials)
     resource_ids = await get_accessible_resources(db, group_ids, resource_type, permission)
     return [ResourceRef(resource_type=resource_type, resource_id=rid) for rid in resource_ids]

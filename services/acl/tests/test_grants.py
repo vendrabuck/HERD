@@ -400,6 +400,103 @@ async def test_check_unauthenticated(no_auth_client):
     assert resp.status_code == 401
 
 
+# --- Self-permission guard (#128, IDOR) ---
+
+_other_user_id = uuid.uuid4()
+
+
+@pytest.mark.asyncio
+@patch("app.routers.grants.fetch_user_groups", new_callable=AsyncMock)
+async def test_check_rejects_other_user(mock_fetch, user_client):
+    """A user querying another user's permission is rejected before any lookup."""
+    resp = await user_client.post(
+        "/check",
+        json={
+            "user_id": str(_other_user_id),
+            "resource_type": "device",
+            "resource_id": str(_device_id_1),
+            "permission": "view",
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Cannot query permissions for another user"
+    # The guard must short-circuit before the cross-user group lookup runs.
+    mock_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("app.routers.grants.fetch_user_groups", new_callable=AsyncMock)
+async def test_check_batch_rejects_other_user(mock_fetch, user_client):
+    resp = await user_client.post(
+        "/check/batch",
+        json={
+            "user_id": str(_other_user_id),
+            "resource_type": "device",
+            "resource_ids": [str(_device_id_1), str(_device_id_2)],
+            "permission": "view",
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Cannot query permissions for another user"
+    mock_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("app.routers.grants.fetch_user_groups", new_callable=AsyncMock)
+async def test_resources_rejects_other_user(mock_fetch, user_client):
+    resp = await user_client.get(
+        "/resources",
+        params={
+            "user_id": str(_other_user_id),
+            "resource_type": "device",
+            "permission": "view",
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Cannot query permissions for another user"
+    mock_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("app.routers.grants.fetch_user_groups", new_callable=AsyncMock)
+async def test_check_allows_self(mock_fetch, user_client):
+    """The self-case (user_id == sub) still resolves normally; guard is not over-broad."""
+    mock_fetch.return_value = [_group_id_1]
+    await _seed_grant(group_id=_group_id_1, permission="view")
+    resp = await user_client.post(
+        "/check",
+        json={
+            "user_id": str(_user_id),
+            "resource_type": "device",
+            "resource_id": str(_device_id_1),
+            "permission": "view",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["allowed"] is True
+    mock_fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch("app.routers.grants.fetch_user_groups", new_callable=AsyncMock)
+async def test_check_admin_may_query_other_user(mock_fetch, admin_client):
+    """Admins and superadmins may introspect any user's permissions."""
+    mock_fetch.return_value = [_group_id_1]
+    await _seed_grant(group_id=_group_id_1, permission="view")
+    resp = await admin_client.post(
+        "/check",
+        json={
+            "user_id": str(_other_user_id),
+            "resource_type": "device",
+            "resource_id": str(_device_id_1),
+            "permission": "view",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["allowed"] is True
+    mock_fetch.assert_awaited_once()
+
+
 # --- Batch Check ---
 
 
