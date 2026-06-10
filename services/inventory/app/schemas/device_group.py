@@ -6,12 +6,12 @@ from pydantic import BaseModel, Field
 
 class DeviceGroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2000)
 
 
 class DeviceGroupUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2000)
 
 
 class DeviceGroupDeviceResponse(BaseModel):
@@ -57,11 +57,11 @@ class DeviceGroupMembershipResponse(BaseModel):
 
 
 class BulkDeviceIds(BaseModel):
-    device_ids: list[uuid.UUID]
+    device_ids: list[uuid.UUID] = Field(max_length=500)
 
 
 class BulkUserGroupIds(BaseModel):
-    user_group_ids: list[uuid.UUID]
+    user_group_ids: list[uuid.UUID] = Field(max_length=500)
 
 
 class BulkResult(BaseModel):

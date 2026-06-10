@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.config import settings
 from app.models.reservation import ReservationStatus, TopologyType
@@ -37,9 +37,9 @@ def _dedupe_preserve_order(values: list[uuid.UUID]) -> list[uuid.UUID]:
 
 
 class ReservationCreate(BaseModel):
-    device_ids: list[uuid.UUID]
+    device_ids: list[uuid.UUID] = Field(max_length=200)
     topology_id: uuid.UUID | None = None
-    purpose: str | None = None
+    purpose: str | None = Field(default=None, max_length=2000)
     start_time: datetime
     end_time: datetime
 
@@ -82,8 +82,8 @@ class ReservationCreate(BaseModel):
 
 class ReservationUpdate(BaseModel):
     end_time: datetime | None = None
-    purpose: str | None = None
-    device_ids: list[uuid.UUID] | None = None
+    purpose: str | None = Field(default=None, max_length=2000)
+    device_ids: list[uuid.UUID] | None = Field(default=None, max_length=200)
 
     @field_validator("device_ids")
     @classmethod
