@@ -1093,6 +1093,7 @@ Authorization: Bearer <admin-token>
 | `/api/cabling/topologies` | POST | yes | yes | yes |
 | `/api/cabling/topologies/{id}` | PUT | creator | yes | yes |
 | `/api/cabling/topologies/{id}` | DELETE | creator | yes | yes |
+| `/api/cabling/internal/forks` | POST | internal | internal | internal |
 | `/api/acl/grants` | GET | | yes | yes |
 | `/api/acl/grants/{id}` | GET | | yes | yes |
 | `/api/acl/grants` | POST | | yes | yes |
