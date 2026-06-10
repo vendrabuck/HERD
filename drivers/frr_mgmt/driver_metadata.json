@@ -1,0 +1,7 @@
+{
+  "name": "FRRouting Management Driver",
+  "version": "0.1.0",
+  "connection_type": "Management",
+  "supports_dry_run": true,
+  "notes": "Configures an FRR router over SSH via vtysh (netmiko, cisco_ios platform). All mutating methods honor context['dry_run']. Connection params: HERD_ip, HERD_login, HERD_password, optional HERD_port."
+}
