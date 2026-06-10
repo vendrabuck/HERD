@@ -623,6 +623,121 @@ class Driver:
     return buf.getvalue()
 
 
+# Path to the real, checked-in FRR management driver package (repo root: drivers/frr_mgmt/).
+# Unlike the other seed drivers, this one is NOT an inline stub: it is the genuine netmiko
+# driver used in the live-config demo, zipped straight from disk so the seeded package and
+# the source of truth can never drift.
+FRR_DRIVER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drivers", "frr_mgmt")
+
+
+def _make_frr_driver_zip() -> bytes | None:
+    """Zip the real drivers/frr_mgmt/ package from disk.
+
+    Returns None (and prints a warning) if the package is missing, so a checkout
+    without the driver still seeds everything else instead of hard-failing. Only
+    driver.py and driver_metadata.json are packaged; __pycache__ and other cruft
+    are skipped so the SHA256 cache key is stable across runs.
+    """
+    driver_py = os.path.join(FRR_DRIVER_DIR, "driver.py")
+    metadata_json = os.path.join(FRR_DRIVER_DIR, "driver_metadata.json")
+    if not (os.path.isfile(driver_py) and os.path.isfile(metadata_json)):
+        print(f"  WARN: FRR driver package not found at {FRR_DRIVER_DIR}; skipping FRR seed")
+        return None
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        with open(driver_py, encoding="utf-8") as f:
+            zf.writestr("driver.py", f.read())
+        with open(metadata_json, encoding="utf-8") as f:
+            zf.writestr("driver_metadata.json", f.read())
+    return buf.getvalue()
+
+
+# The live FRR routers in the network-simulator slice1 lab (topologies/slice1.clab.yml).
+# r1/r2 run frrouting/frr with an SSH-to-vtysh login (netadmin/demo123, shell /usr/bin/vtysh)
+# on the 10.99.0.0/24 management plane. These are the real targets the FRR driver configures
+# in the Thursday live-config demo. demo123 is a throwaway lab password, not a secret.
+FRR_LAB_DEVICES = [
+    {"name": "frr-r1", "ip": "10.99.0.11"},
+    {"name": "frr-r2", "ip": "10.99.0.12"},
+]
+FRR_LAB_LOGIN = os.environ.get("SEED_FRR_LOGIN", "netadmin")
+FRR_LAB_PASSWORD = os.environ.get("SEED_FRR_PASSWORD", "demo123")
+
+
+def get_or_create_management_device(
+    client: httpx.Client,
+    name: str,
+    template_id: str,
+    ip: str,
+    login: str,
+    password: str,
+) -> str:
+    """Create (or find) a Management device with explicit SSH credentials.
+
+    Unlike get_or_create_device, which hardcodes generic admin creds for the bulk
+    DUT population, this threads real per-device creds into field_data so the
+    execution sandbox hands the driver working HERD_login / HERD_password.
+    """
+    field_data = {"ip": ip, "login": login, "password": password}
+    body = {
+        "name": name,
+        "template_id": template_id,
+        "topology_type": "PHYSICAL",
+        "field_data": field_data,
+    }
+    resp = client.post(f"{BASE}/inventory/devices", json=body)
+    if resp.status_code == 201:
+        return resp.json()["id"]
+    if resp.status_code == 409:
+        for d in fetch_all_items(client, f"{BASE}/inventory/devices"):
+            if d["name"] == name:
+                return d["id"]
+    print(f"  Failed to create or find device {name}: {resp.text}")
+    sys.exit(1)
+
+
+def seed_frr_demo(client: httpx.Client) -> None:
+    """Register the real FRR netmiko driver and the two live lab routers.
+
+    Idempotent and opt-in (gated by SEED_FRR=1 in main) so the heavy default seed
+    is unchanged. This is the spine of the live-config demo: HERD drives a real FRR
+    router over SSH via vtysh. The devices point at the network-simulator slice1 lab
+    (10.99.0.11/.12); they are reachable only when that lab is up on the 10.99.0.0/24
+    subnet, which is expected (the driver's status() reports unreachable otherwise).
+    """
+    print("\n--- FRR live-config demo ---")
+    zip_bytes = _make_frr_driver_zip()
+    if zip_bytes is None:
+        return  # warning already printed; nothing to seed without the package
+
+    frr_driver_id = get_or_create_driver(
+        client,
+        "FRRouting Management Driver",
+        "Management",
+        zip_bytes=zip_bytes,
+    )
+    frr_template_id = get_or_create_template(
+        client,
+        "FRRouting Router",
+        "device",
+        "FRRouting router driven over SSH via vtysh (netmiko). Live-config demo target.",
+        SECTIONS,
+        driver_id=frr_driver_id,
+        vendor="FRRouting",
+        model="FRR (slice1 lab)",
+    )
+    for dev in FRR_LAB_DEVICES:
+        device_id = get_or_create_management_device(
+            client,
+            dev["name"],
+            frr_template_id,
+            dev["ip"],
+            FRR_LAB_LOGIN,
+            FRR_LAB_PASSWORD,
+        )
+        print(f"  FRR device: {dev['name']} -> {dev['ip']} ({device_id})")
+
+
 def get_or_create_driver(
     client: httpx.Client,
     name: str,
@@ -2041,6 +2156,11 @@ def main() -> None:
 
     # Dedicated ACL test users + Santa Clara device group (scoped-visibility demo)
     seed_acl_test_fixtures(client)
+
+    # FRR live-config demo (opt-in): real netmiko driver + the two slice1 lab routers.
+    # Off by default so the standard seed population is unchanged; set SEED_FRR=1 to add it.
+    if os.environ.get("SEED_FRR") == "1":
+        seed_frr_demo(client)
 
     total_dut_ports = sum(
         TEMPLATE_PORT_COUNTS.get(d["template"], DEFAULT_PORT_COUNT) for d in DEVICES
