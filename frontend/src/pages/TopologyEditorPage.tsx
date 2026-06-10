@@ -416,11 +416,18 @@ function TopologyEditorInner() {
   const handleSave = async () => {
     if (!id) return;
     const trimmed = description.trim();
-    await updateTopology.mutateAsync({
-      id,
-      canvas_data: { nodes, edges, selectedEdgeLayer },
-      ...(trimmed ? { description: trimmed } : {}),
-    });
+    try {
+      await updateTopology.mutateAsync({
+        id,
+        canvas_data: { nodes, edges, selectedEdgeLayer },
+        ...(trimmed ? { description: trimmed } : {}),
+      });
+    } catch {
+      // The mutation's onError already surfaced the failure as a toast.
+      // Swallow here so the success path below does not run and the
+      // rejection does not dangle as an unhandled promise.
+      return;
+    }
     setDescription("");
     toast.success("Topology saved");
   };

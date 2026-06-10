@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query";
+import toast from "react-hot-toast";
 import type {
   Topology,
   TopologyCreate,
@@ -10,6 +11,11 @@ import type {
 } from "@/types/topology.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+
+function errorDetail(err: unknown, fallback: string): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  return typeof detail === "string" ? detail : fallback;
+}
 
 async function fetchPaginatedTopologies(skip = 0, limit = 50): Promise<PaginatedResponse<Topology>> {
   const resp = await apiClient.get<PaginatedResponse<Topology>>("/cabling/topologies", {
@@ -75,6 +81,7 @@ export function useCreateTopology() {
   return useMutation({
     mutationFn: createTopology,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["topologies"] }),
+    onError: (err) => toast.error(errorDetail(err, "Failed to create topology")),
   });
 }
 
@@ -86,6 +93,7 @@ export function useUpdateTopology() {
       queryClient.invalidateQueries({ queryKey: ["topologies"] });
       queryClient.setQueryData(["topologies", data.id], data);
     },
+    onError: (err) => toast.error(errorDetail(err, "Failed to save topology")),
   });
 }
 
@@ -94,6 +102,7 @@ export function useDeleteTopology() {
   return useMutation({
     mutationFn: deleteTopology,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["topologies"] }),
+    onError: (err) => toast.error(errorDetail(err, "Failed to delete topology")),
   });
 }
 
@@ -105,6 +114,7 @@ export function useCloneTopology() {
       queryClient.invalidateQueries({ queryKey: ["topologies"] });
       queryClient.setQueryData(["topologies", data.id], data);
     },
+    onError: (err) => toast.error(errorDetail(err, "Failed to clone topology")),
   });
 }
 
