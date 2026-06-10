@@ -13,6 +13,11 @@ dependencies = [
     "pydantic-settings>=2.3.0",
     "httpx>=0.27.0",
     "nats-py>=2.7.0",
+    # netmiko (pulls paramiko) gives SSH drivers real network-CLI handling:
+    # config-mode entry, prompt detection, and per-vendor platforms. pip install
+    # is gated off in the driver sandbox, so the SSH client must live in the
+    # execution image, not in a driver package zip.
+    "netmiko>=4.3.0",
     "herd-common",
 ]
 
