@@ -360,6 +360,11 @@ Content-Type: application/json
 Resolves the user's group memberships via the auth service, then checks for a
 matching grant. Returns `{"allowed": true}` or `{"allowed": false}`.
 
+These endpoints are self-service: a non-admin caller may only query its own
+`user_id`. A request whose `user_id` does not match the caller's token returns
+403. Admins and superadmins may introspect any user's permissions. The same rule
+applies to `/api/acl/check/batch` and `/api/acl/resources`.
+
 ### Batch check permissions
 
 ```

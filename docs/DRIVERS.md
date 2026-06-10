@@ -324,8 +324,15 @@ The resource limits are POSIX-only and are not applied on platforms without `os.
 
 ### Dependencies
 
-Vendor your driver's third-party dependencies into a `_deps/` directory inside the
-package; the execution service adds `_deps/` to the driver's `PYTHONPATH` at runtime.
+The execution image ships `netmiko` (which pulls `paramiko`), so SSH-based drivers
+can `import netmiko` / `import paramiko` directly without vendoring or a runtime
+`pip install`. netmiko gives network-CLI drivers config-mode handling, prompt
+detection, and per-vendor platforms; a Management or L2/L3 driver that SSHes into a
+device should use it rather than shipping its own SSH client.
+
+For anything else, vendor your driver's third-party dependencies into a `_deps/`
+directory inside the package; the execution service adds `_deps/` to the driver's
+`PYTHONPATH` at runtime.
 
 Installing a package `requirements.txt` at execution time is off by default, because a
 runtime `pip install` pulls arbitrary code from the network as the service user. An
