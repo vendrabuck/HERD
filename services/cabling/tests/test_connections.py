@@ -210,12 +210,15 @@ async def test_health_endpoint(admin_client):
 
 @pytest.mark.asyncio
 async def test_create_connection_empty_port_name(admin_client):
-    """port_a="" edge case."""
+    """An empty port name is rejected: a connection with no port is degenerate.
+
+    Tightened in #130 (port_a/port_b are Field(min_length=1)). Previously an
+    empty port was accepted and stored; it is now a 422.
+    """
     body = _connection_body()
     body["port_a"] = ""
     resp = await admin_client.post("/connections", json=body)
-    assert resp.status_code == 201
-    assert resp.json()["port_a"] == ""
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio

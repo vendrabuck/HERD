@@ -6,13 +6,15 @@ from pydantic import BaseModel, Field
 
 
 class PortCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=255)
     template_id: uuid.UUID
     field_data: dict[str, Any] = {}
 
 
 class BulkPortCreate(BaseModel):
-    name_prefix: str = Field(..., min_length=1)
+    # The final port name is name_prefix + index, so cap the prefix below the
+    # 255 column width to leave room for the suffix.
+    name_prefix: str = Field(..., min_length=1, max_length=200)
     starting_index: int = Field(..., ge=0)
     instances: int = Field(..., ge=1, le=200)
     template_id: uuid.UUID
@@ -20,7 +22,7 @@ class BulkPortCreate(BaseModel):
 
 
 class PortUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=255)
     field_data: dict[str, Any] | None = None
 
 

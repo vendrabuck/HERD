@@ -2,21 +2,21 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, Field, field_serializer
 
 
 class TopologyCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100)
 
 
 class TopologyClone(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100)
 
 
 class TopologyUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     canvas_data: dict[str, Any] | None = None
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2000)
 
 
 class TopologyResponse(BaseModel):
@@ -105,7 +105,7 @@ class TopologyVersionDiff(BaseModel):
 
 
 class TopologyRestoreRequest(BaseModel):
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2000)
     restore_name: bool = False
 
 

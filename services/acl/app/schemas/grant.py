@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 VALID_RESOURCE_TYPES = {"device", "topology", "reservation"}
 VALID_PERMISSIONS = {"view", "manage"}
@@ -71,7 +71,7 @@ class CheckResponse(BaseModel):
 class BatchCheckRequest(BaseModel):
     user_id: uuid.UUID
     resource_type: str
-    resource_ids: list[uuid.UUID]
+    resource_ids: list[uuid.UUID] = Field(max_length=500)
     permission: str
 
     @field_validator("resource_type")

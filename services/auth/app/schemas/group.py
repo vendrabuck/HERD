@@ -6,12 +6,12 @@ from pydantic import BaseModel, Field
 
 class GroupCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2000)
 
 
 class GroupUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2000)
 
 
 class GroupMemberResponse(BaseModel):
@@ -44,11 +44,11 @@ class AddMemberRequest(BaseModel):
 
 
 class BulkAddMembersRequest(BaseModel):
-    user_ids: list[uuid.UUID]
+    user_ids: list[uuid.UUID] = Field(max_length=500)
 
 
 class BulkRemoveMembersRequest(BaseModel):
-    user_ids: list[uuid.UUID]
+    user_ids: list[uuid.UUID] = Field(max_length=500)
 
 
 class BulkMemberAddResponse(BaseModel):
