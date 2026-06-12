@@ -193,6 +193,50 @@ async def test_create_device(client):
 
 
 @pytest.mark.asyncio
+async def test_device_response_carries_driver_sha256_and_filename(client):
+    """The device payload must expose the driver package's sha256 and filename.
+
+    The execution service keys its driver-package cache on driver_sha256; if the
+    device payload omits it, the cache key is a constant and never invalidates
+    when a driver package is replaced (e.g. one that newly publishes
+    config_schema()). Pin both fields on the create, public GET, and internal
+    GET (the route execution actually fetches) so the contract cannot regress.
+    """
+    driver_id = await _create_driver(client)
+    # Read the driver package back to learn its computed sha256 / filename.
+    drv = (await client.get(f"/drivers/{driver_id}")).json()
+    expected_sha = drv["sha256"]
+    expected_filename = drv["filename"]
+
+    tmpl_resp = await client.post(
+        "/templates",
+        json={**TEMPLATE_PAYLOAD, "driver_id": driver_id, "vendor": "V", "model": "M"},
+    )
+    tid = tmpl_resp.json()["id"]
+    create = await client.post("/devices", json=_device_payload(tid))
+    assert create.status_code == 201
+    body = create.json()
+    assert body["driver_sha256"] == expected_sha
+    assert body["driver_filename"] == expected_filename
+
+    device_id = body["id"]
+    # Public GET.
+    got = (await client.get(f"/devices/{device_id}")).json()
+    assert got["driver_sha256"] == expected_sha
+    assert got["driver_filename"] == expected_filename
+
+    # Internal GET: this is the exact route execution's fetch_device uses, so it
+    # is the contract that actually unblocks cache invalidation.
+    internal = await client.get(
+        f"/devices/{device_id}/internal",
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert internal.status_code == 200
+    assert internal.json()["driver_sha256"] == expected_sha
+    assert internal.json()["driver_filename"] == expected_filename
+
+
+@pytest.mark.asyncio
 async def test_list_devices(client):
     tid = await _create_template(client)
     await client.post("/devices", json=_device_payload(tid))

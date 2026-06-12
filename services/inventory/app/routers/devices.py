@@ -64,6 +64,12 @@ def _device_to_response(device: Device) -> DeviceResponse:
         driver_name=(
             device.template.driver.name if device.template and device.template.driver else None
         ),
+        driver_sha256=(
+            device.template.driver.sha256 if device.template and device.template.driver else None
+        ),
+        driver_filename=(
+            device.template.driver.filename if device.template and device.template.driver else None
+        ),
         connection_type=(
             device.template.driver.connection_type
             if device.template and device.template.driver

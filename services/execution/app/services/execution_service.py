@@ -5,14 +5,23 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import HTTPException
-from herd_common.device_config import ConfigValidationError, validate_device_config
+from herd_common.device_config import (
+    ConfigValidationError,
+    PublishedSchemaError,
+    validate_device_config,
+    validate_device_config_with_schema,
+)
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.execution_command import ExecutionCommand
 from app.models.execution_run import ExecutionRun
-from app.services.driver_loader import get_driver_metadata, load_driver
+from app.services.driver_loader import (
+    get_driver_config_schema,
+    get_driver_metadata,
+    load_driver,
+)
 from app.services.driver_sandbox import DryRunRefused, execute_driver_method
 
 logger = logging.getLogger(__name__)
@@ -289,20 +298,6 @@ async def run_driver_action(
     driver_filename = device_data.get("driver_filename", "driver.zip")
     connection_type = device_data.get("connection_type", "")
 
-    # Method-kwargs allowlist: for `configure`, the kwargs ARE the device config,
-    # and must satisfy the same JSON schema that the inventory write path enforces
-    # on create_config_version. Without this, manual_execute and internal_execute
-    # would accept arbitrary keys and bypass inventory validation.
-    if action == "configure":
-        try:
-            validate_device_config(
-                connection_type or None,
-                method_kwargs,
-                role=device_data.get("name") or None,
-            )
-        except ConfigValidationError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
     # Build context
     context = build_context(device_data, device_id, user_id, reservation_id)
     password_keys = extract_password_keys(template_data)
@@ -345,6 +340,42 @@ async def run_driver_action(
         run = await update_execution_run(db, run, status="FAILED", error=str(e))
         logger.error("Driver load failed", extra={"run_id": str(run.id), "error": str(e)})
         return run
+
+    # Method-kwargs allowlist: for `configure`, the kwargs ARE the device config
+    # and must satisfy the same validation the inventory write path enforces on
+    # create_config_version. Prefer a driver-published config schema (issue #23)
+    # over the neutral registry schema, so a driver like the FRR Management driver
+    # can accept {commands: [...]} that the registry's additionalProperties:False
+    # would reject. The published schema is only cached once load_driver has run
+    # for the current SHA, so this MUST stay after the load above; reading it
+    # before the load would see a cold cache (or a stale row evicted on a SHA
+    # change) and silently fall back to the registry.
+    if action == "configure":
+        try:
+            published_schema = await get_driver_config_schema(db, driver_id)
+            try:
+                validate_device_config_with_schema(
+                    connection_type or None,
+                    method_kwargs,
+                    schema=published_schema,
+                    role=device_data.get("name") or None,
+                )
+            except PublishedSchemaError as exc:
+                # A driver must never break validation by shipping an unsafe or
+                # malformed config_schema(); fall back to the registry, matching
+                # the inventory write path's posture.
+                logger.warning(
+                    "Driver-published schema unusable; falling back to registry",
+                    extra={"driver_id": str(driver_id), "error": str(exc)},
+                )
+                validate_device_config(
+                    connection_type or None,
+                    method_kwargs,
+                    role=device_data.get("name") or None,
+                )
+        except ConfigValidationError as exc:
+            run = await update_execution_run(db, run, status="FAILED", error=str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Fetch the driver's metadata for the dry-run gate (cheap: cached row read).
     driver_metadata = await get_driver_metadata(db, driver_id)
