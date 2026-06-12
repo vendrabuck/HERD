@@ -126,3 +126,47 @@ def test_login_requires_connection_params():
     d = Driver({"dry_run": False})  # no HERD_ip / HERD_login
     with pytest.raises(DriverError):
         d.login()
+
+
+# --- published config schema (issue #23): lets configure accept raw vtysh -----
+
+
+def test_config_schema_is_a_valid_draft_2020_12_schema():
+    import jsonschema
+
+    schema = Driver.config_schema()
+    # Must not raise: the execution sanitizer pins published schemas to 2020-12.
+    jsonschema.Draft202012Validator.check_schema(schema)
+
+
+def test_config_schema_is_ssrf_safe_no_ref_or_id():
+    """The schema must carry no base-URI or remote-reference keywords, so the
+    execution-side sanitizer accepts it without stripping or rejecting it."""
+    import json
+
+    blob = json.dumps(Driver.config_schema())
+    for forbidden in ("$ref", "$id", "$schema", "$anchor", "$dynamicRef"):
+        assert forbidden not in blob
+
+
+def test_config_schema_accepts_commands_and_command():
+    import jsonschema
+
+    schema = Driver.config_schema()
+    jsonschema.validate({"commands": ["ip route 192.0.2.0/24 blackhole"]}, schema)
+    jsonschema.validate({"command": "hostname r1-demo"}, schema)
+
+
+def test_config_schema_rejects_bad_shapes():
+    import jsonschema
+
+    schema = Driver.config_schema()
+    # non-string command line
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"commands": [123]}, schema)
+    # empty list (minItems: 1)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"commands": []}, schema)
+    # additional property outside the driver's vocabulary
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"vlan": 10}, schema)

@@ -61,6 +61,14 @@ class DeviceResponse(BaseModel):
     field_data: dict[str, Any]
     driver_id: uuid.UUID | None = None
     driver_name: str | None = None
+    # The execution service keys its driver-package cache on driver_sha256, so it
+    # must travel on the device payload; without it the cache key is a constant
+    # ("unknown") and never invalidates when a driver package is replaced, so an
+    # updated driver (e.g. one that newly publishes config_schema()) is never
+    # re-extracted. driver_filename lets the execution side extract the package
+    # with the right archive handler (.zip vs .tar.gz).
+    driver_sha256: str | None = None
+    driver_filename: str | None = None
     connection_type: str | None = None
     exclusive: bool = True
     created_at: datetime

@@ -23,6 +23,7 @@ from app.services.execution_service import (
     list_execution_runs,
     run_driver_action,
 )
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
@@ -189,3 +190,160 @@ async def test_run_driver_action_command_log_failure_swallowed(db, monkeypatch):
     run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
     assert run.status == "SUCCESS"
     assert run.duration_ms == 7
+
+
+# --- run_driver_action configure validation: published schema vs registry ---
+
+# A driver-published schema shaped like the FRR Management driver's: it accepts
+# raw vtysh lines under `commands`, which the neutral registry Management schema
+# (additionalProperties:False over {vlan,ip,hostname,description}) would reject.
+_FRR_PUBLISHED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "commands": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+        "command": {"type": "string", "minLength": 1},
+    },
+    "additionalProperties": False,
+    "minProperties": 1,
+}
+
+
+def _ok_method(**kwargs):
+    return MagicMock(return_value={"success": True, "output": None, "duration_ms": 1})()
+
+
+@pytest.mark.asyncio
+async def test_configure_accepts_commands_when_driver_publishes_schema(db, monkeypatch):
+    """The blocker fix: with a published schema allowing `commands`, a configure
+    call carrying raw vtysh lines passes validation and the run succeeds, where
+    the registry-only path would have rejected it as an additional property."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "get_driver_config_schema",
+        AsyncMock(return_value=_FRR_PUBLISHED_SCHEMA),
+    )
+    monkeypatch.setattr(ex_service, "execute_driver_method", MagicMock(side_effect=_ok_method))
+
+    run = await run_driver_action(
+        db,
+        _device_data(),
+        _template_data(),
+        "configure",
+        USER_ID,
+        method_kwargs={"commands": ["ip route 192.0.2.0/24 blackhole"]},
+    )
+    assert run.status == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_configure_registry_fallback_when_no_published_schema(db, monkeypatch):
+    """No published schema => byte-for-byte registry behavior. The registry
+    Management schema accepts `hostname` but rejects `commands` with a 422."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(ex_service, "get_driver_config_schema", AsyncMock(return_value=None))
+    monkeypatch.setattr(ex_service, "execute_driver_method", MagicMock(side_effect=_ok_method))
+
+    # hostname is in the registry Management schema, so this passes.
+    ok = await run_driver_action(
+        db,
+        _device_data(),
+        _template_data(),
+        "configure",
+        USER_ID,
+        method_kwargs={"hostname": "mgmt"},
+    )
+    assert ok.status == "SUCCESS"
+
+    # commands is not in the registry schema, so this is rejected with a 422 and
+    # the run is recorded FAILED.
+    with pytest.raises(HTTPException) as exc:
+        await run_driver_action(
+            db,
+            _device_data(),
+            _template_data(),
+            "configure",
+            USER_ID,
+            method_kwargs={"commands": ["ip route 192.0.2.0/24 blackhole"]},
+        )
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_configure_unsafe_published_schema_falls_back_to_registry(db, monkeypatch):
+    """A hostile/malformed published schema must never break or bypass
+    validation: a non-local $ref raises PublishedSchemaError, the caller falls
+    back to the registry. Registry-valid kwargs then pass; registry-invalid
+    kwargs are rejected (the published schema cannot smuggle `commands` through)."""
+    hostile_schema = {
+        "type": "object",
+        "properties": {"x": {"$ref": "http://169.254.169.254/latest/meta-data/"}},
+    }
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service, "get_driver_config_schema", AsyncMock(return_value=hostile_schema)
+    )
+    monkeypatch.setattr(ex_service, "execute_driver_method", MagicMock(side_effect=_ok_method))
+
+    # Fell back to registry, which accepts hostname.
+    ok = await run_driver_action(
+        db,
+        _device_data(),
+        _template_data(),
+        "configure",
+        USER_ID,
+        method_kwargs={"hostname": "mgmt"},
+    )
+    assert ok.status == "SUCCESS"
+
+    # Fell back to registry, which rejects commands: the hostile schema did not
+    # widen the vocabulary.
+    with pytest.raises(HTTPException) as exc:
+        await run_driver_action(
+            db,
+            _device_data(),
+            _template_data(),
+            "configure",
+            USER_ID,
+            method_kwargs={"commands": ["ip route 192.0.2.0/24 blackhole"]},
+        )
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_configure_validation_runs_after_load_driver(db, monkeypatch):
+    """Ordering guard: the published-schema lookup is only correct after
+    load_driver has populated the cache for the current SHA. Lock in that
+    load_driver is awaited before get_driver_config_schema is read, so a future
+    refactor cannot move validation back above the load (which would see a cold
+    cache and silently fall back to the registry)."""
+    calls = []
+    monkeypatch.setattr(
+        ex_service,
+        "load_driver",
+        AsyncMock(side_effect=lambda *a, **k: calls.append("load") or "/tmp/driver"),
+    )
+    monkeypatch.setattr(
+        ex_service,
+        "get_driver_config_schema",
+        AsyncMock(side_effect=lambda *a, **k: calls.append("schema") or _FRR_PUBLISHED_SCHEMA),
+    )
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(ex_service, "execute_driver_method", MagicMock(side_effect=_ok_method))
+
+    await run_driver_action(
+        db,
+        _device_data(),
+        _template_data(),
+        "configure",
+        USER_ID,
+        method_kwargs={"commands": ["ip route 192.0.2.0/24 blackhole"]},
+    )
+    assert calls.index("load") < calls.index("schema")

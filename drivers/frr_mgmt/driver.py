@@ -43,6 +43,45 @@ class Driver:
         self.port = int(context.get("HERD_port", 22))
         self._conn = None
 
+    # --- published config schema --------------------------------------------
+
+    @classmethod
+    def config_schema(cls):
+        """Schema for the `configure` action's kwargs.
+
+        The platform's neutral Management vocabulary ({vlan, ip, hostname,
+        description}) cannot express raw routing config, so this driver publishes
+        its own schema: a list of vtysh config-mode lines. The execution service
+        prefers this over the registry schema when validating a `configure` call
+        (see issue #23), so {commands: [...]} is accepted instead of rejected as
+        an additional property.
+
+        Kept draft-2020-12 safe on purpose: no $ref, $id, or $schema, so the
+        execution-side sanitizer accepts it without stripping anything.
+        """
+        return {
+            "type": "object",
+            "properties": {
+                "commands": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "description": (
+                        "vtysh config-mode lines, e.g. 'ip route 192.0.2.0/24 blackhole'."
+                    ),
+                },
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "description": "A single vtysh config line (convenience form).",
+                },
+            },
+            "additionalProperties": False,
+            "minProperties": 1,
+        }
+
     # --- connection helpers -------------------------------------------------
 
     def _connect(self):

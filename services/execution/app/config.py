@@ -31,7 +31,16 @@ class Settings(BaseSettings):
     driver_rlimit_as_bytes: int = 256 * 1024 * 1024
     driver_rlimit_cpu_seconds: int = 60
     driver_rlimit_nofile: int = 256
-    driver_rlimit_nproc: int = 64
+    # RLIMIT_NPROC is a per-UID ceiling that counts every thread/process the
+    # service uid already has CONTAINER-WIDE, not just this child, so it must
+    # clear the service's own transient baseline (uvicorn worker pool, the
+    # health scheduler, asyncio executors) plus the driver's own threads. SSH
+    # drivers (netmiko/paramiko) spawn worker threads; measured in-container,
+    # even importing netmiko and starting one thread failed at 64 and at 256
+    # ("can't start new thread") because the service baseline alone is already
+    # above 256 in bursts, while 1024 has comfortable headroom. 1024 keeps a
+    # real fork-bomb guard (a runaway driver still cannot exhaust the host).
+    driver_rlimit_nproc: int = 1024
 
     # Whether a driver package's requirements.txt is pip-installed at execution
     # time. Default off: a runtime `pip install` pulls arbitrary code from the
