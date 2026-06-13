@@ -22,9 +22,11 @@ export function FieldRow({ field, index, onChange, onRemove }: FieldRowProps) {
   );
 
   useEffect(() => {
+    // Intentional state sync: re-seed local edit buffer from props when the
+    // field type changes (e.g. switching to/from dropdown), not on every
+    // field.options change which would overwrite mid-typing.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setOptionsText(field.options?.join(", ") ?? "");
-    // Only re-sync when field type changes (e.g. switching to/from dropdown),
-    // not on every field.options change which would overwrite mid-typing.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [field.type]);
 

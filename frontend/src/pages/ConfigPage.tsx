@@ -284,6 +284,8 @@ function ConfigEditor() {
         changed = true;
       }
     }
+    // Intentional state sync: apply schema defaults once after settings load.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (changed) setValues(updated);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [schema, settingsLoaded]);
