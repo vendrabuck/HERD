@@ -69,31 +69,27 @@ If a migration fails mid-flight, the service stays down. Fix the cause, re-run `
 
 ## Inspecting the NATS DLQ
 
-Three durable consumers across two streams. Each has its own DLQ subject so one consumer's failures do not mask another's:
+Three durable consumers feed off two source streams (`HERD_RESERVATIONS` for `herd.reservations.*`, `HERD_HEALTH` for `herd.health.*`). Each consumer routes its failures to its own 4-token DLQ subject so one consumer's failures do not mask another's. All DLQ subjects are captured by a single dedicated `HERD_DLQ` stream (`herd.*.dlq.>` subjects), created by the execution service at startup. The DLQ subjects are deliberately one token longer than any consumer's 3-token filter, so a DLQ'd message is never redelivered to the consumer that failed it:
 
-**`HERD_RESERVATIONS` stream** (`herd.reservations.*` subjects):
-- `execution` consumer (`execution-consumer`), DLQ `herd.reservations.dlq`
+- `execution` consumer (`execution-consumer`), DLQ `herd.reservations.dlq.execution`
 - `notifications` consumer (`notifications-consumer`), DLQ `herd.reservations.dlq.notifications`
-
-**`HERD_HEALTH` stream** (`herd.health.*` subjects, ROADMAP #13 iter 2):
 - `notifications` health consumer (`notifications-health-consumer`), DLQ `herd.health.dlq.notifications`
 
-Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject. Inspect with the `nats` CLI (install via `brew install nats-io/nats-tools/nats` or the binary from github.com/nats-io/natscli):
+Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ`. Inspect with the `nats` CLI (install via `brew install nats-io/nats-tools/nats` or the binary from github.com/nats-io/natscli):
 
 ```bash
-# List subscriptions and streams
-docker compose exec nats nats stream info HERD_RESERVATIONS
-docker compose exec nats nats stream info HERD_HEALTH
+# List the DLQ stream and its retained messages
+docker compose exec nats nats stream info HERD_DLQ
 
-# Create an ephemeral consumer subscribed to a DLQ and dump pending messages
-docker compose exec nats nats sub 'herd.reservations.dlq' --last-per-subject              # execution
-docker compose exec nats nats sub 'herd.reservations.dlq.notifications' --last-per-subject # notifications (reservations)
-docker compose exec nats nats sub 'herd.health.dlq.notifications' --last-per-subject       # notifications (health)
+# Dump the last message per DLQ subject
+docker compose exec nats nats sub 'herd.reservations.dlq.execution' --last-per-subject     # execution
+docker compose exec nats nats sub 'herd.reservations.dlq.notifications' --last-per-subject  # notifications (reservations)
+docker compose exec nats nats sub 'herd.health.dlq.notifications' --last-per-subject        # notifications (health)
 
 # Or use a durable pull consumer to walk messages one at a time
-docker compose exec nats nats consumer add HERD_RESERVATIONS dlq-inspector \
-  --filter 'herd.reservations.dlq' --ack none --deliver all --pull
-docker compose exec nats nats consumer next HERD_RESERVATIONS dlq-inspector
+docker compose exec nats nats consumer add HERD_DLQ dlq-inspector \
+  --filter 'herd.reservations.dlq.execution' --ack none --deliver all --pull
+docker compose exec nats nats consumer next HERD_DLQ dlq-inspector
 ```
 
 Each DLQ message is a verbatim copy of the original event payload. Reservation events look like `{"event": "reservation.created", "reservation_id": "...", ...}`; health events look like `{"event": "device.health_transition", "device_id": "...", "transition_kind": "bad_news", ...}`.
@@ -111,11 +107,11 @@ docker compose exec nats nats pub 'herd.reservations.created' "$(cat msg.json)"
 If the events are stale (e.g. you've already manually fixed the state), purge the relevant DLQ subject:
 
 ```bash
-docker compose exec nats nats stream purge HERD_RESERVATIONS \
-  --subject 'herd.reservations.dlq'
-docker compose exec nats nats stream purge HERD_RESERVATIONS \
+docker compose exec nats nats stream purge HERD_DLQ \
+  --subject 'herd.reservations.dlq.execution'
+docker compose exec nats nats stream purge HERD_DLQ \
   --subject 'herd.reservations.dlq.notifications'
-docker compose exec nats nats stream purge HERD_HEALTH \
+docker compose exec nats nats stream purge HERD_DLQ \
   --subject 'herd.health.dlq.notifications'
 ```
 

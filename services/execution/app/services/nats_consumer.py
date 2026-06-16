@@ -29,11 +29,12 @@ NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
 # every DLQ'd message would be redelivered to this same consumer: a poison message
 # would loop forever and a max_deliver-exhausted message would re-run the
 # non-idempotent handler. This mirrors the notifications service's
-# "herd.reservations.dlq.notifications". The HERD_RESERVATIONS stream is created
-# with subjects=["herd.reservations.*"], so this subject is not bound to that
-# stream; the publish is best-effort and _publish_to_dlq swallows the resulting
-# error, matching notifications. Breaking the redelivery loop is the fix; durable
-# DLQ retention would require a dedicated stream and is out of scope here.
+# "herd.reservations.dlq.notifications". This 4-token subject is not bound to the
+# HERD_RESERVATIONS source stream (subjects=["herd.reservations.*"]); instead it is
+# captured by the dedicated HERD_DLQ stream (subjects=["herd.*.dlq.>"]), created at
+# execution startup by _ensure_dlq_stream, which retains DLQ'd messages for
+# inspection and replay (see docs/OPERATIONS.md). The _publish_to_dlq publish stays
+# best-effort and swallows errors so a DLQ outage cannot wedge the consumer.
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.execution"
 
 

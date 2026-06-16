@@ -35,12 +35,40 @@ async def _ensure_health_stream(app: FastAPI) -> None:
         logger.warning("Could not create HERD_HEALTH stream", exc_info=True)
 
 
+async def _ensure_dlq_stream(app: FastAPI) -> None:
+    """Create the shared HERD_DLQ stream if NATS is up.
+
+    Every consumer routes poison and retry-exhausted messages to a 4-token
+    DLQ subject (herd.reservations.dlq.execution, herd.reservations.dlq.notifications,
+    herd.health.dlq.notifications). Those subjects are deliberately one token
+    longer than any consumer's 3-token filter so a DLQ'd message is never
+    redelivered to the consumer that failed it; the flip side is that no
+    producing stream captures them, so without this stream _publish_to_dlq
+    publishes into the void and the message is lost. The "herd.*.dlq.>" pattern
+    binds all current and future DLQ subjects into one inspectable stream.
+
+    Idempotent: add_stream returns the existing stream if it already exists.
+    Non-fatal if NATS is down so the service still boots; DLQ publishes are
+    best-effort and swallow their own errors in that case.
+    """
+    nc = getattr(app.state, "nats", None)
+    if nc is None:
+        return
+    try:
+        js = nc.jetstream()
+        await js.add_stream(name="HERD_DLQ", subjects=["herd.*.dlq.>"])
+        logger.info("JetStream stream HERD_DLQ ready")
+    except Exception:
+        logger.warning("Could not create HERD_DLQ stream", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await start_nats_consumer(app)
     await _ensure_health_stream(app)
+    await _ensure_dlq_stream(app)
     await start_health_scheduler(app)
     yield
     await stop_health_scheduler(app)
