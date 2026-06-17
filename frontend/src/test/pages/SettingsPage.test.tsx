@@ -55,6 +55,42 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Reservation cancelled")).toBeInTheDocument();
     expect(screen.getByText("Reservation completed")).toBeInTheDocument();
     expect(screen.getByText("Reservation expiring soon")).toBeInTheDocument();
+    expect(screen.getByText("Device health changes")).toBeInTheDocument();
+  });
+
+  it("toggling the device health event sends device.health_transition in the payload", async () => {
+    let captured: unknown = null;
+    server.use(
+      http.get("/api/notifications/notifications/preferences", () =>
+        HttpResponse.json(DEFAULT_PREFS),
+      ),
+      http.put(
+        "/api/notifications/notifications/preferences",
+        async ({ request }) => {
+          const body = await request.json();
+          captured = body;
+          return HttpResponse.json(body);
+        },
+      ),
+    );
+    renderWithProviders(<SettingsPage />);
+    await waitFor(() =>
+      expect(screen.getByText("Notifications")).toBeInTheDocument(),
+    );
+
+    // The prefs payload omits device.health_transition, so the component
+    // defaults it on; toggling it off must send the key explicitly.
+    const health = screen.getByLabelText("Device health changes") as HTMLInputElement;
+    expect(health.checked).toBe(true);
+    fireEvent.click(health);
+    expect(health.checked).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(toastSuccess).toHaveBeenCalledWith("Preferences saved"),
+    );
+    const body = captured as { events: Record<string, boolean> };
+    expect(body.events["device.health_transition"]).toBe(false);
   });
 
   it("renders outbound channel toggles defaulting off", async () => {
