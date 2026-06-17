@@ -111,9 +111,18 @@ async def create(
     user_id: uuid.UUID,
     reservation_id: uuid.UUID,
     seed_block: str,
+    commit: bool = True,
 ) -> AssistantConversation:
     """Create a new conversation and persist the seed as the position-0 user
-    message. Returns the persisted conversation with .id populated.
+    message. Returns the conversation with .id populated.
+
+    When commit is True (the default, used by the repo's own callers) the row
+    is committed before returning. The route passes commit=False so the new
+    conversation, the opening user message, and the assistant reply all land in
+    a single transaction: if the AI loop fails mid-turn the whole turn rolls
+    back when the session closes, leaving no orphan conversation and, on a
+    reused conversation, no orphan trailing user message that would later wedge
+    the provider's user/assistant role alternation.
     """
     conv = AssistantConversation(
         user_id=user_id,
@@ -131,8 +140,9 @@ async def create(
         position=0,
     )
     db.add(seed_message)
-    await db.commit()
-    await db.refresh(conv)
+    if commit:
+        await db.commit()
+        await db.refresh(conv)
     return conv
 
 

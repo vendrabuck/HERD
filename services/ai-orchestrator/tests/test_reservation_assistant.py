@@ -670,3 +670,238 @@ async def test_stream_requires_auth(async_client):
     async with async_client as client:
         resp = await client.post(_stream_url(), json={"question": "hello"})
     assert resp.status_code == 401
+
+
+# --- Turn atomicity: a mid-turn failure must not orphan the user message ---
+#
+# Root cause regression: _prepare_turn used to commit the new user message
+# before the AI loop ran, so a provider failure (raise, no-text, timeout) left
+# a committed user message with no assistant reply. On the next turn the
+# reconstructed history then had two user messages in a row, which the provider
+# rejects with a 400, wedging the conversation permanently. The fix flushes the
+# user turn and defers the commit to _persist_turn (and rolls back on failure),
+# so the user message and the assistant reply are one atomic transaction.
+
+
+async def _load_db_messages(conversation_id):
+    """Return (role, blocks) tuples for a conversation, ordered by position,
+    read straight from the DB so a test can assert exactly what persisted.
+    """
+    from app.models.conversation import AssistantMessage
+    from sqlalchemy import select
+
+    async with _TestSessionLocal() as db:
+        result = await db.execute(
+            select(AssistantMessage)
+            .where(AssistantMessage.conversation_id == uuid.UUID(conversation_id))
+            .order_by(AssistantMessage.position)
+        )
+        rows = result.scalars().all()
+        return [(row.role.value, row.content_blocks) for row in rows]
+
+
+def _assert_no_orphan_trailing_user(rows):
+    """The persisted history must never end on a USER turn with no ASSISTANT
+    reply after it, and must never have two consecutive real USER turns (TOOL
+    echoes between an assistant turn and the next user turn are fine). Either
+    shape is the orphan that wedges the provider's role alternation.
+    """
+    real_roles = [role for role, _ in rows if role in ("USER", "ASSISTANT")]
+    assert real_roles, "expected at least the seed user message"
+    assert real_roles[-1] == "ASSISTANT", (
+        f"history ends on a USER turn with no assistant reply: {real_roles}"
+    )
+    for prev, cur in zip(real_roles, real_roles[1:]):
+        assert not (prev == "USER" and cur == "USER"), (
+            f"two consecutive user turns persisted (orphan): {real_roles}"
+        )
+
+
+async def _start_conversation(client, headers):
+    """Create a conversation via one successful buffered turn; return its id."""
+    _override_ai(answer="turn one answer")
+    resp = await client.post(_url(), json={"question": "turn one"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp.json()["conversation_id"]
+
+
+async def test_buffered_failure_leaves_no_orphan_and_next_turn_succeeds(async_client):
+    """Buffered: turn 2 fails in the provider; the failed turn's user message
+    must NOT persist, and turn 3 on the same conversation must still succeed.
+    """
+    _override_seed()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        conv_id = await _start_conversation(client, headers)
+
+        # Turn two raises mid-loop.
+        _override_ai(raises=AIError("provider exploded mid-turn"))
+        failed = await client.post(
+            _url(),
+            json={"question": "turn two", "conversation_id": conv_id},
+            headers=headers,
+        )
+        assert failed.status_code == 502
+
+        # The failed turn must have left no orphan trailing user message.
+        rows = await _load_db_messages(conv_id)
+        _assert_no_orphan_trailing_user(rows)
+        # Turn one only: seed-with-question (USER) + assistant reply (ASSISTANT).
+        assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+
+        # Turn three on the same conversation succeeds (conversation not wedged).
+        _override_ai(answer="turn three answer")
+        recovered = await client.post(
+            _url(),
+            json={"question": "turn three", "conversation_id": conv_id},
+            headers=headers,
+        )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["conversation_id"] == conv_id
+    rows = await _load_db_messages(conv_id)
+    _assert_no_orphan_trailing_user(rows)
+    # turn one (USER, ASSISTANT) + turn three (USER, ASSISTANT); turn two
+    # rolled back entirely.
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "USER", "ASSISTANT"]
+
+
+async def test_buffered_no_text_raises_exact_wording_and_leaves_no_orphan(async_client):
+    """The all-reasoning final turn raises 'AI returned no text content'. The
+    route maps it to 502, and the failed turn must leave no orphan user message.
+    This exercises the real loop (not a stub) so the exact wording is pinned.
+    """
+    from app.services.ai_client import AIClient
+    from app.services.llm_provider import ProviderResponse, Usage
+
+    _override_seed()
+
+    class NoTextProvider:
+        async def call(self, **kwargs):
+            # stop_reason is end_turn (not tool_use) with zero text blocks: the
+            # loop's "no usable text" branch fires.
+            return ProviderResponse(
+                content=[],
+                stop_reason="end_turn",
+                usage=Usage(input_tokens=3, output_tokens=0),
+                raw_model="test-model",
+            )
+
+    app.dependency_overrides[get_ai_client] = lambda: AIClient(
+        provider=NoTextProvider(), max_tokens=64
+    )
+
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        # First turn itself returns no text, so the whole turn (conversation
+        # included) must roll back: a follow-up cannot reference it.
+        resp = await client.post(_url(), json={"question": "reason only"}, headers=headers)
+    assert resp.status_code == 502
+
+    # The conversation must not have been left half-created with an orphan user
+    # message. No conversation_id is returned on failure, so prove atomicity at
+    # the DB level: zero conversations, zero messages persisted.
+    from app.models.conversation import AssistantConversation, AssistantMessage
+    from sqlalchemy import func, select
+
+    async with _TestSessionLocal() as db:
+        conv_count = (
+            await db.execute(select(func.count()).select_from(AssistantConversation))
+        ).scalar_one()
+        msg_count = (
+            await db.execute(select(func.count()).select_from(AssistantMessage))
+        ).scalar_one()
+    assert conv_count == 0, "failed first turn left an orphan conversation"
+    assert msg_count == 0, "failed first turn left an orphan message"
+
+
+async def test_buffered_no_text_exact_error_wording():
+    """Pin the exact wording the loop raises on an all-reasoning final turn."""
+    from app.services.ai_client import AIClient
+    from app.services.llm_provider import Message, ProviderResponse, TextBlock, Usage
+    from app.services.tools import ToolDispatcher
+
+    class NoTextProvider:
+        async def call(self, **kwargs):
+            return ProviderResponse(
+                content=[],
+                stop_reason="end_turn",
+                usage=Usage(input_tokens=1, output_tokens=0),
+                raw_model="test-model",
+            )
+
+    client = AIClient(provider=NoTextProvider(), max_tokens=64)
+    async with ToolDispatcher(
+        token="t", reservation_id=RESERVATION_ID, char_cap=1000
+    ) as dispatcher:
+        with pytest.raises(AIError, match=r"^AI returned no text content$"):
+            await client.answer_reservation_question_with_tools(
+                messages=[Message(role="user", content=[TextBlock(text="hi")])],
+                dispatcher=dispatcher,
+                max_iterations=4,
+            )
+
+
+async def test_stream_failure_leaves_no_orphan_and_next_turn_succeeds(async_client):
+    """Streaming: turn 2 fails after the stream opened; the error event must not
+    leave the user message orphaned, and turn 3 must still succeed.
+    """
+    _override_seed()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        conv_id = await _start_conversation(client, headers)
+
+        # Turn two raises inside the streaming generator: surfaces as an error
+        # event (HTTP 200 since the stream had opened) and must roll back.
+        _override_streaming_ai([], raises=AIError("stream blew up"))
+        failed = await client.post(
+            _stream_url(),
+            json={"question": "turn two", "conversation_id": conv_id},
+            headers=headers,
+        )
+        assert failed.status_code == 200
+        events = _parse_sse(failed.text)
+        assert events[-1][0] == "error"
+
+        rows = await _load_db_messages(conv_id)
+        _assert_no_orphan_trailing_user(rows)
+        assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+
+        # Turn three (buffered) on the same conversation succeeds.
+        _override_ai(answer="turn three answer")
+        recovered = await client.post(
+            _url(),
+            json={"question": "turn three", "conversation_id": conv_id},
+            headers=headers,
+        )
+    assert recovered.status_code == 200, recovered.text
+    rows = await _load_db_messages(conv_id)
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "USER", "ASSISTANT"]
+
+
+async def test_stream_no_answer_leaves_no_orphan(async_client):
+    """Streaming: the generator yields no done event (turn is None). The route
+    emits 'Assistant produced no answer' and must roll back the user turn.
+    """
+    from app.services.ai_client import AssistantStatus
+
+    _override_seed()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        conv_id = await _start_conversation(client, headers)
+
+        # Stream yields a status but never a done event.
+        _override_streaming_ai([AssistantStatus(message="analyzing")])
+        failed = await client.post(
+            _stream_url(),
+            json={"question": "turn two", "conversation_id": conv_id},
+            headers=headers,
+        )
+        assert failed.status_code == 200
+        events = _parse_sse(failed.text)
+        assert events[-1][0] == "error"
+        assert events[-1][1]["message"] == "Assistant produced no answer"
+
+        rows = await _load_db_messages(conv_id)
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
