@@ -12,6 +12,7 @@ const EVENT_LABELS: Array<{ key: string; label: string }> = [
   { key: "reservation.cancelled", label: "Reservation cancelled" },
   { key: "reservation.completed", label: "Reservation completed" },
   { key: "reservation.expiring_soon", label: "Reservation expiring soon" },
+  { key: "device.health_transition", label: "Device health changes" },
 ];
 
 const OUTBOUND_CHANNELS: Array<{
