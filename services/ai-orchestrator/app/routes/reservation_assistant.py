@@ -97,6 +97,15 @@ async def _prepare_turn(
     turn, and returns (conversation, messages) ready for the tool loop. Raises
     HTTPException on 404/quota exactly as before so both endpoints behave the
     same up to the point where one buffers and the other streams.
+
+    The new user turn is only FLUSHED here, never committed: the commit is
+    deferred to _persist_turn, which writes the assistant reply in the same
+    transaction. Keeping the whole turn in one transaction makes it atomic, if
+    the AI loop fails (provider raises, returns no text, or times out) the
+    session closes without committing and the user message never persists. That
+    is the fix for the wedge bug: a committed orphan trailing user message would
+    make the next turn's reconstructed history put two user messages in a row,
+    which the provider rejects with a 400, permanently jamming the conversation.
     """
     await usage_repo.enforce_quota(db, user_id)
 
@@ -112,6 +121,7 @@ async def _prepare_turn(
             user_id=user_id,
             reservation_id=reservation_id,
             seed_block=seed_block,
+            commit=False,
         )
         is_new_conversation = True
     else:
@@ -136,8 +146,11 @@ async def _prepare_turn(
         )
     else:
         await conversation_repo.append_user_text(db, conversation=conversation, text=body.question)
-    await db.commit()
-    await db.refresh(conversation)
+    # Flush, do NOT commit: the user turn must persist atomically with the
+    # assistant reply written in _persist_turn. load_messages reads the flushed
+    # (uncommitted) rows from this same session, so the AI loop still sees the
+    # full history.
+    await db.flush()
 
     messages = await conversation_repo.load_messages(db, conversation_id=conversation.id)
     return conversation, messages
@@ -232,13 +245,18 @@ async def reservation_assistant(
                 )
                 call_log = list(dispatcher.call_log)
     except asyncio.TimeoutError as exc:
+        # Discard the flushed-but-uncommitted user turn so a timed-out turn
+        # leaves no orphan trailing user message.
+        await db.rollback()
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,
             f"Assistant did not respond within {settings.assistant_overall_deadline_s:.0f}s",
         ) from exc
     except AIError as exc:
-        # Log the exception detail server-side; return a generic message so a
+        # Roll back first so the failed turn's user message never persists, then
+        # log the exception detail server-side and return a generic message so a
         # backend exception string is never exposed to the client (CWE-209).
+        await db.rollback()
         logger.exception("ai_assistant_failed")
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
@@ -350,6 +368,10 @@ async def reservation_assistant_stream(
                             turn = ev.result
 
                     if turn is None:
+                        # No assistant reply assembled: roll back the flushed
+                        # user turn so it does not persist without a reply and
+                        # wedge the next turn's role alternation.
+                        await db.rollback()
                         yield _sse("error", {"message": "Assistant produced no answer"})
                         return
 
@@ -387,6 +409,9 @@ async def reservation_assistant_stream(
                     )
                     yield _sse("done", payload.model_dump(mode="json"))
         except asyncio.TimeoutError:
+            # Discard the flushed-but-uncommitted user turn so a timed-out turn
+            # leaves no orphan trailing user message.
+            await db.rollback()
             yield _sse(
                 "error",
                 {
@@ -399,7 +424,9 @@ async def reservation_assistant_stream(
         except AIError:
             # Log the exception detail server-side; the client-facing error frame
             # carries a generic message so no backend exception string leaks
-            # (CWE-209 stack-trace exposure).
+            # (CWE-209 stack-trace exposure). Roll back first so the failed turn's
+            # user message never persists.
+            await db.rollback()
             logger.exception("ai_assistant_stream_failed")
             yield _sse("error", {"message": "Assistant call failed"})
 
