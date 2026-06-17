@@ -317,6 +317,97 @@ async def test_rotate_refresh_token_inactive_user():
         assert result is None
 
 
+# --- session resurrection race (logout vs concurrent refresh) ---
+
+
+@pytest.mark.asyncio
+async def test_concurrent_logout_during_refresh_does_not_resurrect_session(monkeypatch):
+    """Regression: a logout that revokes a refresh token must not be undone by a
+    refresh that is already in flight.
+
+    The race window: refresh reads the token as live, THEN a concurrent logout
+    commits revoked=True from another transaction, THEN refresh proceeds to mint a
+    brand-new token and resurrects the just-logged-out session. To trigger this
+    deterministically we interpose the logout at exactly that mid-refresh point by
+    patching get_user_by_id (which rotate_refresh_token calls after its read but
+    before it consumes the token), running the logout in a SEPARATE committed
+    session there. The fix makes refresh consume the old token with a guarded
+    `WHERE revoked == False` UPDATE, so the now-revoked row matches zero rows and
+    refresh issues nothing.
+
+    On the unfixed code (read-then-mutate-in-memory) this test fails: rotate
+    returns a fresh token and a live token survives the logout.
+    """
+    import app.services.auth_service as auth_service
+    from app.models.user import RefreshToken
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
+
+    async with TestSessionLocal() as db:
+        user = await _create_test_user(db, "race@test.com", "raceuser")
+        # Capture the id eagerly: the interleaved logout commit below expires ORM
+        # state, so we must not lazily reload `user` afterwards.
+        user_id = user.id
+        _, raw_refresh = await create_tokens_for_user(db, user)
+
+        real_get_user_by_id = auth_service.get_user_by_id
+        fired = {"done": False}
+
+        async def interposing_get_user_by_id(session, requested_id):
+            # Run the concurrent logout exactly once, mid-refresh, in its own
+            # committed session so refresh's transaction sees a revoked token.
+            if not fired["done"]:
+                fired["done"] = True
+                async with TestSessionLocal() as other:
+                    assert await revoke_refresh_token(other, raw_refresh) is True
+            return await real_get_user_by_id(session, requested_id)
+
+        monkeypatch.setattr(auth_service, "get_user_by_id", interposing_get_user_by_id)
+
+        result = await rotate_refresh_token(db, raw_refresh)
+        assert result is None, "refresh resurrected a logged-out session"
+        assert fired["done"] is True, "interposed logout never ran; test is not exercising the race"
+
+        # No live (unrevoked) refresh token may exist for this user after logout.
+        live = await db.execute(
+            sa_select(func.count())
+            .select_from(RefreshToken)
+            .where(RefreshToken.user_id == user_id, RefreshToken.revoked == False)  # noqa: E712
+        )
+        assert live.scalar() == 0, "a live token survived the concurrent logout"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_refresh_single_winner():
+    """Two refreshes racing the same token: exactly one succeeds, the other is
+    refused, so a leaked/replayed token cannot mint two live sessions.
+
+    The first rotate consumes the token via the guarded UPDATE; the second sees
+    revoked == True and returns None.
+    """
+    from app.models.user import RefreshToken
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
+
+    async with TestSessionLocal() as db:
+        user = await _create_test_user(db, "dup@test.com", "dupuser")
+        _, raw_refresh = await create_tokens_for_user(db, user)
+
+        first = await rotate_refresh_token(db, raw_refresh)
+        second = await rotate_refresh_token(db, raw_refresh)
+
+        assert first is not None
+        assert second is None, "the same refresh token rotated twice"
+
+        # Exactly one live token exists (the rotation replacement), not two.
+        live = await db.execute(
+            sa_select(func.count())
+            .select_from(RefreshToken)
+            .where(RefreshToken.user_id == user.id, RefreshToken.revoked == False)  # noqa: E712
+        )
+        assert live.scalar() == 1
+
+
 # --- create_user auto-assign to "Not Grouped" ---
 
 
