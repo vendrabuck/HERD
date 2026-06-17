@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from passlib.context import CryptContext
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -303,7 +303,26 @@ async def rotate_refresh_token(db: AsyncSession, raw_refresh_token: str) -> tupl
     if not user or not user.is_active:
         return None
 
-    db_token.revoked = True
+    # Atomically consume the old token by flipping revoked False to True in a
+    # single guarded UPDATE. The `revoked == False` predicate in the WHERE clause
+    # is the concurrency gate: if a concurrent logout (revoke_refresh_token) has
+    # already revoked this token, the UPDATE matches zero rows and we abort
+    # without minting a replacement. Without this guard the read-then-mutate above
+    # let logout and refresh both believe the token was live, so refresh would
+    # issue a fresh token and resurrect a session the user had just logged out of.
+    consume = await db.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.token_hash == token_hash,
+            RefreshToken.revoked == False,  # noqa: E712
+        )
+        .values(revoked=True)
+    )
+    if consume.rowcount == 0:
+        # Lost the race to a concurrent logout (or another refresh); do not
+        # resurrect the session.
+        await db.rollback()
+        return None
     await db.commit()
 
     access_token, new_raw_refresh = await create_tokens_for_user(db, user)
@@ -311,11 +330,14 @@ async def rotate_refresh_token(db: AsyncSession, raw_refresh_token: str) -> tupl
 
 
 async def revoke_refresh_token(db: AsyncSession, raw_refresh_token: str) -> bool:
+    # Revocation is a single guarded UPDATE so that a logout is one atomic,
+    # monotonic state transition (revoked False to True). Paired with the
+    # `revoked == False` gate in rotate_refresh_token, this guarantees that a
+    # concurrent refresh cannot resurrect a session a logout has revoked: whoever
+    # flips the row first wins, and the loser issues nothing.
     token_hash = hash_token(raw_refresh_token)
-    result = await db.execute(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
-    db_token = result.scalar_one_or_none()
-    if not db_token:
-        return False
-    db_token.revoked = True
+    result = await db.execute(
+        update(RefreshToken).where(RefreshToken.token_hash == token_hash).values(revoked=True)
+    )
     await db.commit()
-    return True
+    return result.rowcount > 0
