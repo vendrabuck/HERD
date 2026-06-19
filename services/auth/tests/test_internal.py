@@ -116,6 +116,22 @@ async def test_internal_admins_requires_valid_token(internal_client):
 
 
 @pytest.mark.asyncio
+async def test_internal_admins_rejects_correct_prefix_token(internal_client):
+    """A token that is a correct prefix of the real secret but the wrong length
+    must still be rejected (#166).
+
+    The guard uses hmac.compare_digest, which returns False on a length mismatch
+    instead of raising; this pins that behavior and guards against a regression to
+    a plain prefix-short-circuiting `!=`.
+    """
+    await _seed_user(role=Role.ADMIN)
+    prefix = INTERNAL_TOKEN[:-1]
+    assert prefix != INTERNAL_TOKEN
+    resp = await internal_client.get("/internal/admins", headers={"X-Internal-Token": prefix})
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_internal_admins_requires_token_header(internal_client):
     await _seed_user(role=Role.ADMIN)
     resp = await internal_client.get("/internal/admins")

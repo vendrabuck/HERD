@@ -34,10 +34,12 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
             status_code=status.HTTP_409_CONFLICT,
             detail="Local registration is disabled; this deployment uses LDAP authentication.",
         )
-    if await get_user_by_email(db, body.email):
-        raise HTTPException(status_code=409, detail="Email already registered")
-    if await get_user_by_username(db, body.username):
-        raise HTTPException(status_code=409, detail="Username already taken")
+    # Single generic 409 for any collision (email OR username, pre-check OR the
+    # IntegrityError race below). Distinct messages let an unauthenticated caller
+    # enumerate which emails and usernames already exist by reading which one
+    # comes back. Keep this wording identical across all three paths.
+    if await get_user_by_email(db, body.email) or await get_user_by_username(db, body.username):
+        raise HTTPException(status_code=409, detail="Email or username already exists")
     try:
         user = await create_user(db, body.email, body.username, body.password)
     except IntegrityError:

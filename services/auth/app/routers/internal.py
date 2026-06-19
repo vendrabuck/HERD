@@ -6,6 +6,7 @@ users by role without holding a real admin JWT. Token-only auth, no
 user context.
 """
 
+import hmac
 import logging
 import uuid
 
@@ -39,7 +40,11 @@ router = APIRouter(tags=["internal"])
 def _require_internal_token(x_internal_token: str = Header(...)) -> None:
     if not settings.internal_api_token:
         raise HTTPException(status_code=503, detail="Internal API token not configured")
-    if x_internal_token != settings.internal_api_token:
+    # Constant-time comparison: a plain `!=` short-circuits on the first
+    # differing byte, leaking length and prefix timing that let an attacker
+    # recover the shared secret byte by byte. hmac.compare_digest runs in time
+    # independent of how many leading bytes match.
+    if not hmac.compare_digest(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
 
