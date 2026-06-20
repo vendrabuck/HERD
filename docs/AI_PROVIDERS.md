@@ -184,7 +184,7 @@ AI_MODEL=claude-sonnet-4-6
 AI_TLS_VERIFY=true
 ```
 
-`AI_TLS_VERIFY` is honored only by the `openai_compat` provider; the `anthropic` provider always uses the SDK's default TLS verification.
+`AI_TLS_VERIFY` (and `AI_CA_CERT`) are honored by both providers whenever `AI_BASE_URL` is set: each builds its HTTP client with the configured TLS verification and CA bundle and hands it to the SDK, including the keyless local `anthropic` endpoint.
 
 ## Troubleshooting
 

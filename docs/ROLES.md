@@ -760,7 +760,7 @@ Authorization: Bearer <any-authenticated-token>
 
 ```
 POST /api/cabling/topologies
-Authorization: Bearer <admin-token>
+Authorization: Bearer <token>   # any authenticated user may create
 Content-Type: application/json
 
 { "name": "Lab Topology A", "data": { "nodes": [...], "edges": [...] } }
@@ -770,7 +770,7 @@ Content-Type: application/json
 
 ```
 PUT /api/cabling/topologies/{topology_id}
-Authorization: Bearer <admin-token>
+Authorization: Bearer <token>   # creator or admin
 Content-Type: application/json
 
 { "name": "Updated Topology", "data": { "nodes": [...], "edges": [...] } }
@@ -780,7 +780,7 @@ Content-Type: application/json
 
 ```
 DELETE /api/cabling/topologies/{topology_id}
-Authorization: Bearer <admin-token>
+Authorization: Bearer <token>   # creator or admin
 ```
 
 ---
