@@ -17,6 +17,7 @@ the preferences read/write proxy that the /settings channel toggles drive.
 """
 
 import os
+import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -129,20 +130,41 @@ class ReservationUser(HerdUser):
     def create_and_release(self):
         if not self._device_ids:
             return
-        device_id = self._device_ids[0]
+        # Spread bookings across devices rather than hammering the first one, so
+        # this measures real throughput instead of self-inflicted contention on a
+        # single exclusive device.
+        device_id = random.choice(self._device_ids)
         now = datetime.now(timezone.utc)
-        resp = self._auth_post(
+        with self._auth_post(
             "/api/reservations/",
+            name="/api/reservations/ [create]",
+            catch_response=True,
             json={
                 "device_ids": [device_id],
                 "purpose": f"load-test-{uuid.uuid4().hex[:8]}",
                 "start_time": now.isoformat(),
                 "end_time": (now + timedelta(minutes=5)).isoformat(),
             },
-        )
-        if resp.status_code == 201:
+        ) as resp:
+            # 409 (time-window conflict) and 422 (availability precheck) are the
+            # legitimate, expected outcomes when concurrent virtual users contend
+            # for the same exclusive device: the reservations service returns
+            # either, depending on which guard wins the race (see
+            # tests/integration/test_reservation_lifecycle.py, which asserts the
+            # second booking lands in (409, 422)). Count them as load, not
+            # failures; only an unexpected status is a real problem.
+            if resp.status_code in (201, 409, 422):
+                resp.success()
+            else:
+                resp.failure(f"unexpected {resp.status_code}: {resp.text[:200]}")
+                return
+            if resp.status_code != 201:
+                return
             res_id = resp.json()["id"]
-            self._auth_put(f"/api/reservations/{res_id}/release")
+        self._auth_put(
+            f"/api/reservations/{res_id}/release",
+            name="/api/reservations/[id]/release",
+        )
 
 
 class InventoryBrowser(HerdUser):
