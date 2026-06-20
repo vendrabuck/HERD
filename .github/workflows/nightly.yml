@@ -1,0 +1,89 @@
+# Nightly full-stack gate: everything `make everything` runs against a live
+# stack that PR CI does not (Selenium e2e and the locust load test), plus a
+# second pass of contract + integration without -x so a regression reports the
+# full failure set instead of stopping at the first one. workflow_dispatch
+# lets a reviewer run this on any branch before merging a frontend-heavy PR.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  full-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache uv
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: ${{ runner.os }}-uv-
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Create CI .env
+        run: |
+          cat > .env <<EOF
+          POSTGRES_USER=herd
+          POSTGRES_PASSWORD=$(openssl rand -hex 16)
+          POSTGRES_DB=herd
+          AUTH_SECRET_KEY=$(openssl rand -hex 32)
+          INTERNAL_API_TOKEN=$(openssl rand -hex 32)
+          SUPERADMIN_EMAIL=admin@example.com
+          SUPERADMIN_USERNAME=admin
+          SUPERADMIN_PASSWORD=admin123!
+          EOF
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start stack
+        run: docker compose up -d
+
+      - name: Wait for stack healthy
+        run: make _master-wait-healthy
+
+      - name: Contract tests
+        run: make test-contract
+
+      # No -x here (unlike make test-integration): nightly should surface
+      # every failure in one run, not stop at the first.
+      - name: Integration tests (full failure set)
+        run: uv run pytest tests/integration/ -v --timeout=60
+
+      - name: E2E tests (Selenium)
+        run: make test-e2e
+
+      - name: Seed stack for load test
+        run: make seed
+
+      - name: Load test (locust, headless)
+        run: HERD_BASE_URL=https://localhost make test-load
+
+      - name: Collect stack logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps > compose-logs.txt
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-failure-artifacts
+          path: compose-logs.txt
+          retention-days: 7
