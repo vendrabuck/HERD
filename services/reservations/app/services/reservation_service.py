@@ -830,7 +830,17 @@ async def cancel_reservation(
     reservation = await get_reservation(db, reservation_id, user_id)
     if not reservation:
         return None
-    if reservation.status in (ReservationStatus.COMPLETED, ReservationStatus.CANCELLED):
+    # FAILED is terminal here too: a FAILED reservation already released its
+    # devices, and those devices may now be held by a newer ACTIVE reservation.
+    # Running the release path would flip that newer reservation's devices to
+    # AVAILABLE and emit reservation.cancelled, causing the execution consumer
+    # to tear down the newer reservation's live L1/VLAN wiring. No release, no
+    # event; FAILED stays FAILED for audit.
+    if reservation.status in (
+        ReservationStatus.COMPLETED,
+        ReservationStatus.CANCELLED,
+        ReservationStatus.FAILED,
+    ):
         return reservation
     reservation.status = ReservationStatus.CANCELLED
     reservation.modified_by = user_id
