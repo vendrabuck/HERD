@@ -30,8 +30,11 @@ def test_reporting_page_shows_headline_cards(admin_browser, base_url):
     _open_reporting(admin_browser, base_url)
     body = admin_browser.find_element(By.TAG_NAME, "body").text
     assert "Utilization Report" in body
+    # The stat-card labels are uppercased via CSS text-transform, so Selenium's
+    # rendered .text returns them in caps; compare case-insensitively.
+    body_upper = body.upper()
     for label in ("Total reservation-hours", "Reservations counted", "Execution runs"):
-        assert label in body, f"stat card label missing: {label}"
+        assert label.upper() in body_upper, f"stat card label missing: {label}"
 
 
 def test_reporting_range_preset_buttons(admin_browser, base_url):
