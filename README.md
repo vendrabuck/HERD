@@ -130,6 +130,15 @@ and instructions for creating the superadmin account.
 **Option A: Configure via the web UI (recommended)**
 
 ```bash
+cp .env.example .env
+
+# Set these five values in .env before the first `make up`:
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+#   AUTH_SECRET_KEY, INTERNAL_API_TOKEN  (generate each with: openssl rand -hex 32)
+# docker-compose injects them into the containers at creation time. The config
+# UI shows these fields, but editing them there only takes effect on a full
+# recreate, not the UI's "Save and Restart", and postgres is never restarted by it.
+
 make up        # dev mode: hot-reload + volume mounts
 
 # Open https://localhost, click the wrench icon on the login page,
@@ -144,6 +153,8 @@ cp .env.example .env
 
 # Set the superadmin credentials in .env before first startup:
 #   SUPERADMIN_EMAIL, SUPERADMIN_USERNAME, SUPERADMIN_PASSWORD
+# Also set the compose-time values before first `make up`, as in Option A:
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, AUTH_SECRET_KEY, INTERNAL_API_TOKEN
 # AUTH_SECRET_KEY is required; services fail without it
 # LOG_LEVEL controls logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL; default: INFO)
 
