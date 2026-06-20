@@ -121,11 +121,11 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Per-service. |
 
-## Config service (optional overrides)
+## Config service
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `CONFIG_PASSWORD` | `admin123!` | Initial password for the config page. Must be changed on first login. Config service uses its own auth separate from HERD JWT. |
+The config page's initial password is the hardcoded default `admin123!`
+(`services/config/app/config_store.py`) and must be changed on first login; there is no
+environment variable for it. Config service auth is separate from HERD JWT.
 
 ## AI orchestrator
 
@@ -221,7 +221,7 @@ The execution service also hosts the periodic health-poll scheduler (ROADMAP #13
 | `HEALTH_POLL_REGISTRY_REFRESH_SECONDS` | `300` | How often the scheduler re-fetches the device list from inventory's `/devices/health-config` endpoint. New devices or interval changes take effect within roughly this window. |
 | `HEALTH_POLL_MAX_CONSECUTIVE_FAILURES` | `3` | Failures past this threshold trigger exponential backoff with jitter, so an UNREACHABLE device does not flood `execution_runs`. |
 | `HEALTH_POLL_BACKOFF_CAP_SECONDS` | `3600` | Upper bound on backoff between polls. |
-| `HEALTH_POLL_MINIMUM_INTERVAL_SECONDS` | `30` | Floor enforced by inventory's schema validators when setting `poll_interval_seconds` on devices or templates. |
+| `HEALTH_POLL_MINIMUM_INTERVAL_SECONDS` | `30` | Currently unused: the 30-second floor on `poll_interval_seconds` is the hardcoded `MIN_POLL_INTERVAL_SECONDS` in inventory's `app/schemas/device.py`, so changing this variable has no effect. |
 | `HEALTH_POLL_NOTIFY_ENABLED` | `true` | Publish a `device.health_transition` NATS event when a device crosses the failure threshold (bad_news) or recovers. Set to `false` to silence alerts without rolling back the publisher code. |
 
 ## Inventory service (optional storage overrides)

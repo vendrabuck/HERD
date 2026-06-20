@@ -170,7 +170,7 @@ The driver package validation failed. Confirm `driver.py` exists in the package 
 The execution service consumes `herd.reservations.*` events from NATS JetStream. If it missed your event:
 
 - Check execution service logs for consumer errors.
-- A poison message (invalid JSON) lands on the DLQ subject `herd.reservations.dlq`; inspect with the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
+- A poison message (invalid JSON) lands on the DLQ subject `herd.reservations.dlq.execution`; inspect with the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
 - A transient handler failure gets NAK'd and retried up to `max_deliver=5` with configured backoff. After that it also goes to DLQ.
 
 ### Notifications container is stuck in a crash loop on a fresh stack
@@ -198,7 +198,7 @@ The notifications service consumes the same `herd.reservations.*` events on its 
 
 ### DLQ has messages
 
-Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on `herd.reservations.<event-type>`. Check both `herd.reservations.dlq` (execution) and `herd.reservations.dlq.notifications` so you don't miss the half of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
+Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on `herd.reservations.<event-type>`. Check both `herd.reservations.dlq.execution` (execution) and `herd.reservations.dlq.notifications` so you don't miss the half of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 
 ## Logs and where to look
 

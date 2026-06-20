@@ -75,7 +75,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
    AI_TLS_VERIFY=true
    ```
 
-   `AI_BASE_URL` is ignored under the `anthropic` provider but it is good hygiene to clear it so a future operator does not assume it applies. `AI_TLS_VERIFY=true` is the default; explicit is fine.
+   `AI_BASE_URL` is honored under the `anthropic` provider: when set, the SDK targets that URL instead of the hosted API (this is the keyless local-endpoint mode), and a non-empty `AI_BASE_URL` alone keeps AI enabled even with a blank key. Clear it when switching to the hosted API. `AI_TLS_VERIFY=true` is the default; explicit is fine.
 
 2. Same recreate command:
 
@@ -101,7 +101,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
 
 To disable AI without removing the configuration, blank the credential for the active provider:
 
-- Under `anthropic`: set `AI_API_KEY=` (empty).
+- Under `anthropic`: set both `AI_API_KEY=` and `AI_BASE_URL=` (empty); either one alone keeps the provider configured and AI enabled.
 - Under `openai_compat`: set `AI_BASE_URL=` (empty).
 
 Recreate `ai-orchestrator` and `config`. `GET /api/ai/status` will then return `{"enabled": false, "provider": "...", "model": "..."}`, the frontend will hide the **Use AI** button and the **AI Assistant** tab, and the three guarded endpoints will return 503.
@@ -162,13 +162,13 @@ LM Studio's OpenAI surface is on by default in the **Local Server** tab.
 
 ```env
 AI_PROVIDER=openai_compat
-AI_BASE_URL=
+AI_BASE_URL=https://api.openai.com/v1
 AI_API_KEY=sk-...
 AI_MODEL=gpt-4o-mini
 AI_TLS_VERIFY=true
 ```
 
-Omit `AI_BASE_URL` to let the SDK default to `https://api.openai.com/v1`.
+`AI_BASE_URL` must be set explicitly: HERD treats `openai_compat` as unconfigured when it is blank (`/api/ai/status` reports `enabled: false` and the gated endpoints return 503), so the SDK's default URL is never reached.
 
 ### Azure OpenAI
 
@@ -184,7 +184,7 @@ AI_MODEL=claude-sonnet-4-6
 AI_TLS_VERIFY=true
 ```
 
-`AI_TLS_VERIFY` is honored only by the `openai_compat` provider; the `anthropic` provider always uses the SDK's default TLS verification.
+`AI_TLS_VERIFY` (and `AI_CA_CERT`) are honored by both providers whenever `AI_BASE_URL` is set: each builds its HTTP client with the configured TLS verification and CA bundle and hands it to the SDK, including the keyless local `anthropic` endpoint.
 
 ## Troubleshooting
 
