@@ -408,6 +408,107 @@ async def test_concurrent_refresh_single_winner():
         assert live.scalar() == 1
 
 
+# --- refresh TOCTOU: expiry / deactivation in the read-to-consume window (#164) ---
+
+
+@pytest.mark.asyncio
+async def test_token_expiring_during_refresh_does_not_mint(monkeypatch):
+    """A token that expires in the window between refresh's read and its consume
+    must not mint a fresh token.
+
+    rotate_refresh_token checks expiry from a snapshot read, then consumes the
+    token with a guarded UPDATE. We interpose at get_user_by_id (called after the
+    expiry check, before the consume) to expire the token in a separate committed
+    session. The fix re-asserts `expires_at > now` inside the consuming UPDATE, so
+    the now-expired row matches zero rows and refresh issues nothing. On code that
+    gates the UPDATE on `revoked` alone, this test fails: refresh mints a token
+    against an expired credential.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import app.services.auth_service as auth_service
+    from app.models.user import RefreshToken
+    from app.utils.jwt import hash_token
+    from sqlalchemy import update as sa_update
+
+    async with TestSessionLocal() as db:
+        user = await _create_test_user(db, "exprace@test.com", "expraceuser")
+        _, raw_refresh = await create_tokens_for_user(db, user)
+        token_hash = hash_token(raw_refresh)
+
+        real_get_user_by_id = auth_service.get_user_by_id
+        fired = {"done": False}
+
+        async def interposing_get_user_by_id(session, requested_id):
+            # Expire the token mid-refresh, after the snapshot expiry check passed.
+            if not fired["done"]:
+                fired["done"] = True
+                async with TestSessionLocal() as other:
+                    await other.execute(
+                        sa_update(RefreshToken)
+                        .where(RefreshToken.token_hash == token_hash)
+                        .values(expires_at=datetime.now(timezone.utc) - timedelta(hours=1))
+                    )
+                    await other.commit()
+            return await real_get_user_by_id(session, requested_id)
+
+        monkeypatch.setattr(auth_service, "get_user_by_id", interposing_get_user_by_id)
+
+        result = await rotate_refresh_token(db, raw_refresh)
+        assert result is None, "refresh minted a token against a credential that expired mid-flight"
+        assert fired["done"] is True, "interposed expiry never ran; test is not exercising the race"
+
+
+@pytest.mark.asyncio
+async def test_user_deactivated_during_refresh_does_not_mint(monkeypatch):
+    """A user deactivated in the window between refresh's read and its consume
+    must not mint a fresh token.
+
+    We interpose at get_user_by_id, returning the still-active snapshot the
+    fast-path check sees, but committing is_active=False in a separate session
+    first. The fix gates the consuming UPDATE on a correlated `is_active` subquery,
+    so the deactivated user's token matches zero rows. On code that gates on
+    `revoked` alone, refresh resurrects a deactivated account's session.
+    """
+    import app.services.auth_service as auth_service
+    from app.models.user import User
+    from sqlalchemy import update as sa_update
+
+    async with TestSessionLocal() as db:
+        user = await _create_test_user(db, "deactrace@test.com", "deactraceuser")
+        user_id = user.id
+        _, raw_refresh = await create_tokens_for_user(db, user)
+
+        real_get_user_by_id = auth_service.get_user_by_id
+        fired = {"done": False}
+
+        async def interposing_get_user_by_id(session, requested_id):
+            # Fetch the (still-active) user the fast-path check will see, THEN
+            # commit the deactivation so only the atomic consume can catch it.
+            fetched = await real_get_user_by_id(session, requested_id)
+            if not fired["done"]:
+                fired["done"] = True
+                async with TestSessionLocal() as other:
+                    await other.execute(
+                        sa_update(User).where(User.id == user_id).values(is_active=False)
+                    )
+                    await other.commit()
+            return fetched
+
+        monkeypatch.setattr(auth_service, "get_user_by_id", interposing_get_user_by_id)
+
+        result = await rotate_refresh_token(db, raw_refresh)
+        assert result is None, "refresh resurrected a session for a deactivated user"
+        assert fired["done"] is True, (
+            "interposed deactivation never ran; test is not exercising the race"
+        )
+        # We deliberately do NOT assert the old token is now revoked: the consume
+        # matched zero rows (is_active gate), so it neither minted nor revoked. The
+        # lingering token is inert: it can never rotate while the user is inactive,
+        # and login is blocked for inactive users. The security property under test
+        # is solely that no fresh token was issued.
+
+
 # --- create_user auto-assign to "Not Grouped" ---
 
 

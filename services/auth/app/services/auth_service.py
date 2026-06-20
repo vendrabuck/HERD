@@ -293,10 +293,11 @@ async def rotate_refresh_token(db: AsyncSession, raw_refresh_token: str) -> tupl
     if not db_token:
         return None
 
+    now = datetime.now(timezone.utc)
     expires_at = db_token.expires_at
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
+    if expires_at < now:
         return None
 
     user = await get_user_by_id(db, db_token.user_id)
@@ -304,17 +305,27 @@ async def rotate_refresh_token(db: AsyncSession, raw_refresh_token: str) -> tupl
         return None
 
     # Atomically consume the old token by flipping revoked False to True in a
-    # single guarded UPDATE. The `revoked == False` predicate in the WHERE clause
-    # is the concurrency gate: if a concurrent logout (revoke_refresh_token) has
-    # already revoked this token, the UPDATE matches zero rows and we abort
-    # without minting a replacement. Without this guard the read-then-mutate above
-    # let logout and refresh both believe the token was live, so refresh would
-    # issue a fresh token and resurrect a session the user had just logged out of.
+    # single guarded UPDATE. The WHERE clause is the authoritative concurrency
+    # gate; the read-and-check above is only a fast path. We re-assert all three
+    # liveness predicates here so none of them can be defeated by a mutation that
+    # lands in the TOCTOU window between the read above and this UPDATE:
+    #   - revoked == False: a concurrent logout (revoke_refresh_token) must not be
+    #     undone, else refresh resurrects a just-logged-out session.
+    #   - expires_at > now: a token that expires in the window must not mint a
+    #     fresh one.
+    #   - user is active: a user deactivated in the window must not mint a fresh
+    #     one. is_active lives on User, so it is gated via a correlated subquery.
+    # If any predicate fails the UPDATE matches zero rows and we abort without
+    # issuing a replacement.
     consume = await db.execute(
         update(RefreshToken)
         .where(
             RefreshToken.token_hash == token_hash,
             RefreshToken.revoked == False,  # noqa: E712
+            RefreshToken.expires_at > now,
+            RefreshToken.user_id.in_(
+                select(User.id).where(User.id == db_token.user_id, User.is_active.is_(True))
+            ),
         )
         .values(revoked=True)
     )

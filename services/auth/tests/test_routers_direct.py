@@ -59,6 +59,12 @@ async def test_register_endpoint_success():
         assert result.role == Role.USER
 
 
+# Both collision paths must return a byte-identical 409 detail so an
+# unauthenticated caller cannot tell an existing email from an existing username
+# (enumeration resistance, #165). _GENERIC_CONFLICT is that single message.
+_GENERIC_CONFLICT = "Email or username already exists"
+
+
 @pytest.mark.asyncio
 async def test_register_endpoint_duplicate_email():
     from app.routers.auth import register
@@ -70,7 +76,7 @@ async def test_register_endpoint_duplicate_email():
         with pytest.raises(HTTPException) as exc:
             await register(body, db)
         assert exc.value.status_code == 409
-        assert "Email" in exc.value.detail
+        assert exc.value.detail == _GENERIC_CONFLICT
 
 
 @pytest.mark.asyncio
@@ -84,7 +90,9 @@ async def test_register_endpoint_duplicate_username():
         with pytest.raises(HTTPException) as exc:
             await register(body, db)
         assert exc.value.status_code == 409
-        assert "Username" in exc.value.detail
+        # Same message as the email collision: the response must not reveal which
+        # field collided.
+        assert exc.value.detail == _GENERIC_CONFLICT
 
 
 @pytest.mark.asyncio
