@@ -216,7 +216,7 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 
 Services that can't find `config.json` will crash-loop. Rebuild by going through the config-service first-run again (same flow as initial setup).
 
-### Master commit accidentally force-pushed
+### Main commit accidentally force-pushed
 
 Always avoid. If it happened, restore from the most recent verified backup. All GitHub operations (push, merge, force-push) are performed by the repo owner directly, never by automation.
 
