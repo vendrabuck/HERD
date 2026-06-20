@@ -308,7 +308,10 @@ Driver code runs in a separate subprocess with these limits enforced:
     raised or set to 0.
   - CPU time (`RLIMIT_CPU`): 60 seconds default (`DRIVER_RLIMIT_CPU_SECONDS`).
   - Open files (`RLIMIT_NOFILE`): 256 default (`DRIVER_RLIMIT_NOFILE`).
-  - Processes (`RLIMIT_NPROC`): 64 default (`DRIVER_RLIMIT_NPROC`).
+  - Processes (`RLIMIT_NPROC`): 1024 default (`DRIVER_RLIMIT_NPROC`). This is a
+    per-UID ceiling that counts every thread the service user already holds
+    container-wide, not just this child, so SSH/threaded drivers (netmiko,
+    paramiko) need the headroom; it still guards against a runaway fork bomb.
 - Device credentials are passed to the driver via a temporary file only; password-typed
   template fields are not copied into the child's environment variables.
 
@@ -634,8 +637,16 @@ connection type's allowlist is a one-file change there. Drivers can also publish
 their own config schema: a `config_schema()` classmethod on the `Driver` class
 returning a JSON Schema dict is extracted (without instantiating the driver) via
 the execution service and used to validate device configs, falling back to this
-registry when a driver omits it (issue #23). A full driver-authoring section for
-the classmethod contract lands with that feature's docs slice.
+registry when a driver omits it or ships an unusable schema (issue #23). This
+preference is not limited to the AI commit path: the execution service's
+`configure` action validates the call's kwargs against the driver-published
+schema first and only falls back to the registry on a `PublishedSchemaError`, so
+a driver can accept a config vocabulary the registry would reject. Validation
+runs after the driver is loaded, so the published schema is cached for the
+current SHA. The checked-in `drivers/frr_mgmt/driver.py` is the worked example:
+its `config_schema()` returns an object schema for `{commands, command}` (raw
+vtysh config lines), which the registry's `additionalProperties: false`
+Management schema would otherwise reject.
 
 ## Packaging quickstart
 

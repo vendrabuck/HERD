@@ -209,7 +209,7 @@ Same shape, different `AI_BASE_URL`:
 | `DRIVER_RLIMIT_AS_BYTES` | `268435456` | POSIX `RLIMIT_AS` (address space) for the driver subprocess, in bytes; 256 MB default. `0` disables. Raise or disable for numpy/pandas/BLAS drivers, which reserve large virtual address space. |
 | `DRIVER_RLIMIT_CPU_SECONDS` | `60` | POSIX `RLIMIT_CPU` for the driver subprocess, in seconds. `0` disables. |
 | `DRIVER_RLIMIT_NOFILE` | `256` | POSIX `RLIMIT_NOFILE` (open files) for the driver subprocess. `0` disables. |
-| `DRIVER_RLIMIT_NPROC` | `64` | POSIX `RLIMIT_NPROC` (processes, per service uid) for the driver subprocess. `0` disables. |
+| `DRIVER_RLIMIT_NPROC` | `1024` | POSIX `RLIMIT_NPROC` (processes, per service uid) for the driver subprocess. `0` disables. This is a per-UID ceiling that counts every thread the service user already holds container-wide, so SSH/threaded drivers (netmiko, paramiko) need the headroom; 1024 still guards against a runaway fork bomb. |
 | `ALLOW_DRIVER_PIP_INSTALL` | `false` | When `true`, a driver package's `requirements.txt` is `pip install`ed at execution time. Off by default: a runtime install pulls network code as the service user. When off, vendor deps into the package's `_deps/`. |
 
 The execution service also hosts the periodic health-poll scheduler (ROADMAP #13). Each polled device runs the existing driver `login`, `status`, `logout` sequence on its configured cadence; outcomes drop into `device_health_status` and history persists in `execution_runs`.
