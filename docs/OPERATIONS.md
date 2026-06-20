@@ -117,14 +117,15 @@ docker compose exec nats nats stream purge HERD_DLQ \
 
 ## TLS certificate rotation
 
-Certs live in `infra/traefik/certs/` with filenames referenced by `infra/traefik/dynamic.yml`:
+Certs live in `infra/traefik/certs/`. `infra/traefik/dynamic.yml` loads exactly two files: `server-chain.crt` (leaf plus intermediate, concatenated) and `server.key`. Rotating `server.crt` alone changes nothing Traefik serves; regenerate the chain file.
 
 ```
 infra/traefik/certs/
-  root-ca.crt
+  root-ca.crt          # distribute to clients; not loaded by Traefik
   intermediate-ca.crt
-  server.crt
-  server.key
+  server.crt           # leaf; input to server-chain.crt
+  server-chain.crt     # loaded by Traefik (certFile)
+  server.key           # loaded by Traefik (keyFile)
 ```
 
 To rotate:
@@ -140,7 +141,7 @@ The SAN in `server.crt` must match the hostname or IP users hit (e.g. `IP:192.0.
 
 What to preserve:
 
-- **Postgres data**: one Docker volume per service schema (e.g. `postgres_data`). Dump via `pg_dump`:
+- **Postgres data**: a single Docker volume (`postgres-data`) holding one database with one schema per service. Dump via `pg_dump`:
   ```bash
   docker compose exec postgres pg_dump -U herd -d herd > backup-$(date +%Y%m%d).sql
   ```
@@ -162,23 +163,28 @@ Test restore at least annually on a throwaway stack.
 All services emit JSON logs via `herd_common.logging.setup_logging`. Per-service tail plus `jq` filter is usually enough:
 
 ```bash
+# --no-log-prefix strips the "container | " prefix so jq can parse the lines;
+# jq -R 'fromjson?' skips any non-JSON lines (postgres, nats, traefik).
+
 # Errors in the reservations service
-docker compose logs reservations --tail 1000 | jq 'select(.level=="ERROR")'
+docker compose logs reservations --no-log-prefix --tail 1000 | \
+  jq -R 'fromjson? | select(.level=="ERROR")'
 
 # Every reservation-create decision in the last 500 lines
-docker compose logs reservations --tail 500 | \
-  jq 'select(.action | startswith("reservation_"))'
+docker compose logs reservations --no-log-prefix --tail 500 | \
+  jq -R 'fromjson? | select((.action? // "") | startswith("reservation_"))'
 
 # All 5xx responses across every service
-docker compose logs --tail 2000 | \
-  jq 'select(.status_code // 0 >= 500)'
+docker compose logs --no-log-prefix --tail 2000 | \
+  jq -R 'fromjson? | select((.status_code // 0) >= 500)'
 
 # NATS DLQ routings from execution
-docker compose logs execution | \
-  jq 'select(.action == "nats_dlq_exhausted" or .action == "nats_poison_message")'
+docker compose logs execution --no-log-prefix | \
+  jq -R 'fromjson? | select(.action == "nats_dlq_exhausted" or .action == "nats_poison_message")'
 
 # Slow requests (over 1s)
-docker compose logs --tail 5000 | jq 'select(.duration_ms // 0 > 1000)'
+docker compose logs --no-log-prefix --tail 5000 | \
+  jq -R 'fromjson? | select((.duration_ms // 0) > 1000)'
 ```
 
 Configure verbosity per service via `LOG_LEVEL` (default `INFO`; use `DEBUG` for investigations and remember to turn it back down).
@@ -186,7 +192,7 @@ Configure verbosity per service via `LOG_LEVEL` (default `INFO`; use `DEBUG` for
 ## Healthchecks and monitoring
 
 - `docker compose ps` shows per-container health. Unhealthy containers need a logs inspection.
-- Every backend service exposes `GET /health` (200 when healthy). The Traefik router does not expose this externally by default; hit it via `docker compose exec <svc> curl localhost:8000/health`.
+- Every backend service exposes `GET /health` (200 when healthy), reachable through the gateway at `https://<host>/api/<svc>/health` (e.g. `curl -k https://localhost/api/auth/health`). From inside a container use `docker compose exec <svc> python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').status)"`; the service images do not ship curl.
 - Live OpenAPI docs: `https://<host>/api/<service>/docs` (auth required for most endpoints).
 
 There is no built-in Prometheus/Grafana stack; roll your own based on the JSON logs and `/health` endpoints.

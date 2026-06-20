@@ -78,7 +78,7 @@ Two streams today.
 
 **`HERD_HEALTH`** carries `herd.health.status_changed`. The execution service's health-poll scheduler publishes a `device.health_transition` event when a polled device's `consecutive_failures` crosses the configured threshold (bad_news) or resets to zero (recovery). The notifications service consumes this stream with its own durable consumer (`notifications-health-consumer`) and fans the event out as in-app notifications to all admins plus any users with an active reservation on the device.
 
-All consumers use `ConsumerConfig(max_deliver=5, ack_wait=30, backoff=[1,5,15,60,120])` and publish poison messages (JSON decode errors) and exhausted deliveries to service-scoped DLQ subjects on the same stream: `herd.reservations.dlq` (execution), `herd.reservations.dlq.notifications` (notifications, reservations stream), and `herd.health.dlq.notifications` (notifications, health stream). See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq) for inspection.
+All consumers use `ConsumerConfig(max_deliver=5, ack_wait=30, backoff=[1,5,15,60,120])` and publish poison messages (JSON decode errors) and exhausted deliveries to service-scoped DLQ subjects: `herd.reservations.dlq.execution` (execution), `herd.reservations.dlq.notifications` (notifications, reservations stream), and `herd.health.dlq.notifications` (notifications, health stream). See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq) for inspection.
 
 ## Reservation state machine
 

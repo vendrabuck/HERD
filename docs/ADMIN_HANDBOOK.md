@@ -170,7 +170,7 @@ Execution is mostly event-driven via NATS: reservation lifecycle events trigger 
 
 Device-level access is via device groups (above). ACL grants are for topology and reservation resources.
 
-- `POST /api/acl/grants` creates a grant: `{resource_type: "topology|reservation", resource_id, user_group_id, permission: "view|manage"}`.
+- `POST /api/acl/grants` creates a grant: `{resource_type: "device|topology|reservation", resource_id, group_id, permission: "view|manage"}` (`group_id` is the user-group UUID).
 - `manage` implies `view`.
 - `POST /api/acl/check` checks if a user has a given permission on a resource.
 - `GET /api/acl/resources?user_id=&resource_type=&permission=` lists resources accessible to a user.
@@ -181,7 +181,7 @@ In practice you rarely need manual ACL grants for daily use; the defaults (topol
 
 - **`make logs`** (or container logs) for error spikes.
 - **Reservations dashboard**: watch for unusually high `FAILED` rates (symptoms: inventory or internal token trouble).
-- **NATS DLQs**: two consumers each have their own DLQ subject on the `HERD_RESERVATIONS` stream. Any messages on `herd.reservations.dlq` (execution consumer) or `herd.reservations.dlq.notifications` (notifications consumer) are poisoned events that the respective service couldn't handle. Check both during incident triage since one can fill up without the other. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
+- **NATS DLQs**: two consumers each have their own DLQ subject on the `HERD_RESERVATIONS` stream. Any messages on `herd.reservations.dlq.execution` (execution consumer) or `herd.reservations.dlq.notifications` (notifications consumer) are poisoned events that the respective service couldn't handle. Check both during incident triage since one can fill up without the other. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 - **Config service state**: if services crash-loop on startup, `config.json` probably hasn't been written yet. Either populate every required var in `.env` and restart (the config service auto-bootstraps from env on first start) or go through the wrench-icon flow. See [OPERATIONS.md](OPERATIONS.md#config-service-first-run).
 - **Disk usage**: the execution service caches driver packages at `/data/driver-cache/`; size grows with driver churn.
 
