@@ -26,7 +26,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
 	test-frontend test-integration test-contract test-load test-load-ui test-e2e test-e2e-stop test-auth-ldap \
-	coverage-frontend \
+	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed
@@ -316,7 +316,14 @@ $(addprefix migrate-,$(DB_SERVICES)):
 #
 # Per-service `test-<svc>` and the aggregator `test` are generated from SERVICES.
 
-test:  ## Run every backend service's unit suite
+# Repo-root unit tests (tests/unit/) cover root scripts like
+# seed_devices_public.py. They need no stack and are not under services/, so
+# the per-service loops never reach them; both `test` and `coverage` depend on
+# this target so they cannot be silently skipped locally or in CI.
+test-root:  ## Run the repo-root unit tests (tests/unit, no stack needed)
+	uv run pytest tests/unit/ -v
+
+test: test-root  ## Run every backend service's unit suite (plus tests/unit)
 	@for svc in $(SERVICES); do \
 		echo ">>> test $$svc"; \
 		(cd services/$$svc && uv run pytest tests/ -v) || exit $$?; \
@@ -404,7 +411,7 @@ test-auth-ldap:
 # Set COV_XML=1 to additionally emit a coverage-<svc>.xml report at the repo
 # root for each service (used by CI as both the test gate and artifact source).
 
-coverage:  ## Run every backend suite under coverage (COV_XML=1 emits xml)
+coverage: test-root  ## Run every backend suite under coverage (COV_XML=1 emits xml)
 	@for svc in $(SERVICES); do \
 		pkg=app; [ "$$svc" = "common" ] && pkg=herd_common; \
 		echo ">>> coverage $$svc ($$pkg)"; \
@@ -412,8 +419,19 @@ coverage:  ## Run every backend suite under coverage (COV_XML=1 emits xml)
 		(cd services/$$svc && uv run pytest tests/ -v --cov=$$pkg --cov-report=term $$xml) || exit $$?; \
 	done
 
+# Parallel-friendly aggregator: each service is its own make target, so
+# `make -j4 coverage-parallel COV_XML=1` runs four suites at once (each suite
+# runs in its own service dir, so .coverage data files never collide). CI uses
+# this; `coverage` keeps the sequential loop for readable local output.
+coverage-parallel: test-root $(addprefix coverage-,$(SERVICES))  ## coverage, parallel-safe via make -j (CI)
+
+# Per-service coverage. Default emits an html report for local browsing;
+# COV_XML=1 swaps it for the xml report CI uploads (coverage-<svc>.xml at the
+# repo root), keeping coverage-parallel and coverage byte-identical artifacts.
 $(addprefix coverage-,$(SERVICES)):
-	cd services/$(@:coverage-%=%) && uv run pytest tests/ -v --cov=$(call cov_pkg,$(@:coverage-%=%)) --cov-report=term --cov-report=html
+	cd services/$(@:coverage-%=%) && uv run pytest tests/ -v \
+		--cov=$(call cov_pkg,$(@:coverage-%=%)) --cov-report=term \
+		$(if $(COV_XML),--cov-report=xml:$(CURDIR)/coverage-$(@:coverage-%=%).xml,--cov-report=html)
 
 coverage-frontend:  ## Run the frontend suite under coverage
 	cd frontend && npx vitest run --coverage

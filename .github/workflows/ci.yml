@@ -9,9 +9,12 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on PR branches only. Runs on main always finish:
+# a cancelled main run leaves the merge commit unverified (observed 2026-06:
+# a push-event run was cancelled at 32s by the next push and never reported).
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   backend:
@@ -47,10 +50,13 @@ jobs:
         run: uv run ruff format --check services/ seed_devices_public.py
 
       # Single pass: pytest runs once with coverage across every service in the
-      # Makefile's SERVICES list. This is the pass/fail signal AND the artifact
+      # Makefile's SERVICES list (plus the repo-root tests/unit suite via the
+      # test-root prerequisite). This is the pass/fail signal AND the artifact
       # source, so a new service is covered automatically with no edit here.
+      # -j4 matches the 4 vCPUs on ubuntu-latest; -Otarget keeps each suite's
+      # output contiguous so failures stay readable.
       - name: Backend unit tests + coverage (all services)
-        run: make coverage COV_XML=1
+        run: make -j4 -Otarget coverage-parallel COV_XML=1
 
       - name: Upload coverage artifact
         if: always()
@@ -83,3 +89,71 @@ jobs:
 
       - name: Build
         run: cd frontend && npm run build
+
+  # Stack-backed gate: builds the compose images, boots the full stack, and
+  # runs the contract + integration suites that local `make master` covers but
+  # PR CI historically skipped (a 502-to-409 contract change once broke an
+  # integration test no PR check ran). E2E and load stay in nightly.yml. This
+  # job is advisory (not a required status check): requiring it later is a
+  # one-line ruleset toggle, no workflow change.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache uv
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: ${{ runner.os }}-uv-
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      # Ephemeral stack credentials. Throwaway per run; the integration
+      # conftest's SEED_* defaults (admin@example.com / admin123!) match the
+      # SUPERADMIN_* bootstrap values below, so the suite self-seeds.
+      - name: Create CI .env
+        run: |
+          cat > .env <<EOF
+          POSTGRES_USER=herd
+          POSTGRES_PASSWORD=$(openssl rand -hex 16)
+          POSTGRES_DB=herd
+          AUTH_SECRET_KEY=$(openssl rand -hex 32)
+          INTERNAL_API_TOKEN=$(openssl rand -hex 32)
+          SUPERADMIN_EMAIL=admin@example.com
+          SUPERADMIN_USERNAME=admin
+          SUPERADMIN_PASSWORD=admin123!
+          EOF
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start stack
+        run: docker compose up -d
+
+      - name: Wait for stack healthy
+        run: make _master-wait-healthy
+
+      - name: Contract tests
+        run: make test-contract
+
+      - name: Integration tests
+        run: make test-integration
+
+      - name: Collect stack logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps > compose-logs.txt
+
+      - name: Upload stack logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-stack-logs
+          path: compose-logs.txt
+          retention-days: 7
