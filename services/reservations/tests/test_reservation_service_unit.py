@@ -865,6 +865,42 @@ async def test_cancel_completed():
         assert result.status == ReservationStatus.COMPLETED
 
 
+@pytest.mark.asyncio
+async def test_cancel_failed_is_terminal_no_release_no_event():
+    """Regression: cancelling a FAILED reservation must be a no-op.
+
+    A FAILED reservation holds no devices (the provisioning failure reverted
+    them), and those devices may since have been RESERVED by another user's
+    ACTIVE reservation. The old guard let FAILED through, which (a) flipped the
+    devices to AVAILABLE in inventory and (b) emitted reservation.cancelled,
+    causing the execution consumer to disconnect L1 ports and tear down VLANs
+    on wiring owned by the newer reservation.
+    """
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, status=ReservationStatus.FAILED)
+        fetch_mock = AsyncMock(return_value=[_make_device(DEVICE_A)])
+        update_mock = AsyncMock()
+        publish_mock = AsyncMock()
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices_best_effort",
+                new=fetch_mock,
+            ),
+            patch(
+                "app.services.reservation_service._update_device_statuses",
+                new=update_mock,
+            ),
+            patch("app.services.reservation_service._publish_nats_event", new=publish_mock),
+        ):
+            result = await cancel_reservation(db, res.id, USER_ID, "token")
+
+    assert result is not None
+    assert result.status == ReservationStatus.FAILED, "FAILED must stay FAILED for audit"
+    update_mock.assert_not_awaited()
+    publish_mock.assert_not_awaited()
+    fetch_mock.assert_not_awaited()
+
+
 # --- release_reservation ---
 
 
