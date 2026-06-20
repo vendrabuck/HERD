@@ -31,5 +31,5 @@ dev = [
     "pip-audit>=2.10.1",
     "selenium>=4.44.0",
     "pytest-timeout>=2.4.0",
-    "locust>=2.44.3",
+    "locust>=2.44.4",
 ]
