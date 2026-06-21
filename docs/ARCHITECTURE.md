@@ -66,7 +66,7 @@ A fourth opt-in **retry+raise** mode uses `herd_common.retry.retry_with_backoff`
 
 ## Event-driven flows (NATS JetStream)
 
-Two streams today.
+Two source streams carry live work, plus a dedicated `HERD_DLQ` stream that retains dead-lettered messages (see below).
 
 **`HERD_RESERVATIONS`** carries `herd.reservations.*` subjects. The reservations service publishes `reservation.created`, `reservation.cancelled`, `reservation.completed`, `reservation.updated`. Two services consume them with independent durable consumers:
 
@@ -216,7 +216,7 @@ The **notifications** service consumes two NATS streams with distinct durable co
 - Integration tests: cross-service via httpx against a running stack. Self-seeding fixtures.
 - Frontend tests: vitest + testing-library + MSW.
 - E2E: Docker Selenium + Chrome against the full running stack.
-- CI: two-job GitHub Action (backend and frontend), runs on push/PR to main.
+- CI: three-job GitHub Action (backend, frontend, plus an advisory integration job), runs on push/PR to main.
 
 ## Deployment
 
