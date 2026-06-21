@@ -73,7 +73,11 @@ export function AIDialog({ open, onClose, onProposal }: AIDialogProps) {
     } catch (err) {
       if (isAxiosError(err)) {
         if (err.response?.status === 503) {
-          toast.error("AI feature is not configured: ANTHROPIC_API_KEY is blank");
+          const detail = err.response.data?.detail;
+          toast.error(
+            detail ??
+              "AI features are not configured. Ask an administrator to configure an AI provider.",
+          );
         } else if (err.response?.status === 400) {
           const detail = err.response.data?.detail ?? "Invalid upload";
           toast.error(`Upload rejected: ${detail}`);
