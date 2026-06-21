@@ -74,6 +74,7 @@ Two streams today.
   - `reservation.created`: L1 connect_ports per switch; L2 create_vlan + add_to_vlan for each DUT port connected to an L2 switch.
   - `reservation.cancelled / completed`: L1 disconnect_ports; L2 remove_from_vlan + delete_vlan.
   - `reservation.updated`: L1 update_ports for added/removed devices.
+  - Idempotent on redelivery: each mutating driver action records the source message's NATS `stream:sequence` as a `dedupe_key` on its `execution_runs` row, and the consumer skips any action whose `SUCCESS` run already carries that key. A NAK retry re-runs only the action that failed, never the ones that already applied (`login`/`logout` are not deduped).
 - **notifications** (`notifications-consumer`) turns the same events into per-user in-app notifications, gated by the user's `extras.notifications` preferences in user-profile.
 
 **`HERD_HEALTH`** carries `herd.health.status_changed`. The execution service's health-poll scheduler publishes a `device.health_transition` event when a polled device's `consecutive_failures` crosses the configured threshold (bad_news) or resets to zero (recovery). The notifications service consumes this stream with its own durable consumer (`notifications-health-consumer`) and fans the event out as in-app notifications to all admins plus any users with an active reservation on the device.
@@ -86,15 +87,15 @@ Transitions (from state, to state, trigger):
 
 | From | To | Trigger |
 |---|---|---|
-| PENDING | PENDING_PROVISION | create begins provisioning |
+| PENDING | PENDING_PROVISION | expiration task claims a scheduled reservation at start_time |
 | PENDING | CANCELLED | user cancels before activation |
 | PENDING_PROVISION | ACTIVE | inventory status flip succeeds |
 | PENDING_PROVISION | FAILED | provisioning retries exhausted |
 | ACTIVE | COMPLETED | end_time passes (expiration task) |
 | ACTIVE | CANCELLED | user cancels an active hold |
 
-- `PENDING` is the default for scheduled-future reservations; the expiration task activates them at start_time.
-- `PENDING_PROVISION` is the transient state during create: reservations row is committed first, then the inventory status flip retries; success -> `ACTIVE`, exhausted retries -> `FAILED`.
+- `PENDING` is the state for scheduled-future reservations. A booking whose `start_time` is more than `RESERVATION_START_GRACE_SECONDS` ahead is created `PENDING` with no provisioning (its row still holds the window for conflict detection); within the grace, a "start now" booking is provisioned immediately. The expiration task provisions a `PENDING` reservation at `start_time`: it claims the row to `PENDING_PROVISION`, flips inventory, emits `reservation.created`, and creates the fork, the same work the immediate path does. A flip failure at activation reverts the claim to `PENDING` so a later tick retries (it does not `FAIL` the booking).
+- `PENDING_PROVISION` is the transient provisioning state, entered either at create (immediate booking) or when the expiration task claims a scheduled `PENDING` reservation: the inventory status flip retries; success -> `ACTIVE`, exhausted retries -> `FAILED` (immediate path) or revert to `PENDING` (scheduled path).
 - `FAILED` rows persist for audit but hold no devices.
 - `CANCELLED` and `COMPLETED` are terminal states.
 - `_check_conflicts` treats `PENDING`, `PENDING_PROVISION`, and `ACTIVE` as conflicting; two concurrent creates for the same exclusive device race safely.
