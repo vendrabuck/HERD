@@ -32,16 +32,21 @@ async def _insert_reservation(
     start_time: datetime,
     end_time: datetime,
     device_ids: list[str] | None = None,
+    user_id: uuid.UUID | None = None,
+    topology_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Insert a reservation directly into the database and return its id."""
     res_id = uuid.uuid4()
     if device_ids is None:
         device_ids = [str(uuid.uuid4())]
+    if user_id is None:
+        user_id = uuid.uuid4()
     async with TestSessionLocal() as session:
         res = Reservation(
             id=res_id,
-            user_id=uuid.uuid4(),
+            user_id=user_id,
             device_ids=device_ids,
+            topology_id=topology_id,
             topology_type="PHYSICAL",
             purpose="test",
             start_time=start_time,
@@ -302,6 +307,42 @@ async def test_activation_emits_created_not_completed():
     assert "reservation.completed" not in events
     # Activation also creates the editable per-reservation fork (issue #25 path).
     fork_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_activation_threads_booking_user_into_fork():
+    """Scheduled activation threads the booking user into the fork as created_by,
+    so a future-dated booking's fork_connection.created_by records the real user
+    rather than "system" (issue #192). Mirrors the immediate path's assertion in
+    test_reservation_service_unit.test_create_reservation_invokes_fork_when_topology_present.
+    The reservation carries a topology_id so the fork call fires (a None topology_id
+    is the Case A lazy-create path, which skips the fork)."""
+    booking_user_id = uuid.uuid4()
+    topology_id = uuid.uuid4()
+    res_id = await _insert_reservation(
+        ReservationStatus.PENDING,
+        PAST,
+        FUTURE,
+        user_id=booking_user_id,
+        topology_id=topology_id,
+    )
+    nats = AsyncMock()
+    with (
+        patch(
+            "app.tasks.expiration._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[{"exclusive": True}]),
+        ),
+        patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()),
+        patch(
+            "app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()
+        ) as fork_mock,
+        patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()),
+    ):
+        await _run_expiration_cycle(nats)
+    fork_mock.assert_awaited_once()
+    assert fork_mock.call_args.args[0] == res_id
+    assert fork_mock.call_args.args[1] == topology_id
+    assert fork_mock.call_args.kwargs["created_by"] == str(booking_user_id)
 
 
 @pytest.mark.asyncio
