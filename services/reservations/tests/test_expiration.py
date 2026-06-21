@@ -277,25 +277,73 @@ async def test_expiration_publishes_one_completed_event_per_reservation():
 
 
 @pytest.mark.asyncio
-async def test_expiration_no_completed_event_when_only_activation():
-    """Activating a PENDING reservation (no completion) publishes no event."""
+async def test_activation_emits_created_not_completed():
+    """Activating a PENDING reservation at start_time publishes reservation.created
+    (so execution provisions and notifications fire), never reservation.completed
+    (issue #132)."""
     await _insert_reservation(ReservationStatus.PENDING, PAST, FUTURE)
     nats = AsyncMock()
-    with patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_expiration_cycle(nats)
-    pub.assert_not_awaited()
+    with (
+        patch(
+            "app.tasks.expiration._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[{"exclusive": True}]),
+        ),
+        patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()),
+        patch(
+            "app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()
+        ) as fork_mock,
+        patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub,
+    ):
+        await _run_expiration_cycle(nats)
+    subjects = [call.args[1] for call in pub.await_args_list]
+    events = [call.args[2]["event"] for call in pub.await_args_list]
+    assert "herd.reservations.created" in subjects
+    assert "reservation.created" in events
+    assert "reservation.completed" not in events
+    # Activation also creates the editable per-reservation fork (issue #25 path).
+    fork_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_expiration_no_device_release_when_only_activation():
-    """When only PENDING reservations are activated (no completions),
-    _update_device_statuses_internal should not be called."""
+async def test_activation_inventory_failure_stays_pending():
+    """If the inventory flip fails (after retries) at activation, the reservation
+    is reverted to PENDING for a later tick to retry, and no reservation.created
+    is emitted (retry-next-tick policy for #132)."""
+    res_id = await _insert_reservation(ReservationStatus.PENDING, PAST, FUTURE)
+    with (
+        patch(
+            "app.tasks.expiration._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[{"exclusive": True}]),
+        ),
+        patch(
+            "app.tasks.expiration._update_device_statuses",
+            new=AsyncMock(side_effect=RuntimeError("inventory down")),
+        ),
+        patch("app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()),
+        patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub,
+    ):
+        await _run_expiration_cycle(AsyncMock())
+    res = await _get_reservation(res_id)
+    assert res.status == ReservationStatus.PENDING
+    created = [c for c in pub.await_args_list if c.args[2].get("event") == "reservation.created"]
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_activation_reserves_devices_does_not_release():
+    """Scheduled activation flips the reservation's exclusive devices to RESERVED;
+    it never releases them to AVAILABLE (that is the completion path) (issue #132)."""
     await _insert_reservation(ReservationStatus.PENDING, PAST, FUTURE)
     mock_update = AsyncMock()
-    with patch(
-        "app.tasks.expiration._update_device_statuses",
-        new=mock_update,
+    with (
+        patch(
+            "app.tasks.expiration._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[{"exclusive": True}]),
+        ),
+        patch("app.tasks.expiration._update_device_statuses", new=mock_update),
+        patch("app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()),
     ):
         await _run_expiration_cycle()
-    mock_update.assert_not_called()
+    statuses = [call.args[1] for call in mock_update.await_args_list]
+    assert statuses == ["RESERVED"]
+    assert "AVAILABLE" not in statuses
