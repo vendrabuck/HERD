@@ -418,7 +418,7 @@ async def test_create_reservation_success():
         devices = [_make_device(DEVICE_A)]
         data = ReservationCreate(
             device_ids=[DEVICE_A],
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
         with (
@@ -433,6 +433,59 @@ async def test_create_reservation_success():
         assert res.status == ReservationStatus.ACTIVE
         assert res.owner_name == "testuser"
         assert res.topology_type == TopologyType.PHYSICAL
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_future_is_pending_and_defers_provisioning():
+    """A booking more than the start-grace ahead is created PENDING with no
+    immediate provisioning: no inventory flip, no fork, no reservation.created
+    (issue #132). The expiration task provisions it at start_time."""
+    async with TestSessionLocal() as db:
+        devices = [_make_device(DEVICE_A)]
+        data = ReservationCreate(
+            device_ids=[DEVICE_A],
+            start_time=NOW + timedelta(hours=1),
+            end_time=NOW + timedelta(hours=3),
+        )
+        update_mock = AsyncMock()
+        fork_mock = AsyncMock()
+        publish_mock = AsyncMock()
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices",
+                new=AsyncMock(return_value=devices),
+            ),
+            patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+            patch(
+                "app.services.reservation_service._create_reservation_fork_best_effort",
+                new=fork_mock,
+            ),
+            patch("app.services.reservation_service._publish_nats_event", new=publish_mock),
+        ):
+            res = await create_reservation(db, data, USER_ID, "token")
+        assert res.status == ReservationStatus.PENDING
+        update_mock.assert_not_called()
+        fork_mock.assert_not_awaited()
+        publish_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_future_skips_now_availability_check():
+    """A future booking is gated by conflict detection, not current device status:
+    a device that is RESERVED right now can still be scheduled for a later window
+    (issue #132)."""
+    async with TestSessionLocal() as db:
+        devices = [_make_device(DEVICE_A, status="RESERVED")]
+        data = ReservationCreate(
+            device_ids=[DEVICE_A],
+            start_time=NOW + timedelta(hours=1),
+            end_time=NOW + timedelta(hours=3),
+        )
+        with patch(
+            "app.services.reservation_service._fetch_devices", new=AsyncMock(return_value=devices)
+        ):
+            res = await create_reservation(db, data, USER_ID, "token")
+        assert res.status == ReservationStatus.PENDING
 
 
 @pytest.mark.asyncio
@@ -492,7 +545,7 @@ async def test_create_reservation_device_unavailable():
         devices = [_make_device(DEVICE_A, status="RESERVED")]
         data = ReservationCreate(
             device_ids=[DEVICE_A],
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
         with patch(
@@ -509,7 +562,7 @@ async def test_create_reservation_non_exclusive_reserved_ok():
         devices = [_make_device(DEVICE_A, status="RESERVED", exclusive=False)]
         data = ReservationCreate(
             device_ids=[DEVICE_A],
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
         with (
@@ -549,7 +602,7 @@ async def test_create_reservation_nats_event_published():
         mock_nats = MagicMock()
         data = ReservationCreate(
             device_ids=[DEVICE_A],
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
         with (
@@ -573,7 +626,7 @@ async def test_create_reservation_non_exclusive_skips_pending_provision():
         devices = [_make_device(DEVICE_A, exclusive=False)]
         data = ReservationCreate(
             device_ids=[DEVICE_A],
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
         mock_update = AsyncMock()
@@ -597,7 +650,7 @@ async def test_create_reservation_fails_when_inventory_exhausts_retries():
         devices = [_make_device(DEVICE_A)]
         data = ReservationCreate(
             device_ids=[DEVICE_A],
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
         mock_update = AsyncMock(side_effect=RuntimeError("inventory down"))
@@ -644,7 +697,7 @@ async def test_create_reservation_reverts_partially_reserved_devices_on_failure(
         devices = [_make_device(DEVICE_A), _make_device(DEVICE_B)]
         data = ReservationCreate(
             device_ids=[DEVICE_A, DEVICE_B],
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
 
@@ -1485,7 +1538,7 @@ async def test_create_reservation_invokes_fork_when_topology_present():
         data = ReservationCreate(
             device_ids=[DEVICE_A],
             topology_id=topology_id,
-            start_time=NOW + timedelta(hours=1),
+            start_time=NOW,
             end_time=NOW + timedelta(hours=3),
         )
         fork_mock = AsyncMock()

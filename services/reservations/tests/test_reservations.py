@@ -29,7 +29,9 @@ DEVICE_B = str(uuid.uuid4())
 DEVICE_CLOUD = str(uuid.uuid4())
 
 NOW = datetime.now(timezone.utc)
-START = (NOW + timedelta(hours=1)).isoformat()
+# Immediate ("start now") window: start_time within the start-grace of now, so
+# create provisions immediately (status ACTIVE) rather than scheduling PENDING.
+START = NOW.isoformat()
 END = (NOW + timedelta(hours=3)).isoformat()
 
 

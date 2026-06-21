@@ -5,14 +5,17 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from herd_common.retry import retry_with_backoff
 from sqlalchemy import and_, select
 
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.reservation import Reservation, ReservationStatus
 from app.services.reservation_service import (
+    _create_reservation_fork_best_effort,
     _fetch_devices_best_effort,
     _publish_nats_event,
+    _reservation_created_event,
     _update_device_statuses,
 )
 
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 EXPIRING_SOON_SUBJECT = "herd.reservations.expiring_soon"
 COMPLETED_SUBJECT = "herd.reservations.completed"
+CREATED_SUBJECT = "herd.reservations.created"
 
 
 async def _run_reminder_cycle(nats_conn) -> None:
@@ -84,6 +88,88 @@ async def _run_reminder_cycle(nats_conn) -> None:
         await _publish_nats_event(nats_conn, EXPIRING_SOON_SUBJECT, event)
 
 
+async def _activate_pending_reservation(reservation_id: uuid.UUID, nats_conn=None) -> bool:
+    """Provision and activate one claimed (PENDING_PROVISION) reservation.
+
+    This is the deferred half of create_reservation's immediate path (issue #132):
+    a scheduled booking is created PENDING, claimed to PENDING_PROVISION by the
+    cycle below at start_time, then handed here to run exactly what a start-now
+    reservation runs: flip its exclusive devices to RESERVED in inventory, mark it
+    ACTIVE, create the editable fork, and emit reservation.created so execution
+    provisions (L1 connect, L2 VLAN) and notifications fire.
+
+    Failure policy is retry-next-tick (decision for #132): if inventory is
+    unreachable after retries, the claim is reverted to PENDING and False is
+    returned, so a later cycle retries rather than permanently FAILing a valid
+    booking. The inventory flip (idempotent re-RESERVED), fork (idempotent on
+    reservation_id), and the single reservation.created emit (only after a
+    successful flip) make the retry safe.
+    """
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None or res.status != ReservationStatus.PENDING_PROVISION:
+            # Already activated/cancelled or claimed by another instance.
+            return False
+        device_ids = list(res.device_ids)
+        topology_id = res.topology_id
+
+    # Flip exclusive devices to RESERVED, outside any open transaction. Exclusivity
+    # is resolved via the internal-token fetch (same conservative assume-exclusive
+    # on fetch failure as the completion path), since the task acts as the system.
+    fetch_results = await _fetch_devices_best_effort(device_ids)
+    exclusive_ids: list[uuid.UUID] = []
+    for did, result in zip(device_ids, fetch_results):
+        if isinstance(result, BaseException) or result.get("exclusive", True):
+            exclusive_ids.append(did)
+
+    if exclusive_ids:
+        try:
+            await retry_with_backoff(
+                lambda: _update_device_statuses(exclusive_ids, "RESERVED", raise_on_failure=True),
+                attempts=3,
+                initial_delay=0.5,
+                factor=2.0,
+                max_delay=5.0,
+            )
+        except Exception:
+            # Revert the claim so a later tick retries (retry-next-tick policy).
+            async with AsyncSessionLocal() as db:
+                res = await db.get(Reservation, reservation_id)
+                if res is not None and res.status == ReservationStatus.PENDING_PROVISION:
+                    res.status = ReservationStatus.PENDING
+                    await db.commit()
+            logger.warning(
+                "Scheduled activation deferred for %s: inventory flip failed; retry next tick",
+                reservation_id,
+                extra={
+                    "action": "scheduled_activation_deferred",
+                    "reservation_id": str(reservation_id),
+                },
+            )
+            return False
+
+    # Mark ACTIVE and snapshot the event payload while the row is attached.
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None or res.status != ReservationStatus.PENDING_PROVISION:
+            return False
+        res.status = ReservationStatus.ACTIVE
+        await db.commit()
+        await db.refresh(res)
+        event = _reservation_created_event(res)
+
+    # Editable per-reservation fork (best-effort, never raises) then the single
+    # reservation.created emit, mirroring create_reservation's steps 8 and 9.
+    await _create_reservation_fork_best_effort(reservation_id, topology_id)
+    await _publish_nats_event(nats_conn, CREATED_SUBJECT, event)
+    logger.info(
+        "Scheduled reservation activated: %s",
+        reservation_id,
+        extra={"action": "scheduled_activation", "reservation_id": str(reservation_id)},
+    )
+    return True
+
+
 async def _run_expiration_cycle(nats_conn=None) -> None:
     """Single expiration cycle: activate pending, complete expired.
 
@@ -104,23 +190,30 @@ async def _run_expiration_cycle(nats_conn=None) -> None:
     now = datetime.now(timezone.utc)
 
     async with AsyncSessionLocal() as db:
-        # Activate PENDING reservations whose start_time has passed
+        # Claim PENDING reservations whose start_time has passed by moving them to
+        # PENDING_PROVISION (the documented PENDING -> PENDING_PROVISION -> ACTIVE
+        # path). skip_locked so concurrent service instances do not double-claim;
+        # it is a no-op on SQLite (unit tests). Provisioning runs after this
+        # transaction commits and the row lock is released, never during HTTP.
         result = await db.execute(
-            select(Reservation).where(
+            select(Reservation)
+            .where(
                 and_(
                     Reservation.status == ReservationStatus.PENDING,
                     Reservation.start_time <= now,
                 )
             )
+            .with_for_update(skip_locked=True)
         )
-        pending = result.scalars().all()
-        for res in pending:
-            res.status = ReservationStatus.ACTIVE
+        claimed = result.scalars().all()
+        for res in claimed:
+            res.status = ReservationStatus.PENDING_PROVISION
             logger.info(
-                "Auto-activated reservation %s",
+                "Claimed scheduled reservation %s for activation",
                 res.id,
-                extra={"action": "auto_activate", "reservation_id": str(res.id)},
+                extra={"action": "scheduled_activation_claim", "reservation_id": str(res.id)},
             )
+        activate_ids = [res.id for res in claimed]
 
         # Complete ACTIVE reservations whose end_time has passed
         result = await db.execute(
@@ -158,6 +251,13 @@ async def _run_expiration_cycle(nats_conn=None) -> None:
             )
 
         await db.commit()
+
+    # Provision each claimed reservation now that the claim is committed and the
+    # row lock is released: flip inventory, mark ACTIVE, fork, emit
+    # reservation.created (issue #132). Each is independent and best-effort; a
+    # deferred one stays PENDING for a later tick.
+    for reservation_id in activate_ids:
+        await _activate_pending_reservation(reservation_id, nats_conn)
 
     # Release only exclusive devices for completed reservations. Uses the same
     # best-effort fetch + internal-token status update as the cancel/release

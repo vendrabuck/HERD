@@ -351,6 +351,25 @@ async def _acquire_device_locks(db: AsyncSession, device_ids: list[uuid.UUID]) -
         await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
 
 
+def _reservation_created_event(reservation: Reservation) -> dict:
+    """Build the reservation.created NATS payload from a provisioned reservation.
+
+    Shared by the immediate create path and the scheduled-activation path (issue
+    #132) so both emit byte-identical events: execution provisions and
+    notifications render an activated scheduled booking exactly like a start-now one.
+    """
+    return {
+        "event": "reservation.created",
+        "reservation_id": str(reservation.id),
+        "user_id": str(reservation.user_id),
+        "device_ids": [str(d) for d in reservation.device_ids],
+        "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
+        "topology_type": reservation.topology_type.value,
+        "start_time": reservation.start_time.isoformat(),
+        "end_time": reservation.end_time.isoformat(),
+    }
+
+
 async def create_reservation(
     db: AsyncSession,
     data: ReservationCreate,
@@ -384,19 +403,34 @@ async def create_reservation(
     exclusive_ids = {str(d["id"]) for d in devices if d.get("exclusive", True)}
     non_exclusive_ids = {str(d["id"]) for d in devices if not d.get("exclusive", True)}
 
-    # 3. Check availability: exclusive devices must be AVAILABLE;
-    #    non-exclusive devices accept AVAILABLE or RESERVED
-    bad_exclusive = [
-        d["name"] for d in devices if str(d["id"]) in exclusive_ids and d["status"] != "AVAILABLE"
-    ]
-    bad_non_exclusive = [
-        d["name"]
-        for d in devices
-        if str(d["id"]) in non_exclusive_ids and d["status"] not in ("AVAILABLE", "RESERVED")
-    ]
-    unavailable = bad_exclusive + bad_non_exclusive
-    if unavailable:
-        raise ValueError(f"The following devices are not available: {', '.join(unavailable)}")
+    # A booking whose start_time is more than the start-grace ahead is scheduled,
+    # not started: it is created PENDING and provisioned by the expiration task at
+    # start_time (issue #132), so none of the immediate-provisioning steps below
+    # run now. Within the grace (the same "start now" tolerance the request
+    # validator allows for past skew) it is treated as immediate, so a start-now
+    # click is not made to wait for the next activation tick.
+    grace = settings.reservation_start_grace_seconds
+    is_future = (data.start_time - datetime.now(timezone.utc)).total_seconds() > grace
+
+    # 3. Check current availability for an immediate ("start now") booking only:
+    #    exclusive devices must be AVAILABLE, non-exclusive accept AVAILABLE/RESERVED.
+    #    A future booking is gated solely by time-window conflict detection (step 5),
+    #    not by what the devices happen to be doing right now, so it can reserve a
+    #    device that is busy now but free in the requested window.
+    if not is_future:
+        bad_exclusive = [
+            d["name"]
+            for d in devices
+            if str(d["id"]) in exclusive_ids and d["status"] != "AVAILABLE"
+        ]
+        bad_non_exclusive = [
+            d["name"]
+            for d in devices
+            if str(d["id"]) in non_exclusive_ids and d["status"] not in ("AVAILABLE", "RESERVED")
+        ]
+        unavailable = bad_exclusive + bad_non_exclusive
+        if unavailable:
+            raise ValueError(f"The following devices are not available: {', '.join(unavailable)}")
 
     # 4. Acquire advisory locks to prevent concurrent conflicting reservations
     await _acquire_device_locks(db, data.device_ids)
@@ -419,9 +453,14 @@ async def create_reservation(
     #    _check_conflicts (step 5 in concurrent creates) immediately, which closes the
     #    double-booking race while we talk to inventory below.
     exclusive_uuid_ids = [d for d in data.device_ids if str(d) in exclusive_ids]
-    initial_status = (
-        ReservationStatus.PENDING_PROVISION if exclusive_uuid_ids else ReservationStatus.ACTIVE
-    )
+    if is_future:
+        # Scheduled: hold the window (the row is visible to _check_conflicts) but
+        # defer all provisioning to the activation cycle at start_time.
+        initial_status = ReservationStatus.PENDING
+    elif exclusive_uuid_ids:
+        initial_status = ReservationStatus.PENDING_PROVISION
+    else:
+        initial_status = ReservationStatus.ACTIVE
     reservation = Reservation(
         user_id=user_id,
         owner_name=username,
@@ -452,6 +491,12 @@ async def create_reservation(
             "initial_status": initial_status.value,
         },
     )
+
+    # Scheduled-future booking: stop here. No inventory flip, no fork, no
+    # reservation.created. The expiration task's activation cycle runs all of
+    # that when start_time arrives (issue #132).
+    if is_future:
+        return reservation
 
     # 7. Mark exclusive devices as RESERVED in inventory with retry; non-exclusive
     #    devices stay AVAILABLE so no inventory call is needed. On exhausted retries
@@ -522,16 +567,7 @@ async def create_reservation(
     await _publish_nats_event(
         nats_conn,
         "herd.reservations.created",
-        {
-            "event": "reservation.created",
-            "reservation_id": str(reservation.id),
-            "user_id": str(user_id),
-            "device_ids": [str(d) for d in data.device_ids],
-            "topology_id": str(data.topology_id) if data.topology_id else None,
-            "topology_type": topology_type.value,
-            "start_time": data.start_time.isoformat(),
-            "end_time": data.end_time.isoformat(),
-        },
+        _reservation_created_event(reservation),
     )
 
     return reservation
