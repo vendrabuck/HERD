@@ -140,6 +140,7 @@ async def _validate_topology_connectivity(topology_id: uuid.UUID) -> None:
 async def _create_reservation_fork(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
+    created_by: str | None = None,
 ) -> None:
     """Create the editable per-reservation fork in cabling at activation (issue #25).
 
@@ -176,6 +177,7 @@ async def _create_reservation_fork(
                 "reservation_id": str(reservation_id),
                 "parent_topology_id": str(topology_id),
                 "parent_version_id": None,
+                "created_by": created_by,
             },
             timeout=10.0,
         )
@@ -186,6 +188,7 @@ async def _create_reservation_fork(
 async def _create_reservation_fork_best_effort(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
+    created_by: str | None = None,
 ) -> None:
     """Run _create_reservation_fork with bounded retry and log-and-continue.
 
@@ -197,7 +200,7 @@ async def _create_reservation_fork_best_effort(
         return
     try:
         await retry_with_backoff(
-            lambda: _create_reservation_fork(reservation_id, topology_id),
+            lambda: _create_reservation_fork(reservation_id, topology_id, created_by),
             attempts=3,
             initial_delay=0.5,
             factor=2.0,
@@ -561,7 +564,9 @@ async def create_reservation(
     #    reservation is ACTIVE (issue #25). Best-effort: a fork-create failure must
     #    not strand the provisioned reservation, so this never raises. Skipped when
     #    there is no parent topology (Case A lazy-create).
-    await _create_reservation_fork_best_effort(reservation.id, reservation.topology_id)
+    await _create_reservation_fork_best_effort(
+        reservation.id, reservation.topology_id, created_by=str(user_id)
+    )
 
     # 9. Emit NATS event (only on successful provisioning)
     await _publish_nats_event(

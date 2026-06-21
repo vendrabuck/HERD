@@ -339,6 +339,74 @@ async def test_create_fork_snapshots_physical_path(client):
         assert c.layer == "L1"
         assert {c.device_a_id, c.device_b_id} == {dev_a, dev_b}
         assert c.physical_connection_id == physical_id
+        # created_by omitted from the body falls back to the "system" sentinel.
+        assert c.created_by == "system"
+
+
+@pytest.mark.asyncio
+async def test_create_fork_threads_created_by(client):
+    """The booking user passed as created_by is stamped onto every snapshotted
+    fork_connection, instead of the "system" default (issue #134)."""
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    booking_user = str(uuid.uuid4())
+    async with TestSessionLocal() as db:
+        db.add(
+            Connection(
+                device_a_id=dev_a,
+                port_a="eth0",
+                device_b_id=dev_b,
+                port_b="eth1",
+                created_by="admin",
+            )
+        )
+        await db.commit()
+
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "n2", "data": {"device": {"id": str(dev_b)}}},
+        ],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2"}],
+    }
+    async with TestSessionLocal() as db:
+        topo = Topology(name="t", created_by=uuid.uuid4(), canvas_data=canvas)
+        db.add(topo)
+        await db.flush()
+        db.add(
+            TopologyVersion(
+                topology_id=topo.id,
+                version_number=1,
+                canvas_data=canvas,
+                name="t",
+                created_by=uuid.uuid4(),
+            )
+        )
+        await db.commit()
+        topo_id = topo.id
+
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "created_by": booking_user,
+        },
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        conns = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        assert len(conns) == 1
+        assert conns[0].created_by == booking_user
 
 
 @pytest.mark.asyncio
