@@ -10,7 +10,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
 
 ## Before you switch
 
-- Confirm the destination provider works in isolation. If you are pointing at a local LLM, the endpoint should answer `GET /v1/models` with a JSON list. For Anthropic, the key should be valid.
+- Confirm the destination provider works in isolation. If you are pointing at a local LLM via `openai_compat`, the endpoint should answer `GET /v1/models` with a JSON list. For a keyless local `anthropic` endpoint, `AI_BASE_URL` is the server root and it should serve `POST /v1/messages` in Anthropic format. For hosted Anthropic, the key should be valid.
 - If you are pointing at a self-signed local LLM, set `AI_TLS_VERIFY=false`. Without it, the AsyncOpenAI SDK will refuse the connection at TLS handshake.
 - If you are using tool-use (which `/generate` and the reservation assistant both require), confirm the local server is launched with tool-call parsing enabled. For vLLM that is `--enable-auto-tool-choice` plus a `--tool-call-parser` flag appropriate for the model family. Without it the loop exits early with raw text instead of structured tool calls.
 

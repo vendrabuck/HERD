@@ -96,7 +96,7 @@ Each DLQ message is a verbatim copy of the original event payload. Reservation e
 
 ### Replaying a DLQ message
 
-Once you understand what made the message fail and have fixed the underlying cause, re-publish it on the original subject (both consumers will reprocess it):
+Once you understand what made the message fail and have fixed the underlying cause, re-publish it on the original subject. Every durable consumer bound to that subject reprocesses it: for `herd.reservations.*` that is both execution and notifications; for `herd.health.*` it is notifications only (execution publishes health events, it does not consume them):
 
 ```bash
 docker compose exec nats nats pub 'herd.reservations.created' "$(cat msg.json)"
@@ -143,11 +143,11 @@ What to preserve:
 
 - **Postgres data**: a single Docker volume (`postgres-data`) holding one database with one schema per service. Dump via `pg_dump`:
   ```bash
-  docker compose exec postgres pg_dump -U herd -d herd > backup-$(date +%Y%m%d).sql
+  docker compose exec postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" > backup-$(date +%Y%m%d).sql
   ```
   Restore:
   ```bash
-  cat backup-YYYYMMDD.sql | docker compose exec -T postgres psql -U herd -d herd
+  cat backup-YYYYMMDD.sql | docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
   ```
 - **Config volume** (`herd-config`): holds `config.json` and `config_auth.json`. Copy the contents out:
   ```bash
