@@ -283,7 +283,7 @@ The notifications service runs two durable NATS consumers: one on `herd.reservat
 |---|---|---|
 | `EXPIRATION_INTERVAL_SECONDS` | `60` | How often the expiration loop wakes up to activate `PENDING` reservations, complete `ACTIVE` ones whose windows closed, and emit upcoming-expiry reminders. |
 | `EXPIRY_REMINDER_LEAD_SECONDS` | `3600` | Lead window before `end_time` in which the expiration task publishes a `reservation.expiring_soon` event onto `HERD_RESERVATIONS` (ROADMAP #40). An ACTIVE reservation whose `end_time` is within this many seconds of now, and still in the future, gets exactly one reminder, deduped via `expiry_reminder_sent_at`. `0` disables the reminder. |
-| `RESERVATION_START_GRACE_SECONDS` | `300` | On create, a `start_time` earlier than now minus this grace is rejected (422), so a user cannot book a window that already passed. The grace tolerates clock skew and "start now"; the expiration loop still activates PENDING reservations whose start has ticked past. |
+| `RESERVATION_START_GRACE_SECONDS` | `300` | On create, a `start_time` earlier than now minus this grace is rejected (422), so a user cannot book a window that already passed. The grace tolerates clock skew and "start now". It also sets the scheduled-vs-immediate boundary: a `start_time` more than this grace in the future is created `PENDING` and provisioned by the expiration task at start_time, while a booking within the grace is provisioned immediately. The expiration loop activates `PENDING` reservations whose start has ticked past. |
 | `RESERVATION_MAX_DURATION_SECONDS` | `2592000` | On create, a window longer than this (default 30 days) is rejected (422), guarding against runaway or typo'd bookings. `0` disables the cap. |
 
 ## Frontend (Vite build-time)
