@@ -598,7 +598,12 @@ async def test_visible_devices_requires_auth():
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_ids_raises_on_auth_service_5xx():
-    """Non-200 from auth service surfaces as HTTPException(502)."""
+    """Non-200 from auth service surfaces as HTTPException(503).
+
+    503 is the cross-service convention for an unusable upstream dependency
+    (see issue #131); reservations raises the same code for the equivalent
+    inventory-down condition.
+    """
     from unittest.mock import MagicMock
 
     from app.routers.device_groups import _fetch_user_group_ids
@@ -617,13 +622,13 @@ async def test_fetch_user_group_ids_raises_on_auth_service_5xx():
         with pytest.raises(HTTPException) as excinfo:
             await _fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
 
-    assert excinfo.value.status_code == 502
+    assert excinfo.value.status_code == 503
     assert "500" in excinfo.value.detail
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_ids_raises_on_connection_error():
-    """Connection error surfaces as HTTPException(502)."""
+    """Connection error surfaces as HTTPException(503) (issue #131)."""
     import httpx
     from app.routers.device_groups import _fetch_user_group_ids
     from fastapi import HTTPException
@@ -637,13 +642,13 @@ async def test_fetch_user_group_ids_raises_on_connection_error():
         with pytest.raises(HTTPException) as excinfo:
             await _fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
 
-    assert excinfo.value.status_code == 502
+    assert excinfo.value.status_code == 503
     assert "unreachable" in excinfo.value.detail
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_names_raises_on_auth_service_5xx():
-    """Non-200 from auth service surfaces as HTTPException(502)."""
+    """Non-200 from auth service surfaces as HTTPException(503)."""
     from unittest.mock import MagicMock
 
     from app.routers.device_groups import _fetch_user_group_names
@@ -662,7 +667,7 @@ async def test_fetch_user_group_names_raises_on_auth_service_5xx():
         with pytest.raises(HTTPException) as excinfo:
             await _fetch_user_group_names([uuid.uuid4()], "Bearer fake-token")
 
-    assert excinfo.value.status_code == 502
+    assert excinfo.value.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -683,13 +688,13 @@ async def test_fetch_user_group_names_empty_input_returns_empty_map_without_call
     "app.routers.device_groups._fetch_user_group_ids",
     new_callable=AsyncMock,
 )
-async def test_visible_devices_endpoint_returns_502_when_auth_service_down(mock_fetch, client):
-    """If the auth-service helper raises 502, the endpoint surfaces that status."""
+async def test_visible_devices_endpoint_returns_503_when_auth_service_down(mock_fetch, client):
+    """If the auth-service helper raises 503, the endpoint surfaces that status."""
     from fastapi import HTTPException
 
-    mock_fetch.side_effect = HTTPException(status_code=502, detail="auth service down")
+    mock_fetch.side_effect = HTTPException(status_code=503, detail="auth service down")
     resp = await client.get(f"/device-groups/visible-devices?user_id={uuid.uuid4()}")
-    assert resp.status_code == 502
+    assert resp.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -697,9 +702,9 @@ async def test_visible_devices_endpoint_returns_502_when_auth_service_down(mock_
     "app.routers.device_groups._fetch_user_group_names",
     new_callable=AsyncMock,
 )
-async def test_device_groups_for_device_returns_502_when_auth_service_down(mock_fetch, client):
-    """If the auth-service helper raises 502 during group-name resolution, the
-    /device-groups/device/{id} endpoint returns 502 instead of a 200 with None names."""
+async def test_device_groups_for_device_returns_503_when_auth_service_down(mock_fetch, client):
+    """If the auth-service helper raises 503 during group-name resolution, the
+    /device-groups/device/{id} endpoint returns 503 instead of a 200 with None names."""
     from fastapi import HTTPException
 
     # Seed a device + group + permission so the endpoint reaches the name-resolution step.
@@ -714,9 +719,9 @@ async def test_device_groups_for_device_returns_502_when_auth_service_down(mock_
         json={"user_group_ids": [str(uuid.uuid4())]},
     )
 
-    mock_fetch.side_effect = HTTPException(status_code=502, detail="auth service down")
+    mock_fetch.side_effect = HTTPException(status_code=503, detail="auth service down")
     resp = await client.get(f"/device-groups/device/{dev['id']}")
-    assert resp.status_code == 502
+    assert resp.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -851,7 +856,7 @@ async def test_fetch_user_group_names_success_maps_wanted_ids():
 
 
 @pytest.mark.asyncio
-async def test_fetch_user_group_names_connection_error_raises_502():
+async def test_fetch_user_group_names_connection_error_raises_503():
     import httpx
     from app.routers.device_groups import _fetch_user_group_names
     from fastapi import HTTPException
@@ -864,7 +869,7 @@ async def test_fetch_user_group_names_connection_error_raises_502():
     with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as exc:
             await _fetch_user_group_names([uuid.uuid4()], "Bearer t")
-    assert exc.value.status_code == 502
+    assert exc.value.status_code == 503
     assert "unreachable" in exc.value.detail
 
 

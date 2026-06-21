@@ -108,7 +108,7 @@ async def get_devices(
         dut_only = True
         # Fail closed: a malformed token subject is an auth error, not a reason
         # to fall through to showing every device. _resolve_visible_device_ids
-        # likewise propagates a 502 on an auth-service outage.
+        # likewise propagates a 503 on an auth-service outage.
         try:
             user_id = uuid.UUID(payload["sub"])
         except (ValueError, KeyError) as exc:
@@ -305,7 +305,7 @@ async def _resolve_visible_device_ids(
     """Resolve the set of device IDs a non-admin user can see via their groups.
 
     Fails closed: if the auth service is unreachable or errors,
-    `_fetch_user_group_ids` raises HTTPException(502) and that propagates so the
+    `_fetch_user_group_ids` raises HTTPException(503) and that propagates so the
     request fails rather than falling back to showing every device. A user who
     legitimately belongs to no groups resolves to an empty set (sees no DUTs),
     which is distinct from an auth-service outage.

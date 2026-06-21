@@ -285,8 +285,8 @@ async def test_get_device_non_admin_denied_when_not_visible(client):
 
 @pytest.mark.asyncio
 async def test_single_device_read_fails_closed_on_auth_outage(client):
-    """When the auth service is down (visibility resolution raises 502), a
-    non-admin single-device read returns 502, not the device. Fail closed."""
+    """When the auth service is down (visibility resolution raises 503), a
+    non-admin single-device read returns 503, not the device. Fail closed."""
     from fastapi import HTTPException
 
     tid = await _create_template(client)
@@ -296,15 +296,15 @@ async def test_single_device_read_fails_closed_on_auth_outage(client):
     app.dependency_overrides[get_current_user_payload] = override_auth_user
     with patch(
         "app.routers.devices._resolve_visible_device_ids",
-        new=AsyncMock(side_effect=HTTPException(status_code=502, detail="auth down")),
+        new=AsyncMock(side_effect=HTTPException(status_code=503, detail="auth down")),
     ):
         resp = await client.get(f"/devices/{device_id}")
-    assert resp.status_code == 502
+    assert resp.status_code == 503
 
 
 @pytest.mark.asyncio
 async def test_device_list_fails_closed_on_auth_outage(client):
-    """When the auth service is down, a non-admin device list returns 502
+    """When the auth service is down, a non-admin device list returns 503
     instead of fail-open showing every device."""
     from fastapi import HTTPException
 
@@ -314,10 +314,10 @@ async def test_device_list_fails_closed_on_auth_outage(client):
     app.dependency_overrides[get_current_user_payload] = override_auth_user
     with patch(
         "app.routers.devices._resolve_visible_device_ids",
-        new=AsyncMock(side_effect=HTTPException(status_code=502, detail="auth down")),
+        new=AsyncMock(side_effect=HTTPException(status_code=503, detail="auth down")),
     ):
         resp = await client.get("/devices")
-    assert resp.status_code == 502
+    assert resp.status_code == 503
 
 
 @pytest.mark.asyncio

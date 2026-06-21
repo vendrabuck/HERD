@@ -346,7 +346,7 @@ def _auth_base() -> str:
 async def _fetch_user_group_ids(user_id: uuid.UUID, authorization: str | None) -> list[uuid.UUID]:
     """Fetch user's group IDs from the auth service, forwarding the caller JWT.
 
-    Raises HTTPException(502) on upstream failure. Callers that want fail-open
+    Raises HTTPException(503) on upstream failure. Callers that want fail-open
     behavior (e.g. show-all-devices on auth outage) must wrap this call in
     their own try/except.
 
@@ -368,7 +368,7 @@ async def _fetch_user_group_ids(user_id: uuid.UUID, authorization: str | None) -
     except httpx.HTTPError as exc:
         logger.error("auth service unreachable while fetching groups for user %s: %s", user_id, exc)
         raise HTTPException(
-            status_code=502, detail="auth service unreachable while fetching user groups"
+            status_code=503, detail="auth service unreachable while fetching user groups"
         ) from exc
 
     if resp.status_code != 200:
@@ -379,7 +379,7 @@ async def _fetch_user_group_ids(user_id: uuid.UUID, authorization: str | None) -
             resp.text[:200],
         )
         raise HTTPException(
-            status_code=502,
+            status_code=503,
             detail=f"auth service returned {resp.status_code} when fetching user groups",
         )
 
@@ -393,7 +393,7 @@ async def _fetch_user_group_names(
 ) -> dict[uuid.UUID, str]:
     """Fetch user group names from the auth service. Returns a map of id to name.
 
-    Raises HTTPException(502) on upstream failure. A None authorization raises
+    Raises HTTPException(503) on upstream failure. A None authorization raises
     HTTPException(500); the bearer dep on each route guarantees it's present.
     """
     if not user_group_ids:
@@ -413,7 +413,7 @@ async def _fetch_user_group_names(
     except httpx.HTTPError as exc:
         logger.error("auth service unreachable while fetching group names: %s", exc)
         raise HTTPException(
-            status_code=502, detail="auth service unreachable while fetching group names"
+            status_code=503, detail="auth service unreachable while fetching group names"
         ) from exc
 
     if resp.status_code != 200:
@@ -423,7 +423,7 @@ async def _fetch_user_group_names(
             resp.text[:200],
         )
         raise HTTPException(
-            status_code=502,
+            status_code=503,
             detail=f"auth service returned {resp.status_code} when fetching group names",
         )
 
