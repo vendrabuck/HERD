@@ -112,6 +112,7 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID, nats_conn=Non
             return False
         device_ids = list(res.device_ids)
         topology_id = res.topology_id
+        user_id = res.user_id
 
     # Flip exclusive devices to RESERVED, outside any open transaction. Exclusivity
     # is resolved via the internal-token fetch (same conservative assume-exclusive
@@ -160,7 +161,7 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID, nats_conn=Non
 
     # Editable per-reservation fork (best-effort, never raises) then the single
     # reservation.created emit, mirroring create_reservation's steps 8 and 9.
-    await _create_reservation_fork_best_effort(reservation_id, topology_id)
+    await _create_reservation_fork_best_effort(reservation_id, topology_id, created_by=str(user_id))
     await _publish_nats_event(nats_conn, CREATED_SUBJECT, event)
     logger.info(
         "Scheduled reservation activated: %s",
