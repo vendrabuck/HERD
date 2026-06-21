@@ -45,6 +45,7 @@ async def create_fork_internal(
         reservation_id=body.reservation_id,
         parent_topology_id=body.parent_topology_id,
         parent_version_id=body.parent_version_id,
+        created_by=body.created_by or "system",
     )
 
     version_number = (

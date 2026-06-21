@@ -1420,7 +1420,34 @@ async def test_create_reservation_fork_posts_to_cabling():
     assert kwargs["json"]["reservation_id"] == str(reservation_id)
     assert kwargs["json"]["parent_topology_id"] == str(topology_id)
     assert kwargs["json"]["parent_version_id"] is None
+    # No booking user supplied: created_by rides as null and cabling defaults it.
+    assert kwargs["json"]["created_by"] is None
     assert kwargs["headers"]["X-Internal-Token"] == "tok"
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_fork_threads_created_by():
+    """The booking user is forwarded as created_by in the fork-create body so
+    cabling stamps it onto fork_connections instead of "system" (issue #134)."""
+    booking_user = str(uuid.uuid4())
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 201
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("app.services.reservation_service.settings") as mock_settings,
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cabling:8000"
+        await _create_reservation_fork(uuid.uuid4(), uuid.uuid4(), created_by=booking_user)
+
+    _, kwargs = mock_client.post.call_args
+    assert kwargs["json"]["created_by"] == booking_user
 
 
 @pytest.mark.asyncio
@@ -1511,3 +1538,5 @@ async def test_create_reservation_invokes_fork_when_topology_present():
         called_args = fork_mock.call_args.args
         assert called_args[0] == res.id
         assert called_args[1] == topology_id
+        # The booking user is threaded through as created_by (issue #134).
+        assert fork_mock.call_args.kwargs["created_by"] == str(USER_ID)

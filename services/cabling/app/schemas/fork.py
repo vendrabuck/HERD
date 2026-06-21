@@ -9,6 +9,7 @@ class ForkCreate(BaseModel):
     reservation_id: uuid.UUID
     parent_topology_id: uuid.UUID | None = None
     parent_version_id: uuid.UUID | None = None
+    created_by: str | None = None
 
 
 class ForkCreateResponse(BaseModel):
