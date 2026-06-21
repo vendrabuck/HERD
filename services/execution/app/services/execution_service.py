@@ -39,6 +39,7 @@ async def create_execution_run(
     port_a: str | None = None,
     port_b: str | None = None,
     method_kwargs: dict | None = None,
+    dedupe_key: str | None = None,
 ) -> ExecutionRun:
     # Store method_kwargs in input_params for queryability
     if method_kwargs:
@@ -55,11 +56,46 @@ async def create_execution_run(
         input_params=input_params,
         port_a=port_a,
         port_b=port_b,
+        dedupe_key=dedupe_key,
     )
     db.add(run)
     await db.commit()
     await db.refresh(run)
     return run
+
+
+async def action_already_succeeded(
+    db: AsyncSession,
+    dedupe_key: str | None,
+    device_id: uuid.UUID,
+    action: str,
+    port_a: str | None,
+    port_b: str | None,
+) -> bool:
+    """Has this exact driver action already SUCCEEDED for this source message?
+
+    Idempotency guard for the NATS consumer (issue #133): a message that NAKs
+    mid-handler is redelivered, and without this check every already-applied
+    driver action (connect_ports, create_vlan, add_to_vlan, ...) re-runs against
+    the real device. We key on the source message's dedupe_key plus the action's
+    identity (device, action, ports), so a redelivery skips the steps that
+    completed and only retries the one that failed.
+
+    Returns False when dedupe_key is None (no JetStream metadata, e.g. unit-test
+    stubs), so the un-keyed path keeps its original at-least-once behavior.
+    """
+    if not dedupe_key:
+        return False
+    conditions = [
+        ExecutionRun.dedupe_key == dedupe_key,
+        ExecutionRun.device_id == device_id,
+        ExecutionRun.action == action,
+        ExecutionRun.status == "SUCCESS",
+        ExecutionRun.port_a.is_(None) if port_a is None else ExecutionRun.port_a == port_a,
+        ExecutionRun.port_b.is_(None) if port_b is None else ExecutionRun.port_b == port_b,
+    ]
+    result = await db.execute(select(ExecutionRun.id).where(*conditions).limit(1))
+    return result.scalar_one_or_none() is not None
 
 
 async def update_execution_run(

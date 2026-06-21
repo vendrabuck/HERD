@@ -12,6 +12,24 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _dedupe_key_from_msg(msg) -> str | None:
+    """Build a stable per-message dedupe key from JetStream metadata.
+
+    Uses "<stream>:<stream-sequence>", identical across redeliveries of the same
+    message and distinct for every new publish. Returns None when the metadata is
+    unavailable (e.g. a non-JetStream test stub), so idempotency is simply skipped
+    rather than failing the message. Mirrors the notifications consumer.
+    """
+    meta = getattr(msg, "metadata", None)
+    seq = getattr(meta, "sequence", None)
+    stream_seq = getattr(seq, "stream", None)
+    stream = getattr(meta, "stream", None)
+    if stream_seq is None:
+        return None
+    return f"{stream or 'stream'}:{stream_seq}"
+
+
 # Map NATS event types to driver actions
 EVENT_ACTIONS = {
     "reservation.created": "connect_ports",
@@ -305,6 +323,7 @@ async def _execute_l2_switch_operations(
     reservation_id: str | None,
     user_id: str,
     get_db_session,
+    dedupe_key: str | None = None,
 ) -> None:
     """Resolve L2 switch operations for devices and execute VLAN provisioning.
 
@@ -315,6 +334,8 @@ async def _execute_l2_switch_operations(
         reservation_id: reservation UUID string
         user_id: user UUID string
         get_db_session: async context manager that yields an AsyncSession
+        dedupe_key: source-message key; a VLAN action whose SUCCESS run already
+            carries it is skipped on redelivery (issue #133).
     """
     if not reservation_id:
         logger.warning("No reservation_id for L2 operations, skipping")
@@ -361,6 +382,7 @@ async def _execute_l2_switch_operations(
     from app.services.driver_loader import load_driver
     from app.services.driver_sandbox import execute_driver_method
     from app.services.execution_service import (
+        action_already_succeeded,
         build_context,
         create_execution_run,
         extract_password_keys,
@@ -421,6 +443,7 @@ async def _execute_l2_switch_operations(
                 user_uuid,
                 redacted,
                 res_uuid,
+                dedupe_key=dedupe_key,
             )
             started = datetime.now(timezone.utc)
             login_result = execute_driver_method(
@@ -450,44 +473,64 @@ async def _execute_l2_switch_operations(
                 continue
 
             if l2_action == "provision":
-                # Create VLAN first
+                # Create VLAN first (skip if this message already created it)
                 vlan_kwargs = {"vlan_id": vlan_id}
-                run = await create_execution_run(
-                    db,
-                    switch_uuid,
-                    driver_id,
-                    driver_sha256,
-                    "create_vlan",
-                    user_uuid,
-                    redacted,
-                    res_uuid,
-                    method_kwargs=vlan_kwargs,
-                )
-                op_started = datetime.now(timezone.utc)
-                result = execute_driver_method(
-                    driver_path,
-                    "create_vlan",
-                    context,
-                    method_kwargs=vlan_kwargs,
-                    password_keys=password_keys,
-                )
-                status = "SUCCESS" if result["success"] else "FAILED"
-                await update_execution_run(
-                    db,
-                    run,
-                    status,
-                    output=json.dumps(result["output"], default=str)
-                    if result.get("output")
-                    else None,
-                    error=result.get("error"),
-                    started_at=op_started,
-                    completed_at=datetime.now(timezone.utc),
-                    duration_ms=result["duration_ms"],
-                )
+                if await action_already_succeeded(
+                    db, dedupe_key, switch_uuid, "create_vlan", None, None
+                ):
+                    logger.info(
+                        "Skipping already-applied create_vlan on switch %s; idempotent replay",
+                        switch_id,
+                    )
+                else:
+                    run = await create_execution_run(
+                        db,
+                        switch_uuid,
+                        driver_id,
+                        driver_sha256,
+                        "create_vlan",
+                        user_uuid,
+                        redacted,
+                        res_uuid,
+                        method_kwargs=vlan_kwargs,
+                        dedupe_key=dedupe_key,
+                    )
+                    op_started = datetime.now(timezone.utc)
+                    result = execute_driver_method(
+                        driver_path,
+                        "create_vlan",
+                        context,
+                        method_kwargs=vlan_kwargs,
+                        password_keys=password_keys,
+                    )
+                    status = "SUCCESS" if result["success"] else "FAILED"
+                    await update_execution_run(
+                        db,
+                        run,
+                        status,
+                        output=json.dumps(result["output"], default=str)
+                        if result.get("output")
+                        else None,
+                        error=result.get("error"),
+                        started_at=op_started,
+                        completed_at=datetime.now(timezone.utc),
+                        duration_ms=result["duration_ms"],
+                    )
 
                 # Add each port to the VLAN
                 for op in ops:
-                    port_kwargs = {"port": op["switch_port"], "vlan_id": vlan_id, "tag": op["tag"]}
+                    port = op["switch_port"]
+                    if await action_already_succeeded(
+                        db, dedupe_key, switch_uuid, "add_to_vlan", port, None
+                    ):
+                        logger.info(
+                            "Skipping already-applied add_to_vlan on switch %s port %s; "
+                            "idempotent replay",
+                            switch_id,
+                            port,
+                        )
+                        continue
+                    port_kwargs = {"port": port, "vlan_id": vlan_id, "tag": op["tag"]}
                     run = await create_execution_run(
                         db,
                         switch_uuid,
@@ -497,7 +540,9 @@ async def _execute_l2_switch_operations(
                         user_uuid,
                         redacted,
                         res_uuid,
+                        port,
                         method_kwargs=port_kwargs,
+                        dedupe_key=dedupe_key,
                     )
                     op_started = datetime.now(timezone.utc)
                     result = execute_driver_method(
@@ -524,7 +569,18 @@ async def _execute_l2_switch_operations(
             elif l2_action == "deprovision":
                 # Remove each port from the VLAN first
                 for op in ops:
-                    port_kwargs = {"port": op["switch_port"], "vlan_id": vlan_id}
+                    port = op["switch_port"]
+                    if await action_already_succeeded(
+                        db, dedupe_key, switch_uuid, "remove_from_vlan", port, None
+                    ):
+                        logger.info(
+                            "Skipping already-applied remove_from_vlan on switch %s port %s; "
+                            "idempotent replay",
+                            switch_id,
+                            port,
+                        )
+                        continue
+                    port_kwargs = {"port": port, "vlan_id": vlan_id}
                     run = await create_execution_run(
                         db,
                         switch_uuid,
@@ -534,7 +590,9 @@ async def _execute_l2_switch_operations(
                         user_uuid,
                         redacted,
                         res_uuid,
+                        port,
                         method_kwargs=port_kwargs,
+                        dedupe_key=dedupe_key,
                     )
                     op_started = datetime.now(timezone.utc)
                     result = execute_driver_method(
@@ -558,40 +616,49 @@ async def _execute_l2_switch_operations(
                         duration_ms=result["duration_ms"],
                     )
 
-                # Delete the VLAN
-                vlan_kwargs = {"vlan_id": vlan_id}
-                run = await create_execution_run(
-                    db,
-                    switch_uuid,
-                    driver_id,
-                    driver_sha256,
-                    "delete_vlan",
-                    user_uuid,
-                    redacted,
-                    res_uuid,
-                    method_kwargs=vlan_kwargs,
-                )
-                op_started = datetime.now(timezone.utc)
-                result = execute_driver_method(
-                    driver_path,
-                    "delete_vlan",
-                    context,
-                    method_kwargs=vlan_kwargs,
-                    password_keys=password_keys,
-                )
-                status = "SUCCESS" if result["success"] else "FAILED"
-                await update_execution_run(
-                    db,
-                    run,
-                    status,
-                    output=json.dumps(result["output"], default=str)
-                    if result.get("output")
-                    else None,
-                    error=result.get("error"),
-                    started_at=op_started,
-                    completed_at=datetime.now(timezone.utc),
-                    duration_ms=result["duration_ms"],
-                )
+                # Delete the VLAN (skip if this message already deleted it)
+                if await action_already_succeeded(
+                    db, dedupe_key, switch_uuid, "delete_vlan", None, None
+                ):
+                    logger.info(
+                        "Skipping already-applied delete_vlan on switch %s; idempotent replay",
+                        switch_id,
+                    )
+                else:
+                    vlan_kwargs = {"vlan_id": vlan_id}
+                    run = await create_execution_run(
+                        db,
+                        switch_uuid,
+                        driver_id,
+                        driver_sha256,
+                        "delete_vlan",
+                        user_uuid,
+                        redacted,
+                        res_uuid,
+                        method_kwargs=vlan_kwargs,
+                        dedupe_key=dedupe_key,
+                    )
+                    op_started = datetime.now(timezone.utc)
+                    result = execute_driver_method(
+                        driver_path,
+                        "delete_vlan",
+                        context,
+                        method_kwargs=vlan_kwargs,
+                        password_keys=password_keys,
+                    )
+                    status = "SUCCESS" if result["success"] else "FAILED"
+                    await update_execution_run(
+                        db,
+                        run,
+                        status,
+                        output=json.dumps(result["output"], default=str)
+                        if result.get("output")
+                        else None,
+                        error=result.get("error"),
+                        started_at=op_started,
+                        completed_at=datetime.now(timezone.utc),
+                        duration_ms=result["duration_ms"],
+                    )
 
             # Logout
             logout_run = await create_execution_run(
@@ -603,6 +670,7 @@ async def _execute_l2_switch_operations(
                 user_uuid,
                 redacted,
                 res_uuid,
+                dedupe_key=dedupe_key,
             )
             logout_started = datetime.now(timezone.utc)
             logout_result = execute_driver_method(
@@ -639,6 +707,7 @@ async def _execute_switch_operations(
     reservation_id: str | None,
     user_id: str,
     get_db_session,
+    dedupe_key: str | None = None,
 ) -> None:
     """Resolve L1 switch operations for devices and execute driver methods.
 
@@ -648,6 +717,8 @@ async def _execute_switch_operations(
         reservation_id: reservation UUID string
         user_id: user UUID string
         get_db_session: async context manager that yields an AsyncSession
+        dedupe_key: source-message key; a port operation whose SUCCESS run already
+            carries it is skipped on redelivery (issue #133).
     """
     operations = await _resolve_l1_switch_operations(device_ids)
     if not operations:
@@ -660,6 +731,7 @@ async def _execute_switch_operations(
     from app.services.driver_loader import load_driver
     from app.services.driver_sandbox import execute_driver_method
     from app.services.execution_service import (
+        action_already_succeeded,
         build_context,
         create_execution_run,
         extract_password_keys,
@@ -709,6 +781,26 @@ async def _execute_switch_operations(
                 logger.error("Failed to load driver for switch %s: %s", switch_id, e)
                 continue
 
+            # Idempotency (issue #133): drop port pairs this source message already
+            # applied. If a redelivery finds them all done, skip the switch entirely
+            # rather than re-login just to do nothing.
+            pending_pairs = []
+            for port_a, port_b in port_pairs:
+                if await action_already_succeeded(
+                    db, dedupe_key, switch_uuid, action, port_a, port_b
+                ):
+                    logger.info(
+                        "Skipping already-applied %s on switch %s (%s to %s); idempotent replay",
+                        action,
+                        switch_id,
+                        port_a,
+                        port_b,
+                    )
+                    continue
+                pending_pairs.append((port_a, port_b))
+            if not pending_pairs:
+                continue
+
             # Login
             login_run = await create_execution_run(
                 db,
@@ -719,6 +811,7 @@ async def _execute_switch_operations(
                 user_uuid,
                 redacted,
                 res_uuid,
+                dedupe_key=dedupe_key,
             )
             started = datetime.now(timezone.utc)
             login_result = execute_driver_method(
@@ -747,8 +840,8 @@ async def _execute_switch_operations(
                 logger.error("Login failed for switch %s, skipping port operations", switch_id)
                 continue
 
-            # Execute port operations
-            for port_a, port_b in port_pairs:
+            # Execute port operations (already-applied pairs filtered out above)
+            for port_a, port_b in pending_pairs:
                 port_kwargs = {"port_a": port_a, "port_b": port_b}
                 run = await create_execution_run(
                     db,
@@ -762,6 +855,7 @@ async def _execute_switch_operations(
                     port_a,
                     port_b,
                     method_kwargs=port_kwargs,
+                    dedupe_key=dedupe_key,
                 )
                 op_started = datetime.now(timezone.utc)
                 result = execute_driver_method(
@@ -802,6 +896,7 @@ async def _execute_switch_operations(
                 user_uuid,
                 redacted,
                 res_uuid,
+                dedupe_key=dedupe_key,
             )
             logout_started = datetime.now(timezone.utc)
             logout_result = execute_driver_method(
@@ -824,12 +919,17 @@ async def _execute_switch_operations(
             )
 
 
-async def handle_reservation_event(event_data: dict, get_db_session) -> None:
+async def handle_reservation_event(
+    event_data: dict, get_db_session, dedupe_key: str | None = None
+) -> None:
     """Process a reservation lifecycle event.
 
     Args:
         event_data: parsed NATS message payload
         get_db_session: async context manager that yields an AsyncSession
+        dedupe_key: NATS "<stream>:<sequence>" of the source message, threaded
+            into execution_runs so a redelivery skips already-applied driver
+            actions (issue #133). None when JetStream metadata is unavailable.
     """
     event_type = event_data.get("event", "")
     action = EVENT_ACTIONS.get(event_type)
@@ -853,28 +953,28 @@ async def handle_reservation_event(event_data: dict, get_db_session) -> None:
         removed_ids = event_data.get("removed_device_ids", [])
         if added_ids:
             await _execute_switch_operations(
-                added_ids, "connect_ports", reservation_id, user_id, get_db_session
+                added_ids, "connect_ports", reservation_id, user_id, get_db_session, dedupe_key
             )
             await _execute_l2_switch_operations(
-                added_ids, "provision", reservation_id, user_id, get_db_session
+                added_ids, "provision", reservation_id, user_id, get_db_session, dedupe_key
             )
         if removed_ids:
             await _execute_switch_operations(
-                removed_ids, "disconnect_ports", reservation_id, user_id, get_db_session
+                removed_ids, "disconnect_ports", reservation_id, user_id, get_db_session, dedupe_key
             )
             await _execute_l2_switch_operations(
-                removed_ids, "deprovision", reservation_id, user_id, get_db_session
+                removed_ids, "deprovision", reservation_id, user_id, get_db_session, dedupe_key
             )
     else:
         device_ids = event_data.get("device_ids", [])
         await _execute_switch_operations(
-            device_ids, action, reservation_id, user_id, get_db_session
+            device_ids, action, reservation_id, user_id, get_db_session, dedupe_key
         )
         # L2 switch operations
         l2_action = L2_EVENT_ACTIONS.get(event_type)
         if l2_action:
             await _execute_l2_switch_operations(
-                device_ids, l2_action, reservation_id, user_id, get_db_session
+                device_ids, l2_action, reservation_id, user_id, get_db_session, dedupe_key
             )
 
     logger.info(
@@ -894,7 +994,7 @@ async def _publish_to_dlq(js, payload: bytes) -> None:
 async def process_reservation_message(
     msg,
     js,
-    handler: Callable[[dict, Callable], Awaitable[None]],
+    handler: Callable[..., Awaitable[None]],
     session_factory: Callable,
     *,
     max_deliver: int = NATS_MAX_DELIVER,
@@ -917,7 +1017,7 @@ async def process_reservation_message(
         return "dlq"
 
     try:
-        await handler(event_data, session_factory)
+        await handler(event_data, session_factory, _dedupe_key_from_msg(msg))
     except Exception as exc:
         num_delivered = getattr(getattr(msg, "metadata", None), "num_delivered", 1) or 1
         if num_delivered >= max_deliver:

@@ -24,6 +24,14 @@ class ExecutionRun(Base):
             "reservation_id",
             text("created_at DESC"),
         ),
+        # Idempotency guard lookup: "has a SUCCESS run for this source message
+        # already applied this (device, action, ports)?" keyed on dedupe_key.
+        Index(
+            "ix_execution_runs_dedupe_device_action",
+            "dedupe_key",
+            "device_id",
+            "action",
+        ),
         {"schema": _schema} if _schema else {},
     )
 
@@ -42,6 +50,11 @@ class ExecutionRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     port_a: Mapped[str | None] = mapped_column(String(255), nullable=True)
     port_b: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # NATS "<stream>:<sequence>" of the source reservation event. Stable across
+    # redeliveries, so a SUCCESS run keyed on it lets a NAK retry skip the driver
+    # actions it already applied (issue #133). Null for non-event runs (e.g. the
+    # health scheduler) and when JetStream metadata is unavailable.
+    dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
