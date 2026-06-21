@@ -145,12 +145,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Return the JSON schema that `config_payload` must satisfy when "
             "calling propose_config_change on this device. Returns "
-            "{connection_type, schema, allowed_keys}. The schema is keyed by "
-            "the device's driver connection_type; `schema` is null and "
-            "`allowed_keys` is empty when no schema is registered for that "
-            "connection_type (writes will be rejected). ALWAYS call this "
-            "before propose_config_change so your payload matches what the "
-            "validator accepts; guessing the shape will fail with a 422."
+            "{connection_type, schema, allowed_keys, source}. `source` is "
+            "'driver' when the schema is the one the device's driver actually "
+            "publishes (the real accepted shape; trust these allowed_keys), "
+            "'registry' when it is the generic connection_type vocabulary, or "
+            "'none' when no schema applies. `schema` is null and `allowed_keys` "
+            "is empty when no schema is registered (writes will be rejected). "
+            "ALWAYS call this before propose_config_change so your payload "
+            "matches what the validator accepts; guessing the shape will fail "
+            "with a 422."
         ),
         "input_schema": {
             "type": "object",
@@ -462,6 +465,7 @@ class ToolDispatcher:
                 "connection_type": None,
                 "schema": None,
                 "allowed_keys": [],
+                "source": "none",
                 "note": (
                     "device has no template_id; cannot determine connection_type "
                     "and no schema can be validated"
@@ -470,10 +474,10 @@ class ToolDispatcher:
             self._schema_cache[cache_key] = response
             return response
 
-        # Fetch the template to read connection_type (computed server-side from
-        # the joined driver). A separate one-liner here rather than reusing
-        # _password_keys_for_template's cache because that one stores only the
-        # password-key set, not the full template payload.
+        # Fetch the template to read connection_type and driver_id (both computed
+        # server-side from the joined driver). A separate one-liner here rather
+        # than reusing _password_keys_for_template's cache because that one stores
+        # only the password-key set, not the full template payload.
         url = f"{settings.inventory_service_url.rstrip('/')}/templates/{template_id}"
         resp = await self._http.get(url, headers=self._auth_headers)
         if resp.status_code == 404:
@@ -481,16 +485,41 @@ class ToolDispatcher:
         resp.raise_for_status()
         template = resp.json()
         connection_type = template.get("connection_type")
+        driver_id = template.get("driver_id")
 
         if not connection_type:
             response = {
                 "connection_type": None,
                 "schema": None,
                 "allowed_keys": [],
+                "source": "none",
                 "note": (
                     "template has no connection_type (no driver bound); device "
                     "cannot accept a config_payload"
                 ),
+            }
+            self._schema_cache[cache_key] = response
+            return response
+
+        # Prefer the driver-PUBLISHED schema (issue #147). Inventory's
+        # /drivers/{id}/config-schema proxy already implements the #23 configure-
+        # boundary precedence: it returns the driver's published config_schema()
+        # (sourced from execution's per-SHA256 cache) when one exists, else the
+        # hardcoded registry entry, and it fails open. A Management driver like
+        # frr_mgmt publishes a {commands, command} vocabulary the registry's
+        # {vlan, ip, hostname, description} does not describe; without this the
+        # model steers toward payloads the device rejects at apply time. Any
+        # failure here (no driver_id, network error, non-2xx, malformed payload)
+        # degrades to the in-process registry so a broken or missing published
+        # schema never breaks the tool.
+        published = await self._fetch_published_schema_for_driver(driver_id)
+        if published is not None:
+            allowed = sorted(published.get("properties", {}).keys())
+            response = {
+                "connection_type": connection_type,
+                "schema": published,
+                "allowed_keys": allowed,
+                "source": "driver",
             }
             self._schema_cache[cache_key] = response
             return response
@@ -501,6 +530,7 @@ class ToolDispatcher:
                 "connection_type": connection_type,
                 "schema": None,
                 "allowed_keys": [],
+                "source": "none",
                 "note": (
                     f"no schema is registered for connection_type "
                     f"{connection_type!r}; propose_config_change will be "
@@ -513,9 +543,37 @@ class ToolDispatcher:
                 "connection_type": connection_type,
                 "schema": schema,
                 "allowed_keys": allowed,
+                "source": "registry",
             }
         self._schema_cache[cache_key] = response
         return response
+
+    async def _fetch_published_schema_for_driver(self, driver_id: Any) -> dict[str, Any] | None:
+        """Resolve a driver's published config schema via inventory, else None.
+
+        Calls inventory's /drivers/{driver_id}/config-schema proxy, which returns
+        {schema, source, ...} with the driver-published schema when source is
+        "driver". Returns that schema dict only when the proxy reports a driver-
+        sourced schema; returns None (so the caller falls back to the in-process
+        registry) on a missing driver_id or any failure: network error, non-2xx,
+        malformed payload, or a registry/none source. Never raises; a broken or
+        unreachable published-schema path must not break the tool.
+        """
+        if not driver_id:
+            return None
+        url = f"{settings.inventory_service_url.rstrip('/')}/drivers/{driver_id}/config-schema"
+        try:
+            resp = await self._http.get(url, headers=self._auth_headers)
+            if resp.status_code != 200:
+                return None
+            body = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        if not isinstance(body, dict):
+            return None
+        if body.get("source") == "driver" and isinstance(body.get("schema"), dict):
+            return body["schema"]
+        return None
 
     async def _tool_find_path(self, args: dict[str, Any]) -> dict[str, Any]:
         src = _require_uuid(args, "source_device_id")

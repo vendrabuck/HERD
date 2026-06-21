@@ -399,12 +399,35 @@ async def test_list_device_config_history_rejects_bad_limit():
 # --- get_device_config_schema (Branch 2: schema discovery) ---
 
 
-def _schema_routes(template_id=TEMPLATE_FW, connection_type="Management"):
-    """Build routes that resolve device -> template (with connection_type) so
-    get_device_config_schema can do its full lookup chain. Returns the list
-    plus a mutable counter so tests can assert call counts.
+DRIVER_ID = "55555555-5555-5555-5555-555555555555"
+
+# The {commands, command} vocabulary that a Management driver like frr_mgmt
+# publishes, which the registry Management schema ({vlan, ip, hostname,
+# description}) does not describe (issue #147).
+_FRR_PUBLISHED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "commands": {"type": "array", "items": {"type": "string"}},
+        "command": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+
+def _schema_routes(
+    template_id=TEMPLATE_FW,
+    connection_type="Management",
+    driver_id=None,
+    config_schema_response=None,
+):
+    """Build routes that resolve device -> template (with connection_type and
+    optional driver_id) so get_device_config_schema can do its full lookup chain.
+
+    When driver_id is set, also mock inventory's /drivers/{id}/config-schema
+    proxy with config_schema_response (an httpx.Response factory or Response).
+    Returns the list plus a mutable counter so tests can assert call counts.
     """
-    counters = {"device": 0, "template": 0}
+    counters = {"device": 0, "template": 0, "config_schema": 0}
 
     def device_handler(request: httpx.Request) -> httpx.Response:
         counters["device"] += 1
@@ -414,12 +437,27 @@ def _schema_routes(template_id=TEMPLATE_FW, connection_type="Management"):
         counters["template"] += 1
         body = _template_payload(template_id)
         body["connection_type"] = connection_type
+        body["driver_id"] = driver_id
         return httpx.Response(200, json=body)
 
     routes = [
         (lambda r: r.url.path.endswith(f"/devices/{DEVICE_A}"), device_handler),
         (lambda r: r.url.path.endswith(f"/templates/{template_id}"), template_handler),
     ]
+    if driver_id is not None:
+
+        def config_schema_handler(request: httpx.Request) -> httpx.Response:
+            counters["config_schema"] += 1
+            if callable(config_schema_response):
+                return config_schema_response(request)
+            return config_schema_response
+
+        routes.append(
+            (
+                lambda r: r.url.path.endswith(f"/drivers/{driver_id}/config-schema"),
+                config_schema_handler,
+            )
+        )
     return routes, counters
 
 
@@ -434,7 +472,8 @@ async def test_get_device_config_schema_returns_schema_for_known_connection_type
     assert body["connection_type"] == "Management"
     assert isinstance(body["schema"], dict)
     assert body["schema"]["type"] == "object"
-    # The Management schema's allowed keys are the source of truth.
+    # No driver_id on the template, so we fall back to the registry vocabulary.
+    assert body["source"] == "registry"
     assert set(body["allowed_keys"]) == {"vlan", "ip", "hostname", "description"}
     assert "note" not in body
 
@@ -450,6 +489,7 @@ async def test_get_device_config_schema_null_schema_for_unregistered_connection_
     assert body["connection_type"] == "MadeUpProtocol"
     assert body["schema"] is None
     assert body["allowed_keys"] == []
+    assert body["source"] == "none"
     assert "no schema is registered" in body["note"]
 
 
@@ -505,7 +545,83 @@ async def test_get_device_config_schema_null_when_template_has_no_connection_typ
     assert result["is_error"] is False
     assert body["connection_type"] is None
     assert body["schema"] is None
+    assert body["source"] == "none"
     assert "no driver bound" in body["note"]
+
+
+@pytest.mark.asyncio
+async def test_get_device_config_schema_returns_driver_published_schema():
+    """When the driver publishes a config schema, the tool returns THAT shape
+    (issue #147), not the generic registry connection_type vocabulary."""
+    routes, counters = _schema_routes(
+        connection_type="Management",
+        driver_id=DRIVER_ID,
+        config_schema_response=httpx.Response(
+            200,
+            json={
+                "driver_id": DRIVER_ID,
+                "connection_type": "Management",
+                "schema": _FRR_PUBLISHED_SCHEMA,
+                "source": "driver",
+            },
+        ),
+    )
+    async with _dispatcher_with(routes) as d:
+        result = await d.dispatch("get_device_config_schema", {"device_id": str(DEVICE_A)})
+
+    body = json.loads(result["content"])
+    assert result["is_error"] is False
+    assert body["connection_type"] == "Management"
+    assert body["source"] == "driver"
+    assert body["schema"] == _FRR_PUBLISHED_SCHEMA
+    # The published frr_mgmt vocabulary, NOT the registry {vlan, ip, ...}.
+    assert set(body["allowed_keys"]) == {"commands", "command"}
+    assert counters["config_schema"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_device_config_schema_falls_back_to_registry_when_source_not_driver():
+    """When inventory reports a non-driver source (no published schema), the tool
+    falls back to the in-process registry vocabulary for the connection_type."""
+    routes, _ = _schema_routes(
+        connection_type="Management",
+        driver_id=DRIVER_ID,
+        config_schema_response=httpx.Response(
+            200,
+            json={
+                "driver_id": DRIVER_ID,
+                "connection_type": "Management",
+                "schema": {"type": "object"},
+                "source": "registry",
+            },
+        ),
+    )
+    async with _dispatcher_with(routes) as d:
+        result = await d.dispatch("get_device_config_schema", {"device_id": str(DEVICE_A)})
+
+    body = json.loads(result["content"])
+    assert result["is_error"] is False
+    assert body["source"] == "registry"
+    # Registry Management vocabulary, resolved locally.
+    assert set(body["allowed_keys"]) == {"vlan", "ip", "hostname", "description"}
+
+
+@pytest.mark.asyncio
+async def test_get_device_config_schema_falls_back_to_registry_when_proxy_errors():
+    """A failing published-schema lookup (non-2xx) must never break the tool; it
+    degrades to the registry vocabulary."""
+    routes, _ = _schema_routes(
+        connection_type="Management",
+        driver_id=DRIVER_ID,
+        config_schema_response=httpx.Response(500, json={"detail": "execution down"}),
+    )
+    async with _dispatcher_with(routes) as d:
+        result = await d.dispatch("get_device_config_schema", {"device_id": str(DEVICE_A)})
+
+    body = json.loads(result["content"])
+    assert result["is_error"] is False
+    assert body["source"] == "registry"
+    assert set(body["allowed_keys"]) == {"vlan", "ip", "hostname", "description"}
 
 
 def test_get_device_config_schema_in_active_tool_set_unconditionally():
