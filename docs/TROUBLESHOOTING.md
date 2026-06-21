@@ -49,10 +49,10 @@ The stack is in LDAP mode (`AUTH_METHOD=ldap`). Accounts are provisioned on the 
 Happens to non-admin users. Three possibilities, in order of likelihood:
 
 1. **No device groups assigned to your user group.** Ask an admin; the fix is adding a user-group permission on the device group in question. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#device-groups-visibility).
-2. **Inventory or auth service is returning 502** (after B4, upstream-failure is surfaced rather than silently hidden). Check `https://<host>/api/inventory/device-groups/visible-devices?user_id=<self>` in browser devtools network tab; if it's returning 502, check `make logs` for errors in inventory or auth.
+2. **Inventory or auth service is returning 503** (after B4, upstream-failure is surfaced rather than silently hidden; the inventory helpers map an unreachable or erroring auth service to 503, the cross-service convention for an unavailable dependency). Check `https://<host>/api/inventory/device-groups/visible-devices?user_id=<self>` in browser devtools network tab; if it's returning 503, check `make logs` for errors in inventory or auth.
 3. **All devices in your groups are currently reserved** and "Show reserved" is off in the palette. Toggle the filter.
 
-To tell (1) from (2): an admin should see the same devices you cannot; if the admin also gets 502 on the helper endpoints, it's (2).
+To tell (1) from (2): an admin should see the same devices you cannot; if the admin also gets 503 on the helper endpoints, it's (2).
 
 ### Palette is empty but Inventory list has devices
 

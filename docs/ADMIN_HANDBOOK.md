@@ -152,7 +152,7 @@ Under the hood:
 - `GET /api/reservations/reports/utilization?start=&end=&status=` returns `UtilizationReport{total_hours, total_reservations, by_user, by_device, by_topology_type, by_day, by_group, execution_run_count}` (admin-only).
 - `GET /api/reservations/reports/utilization.csv?start=&end=&section=user|device&status=` returns a `text/csv` download with `Content-Disposition: attachment`. `section=template` is rejected with 422 because the template rollup depends on the inventory service and is computed client-side.
 - The reservations service calls the execution service's `GET /api/execution/runs?created_after=&created_before=&limit=1` endpoint, forwarding the admin JWT, and reads `.total` for the run-count card.
-- The reservations service calls the auth service's `GET /api/auth/groups/user/{user_id}` once per distinct user in the report to build the By Group slice.
+- The reservations service calls the auth service's batch endpoint `POST /api/auth/groups/users/groups` once with the full set of distinct report users (request body `{user_ids: [...]}`, response `{user_id: [group, ...]}`) to build the By Group slice, so the rollup is a single round-trip rather than one call per user.
 - The **By Template** slice is still computed on the client by joining `by_device` with the inventory device list, so devices deleted since the reservation was created show up under template `Unknown`.
 - Postgres has indexes on `reservations.start_time`, `end_time`, and `status` so the window scan stays cheap as data grows.
 

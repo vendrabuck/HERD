@@ -402,14 +402,46 @@ async def test_fetch_user_groups_map_returns_empty_without_auth():
 
 
 @pytest.mark.asyncio
-async def test_fetch_user_groups_map_collects_groups_per_user():
+async def test_fetch_user_groups_map_uses_single_batch_call():
     gid = uuid.uuid4()
-    ok_resp = httpx.Response(200, json=[{"id": str(gid), "name": "Platform"}])
+    ok_resp = httpx.Response(
+        200,
+        json={
+            str(USER_A): [{"id": str(gid), "name": "Platform"}],
+            str(USER_B): [],
+        },
+    )
     with patch("httpx.AsyncClient") as mock_client_cls:
         instance = mock_client_cls.return_value.__aenter__.return_value
-        instance.get = AsyncMock(return_value=ok_resp)
-        result = await fetch_user_groups_map([USER_A], "Bearer tok")
+        instance.post = AsyncMock(return_value=ok_resp)
+        result = await fetch_user_groups_map([USER_A, USER_B], "Bearer tok")
+
+    # Exactly one round-trip to auth regardless of user count (no N+1 fan-out).
+    assert instance.post.await_count == 1
+    called_url = instance.post.await_args.args[0]
+    assert called_url.endswith("/groups/users/groups")
     assert result[USER_A] == [(gid, "Platform")]
+    assert result[USER_B] == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_groups_map_fails_soft_on_non_200():
+    err_resp = httpx.Response(503, text="auth down")
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        instance = mock_client_cls.return_value.__aenter__.return_value
+        instance.post = AsyncMock(return_value=err_resp)
+        result = await fetch_user_groups_map([USER_A, USER_B], "Bearer tok")
+    # Every requested user still present, bucketed as Ungrouped, no exception.
+    assert result == {USER_A: [], USER_B: []}
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_groups_map_fails_soft_on_unreachable():
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        instance = mock_client_cls.return_value.__aenter__.return_value
+        instance.post = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        result = await fetch_user_groups_map([USER_A], "Bearer tok")
+    assert result == {USER_A: []}
 
 
 def test_report_to_csv_handles_commas_in_owner_name():

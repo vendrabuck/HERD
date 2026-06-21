@@ -14,6 +14,7 @@ from app.schemas.group import (
     BulkMemberAddResponse,
     BulkMemberRemoveResponse,
     BulkRemoveMembersRequest,
+    BulkUserGroupsRequest,
     GroupCreateRequest,
     GroupDetailResponse,
     GroupMemberResponse,
@@ -31,6 +32,7 @@ from app.services.group_service import (
     get_all_groups,
     get_group_by_id,
     get_group_members,
+    get_user_groups_map,
     remove_member,
     update_group,
 )
@@ -254,6 +256,22 @@ async def get_user_groups_endpoint(
     from app.services.group_service import get_user_groups
 
     return await get_user_groups(db, user_id)
+
+
+@router.post("/users/groups", response_model=dict[uuid.UUID, list[GroupResponse]])
+async def get_users_groups_endpoint(
+    body: BulkUserGroupsRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Batch form of GET /user/{user_id}: resolve group memberships for a set
+    of users in one round-trip. Every requested user_id is present in the
+    response; a user with no memberships maps to an empty list.
+    """
+    groups_map = await get_user_groups_map(db, body.user_ids)
+    return {
+        uid: [GroupResponse.model_validate(g) for g in groups] for uid, groups in groups_map.items()
+    }
 
 
 @router.delete(

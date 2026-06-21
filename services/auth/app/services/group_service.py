@@ -151,6 +151,30 @@ async def get_user_groups(db: AsyncSession, user_id: uuid.UUID) -> list[UserGrou
     return list(result.scalars().all())
 
 
+async def get_user_groups_map(
+    db: AsyncSession, user_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[UserGroup]]:
+    """Resolve group memberships for many users in a single query.
+
+    Returns a map of user_id to its groups (name-ordered). Every requested
+    user_id is present in the result; a user with no memberships maps to an
+    empty list. This is the batch form of get_user_groups, used to avoid an
+    N+1 fan-out when a caller needs memberships for a whole user set.
+    """
+    out: dict[uuid.UUID, list[UserGroup]] = {uid: [] for uid in user_ids}
+    if not user_ids:
+        return out
+    result = await db.execute(
+        select(GroupMember.user_id, UserGroup)
+        .join(UserGroup, GroupMember.group_id == UserGroup.id)
+        .where(GroupMember.user_id.in_(user_ids))
+        .order_by(UserGroup.name)
+    )
+    for user_id, group in result.all():
+        out[user_id].append(group)
+    return out
+
+
 async def bulk_add_members(
     db: AsyncSession, group_id: uuid.UUID, user_ids: list[uuid.UUID]
 ) -> tuple[int, int]:

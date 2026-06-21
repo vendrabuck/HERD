@@ -16,6 +16,7 @@ from app.services.group_service import (
     get_group_by_name,
     get_group_members,
     get_user_groups,
+    get_user_groups_map,
     remove_member,
     update_group,
 )
@@ -243,6 +244,58 @@ async def test_get_user_groups_returns_groups():
         names = {g.name for g in groups}
         assert "Alpha" in names
         assert "Beta" in names
+
+
+# --- get_user_groups_map ---
+
+
+@pytest.mark.asyncio
+async def test_get_user_groups_map_empty_input():
+    async with TestSessionLocal() as db:
+        assert await get_user_groups_map(db, []) == {}
+
+
+@pytest.mark.asyncio
+async def test_get_user_groups_map_includes_user_with_no_groups():
+    """Every requested user_id is present; a memberless user maps to []."""
+    async with TestSessionLocal() as db:
+        member = await _make_user(db, "m@t.com", "member")
+        lonely = await _make_user(db, "l@t.com", "lonely")
+        g1 = await _make_group(db, "Alpha")
+        await add_member(db, g1.id, member.id)
+
+        result = await get_user_groups_map(db, [member.id, lonely.id])
+
+        assert set(result.keys()) == {member.id, lonely.id}
+        assert [g.name for g in result[member.id]] == ["Alpha"]
+        assert result[lonely.id] == []
+
+
+@pytest.mark.asyncio
+async def test_get_user_groups_map_matches_single_lookups():
+    """The batch map must agree with per-user get_user_groups for each user."""
+    async with TestSessionLocal() as db:
+        u1 = await _make_user(db, "u1@t.com", "u1")
+        u2 = await _make_user(db, "u2@t.com", "u2")
+        g1 = await _make_group(db, "Alpha")
+        g2 = await _make_group(db, "Beta")
+        await add_member(db, g1.id, u1.id)
+        await add_member(db, g2.id, u1.id)
+        await add_member(db, g2.id, u2.id)
+
+        batch = await get_user_groups_map(db, [u1.id, u2.id])
+
+        for uid in (u1.id, u2.id):
+            single = await get_user_groups(db, uid)
+            assert {g.id for g in batch[uid]} == {g.id for g in single}
+
+
+@pytest.mark.asyncio
+async def test_get_user_groups_map_unknown_user_maps_to_empty():
+    async with TestSessionLocal() as db:
+        ghost = uuid.uuid4()
+        result = await get_user_groups_map(db, [ghost])
+        assert result == {ghost: []}
 
 
 # --- bulk_add_members ---

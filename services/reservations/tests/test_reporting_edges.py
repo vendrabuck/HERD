@@ -258,44 +258,34 @@ async def test_fetch_user_groups_map_empty_user_list_returns_empty():
 
 
 @pytest.mark.asyncio
-async def test_fetch_user_groups_map_404_yields_empty_groups_for_user():
+async def test_fetch_user_groups_map_non_200_fails_soft_to_empty():
+    """A non-200 from the batch endpoint yields every user empty, not an error."""
     not_found = httpx.Response(404)
     with patch("httpx.AsyncClient") as mock_cls:
         instance = mock_cls.return_value.__aenter__.return_value
-        instance.get = AsyncMock(return_value=not_found)
-        result = await fetch_user_groups_map([USER_A], "Bearer tok")
-    assert result[USER_A] == []
+        instance.post = AsyncMock(return_value=not_found)
+        result = await fetch_user_groups_map([USER_A, USER_B], "Bearer tok")
+    assert result == {USER_A: [], USER_B: []}
 
 
 @pytest.mark.asyncio
-async def test_fetch_user_groups_map_one_user_unreachable_does_not_kill_others():
-    """A per-user HTTPError must let the remaining users still resolve."""
-    gid = uuid.uuid4()
-    good_resp = httpx.Response(200, json=[{"id": str(gid), "name": "Platform"}])
-
-    calls = {"n": 0}
-
-    async def _flaky_get(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise httpx.ConnectError("boom")
-        return good_resp
-
+async def test_fetch_user_groups_map_transport_error_fails_soft_for_all():
+    """A transport error on the single batch call must not fail the report:
+    every requested user resolves to an empty membership list."""
     with patch("httpx.AsyncClient") as mock_cls:
         instance = mock_cls.return_value.__aenter__.return_value
-        instance.get = AsyncMock(side_effect=_flaky_get)
+        instance.post = AsyncMock(side_effect=httpx.ConnectError("boom"))
         result = await fetch_user_groups_map([USER_A, USER_B], "Bearer tok")
-    assert result[USER_A] == []
-    assert result[USER_B] == [(gid, "Platform")]
+    assert result == {USER_A: [], USER_B: []}
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_groups_map_missing_name_falls_back_to_empty_string():
     gid = uuid.uuid4()
-    resp = httpx.Response(200, json=[{"id": str(gid)}])
+    resp = httpx.Response(200, json={str(USER_A): [{"id": str(gid)}]})
     with patch("httpx.AsyncClient") as mock_cls:
         instance = mock_cls.return_value.__aenter__.return_value
-        instance.get = AsyncMock(return_value=resp)
+        instance.post = AsyncMock(return_value=resp)
         result = await fetch_user_groups_map([USER_A], "Bearer tok")
     assert result[USER_A] == [(gid, "")]
 

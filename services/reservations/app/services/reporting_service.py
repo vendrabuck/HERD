@@ -187,28 +187,31 @@ async def fetch_user_groups_map(
     Missing or unreachable users resolve to an empty list so the caller can
     bucket them under "Ungrouped" rather than fail the whole report.
     """
+    empty = {uid: [] for uid in user_ids}
     if not auth_header or not user_ids:
-        return {uid: [] for uid in user_ids}
+        return empty
     out: dict[uuid.UUID, list[tuple[uuid.UUID, str]]] = {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            for uid in user_ids:
-                try:
-                    resp = await client.get(
-                        f"{settings.auth_service_url}/groups/user/{uid}",
-                        headers={"Authorization": auth_header},
-                    )
-                except httpx.HTTPError as exc:
-                    logger.warning("auth service unreachable for user %s: %s", uid, exc)
-                    out[uid] = []
-                    continue
-                if resp.status_code != 200:
-                    out[uid] = []
-                    continue
-                groups = resp.json() or []
-                out[uid] = [(uuid.UUID(g["id"]), g.get("name") or "") for g in groups]
+            resp = await client.post(
+                f"{settings.auth_service_url}/groups/users/groups",
+                json={"user_ids": [str(uid) for uid in user_ids]},
+                headers={"Authorization": auth_header},
+            )
+        if resp.status_code != 200:
+            logger.warning("auth /groups/users/groups returned %s", resp.status_code)
+            return empty
+        data = resp.json() or {}
+        for uid_str, groups in data.items():
+            out[uuid.UUID(uid_str)] = [
+                (uuid.UUID(g["id"]), g.get("name") or "") for g in (groups or [])
+            ]
+    except httpx.HTTPError as exc:
+        logger.warning("auth service unreachable while fetching user groups: %s", exc)
+        return empty
     except Exception as exc:
         logger.warning("unexpected error in fetch_user_groups_map: %s", exc)
+        return empty
     return {uid: out.get(uid, []) for uid in user_ids}
 
 

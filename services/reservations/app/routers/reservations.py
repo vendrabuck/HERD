@@ -429,6 +429,15 @@ async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] 
     authenticates this call and lets inventory resolve the user's groups as the
     real user. Returns None on a genuine transport error (fail-open, do not
     restrict); a None from here means the visibility filter is skipped.
+
+    This fail-open is deliberate and intentionally differs from the 503 raised
+    when the create-reservation device-info fetch fails (see create_reservation,
+    which surfaces a hard RuntimeError -> 503). Visibility is an additive filter:
+    losing it on a transient inventory outage degrades to "show/allow more,"
+    never to a privilege escalation across a tenancy boundary, so blocking the
+    request would be a worse outcome than briefly skipping the filter. The
+    device-info fetch, by contrast, is load-bearing for correctness, so it fails
+    closed. Keep the two behaviors distinct on purpose.
     """
     try:
         async with httpx.AsyncClient() as client:

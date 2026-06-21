@@ -478,6 +478,53 @@ async def test_get_user_groups_nonexistent_user(user_client):
     assert resp.json() == []
 
 
+@pytest.mark.asyncio
+async def test_get_users_groups_batch(admin_client):
+    uid1 = uuid.uuid4()
+    uid2 = uuid.uuid4()
+    uid3 = uuid.uuid4()  # member of nothing
+    async with TestSessionLocal() as session:
+        await _seed_user(session, user_id=uid1, username="bu1", email="bu1@test.com")
+        await _seed_user(session, user_id=uid2, username="bu2", email="bu2@test.com")
+        await _seed_user(session, user_id=uid3, username="bu3", email="bu3@test.com")
+
+    gid1 = (await _create_group(admin_client, name="BG1")).json()["id"]
+    gid2 = (await _create_group(admin_client, name="BG2")).json()["id"]
+
+    await admin_client.post(f"/groups/{gid1}/members", json={"user_id": str(uid1)})
+    await admin_client.post(f"/groups/{gid2}/members", json={"user_id": str(uid1)})
+    await admin_client.post(f"/groups/{gid1}/members", json={"user_id": str(uid2)})
+
+    resp = await admin_client.post(
+        "/groups/users/groups",
+        json={"user_ids": [str(uid1), str(uid2), str(uid3)]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Every requested user_id is present, even one with no memberships.
+    assert set(data.keys()) == {str(uid1), str(uid2), str(uid3)}
+    assert {g["name"] for g in data[str(uid1)]} == {"BG1", "BG2"}
+    assert {g["name"] for g in data[str(uid2)]} == {"BG1"}
+    assert data[str(uid3)] == []
+
+
+@pytest.mark.asyncio
+async def test_get_users_groups_batch_empty_input(admin_client):
+    resp = await admin_client.post("/groups/users/groups", json={"user_ids": []})
+    assert resp.status_code == 200
+    assert resp.json() == {}
+
+
+@pytest.mark.asyncio
+async def test_get_users_groups_batch_unknown_user(admin_client):
+    unknown = uuid.uuid4()
+    resp = await admin_client.post("/groups/users/groups", json={"user_ids": [str(unknown)]})
+    assert resp.status_code == 200
+    # Unknown user resolves to an empty membership list, not an error.
+    assert resp.json() == {str(unknown): []}
+
+
 # --- Bulk member tests ---
 
 

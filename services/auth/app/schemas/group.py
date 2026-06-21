@@ -51,6 +51,10 @@ class BulkRemoveMembersRequest(BaseModel):
     user_ids: list[uuid.UUID] = Field(max_length=500)
 
 
+class BulkUserGroupsRequest(BaseModel):
+    user_ids: list[uuid.UUID] = Field(max_length=500)
+
+
 class BulkMemberAddResponse(BaseModel):
     added: int = 0
     skipped: int = 0
