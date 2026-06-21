@@ -1046,6 +1046,7 @@ Authorization: Bearer <admin-token>
 | `/api/auth/groups/{id}/members/bulk` | POST | | yes | yes |
 | `/api/auth/groups/{id}/members/bulk-remove` | POST | | yes | yes |
 | `/api/auth/groups/user/{user_id}` | GET | yes | yes | yes |
+| `/api/auth/groups/users/groups` | POST | yes | yes | yes |
 | `/api/auth/users` | GET | | yes | yes |
 | `/api/auth/users/{id}/role` | PUT | | | yes |
 | `/api/inventory/templates` | GET | yes | yes | yes |
