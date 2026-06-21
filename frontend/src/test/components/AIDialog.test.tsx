@@ -94,11 +94,11 @@ describe("AIDialog", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
-  it("toasts the 503 'not configured' message", async () => {
+  it("surfaces the server detail on a 503 and never names ANTHROPIC_API_KEY", async () => {
     server.use(
       http.post("/api/ai/generate", () =>
         HttpResponse.json(
-          { detail: "AI not configured" },
+          { detail: "AI orchestrator is not configured" },
           { status: 503 },
         ),
       ),
@@ -109,7 +109,29 @@ describe("AIDialog", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Generate" }));
     await waitFor(() => expect(toastError).toHaveBeenCalled());
-    expect(toastError.mock.calls[0][0]).toMatch(/not configured/i);
+    const message = toastError.mock.calls[0][0] as string;
+    // The server detail is provider-agnostic and must be surfaced verbatim.
+    expect(message).toBe("AI orchestrator is not configured");
+    // The old hardcoded message is wrong for keyless-anthropic and openai_compat.
+    expect(message).not.toMatch(/ANTHROPIC_API_KEY/);
+  });
+
+  it("falls back to a provider-agnostic 503 message when the body has no detail", async () => {
+    server.use(
+      http.post("/api/ai/generate", () =>
+        new HttpResponse(null, { status: 503 }),
+      ),
+    );
+    renderDialog();
+    fireEvent.change(screen.getByLabelText("Prompt"), {
+      target: { value: "go" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    const message = toastError.mock.calls[0][0] as string;
+    expect(message).toMatch(/not configured/i);
+    expect(message).toMatch(/administrator/i);
+    expect(message).not.toMatch(/ANTHROPIC_API_KEY/);
   });
 
   it("toasts the 502 upstream detail", async () => {
