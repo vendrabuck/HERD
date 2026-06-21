@@ -423,8 +423,12 @@ async def test_handle_updated_event_connect_added_devices():
         ) as mock_l2_exec,
     ):
         await handle_reservation_event(event_data, mock_session)
-        mock_exec.assert_called_once_with(["device-2"], "connect_ports", rid, uid, mock_session)
-        mock_l2_exec.assert_called_once_with(["device-2"], "provision", rid, uid, mock_session)
+        mock_exec.assert_called_once_with(
+            ["device-2"], "connect_ports", rid, uid, mock_session, None
+        )
+        mock_l2_exec.assert_called_once_with(
+            ["device-2"], "provision", rid, uid, mock_session, None
+        )
 
 
 @pytest.mark.asyncio
@@ -452,8 +456,12 @@ async def test_handle_updated_event_disconnect_removed_devices():
         ) as mock_l2_exec,
     ):
         await handle_reservation_event(event_data, mock_session)
-        mock_exec.assert_called_once_with(["device-3"], "disconnect_ports", rid, uid, mock_session)
-        mock_l2_exec.assert_called_once_with(["device-3"], "deprovision", rid, uid, mock_session)
+        mock_exec.assert_called_once_with(
+            ["device-3"], "disconnect_ports", rid, uid, mock_session, None
+        )
+        mock_l2_exec.assert_called_once_with(
+            ["device-3"], "deprovision", rid, uid, mock_session, None
+        )
 
 
 @pytest.mark.asyncio
@@ -482,11 +490,11 @@ async def test_handle_updated_event_both_added_and_removed():
     ):
         await handle_reservation_event(event_data, mock_session)
         assert mock_exec.call_count == 2
-        mock_exec.assert_any_call(["device-2"], "connect_ports", rid, uid, mock_session)
-        mock_exec.assert_any_call(["device-3"], "disconnect_ports", rid, uid, mock_session)
+        mock_exec.assert_any_call(["device-2"], "connect_ports", rid, uid, mock_session, None)
+        mock_exec.assert_any_call(["device-3"], "disconnect_ports", rid, uid, mock_session, None)
         assert mock_l2_exec.call_count == 2
-        mock_l2_exec.assert_any_call(["device-2"], "provision", rid, uid, mock_session)
-        mock_l2_exec.assert_any_call(["device-3"], "deprovision", rid, uid, mock_session)
+        mock_l2_exec.assert_any_call(["device-2"], "provision", rid, uid, mock_session, None)
+        mock_l2_exec.assert_any_call(["device-3"], "deprovision", rid, uid, mock_session, None)
 
 
 # --- L2 Switch Operation Resolution ---
@@ -657,8 +665,8 @@ async def test_handle_created_event_calls_l2_provision():
         ) as mock_l2,
     ):
         await handle_reservation_event(event_data, mock_session)
-        mock_l1.assert_called_once_with(["device-1"], "connect_ports", rid, uid, mock_session)
-        mock_l2.assert_called_once_with(["device-1"], "provision", rid, uid, mock_session)
+        mock_l1.assert_called_once_with(["device-1"], "connect_ports", rid, uid, mock_session, None)
+        mock_l2.assert_called_once_with(["device-1"], "provision", rid, uid, mock_session, None)
 
 
 @pytest.mark.asyncio
@@ -684,8 +692,10 @@ async def test_handle_cancelled_event_calls_l2_deprovision():
         ) as mock_l2,
     ):
         await handle_reservation_event(event_data, mock_session)
-        mock_l1.assert_called_once_with(["device-1"], "disconnect_ports", rid, uid, mock_session)
-        mock_l2.assert_called_once_with(["device-1"], "deprovision", rid, uid, mock_session)
+        mock_l1.assert_called_once_with(
+            ["device-1"], "disconnect_ports", rid, uid, mock_session, None
+        )
+        mock_l2.assert_called_once_with(["device-1"], "deprovision", rid, uid, mock_session, None)
 
 
 # --- process_reservation_message: DLQ / retry semantics ---

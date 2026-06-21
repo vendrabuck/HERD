@@ -749,3 +749,192 @@ async def test_start_nats_consumer_stream_create_failure():
         await task
     except asyncio.CancelledError:
         pass
+
+
+# --- NATS-redelivery idempotency (issue #133) ---
+
+
+async def _seed_success_run(action, port_a=None, port_b=None, *, dedupe_key, device_id):
+    """Persist a SUCCESS ExecutionRun standing in for a prior, acked delivery."""
+    async with TestSessionLocal() as session:
+        session.add(
+            ExecutionRun(
+                device_id=uuid.UUID(device_id),
+                driver_id=uuid.UUID(DRIVER_ID),
+                driver_sha256="sha256abc",
+                action=action,
+                status="SUCCESS",
+                user_id=uuid.UUID(USER_ID),
+                input_params={},
+                port_a=port_a,
+                port_b=port_b,
+                dedupe_key=dedupe_key,
+            )
+        )
+        await session.commit()
+
+
+def _recording_execute():
+    """An execute_driver_method stub that records each (action, kwargs) it runs."""
+    calls: list[tuple[str, dict]] = []
+
+    def _execute(driver_path, action, context, **kwargs):
+        calls.append((action, kwargs.get("method_kwargs") or {}))
+        return SUCCESS_RESULT
+
+    return calls, _execute
+
+
+@pytest.mark.asyncio
+async def test_action_already_succeeded_matches_only_exact_success():
+    """The guard matches a SUCCESS run for the same (key, device, action, ports)
+    and ignores a null key, a different key, and a non-SUCCESS run."""
+    from app.services.execution_service import action_already_succeeded
+
+    key = "HERD_RESERVATIONS:7"
+    await _seed_success_run("connect_ports", "0/0/1", "0/0/2", dedupe_key=key, device_id=SWITCH_ID)
+
+    async with TestSessionLocal() as db:
+        dev = uuid.UUID(SWITCH_ID)
+        # Exact match.
+        assert await action_already_succeeded(db, key, dev, "connect_ports", "0/0/1", "0/0/2")
+        # Null key never matches (preserves the un-keyed at-least-once path).
+        assert not await action_already_succeeded(db, None, dev, "connect_ports", "0/0/1", "0/0/2")
+        # Different source message.
+        assert not await action_already_succeeded(
+            db, "HERD_RESERVATIONS:8", dev, "connect_ports", "0/0/1", "0/0/2"
+        )
+        # Different ports.
+        assert not await action_already_succeeded(db, key, dev, "connect_ports", "0/0/9", "0/0/2")
+
+
+@pytest.mark.asyncio
+async def test_action_already_succeeded_ignores_failed_run():
+    """A FAILED prior attempt must NOT suppress a retry."""
+    from app.services.execution_service import action_already_succeeded
+
+    key = "HERD_RESERVATIONS:9"
+    async with TestSessionLocal() as session:
+        session.add(
+            ExecutionRun(
+                device_id=uuid.UUID(SWITCH_ID),
+                driver_id=uuid.UUID(DRIVER_ID),
+                driver_sha256="sha256abc",
+                action="connect_ports",
+                status="FAILED",
+                user_id=uuid.UUID(USER_ID),
+                input_params={},
+                port_a="0/0/1",
+                port_b="0/0/2",
+                dedupe_key=key,
+            )
+        )
+        await session.commit()
+
+    async with TestSessionLocal() as db:
+        assert not await action_already_succeeded(
+            db, key, uuid.UUID(SWITCH_ID), "connect_ports", "0/0/1", "0/0/2"
+        )
+
+
+@pytest.mark.asyncio
+async def test_l1_redelivery_skips_already_connected_ports():
+    """A redelivery (same dedupe_key) whose only port pair already SUCCEEDED runs
+    no driver method at all: the switch is skipped before login."""
+    key = "HERD_RESERVATIONS:42"
+    await _seed_success_run("connect_ports", "0/0/1", "0/0/2", dedupe_key=key, device_id=SWITCH_ID)
+    calls, execute_fn = _recording_execute()
+
+    patches = _event_patches(execute_fn=execute_fn)
+    for p in patches:
+        p.start()
+    try:
+        await handle_reservation_event(
+            _make_event("reservation.created"), _db_session_factory(), key
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert calls == [], f"expected no driver calls on full replay, ran {calls}"
+
+
+@pytest.mark.asyncio
+async def test_l1_fresh_delivery_executes_ports():
+    """Baseline contrast: a new dedupe_key with no prior run executes connect_ports."""
+    calls, execute_fn = _recording_execute()
+
+    patches = _event_patches(execute_fn=execute_fn)
+    for p in patches:
+        p.start()
+    try:
+        await handle_reservation_event(
+            _make_event("reservation.created"), _db_session_factory(), "HERD_RESERVATIONS:100"
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    ran = [action for action, _ in calls]
+    assert "connect_ports" in ran
+
+
+@pytest.mark.asyncio
+async def test_l2_redelivery_skips_completed_vlan_ops():
+    """On an L2 provision replay, a create_vlan and the add_to_vlan for a port that
+    already SUCCEEDED under this dedupe_key are not re-run; an un-applied port is."""
+    from app.services.nats_consumer import _execute_l2_switch_operations
+
+    l2_switch_id = str(uuid.uuid4())
+    l2_switch_data = {**SWITCH_DATA, "id": l2_switch_id, "connection_type": "Layer 2 Switch"}
+    ops = [
+        {"switch_device_id": l2_switch_id, "switch_port": "eth1", "tag": "tagged"},
+        {"switch_device_id": l2_switch_id, "switch_port": "eth2", "tag": "tagged"},
+    ]
+    key = "HERD_RESERVATIONS:55"
+    # Pretend a prior delivery created the VLAN and added eth1, then died before eth2.
+    await _seed_success_run("create_vlan", dedupe_key=key, device_id=l2_switch_id)
+    await _seed_success_run("add_to_vlan", "eth1", dedupe_key=key, device_id=l2_switch_id)
+
+    calls, execute_fn = _recording_execute()
+
+    async def _assign(operations, reservation_id, get_db_session):
+        for op in operations:
+            op["vlan_id"] = 100
+        return operations
+
+    patches = [
+        patch(
+            "app.services.nats_consumer._resolve_l2_switch_operations",
+            new=AsyncMock(return_value=ops),
+        ),
+        patch("app.services.nats_consumer._assign_vlans_to_operations", new=_assign),
+        patch(
+            "app.services.nats_consumer._fetch_device", new=AsyncMock(return_value=l2_switch_data)
+        ),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await _execute_l2_switch_operations(
+            device_ids=["dev-1"],
+            l2_action="provision",
+            reservation_id=str(uuid.uuid4()),
+            user_id=USER_ID,
+            get_db_session=_db_session_factory(),
+            dedupe_key=key,
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    ran_actions = [action for action, _ in calls]
+    # create_vlan and the eth1 add were already applied: not re-run.
+    assert "create_vlan" not in ran_actions
+    add_ports = [kw.get("port") for action, kw in calls if action == "add_to_vlan"]
+    assert add_ports == ["eth2"], f"only the un-applied port should be added, got {add_ports}"
