@@ -211,6 +211,7 @@
     },
     "ForkCreate": {
       "properties": {
+        "created_by": "anyOf",
         "parent_topology_id": "anyOf",
         "parent_version_id": "anyOf",
         "reservation_id": "string"
