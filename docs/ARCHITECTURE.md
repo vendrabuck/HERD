@@ -59,8 +59,8 @@ Endpoints that accept internal tokens are named with suffixes like `/internal` o
 Three patterns are in active use:
 
 1. **Strict (raise 503):** user-facing reads that feed the UI. Current sites: inventory's `_fetch_user_group_ids` and `_fetch_user_group_names` raise `HTTPException(503)` on non-200/connection errors, the cross-service convention for an unreachable dependency (matching the 503 reservations raises for an unreachable inventory). Endpoints that want fail-open layer their own try/except over these.
-2. **Fail-open (return None, callers treat as "don't restrict"):** visibility filters where blocking on an outage is worse than allowing through. Sites: `reservations._fetch_visible_device_ids`, `reservations.expiration._fetch_exclusive_device_ids`, `acl.auth_client.fetch_user_groups`.
-3. **Best-effort (log + swallow):** side-effect writes where the local state already moved forward. Sites: `reservations._update_device_statuses` (default), `expiration._update_device_statuses_internal`.
+2. **Fail-open (return None, callers treat as "don't restrict"):** visibility filters where blocking on an outage is worse than allowing through. Sites: `reservations._fetch_visible_device_ids`, `reservations.expiration` (which resolves exclusive device IDs via the best-effort `_fetch_devices_best_effort` and filters inline), `acl.auth_client.fetch_user_groups`.
+3. **Best-effort (log + swallow):** side-effect writes where the local state already moved forward. Sites: `reservations._update_device_statuses` (default), also called by `reservations.expiration`.
 
 A fourth opt-in **retry+raise** mode uses `herd_common.retry.retry_with_backoff`. Currently wrapped around `_update_device_statuses` on the reservation create path so a failed reservation lands in `FAILED` instead of silently drifting.
 
