@@ -1,6 +1,6 @@
 # 0002 - Driver-published configuration schemas
 
-Status: Proposed
+Status: Shipped
 Issue: #23 "Driver-published configuration schemas"
 Context verified against the live HERD-public tree on 2026-06-09.
 

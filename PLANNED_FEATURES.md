@@ -49,7 +49,7 @@ HERD is a lab reservation and topology-management platform built as independent 
 ## Topology and resource modeling
 
 - `Planned` Network element objects. Place non-device elements on the canvas, such as a shared VLAN segment or an external cloud, with many-to-one connections, so a topology can model shared infrastructure rather than only point-to-point device links.
-- `Planned` Editable reservation topologies. Give each reservation an editable fork of its parent topology: edit loosely during the reservation, reconcile on save, and capture an immutable as-built record at teardown, so the master template stays clean while reservations evolve.
+- `Partial` Editable reservation topologies. Give each reservation an editable fork of its parent topology: edit loosely during the reservation, reconcile on save, and capture an immutable as-built record at teardown, so the master template stays clean while reservations evolve. Shipped so far: the per-reservation fork (fork, fork connections, and fork versions, created on activation). Reconcile-on-save and the immutable as-built record are still planned.
 - `Planned` Dynamic resources. A dynamic template type backed by registered hypervisors, where service recipes run as sandboxed jobs to bring a resource into existence when a reservation starts and tear it down at the end. This depends on the encrypted credential store above.
 - `Planned` First-class Layer 3 routing. Promote Layer 3 routing to a dedicated connection type with a decoupled configuration model, replacing the current minimal representation. An initial version is shipped.
 

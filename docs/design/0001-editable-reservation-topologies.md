@@ -1,6 +1,8 @@
 # Decision: Editable Reservation Topologies (Fork-on-Reserve), Issue #25
 
-Status: Design only. Unblocks GitHub issue #25. No code in this doc.
+Status: Accepted; P1-P2 shipped (fork models, tables, and creation in the
+cabling service). P3 reconcile-on-save is still open under issue #25. No code in
+this doc.
 Context verified against the live HERD-public tree on 2026-06-09.
 
 ## Context
