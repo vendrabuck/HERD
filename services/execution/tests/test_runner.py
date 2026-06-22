@@ -271,3 +271,89 @@ class Driver:
         assert output["port"] == "eth1"
         assert output["vlan_id"] == 100
         assert output["tag"] == "tagged"
+
+
+# --- __config_schema__ sentinel (_runner.py 58-65) ---
+
+
+def _run_main_capture_stdout(argv: list[str]) -> str:
+    """Call main() with argv, returning captured stdout."""
+    import io
+
+    from app.services._runner import main
+
+    captured = io.StringIO()
+    old_stdout = sys.stdout
+    old_argv = sys.argv
+    sys.stdout = captured
+    sys.argv = argv
+    try:
+        main()
+    finally:
+        sys.stdout = old_stdout
+        sys.argv = old_argv
+    return captured.getvalue()
+
+
+def test_runner_config_schema_returns_published_schema():
+    """The __config_schema__ sentinel reads the classmethod on the Driver class
+    (never instantiating it) and returns has_schema True with the schema."""
+    driver = """
+class Driver:
+    def __init__(self, context):
+        raise RuntimeError("config_schema must not instantiate the driver")
+
+    @classmethod
+    def config_schema(cls):
+        return {"type": "object", "properties": {"commands": {"type": "array"}}}
+"""
+    tmpdir = _make_driver_dir(driver)
+    with tmpdir:
+        ctx_file = Path(tmpdir.name) / "context.json"
+        ctx_file.write_text(json.dumps({}))
+        out = _run_main_capture_stdout(
+            ["_runner.py", tmpdir.name, "__config_schema__", str(ctx_file)]
+        )
+    result = json.loads(out)
+    assert result["has_schema"] is True
+    assert result["schema"]["properties"]["commands"]["type"] == "array"
+
+
+def test_runner_config_schema_absent_returns_no_schema():
+    """A driver without a config_schema classmethod yields has_schema False and a
+    null schema, and the driver is still never instantiated."""
+    tmpdir = _make_driver_dir(BASIC_DRIVER)
+    with tmpdir:
+        ctx_file = Path(tmpdir.name) / "context.json"
+        ctx_file.write_text(json.dumps({}))
+        out = _run_main_capture_stdout(
+            ["_runner.py", tmpdir.name, "__config_schema__", str(ctx_file)]
+        )
+    result = json.loads(out)
+    assert result["has_schema"] is False
+    assert result["schema"] is None
+
+
+# --- __main__ guard error handling (_runner.py 82-86) ---
+
+
+def test_runner_main_guard_prints_error_and_exits_one(capsys):
+    """Executing the module as __main__ with a driver that raises sends the error
+    text to stderr and exits 1. Run via runpy so the in-process coverage run
+    credits the if __name__ == '__main__' try/except block."""
+    import runpy
+
+    tmpdir = _make_driver_dir(FAILING_DRIVER)
+    with tmpdir:
+        ctx_file = Path(tmpdir.name) / "context.json"
+        ctx_file.write_text(json.dumps({}))
+        old_argv = sys.argv
+        sys.argv = ["_runner.py", tmpdir.name, "login", str(ctx_file)]
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                runpy.run_path(RUNNER_PATH, run_name="__main__")
+        finally:
+            sys.argv = old_argv
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Init failed" in captured.err
