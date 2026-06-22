@@ -851,6 +851,8 @@ Content-Type: application/json
 
 Returns HTTP 201 with the execution run result.
 
+Admins may execute any action. A non-admin may call this endpoint only when the action is `configure` and the caller holds an ACL `manage` grant on the target device; any other non-admin call is rejected 403 (`Admin access required`, or `Admin access or device manage grant required` when the grant is missing).
+
 ### Retry a failed run
 
 ```
@@ -1109,7 +1111,7 @@ Authorization: Bearer <admin-token>
 | `/api/acl/resources` | GET | yes | yes | yes |
 | `/api/execution/runs` | GET | yes (owner, with `reservation_id`) | yes | yes |
 | `/api/execution/runs/{id}` | GET | | yes | yes |
-| `/api/execution/execute` | POST | | yes | yes |
+| `/api/execution/execute` | POST | yes (`configure` only, with device `manage` grant) | yes | yes |
 | `/api/execution/runs/{id}/retry` | POST | | yes | yes |
 | `/api/execution/device-check` | POST | internal | internal | internal |
 | `/api/auth/health` | GET | open | open | open |

@@ -18,7 +18,7 @@ The palette lists every DUT (Management-connection device) you have visibility o
 
 - Already-reserved exclusive devices are hidden by default. Toggle **Show reserved resources** to include them.
 - Filters: search, template dropdown, topology type dropdown.
-- Search matches device name and any string/dropdown field value. Password-type fields are excluded; fields with the key `login` are also excluded from search.
+- Search matches the device name (a case-insensitive substring match); it does not search field values.
 - Devices already on the canvas are hidden from the palette. Removing a node from the canvas restores it to the palette.
 
 Regardless of your role, the palette only shows Management-type devices; infrastructure (L1/L2/L3 switches) is used automatically by the routing system and is not dragged in by hand.
@@ -87,7 +87,7 @@ Permissions: restoring requires admin or the topology's original creator; any au
 
 ## AI generation (optional)
 
-If the AI orchestrator is configured, the toolbar includes an **AI Generate** button. See [AI_GENERATE.md](AI_GENERATE.md) for the full flow (prompt entry, ghost-node preview, Accept / Modify / Reject, commit dialog that creates both the topology and a reservation).
+If the AI orchestrator is configured, the toolbar includes a **Use AI** button. See [AI_GENERATE.md](AI_GENERATE.md) for the full flow (prompt entry, ghost-node preview, Accept / Modify / Reject, commit dialog that creates both the topology and a reservation).
 
 ## Keyboard and mouse reference
 
