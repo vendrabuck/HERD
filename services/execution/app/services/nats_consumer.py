@@ -81,17 +81,51 @@ async def _get_internal(client, url, *, what, **kwargs):
     return resp
 
 
-async def _fetch_connections_for_device(device_id: str) -> list[dict]:
+class _AsyncNullCtx:
+    """Async context manager that yields a pre-existing object without closing it.
+
+    Lets a fetch helper write `async with _client_ctx(client) as c:` uniformly
+    whether it owns a freshly opened client (which must be closed) or is reusing
+    a per-event client owned by the caller (which must NOT be closed here).
+    """
+
+    def __init__(self, obj):
+        self._obj = obj
+
+    async def __aenter__(self):
+        return self._obj
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _client_ctx(client):
+    """Return an async context manager yielding an httpx client.
+
+    When `client` is None the helper opens (and closes) its own AsyncClient,
+    preserving the standalone per-call behavior. When a client is supplied the
+    caller owns its lifecycle, so we yield it without closing: this is how a
+    single per-event client gets reused across many fetches (issue #137).
+    """
+    if client is None:
+        return httpx.AsyncClient()
+    return _AsyncNullCtx(client)
+
+
+async def _fetch_connections_for_device(device_id: str, client=None) -> list[dict]:
     """Fetch connections involving a device from the cabling service.
 
     Raises TransientUpstreamError on a 5xx or transport error so the message
     NAKs and retries; a non-200 below 500 returns [] (treated as no
     connections), matching the prior behavior for the 404 case.
+
+    When `client` is provided it is reused (per-event connection pooling, issue
+    #137); when None a fresh client is opened for this one call as before.
     """
     url = f"{settings.cabling_service_url}/connections/internal"
-    async with httpx.AsyncClient() as client:
+    async with _client_ctx(client) as c:
         resp = await _get_internal(
-            client,
+            c,
             url,
             what=f"fetch connections for device {device_id}",
             params={"device_id": device_id, "limit": 500},
@@ -107,16 +141,19 @@ async def _fetch_connections_for_device(device_id: str) -> list[dict]:
         return data.get("items", data) if isinstance(data, dict) else data
 
 
-async def _fetch_device(device_id: str) -> dict | None:
+async def _fetch_device(device_id: str, client=None) -> dict | None:
     """Fetch device details from inventory service.
 
     Raises TransientUpstreamError on a 5xx or transport error so the message
     NAKs and retries; a non-200 below 500 (e.g. a genuine 404) returns None.
+
+    When `client` is provided it is reused (per-event connection pooling, issue
+    #137); when None a fresh client is opened for this one call as before.
     """
     url = f"{settings.inventory_service_url}/devices/{device_id}/internal"
-    async with httpx.AsyncClient() as client:
+    async with _client_ctx(client) as c:
         resp = await _get_internal(
-            client,
+            c,
             url,
             what=f"fetch device {device_id}",
             headers={"X-Internal-Token": settings.internal_api_token},
@@ -127,16 +164,19 @@ async def _fetch_device(device_id: str) -> dict | None:
         return resp.json()
 
 
-async def _fetch_template(template_id: str) -> dict | None:
+async def _fetch_template(template_id: str, client=None) -> dict | None:
     """Fetch template details from inventory service.
 
     Raises TransientUpstreamError on a 5xx or transport error so the message
     NAKs and retries; a non-200 below 500 (e.g. a genuine 404) returns None.
+
+    When `client` is provided it is reused (per-event connection pooling, issue
+    #137); when None a fresh client is opened for this one call as before.
     """
     url = f"{settings.inventory_service_url}/templates/{template_id}/internal"
-    async with httpx.AsyncClient() as client:
+    async with _client_ctx(client) as c:
         resp = await _get_internal(
-            client,
+            c,
             url,
             what=f"fetch template {template_id}",
             headers={"X-Internal-Token": settings.internal_api_token},
@@ -147,20 +187,66 @@ async def _fetch_template(template_id: str) -> dict | None:
         return resp.json()
 
 
+class _FetchContext:
+    """Per-event fetch context: one shared httpx client plus memoization caches.
+
+    Created once per reservation lifecycle event so the L1 and L2 resolver passes
+    (and the later execution phase) reuse a single connection pool and never
+    re-fetch the same device's connections or the same far-end device twice
+    (issue #137). The caches map:
+      - conn_cache:   device_id -> list[connection dict]
+      - device_cache: device_id -> device dict | None
+
+    A None entry in device_cache is a real cached "not found" (a 404), so a
+    missing far end is classified at most once too. The client is owned by the
+    caller (handle_reservation_event); these helpers never close it.
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self._conn_cache: dict[str, list[dict]] = {}
+        self._device_cache: dict[str, dict | None] = {}
+
+    @property
+    def client(self):
+        return self._client
+
+    async def get_connections(self, device_id: str) -> list[dict]:
+        """Return a device's connections, fetching at most once per event."""
+        if device_id not in self._conn_cache:
+            self._conn_cache[device_id] = await _fetch_connections_for_device(
+                device_id, self._client
+            )
+        return self._conn_cache[device_id]
+
+    async def get_device(self, device_id: str) -> dict | None:
+        """Return a far-end device, classifying it at most once per event."""
+        if device_id not in self._device_cache:
+            self._device_cache[device_id] = await _fetch_device(device_id, self._client)
+        return self._device_cache[device_id]
+
+
 async def _resolve_l1_switch_operations(
     device_ids: list[str],
+    ctx: "_FetchContext | None" = None,
 ) -> list[dict]:
     """Resolve which L1 switch operations are needed for a set of reserved devices.
 
     Returns a list of dicts with keys:
       switch_device_id, switch_port_a, switch_port_b
     representing port pairs on L1 switches that need to be connected/disconnected.
+
+    `ctx` carries the per-event shared client and memoization caches (issue
+    #137). When None (e.g. a direct unit-test call) a throwaway context with no
+    shared client is used, so connections/devices are fetched per call as before.
     """
+    if ctx is None:
+        ctx = _FetchContext(None)
     operations = []
 
     # For each reserved device, find connections where the other side is an L1 switch
     for device_id in device_ids:
-        connections = await _fetch_connections_for_device(device_id)
+        connections = await ctx.get_connections(device_id)
         for conn in connections:
             # Determine which side is the reserved device and which might be the L1 switch
             if str(conn.get("device_a_id")) == device_id:
@@ -171,7 +257,7 @@ async def _resolve_l1_switch_operations(
                 continue
 
             # Check if the other device is an L1 switch
-            other_device = await _fetch_device(other_device_id)
+            other_device = await ctx.get_device(other_device_id)
             if not other_device:
                 continue
             if other_device.get("connection_type") != "Layer 1 Switch":
@@ -230,6 +316,7 @@ def _derive_vlan_id(reservation_id: str) -> int:
 
 async def _resolve_l2_switch_operations(
     device_ids: list[str],
+    ctx: "_FetchContext | None" = None,
 ) -> list[dict]:
     """Resolve which L2 switch operations are needed for a set of reserved devices.
 
@@ -238,11 +325,17 @@ async def _resolve_l2_switch_operations(
     representing per-port VLAN operations on L2 switches.
     VLAN ID is NOT set here; it is assigned per-fabric by the caller.
     Unlike L1, L2 operations are per-port (not paired).
+
+    `ctx` carries the per-event shared client and memoization caches (issue
+    #137). When None (e.g. a direct unit-test call) a throwaway context with no
+    shared client is used, so connections/devices are fetched per call as before.
     """
+    if ctx is None:
+        ctx = _FetchContext(None)
     operations = []
 
     for device_id in device_ids:
-        connections = await _fetch_connections_for_device(device_id)
+        connections = await ctx.get_connections(device_id)
         for conn in connections:
             if str(conn.get("device_a_id")) == device_id:
                 other_device_id = str(conn.get("device_b_id"))
@@ -251,7 +344,7 @@ async def _resolve_l2_switch_operations(
             else:
                 continue
 
-            other_device = await _fetch_device(other_device_id)
+            other_device = await ctx.get_device(other_device_id)
             if not other_device:
                 continue
             if other_device.get("connection_type") != "Layer 2 Switch":
@@ -324,6 +417,7 @@ async def _execute_l2_switch_operations(
     user_id: str,
     get_db_session,
     dedupe_key: str | None = None,
+    ctx: "_FetchContext | None" = None,
 ) -> None:
     """Resolve L2 switch operations for devices and execute VLAN provisioning.
 
@@ -336,12 +430,17 @@ async def _execute_l2_switch_operations(
         get_db_session: async context manager that yields an AsyncSession
         dedupe_key: source-message key; a VLAN action whose SUCCESS run already
             carries it is skipped on redelivery (issue #133).
+        ctx: per-event fetch context (shared client + caches, issue #137). When
+            None a throwaway context is created so a direct call still works.
     """
     if not reservation_id:
         logger.warning("No reservation_id for L2 operations, skipping")
         return
 
-    operations = await _resolve_l2_switch_operations(device_ids)
+    if ctx is None:
+        ctx = _FetchContext(None)
+
+    operations = await _resolve_l2_switch_operations(device_ids, ctx)
 
     if l2_action == "deprovision":
         # For deprovisioning, look up stored VLAN assignments first.
@@ -399,12 +498,12 @@ async def _execute_l2_switch_operations(
         switch_groups[sid].append(op)
 
     for switch_id, ops in switch_groups.items():
-        switch_data = await _fetch_device(switch_id)
+        switch_data = await ctx.get_device(switch_id)
         if not switch_data:
             logger.error("L2 switch %s not found", switch_id)
             continue
 
-        template_data = await _fetch_template(switch_data.get("template_id", ""))
+        template_data = await _fetch_template(switch_data.get("template_id", ""), ctx.client)
         if not template_data:
             logger.error("Template for L2 switch %s not found", switch_id)
             continue
@@ -708,6 +807,7 @@ async def _execute_switch_operations(
     user_id: str,
     get_db_session,
     dedupe_key: str | None = None,
+    ctx: "_FetchContext | None" = None,
 ) -> None:
     """Resolve L1 switch operations for devices and execute driver methods.
 
@@ -719,8 +819,12 @@ async def _execute_switch_operations(
         get_db_session: async context manager that yields an AsyncSession
         dedupe_key: source-message key; a port operation whose SUCCESS run already
             carries it is skipped on redelivery (issue #133).
+        ctx: per-event fetch context (shared client + caches, issue #137). When
+            None a throwaway context is created so a direct call still works.
     """
-    operations = await _resolve_l1_switch_operations(device_ids)
+    if ctx is None:
+        ctx = _FetchContext(None)
+    operations = await _resolve_l1_switch_operations(device_ids, ctx)
     if not operations:
         logger.info("No L1 switch operations needed for reservation %s", reservation_id)
         return
@@ -748,12 +852,12 @@ async def _execute_switch_operations(
         switch_groups[sid].append((op["switch_port_a"], op["switch_port_b"]))
 
     for switch_id, port_pairs in switch_groups.items():
-        switch_data = await _fetch_device(switch_id)
+        switch_data = await ctx.get_device(switch_id)
         if not switch_data:
             logger.error("L1 switch %s not found", switch_id)
             continue
 
-        template_data = await _fetch_template(switch_data.get("template_id", ""))
+        template_data = await _fetch_template(switch_data.get("template_id", ""), ctx.client)
         if not template_data:
             logger.error("Template for switch %s not found", switch_id)
             continue
@@ -948,34 +1052,67 @@ async def handle_reservation_event(
         },
     )
 
-    if action == "update_ports":
-        added_ids = event_data.get("added_device_ids", [])
-        removed_ids = event_data.get("removed_device_ids", [])
-        if added_ids:
+    # One httpx client and one set of memoization caches for the whole event, so
+    # the L1 and L2 passes pool connections and never re-fetch a device's
+    # connections or a shared far-end switch twice (issue #137). For
+    # reservation.updated the added and removed device sets are disjoint and
+    # touch different connections, but sharing the context is still correct and
+    # lets a switch referenced by both reuse one cached device fetch.
+    async with httpx.AsyncClient() as client:
+        ctx = _FetchContext(client)
+
+        if action == "update_ports":
+            added_ids = event_data.get("added_device_ids", [])
+            removed_ids = event_data.get("removed_device_ids", [])
+            if added_ids:
+                await _execute_switch_operations(
+                    added_ids,
+                    "connect_ports",
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    dedupe_key,
+                    ctx,
+                )
+                await _execute_l2_switch_operations(
+                    added_ids,
+                    "provision",
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    dedupe_key,
+                    ctx,
+                )
+            if removed_ids:
+                await _execute_switch_operations(
+                    removed_ids,
+                    "disconnect_ports",
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    dedupe_key,
+                    ctx,
+                )
+                await _execute_l2_switch_operations(
+                    removed_ids,
+                    "deprovision",
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    dedupe_key,
+                    ctx,
+                )
+        else:
+            device_ids = event_data.get("device_ids", [])
             await _execute_switch_operations(
-                added_ids, "connect_ports", reservation_id, user_id, get_db_session, dedupe_key
+                device_ids, action, reservation_id, user_id, get_db_session, dedupe_key, ctx
             )
-            await _execute_l2_switch_operations(
-                added_ids, "provision", reservation_id, user_id, get_db_session, dedupe_key
-            )
-        if removed_ids:
-            await _execute_switch_operations(
-                removed_ids, "disconnect_ports", reservation_id, user_id, get_db_session, dedupe_key
-            )
-            await _execute_l2_switch_operations(
-                removed_ids, "deprovision", reservation_id, user_id, get_db_session, dedupe_key
-            )
-    else:
-        device_ids = event_data.get("device_ids", [])
-        await _execute_switch_operations(
-            device_ids, action, reservation_id, user_id, get_db_session, dedupe_key
-        )
-        # L2 switch operations
-        l2_action = L2_EVENT_ACTIONS.get(event_type)
-        if l2_action:
-            await _execute_l2_switch_operations(
-                device_ids, l2_action, reservation_id, user_id, get_db_session, dedupe_key
-            )
+            # L2 switch operations
+            l2_action = L2_EVENT_ACTIONS.get(event_type)
+            if l2_action:
+                await _execute_l2_switch_operations(
+                    device_ids, l2_action, reservation_id, user_id, get_db_session, dedupe_key, ctx
+                )
 
     logger.info(
         "Completed processing reservation event",

@@ -529,7 +529,7 @@ async def test_handle_event_multiple_switches():
     ]
     event = _make_event("reservation.created")
 
-    async def mock_fetch_device(device_id):
+    async def mock_fetch_device(device_id, client=None):
         if device_id == SWITCH_ID:
             return SWITCH_DATA
         return switch_2_data
