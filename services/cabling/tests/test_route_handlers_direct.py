@@ -1381,3 +1381,554 @@ async def test_import_missing_name_and_unresolved_rejected():
     reasons = [r.reason for r in report.rows]
     assert any("name" in (r or "") for r in reasons)
     assert any("unresolved device names" in (r or "") for r in reasons)
+
+
+# --- routes/connections.py --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connections_internal_handler_valid_token():
+    """The /connections/internal handler returns the page on a matching token."""
+    from app.config import settings
+    from app.routes.connections import list_connections_internal
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth1")
+        with patch.object(settings, "internal_api_token", "tok"):
+            result = await list_connections_internal(
+                device_id=None, skip=0, limit=50, x_internal_token="tok", db=db
+            )
+    assert result.total == 1
+    assert result.items[0].device_a_id == a
+
+
+@pytest.mark.asyncio
+async def test_connections_internal_handler_wrong_token():
+    from app.config import settings
+    from app.routes.connections import list_connections_internal
+    from fastapi import HTTPException
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "right"):
+            with pytest.raises(HTTPException) as exc:
+                await list_connections_internal(
+                    device_id=None, skip=0, limit=50, x_internal_token="wrong", db=db
+                )
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Invalid internal token"
+
+
+@pytest.mark.asyncio
+async def test_connections_get_handler_found_and_404():
+    from app.routes.connections import get_connection_endpoint
+    from fastapi import HTTPException
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth1")
+        from app.models.connection import Connection
+        from sqlalchemy import select
+
+        existing = (await db.execute(select(Connection))).scalars().one()
+        got = await get_connection_endpoint(connection_id=existing.id, _=_payload(), db=db)
+        assert got.id == existing.id
+
+        with pytest.raises(HTTPException) as exc:
+            await get_connection_endpoint(connection_id=uuid.uuid4(), _=_payload(), db=db)
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "Connection not found"
+
+
+@pytest.mark.asyncio
+async def test_connections_delete_handler_removes_and_404s():
+    """Deleting an existing connection succeeds and logs; a second delete of the
+    same id then raises a 404 with the exact wording."""
+    from app.models.connection import Connection
+    from app.routes.connections import delete_connection_endpoint
+    from fastapi import HTTPException
+    from sqlalchemy import select
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    admin = _payload(ADMIN_ID, username="admin", role="admin")
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth1")
+        existing = (await db.execute(select(Connection))).scalars().one()
+        # Successful delete: returns None (204) and logs the removal.
+        result = await delete_connection_endpoint(connection_id=existing.id, payload=admin, db=db)
+        assert result is None
+        gone = (await db.execute(select(Connection))).scalars().all()
+        assert gone == []
+
+        with pytest.raises(HTTPException) as exc:
+            await delete_connection_endpoint(connection_id=existing.id, payload=admin, db=db)
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "Connection not found"
+
+
+# --- services/version_diff.py ----------------------------------------------
+
+
+def test_version_diff_index_skips_non_dict_and_missing_id():
+    """_index_by_id drops non-dict members and dicts with no id (lines 8, 11)."""
+    from app.services.version_diff import diff_collection
+
+    before = [
+        {"id": "keep", "v": 1},
+        "not-a-dict",  # non-dict member: skipped (line 8)
+        {"no": "id"},  # dict without an id: skipped (line 11)
+    ]
+    after = [{"id": "keep", "v": 2}]
+    added, removed, modified = diff_collection(before, after)
+    # Only the id-bearing dict survives indexing, so the malformed entries
+    # contribute nothing to added/removed.
+    assert added == []
+    assert removed == []
+    assert [m["id"] for m in modified] == ["keep"]
+
+
+def test_version_diff_canvas_tolerates_malformed_collections():
+    """diff_canvas runs the same skipping logic for both nodes and edges."""
+    from app.services.version_diff import diff_canvas
+
+    before = {"nodes": [None, {"id": "n1"}], "edges": [{"weird": True}]}
+    after = {"nodes": [{"id": "n1"}], "edges": [{"id": "e1"}]}
+    result = diff_canvas(before, after)
+    assert result["nodes_added"] == []
+    assert result["nodes_removed"] == []
+    assert [e["id"] for e in result["edges_added"]] == ["e1"]
+
+
+# --- services/fork_service.py + routes/forks.py ----------------------------
+
+
+async def _make_parent_topology(db, canvas, *, with_version=True):
+    """Create a parent Topology, optionally with a v1 TopologyVersion.
+
+    Returns (topology_id, version_id_or_None).
+    """
+    from app.models.topology import Topology, TopologyVersion
+
+    topo = Topology(name="parent", created_by=uuid.uuid4(), canvas_data=canvas)
+    db.add(topo)
+    await db.flush()
+    version_id = None
+    if with_version:
+        version = TopologyVersion(
+            topology_id=topo.id,
+            version_number=1,
+            canvas_data=canvas,
+            name="parent",
+            created_by=uuid.uuid4(),
+        )
+        db.add(version)
+        await db.flush()
+        version_id = version.id
+    await db.commit()
+    return topo.id, version_id
+
+
+@pytest.mark.asyncio
+async def test_fork_resolve_explicit_version_pins_it():
+    """_resolve_parent_canvas with an explicit parent_version_id pins that version
+    (fork_service.py lines 55-57)."""
+    from app.services.fork_service import _resolve_parent_canvas
+
+    canvas = {"nodes": [{"id": "n1"}], "edges": []}
+    async with TestSession() as db:
+        topo_id, version_id = await _make_parent_topology(db, canvas)
+        resolved_canvas, pinned = await _resolve_parent_canvas(
+            db, parent_topology_id=None, parent_version_id=version_id
+        )
+    assert resolved_canvas == canvas
+    assert pinned == version_id
+
+
+@pytest.mark.asyncio
+async def test_fork_resolve_topology_without_versions_uses_live_canvas():
+    """A parent topology with no versions falls back to its live canvas, unpinned
+    (fork_service.py lines 70-72)."""
+    from app.services.fork_service import _resolve_parent_canvas
+
+    canvas = {"nodes": [{"id": "live"}], "edges": []}
+    async with TestSession() as db:
+        topo_id, _ = await _make_parent_topology(db, canvas, with_version=False)
+        resolved_canvas, pinned = await _resolve_parent_canvas(
+            db, parent_topology_id=topo_id, parent_version_id=None
+        )
+    assert resolved_canvas == canvas
+    assert pinned is None
+
+
+@pytest.mark.asyncio
+async def test_fork_resolve_unknown_topology_returns_none():
+    """An unknown parent topology with no version yields (None, None): nothing to copy."""
+    from app.services.fork_service import _resolve_parent_canvas
+
+    async with TestSession() as db:
+        resolved_canvas, pinned = await _resolve_parent_canvas(
+            db, parent_topology_id=uuid.uuid4(), parent_version_id=None
+        )
+    assert resolved_canvas is None
+    assert pinned is None
+
+
+@pytest.mark.asyncio
+async def test_fork_resolve_missing_explicit_version_falls_through():
+    """An explicit parent_version_id that does not exist falls through to the
+    topology branch rather than returning the missing version."""
+    from app.services.fork_service import _resolve_parent_canvas
+
+    canvas = {"nodes": [{"id": "n1"}], "edges": []}
+    async with TestSession() as db:
+        topo_id, _ = await _make_parent_topology(db, canvas, with_version=False)
+        resolved_canvas, pinned = await _resolve_parent_canvas(
+            db, parent_topology_id=topo_id, parent_version_id=uuid.uuid4()
+        )
+    # The bogus version id resolved to nothing, so resolution used the topology's
+    # current canvas instead (unpinned, since the topology has no versions).
+    assert resolved_canvas == canvas
+    assert pinned is None
+
+
+def test_fork_node_to_device_map_skips_malformed_nodes():
+    """_node_to_device_map drops nodes missing an id or device id (line 85) and
+    nodes whose device id is not a UUID (lines 88-89)."""
+    from app.services.fork_service import _node_to_device_map
+
+    good = uuid.uuid4()
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": str(good)}}},
+            {"id": "n2", "data": {"device": {}}},  # no device id: skipped (line 85)
+            {"data": {"device": {"id": str(uuid.uuid4())}}},  # no node id: skipped (85)
+            {"id": "n4", "data": {"device": {"id": "not-a-uuid"}}},  # bad UUID (88-89)
+        ]
+    }
+    mapping = _node_to_device_map(canvas)
+    assert mapping == {"n1": good}
+
+
+@pytest.mark.asyncio
+async def test_fork_create_snapshots_multi_hop_path_and_dedupes():
+    """create_fork snapshots a two-hop path A-X-B as two L1 fork_connections, each
+    carrying its backing physical connection id, and a second canvas edge sharing a
+    hop is de-duplicated (fork_service.py 126-151, 169-194, and the seen-key skip)."""
+    from app.models.connection import Connection
+    from app.models.fork import ForkConnection, ReservationFork
+    from app.services.fork_service import create_fork
+    from sqlalchemy import select
+
+    dev_a, dev_x, dev_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, dev_a, "a-x", dev_x, "x-a")
+        await _seed_cable(db, dev_x, "x-b", dev_b, "b-x")
+        all_cables = (await db.execute(select(Connection))).scalars().all()
+        phys_by_pair = {}
+        for c in all_cables:
+            phys_by_pair[(c.device_a_id, c.device_b_id)] = c.id
+
+    # Two canvas edges A-B: both resolve to the same A-X-B path, so the second
+    # edge's hops are already in `seen` and must not double-insert.
+    canvas = {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "nX", "data": {"device": {"id": str(dev_x)}}},
+            {"id": "nB", "data": {"device": {"id": str(dev_b)}}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "nA", "target": "nB"},
+            {"id": "e2", "source": "nA", "target": "nB"},
+        ],
+    }
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        topo_id, _ = await _make_parent_topology(db, canvas)
+        fork = await create_fork(
+            db,
+            reservation_id=rid,
+            parent_topology_id=topo_id,
+            parent_version_id=None,
+            created_by="booker",
+        )
+    async with TestSession() as db:
+        conns = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+    # Two distinct hops on the path, de-duplicated across the two canvas edges.
+    assert len(conns) == 2
+    pairs = {(c.device_a_id, c.device_b_id) for c in conns}
+    assert pairs == {(dev_a, dev_x), (dev_x, dev_b)}
+    for c in conns:
+        assert c.layer == "L1"
+        assert c.created_by == "booker"
+        assert c.physical_connection_id == phys_by_pair[(c.device_a_id, c.device_b_id)]
+    # The fork itself was persisted and is ACTIVE.
+    async with TestSession() as db:
+        stored = (
+            await db.execute(select(ReservationFork).where(ReservationFork.id == fork.id))
+        ).scalar_one()
+        from app.models.fork import ForkStatus_ACTIVE
+
+        assert stored.status == ForkStatus_ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_fork_snapshot_skips_proposal_and_unresolvable_edges():
+    """_snapshot_connections skips proposal edges (155-156) and edges whose
+    endpoints do not map to devices (159-160), wiring nothing for either."""
+    from app.models.fork import ForkConnection
+    from app.services.fork_service import create_fork
+    from sqlalchemy import select
+
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, dev_a, "eth0", dev_b, "eth1")
+    canvas = {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "nB", "data": {"device": {"id": str(dev_b)}}},
+            {"id": "nGhost", "data": {}},  # no device: unresolvable endpoint
+        ],
+        "edges": [
+            # A proposal edge is skipped even though the path exists.
+            {"id": "prop", "source": "nA", "target": "nB", "data": {"isProposal": True}},
+            # An edge into the ghost node has an unresolvable target.
+            {"id": "ghost", "source": "nA", "target": "nGhost"},
+        ],
+    }
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        topo_id, _ = await _make_parent_topology(db, canvas)
+        fork = await create_fork(
+            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+        )
+    async with TestSession() as db:
+        conns = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+    assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_fork_snapshot_empty_component_when_no_devices_resolve():
+    """A canvas with edges but no resolvable device nodes leaves an empty component:
+    the phys-lookup else branch runs and no fork_connections are written
+    (fork_service.py line 144-145)."""
+    from app.models.fork import ForkConnection
+    from app.services.fork_service import create_fork
+    from sqlalchemy import select
+
+    canvas = {
+        "nodes": [
+            {"id": "nA", "data": {}},  # no device id
+            {"id": "nB", "data": {}},
+        ],
+        "edges": [{"id": "e1", "source": "nA", "target": "nB"}],
+    }
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        topo_id, _ = await _make_parent_topology(db, canvas)
+        fork = await create_fork(
+            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+        )
+    async with TestSession() as db:
+        conns = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+    assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_fork_snapshot_skips_hop_with_null_port():
+    """A defensive guard: a path hop carrying a None port is skipped rather than
+    written as a half-wired fork_connection (fork_service.py line 178).
+
+    Real connections never have NULL ports (the column is NOT NULL), so this guard
+    is only reachable via a doctored path. We patch the pathfinder to return one
+    so the branch is pinned rather than left dead."""
+    from app.models.fork import ForkConnection
+    from app.schemas.pathfind import PathHop
+    from app.services import fork_service
+    from sqlalchemy import select
+
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, dev_a, "eth0", dev_b, "eth1")
+    canvas = {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "nB", "data": {"device": {"id": str(dev_b)}}},
+        ],
+        "edges": [{"id": "e1", "source": "nA", "target": "nB"}],
+    }
+    # The middle hop's port_in is None, so the (first, second) pair has pb=None.
+    doctored = [
+        [
+            PathHop(device_id=dev_a, port_out="eth0"),
+            PathHop(device_id=dev_b, port_in=None, port_out=None),
+        ]
+    ]
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        topo_id, _ = await _make_parent_topology(db, canvas)
+        with patch.object(
+            fork_service,
+            "find_all_shortest_paths_async",
+            new=AsyncMock(return_value=doctored),
+        ):
+            fork = await fork_service.create_fork(
+                db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+            )
+    async with TestSession() as db:
+        conns = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+    assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_fork_create_is_idempotent_returns_existing():
+    """A second create_fork for the same reservation returns the first fork without
+    building a second (fork_service.py lines 216-217)."""
+    from app.models.fork import ReservationFork
+    from app.services.fork_service import create_fork
+    from sqlalchemy import select
+
+    canvas = {"nodes": [], "edges": []}
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        topo_id, _ = await _make_parent_topology(db, canvas)
+        first = await create_fork(
+            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+        )
+        second = await create_fork(
+            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+        )
+    assert first.id == second.id
+    async with TestSession() as db:
+        forks = (
+            (await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid)))
+            .scalars()
+            .all()
+        )
+    assert len(forks) == 1
+
+
+@pytest.mark.asyncio
+async def test_fork_create_integrity_error_returns_concurrent_winner():
+    """If the commit hits a unique-violation (a concurrent activation won the race),
+    create_fork rolls back and returns the existing winner so the contract stays
+    idempotent (fork_service.py lines 246-257)."""
+    from app.models.fork import ReservationFork
+    from app.services import fork_service
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
+    rid = uuid.uuid4()
+    winner_holder = {"id": None}
+
+    async with TestSession() as db:
+        # create_fork's existence check finds nothing, so it builds and flushes its
+        # own fork. The first commit raises as if a concurrent activation had
+        # committed the same reservation_id first. create_fork then rolls back
+        # (discarding its flushed row) and re-reads to find the winner; we splice the
+        # winner in on the back of that real rollback so the recovery SELECT sees it.
+        real_commit = db.commit
+        real_rollback = db.rollback
+
+        async def _commit_collides():
+            raise IntegrityError("dup", {}, Exception("unique"))
+
+        async def _rollback_then_seed_winner():
+            await real_rollback()
+            # Now the session is clean; persist the winner the recovery SELECT will
+            # return, exactly as a concurrent committer would have left it.
+            winner = ReservationFork(reservation_id=rid)
+            db.add(winner)
+            await real_commit()
+            winner_holder["id"] = winner.id
+
+        with patch.object(db, "commit", new=_commit_collides):
+            with patch.object(db, "rollback", new=_rollback_then_seed_winner):
+                result = await fork_service.create_fork(
+                    db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+                )
+    assert result.id == winner_holder["id"]
+    # Exactly one fork survived: the concurrent winner, not a duplicate.
+    async with TestSession() as db:
+        forks = (
+            (await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid)))
+            .scalars()
+            .all()
+        )
+    assert len(forks) == 1
+
+
+@pytest.mark.asyncio
+async def test_fork_create_integrity_error_no_winner_reraises():
+    """If the commit fails with IntegrityError but no existing fork is found on
+    recovery, create_fork re-raises rather than silently swallowing (lines 255-256)."""
+    from app.services import fork_service
+    from sqlalchemy.exc import IntegrityError
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+
+        async def _always_fail():
+            raise IntegrityError("dup", {}, Exception("unique"))
+
+        with patch.object(db, "commit", new=_always_fail):
+            with pytest.raises(IntegrityError):
+                await fork_service.create_fork(
+                    db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+                )
+
+
+@pytest.mark.asyncio
+async def test_forks_route_handler_returns_version_number():
+    """The create_fork_internal handler builds the ForkCreateResponse with the fork
+    id and v1 version number (routes/forks.py lines 51-57)."""
+    from app.config import settings
+    from app.routes.forks import create_fork_internal
+    from app.schemas.fork import ForkCreate
+
+    canvas = {"nodes": [{"id": "n1"}], "edges": []}
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        topo_id, version_id = await _make_parent_topology(db, canvas)
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await create_fork_internal(
+                body=ForkCreate(reservation_id=rid, parent_topology_id=topo_id),
+                x_internal_token="tok",
+                db=db,
+            )
+    assert resp.version_number == 1
+    assert resp.fork_id is not None
+
+
+@pytest.mark.asyncio
+async def test_forks_route_handler_rejects_bad_token():
+    from app.config import settings
+    from app.routes.forks import create_fork_internal
+    from app.schemas.fork import ForkCreate
+    from fastapi import HTTPException
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "right"):
+            with pytest.raises(HTTPException) as exc:
+                await create_fork_internal(
+                    body=ForkCreate(reservation_id=uuid.uuid4()),
+                    x_internal_token="wrong",
+                    db=db,
+                )
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Invalid internal token"

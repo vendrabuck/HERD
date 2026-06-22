@@ -245,7 +245,11 @@ async def create_fork(
         await db.commit()
     except IntegrityError:
         # A concurrent activation committed its fork first (unique reservation_id).
-        # Roll back and return the winner so the contract stays idempotent.
+        # Roll back and return the winner so the contract stays idempotent. This is
+        # critical for reservations.create retries: the activation->fork transition
+        # is not atomic at the application level, so two concurrent PENDINGs both
+        # call create_fork. The DB unique constraint on (reservation_id) serializes
+        # them; the loser rolls back and fetches the winner's fork.
         await db.rollback()
         existing = (
             await db.execute(
