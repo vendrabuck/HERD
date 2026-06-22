@@ -139,10 +139,14 @@ The validator is exposed via two endpoints sharing one implementation:
   reserved, so JWT-forward against the public endpoint would 403.
 
 Both endpoints rebuild the adjacency graph per request via
-`build_adjacency_graph` and run `find_all_shortest_paths` over it. The rebuild
-is a single sequential scan of the connections table; serving fresh state on
-every request avoids any cross-process cache-coherence problem if cabling is
-ever scaled horizontally. To express overlay links between physically
+`build_adjacency_graph` and run `find_all_shortest_paths` over it. When the
+caller passes the topology's device set, the rebuild loads only the edges in
+that connected component (iterative frontier expansion, so off-canvas
+intermediates that realize a topology edge are still pulled in) rather than
+scanning the whole connections table; passing no device set falls back to a
+full load. Path enumeration is capped at `MAX_ENUMERATED_PATHS` (256). Serving
+fresh state on every request avoids any cross-process cache-coherence problem
+if cabling is ever scaled horizontally. To express overlay links between physically
 isolated fabrics (e.g., MPLS between sites), users add a virtual device and
 cable to it, which lets the same validator stay strict about physical
 reachability.

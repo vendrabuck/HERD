@@ -203,7 +203,7 @@ Inspect them, figure out why they failed, decide whether to replay or discard. E
 ## Logs and where to look
 
 - **Global tail**: `make logs` (all containers).
-- **Per service shell**: `make shell-<service>` (auth, inventory, reservations, cabling, acl, execution, user-profile, notifications).
+- **Per service shell**: `make shell-<service>` (auth, inventory, reservations, cabling, acl, execution, user-profile, notifications, ai-orchestrator).
 - **Structured fields to grep for**:
   - `action=reservation_create` / `reservation_provision_failed` (reservations)
   - `action=nats_poison_message` / `nats_dlq_exhausted` / `nats_message_nak` (execution, notifications)
