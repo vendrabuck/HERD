@@ -28,7 +28,10 @@ async def get_fabric_internal(
     if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
-    graph = await build_adjacency_graph(db)
+    # Scope the load to the queried device's connected component. Component
+    # expansion loads exactly that component (and unrelated fabrics are skipped),
+    # which is precisely what find_connected_component needs.
+    graph = await build_adjacency_graph(db, device_ids={device_id})
     component = find_connected_component(graph, device_id)
     fabric_id = compute_fabric_id(component)
 

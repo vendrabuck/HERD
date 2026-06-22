@@ -18,14 +18,14 @@ import copy
 import logging
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.connection import Connection
 from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
 from app.models.topology import Topology, TopologyVersion
-from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths
+from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
 
 logger = logging.getLogger(__name__)
 
@@ -111,21 +111,38 @@ async def _snapshot_connections(
         return
 
     node_to_device = _node_to_device_map(canvas)
-    graph = await build_adjacency_graph(db)
+    # Scope to the connected component(s) of the canvas devices (the fork's own
+    # fabric), matching this module's stated rule: snapshot from the parent
+    # canvas edges resolved to physical paths, not the whole global graph.
+    # Component expansion still loads off-canvas intermediates, so every hop on
+    # a chosen path is present.
+    graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
 
     # Look up the backing physical connection id for an (a, port_a, b, port_b) hop.
-    # The cabling graph is undirected, so match either orientation.
-    phys_rows = (
-        await db.execute(
-            select(
-                Connection.id,
-                Connection.device_a_id,
-                Connection.port_a,
-                Connection.device_b_id,
-                Connection.port_b,
+    # The cabling graph is undirected, so match either orientation. Scope the
+    # phys lookup to the same component devices the graph loaded (graph.keys()),
+    # so every connection that can appear on a returned path is indexed while
+    # unrelated fabrics are skipped.
+    component_devices = set(graph.keys())
+    if component_devices:
+        phys_rows = (
+            await db.execute(
+                select(
+                    Connection.id,
+                    Connection.device_a_id,
+                    Connection.port_a,
+                    Connection.device_b_id,
+                    Connection.port_b,
+                ).where(
+                    or_(
+                        Connection.device_a_id.in_(component_devices),
+                        Connection.device_b_id.in_(component_devices),
+                    )
+                )
             )
-        )
-    ).all()
+        ).all()
+    else:
+        phys_rows = []
     phys_index: dict[tuple[uuid.UUID, str, uuid.UUID, str], uuid.UUID] = {}
     for conn_id, da, pa, db_, pb in phys_rows:
         phys_index[(da, pa, db_, pb)] = conn_id
@@ -142,7 +159,7 @@ async def _snapshot_connections(
         if source_device is None or target_device is None:
             continue
 
-        paths = find_all_shortest_paths(graph, source_device, target_device)
+        paths = await find_all_shortest_paths_async(graph, source_device, target_device)
         if not paths:
             # Unreachable edge: nothing to wire. Create-time validation already
             # gates the booking on connectivity, so this is the rare deleted-cable

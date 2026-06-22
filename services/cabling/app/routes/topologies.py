@@ -18,7 +18,7 @@ from app.schemas.topology import (
     TopologyUpdate,
     TopologyValidationResponse,
 )
-from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths
+from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
 
@@ -225,7 +225,12 @@ async def _run_topology_validation(
     if not edges:
         return TopologyValidationResponse(valid=True, invalid_edges=[])
 
-    graph = await build_adjacency_graph(db)
+    # Scope the graph to the connected component(s) of the topology's devices.
+    # Expansion still loads off-canvas intermediates (a patch panel that
+    # physically realizes an edge), so no reachable path is dropped; it only
+    # skips fabrics unrelated to this topology. Built once and reused across all
+    # edges, as before.
+    graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
     invalid: list[InvalidEdge] = []
 
     for edge in edges:
@@ -253,7 +258,7 @@ async def _run_topology_validation(
             )
             continue
 
-        paths = find_all_shortest_paths(graph, source_device, target_device)
+        paths = await find_all_shortest_paths_async(graph, source_device, target_device)
         if not paths:
             invalid.append(
                 InvalidEdge(

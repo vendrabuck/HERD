@@ -433,3 +433,165 @@ async def test_bidirectional(admin_client, user_client):
     )
     assert resp.json()["reachable"] is True
     assert resp.json()["hop_count"] == 3
+
+
+# ---- Scoped graph load, offload, and cap (issue #139) ----
+
+
+async def _insert_cable(db, a, port_a, b, port_b):
+    """Insert one connection directly through a session (no HTTP)."""
+    from app.models.connection import Connection
+
+    db.add(
+        Connection(device_a_id=a, port_a=port_a, device_b_id=b, port_b=port_b, created_by="seed")
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_scoped_graph_loads_only_in_scope_component():
+    """A scoped build loads only the seed devices' component, ignoring other rows.
+
+    Two disjoint fabrics are seeded: {a, b} and {c, d}. Scoping to {a} must load
+    only the a-b edge and leave the c-d fabric out of the graph entirely.
+    """
+    from app.services.pathfind_service import build_adjacency_graph
+
+    a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with TestSessionLocal() as db:
+        await _insert_cable(db, a, "eth1", b, "eth1")
+        await _insert_cable(db, c, "eth1", d, "eth1")
+
+        scoped = await build_adjacency_graph(db, device_ids={a})
+        full = await build_adjacency_graph(db)
+
+    # Out-of-scope fabric devices are absent from the scoped graph.
+    assert set(scoped.keys()) == {a, b}
+    assert c not in scoped and d not in scoped
+    # The unscoped graph still sees everyone (backward-compatible default).
+    assert set(full.keys()) == {a, b, c, d}
+
+
+@pytest.mark.asyncio
+async def test_scoped_graph_includes_off_scope_intermediates():
+    """Scoping must not drop a valid path that routes through off-scope hops.
+
+    a - hub - b where only {a, b} are in scope: component expansion must still
+    load the hub and both hub edges, so the a to b path survives. This is the
+    central correctness guard for #139's scoping.
+    """
+    from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths
+
+    a, hub, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with TestSessionLocal() as db:
+        await _insert_cable(db, a, "eth1", hub, "0/0/1")
+        await _insert_cable(db, hub, "0/0/2", b, "eth1")
+
+        scoped = await build_adjacency_graph(db, device_ids={a, b})
+
+    # The hub is not in the scope set but must be loaded as an intermediate.
+    assert hub in scoped
+    paths = find_all_shortest_paths(scoped, a, b)
+    assert len(paths) == 1
+    assert [h.device_id for h in paths[0]] == [a, hub, b]
+
+
+@pytest.mark.asyncio
+async def test_scoped_results_match_unscoped():
+    """For an in-scope query, scoped and unscoped graphs yield identical paths."""
+    from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths
+
+    # dut1 - sw_a - dut2 and dut1 - sw_b - dut2 (two equal-cost routes), plus an
+    # unrelated isolated fabric that scoping should skip.
+    dut1, dut2, sw_a, sw_b = (uuid.uuid4() for _ in range(4))
+    other1, other2 = uuid.uuid4(), uuid.uuid4()
+    async with TestSessionLocal() as db:
+        await _insert_cable(db, dut1, "eth1", sw_a, "p1")
+        await _insert_cable(db, dut2, "eth1", sw_a, "p2")
+        await _insert_cable(db, dut1, "eth2", sw_b, "q1")
+        await _insert_cable(db, dut2, "eth2", sw_b, "q2")
+        await _insert_cable(db, other1, "eth1", other2, "eth1")
+
+        scoped = await build_adjacency_graph(db, device_ids={dut1, dut2})
+        full = await build_adjacency_graph(db)
+
+    scoped_paths = find_all_shortest_paths(scoped, dut1, dut2)
+    full_paths = find_all_shortest_paths(full, dut1, dut2)
+
+    def _key(paths):
+        return sorted(tuple(h.device_id for h in p) for p in paths)
+
+    assert _key(scoped_paths) == _key(full_paths)
+    assert len(scoped_paths) == 2
+
+
+@pytest.mark.asyncio
+async def test_async_offload_matches_sync():
+    """The asyncio.to_thread wrapper returns identical results to the sync call."""
+    from app.services.pathfind_service import (
+        find_all_shortest_paths,
+        find_all_shortest_paths_async,
+    )
+
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(b, "eth1", "0/0/1")],
+        b: [(a, "0/0/1", "eth1"), (c, "0/0/2", "eth1")],
+        c: [(b, "eth1", "0/0/2")],
+    }
+    sync_paths = find_all_shortest_paths(graph, a, c)
+    async_paths = await find_all_shortest_paths_async(graph, a, c)
+
+    assert [(h.device_id, h.port_in, h.port_out) for p in sync_paths for h in p] == [
+        (h.device_id, h.port_in, h.port_out) for p in async_paths for h in p
+    ]
+
+
+def test_path_count_cap_truncates_on_dense_mesh():
+    """A densely meshed graph with many equal-cost routes truncates at the cap.
+
+    source and target are each connected to N distinct intermediates, giving N
+    equal-cost 3-hop routes. With N above the cap, enumeration must return
+    exactly MAX_ENUMERATED_PATHS rather than hang or return all N.
+    """
+    from app.services.pathfind_service import MAX_ENUMERATED_PATHS, find_all_shortest_paths
+
+    source, target = uuid.uuid4(), uuid.uuid4()
+    n = MAX_ENUMERATED_PATHS + 50
+    intermediates = [uuid.uuid4() for _ in range(n)]
+    graph: dict = {source: [], target: []}
+    for mid in intermediates:
+        graph[source].append((mid, "s_out", "m_in"))
+        graph[target].append((mid, "t_out", "m_in"))
+        graph[mid] = [(source, "m_in", "s_out"), (target, "m_out", "t_out")]
+
+    paths = find_all_shortest_paths(graph, source, target)
+    # All routes are distinct (distinct intermediates), so the cap bites exactly.
+    assert len(paths) == MAX_ENUMERATED_PATHS
+    # Every returned route is a valid 3-hop source to target path.
+    for p in paths:
+        assert p[0].device_id == source
+        assert p[-1].device_id == target
+        assert len(p) == 3
+
+
+def test_path_count_cap_does_not_truncate_collapsed_parallel_cables():
+    """Many parallel cables through ONE intermediate collapse to a single route.
+
+    This guards that the cap counts distinct routes, not raw cable permutations:
+    2N parallel cables through one switch must still return exactly one route,
+    well under the cap, matching the existing collapse semantics.
+    """
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    dut1, dut2, sw = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    graph: dict = {dut1: [], dut2: [], sw: []}
+    for i in range(40):
+        graph[dut1].append((sw, f"d1_{i}", f"p{i}"))
+        graph[sw].append((dut1, f"p{i}", f"d1_{i}"))
+        graph[dut2].append((sw, f"d2_{i}", f"q{i}"))
+        graph[sw].append((dut2, f"q{i}", f"d2_{i}"))
+
+    paths = find_all_shortest_paths(graph, dut1, dut2)
+    assert len(paths) == 1
+    assert paths[0][1].device_id == sw
