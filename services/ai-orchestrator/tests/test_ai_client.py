@@ -671,3 +671,84 @@ async def test_streaming_empty_final_text_raises():
             messages=_msgs("<reservation>r1</reservation>", "Q?"),
             dispatcher=_FakeDispatcher(),
         )
+
+
+class _StreamingCapFakeProvider:
+    """call_stream always returns a tool_use turn, so the streaming tool loop
+    never returns early and runs to its iteration cap; call serves the forced
+    buffered close the cap path makes with tools disabled (the streaming
+    _StreamingFakeProvider.call raises, so it cannot exercise this). Records the
+    buffered call kwargs so a test can assert tools=None and the nudge message.
+    """
+
+    def __init__(self, *, final: ProviderResponse) -> None:
+        self._final = final
+        self.stream_calls = 0
+        self.buffered_calls: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> ProviderResponse:
+        self.buffered_calls.append(kwargs)
+        return self._final
+
+    async def call_stream(self, **kwargs: Any):
+        self.stream_calls += 1
+        i = self.stream_calls
+        yield StreamDone(
+            response=_resp(
+                [_tool_use("get_device", {"device_id": f"d{i}"}, f"toolu_{i}")],
+                stop_reason="tool_use",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_streaming_iteration_cap_forces_buffered_final_answer():
+    """Streaming twin of test_tool_loop_iteration_cap_forces_final_answer_without_tools.
+
+    Every streamed turn is a tool_use turn, so the loop exhausts its iteration
+    budget and forces a final buffered answer with tools disabled. The forced
+    close streams its text as token(s) and the done event carries the answer.
+    """
+    provider = _StreamingCapFakeProvider(
+        final=_resp([TextBlock(text="Best guess answer.")], stop_reason="end_turn"),
+    )
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher()
+    events = await _collect_stream(
+        client,
+        messages=_msgs("<reservation/>", "Why is everything broken?"),
+        dispatcher=dispatcher,
+        max_iterations=3,
+    )
+    # Three streamed tool turns, then exactly one forced buffered close.
+    assert provider.stream_calls == 3
+    assert len(provider.buffered_calls) == 1
+    # The forced close disables tools and nudges with an "exhausted" user message.
+    assert provider.buffered_calls[0]["tools"] is None
+    nudge = provider.buffered_calls[0]["messages"][-1]
+    assert nudge.role == "user"
+    assert "exhausted" in nudge.content[0].text.lower()
+    # The forced answer flushes as token(s) and the done event carries it.
+    done = events[-1]
+    assert done.type == "done"
+    assert done.result.answer == "Best guess answer."
+    assert done.result.iteration == 3
+    assert any(e.type == "token" and e.text == "Best guess answer." for e in events)
+
+
+@pytest.mark.asyncio
+async def test_streaming_iteration_cap_no_text_raises_aierror():
+    """Streaming twin of test_tool_loop_iteration_cap_with_no_text_raises_aierror.
+
+    The forced buffered close returns no usable text, so the streaming path
+    raises AIError naming the exhausted budget rather than emitting a done event.
+    """
+    provider = _StreamingCapFakeProvider(final=_resp([], stop_reason="end_turn"))
+    client = _make_client(provider)
+    with pytest.raises(AIError, match="exhausted"):
+        await _collect_stream(
+            client,
+            messages=_msgs("<reservation/>", "?"),
+            dispatcher=_FakeDispatcher(),
+            max_iterations=1,
+        )
