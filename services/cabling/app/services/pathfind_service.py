@@ -22,17 +22,19 @@ async def build_adjacency_graph(
 ) -> dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]]:
     """Load connections and build a bidirectional adjacency list.
 
-    Each entry maps device_id to a list of (neighbor_id, local_port, remote_port).
+    Each entry maps device_id to a list of (neighbor_id, local_port,
+    remote_port). Bidirectional: if there is an edge A to B, both A maps to
+    [B, ...] and B maps to [A, ...] are present so pathfinding is undirected.
 
-    When ``device_ids`` is None the whole connections table is loaded (the
-    original, instance-wide behavior). When a set is given, only the connected
-    components that contain those devices are loaded: we expand the device
-    frontier iteratively (each round pulls every connection touching a known
-    device, then adds the newly discovered neighbors) until it stops growing.
-    That keeps the load scoped to the relevant fabric(s) without ever dropping a
-    legitimate path, since every edge reachable from a seed device is loaded,
-    including intermediates that are not themselves in ``device_ids`` (for
-    example a patch panel that physically realizes a topology edge).
+    When device_ids is None the entire connections table is loaded (the
+    instance-wide behavior, used during topology import). When a set is given,
+    only the connected components containing those devices are loaded via
+    iterative frontier expansion (issue #139): each round fetches every
+    connection touching a known device and adds newly discovered neighbors to
+    the frontier. This scopes the graph load to relevant fabrics, improving
+    pathfind latency on large instances. The expansion never drops a legitimate
+    path: every edge reachable from a seed device is loaded, including
+    intermediates (e.g. patch panels) not themselves in device_ids.
     """
     graph: dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]] = {}
 
@@ -119,17 +121,20 @@ def find_all_shortest_paths(
     source_id: uuid.UUID,
     target_id: uuid.UUID,
 ) -> list[list[PathHop]]:
-    """Find every shortest route between two devices.
+    """Find all shortest-hop paths from source to target.
 
     BFS with multi-predecessor tracking enumerates all minimum-hop paths.
     Routes that traverse the same intermediate device sequence via different
     cables collapse to a single entry: parallel cables between the same pair
-    of devices look like one route to the user, not N. Edge weights are
-    uniform (1 hop). Returns an empty list when target is unreachable.
-
-    The number of distinct returned routes is capped at MAX_ENUMERATED_PATHS;
-    on a denser fabric the result is truncated rather than enumerated without
-    bound.
+    look like one route, not N. Edge weights are uniform (1 hop). Returns
+    empty list when target is unreachable or source not in graph. CPU-bound;
+    called from find_all_shortest_paths_async which offloads to a worker
+    thread. The distance dict tracks hop count per device; predecessors dict
+    stores all (prev, local_port, remote_port) tuples at each hop distance
+    so _enumerate_paths can reconstruct all paths in parallel. The enumeration
+    is capped at MAX_ENUMERATED_PATHS per-sequence to prevent exponential
+    explosion on dense fabrics (many equal-cost routes through distinct
+    intermediate device sequences).
     """
     if source_id == target_id:
         return [[PathHop(device_id=source_id)]]
@@ -182,15 +187,19 @@ def _enumerate_paths(
     source_id: uuid.UUID,
     target_id: uuid.UUID,
 ) -> list[list[PathHop]]:
-    """Walk predecessor chains from target back to source.
+    """Walk predecessor chains from target back to source reconstructing paths.
 
-    Enumeration is deduped by intermediate-device sequence as it runs and stops
-    once MAX_ENUMERATED_PATHS distinct sequences have been recorded, so a dense
-    predecessor DAG (many parallel equal-cost routes) cannot blow up
-    exponentially in either time or memory. Parallel cables through the same
-    intermediates share a key and collapse to the first trail seen, which still
-    carries valid ports for that route; the caller dedupes again on the same key
-    (idempotent). The bound therefore counts genuinely distinct routes.
+    Depth-first stack-based traversal: each stack entry is (current_device,
+    trail_so_far). The trail is built from target to source (reversed at end).
+    Enumeration dedupes by intermediate-device sequence as it runs and stops
+    once MAX_ENUMERATED_PATHS distinct sequences are recorded, so a dense DAG
+    (many parallel equal-cost routes) cannot blow up exponentially. The seen_keys
+    set (intermediate device IDs only, excluding source and target) prevents
+    retraversing the same route from different predecessor branches. Parallel
+    cables through the same intermediates share a key and collapse to the first
+    trail seen, still carrying valid ports for that route; the caller dedupes
+    again on the same key (idempotent). The bound counts genuinely distinct
+    intermediate sequences, not cable-level details.
     """
     # Each entry on the stack: (current_device, hops_so_far_from_target)
     # hops_so_far_from_target stores tuples (device, port_in, port_out_to_next)

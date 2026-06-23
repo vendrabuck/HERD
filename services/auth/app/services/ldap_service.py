@@ -30,15 +30,18 @@ logger = logging.getLogger(__name__)
 
 
 def _build_tls() -> Tls:
-    """Build the TLS config for LDAP connections.
+    """Build the TLS config for LDAP connections, validating server certificate.
 
-    Validates the directory server's certificate by default: the SIMPLE binds
-    below transmit the service-account password and every user's submitted
-    password, so an unvalidated certificate lets an active network attacker MITM
-    the connection and harvest credentials. ldap3's bare Tls() defaults to
-    CERT_NONE, which is why the validation must be set explicitly here. Disabling
-    validation (ldap_tls_validate=False) is an opt-in escape hatch for a lab
-    directory behind a self-signed cert and logs a warning.
+    Validates the directory server's certificate by default: both SIMPLE binds
+    below (service-account and user credentials) transmit passwords on the wire,
+    so an unvalidated certificate lets an active network attacker MITM the
+    connection and harvest credentials. ldap3's bare Tls() defaults to
+    CERT_NONE, a dangerous default for password-carrying connections; validation
+    is explicitly set here. Disabling validation (ldap_tls_validate=False) is an
+    opt-in escape hatch for lab directories behind self-signed certs and logs a
+    warning; production deployments should use a real CA cert or
+    ldap_ca_cert pointing to a private CA bundle. This function is not
+    authentication itself but a prerequisite that prevents credential leaks.
     """
     if not settings.ldap_tls_validate:
         logger.warning(
@@ -72,7 +75,16 @@ def _build_server() -> Server:
 
 
 def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
-    """Service-account bind, then search for the user. Returns (dn, attrs) or None."""
+    """Bind as service account, then search for the user DN and attributes.
+
+    Returns (user_dn, {email_attr: [values], username_attr: [values]}) on
+    success, or None on any failure (bind failed, search returned no results,
+    LDAP exception). The service account (ldap_bind_dn + ldap_bind_password)
+    must have search permission on ldap_user_base_dn. The search_filter is
+    template'd with the escaped username to prevent filter injection. This
+    function is always synchronous (blocking ldap3 calls); callers use
+    anyio.to_thread to dispatch it.
+    """
     server = _build_server()
     conn = Connection(
         server,
@@ -142,6 +154,17 @@ def _bind_as_user(user_dn: str, password: str) -> bool:
 
 
 def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
+    """Authenticate a user against LDAP. Returns LdapIdentity on success, None on failure.
+
+    Flow: (1) bind as service account and search for the user DN; (2) bind as
+    that user with the submitted password; (3) extract and return email and
+    username attributes. The search filters on ldap_user_filter (injected with
+    escaped username to prevent LDAP filter injection). Returns None on any
+    failure: configuration incomplete, empty password (rejects anonymous bind),
+    service-account bind failure, search returned no results, user bind failure
+    (wrong password, disabled account, etc.), missing email attribute, or LDAP
+    exception. Callers wrap this in anyio.to_thread to keep it off the event loop.
+    """
     if not settings.ldap_server_url or not settings.ldap_user_base_dn:
         logger.error("LDAP not fully configured; bind aborted")
         return None

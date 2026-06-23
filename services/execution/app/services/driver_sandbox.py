@@ -52,11 +52,15 @@ def _build_preexec_fn():
     """Return a preexec_fn that applies POSIX resource limits to the driver child.
 
     Runs in the child after fork, before exec. Returns None on non-POSIX
-    platforms (Windows, or any platform without os.fork), in which case the
-    subprocess is launched without rlimits (the prior behavior, so no
-    regression). Each limit reads settings live so tests can monkeypatch them;
-    a limit of 0 leaves that resource unlimited. setrlimit failures are
-    swallowed: there is no safe logger inside the forked child.
+    platforms (Windows, no os.fork), in which case the subprocess launches
+    without rlimits (backward compatible; no regression). Each limit reads
+    settings live so tests can monkeypatch them; a limit of 0 leaves that
+    resource unlimited. Limits applied: RLIMIT_AS (address space, prevents
+    OOM-bomb drivers), RLIMIT_CPU (seconds, prevents infinite loops),
+    RLIMIT_NOFILE (open files), RLIMIT_NPROC (child processes, prevents
+    fork-bombs). setrlimit failures are swallowed: no safe logger exists
+    inside the forked child after fork and before exec; a setrlimit error
+    (e.g. insufficient permissions) must not break the spawn.
     """
     if sys.platform == "win32" or not hasattr(os, "fork"):
         return None
@@ -284,18 +288,20 @@ def execute_driver_method(
 
 
 def extract_config_schema(driver_path: str, timeout: int | None = None) -> dict:
-    """Extract a driver's published config schema in the sandbox.
+    """Extract a driver's published config schema via the sandbox.
 
     Invokes the `__config_schema__` sentinel action, which reads
-    `Driver.config_schema()` on the class object without instantiating the
-    driver (so a credential-dependent __init__ never runs). The classmethod is
-    still untrusted code, so it runs under the same rlimit subprocess and the
-    short status timeout.
-
-    Returns the standard execute_driver_method result dict. On success its
-    `output` is `{"has_schema": bool, "schema": dict | None}`. Callers must
-    treat a non-dict schema, a failed run, or a timeout as "no usable schema"
-    and fall back to the registry; this helper never raises.
+    Driver.config_schema() on the class object without instantiation (so a
+    credential-dependent __init__ never runs). The classmethod is still
+    untrusted code, so it runs under the same rlimit subprocess and the short
+    status timeout, preventing credential leaks even during schema inspection.
+    At driver load time execution caches the schema per-SHA256; mismatches
+    between driver versions are naturally scoped. Returns the standard
+    execute_driver_method result dict; on success `output` is
+    {"has_schema": bool, "schema": dict | None}. Callers must treat
+    non-dict schema, failed run, or timeout as "no usable schema" and fall
+    back to the in-process registry; this helper never raises so extraction
+    failures do not block driver load.
     """
     if timeout is None:
         timeout = settings.status_check_timeout_seconds
