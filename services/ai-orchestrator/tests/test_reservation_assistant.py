@@ -672,6 +672,141 @@ async def test_stream_requires_auth(async_client):
     assert resp.status_code == 401
 
 
+# --- Streaming endpoint setup gates ---
+#
+# Auth, quota, and conversation resolution run in the endpoint body BEFORE the
+# StreamingResponse is returned, so these failures must surface as real HTTP
+# statuses the client can branch on, NOT as in-band SSE `error` frames. The
+# streaming endpoint duplicates these gates from the buffered one without sharing
+# the code path, so each is pinned here independently. Only failures AFTER the
+# stream opens (see the timeout test below) become `error` events.
+
+
+async def test_stream_503_when_api_key_blank(async_client, monkeypatch):
+    """Unconfigured AI: the stream endpoint 503s as a real HTTP status, before
+    any stream is opened (not a 200 event-stream carrying an error frame)."""
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    _override_seed()
+    _override_streaming_ai([])
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "hello"}, headers=headers)
+    assert resp.status_code == 503
+    assert not resp.headers["content-type"].startswith("text/event-stream")
+
+
+async def test_stream_over_quota_returns_429_without_calling_ai(async_client, monkeypatch):
+    """At/over quota, the stream endpoint 429s as a real HTTP status and never
+    opens the stream or invokes the provider (enforce_quota runs in _prepare_turn,
+    before the StreamingResponse is returned). Mirrors the buffered 429 gate."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    token = _user_token()
+    async with _TestSessionLocal() as db:
+        await usage_repo.add_tokens(db, _decode_sub(token), input_tokens=100, output_tokens=0)
+
+    class ExplodingStreamAI:
+        async def answer_reservation_question_streaming(self, **kwargs):
+            raise AssertionError("provider must not be called when over quota")
+            yield  # unreachable; present only so this is an async generator
+
+    app.dependency_overrides[get_ai_client] = lambda: ExplodingStreamAI()
+    _override_seed()
+    headers = {"Authorization": f"Bearer {token}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "hello"}, headers=headers)
+    assert resp.status_code == 429
+    assert resp.json()["detail"]["limit"] == 100
+    assert not resp.headers["content-type"].startswith("text/event-stream")
+
+
+async def test_stream_unknown_conversation_id_returns_404(async_client):
+    """A non-existent conversation_id 404s as a real HTTP status before the
+    stream opens. Mirrors the buffered unknown-conversation gate."""
+    _override_seed()
+    _override_streaming_ai([])
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    bogus = str(uuid.uuid4())
+    async with async_client as client:
+        resp = await client.post(
+            _stream_url(),
+            json={"question": "hi", "conversation_id": bogus},
+            headers=headers,
+        )
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"].lower()
+
+
+async def test_stream_other_users_conversation_id_returns_404(async_client):
+    """Ownership-leak protection on the stream path: a conversation created by
+    user A must not be loadable by user B. Returns 404 (not 403) so existence is
+    not leaked, as a real HTTP status before the stream opens."""
+    _override_seed()
+    _override_ai()  # user A creates the conversation via the buffered endpoint
+    user_a_token = _user_token()
+    user_b_token = _user_token()  # different `sub` (random uuid in helper)
+    async with async_client as client:
+        a_resp = await client.post(
+            _url(),
+            json={"question": "private question"},
+            headers={"Authorization": f"Bearer {user_a_token}"},
+        )
+        assert a_resp.status_code == 200
+        conv_id = a_resp.json()["conversation_id"]
+
+        # User B must be rejected before reaching the stream.
+        _override_streaming_ai([])
+        b_resp = await client.post(
+            _stream_url(),
+            json={"question": "give me your data", "conversation_id": conv_id},
+            headers={"Authorization": f"Bearer {user_b_token}"},
+        )
+    assert b_resp.status_code == 404
+
+
+async def test_stream_overall_timeout_emits_error_and_leaves_no_orphan(async_client, monkeypatch):
+    """The stream opens (200), then the overall deadline fires mid-generation:
+    an HTTP status can no longer be set, so the timeout becomes an SSE `error`
+    frame, and the flushed-but-uncommitted user turn is rolled back so no orphan
+    persists. Streaming twin of the buffered 504 timeout."""
+    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.05)
+
+    class SlowStreamAI:
+        async def answer_reservation_question_streaming(
+            self, *, messages, dispatcher, max_iterations=8, per_call_timeout_s=20.0
+        ):
+            await asyncio.sleep(1)
+            yield  # never reached: the deadline fires during the sleep above
+
+    app.dependency_overrides[get_ai_client] = lambda: SlowStreamAI()
+    _override_seed()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "slow"}, headers=headers)
+    # The stream opened, so the failure rides an error event, not an HTTP status.
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    events = _parse_sse(resp.text)
+    assert events[-1][0] == "error"
+    assert events[-1][1]["message"].startswith("Assistant did not respond within")
+
+    # Atomicity: a first-turn timeout must roll back the flushed conversation and
+    # user message. No conversation_id is returned on failure, so prove it at the
+    # DB level: zero conversations and zero messages persisted.
+    from app.models.conversation import AssistantConversation, AssistantMessage
+    from sqlalchemy import func, select
+
+    async with _TestSessionLocal() as db:
+        conv_count = (
+            await db.execute(select(func.count()).select_from(AssistantConversation))
+        ).scalar_one()
+        msg_count = (
+            await db.execute(select(func.count()).select_from(AssistantMessage))
+        ).scalar_one()
+    assert conv_count == 0
+    assert msg_count == 0
+
+
 # --- Turn atomicity: a mid-turn failure must not orphan the user message ---
 #
 # Root cause regression: _prepare_turn used to commit the new user message
