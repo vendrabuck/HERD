@@ -266,11 +266,16 @@ def get_active_tool_definitions() -> list[dict[str, Any]]:
 
 
 def _flatten_password_keys_present(payload: Any, password_keys: set[str]) -> set[str]:
-    """Recursively walk `payload` and return any key in `password_keys` that
-    appears anywhere. Used to reject AI writes targeting password-typed
-    template fields before they reach the inventory service.
+    """Find any password-typed template field keys present in the payload.
 
-    Walks dicts and lists. Non-container values are leaves.
+    Recursively walks dicts and lists (non-containers are leaves) and returns
+    the set of keys from password_keys that appear anywhere in payload. Used
+    to reject AI writes (propose_config_change) targeting password-typed
+    template fields before they reach the inventory service. The AI should
+    never write credentials; if it tries, this rejects the whole write so the
+    model can apologise and retry with a safe payload. This is defense in depth:
+    the tool schema already tells the model not to include passwords, but the
+    model might still try (prompt injection, model hallucination, etc.).
     """
     if not password_keys:
         return set()
@@ -331,22 +336,25 @@ class ToolDispatcher:
         return {"Authorization": f"Bearer {self._token}"}
 
     async def dispatch(self, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
-        """Execute one tool call. Returns {"content": <json string>, "is_error": bool}
-        ready to be wrapped into an Anthropic tool_result block by the loop.
+        """Execute one tool call. Returns {"content": <json string>, "is_error": bool}.
 
         Never raises for downstream failures; converts them to is_error=True
         so the model can recover or apologise within the same conversation.
+        Always returns a tool_result block ready for the LLM loop.
+
+        The write-tools gate is enforced here at execution, not just in
+        get_active_tool_definitions(). Hiding a write tool from the advertised
+        list is insufficient: a model can still emit the call by name. This
+        dispatch gate ensures the flag holds regardless of the tool set. The
+        ToolError flows through the except branch into an is_error result the
+        model can recover from; the finally block records all attempts (success,
+        error, write-gate rejection) in call_log so the route can surface the
+        full attempt history in conversation metadata and usage logs.
         """
         started = time.monotonic()
         error: str | None = None
         content: Any
         try:
-            # Enforce the write-tools gate at the execution boundary. Hiding a
-            # write tool from get_active_tool_definitions() is not enough: a model
-            # can still emit the call by name. Refuse to run it here so the gate
-            # holds even when the flag is off. The ToolError flows through the
-            # except branch below into an is_error result the model can recover
-            # from, and the finally block still records the attempt in call_log.
             if tool_name in WRITE_TOOL_NAMES and not settings.ai_write_tools_enabled:
                 raise ToolError("write tools are disabled")
             handler = getattr(self, f"_tool_{tool_name}", None)
@@ -549,15 +557,21 @@ class ToolDispatcher:
         return response
 
     async def _fetch_published_schema_for_driver(self, driver_id: Any) -> dict[str, Any] | None:
-        """Resolve a driver's published config schema via inventory, else None.
+        """Resolve driver published config schema via inventory proxy.
 
-        Calls inventory's /drivers/{driver_id}/config-schema proxy, which returns
-        {schema, source, ...} with the driver-published schema when source is
-        "driver". Returns that schema dict only when the proxy reports a driver-
-        sourced schema; returns None (so the caller falls back to the in-process
-        registry) on a missing driver_id or any failure: network error, non-2xx,
-        malformed payload, or a registry/none source. Never raises; a broken or
-        unreachable published-schema path must not break the tool.
+        Calls inventory /drivers endpoint which returns schema with source field.
+        Implements issue #23 configure-boundary precedence: returns the driver
+        published config_schema (sourced from execution per-SHA256 cache) when
+        one exists, else the in-process registry entry, and fails open. A
+        Management driver like frr_mgmt publishes commands vocabulary the
+        generic registry (vlan, ip, hostname, description) does not describe;
+        without this the model steers toward payloads the device rejects at
+        apply time (issue #147). Returns that schema dict only when the proxy
+        response source is driver; returns None (so caller falls back to the
+        in-process registry) on missing driver_id, network error, HTTP errors,
+        malformed payload, or non-driver source. Never raises; broken or
+        unreachable published-schema path must not break the tool, since the
+        registry fallback is always correct.
         """
         if not driver_id:
             return None

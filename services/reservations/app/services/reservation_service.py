@@ -190,11 +190,15 @@ async def _create_reservation_fork_best_effort(
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
 ) -> None:
-    """Run _create_reservation_fork with bounded retry and log-and-continue.
+    """Create the fork with bounded retry and log-and-continue.
 
-    Fork creation is best-effort at activation: it must never raise out of
-    create_reservation and strand a provisioned reservation. Exhausted retries are
-    logged structured and swallowed, leaving the reservation ACTIVE with no fork.
+    Fork creation is best-effort at activation (issue #25): it must never raise
+    out of create_reservation and strand a provisioned reservation. Exhausted
+    retries are logged as structured errors and swallowed, leaving the
+    reservation ACTIVE with fork_id null. The reservation is still usable on
+    the bench; the fork is created lazily on first edit or by a future sweeper.
+    This fail-open design ensures provisioning success does not depend on a
+    separate cabling service call.
     """
     if topology_id is None:
         return
@@ -227,11 +231,15 @@ async def _check_conflicts(
     exclude_id: uuid.UUID | None = None,
     exclusive_device_ids: set[str] | None = None,
 ) -> list[uuid.UUID]:
-    """
-    Returns a list of device_ids that have conflicting reservations in the given window.
-    Conflict = any ACTIVE/PENDING/PENDING_PROVISION reservation overlapping [start_time, end_time).
-    PENDING_PROVISION is included so a second create during the provisioning window is rejected.
-    Only exclusive devices are checked when exclusive_device_ids is provided.
+    """Return device IDs with conflicting reservations in the given window.
+
+    Conflict is any ACTIVE/PENDING/PENDING_PROVISION reservation overlapping
+    [start_time, end_time). PENDING_PROVISION is included (not just ACTIVE)
+    so a second create during the provisioning window is rejected; the commit
+    of the first reservation's row closes the race against concurrent creates.
+    Only exclusive devices are checked when exclusive_device_ids is provided;
+    non-exclusive devices may overbuild and so are never conflict-checked.
+    Uses indexed join over reservation_devices to avoid N+1 queries.
     """
     # Only check exclusive devices when the set is provided.
     requested_str = {str(d) for d in device_ids}
@@ -342,9 +350,15 @@ async def _update_device_statuses(
 
 
 async def _acquire_device_locks(db: AsyncSession, device_ids: list[uuid.UUID]) -> None:
-    """Acquire PostgreSQL advisory locks for each device to prevent race conditions.
-    Locks are sorted to avoid deadlocks and auto-release on transaction commit.
-    No-op on SQLite (tests).
+    """Acquire PostgreSQL advisory locks for each device before conflict checking.
+
+    Serializes concurrent creates on the same device set to prevent the
+    create-window race: both threads fetch AVAILABLE status, both see no
+    conflicts (the first reservation row is not yet committed), and both
+    commit. Advisory locks are sorted by stringified device_id (stable
+    ordering) to prevent deadlocks between concurrent different device sets.
+    Locks auto-release on transaction commit. No-op on SQLite (integration
+    tests run in-memory without advisory lock support).
     """
     dialect = db.bind.dialect.name if db.bind else ""
     if dialect != "postgresql":

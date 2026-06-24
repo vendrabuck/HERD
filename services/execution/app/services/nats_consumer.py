@@ -84,9 +84,12 @@ async def _get_internal(client, url, *, what, **kwargs):
 class _AsyncNullCtx:
     """Async context manager that yields a pre-existing object without closing it.
 
-    Lets a fetch helper write `async with _client_ctx(client) as c:` uniformly
-    whether it owns a freshly opened client (which must be closed) or is reusing
-    a per-event client owned by the caller (which must NOT be closed here).
+    Lets fetch helpers write `async with _client_ctx(client) as c:` uniformly
+    whether they own a freshly-opened client (which must be closed) or are
+    reusing a per-event client owned by the caller (which must NOT be closed
+    here). This abstraction enables per-event client pooling (issue #137):
+    one httpx.AsyncClient for the whole event, reused across many fetches,
+    versus the prior per-call behavior (open, use, close every fetch).
     """
 
     def __init__(self, obj):
@@ -190,16 +193,18 @@ async def _fetch_template(template_id: str, client=None) -> dict | None:
 class _FetchContext:
     """Per-event fetch context: one shared httpx client plus memoization caches.
 
-    Created once per reservation lifecycle event so the L1 and L2 resolver passes
-    (and the later execution phase) reuse a single connection pool and never
-    re-fetch the same device's connections or the same far-end device twice
-    (issue #137). The caches map:
+    Created once per reservation lifecycle event (issue #137) so the L1 and L2
+    resolver passes (and the later execution phase) reuse a single connection
+    pool and never re-fetch the same device's connections or the same far-end
+    device twice. This is a performance critical optimization: dense topologies
+    can have many connections, and without memoization each connection's
+    far-end device would be fetched N times. The caches map:
       - conn_cache:   device_id -> list[connection dict]
       - device_cache: device_id -> device dict | None
 
-    A None entry in device_cache is a real cached "not found" (a 404), so a
-    missing far end is classified at most once too. The client is owned by the
-    caller (handle_reservation_event); these helpers never close it.
+    A None entry in device_cache is a real cached "not found" (404), so a
+    missing far end is classified at most once per event. The client is owned
+    by the caller (handle_reservation_event); these helpers never close it.
     """
 
     def __init__(self, client):
@@ -1136,11 +1141,17 @@ async def process_reservation_message(
     *,
     max_deliver: int = NATS_MAX_DELIVER,
 ) -> str:
-    """Process one NATS message. Returns 'ack', 'nak', or 'dlq'.
+    """Process one NATS message from the herd.reservations.* stream.
 
-    Poison messages (undecodable JSON) go to the DLQ immediately. Transient
-    handler failures NAK so JetStream reapplies the configured backoff; once
-    num_delivered reaches max_deliver the message is moved to the DLQ.
+    Returns 'ack', 'nak', or 'dlq'. Poison messages (undecodable JSON) are
+    routed to the DLQ immediately so a single malformed event does not wedge
+    the consumer. Transient handler failures (TransientUpstreamError) NAK so
+    JetStream reapplies the configured backoff and redelivers; the handler
+    is expected to raise TransientUpstreamError on 5xx or transport errors,
+    and swallow 404s as "not found". Once num_delivered reaches max_deliver
+    the message is moved to the DLQ (herd.reservations.dlq.execution) for
+    inspection and replay. All ack/nak/dlq actions are explicit; the loop
+    does not rely on ack_wait timeout to drive failure handling.
     """
     try:
         event_data = json.loads(msg.data.decode())
