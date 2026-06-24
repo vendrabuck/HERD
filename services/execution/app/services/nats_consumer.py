@@ -1160,6 +1160,7 @@ async def process_reservation_message(
             "Poison message on reservations stream; routing to DLQ",
             extra={"action": "nats_poison_message", "size": len(msg.data)},
         )
+        # Undecodable messages go to DLQ immediately and are ACK'd so they don't loop.
         await _publish_to_dlq(js, msg.data)
         await msg.ack()
         return "dlq"
@@ -1169,6 +1170,9 @@ async def process_reservation_message(
     except Exception as exc:
         num_delivered = getattr(getattr(msg, "metadata", None), "num_delivered", 1) or 1
         if num_delivered >= max_deliver:
+            # Backoff expired: move to DLQ (4-token subject sits outside the 3-token
+            # consumer filter so it is not redelivered to this consumer, avoiding
+            # poison loops). DLQ retention allows inspection and manual replay.
             logger.error(
                 "Message exhausted max_deliver; routing to DLQ",
                 extra={
@@ -1181,6 +1185,9 @@ async def process_reservation_message(
             await _publish_to_dlq(js, msg.data)
             await msg.ack()
             return "dlq"
+        # Transient error: NAK so JetStream applies the backoff delay and redelivers.
+        # This signals the handler that resource contention or a service outage might
+        # clear soon, so do not give up yet.
         logger.warning(
             "Transient error processing NATS message; NAK for retry",
             extra={
@@ -1198,7 +1205,14 @@ async def process_reservation_message(
 
 
 async def start_nats_consumer(app) -> None:
-    """Start the NATS consumer as a background task during app lifespan."""
+    """Start the NATS consumer as a background task during app lifespan.
+
+    Subscribes to "herd.reservations.*" events with a durable consumer, configures
+    bounded retry policy (max_deliver + exponential backoff), and spins the message
+    loop. Failed messages that exhaust retries or are poison (undecodable JSON) are
+    routed to the DLQ stream for inspection and manual replay. The consumer survives
+    pod restarts; restarting the service resumes consuming from the last ACK'd offset.
+    """
     import nats
     from nats.js.api import ConsumerConfig
 
@@ -1217,8 +1231,11 @@ async def start_nats_consumer(app) -> None:
             logger.warning("Could not create/update NATS stream", exc_info=True)
 
         # Durable consumer with explicit retry policy: bounded redelivery + backoff.
-        # The DLQ subject (NATS_DLQ_SUBJECT) is intentionally outside this filter so
-        # DLQ'd messages are not redelivered to this consumer; see its definition.
+        # Durability persists the consumer state across restarts, so unprocessed messages
+        # are not lost if the execution pod goes down. The consumer name is scoped to
+        # this service so other consumers (e.g., notifications) have their own durable
+        # offset. The DLQ subject (NATS_DLQ_SUBJECT) is intentionally outside this filter
+        # so DLQ'd messages are not redelivered to this consumer; see NATS_DLQ_SUBJECT.
         sub = await js.subscribe(
             "herd.reservations.*",
             durable="execution-consumer",

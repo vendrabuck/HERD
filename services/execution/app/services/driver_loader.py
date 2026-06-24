@@ -163,6 +163,11 @@ def extract_config_schema_json(driver_dir: Path) -> str | None:
     returned a non-dict, or the extraction failed/timed out. This is fail-open
     by design: a broken config_schema() must never block a driver load; the
     validation path falls back to the registry. See issue #23.
+
+    The sandbox is used to safely extract the schema without trusting arbitrary
+    driver code at import time. The extraction runs in a subprocess with resource
+    limits, so a malicious or runaway driver.config_schema() cannot hang the
+    execution service.
     """
     # Imported lazily so unit tests that exercise extract/validate without the
     # sandbox do not pull in the subprocess machinery at import time.
@@ -181,6 +186,7 @@ def extract_config_schema_json(driver_dir: Path) -> str | None:
         )
         return None
     output = result.get("output") or {}
+    # has_schema signals that config_schema() exists and returned a dict.
     if not output.get("has_schema"):
         return None
     schema = output.get("schema")
@@ -287,7 +293,12 @@ async def load_driver(
     # yields None and we degrade to the registry at validation time.
     config_schema_json = extract_config_schema_json(dest_dir)
 
-    # Update cache
+    # Update cache: upsert to handle concurrent load_driver calls. If two
+    # executions race on the same driver_id, both will download + extract + validate
+    # but only one will win the database write (UPSERT semantics). The loser's disk
+    # extraction is wasted but the cache row reflects the same sha256, so a later
+    # load will use whichever path the DB has (stale extraction paths are pruned
+    # on next load if the sha256 mismatches).
     result = await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id))
     existing = result.scalar_one_or_none()
     if existing:

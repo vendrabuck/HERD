@@ -938,3 +938,185 @@ async def test_l2_redelivery_skips_completed_vlan_ops():
     assert "create_vlan" not in ran_actions
     add_ports = [kw.get("port") for action, kw in calls if action == "add_to_vlan"]
     assert add_ports == ["eth2"], f"only the un-applied port should be added, got {add_ports}"
+
+
+# --- L2 deprovision execution block (nats_consumer.py 668-749) ---
+
+
+class _Assignment:
+    """Stand-in for a vlan_service VlanAssignment ORM row used by release_vlan."""
+
+    def __init__(self, vlan_id, switch_device_ids):
+        self.vlan_id = vlan_id
+        self.switch_device_ids = switch_device_ids
+
+
+def _l2_deprovision_patches(switch_id, switch_data, ops, assignments, execute_fn):
+    """Patch set that drives the deprovision execution block end to end.
+
+    release_vlan returns stored assignments so each op keeps its real VLAN, and
+    _fetch_device returns switch data so processing reaches the per-switch loop
+    instead of the "switch not found" continue.
+    """
+    return [
+        patch(
+            "app.services.nats_consumer._resolve_l2_switch_operations",
+            new=AsyncMock(return_value=ops),
+        ),
+        patch(
+            "app.services.vlan_service.release_vlan",
+            new=AsyncMock(return_value=assignments),
+        ),
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(return_value=switch_data)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_l2_deprovision_removes_ports_then_deletes_vlan():
+    """A fresh deprovision runs, in order, login, remove_from_vlan for each port,
+    delete_vlan, then logout, and persists a SUCCESS run for each."""
+    from app.services.nats_consumer import _execute_l2_switch_operations
+
+    l2_switch_id = str(uuid.uuid4())
+    l2_switch_data = {**SWITCH_DATA, "id": l2_switch_id, "connection_type": "Layer 2 Switch"}
+    ops = [
+        {"switch_device_id": l2_switch_id, "switch_port": "eth1", "tag": "tagged"},
+        {"switch_device_id": l2_switch_id, "switch_port": "eth2", "tag": "tagged"},
+    ]
+    assignments = [_Assignment(404, [l2_switch_id])]
+    calls, execute_fn = _recording_execute()
+
+    patches = _l2_deprovision_patches(l2_switch_id, l2_switch_data, ops, assignments, execute_fn)
+    for p in patches:
+        p.start()
+    try:
+        await _execute_l2_switch_operations(
+            device_ids=["dev-1"],
+            l2_action="deprovision",
+            reservation_id=str(uuid.uuid4()),
+            user_id=USER_ID,
+            get_db_session=_db_session_factory(),
+            dedupe_key="HERD_RESERVATIONS:70",
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    ran = [action for action, _ in calls]
+    # Ports are removed before the VLAN is deleted, and the VLAN is deleted once.
+    assert ran == ["login", "remove_from_vlan", "remove_from_vlan", "delete_vlan", "logout"]
+    removed_ports = [kw.get("port") for action, kw in calls if action == "remove_from_vlan"]
+    assert removed_ports == ["eth1", "eth2"]
+    # The stored VLAN id flows into both the port removals and the delete.
+    vlan_args = {
+        kw.get("vlan_id") for action, kw in calls if action != "login" and action != "logout"
+    }
+    assert vlan_args == {404}
+
+    async with TestSessionLocal() as session:
+        runs = list((await session.execute(select(ExecutionRun))).scalars().all())
+    by_action = {}
+    for run in runs:
+        by_action.setdefault(run.action, []).append(run)
+    assert set(by_action) == {"login", "remove_from_vlan", "delete_vlan", "logout"}
+    for run in runs:
+        assert run.status == "SUCCESS", f"{run.action} should have succeeded"
+
+
+@pytest.mark.asyncio
+async def test_l2_deprovision_redelivery_skips_completed_ops():
+    """On a deprovision replay, a remove_from_vlan for a port and the delete_vlan
+    that already SUCCEEDED under this dedupe_key are not re-run; the un-applied
+    port still is (issue #133 idempotency on the deprovision branch)."""
+    from app.services.nats_consumer import _execute_l2_switch_operations
+
+    l2_switch_id = str(uuid.uuid4())
+    l2_switch_data = {**SWITCH_DATA, "id": l2_switch_id, "connection_type": "Layer 2 Switch"}
+    ops = [
+        {"switch_device_id": l2_switch_id, "switch_port": "eth1", "tag": "tagged"},
+        {"switch_device_id": l2_switch_id, "switch_port": "eth2", "tag": "tagged"},
+    ]
+    assignments = [_Assignment(404, [l2_switch_id])]
+    key = "HERD_RESERVATIONS:71"
+    # A prior delivery removed eth1 and deleted the VLAN, then died before eth2.
+    await _seed_success_run("remove_from_vlan", "eth1", dedupe_key=key, device_id=l2_switch_id)
+    await _seed_success_run("delete_vlan", dedupe_key=key, device_id=l2_switch_id)
+
+    calls, execute_fn = _recording_execute()
+    patches = _l2_deprovision_patches(l2_switch_id, l2_switch_data, ops, assignments, execute_fn)
+    for p in patches:
+        p.start()
+    try:
+        await _execute_l2_switch_operations(
+            device_ids=["dev-1"],
+            l2_action="deprovision",
+            reservation_id=str(uuid.uuid4()),
+            user_id=USER_ID,
+            get_db_session=_db_session_factory(),
+            dedupe_key=key,
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    ran = [action for action, _ in calls]
+    # The already-applied eth1 removal and the delete_vlan are skipped.
+    removed_ports = [kw.get("port") for action, kw in calls if action == "remove_from_vlan"]
+    assert removed_ports == ["eth2"], (
+        f"only the un-applied port should be removed, got {removed_ports}"
+    )
+    assert "delete_vlan" not in ran, "an already-applied delete_vlan must not re-run"
+    # login and logout always run; they are not dedupe-guarded.
+    assert ran[0] == "login"
+    assert ran[-1] == "logout"
+
+
+@pytest.mark.asyncio
+async def test_l2_deprovision_login_failure_skips_vlan_ops():
+    """If login fails on the deprovision path, no VLAN operations run, but the
+    switch loop continues to the next switch (here, just logout is skipped too)."""
+    from app.services.nats_consumer import _execute_l2_switch_operations
+
+    l2_switch_id = str(uuid.uuid4())
+    l2_switch_data = {**SWITCH_DATA, "id": l2_switch_id, "connection_type": "Layer 2 Switch"}
+    ops = [{"switch_device_id": l2_switch_id, "switch_port": "eth1", "tag": "tagged"}]
+    assignments = [_Assignment(404, [l2_switch_id])]
+
+    call_actions = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        call_actions.append(action)
+        if action == "login":
+            return FAILURE_RESULT
+        return SUCCESS_RESULT
+
+    patches = _l2_deprovision_patches(l2_switch_id, l2_switch_data, ops, assignments, execute_fn)
+    for p in patches:
+        p.start()
+    try:
+        await _execute_l2_switch_operations(
+            device_ids=["dev-1"],
+            l2_action="deprovision",
+            reservation_id=str(uuid.uuid4()),
+            user_id=USER_ID,
+            get_db_session=_db_session_factory(),
+            dedupe_key="HERD_RESERVATIONS:72",
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    # Login fails, the switch is skipped via continue: no remove_from_vlan/delete_vlan/logout.
+    assert call_actions == ["login"]
+    async with TestSessionLocal() as session:
+        runs = list((await session.execute(select(ExecutionRun))).scalars().all())
+    login_runs = [r for r in runs if r.action == "login"]
+    assert len(login_runs) == 1
+    assert login_runs[0].status == "FAILED"
+    assert login_runs[0].error == "Connection refused"
+    assert {r.action for r in runs} == {"login"}
