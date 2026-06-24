@@ -1,0 +1,7 @@
+{
+  "name": "Mock Layer 1 Switch Driver",
+  "version": "0.1.0",
+  "connection_type": "Layer 1 Switch",
+  "supports_dry_run": true,
+  "notes": "Hardware-free L1 cross-connect driver for integration tests. Acknowledges port operations (connect_ports, disconnect_ports) deterministically and supports failure injection via HERD_mock_fail_actions / HERD_mock_raise_actions / HERD_mock_sleep_ms field_data. Not for production use."
+}
