@@ -1,0 +1,7 @@
+{
+  "name": "Mock Layer 2 Switch Driver",
+  "version": "0.1.0",
+  "connection_type": "Layer 2 Switch",
+  "supports_dry_run": true,
+  "notes": "Hardware-free L2 switch driver for integration tests. Acknowledges VLAN operations (create_vlan, add_to_vlan, remove_from_vlan, delete_vlan) deterministically and supports failure injection via HERD_mock_fail_actions / HERD_mock_raise_actions / HERD_mock_sleep_ms field_data. Not for production use."
+}
