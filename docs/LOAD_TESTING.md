@@ -4,7 +4,7 @@ HERD's load tests drive the HTTP API with [Locust](https://locust.io/), a Python
 
 ## What the tests do
 
-The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and three concrete user classes:
+The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and five concrete user classes:
 
 ### `HerdUser` (base)
 
@@ -46,9 +46,29 @@ Hits the permission-check endpoints as a non-admin user.
   - `single_check` (weight 2): `POST /api/acl/check` for one device
 - Think time: 1 to 3 seconds.
 
+### `BulkExporter` (weight 1)
+
+Exercises the bulk export/import surface as an admin.
+
+- Tasks:
+  - `export_devices_json` (weight 3): `GET /api/inventory/devices/export?format=json`
+  - `export_devices_csv` (weight 2): `GET /api/inventory/devices/export?format=csv`
+  - `export_templates_json` (weight 2): `GET /api/inventory/templates/export?format=json`
+  - `export_topologies_json` (weight 2): `GET /api/cabling/topologies/export?format=json`
+  - `dry_run_device_import` (weight 1): `POST /api/inventory/devices/import` with `dry_run=true`
+
+### `NotificationUser` (weight 2)
+
+Simulates a user polling and tuning notifications.
+
+- Tasks:
+  - `unread_count` (weight 5): `GET /api/notifications/notifications/unread-count`
+  - `list_notifications` (weight 3): `GET /api/notifications/notifications`
+  - `update_preferences` (weight 1): updates the user's notification preferences
+
 ### Class weighting
 
-Locust picks which class to spawn using the `weight` attribute. With the defaults (3, 5, 2), out of every 10 virtual users you get roughly 3 reservation users, 5 inventory browsers, and 2 ACL checkers. Increase `-u` to scale all three proportionally.
+Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `NotificationUser` 2, `ACLChecker` 2; total 13), out of every 13 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 2 notification users, and 2 ACL checkers. Increase `-u` to scale all five proportionally.
 
 ## Prerequisites
 

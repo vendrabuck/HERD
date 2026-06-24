@@ -107,7 +107,7 @@ Same request body, auth, ownership, quota, and persistence as the buffered endpo
 
 Event types (each frame is `event: <type>` then `data: <json>`):
 
-- `status`: a progress signal, `{ "message": "analyzing" | "running tools", "tools": ["list_ports", ...], "interim": false }`. `interim` is `true` on the status that follows a tool turn's narration text, the client's cue to discard the provisional tokens streamed so far in that turn before the tools run.
+- `status`: a progress signal, `{ "message": "analyzing" | "running tools", "tools": ["get_device_ports", ...], "interim": false }`. `interim` is `true` on the status that follows a tool turn's narration text, the client's cue to discard the provisional tokens streamed so far in that turn before the tools run.
 - `token`: one chunk of the final answer text, `{ "text": "..." }`. Only real answer text is streamed; a reasoning model's internal thinking is dropped.
 - `done`: the fully-assembled turn, carrying the same JSON object the buffered endpoint returns (`answer`, `model`, token counts, `stop_reason`, `tool_calls`, `tool_iterations`, `conversation_id`, `pending_apply`).
 - `error`: `{ "message": "..." }` for a failure after the stream opened (timeout or LLM failure).

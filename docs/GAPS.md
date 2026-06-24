@@ -86,22 +86,20 @@ Tests live under `frontend/src/test/api/`. Currently covered after this round:
 
 ## E2E
 
-`tests/e2e/` has 17 files and 66 tests. Major UI gaps:
+`tests/e2e/` has 30 files and 116 tests. Remaining UI gaps:
 
-- [HIGH] Notifications bell interaction (open panel, mark read, navigate).
-- [HIGH] Settings page (channel/event toggles round-trip; prefs visible to backend).
-- [HIGH] AI Generate feature (submit prompt, accept proposal, commit dialog).
-  Status-endpoint gate is covered; the integration-level positive test in
-  `tests/integration/test_ai_status.py::test_ai_generate_succeeds_when_key_present`
-  exercises the live LLM path, but the generate-to-commit UI flow is not.
-- [HIGH] Clone topology + template instantiate UI flows. Frontend API-client
-  tests + cabling unit tests exist; no Selenium walkthrough of "open menu,
-  click clone, see new entry" or "instantiate template with role assignments".
-  Target: `tests/e2e/test_topology_clone.py`, `tests/e2e/test_topology_templates.py`.
+- [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
+  covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
+  but submitting a prompt, accepting the proposal, and committing is a deferred
+  E2E gap until the LLM call can be stubbed at the network layer (the integration
+  test `tests/integration/test_ai_status.py::test_ai_generate_succeeds_when_key_present`
+  exercises the live LLM path).
 - [HIGH] Device-config edit -> schedule -> result UI flow. Backend (inventory +
   execution + scheduler) is unit-tested; the user-visible journey of editing
-  a config, scheduling an apply, and watching the job status update is not.
-  Target: `tests/e2e/test_device_config_apply.py`.
+  a config, scheduling an apply, and watching the job status update is not
+  (`tests/e2e/test_device_config_apply.py` covers the device-detail page, the
+  config section, and the apply-jobs panel rendering, but the schedule submit is
+  a deferred E2E gap).
 - [MEDIUM] LDAP login E2E (depends on stack configured for LDAP + live directory).
 - [MEDIUM] Pathfind UI: "Find Path" button, result rendering, dedup display.
 - [MEDIUM] Device detail modal edit workflows (not the passive view already tested).
