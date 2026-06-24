@@ -221,6 +221,16 @@ async def commit_proposal(
     user_bearer_token: str,
     user_id: str,
 ) -> CommitResponse:
+    """Commit an AI proposal: create topology + reservation, optionally run configs.
+
+    Validates every device config upfront so the request fails fast with a 422
+    before we write to any upstream service. This is the guardrail between
+    LLM-proposed kwargs and driver method_kwargs. If topology creation succeeds
+    but canvas or reservation fails, the topology is deleted to roll back so the
+    user does not end up with a dangling empty topology. All upstream calls
+    carry the user's JWT so existing RBAC rules apply (device visibility, admin-only
+    config apply, etc.).
+    """
     # Validate every device's config up-front so the request fails fast with
     # a clear 422 before we write to cabling or reservations. This is the
     # guardrail between LLM-proposed kwargs and driver method_kwargs.
@@ -239,6 +249,9 @@ async def commit_proposal(
             await _update_topology_canvas(client, headers, topology_id, canvas_data)
             reservation_id = await _create_reservation(client, headers, req, topology_id)
         except CommitError:
+            # Canvas or reservation failed: delete the empty topology so the user
+            # does not end up with a dangling stub. This rollback is best-effort and
+            # swallows errors so a delete failure does not mask the root cause.
             await _delete_topology(client, headers, topology_id)
             raise
         except Exception as e:
@@ -247,6 +260,9 @@ async def commit_proposal(
 
         config_results: list[DeviceConfigResult] = []
         if req.apply_configs:
+            # Config apply is optional and never blocks the commit. Per-device
+            # failures (403, 404, etc.) are captured and returned as result entries
+            # so the user sees partial success (e.g., 2 of 3 configured).
             config_results = await _apply_configs(client, headers, req, user_id, reservation_id)
 
     logger.info(

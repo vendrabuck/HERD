@@ -245,8 +245,11 @@ async def reservation_assistant(
                 )
                 call_log = list(dispatcher.call_log)
     except asyncio.TimeoutError as exc:
-        # Discard the flushed-but-uncommitted user turn so a timed-out turn
-        # leaves no orphan trailing user message.
+        # Wedge-bug fix: discard the flushed-but-uncommitted user turn so a
+        # timed-out turn leaves no orphan trailing user message. If we committed
+        # the user turn without the assistant reply, the next turn's reconstructed
+        # message history would have two consecutive user messages, causing a 400
+        # from the provider and permanently jamming the conversation.
         await db.rollback()
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,
@@ -368,8 +371,9 @@ async def reservation_assistant_stream(
                             turn = ev.result
 
                     if turn is None:
-                        # No assistant reply assembled: roll back the flushed
-                        # user turn so it does not persist without a reply and
+                        # No assistant reply assembled (stream ended without a done event):
+                        # wedge-bug fix, same as the buffered endpoint. Roll back the
+                        # flushed user turn so it does not persist without a reply and
                         # wedge the next turn's role alternation.
                         await db.rollback()
                         yield _sse("error", {"message": "Assistant produced no answer"})
@@ -378,8 +382,10 @@ async def reservation_assistant_stream(
                     # Persist inside the generator: this is the only scope where
                     # the assembled turn (from the done event), the open
                     # ToolDispatcher, and the db session all coexist. The
-                    # async-with blocks close once the generator returns, so the
-                    # write must happen here, before the final done frame.
+                    # async-with blocks (timeout and ToolDispatcher) close once the
+                    # generator returns, and _persist_turn needs the dispatcher's
+                    # tool-call results, so the write must happen here, before the
+                    # final done frame.
                     pending_apply = await _persist_turn(
                         db=db,
                         conversation=conversation,
