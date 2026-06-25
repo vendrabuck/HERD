@@ -175,6 +175,19 @@ def test_validate_field_data_number_type_check():
     assert exc.value.status_code == 422
 
 
+def test_validate_field_data_number_rejects_bool():
+    template = DeviceTemplate(
+        vendor="V",
+        model="M",
+        name="T",
+        sections=[{"name": "S", "fields": [{"key": "a", "label": "A", "type": "number"}]}],
+    )
+    with pytest.raises(HTTPException) as exc:
+        validate_field_data(template, {"a": True})
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "Field 'a' must be a number"
+
+
 def test_validate_field_data_boolean_type_check():
     template = DeviceTemplate(
         vendor="V",
