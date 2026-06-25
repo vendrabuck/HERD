@@ -4,6 +4,7 @@ import importlib
 import json
 
 from pydantic_settings import BaseSettings
+from sqlalchemy.engine import make_url
 
 
 def _reload_loader(monkeypatch, config_path: str):
@@ -83,6 +84,35 @@ def test_source_builds_database_url_when_postgres_fields_present(tmp_path, monke
     assert values["database_url"] == "postgresql+asyncpg://herd:pw@postgres:5432/herd"
 
 
+def test_source_url_encodes_special_chars_in_password(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "POSTGRES_USER": "herd",
+                "POSTGRES_PASSWORD": "p@ss:w/rd#1",
+                "POSTGRES_DB": "herd",
+            }
+        )
+    )
+    loader = _reload_loader(monkeypatch, str(config_file))
+
+    class S(BaseSettings):
+        database_url: str = ""
+
+    values = loader.HerdJsonConfigSource(S)()
+    # The raw f-string would mis-parse @ : / # in the password; URL.create
+    # percent-encodes each component so SQLAlchemy round-trips it correctly.
+    parsed = make_url(values["database_url"])
+    assert parsed.password == "p@ss:w/rd#1"
+    assert parsed.host == "postgres"
+    assert parsed.port == 5432
+    assert parsed.database == "herd"
+    assert parsed.username == "herd"
+    # Literal special chars must not survive unencoded in the rendered string.
+    assert "p@ss:w/rd#1" not in values["database_url"]
+
+
 def test_source_skips_database_url_when_postgres_incomplete(tmp_path, monkeypatch):
     config_file = tmp_path / "config.json"
     config_file.write_text(json.dumps({"POSTGRES_USER": "herd"}))
@@ -124,3 +154,17 @@ def test_get_field_value_returns_tuple(tmp_path, monkeypatch):
     assert missing_val is None
     assert missing_name == "other"
     assert missing_is_set is False
+
+
+def test_source_falls_back_when_config_json_is_corrupt(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{broken")
+    loader = _reload_loader(monkeypatch, str(config_file))
+
+    class S(BaseSettings):
+        secret_key: str = "default"
+
+    # A truncated/corrupt mounted config must not raise JSONDecodeError at
+    # import/construction time; it falls back to {} so env/defaults apply.
+    source = loader.HerdJsonConfigSource(S)
+    assert source() == {}
