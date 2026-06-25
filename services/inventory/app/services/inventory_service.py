@@ -53,7 +53,7 @@ def validate_field_data(template: DeviceTemplate, field_data: dict[str, Any]) ->
                 status_code=422,
                 detail=f"Field '{key}' must be a string",
             )
-        if ftype == "number" and not isinstance(value, (int, float)):
+        if ftype == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))):
             raise HTTPException(
                 status_code=422,
                 detail=f"Field '{key}' must be a number",
