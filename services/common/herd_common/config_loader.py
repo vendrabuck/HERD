@@ -7,11 +7,15 @@ the user-facing config keys to service-specific env var names.
 """
 
 import json
+import logging
 import os
 from typing import Any
 
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+from sqlalchemy.engine import URL
+
+logger = logging.getLogger(__name__)
 
 CONFIG_FILE = os.environ.get("HERD_CONFIG_FILE", "/etc/herd/config.json")
 
@@ -30,8 +34,15 @@ _KEY_MAP = {
 def _load_json() -> dict:
     if not os.path.exists(CONFIG_FILE):
         return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        # A truncated or corrupt mounted config.json must never crash a service
+        # at import time. Fall back to an empty dict so env vars and model
+        # defaults still apply, mirroring the missing-file path above.
+        logger.warning("Ignoring unreadable HERD config file %s: %s", CONFIG_FILE, exc)
+        return {}
 
 
 def _build_database_url(data: dict) -> str | None:
@@ -39,7 +50,17 @@ def _build_database_url(data: dict) -> str | None:
     password = data.get("POSTGRES_PASSWORD")
     db = data.get("POSTGRES_DB")
     if user and password and db:
-        return f"postgresql+asyncpg://{user}:{password}@postgres:5432/{db}"
+        # Use URL.create so each component is percent-encoded; a raw f-string
+        # breaks on passwords containing @ : / # ? [ ] (issue #209).
+        url = URL.create(
+            "postgresql+asyncpg",
+            username=user,
+            password=password,
+            host="postgres",
+            port=5432,
+            database=db,
+        )
+        return url.render_as_string(hide_password=False)
     return None
 
 
