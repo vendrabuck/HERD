@@ -12,6 +12,7 @@ from app.services.nats_consumer import (
     L2_EVENT_ACTIONS,
     NATS_DLQ_SUBJECT,
     NATS_MAX_DELIVER,
+    PermanentEventError,
     TransientUpstreamError,
     _derive_vlan_id,
     _fetch_connections_for_device,
@@ -788,6 +789,44 @@ async def test_process_message_at_max_deliver_routes_to_dlq_and_acks():
     js.publish.assert_awaited_once_with(NATS_DLQ_SUBJECT, payload)
     msg.ack.assert_awaited_once()
     msg.nak.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_message_permanent_error_dlqs_on_first_delivery(caplog):
+    """A PermanentEventError (VLAN exhaustion) DLQs on the FIRST delivery (#211).
+
+    Unlike a transient RuntimeError, which NAKs and burns the full max_deliver
+    backoff before DLQ'ing, a permanent error is routed straight to the DLQ at
+    delivery count 1 with a distinct exhaustion-tagged log phrase. Retrying is
+    pointless: the fabric's in-use VLAN set is unchanged between attempts.
+    """
+    import logging
+
+    js = _make_js()
+    payload = json.dumps({"event": "reservation.created"}).encode()
+    # num_delivered=1: this is the FIRST delivery, well below max_deliver.
+    msg = _make_msg(payload, num_delivered=1)
+    handler = AsyncMock(
+        side_effect=PermanentEventError("No free VLAN IDs in fabric abc (all 4093 in use)")
+    )
+
+    with caplog.at_level(logging.ERROR):
+        result = await process_reservation_message(
+            msg, js, handler, session_factory=lambda: None, max_deliver=NATS_MAX_DELIVER
+        )
+
+    # Routed to DLQ immediately, ACK'd (not NAK'd), without consuming retries.
+    assert result == "dlq"
+    js.publish.assert_awaited_once_with(NATS_DLQ_SUBJECT, payload)
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()
+
+    # Distinct exhaustion-tagged signal, separate from the generic DLQ-exhausted path.
+    assert any(
+        "exhaustion" in rec.getMessage().lower()
+        and getattr(rec, "action", None) == "nats_dlq_permanent"
+        for rec in caplog.records
+    )
 
 
 @pytest.mark.asyncio

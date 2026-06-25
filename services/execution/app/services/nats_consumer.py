@@ -67,6 +67,18 @@ class TransientUpstreamError(RuntimeError):
     """
 
 
+class PermanentEventError(RuntimeError):
+    """A reservation event failed in a way that retry cannot fix.
+
+    Sibling of TransientUpstreamError. Raised for non-retryable conditions
+    (e.g. a fabric's VLAN pool is exhausted: the in-use set is unchanged
+    between delivery attempts, so backoff-and-retry only wastes max_deliver
+    attempts before DLQ'ing). process_reservation_message routes this straight
+    to the DLQ on the FIRST delivery, with a distinct log phrase, rather than
+    NAK'ing through the full backoff schedule like a transient failure.
+    """
+
+
 async def _get_internal(client, url, *, what, **kwargs):
     """GET an internal service URL, raising TransientUpstreamError on a failure
     that retry might fix (5xx or transport error). Returns the httpx.Response
@@ -1167,6 +1179,24 @@ async def process_reservation_message(
 
     try:
         await handler(event_data, session_factory, _dedupe_key_from_msg(msg))
+    except PermanentEventError as exc:
+        # Non-retryable (e.g. VLAN pool exhausted): the in-use set is unchanged
+        # between attempts, so retrying only burns max_deliver and delays the DLQ.
+        # Route to the DLQ on the FIRST delivery with a distinct exhaustion phrase.
+        num_delivered = getattr(getattr(msg, "metadata", None), "num_delivered", 1) or 1
+        logger.error(
+            "Permanent error (VLAN exhaustion) processing NATS message; "
+            "routing to DLQ on first delivery (no retry)",
+            extra={
+                "action": "nats_dlq_permanent",
+                "delivered": num_delivered,
+                "event": event_data.get("event"),
+            },
+            exc_info=exc,
+        )
+        await _publish_to_dlq(js, msg.data)
+        await msg.ack()
+        return "dlq"
     except Exception as exc:
         num_delivered = getattr(getattr(msg, "metadata", None), "num_delivered", 1) or 1
         if num_delivered >= max_deliver:

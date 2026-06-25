@@ -13,6 +13,7 @@ import pytest
 from app.database import Base
 from app.models.vlan_assignment import VlanAssignment
 from app.services import vlan_service
+from app.services.nats_consumer import PermanentEventError
 from app.services.vlan_service import (
     VLAN_MAX,
     VLAN_MIN,
@@ -108,11 +109,13 @@ async def test_fetch_fabric_id_exception_returns_none(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_assign_vlan_raises_when_all_in_use(db, monkeypatch):
-    """When every VLAN in range is taken, the assignment raises RuntimeError.
+    """When every VLAN in range is taken, the assignment raises PermanentEventError.
 
     We shrink the VLAN range to a single value so the in-use set can saturate
     it cheaply: pre-assign that one VLAN to another reservation, then the caller
-    (whose preferred VLAN collides) finds no free candidate and raises.
+    (whose preferred VLAN collides) finds no free candidate and raises. The error
+    is a PermanentEventError (not a bare RuntimeError) so the NATS consumer DLQs
+    it on first delivery instead of retrying a condition retry cannot fix (#211).
     """
     # Collapse the usable range to exactly one VLAN id (VLAN_MIN..VLAN_MIN).
     monkeypatch.setattr(vlan_service, "VLAN_MAX", VLAN_MIN)
@@ -132,7 +135,7 @@ async def test_assign_vlan_raises_when_all_in_use(db, monkeypatch):
     # The caller's preferred id, derived against the shrunk range, is VLAN_MIN
     # (the only value), which is already in use, so the lowest-free scan fails.
     rid = str(uuid.uuid4())
-    with pytest.raises(RuntimeError, match="No free VLAN"):
+    with pytest.raises(PermanentEventError, match="No free VLAN"):
         await find_or_assign_vlan(db, rid, FABRIC, [SWITCH])
 
 

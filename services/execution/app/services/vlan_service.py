@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.vlan_assignment import VlanAssignment
+from app.services.nats_consumer import PermanentEventError
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,11 @@ async def find_or_assign_vlan(
                     vlan_id = candidate
                     break
             if vlan_id is None:
-                raise RuntimeError(
+                # Pool exhausted: the in-use set is fixed for this fabric, so a
+                # NATS redelivery would recompute the identical empty free set.
+                # Raise a permanent error so the consumer DLQs on first delivery
+                # instead of burning the full max_deliver backoff schedule.
+                raise PermanentEventError(
                     f"No free VLAN IDs in fabric {fabric_id} (all {VLAN_MAX - VLAN_MIN + 1} in use)"
                 )
 
