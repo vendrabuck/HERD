@@ -15,6 +15,10 @@ AUTH_FILE = os.path.join(DATA_DIR, "config_auth.json")
 DEFAULT_PASSWORD = "admin123!"
 
 
+class ConfigAuthError(Exception):
+    """Raised when the config auth file exists but cannot be read/parsed."""
+
+
 def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -43,8 +47,15 @@ def load_auth() -> dict:
         auth = _default_auth()
         _save_auth(auth)
         return auth
-    with open(AUTH_FILE) as f:
-        return json.load(f)
+    try:
+        with open(AUTH_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        # Fail closed: do NOT regenerate the default here, that would silently
+        # reset the admin password. Recovery is operator-driven: remove the
+        # corrupt file and the missing-file branch above regenerates the default.
+        logger.error("Corrupt config auth file %s: %s", AUTH_FILE, exc)
+        raise ConfigAuthError(f"corrupt auth file {AUTH_FILE}") from exc
 
 
 def _save_auth(auth: dict) -> None:
@@ -54,11 +65,18 @@ def _save_auth(auth: dict) -> None:
 
 
 def verify_password(password: str) -> bool:
-    auth = load_auth()
+    try:
+        auth = load_auth()
+    except ConfigAuthError:
+        # Fail closed: deny login when the auth file is present but corrupt.
+        return False
     return _check_password(password, auth["password_hash"])
 
 
 def change_password(new_password: str) -> None:
+    # Unreachable with a corrupt auth file: this is only called behind
+    # require_config_session, which requires a successful login, and
+    # verify_password now denies login when the auth file is corrupt.
     auth = load_auth()
     auth["password_hash"] = _hash_password(new_password)
     auth["password_changed"] = True
@@ -66,7 +84,11 @@ def change_password(new_password: str) -> None:
 
 
 def is_password_changed() -> bool:
-    return load_auth().get("password_changed", False)
+    try:
+        return load_auth().get("password_changed", False)
+    except ConfigAuthError:
+        # Keep the public /status endpoint up; report the safe default.
+        return False
 
 
 # -- Config file --

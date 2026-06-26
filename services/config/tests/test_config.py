@@ -4,6 +4,7 @@ import os
 import pytest
 from app.config_store import (
     DEFAULT_PASSWORD,
+    ConfigAuthError,
     change_password,
     is_configured,
     is_password_changed,
@@ -93,6 +94,41 @@ class TestConfigStore:
         assert any("POSTGRES_USER" in e for e in errors)
 
 
+class TestCorruptAuthFile:
+    """A corrupt config_auth.json must fail closed (deny login, keep /status up)
+    instead of crashing with an unhandled JSONDecodeError."""
+
+    @staticmethod
+    def _corrupt_auth(tmp_config_dir):
+        auth_path = os.path.join(tmp_config_dir, "config_auth.json")
+        with open(auth_path, "w") as f:
+            f.write("{bad")
+        return auth_path
+
+    def test_load_auth_raises_on_corrupt(self, tmp_config_dir):
+        self._corrupt_auth(tmp_config_dir)
+        with pytest.raises(ConfigAuthError):
+            load_auth()
+
+    def test_verify_password_fails_closed(self, tmp_config_dir):
+        self._corrupt_auth(tmp_config_dir)
+        # Must not raise; denies login.
+        assert verify_password("anything") is False
+
+    def test_is_password_changed_safe_default(self, tmp_config_dir):
+        self._corrupt_auth(tmp_config_dir)
+        # Must not raise; keeps the public /status endpoint up.
+        assert is_password_changed() is False
+
+    def test_default_password_not_regenerated_on_corrupt(self, tmp_config_dir):
+        # Recovery is operator-driven, not silent: the corrupt file is left in
+        # place (no default regenerated) so the admin password is not reset.
+        auth_path = self._corrupt_auth(tmp_config_dir)
+        assert verify_password(DEFAULT_PASSWORD) is False
+        with open(auth_path) as f:
+            assert f.read() == "{bad"
+
+
 # -- API endpoint tests --
 
 
@@ -121,6 +157,18 @@ class TestStatusEndpoint:
         resp = await async_client.get("/status")
         assert resp.json()["configured"] is True
 
+    @pytest.mark.asyncio
+    async def test_status_with_corrupt_auth_file(self, async_client, tmp_config_dir):
+        # A corrupt config_auth.json must not 500 the public /status endpoint;
+        # password_changed falls back to the safe default. configured reflects
+        # is_configured(), which is unaffected by the auth file.
+        auth_path = os.path.join(tmp_config_dir, "config_auth.json")
+        with open(auth_path, "w") as f:
+            f.write("{bad")
+        resp = await async_client.get("/status")
+        assert resp.status_code == 200
+        assert resp.json()["password_changed"] is False
+
 
 class TestLoginEndpoint:
     @pytest.mark.asyncio
@@ -134,6 +182,15 @@ class TestLoginEndpoint:
     @pytest.mark.asyncio
     async def test_login_wrong_password(self, async_client):
         resp = await async_client.post("/login", json={"password": "wrong"})
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_login_with_corrupt_auth_file(self, async_client, tmp_config_dir):
+        # A corrupt config_auth.json must fail closed (401), not 500.
+        auth_path = os.path.join(tmp_config_dir, "config_auth.json")
+        with open(auth_path, "w") as f:
+            f.write("{bad")
+        resp = await async_client.post("/login", json={"password": DEFAULT_PASSWORD})
         assert resp.status_code == 401
 
 
