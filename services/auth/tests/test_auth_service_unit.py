@@ -67,6 +67,19 @@ def test_get_password_hash_produces_verifiable_hash():
     assert verify_password(password, hashed) is True
 
 
+def test_dummy_hash_is_valid_bcrypt():
+    """The timing-attack dummy hash used on unknown-user login must be a real
+    bcrypt hash that verifies cleanly (False, not a malformed-hash error). A
+    broken constant would raise inside the unknown-user branch."""
+    from app.services.auth_service import _DUMMY_HASH
+
+    assert _DUMMY_HASH.startswith("$2")  # bcrypt identifier prefix
+    # verify (passlib, the lib the service uses) must return False without raising.
+    assert verify_password("anything", _DUMMY_HASH) is False
+    # The real seed password still verifies against it.
+    assert verify_password("not-a-real-password", _DUMMY_HASH) is True
+
+
 # --- User lookups ---
 
 
