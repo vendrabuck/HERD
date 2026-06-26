@@ -619,6 +619,53 @@ async def test_stream_emits_status_tokens_then_done(async_client):
     assert done_data["output_tokens"] == 8
 
 
+async def test_stream_status_frame_carries_interim_flag(async_client):
+    """The route copies AssistantStatus.interim straight onto the wire `status`
+    frame. A post-tool-narration status (interim=True) tells the client to
+    DISCARD the provisional tokens streamed before the tool turn; assert both the
+    default-False and the True frames serialize their flag verbatim."""
+    from app.services.ai_client import AssistantDone, AssistantStatus, AssistantToken
+
+    done = AssistantDone(
+        result=AssistantTurnResult(
+            answer="eth1/6 is down.",
+            usage=SimpleNamespace(input_tokens=12, output_tokens=8),
+            stop_reason="end_turn",
+            iteration=2,
+            segments=[TurnSegment(assistant_blocks=[TextBlock(text="eth1/6 is down.")])],
+        )
+    )
+    _override_seed()
+    _override_streaming_ai(
+        [
+            # Generic thinking phase: interim defaults to False.
+            AssistantStatus(message="analyzing"),
+            # A provisional token streamed before the model resolves to a tool.
+            AssistantToken(text="let me check "),
+            # Post-narration status: interim=True, telling the client to discard
+            # the provisional token above before showing tool progress.
+            AssistantStatus(message="running list_ports", tools=["list_ports"], interim=True),
+            AssistantToken(text="eth1/6 is down."),
+            done,
+        ]
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "what's wrong?"}, headers=headers)
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    status_frames = [d for e, d in events if e == "status"]
+    assert len(status_frames) == 2
+    # First status is the generic thinking phase: interim False, no tools.
+    assert status_frames[0]["interim"] is False
+    assert status_frames[0]["tools"] == []
+    # Second status is the post-narration interim discard signal: True, with the
+    # about-to-dispatch tool name passed through.
+    assert status_frames[1]["interim"] is True
+    assert status_frames[1]["tools"] == ["list_ports"]
+    assert status_frames[1]["message"] == "running list_ports"
+
+
 async def test_stream_persists_conversation(async_client):
     """After the stream completes, the conversation exists and a follow-up turn
     on the same conversation_id is accepted (proves persistence ran)."""

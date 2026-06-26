@@ -49,6 +49,22 @@ async def test_create_persists_seed_as_first_user_message():
     assert messages[0].content[0].text == "<seed/>"
 
 
+# --- _json_to_block fail-loud guard ---
+
+
+def test_json_to_block_raises_on_unknown_type():
+    """A corrupted/unknown discriminator must fail loudly so the loader never
+    silently drops content the model needs on the next turn."""
+    with pytest.raises(ValueError, match="unknown content block type"):
+        conversation_repo._json_to_block({"type": "bogus", "text": "x"})
+
+
+def test_json_to_block_raises_on_missing_type():
+    """A block with no `type` key takes the same fail-loud path (type_ is None)."""
+    with pytest.raises(ValueError, match="unknown content block type"):
+        conversation_repo._json_to_block({"text": "no discriminator"})
+
+
 # --- ownership enforcement on get_or_404 ---
 
 

@@ -257,6 +257,46 @@ async def test_record_usage_fallback_minimum_one(set_quota):
         assert await usage_repo.get_today_total(db, USER) == 1
 
 
+async def test_record_usage_asymmetric_zero_output_does_not_trigger_fallback(set_quota):
+    """Only the BOTH-zero case triggers the chars/4 fallback. With a nonzero
+    input and a zero output the provider numbers are booked verbatim: the row
+    holds input=30, output=0, and the fallback estimate over fallback_text is
+    never consulted."""
+    set_quota(1000)
+    async with TestSessionLocal() as db:
+        await usage_repo.record_usage(
+            db,
+            USER,
+            Usage(input_tokens=30, output_tokens=0),
+            # A nonzero fallback_text proves the estimate did not fire: if the
+            # both-zero guard had triggered, output would be 10, not 0.
+            fallback_text="x" * 40,
+        )
+        row = (await db.execute(AIUsage.__table__.select().where(AIUsage.user_id == USER))).first()
+        assert row.input_tokens == 30
+        assert row.output_tokens == 0
+        # Quota total reflects the verbatim provider numbers (30 + 0).
+        assert await usage_repo.get_today_total(db, USER) == 30
+
+
+async def test_record_usage_asymmetric_zero_input_does_not_trigger_fallback(set_quota):
+    """Mirror of the above with the zero on the input side: output is nonzero,
+    so the both-zero fallback stays dormant and input=0, output=12 are booked
+    as reported."""
+    set_quota(1000)
+    async with TestSessionLocal() as db:
+        await usage_repo.record_usage(
+            db,
+            USER,
+            Usage(input_tokens=0, output_tokens=12),
+            fallback_text="x" * 40,
+        )
+        row = (await db.execute(AIUsage.__table__.select().where(AIUsage.user_id == USER))).first()
+        assert row.input_tokens == 0
+        assert row.output_tokens == 12
+        assert await usage_repo.get_today_total(db, USER) == 12
+
+
 # --- status + UTC-day reset ---
 
 
