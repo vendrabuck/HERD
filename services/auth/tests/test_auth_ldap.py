@@ -133,3 +133,73 @@ async def test_local_mode_blocks_ldap_user(monkeypatch):
 def test_auth_service_exposes_create_ldap_user():
     # Sanity check that the helper is importable from the service module.
     assert callable(auth_service.create_ldap_user)
+
+
+@pytest.mark.asyncio
+async def test_ldap_login_inactive_user_returns_401(client, ldap_mode, fake_bind, caplog):
+    """A deactivated LDAP user must be denied (401) AND the denial must be
+    logged. The LDAP inactive-user path previously returned None silently while
+    the local path logged the same condition (asymmetry); this pins the log."""
+    import logging
+
+    # Provision the LDAP user, then deactivate it.
+    await client.post("/login", json={"email": "alice", "password": "good"})
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.email == "alice@example.com"))
+        ).scalar_one()
+        user.is_active = False
+        await db.commit()
+
+    with caplog.at_level(logging.WARNING, logger="app.services.auth_service"):
+        resp = await client.post("/login", json={"email": "alice", "password": "good"})
+
+    assert resp.status_code == 401
+    matching = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "account deactivated" in r.getMessage()
+    ]
+    assert matching, "expected a warning log on the LDAP inactive-user denial"
+    assert any("alice@example.com" in r.getMessage() for r in matching)
+
+
+@pytest.mark.asyncio
+async def test_ldap_login_username_collision_returns_401(client, ldap_mode, fake_bind, monkeypatch):
+    """LDAP JIT provisioning that collides on username/uid (same username, a new
+    email the local lookup misses) hits the `except IntegrityError` branch and
+    the login is denied (401) rather than taking over the local identity."""
+    from sqlalchemy.exc import IntegrityError
+
+    async def _raise_integrity(*args, **kwargs):
+        raise IntegrityError("INSERT users", params=None, orig=Exception("unique"))
+
+    # Force the user insert in create_ldap_user to violate a uniqueness constraint.
+    monkeypatch.setattr(auth_service, "create_ldap_user", _raise_integrity)
+
+    resp = await client.post("/login", json={"email": "alice", "password": "good"})
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_ldap_jit_provision_auto_assigns_to_not_grouped(client, ldap_mode, fake_bind):
+    """A newly JIT-provisioned LDAP user lands in the 'Not Grouped' device group,
+    mirroring the local create_user path (create_ldap_user calls
+    _auto_assign_not_grouped too)."""
+    from app.models.group import UserGroup
+    from app.services.group_service import get_user_groups
+
+    async with TestSessionLocal() as db:
+        ng = UserGroup(name="Not Grouped", description="Default")
+        db.add(ng)
+        await db.commit()
+
+    resp = await client.post("/login", json={"email": "alice", "password": "good"})
+    assert resp.status_code == 200
+
+    async with TestSessionLocal() as db:
+        user = (
+            await db.execute(select(User).where(User.email == "alice@example.com"))
+        ).scalar_one()
+        groups = await get_user_groups(db, user.id)
+        assert "Not Grouped" in {g.name for g in groups}

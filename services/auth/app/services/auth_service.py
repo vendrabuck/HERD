@@ -238,6 +238,19 @@ async def _authenticate_ldap(db: AsyncSession, email: str, password: str) -> Use
         return None
 
     if not user.is_active:
+        # Mirror the local path: log the deactivated-account denial rather than
+        # returning None silently, so an LDAP login refused for inactivity is
+        # auditable too.
+        logger.warning(
+            "Login failed: account deactivated for %s",
+            user.email,
+            extra={
+                "action": "login_failure",
+                "email": user.email,
+                "reason": "inactive",
+                "source": "ldap",
+            },
+        )
         return None
 
     logger.info(

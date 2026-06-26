@@ -216,6 +216,8 @@ async def test_cannot_change_own_role(superadmin_client):
 async def test_non_superadmin_gets_403(regular_client):
     resp = await regular_client.get("/users")
     assert resp.status_code == 403
+    # Pin the exact require_role 403 detail wording.
+    assert resp.json()["detail"] == "You do not have permission to perform this action"
 
 
 # --- Logout and refresh revocation tests ---
@@ -255,6 +257,8 @@ async def test_refresh_with_revoked_token(client):
     # Original token should now be invalid
     retry_resp = await client.post("/refresh", json={"refresh_token": original_token})
     assert retry_resp.status_code == 401
+    # Pin the exact 401 detail wording for refresh failures.
+    assert retry_resp.json()["detail"] == "Invalid or expired refresh token"
 
 
 # --- Registration validation tests ---
