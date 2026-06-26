@@ -1155,6 +1155,8 @@ def test_parse_json_invalid_json_raises_422():
     with pytest.raises(HTTPException) as exc:
         parse_json_topologies(b"{not json")
     assert exc.value.status_code == 422
+    # The detail prefixes the underlying json.JSONDecodeError message verbatim.
+    assert exc.value.detail.startswith("Invalid JSON: ")
 
 
 def test_parse_json_bare_list_accepted():
@@ -1170,6 +1172,9 @@ def test_parse_json_wrong_shape_raises_422():
     with pytest.raises(HTTPException) as exc:
         parse_json_topologies(b'{"resource": "topologies"}')
     assert exc.value.status_code == 422
+    assert exc.value.detail == (
+        "JSON import must be a list of topologies or an object with an 'items' list"
+    )
 
 
 def test_parse_json_items_not_a_list_raises_422():
@@ -1179,6 +1184,7 @@ def test_parse_json_items_not_a_list_raises_422():
     with pytest.raises(HTTPException) as exc:
         parse_json_topologies(b'{"items": "nope"}')
     assert exc.value.status_code == 422
+    assert exc.value.detail == "'items' must be a list"
 
 
 def test_parse_csv_groups_rows_into_topologies():
@@ -1196,6 +1202,60 @@ def test_parse_csv_groups_rows_into_topologies():
     names = {n["data"]["device"]["name"] for n in rec["canvas"]["nodes"]}
     assert names == {"sw-a", "sw-b"}
     assert len(rec["canvas"]["edges"]) == 1
+
+
+def test_parse_csv_merges_same_name_topology_rows():
+    """Two CSV rows sharing a topology_name merge into one record.
+
+    parse_csv_topologies keys buckets by topology_name via setdefault, so both
+    rows land in the same bucket: every distinct device name becomes one node
+    (de-duplicated), and each row contributes one edge.
+    """
+    from app.services.bulk_service import parse_csv_topologies
+
+    raw = (
+        "topology_name,source_device,source_port,target_device,target_port,layer\n"
+        "Lab,sw-a,eth0,sw-b,eth1,L1\n"
+        "Lab,sw-b,eth2,sw-c,eth3,L2\n"
+    ).encode()
+    records = parse_csv_topologies(raw)
+
+    # Both rows merge: a single topology record, not two.
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["name"] == "Lab"
+
+    # sw-b appears in both rows but is de-duplicated to a single node.
+    names = sorted(n["data"]["device"]["name"] for n in rec["canvas"]["nodes"])
+    assert names == ["sw-a", "sw-b", "sw-c"]
+
+    # Both edges are retained, keyed to the synthesized node ids.
+    edges = rec["canvas"]["edges"]
+    assert len(edges) == 2
+    endpoints = {(e["source"], e["target"]) for e in edges}
+    assert endpoints == {("node-sw-a", "node-sw-b"), ("node-sw-b", "node-sw-c")}
+    # Per-row edge attributes survive the merge.
+    layers = sorted(e["data"]["layer"] for e in edges)
+    assert layers == ["L1", "L2"]
+
+
+def test_records_to_csv_null_canvas_emits_header_only():
+    """Exporting a topology with canvas_data=None yields valid header-only CSV.
+
+    topology_to_csv_rows reads `topology.canvas_data or {}`, so a None canvas
+    flattens to zero edge rows without raising; the writer still emits the
+    column header.
+    """
+    from app.models.topology import Topology
+    from app.services.bulk_service import TOPOLOGY_CSV_COLUMNS, records_to_csv
+
+    topo = Topology(name="Empty Lab", created_by=USER_ID, canvas_data=None)
+    out = records_to_csv([topo])
+
+    lines = out.splitlines()
+    # Exactly the header row, no edge rows.
+    assert lines[0] == ",".join(TOPOLOGY_CSV_COLUMNS)
+    assert len(lines) == 1
 
 
 def test_rewrite_canvas_names_reports_unresolved():
@@ -1497,6 +1557,36 @@ def test_version_diff_canvas_tolerates_malformed_collections():
     assert result["nodes_added"] == []
     assert result["nodes_removed"] == []
     assert [e["id"] for e in result["edges_added"]] == ["e1"]
+
+
+def test_version_diff_reports_modified_edge():
+    """An edge present in both canvases but changed appears in edges_modified.
+
+    diff_collection matches by id; a same-id dict whose value differs yields a
+    modified entry carrying the id plus its before/after snapshots.
+    """
+    from app.services.version_diff import diff_canvas
+
+    before = {
+        "nodes": [{"id": "n1"}, {"id": "n2"}],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2", "data": {"layer": "L1"}}],
+    }
+    after = {
+        "nodes": [{"id": "n1"}, {"id": "n2"}],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2", "data": {"layer": "L2"}}],
+    }
+    result = diff_canvas(before, after)
+
+    # Same edge id on both sides, so it is neither added nor removed.
+    assert result["edges_added"] == []
+    assert result["edges_removed"] == []
+
+    modified = result["edges_modified"]
+    assert len(modified) == 1
+    entry = modified[0]
+    assert entry["id"] == "e1"
+    assert entry["before"]["data"]["layer"] == "L1"
+    assert entry["after"]["data"]["layer"] == "L2"
 
 
 # --- services/fork_service.py + routes/forks.py ----------------------------
