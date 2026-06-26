@@ -288,7 +288,7 @@ async def fetch_device(device_id: uuid.UUID) -> dict:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch device: {exc}")
+        raise HTTPException(status_code=503, detail=f"Failed to fetch device: {exc}")
 
 
 async def fetch_template(template_id: str) -> dict:
@@ -312,7 +312,7 @@ async def fetch_template(template_id: str) -> dict:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch template: {exc}")
+        raise HTTPException(status_code=503, detail=f"Failed to fetch template: {exc}")
 
 
 async def run_driver_action(

@@ -407,7 +407,7 @@ def test_caller_id_rejects_missing_subject():
 
 
 @pytest.mark.asyncio
-async def test_get_preferences_returns_502_on_transport_error(user_client):
+async def test_get_preferences_returns_503_on_transport_error(user_client):
     async def _get(*args, **kwargs):
         raise httpx.ConnectError("user-profile down")
 
@@ -415,11 +415,11 @@ async def test_get_preferences_returns_502_on_transport_error(user_client):
         inst = MockClient.return_value.__aenter__.return_value
         inst.get = _get
         resp = await user_client.get("/notifications/preferences")
-    assert resp.status_code == 502
+    assert resp.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_get_preferences_returns_502_on_upstream_4xx(user_client):
+async def test_get_preferences_returns_503_on_upstream_4xx(user_client):
     bad = AsyncMock()
     bad.status_code = 404
     bad.json = lambda: {}
@@ -431,11 +431,11 @@ async def test_get_preferences_returns_502_on_upstream_4xx(user_client):
         inst = MockClient.return_value.__aenter__.return_value
         inst.get = _get
         resp = await user_client.get("/notifications/preferences")
-    assert resp.status_code == 502
+    assert resp.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_put_preferences_returns_502_on_transport_error(user_client):
+async def test_put_preferences_returns_503_on_transport_error(user_client):
     get_resp = AsyncMock()
     get_resp.status_code = 200
     get_resp.json = lambda: {
@@ -455,11 +455,11 @@ async def test_put_preferences_returns_502_on_transport_error(user_client):
         resp = await user_client.put(
             "/notifications/preferences", json={"events": {"reservation.completed": False}}
         )
-    assert resp.status_code == 502
+    assert resp.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_put_preferences_returns_502_on_upstream_4xx(user_client):
+async def test_put_preferences_returns_503_on_upstream_4xx(user_client):
     get_resp = AsyncMock()
     get_resp.status_code = 200
     get_resp.json = lambda: {
@@ -482,4 +482,4 @@ async def test_put_preferences_returns_502_on_upstream_4xx(user_client):
         resp = await user_client.put(
             "/notifications/preferences", json={"events": {"reservation.completed": False}}
         )
-    assert resp.status_code == 502
+    assert resp.status_code == 503

@@ -141,10 +141,10 @@ async def test_device_check_uses_internal_inventory_routes(admin_client, base_ur
                 json={"device_id": device_id, "user_id": user_id},
             )
 
-        # Under the pre-fix bug this would be 502 (Failed to fetch device/template).
+        # Under the pre-fix bug this would be 503 (Failed to fetch device/template).
         assert check.status_code == 200, (
             f"device-check returned {check.status_code}: {check.text} "
-            "(a 502 here means the execution service hit the Bearer-only inventory "
+            "(a 503 here means the execution service hit the Bearer-only inventory "
             "route with an internal token)"
         )
         body = check.json()
