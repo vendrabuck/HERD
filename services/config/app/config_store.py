@@ -79,8 +79,12 @@ def is_configured() -> bool:
 def load_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
         return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Ignoring corrupt config file %s: %s", CONFIG_FILE, exc)
+        return {}
 
 
 def save_config(values: dict) -> list[str]:
