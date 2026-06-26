@@ -1,4 +1,8 @@
-from pydantic import BaseModel, Field
+import logging
+
+from pydantic import BaseModel, Field, ValidationError
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_EVENT_TYPES = (
     "reservation.created",
@@ -41,8 +45,17 @@ class NotificationPreferences(BaseModel):
 
     @classmethod
     def with_defaults(cls, stored: dict | None) -> "NotificationPreferences":
-        data = dict(stored or {})
-        prefs = cls.model_validate(data) if data else cls()
+        if stored is not None and not isinstance(stored, dict):
+            logger.warning(
+                "Ignoring non-dict stored notification preferences (%s); using defaults",
+                type(stored).__name__,
+            )
+            stored = None
+        try:
+            prefs = cls.model_validate(dict(stored)) if stored else cls()
+        except ValidationError:
+            logger.warning("Ignoring malformed stored notification preferences; using defaults")
+            prefs = cls()
         for event_type in DEFAULT_EVENT_TYPES:
             prefs.events.setdefault(event_type, True)
         return prefs

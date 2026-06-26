@@ -74,6 +74,13 @@ class TestConfigStore:
         assert len(errors) > 0
         assert any("POSTGRES_PASSWORD" in e for e in errors)
 
+    def test_load_config_corrupt_returns_empty(self, tmp_config_dir):
+        config_path = os.path.join(tmp_config_dir, "config.json")
+        with open(config_path, "w") as f:
+            f.write("{not valid json")
+        # Must not raise; falls back to {} like the missing-file path.
+        assert load_config() == {}
+
     def test_save_config_blank_required(self):
         values = {
             "POSTGRES_USER": "",
@@ -310,6 +317,21 @@ class TestSettingsEndpoints:
         headers = await self._login(async_client)
         resp = await async_client.get("/settings", headers=headers)
         assert resp.json()["values"]["AUTH_SECRET_KEY"] == "********"
+
+    @pytest.mark.asyncio
+    async def test_get_settings_with_corrupt_config_file(
+        self, async_client, tmp_config_dir, monkeypatch
+    ):
+        # A corrupt config.json on disk must not 500 the settings editor; the
+        # endpoint should fall back to env/defaults instead of crashing.
+        monkeypatch.setenv("POSTGRES_USER", "env-user")
+        config_path = os.path.join(tmp_config_dir, "config.json")
+        with open(config_path, "w") as f:
+            f.write("{truncated")
+        headers = await self._login(async_client)
+        resp = await async_client.get("/settings", headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["values"]["POSTGRES_USER"] == "env-user"
 
 
 class TestLoadEnvValues:
