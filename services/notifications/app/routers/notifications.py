@@ -161,10 +161,10 @@ async def put_preferences(
             )
     except httpx.HTTPError as exc:
         logger.warning("Failed to write preferences", exc_info=True)
-        raise HTTPException(status_code=502, detail="user-profile unreachable") from exc
+        raise HTTPException(status_code=503, detail="user-profile unreachable") from exc
 
     if resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"user-profile error: {resp.status_code}")
+        raise HTTPException(status_code=503, detail=f"user-profile error: {resp.status_code}")
 
     from app.services.preferences_client import get_preferences_client
 
@@ -181,10 +181,10 @@ async def _fetch_prefs_via_jwt(
             resp = await client.get(url, headers=_auth_header(credentials), timeout=10.0)
     except httpx.HTTPError as exc:
         logger.warning("Failed to read preferences", exc_info=True)
-        raise HTTPException(status_code=502, detail="user-profile unreachable") from exc
+        raise HTTPException(status_code=503, detail="user-profile unreachable") from exc
 
     if resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"user-profile error: {resp.status_code}")
+        raise HTTPException(status_code=503, detail=f"user-profile error: {resp.status_code}")
     body = resp.json()
     stored = (body.get("extras") or {}).get("notifications")
     return NotificationPreferences.with_defaults(stored)

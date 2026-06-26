@@ -162,14 +162,14 @@ async def test_fetch_device_404_raises_404(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_device_other_error_raises_502(monkeypatch):
+async def test_fetch_device_other_error_raises_503(monkeypatch):
     def _client_factory():
         return _FakeHttpxClient(exc=RuntimeError("boom"))
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda: _client_factory())
     with pytest.raises(HTTPException) as exc:
         await fetch_device(uuid.UUID(DEVICE_ID))
-    assert exc.value.status_code == 502
+    assert exc.value.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -195,14 +195,14 @@ async def test_fetch_template_returns_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_template_other_error_raises_502(monkeypatch):
+async def test_fetch_template_other_error_raises_503(monkeypatch):
     def _client_factory():
         return _FakeHttpxClient(exc=RuntimeError("network"))
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda: _client_factory())
     with pytest.raises(HTTPException) as exc:
         await fetch_template(TEMPLATE_ID)
-    assert exc.value.status_code == 502
+    assert exc.value.status_code == 503
 
 
 # --- run_driver_action: success and failure paths ---

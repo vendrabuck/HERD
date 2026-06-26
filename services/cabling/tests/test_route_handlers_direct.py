@@ -1226,7 +1226,7 @@ async def test_import_unknown_format_raises_422():
 
 
 @pytest.mark.asyncio
-async def test_import_resolver_failure_raises_502():
+async def test_import_resolver_failure_raises_503():
     import json
 
     from app.services.bulk_service import import_topologies
@@ -1247,7 +1247,7 @@ async def test_import_resolver_failure_raises_502():
         ):
             with pytest.raises(HTTPException) as exc:
                 await import_topologies(db, raw, "json", True, USER_ID, "viewer")
-    assert exc.value.status_code == 502
+    assert exc.value.status_code == 503
 
 
 @pytest.mark.asyncio

@@ -261,7 +261,7 @@ async def import_topologies(
         name_to_id = await resolve_device_names(sorted(all_names)) if all_names else {}
     except Exception as exc:
         raise HTTPException(
-            status_code=502, detail=f"could not resolve device names via inventory: {exc}"
+            status_code=503, detail=f"could not resolve device names via inventory: {exc}"
         ) from exc
 
     # Local import of the validator to avoid a circular import at module load
