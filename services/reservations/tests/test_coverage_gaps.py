@@ -282,7 +282,6 @@ async def test_update_reservation_extend_fetch_failure_falls_back_to_exclusive()
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(side_effect=RuntimeError("inventory down")),
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             result = await update_reservation(
                 db, res.id, USER_ID, ReservationUpdate(end_time=new_end), token="t"
@@ -304,7 +303,6 @@ async def test_update_reservation_extend_conflict_rejected():
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=[_make_device(DEVICE_A)]),
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             with pytest.raises(LookupError, match="extended window"):
                 await update_reservation(
@@ -320,10 +318,9 @@ async def test_update_reservation_extend_conflict_rejected():
 async def test_update_reservation_purpose_only():
     async with TestSessionLocal() as db:
         res = await _insert_reservation(db, device_ids=[DEVICE_A])
-        with patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()):
-            result = await update_reservation(
-                db, res.id, USER_ID, ReservationUpdate(purpose="new purpose")
-            )
+        result = await update_reservation(
+            db, res.id, USER_ID, ReservationUpdate(purpose="new purpose")
+        )
         assert result.purpose == "new purpose"
 
 
@@ -446,7 +443,6 @@ async def test_update_reservation_add_exclusive_device_marks_reserved():
                 new=AsyncMock(return_value=devices),
             ),
             patch("app.services.reservation_service._update_device_statuses", new=update_mock),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             result = await update_reservation(
                 db,
@@ -475,7 +471,6 @@ async def test_update_reservation_remove_exclusive_device_marks_available():
         with (
             patch("app.services.reservation_service._fetch_devices", new=mock_fetch),
             patch("app.services.reservation_service._update_device_statuses", new=update_mock),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             result = await update_reservation(
                 db, res.id, USER_ID, ReservationUpdate(device_ids=[DEVICE_A]), token="t"
@@ -501,7 +496,6 @@ async def test_update_reservation_remove_device_fetch_failure_assumes_exclusive(
         with (
             patch("app.services.reservation_service._fetch_devices", new=mock_fetch),
             patch("app.services.reservation_service._update_device_statuses", new=update_mock),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             result = await update_reservation(
                 db, res.id, USER_ID, ReservationUpdate(device_ids=[DEVICE_A]), token="t"
@@ -529,7 +523,6 @@ async def test_update_reservation_device_change_revalidates_topology():
                 new=validate_mock,
             ),
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             await update_reservation(
                 db,
@@ -566,7 +559,6 @@ async def test_cancel_reservation_selects_exclusive_from_fetch_result():
                 new=AsyncMock(return_value=fetch_results),
             ),
             patch("app.services.reservation_service._update_device_statuses", new=update_mock),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             cancelled = await cancel_reservation(db, res.id, USER_ID, "token")
         assert cancelled.status == ReservationStatus.CANCELLED
@@ -589,7 +581,6 @@ async def test_release_reservation_selects_exclusive_from_fetch_result():
                 new=AsyncMock(return_value=fetch_results),
             ),
             patch("app.services.reservation_service._update_device_statuses", new=update_mock),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             released = await release_reservation(db, res.id, USER_ID, "token")
         assert released.status == ReservationStatus.COMPLETED
@@ -609,7 +600,6 @@ async def test_cancel_reservation_all_non_exclusive_skips_inventory():
                 new=AsyncMock(return_value=[_make_device(DEVICE_A, exclusive=False)]),
             ),
             patch("app.services.reservation_service._update_device_statuses", new=update_mock),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             cancelled = await cancel_reservation(db, res.id, USER_ID, "token")
         assert cancelled.status == ReservationStatus.CANCELLED
@@ -640,10 +630,10 @@ async def test_expiration_loop_runs_both_cycles_and_handles_errors(caplog):
         caplog.at_level("ERROR", logger="app.tasks.expiration"),
     ):
         with pytest.raises(_StopLoop):
-            await expiration.expiration_loop(interval_seconds=1, nats_conn=None)
+            await expiration.expiration_loop(interval_seconds=1)
 
     expiration_cycle.assert_awaited_once()
-    reminder_cycle.assert_awaited_once_with(None)
+    reminder_cycle.assert_awaited_once()
     messages = [r.getMessage() for r in caplog.records]
     assert any("Expiration cycle failed" in m for m in messages)
     assert any("Expiry reminder cycle failed" in m for m in messages)
@@ -662,7 +652,7 @@ async def test_expiration_loop_happy_path_single_iteration():
         patch.object(expiration.asyncio, "sleep", new=AsyncMock(side_effect=_StopLoop())),
     ):
         with pytest.raises(_StopLoop):
-            await expiration.expiration_loop(interval_seconds=5, nats_conn=MagicMock())
+            await expiration.expiration_loop(interval_seconds=5)
 
     expiration_cycle.assert_awaited_once()
     reminder_cycle.assert_awaited_once()
@@ -730,7 +720,6 @@ async def test_update_reservation_add_persists_membership_rows(caplog):
                 new=AsyncMock(return_value=devices),
             ),
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             await update_reservation(
                 db,
@@ -904,7 +893,6 @@ async def test_visible_devices_non_200_logs_and_fails_open(non_admin_router_clie
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[_make_device(DEVICE_A)]),
         ),
-        patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
         caplog.at_level("WARNING", logger="app.routers.reservations"),
     ):

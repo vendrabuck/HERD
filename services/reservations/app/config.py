@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     nats_url: str = "nats://nats:4222"
     internal_api_token: str = ""
     expiration_interval_seconds: int = 60
+    # Transactional outbox relay (issue #21). The relay drains unpublished outbox
+    # rows to JetStream every tick and prunes published rows past the retention
+    # window. Defaults match herd_common.outbox.run_outbox_relay.
+    outbox_relay_tick_seconds: float = 5.0
+    outbox_batch_size: int = 100
+    outbox_retention_seconds: float = 7 * 24 * 3600
     # ROADMAP #40: lead window before end_time in which the expiration task
     # emits a reservation.expiring_soon reminder onto HERD_RESERVATIONS. An
     # ACTIVE reservation whose end_time is within this many seconds of now (and

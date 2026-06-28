@@ -11,17 +11,18 @@ Key rules enforced here:
 
 import asyncio
 import hashlib
-import json
 import logging
 import uuid
 from datetime import datetime, timezone
 
 import httpx
+from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import and_, exists, false, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.outbox import OutboxEvent
 from app.models.reservation import (
     Reservation,
     ReservationDevice,
@@ -277,20 +278,6 @@ async def _check_conflicts(
     return list(result.scalars().all())
 
 
-async def _publish_nats_event(nc, subject: str, event: dict) -> None:
-    """Publish a NATS event using the provided connection. Errors are logged, never raised."""
-    if nc is None:
-        return
-    try:
-        js = nc.jetstream()
-        await js.publish(
-            subject,
-            json.dumps(event, default=str).encode(),
-        )
-    except Exception:
-        logger.error("Failed to publish NATS event: %s", event.get("event"), exc_info=True)
-
-
 async def _update_device_statuses(
     device_ids: list[uuid.UUID],
     status: str,
@@ -392,7 +379,6 @@ async def create_reservation(
     data: ReservationCreate,
     user_id: uuid.UUID,
     token: str,
-    nats_conn=None,
     username: str = "",
 ) -> Reservation:
     # 1. Fetch all devices from inventory (concurrently)
@@ -493,6 +479,19 @@ async def create_reservation(
     # The cascaded reservation_devices rows flush in this same commit, so the
     # PENDING_PROVISION reservation and its device memberships become visible
     # together: exactly what _check_conflicts needs to reject a concurrent create.
+    if initial_status == ReservationStatus.ACTIVE:
+        # No exclusive devices, so the reservation is ACTIVE immediately with no
+        # inventory flip to come. Stage reservation.created in this same
+        # transaction (issue #21) so the event commits atomically with the ACTIVE
+        # row. flush() first to populate the python-side uuid default used in the
+        # payload and to materialize the device memberships.
+        await db.flush()
+        enqueue_event(
+            db,
+            OutboxEvent,
+            "herd.reservations.created",
+            _reservation_created_event(reservation),
+        )
     await db.commit()
     # expire_on_commit=False keeps the eager-loaded devices collection populated
     # across the commit; a full refresh reloads the scalar columns.
@@ -571,6 +570,15 @@ async def create_reservation(
             ) from exc
 
         reservation.status = ReservationStatus.ACTIVE
+        # Stage reservation.created in the same transaction that lands the row in
+        # ACTIVE (issue #21), so the event exists iff provisioning committed. The
+        # old fire-and-forget post-commit publish could drop it if NATS was down.
+        enqueue_event(
+            db,
+            OutboxEvent,
+            "herd.reservations.created",
+            _reservation_created_event(reservation),
+        )
         await db.commit()
         await db.refresh(reservation)
 
@@ -580,13 +588,6 @@ async def create_reservation(
     #    there is no parent topology (Case A lazy-create).
     await _create_reservation_fork_best_effort(
         reservation.id, reservation.topology_id, created_by=str(user_id)
-    )
-
-    # 9. Emit NATS event (only on successful provisioning)
-    await _publish_nats_event(
-        nats_conn,
-        "herd.reservations.created",
-        _reservation_created_event(reservation),
     )
 
     return reservation
@@ -680,7 +681,6 @@ async def update_reservation(
     user_id: uuid.UUID,
     data: ReservationUpdate,
     token: str = "",
-    nats_conn=None,
 ) -> Reservation | None:
     """Update an ACTIVE or PENDING reservation (end_time, purpose)."""
     reservation = await get_reservation(db, reservation_id, user_id)
@@ -842,21 +842,12 @@ async def update_reservation(
             reservation.device_ids = list(data.device_ids)
 
     reservation.modified_by = user_id
-    await db.commit()
-    await db.refresh(reservation)
-
-    logger.info(
-        "Reservation updated: %s",
-        reservation.id,
-        extra={
-            "action": "reservation_update",
-            "reservation_id": str(reservation.id),
-            "user_id": str(user_id),
-        },
-    )
-
-    await _publish_nats_event(
-        nats_conn,
+    # Stage reservation.updated in the same transaction as the edit (issue #21).
+    # The device membership diff (added/removed) and any inventory flips above are
+    # already applied to the session; this commits the event atomically with them.
+    enqueue_event(
+        db,
+        OutboxEvent,
         "herd.reservations.updated",
         {
             "event": "reservation.updated",
@@ -871,6 +862,18 @@ async def update_reservation(
             "end_time": reservation.end_time.isoformat() if end_time_changed else None,
         },
     )
+    await db.commit()
+    await db.refresh(reservation)
+
+    logger.info(
+        "Reservation updated: %s",
+        reservation.id,
+        extra={
+            "action": "reservation_update",
+            "reservation_id": str(reservation.id),
+            "user_id": str(user_id),
+        },
+    )
 
     return reservation
 
@@ -880,7 +883,6 @@ async def cancel_reservation(
     reservation_id: uuid.UUID,
     user_id: uuid.UUID,
     token: str = "",
-    nats_conn=None,
 ) -> Reservation | None:
     reservation = await get_reservation(db, reservation_id, user_id)
     if not reservation:
@@ -899,6 +901,22 @@ async def cancel_reservation(
         return reservation
     reservation.status = ReservationStatus.CANCELLED
     reservation.modified_by = user_id
+    # Stage reservation.cancelled in the same transaction that lands CANCELLED
+    # (issue #21). The inventory device release below is best-effort and runs
+    # after the commit; the event is durable regardless of NATS availability.
+    enqueue_event(
+        db,
+        OutboxEvent,
+        "herd.reservations.cancelled",
+        {
+            "event": "reservation.cancelled",
+            "reservation_id": str(reservation.id),
+            "user_id": str(user_id),
+            "device_ids": [str(d) for d in reservation.device_ids],
+            "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
+            "topology_type": reservation.topology_type.value,
+        },
+    )
     await db.commit()
     await db.refresh(reservation)
 
@@ -952,20 +970,6 @@ async def cancel_reservation(
                 exc_info=exc,
             )
 
-    # Emit NATS event
-    await _publish_nats_event(
-        nats_conn,
-        "herd.reservations.cancelled",
-        {
-            "event": "reservation.cancelled",
-            "reservation_id": str(reservation.id),
-            "user_id": str(user_id),
-            "device_ids": [str(d) for d in reservation.device_ids],
-            "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
-            "topology_type": reservation.topology_type.value,
-        },
-    )
-
     return reservation
 
 
@@ -974,7 +978,6 @@ async def release_reservation(
     reservation_id: uuid.UUID,
     user_id: uuid.UUID,
     token: str = "",
-    nats_conn=None,
 ) -> Reservation | None:
     reservation = await get_reservation(db, reservation_id, user_id)
     if not reservation:
@@ -983,6 +986,22 @@ async def release_reservation(
         return reservation
     reservation.status = ReservationStatus.COMPLETED
     reservation.modified_by = user_id
+    # Stage reservation.completed in the same transaction that lands COMPLETED
+    # (issue #21), mirroring the auto-expiry path. Inventory device release below
+    # is best-effort; the event is durable regardless of NATS availability.
+    enqueue_event(
+        db,
+        OutboxEvent,
+        "herd.reservations.completed",
+        {
+            "event": "reservation.completed",
+            "reservation_id": str(reservation.id),
+            "user_id": str(user_id),
+            "device_ids": [str(d) for d in reservation.device_ids],
+            "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
+            "topology_type": reservation.topology_type.value,
+        },
+    )
     await db.commit()
     await db.refresh(reservation)
 
@@ -1034,19 +1053,5 @@ async def release_reservation(
                 },
                 exc_info=exc,
             )
-
-    # Emit NATS event
-    await _publish_nats_event(
-        nats_conn,
-        "herd.reservations.completed",
-        {
-            "event": "reservation.completed",
-            "reservation_id": str(reservation.id),
-            "user_id": str(user_id),
-            "device_ids": [str(d) for d in reservation.device_ids],
-            "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
-            "topology_type": reservation.topology_type.value,
-        },
-    )
 
     return reservation

@@ -11,10 +11,11 @@ Acceptance criteria covered:
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from app.database import Base, engine
+from app.models.outbox import OutboxEvent
 from app.models.reservation import Reservation, ReservationStatus
 from app.tasks.expiration import _run_reminder_cycle
 from sqlalchemy import select
@@ -23,6 +24,17 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 NOW = datetime.now(timezone.utc)
+
+
+async def _expiring_soon_rows():
+    """Staged reservation.expiring_soon outbox rows (issue #21)."""
+    async with TestSessionLocal() as session:
+        stmt = (
+            select(OutboxEvent)
+            .where(OutboxEvent.subject == "herd.reservations.expiring_soon")
+            .order_by(OutboxEvent.created_at)
+        )
+        return (await session.execute(stmt)).scalars().all()
 
 
 @pytest.fixture(autouse=True)
@@ -71,99 +83,88 @@ def _patched_lead(seconds: int):
 
 
 @pytest.mark.asyncio
-async def test_reminder_emitted_once_within_window():
+async def test_reminder_staged_once_within_window():
     res_id = await _insert(ReservationStatus.ACTIVE, NOW + timedelta(minutes=30))
-    nats = AsyncMock()
     with _patched_lead(3600):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_reminder_cycle(nats)
-    pub.assert_awaited_once()
-    subject = pub.await_args[0][1]
-    event = pub.await_args[0][2]
-    assert subject == "herd.reservations.expiring_soon"
+        await _run_reminder_cycle()
+    rows = await _expiring_soon_rows()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.published_at is None
+    event = row.payload
     assert event["event"] == "reservation.expiring_soon"
     assert event["reservation_id"] == str(res_id)
     assert "end_time" in event and "user_id" in event
+    assert event["event_id"] == str(row.id)
     assert await _reminder_sent_at(res_id) is not None
 
 
 @pytest.mark.asyncio
 async def test_reminder_not_repeated_across_ticks():
-    """Exactly one event across two cycles for a reservation in the window."""
+    """Exactly one staged event across two cycles for a reservation in the window.
+
+    The stamp and the outbox row commit together (issue #21), so the second tick
+    sees an already-reminded row and stages nothing more.
+    """
     await _insert(ReservationStatus.ACTIVE, NOW + timedelta(minutes=30))
-    nats = AsyncMock()
     with _patched_lead(3600):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_reminder_cycle(nats)
-            await _run_reminder_cycle(nats)
-    assert pub.await_count == 1
+        await _run_reminder_cycle()
+        await _run_reminder_cycle()
+    assert len(await _expiring_soon_rows()) == 1
 
 
 @pytest.mark.asyncio
 async def test_reminder_skips_outside_window():
     await _insert(ReservationStatus.ACTIVE, NOW + timedelta(hours=5))
-    nats = AsyncMock()
     with _patched_lead(3600):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_reminder_cycle(nats)
-    pub.assert_not_awaited()
+        await _run_reminder_cycle()
+    assert await _expiring_soon_rows() == []
 
 
 @pytest.mark.asyncio
 async def test_reminder_skips_already_expired():
     """end_time already in the past is the completion path, not a reminder."""
     await _insert(ReservationStatus.ACTIVE, NOW - timedelta(minutes=5))
-    nats = AsyncMock()
     with _patched_lead(3600):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_reminder_cycle(nats)
-    pub.assert_not_awaited()
+        await _run_reminder_cycle()
+    assert await _expiring_soon_rows() == []
 
 
 @pytest.mark.asyncio
 async def test_reminder_skips_non_active():
     await _insert(ReservationStatus.PENDING, NOW + timedelta(minutes=30))
-    nats = AsyncMock()
     with _patched_lead(3600):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_reminder_cycle(nats)
-    pub.assert_not_awaited()
+        await _run_reminder_cycle()
+    assert await _expiring_soon_rows() == []
 
 
 @pytest.mark.asyncio
 async def test_reminder_skips_already_reminded():
     await _insert(ReservationStatus.ACTIVE, NOW + timedelta(minutes=30), reminded=True)
-    nats = AsyncMock()
     with _patched_lead(3600):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_reminder_cycle(nats)
-    pub.assert_not_awaited()
+        await _run_reminder_cycle()
+    assert await _expiring_soon_rows() == []
 
 
 @pytest.mark.asyncio
 async def test_lead_window_zero_disables_reminder():
     await _insert(ReservationStatus.ACTIVE, NOW + timedelta(minutes=30))
-    nats = AsyncMock()
     with _patched_lead(0):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_reminder_cycle(nats)
-    pub.assert_not_awaited()
+        await _run_reminder_cycle()
+    assert await _expiring_soon_rows() == []
 
 
 @pytest.mark.asyncio
-async def test_reminder_stamps_before_publish_so_failed_publish_not_retried():
-    """The row is stamped even if the publish fails, so a transient NATS error
-    does not produce a duplicate on the next tick (at-most-once)."""
+async def test_reminder_stamp_and_event_commit_together():
+    """The stamp and the outbox event are written in the same transaction (issue
+    #21): after one cycle the reservation is stamped AND exactly one unpublished
+    expiring_soon row exists, so the relay can never publish a reminder for a row
+    that was not stamped, nor stamp one whose event was lost."""
     res_id = await _insert(ReservationStatus.ACTIVE, NOW + timedelta(minutes=30))
-    nats = AsyncMock()
     with _patched_lead(3600):
-        with patch(
-            "app.tasks.expiration._publish_nats_event",
-            new=AsyncMock(side_effect=RuntimeError("nats down")),
-        ):
-            # _publish_nats_event swallows its own errors in production; here we
-            # force it to raise to prove the stamp already happened. The cycle
-            # itself should let it propagate is fine since the loop wraps it.
-            with pytest.raises(RuntimeError):
-                await _run_reminder_cycle(nats)
+        await _run_reminder_cycle()
+    rows = await _expiring_soon_rows()
+    assert len(rows) == 1
+    assert rows[0].published_at is None
+    assert rows[0].payload["reservation_id"] == str(res_id)
     assert await _reminder_sent_at(res_id) is not None

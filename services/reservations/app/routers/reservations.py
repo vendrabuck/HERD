@@ -68,10 +68,9 @@ async def create_new_reservation(
                     detail="You do not have access to one or more requested devices",
                 )
 
-    nats_conn = getattr(request.app.state, "nats", None)
     try:
         reservation = await create_reservation(
-            db, body, user_id, credentials.credentials, nats_conn=nats_conn, username=username
+            db, body, user_id, credentials.credentials, username=username
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -365,7 +364,6 @@ async def update_reservation_by_id(
                     detail="You do not have access to one or more requested devices",
                 )
 
-    nats_conn = getattr(request.app.state, "nats", None)
     try:
         reservation = await update_reservation(
             db,
@@ -373,7 +371,6 @@ async def update_reservation_by_id(
             user_id,
             body,
             token=credentials.credentials,
-            nats_conn=nats_conn,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -395,9 +392,8 @@ async def cancel_reservation_by_id(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     user_id = uuid.UUID(payload["sub"])
-    nats_conn = getattr(request.app.state, "nats", None)
     reservation = await cancel_reservation(
-        db, reservation_id, user_id, token=credentials.credentials, nats_conn=nats_conn
+        db, reservation_id, user_id, token=credentials.credentials
     )
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
@@ -412,9 +408,8 @@ async def release_reservation_early(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     user_id = uuid.UUID(payload["sub"])
-    nats_conn = getattr(request.app.state, "nats", None)
     reservation = await release_reservation(
-        db, reservation_id, user_id, token=credentials.credentials, nats_conn=nats_conn
+        db, reservation_id, user_id, token=credentials.credentials
     )
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
