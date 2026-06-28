@@ -14,6 +14,12 @@ services:
 
   inventory:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # Dev/test-only fault-injection seam (issue #214). Enables the double-gated
+    # hook in update_device_status_internal; harmless unless a device name also
+    # carries the __herd_fault_status__ sentinel. This override file is excluded
+    # by `make prod` (docker compose -f docker-compose.yml), so prod never sees it.
+    environment:
+      - HERD_FAULT_INJECTION=1
     volumes:
       - ./services/inventory/app:/app/app
       - ./services/inventory/migrations:/app/migrations

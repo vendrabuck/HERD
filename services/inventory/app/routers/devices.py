@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -24,6 +25,17 @@ from app.services.inventory_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["devices"])
+
+_FAULT_STATUS_SENTINEL = "__herd_fault_status__"
+
+
+def _fault_injection_enabled() -> bool:
+    return os.environ.get("HERD_FAULT_INJECTION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class DeviceStatusUpdate(BaseModel):
@@ -293,6 +305,18 @@ async def update_device_status_internal(
     """Update device status. Internal service-to-service endpoint, guarded by token."""
     if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
         raise HTTPException(status_code=403, detail="Invalid internal token")
+    # Test-only fault-injection seam (issue #214). Double-gated: active only when
+    # HERD_FAULT_INJECTION is set (dev/test compose override; never in `make prod`)
+    # AND the target device's name carries the sentinel. Lets integration tests
+    # drive the provisioning FAILED + device-revert path by failing one device's
+    # status update on demand. Inert in production (env unset) and for normal devices.
+    if _fault_injection_enabled():
+        existing = await get_device(db, device_id)
+        if existing is not None and _FAULT_STATUS_SENTINEL in (existing.name or ""):
+            raise HTTPException(
+                status_code=503,
+                detail="fault injection: simulated inventory status-update failure",
+            )
     device = await set_device_status(db, device_id, body.status)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
