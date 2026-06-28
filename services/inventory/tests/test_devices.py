@@ -422,6 +422,73 @@ async def test_internal_status_update_bad_token(client):
     assert resp.status_code == 403
 
 
+# --- fault-injection seam (issue #214) ---
+
+
+@pytest.mark.asyncio
+async def test_fault_injection_fails_sentinel_device(client, monkeypatch):
+    """With HERD_FAULT_INJECTION on, a sentinel-named device's status update is
+    refused with 503 and the device status is left UNCHANGED (the fault raises
+    before set_device_status runs)."""
+    monkeypatch.setenv("HERD_FAULT_INJECTION", "1")
+    tid = await _create_template(client)
+    payload = {**_device_payload(tid), "name": "FW-__herd_fault_status__-01"}
+    create_resp = await client.post("/devices", json=payload)
+    device_id = create_resp.json()["id"]
+
+    resp = await client.post(
+        f"/devices/{device_id}/status",
+        json={"status": "RESERVED"},
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == ("fault injection: simulated inventory status-update failure")
+
+    # The status update never ran: the device is still AVAILABLE.
+    get_resp = await client.get(
+        f"/devices/{device_id}/internal", headers={"X-Internal-Token": "test-token"}
+    )
+    assert get_resp.status_code == 200
+    assert get_resp.json()["status"] == "AVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_fault_injection_skips_normal_device(client, monkeypatch):
+    """With the env on but a normally-named device, the status update succeeds:
+    the sentinel name gate, not the env alone, selects the failing device."""
+    monkeypatch.setenv("HERD_FAULT_INJECTION", "1")
+    tid = await _create_template(client)
+    create_resp = await client.post("/devices", json=_device_payload(tid))
+    device_id = create_resp.json()["id"]
+
+    resp = await client.post(
+        f"/devices/{device_id}/status",
+        json={"status": "RESERVED"},
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "RESERVED"
+
+
+@pytest.mark.asyncio
+async def test_fault_injection_inert_when_env_unset(client, monkeypatch):
+    """With HERD_FAULT_INJECTION unset (default), even a sentinel-named device
+    updates normally: the env gate, not just the name, must be tripped."""
+    monkeypatch.delenv("HERD_FAULT_INJECTION", raising=False)
+    tid = await _create_template(client)
+    payload = {**_device_payload(tid), "name": "FW-__herd_fault_status__-02"}
+    create_resp = await client.post("/devices", json=payload)
+    device_id = create_resp.json()["id"]
+
+    resp = await client.post(
+        f"/devices/{device_id}/status",
+        json={"status": "RESERVED"},
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "RESERVED"
+
+
 # --- 404 tests ---
 
 
