@@ -5,6 +5,8 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 
+from herd_common.outbox import event_dedupe_key
+
 from app.config import settings
 from app.services import event_router
 from app.services.dispatchers import default_dispatchers
@@ -29,23 +31,6 @@ HEALTH_STREAM = "HERD_HEALTH"
 HEALTH_SUBJECT_PATTERN = "herd.health.*"
 HEALTH_DURABLE = "notifications-health-consumer"
 HEALTH_DLQ_SUBJECT = "herd.health.dlq.notifications"
-
-
-def _dedupe_key_from_msg(msg) -> str | None:
-    """Build a stable per-message dedupe key from JetStream metadata.
-
-    Uses "<stream>:<stream-sequence>", which is identical across redeliveries of
-    the same message and distinct for every new publish. Returns None when the
-    metadata is unavailable (e.g. a non-JetStream test stub), so dedup is simply
-    skipped rather than failing the message.
-    """
-    meta = getattr(msg, "metadata", None)
-    seq = getattr(meta, "sequence", None)
-    stream_seq = getattr(seq, "stream", None)
-    stream = getattr(meta, "stream", None)
-    if stream_seq is None:
-        return None
-    return f"{stream or 'stream'}:{stream_seq}"
 
 
 async def _dispatch(
@@ -119,7 +104,10 @@ async def process_message(
         return "dlq"
 
     try:
-        await handler(event_data, session_factory, _dedupe_key_from_msg(msg))
+        # Idempotency key: the producer-stamped payload `event_id` (outbox,
+        # issue #21), which survives a relay republish under a new stream
+        # sequence; falls back to "<stream>:<sequence>" for pre-outbox events.
+        await handler(event_data, session_factory, event_dedupe_key(event_data, msg))
     except Exception as exc:
         num_delivered = getattr(getattr(msg, "metadata", None), "num_delivered", 1) or 1
         if num_delivered >= max_deliver:
