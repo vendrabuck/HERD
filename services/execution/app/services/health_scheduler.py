@@ -24,13 +24,13 @@ logged and the row resweeps on the next tick.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from herd_common.outbox import enqueue_event
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.models.device_health_status import DeviceHealthStatus
+from app.models.outbox import OutboxEvent
 from app.services.execution_service import fetch_device, fetch_template, run_driver_action
 
 # ROADMAP #13 iter 2: NATS stream + subject for health-transition events.
@@ -229,27 +230,6 @@ def _next_poll_at(
     return now + timedelta(seconds=capped + jitter)
 
 
-async def _publish_health_event(nc, payload: dict) -> None:
-    """Publish a health-transition event to NATS.
-
-    Closed-default on any failure: a missed publish is tolerable since
-    the snapshot in `device_health_status` still reflects the bad state
-    and the next bad-news transition (if it happens) will fire again.
-    No retry, no local outbox; if NATS is down the event is lost.
-    """
-    if nc is None:
-        return
-    try:
-        js = nc.jetstream()
-        await js.publish(HEALTH_NATS_SUBJECT, json.dumps(payload, default=str).encode())
-    except Exception:
-        logger.error(
-            "Failed to publish health transition event",
-            extra={"action": "health_publish_failed", "payload": payload},
-            exc_info=True,
-        )
-
-
 def _decide_transition(
     *,
     old_failures: int,
@@ -287,8 +267,12 @@ async def fire_poll(
     Logout failure does not mask the real outcome.
 
     If iter 2's notify path is enabled and the new consecutive_failures
-    count crosses the bad-news or recovery threshold, publish a NATS
-    event to `herd.health.status_changed` after the commit.
+    count crosses the bad-news or recovery threshold, a health-transition
+    event (subject `herd.health.status_changed`) is staged into the outbox
+    in the SAME transaction as the status update, so the event exists iff
+    the status change committed (issue #21). The relay (main.py) publishes
+    it to NATS. `nc` is retained for call-site compatibility but is unused:
+    publishing is now the relay's job, not fire_poll's.
     """
     started = datetime.now(timezone.utc)
     last_status = "UNKNOWN"
@@ -352,7 +336,10 @@ async def fire_poll(
 
     # Update the health-status row in a fresh session so the run-session
     # commits do not interfere. Capture the pre-update state so the
-    # transition check (iter 2) can fire only on threshold crossings.
+    # transition check (iter 2) can fire only on threshold crossings, and
+    # stage any health-transition event into the outbox BEFORE this session
+    # commits, so the event row commits atomically with the status update
+    # (issue #21). The relay (main.py) publishes the staged row to NATS.
     async with session_factory() as status_session:
         row = await status_session.get(DeviceHealthStatus, device_id)
         if row is None:
@@ -373,6 +360,36 @@ async def fire_poll(
             interval_seconds, row.consecutive_failures, datetime.now(timezone.utc)
         )
         new_failures = row.consecutive_failures
+
+        # ROADMAP #13 iter 2 + issue #21: stage a health-transition event on a
+        # bad-news / recovery transition into the outbox, in the SAME
+        # transaction as the status update. The bad_news threshold is the same
+        # value that controls the failure backoff, so the event aligns with the
+        # scheduler's existing "device is in trouble" signal; recovery fires on
+        # the first poll that resets failures to zero. The
+        # health_poll_notify_enabled flag still gates whether any event is
+        # emitted at all.
+        if settings.health_poll_notify_enabled:
+            transition = _decide_transition(
+                old_failures=old_failures,
+                new_failures=new_failures,
+                threshold=settings.health_poll_max_consecutive_failures,
+            )
+            if transition is not None:
+                device_name = device_data.get("name") if device_data else None
+                payload = {
+                    "event": "device.health_transition",
+                    "device_id": str(device_id),
+                    "device_name": device_name or str(device_id),
+                    "old_status": old_status,
+                    "new_status": last_status,
+                    "transition_kind": transition,
+                    "consecutive_failures": new_failures,
+                    "last_run_id": str(last_run_id) if last_run_id else None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                enqueue_event(status_session, OutboxEvent, HEALTH_NATS_SUBJECT, payload)
+
         await status_session.commit()
 
     log_event = "health_poll_completed" if not poll_failed else "health_poll_failed"
@@ -385,35 +402,6 @@ async def fire_poll(
             "duration_ms": duration_ms,
         },
     )
-
-    # ROADMAP #13 iter 2: emit a NATS event on bad-news / recovery
-    # transitions. The threshold for bad_news is the same value that
-    # controls the existing failure backoff, so the publish naturally
-    # aligns with the scheduler's existing "device is in trouble"
-    # signal. Recovery fires on the first poll that resets failures
-    # to zero.
-    if not settings.health_poll_notify_enabled:
-        return
-    transition = _decide_transition(
-        old_failures=old_failures,
-        new_failures=new_failures,
-        threshold=settings.health_poll_max_consecutive_failures,
-    )
-    if transition is None:
-        return
-    device_name = device_data.get("name") if device_data else None
-    payload = {
-        "event": "device.health_transition",
-        "device_id": str(device_id),
-        "device_name": device_name or str(device_id),
-        "old_status": old_status,
-        "new_status": last_status,
-        "transition_kind": transition,
-        "consecutive_failures": new_failures,
-        "last_run_id": str(last_run_id) if last_run_id else None,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    await _publish_health_event(nc, payload)
 
 
 # --- Loop ---

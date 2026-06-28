@@ -1,13 +1,16 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
+from herd_common.outbox import run_outbox_relay
 
 from app.config import settings
-from app.database import Base, engine
+from app.database import AsyncSessionLocal, Base, engine
 from app.models import *  # noqa: F401, F403
+from app.models.outbox import OutboxEvent
 from app.routers.executions import router as executions_router
 from app.routers.health import router as health_router
 from app.services.health_scheduler import start_health_scheduler, stop_health_scheduler
@@ -62,6 +65,47 @@ async def _ensure_dlq_stream(app: FastAPI) -> None:
         logger.warning("Could not create HERD_DLQ stream", exc_info=True)
 
 
+async def start_outbox_relay(app: FastAPI) -> None:
+    """Start the transactional-outbox relay as a background task (issue #21).
+
+    Drains unpublished OutboxEvent rows (staged by the health scheduler in the
+    same transaction as the status update) to JetStream and prunes old ones.
+    `get_nats` is read each tick via app.state.nats, so a NATS connection that
+    was None at startup, or a later reconnect, is picked up without a restart.
+    Mirrors start_health_scheduler: stored on app.state for shutdown to cancel.
+    """
+    task = asyncio.create_task(
+        run_outbox_relay(
+            AsyncSessionLocal,
+            lambda: getattr(app.state, "nats", None),
+            OutboxEvent,
+            name="execution-outbox",
+        )
+    )
+
+    def _surface_crash(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("outbox relay task exited unexpectedly: %s", exc)
+
+    task.add_done_callback(_surface_crash)
+    app.state.outbox_relay_task = task
+
+
+async def stop_outbox_relay(app: FastAPI) -> None:
+    """Cancel the outbox relay task on app shutdown."""
+    task = getattr(app.state, "outbox_relay_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
@@ -70,7 +114,9 @@ async def lifespan(app: FastAPI):
     await _ensure_health_stream(app)
     await _ensure_dlq_stream(app)
     await start_health_scheduler(app)
+    await start_outbox_relay(app)
     yield
+    await stop_outbox_relay(app)
     await stop_health_scheduler(app)
     await stop_nats_consumer(app)
 

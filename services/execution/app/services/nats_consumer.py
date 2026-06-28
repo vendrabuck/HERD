@@ -7,27 +7,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import httpx
+from herd_common.outbox import event_dedupe_key
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-
-
-def _dedupe_key_from_msg(msg) -> str | None:
-    """Build a stable per-message dedupe key from JetStream metadata.
-
-    Uses "<stream>:<stream-sequence>", identical across redeliveries of the same
-    message and distinct for every new publish. Returns None when the metadata is
-    unavailable (e.g. a non-JetStream test stub), so idempotency is simply skipped
-    rather than failing the message. Mirrors the notifications consumer.
-    """
-    meta = getattr(msg, "metadata", None)
-    seq = getattr(meta, "sequence", None)
-    stream_seq = getattr(seq, "stream", None)
-    stream = getattr(meta, "stream", None)
-    if stream_seq is None:
-        return None
-    return f"{stream or 'stream'}:{stream_seq}"
 
 
 # Map NATS event types to driver actions
@@ -1178,7 +1162,10 @@ async def process_reservation_message(
         return "dlq"
 
     try:
-        await handler(event_data, session_factory, _dedupe_key_from_msg(msg))
+        # Key idempotency on the stable producer-stamped event_id when present
+        # (issue #21), so a relay republish under a new stream sequence still
+        # dedupes; fall back to "<stream>:<sequence>" for pre-outbox events.
+        await handler(event_data, session_factory, event_dedupe_key(event_data, msg))
     except PermanentEventError as exc:
         # Non-retryable (e.g. VLAN pool exhausted): the in-use set is unchanged
         # between attempts, so retrying only burns max_deliver and delays the DLQ.
