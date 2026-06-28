@@ -22,6 +22,11 @@ NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
 NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.notifications"
+# Pull-consumer fetch tuning. A pull consumer re-establishes on the next fetch
+# after a broker reconnect, which a push subscription does not do reliably, so it
+# survives a NATS restart (issue #21).
+NATS_FETCH_BATCH = 10
+NATS_FETCH_TIMEOUT_SECONDS = 5
 
 # ROADMAP #13 iter 2: second subscription for device health transitions.
 # Same handler dispatch (event_router branches by `event` field) but a
@@ -155,7 +160,13 @@ async def start_nats_consumer(app) -> None:
     from nats.js.api import ConsumerConfig
 
     try:
-        nc = await nats.connect(settings.nats_url)
+        # Retry reconnect forever so the durable consumer resumes after a broker
+        # restart instead of giving up at the default 60-attempt cap.
+        nc = await nats.connect(
+            settings.nats_url,
+            max_reconnect_attempts=-1,
+            reconnect_time_wait=2,
+        )
         app.state.nats = nc
         js = nc.jetstream()
 
@@ -187,10 +198,9 @@ async def start_nats_consumer(app) -> None:
                     exc_info=True,
                 )
 
-            sub = await js.subscribe(
+            psub = await js.pull_subscribe(
                 subject_pattern,
                 durable=durable,
-                manual_ack=True,
                 config=ConsumerConfig(
                     max_deliver=NATS_MAX_DELIVER,
                     ack_wait=NATS_ACK_WAIT_SECONDS,
@@ -199,21 +209,41 @@ async def start_nats_consumer(app) -> None:
             )
 
             async def _consumer_loop():
-                async for msg in sub.messages:
+                while True:
                     try:
-                        await process_message(
-                            msg,
-                            js,
-                            handle_event,
-                            _get_db_session,
-                            dlq_subject=dlq_subject,
+                        msgs = await psub.fetch(
+                            NATS_FETCH_BATCH, timeout=NATS_FETCH_TIMEOUT_SECONDS
                         )
+                    except asyncio.CancelledError:
+                        raise
+                    except (nats.errors.TimeoutError, asyncio.TimeoutError):
+                        # No messages this cycle; fetch again. The fetch also
+                        # re-establishes delivery after a broker reconnect.
+                        continue
                     except Exception:
-                        logger.error(
-                            "Unexpected error in NATS consumer loop for %s",
+                        # Connection lost or reconnecting; pause then re-fetch.
+                        logger.warning(
+                            "NATS pull fetch failed for %s; will retry",
                             subject_pattern,
                             exc_info=True,
                         )
+                        await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
+                        continue
+                    for msg in msgs:
+                        try:
+                            await process_message(
+                                msg,
+                                js,
+                                handle_event,
+                                _get_db_session,
+                                dlq_subject=dlq_subject,
+                            )
+                        except Exception:
+                            logger.error(
+                                "Unexpected error in NATS consumer loop for %s",
+                                subject_pattern,
+                                exc_info=True,
+                            )
 
             return asyncio.create_task(_consumer_loop())
 

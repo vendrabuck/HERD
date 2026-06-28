@@ -10,8 +10,15 @@ JetStream at-least-once.
 
 from herd_common.outbox import OutboxMixin
 
+from app.config import settings
 from app.database import Base
+
+_schema = settings.db_schema or None
 
 
 class OutboxEvent(OutboxMixin, Base):
     __tablename__ = "outbox"
+    # The reservations models carry their schema per-table via __table_args__
+    # (the Base has no schema-scoped MetaData), so the outbox must do the same or
+    # it lands in the default `public` schema instead of `reservations`.
+    __table_args__ = {"schema": _schema} if _schema else {}

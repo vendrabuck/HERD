@@ -493,23 +493,28 @@ class _FakeApp:
         self.state = types.SimpleNamespace()
 
 
+class _FakeNatsTimeout(Exception):
+    """Stand-in for nats.errors.TimeoutError, raised by an idle fetch()."""
+
+
 class _FakeSubscription:
-    """A JetStream pull-style subscription whose `.messages` yields a fixed
-    list once, then blocks forever (mirrors the real never-ending stream)."""
+    """A JetStream pull subscription whose `fetch()` returns a fixed list once,
+    then raises TimeoutError forever (mirrors an idle pull consumer that the
+    loop keeps polling until the test cancels it)."""
 
     def __init__(self, msgs):
-        self._msgs = msgs
+        self._msgs = list(msgs)
+        self._drained = False
 
-    @property
-    def messages(self):
-        async def _gen():
-            for m in self._msgs:
-                yield m
-            # The real subscription never ends; block so the loop task stays
-            # alive until the test cancels it (as stop_nats_consumer would).
-            await asyncio.Event().wait()
-
-        return _gen()
+    async def fetch(self, batch, timeout=None):
+        if not self._drained and self._msgs:
+            self._drained = True
+            return self._msgs
+        # Yield to the event loop before raising: the real fetch blocks for
+        # `timeout`, so without a sleep here the consumer loop would busy-spin and
+        # starve the test's own await points.
+        await asyncio.sleep(0.02)
+        raise _FakeNatsTimeout()
 
 
 class _FakeJetStream:
@@ -525,7 +530,7 @@ class _FakeJetStream:
             raise RuntimeError("stream exists / cannot update")
         self.added_streams.append((name, tuple(subjects)))
 
-    async def subscribe(self, subject_pattern, durable, manual_ack, config):
+    async def pull_subscribe(self, subject_pattern, durable, config):
         self.subscribe_calls.append(
             {"subject": subject_pattern, "durable": durable, "config": config}
         )
@@ -554,6 +559,9 @@ def _install_fake_nats(monkeypatch, connect_impl):
     fake_nats.connect = connect_impl
     fake_js = types.ModuleType("nats.js")
     fake_js_api = types.ModuleType("nats.js.api")
+    fake_errors = types.ModuleType("nats.errors")
+    fake_errors.TimeoutError = _FakeNatsTimeout
+    fake_nats.errors = fake_errors
 
     class _ConsumerConfig:
         def __init__(self, **kwargs):
@@ -563,6 +571,7 @@ def _install_fake_nats(monkeypatch, connect_impl):
     monkeypatch.setitem(sys.modules, "nats", fake_nats)
     monkeypatch.setitem(sys.modules, "nats.js", fake_js)
     monkeypatch.setitem(sys.modules, "nats.js.api", fake_js_api)
+    monkeypatch.setitem(sys.modules, "nats.errors", fake_errors)
     return _ConsumerConfig
 
 
@@ -571,7 +580,7 @@ async def test_start_nats_consumer_wires_both_subscriptions(monkeypatch):
     js = _FakeJetStream()
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -618,7 +627,7 @@ async def test_start_nats_consumer_loop_processes_a_message(monkeypatch):
     js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: res_sub})
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -664,7 +673,7 @@ async def test_start_nats_consumer_loop_swallows_unexpected_errors(monkeypatch):
     js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: sub})
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -694,7 +703,7 @@ async def test_start_nats_consumer_tolerates_add_stream_failure(monkeypatch):
     js = _FakeJetStream(add_stream_error=True)
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -712,7 +721,7 @@ async def test_start_nats_consumer_tolerates_add_stream_failure(monkeypatch):
 async def test_start_nats_consumer_swallows_connect_failure(monkeypatch):
     """A broker that is unreachable is logged; the app boots without consumers."""
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         raise RuntimeError("connection refused")
 
     _install_fake_nats(monkeypatch, _connect)

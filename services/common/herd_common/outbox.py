@@ -114,14 +114,18 @@ async def _publish_pending(
     model: type,
     *,
     batch_size: int,
+    publish_timeout: float = 10.0,
 ) -> int:
     """Publish up to `batch_size` unpublished rows, marking each sent.
 
     Claims one row at a time with FOR UPDATE SKIP LOCKED so multiple relay
     instances never publish the same row, holding the row lock only across that
-    row's single publish. A publish failure records the attempt, leaves the row
-    unpublished for a later tick, and stops the batch (NATS is likely down, so
-    there is no value hammering the rest this tick). Returns the count published.
+    row's single publish. Each publish is bounded by `publish_timeout`: a
+    JetStream publish on a connection that drops mid-call can otherwise block the
+    whole relay loop indefinitely, so on timeout we treat it as a failed attempt.
+    A publish failure records the attempt, leaves the row unpublished for a later
+    tick, and stops the batch (NATS is likely down, so there is no value
+    hammering the rest this tick). Returns the count published.
     """
     published = 0
     for _ in range(batch_size):
@@ -137,10 +141,13 @@ async def _publish_pending(
             break
         row.attempts += 1
         try:
-            await js.publish(
-                row.subject,
-                json.dumps(row.payload, default=str).encode(),
-                headers={NATS_MSG_ID_HEADER: str(row.id)},
+            await asyncio.wait_for(
+                js.publish(
+                    row.subject,
+                    json.dumps(row.payload, default=str).encode(),
+                    headers={NATS_MSG_ID_HEADER: str(row.id)},
+                ),
+                timeout=publish_timeout,
             )
         except Exception:
             logger.exception("outbox publish failed for event %s; will retry", row.id)
@@ -180,15 +187,19 @@ async def run_outbox_relay(
     batch_size: int = 100,
     retention_seconds: float = 7 * 24 * 3600,
     prune_every_seconds: float = 3600.0,
+    publish_timeout: float = 10.0,
 ) -> None:
     """Background relay: drain unpublished rows to JetStream, prune old ones.
 
-    Mirrors the health scheduler's tick/backoff/cancellation shape. A tick with
-    no NATS connection or a failed publish backs off exponentially to a cap; a
-    healthy tick resets to `tick_seconds`. `get_nats` is called each tick so a
-    reconnect (or a connection that was None at startup) is picked up. Drains all
-    pending rows on the first healthy tick after an outage, which is what makes
-    restart-recovery work. Cancellable via task.cancel().
+    Mirrors the health scheduler's tick/backoff/cancellation shape. `get_nats` is
+    called each tick so a reconnect (or a connection that was None at startup) is
+    picked up. The connection must report `is_connected` before we publish: a
+    JetStream publish on a disconnected client can block the loop, and the
+    services connect with infinite reconnect, so during a broker outage the relay
+    just waits at the base cadence (not escalating backoff) until the client
+    reconnects, then drains all buffered rows on the first healthy tick. That
+    drain-on-recovery is what makes restart-recovery work. An unexpected error
+    backs off exponentially to a cap. Cancellable via task.cancel().
     """
     max_backoff = max(tick_seconds * 10, 300)
     current_backoff = tick_seconds
@@ -196,15 +207,20 @@ async def run_outbox_relay(
     logger.info("%s relay started; tick=%ss batch=%s", name, tick_seconds, batch_size)
     while True:
         tick_failed = False
+        waiting_for_nats = False
         try:
             nc = get_nats()
-            if nc is None:
-                # No NATS yet; back off and retry without touching the DB.
-                tick_failed = True
+            if nc is None or not nc.is_connected:
+                # Not connected (startup, or an outage we are waiting out). Retry
+                # at the base cadence so reconnection is picked up promptly, and
+                # do not call publish on a dead client.
+                waiting_for_nats = True
             else:
                 js = nc.jetstream()
                 async with session_factory() as session:
-                    count = await _publish_pending(session, js, model, batch_size=batch_size)
+                    count = await _publish_pending(
+                        session, js, model, batch_size=batch_size, publish_timeout=publish_timeout
+                    )
                 if count:
                     logger.info("%s relay published %s event(s)", name, count)
                 now = datetime.now(timezone.utc)
@@ -222,7 +238,10 @@ async def run_outbox_relay(
             logger.exception("%s relay tick failed", name)
             tick_failed = True
 
-        current_backoff = min(current_backoff * 2, max_backoff) if tick_failed else tick_seconds
+        if waiting_for_nats:
+            current_backoff = tick_seconds
+        else:
+            current_backoff = min(current_backoff * 2, max_backoff) if tick_failed else tick_seconds
         try:
             await asyncio.sleep(current_backoff)
         except asyncio.CancelledError:

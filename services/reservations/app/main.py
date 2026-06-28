@@ -26,7 +26,15 @@ async def lifespan(app: FastAPI):
     try:
         import nats
 
-        nc = await nats.connect(settings.nats_url)
+        # Retry reconnect forever (max_reconnect_attempts=-1): the outbox relay
+        # depends on this connection recovering after a broker restart, otherwise
+        # buffered events would be stranded once the default 60-attempt cap gave
+        # up and closed the connection.
+        nc = await nats.connect(
+            settings.nats_url,
+            max_reconnect_attempts=-1,
+            reconnect_time_wait=2,
+        )
         app.state.nats = nc
         logger.info("Connected to NATS at %s", settings.nats_url)
         js = nc.jetstream()
