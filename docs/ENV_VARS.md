@@ -245,6 +245,12 @@ Inventory also hosts the apply-job scheduler that runs scheduled device-config a
 | `APPLY_SCHEDULER_ENABLED` | `true` | Enable the in-process asyncio scheduler that polls for due apply jobs and dispatches them. Set to `false` to run inventory without the scheduler (useful for read-only replicas or debugging). |
 | `APPLY_SCHEDULER_INTERVAL_SECONDS` | `30` | Polling interval. Lower values find due jobs faster but increase DB load. Reservation-bound jobs only fire while the reservation is active; the scheduler skips (does not catch up) past-due windows. |
 
+Test-only fault-injection seam (issue #214):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HERD_FAULT_INJECTION` | unset | Test-only. When truthy (`1`/`true`/`yes`/`on`), the internal `POST /devices/{id}/status` endpoint returns 503 for any device whose name carries the `__herd_fault_status__` sentinel, letting integration tests drive the provisioning FAILED + device-revert path. Double-gated (env set AND the sentinel name), so it is inert for normal devices. Set only in `docker-compose.override.yml` (dev/test), which `make prod` excludes, so production never enables it. |
+
 ## Notifications service
 
 | Variable | Default | Purpose |
