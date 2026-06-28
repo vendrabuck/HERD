@@ -15,6 +15,7 @@ from app.config import settings
 from app.database import Base
 from app.models.device_health_status import DeviceHealthStatus
 from app.models.execution_run import ExecutionRun
+from app.models.outbox import OutboxEvent
 from app.services import health_scheduler
 from app.services.health_scheduler import (
     SYSTEM_POLL_USER_ID,
@@ -23,6 +24,7 @@ from app.services.health_scheduler import (
     _next_poll_at,
     fire_poll,
 )
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
@@ -390,18 +392,12 @@ async def test_fire_poll_creates_row_if_missing(monkeypatch):
         assert row.last_status == "HEALTHY"
 
 
-# --- ROADMAP #13 iter 2: transition publish ---
-
-
-def _make_nc_mock():
-    """Build a fake NATS client whose jetstream().publish is an AsyncMock."""
-    from unittest.mock import MagicMock
-
-    nc = MagicMock()
-    js_mock = MagicMock()
-    js_mock.publish = AsyncMock()
-    nc.jetstream = MagicMock(return_value=js_mock)
-    return nc, js_mock.publish
+# --- ROADMAP #13 iter 2 + issue #21: transition enqueued to the outbox ---
+#
+# The publish path is gone: fire_poll now stages the health-transition event
+# into the outbox table in the SAME transaction as the status update, and a
+# separate relay (main.py) publishes it. These tests assert against the staged
+# OutboxEvent rows rather than a direct js.publish.
 
 
 def _setup_driver_outcomes(monkeypatch, *, login_status: str, status_status: str | None):
@@ -423,22 +419,31 @@ def _setup_driver_outcomes(monkeypatch, *, login_status: str, status_status: str
     return uuid.UUID(device["id"])
 
 
+async def _outbox_rows() -> list[OutboxEvent]:
+    async with TestSessionLocal() as db:
+        result = await db.execute(select(OutboxEvent))
+        return list(result.scalars().all())
+
+
 @pytest.mark.asyncio
-async def test_publish_on_threshold_crossing(monkeypatch):
-    """consecutive_failures goes from 2 to 3 (threshold=3): bad_news fires."""
+async def test_enqueue_on_threshold_crossing(monkeypatch):
+    """2 to 3 failures (threshold=3): exactly one bad_news OutboxEvent, unpublished."""
     now = datetime.now(timezone.utc)
     device_id = _setup_driver_outcomes(monkeypatch, login_status="FAILED", status_status=None)
     await _existing_row(device_id, now, consecutive_failures=2, last_status="HEALTHY")
 
-    nc, publish = _make_nc_mock()
-    await fire_poll(TestSessionLocal, device_id, 60, nc=nc)
+    await fire_poll(TestSessionLocal, device_id, 60)
 
-    publish.assert_called_once()
-    args, _kw = publish.call_args
-    assert args[0] == health_scheduler.HEALTH_NATS_SUBJECT
-    import json
-
-    payload = json.loads(args[1].decode())
+    rows = await _outbox_rows()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.subject == health_scheduler.HEALTH_NATS_SUBJECT
+    # Staged but not yet relayed: the relay sets published_at on publish.
+    assert row.published_at is None
+    payload = row.payload
+    # enqueue_event stamps a stable event_id that the consumer dedupes on.
+    assert payload["event_id"] == str(row.id)
+    assert uuid.UUID(payload["event_id"])  # well-formed UUID
     assert payload["event"] == "device.health_transition"
     assert payload["transition_kind"] == "bad_news"
     assert payload["new_status"] == "UNREACHABLE"
@@ -447,105 +452,112 @@ async def test_publish_on_threshold_crossing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_publish_below_threshold(monkeypatch):
-    """1 failure to 2 failures, threshold=3: stays silent."""
+async def test_enqueue_shares_transaction_with_status_update(monkeypatch):
+    """The enqueue runs in the same session/transaction as the status update.
+
+    Proven by inspecting the session at enqueue time: the modified
+    DeviceHealthStatus row is already pending (dirty, uncommitted) in the very
+    session enqueue_event is handed, so a single commit persists both rows.
+    """
+    now = datetime.now(timezone.utc)
+    device_id = _setup_driver_outcomes(monkeypatch, login_status="FAILED", status_status=None)
+    await _existing_row(device_id, now, consecutive_failures=2, last_status="HEALTHY")
+
+    captured: dict = {}
+    real_enqueue = health_scheduler.enqueue_event
+
+    def _spy(session, model, subject, payload, **kwargs):
+        dirty = [o for o in session.dirty if isinstance(o, DeviceHealthStatus)]
+        captured["dirty_failures"] = [o.consecutive_failures for o in dirty]
+        return real_enqueue(session, model, subject, payload, **kwargs)
+
+    monkeypatch.setattr(health_scheduler, "enqueue_event", _spy)
+    await fire_poll(TestSessionLocal, device_id, 60)
+
+    # The status update (consecutive_failures -> 3) was pending-uncommitted in
+    # the same session at the moment the event was staged.
+    assert captured["dirty_failures"] == [3]
+    rows = await _outbox_rows()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_enqueue_below_threshold(monkeypatch):
+    """1 to 2 failures, threshold=3: no transition, no outbox row."""
     now = datetime.now(timezone.utc)
     device_id = _setup_driver_outcomes(monkeypatch, login_status="FAILED", status_status=None)
     await _existing_row(device_id, now, consecutive_failures=1, last_status="UNREACHABLE")
 
-    nc, publish = _make_nc_mock()
-    await fire_poll(TestSessionLocal, device_id, 60, nc=nc)
+    await fire_poll(TestSessionLocal, device_id, 60)
 
-    publish.assert_not_called()
+    assert await _outbox_rows() == []
 
 
 @pytest.mark.asyncio
-async def test_no_republish_on_continued_failure(monkeypatch):
-    """Already past threshold (3 to 4): no second bad_news event."""
+async def test_no_re_enqueue_on_continued_failure(monkeypatch):
+    """Already past threshold (3 to 4): no second bad_news row."""
     now = datetime.now(timezone.utc)
     device_id = _setup_driver_outcomes(monkeypatch, login_status="FAILED", status_status=None)
     await _existing_row(device_id, now, consecutive_failures=3, last_status="UNREACHABLE")
 
-    nc, publish = _make_nc_mock()
-    await fire_poll(TestSessionLocal, device_id, 60, nc=nc)
+    await fire_poll(TestSessionLocal, device_id, 60)
 
-    publish.assert_not_called()
+    assert await _outbox_rows() == []
 
 
 @pytest.mark.asyncio
-async def test_publish_on_recovery(monkeypatch):
-    """consecutive_failures resets from 5 to 0: recovery fires."""
+async def test_enqueue_on_recovery(monkeypatch):
+    """consecutive_failures resets from 5 to 0: one recovery OutboxEvent."""
     now = datetime.now(timezone.utc)
     device_id = _setup_driver_outcomes(monkeypatch, login_status="SUCCESS", status_status="SUCCESS")
     await _existing_row(device_id, now, consecutive_failures=5, last_status="UNREACHABLE")
 
-    nc, publish = _make_nc_mock()
-    await fire_poll(TestSessionLocal, device_id, 60, nc=nc)
+    await fire_poll(TestSessionLocal, device_id, 60)
 
-    publish.assert_called_once()
-    args, _kw = publish.call_args
-    import json
-
-    payload = json.loads(args[1].decode())
+    rows = await _outbox_rows()
+    assert len(rows) == 1
+    payload = rows[0].payload
     assert payload["transition_kind"] == "recovery"
     assert payload["old_status"] == "UNREACHABLE"
     assert payload["new_status"] == "HEALTHY"
     assert payload["consecutive_failures"] == 0
+    assert payload["event_id"] == str(rows[0].id)
 
 
 @pytest.mark.asyncio
-async def test_no_publish_healthy_to_healthy(monkeypatch):
+async def test_no_enqueue_healthy_to_healthy(monkeypatch):
     """A device that has always been healthy does not generate noise."""
     now = datetime.now(timezone.utc)
     device_id = _setup_driver_outcomes(monkeypatch, login_status="SUCCESS", status_status="SUCCESS")
     await _existing_row(device_id, now, consecutive_failures=0, last_status="HEALTHY")
 
-    nc, publish = _make_nc_mock()
-    await fire_poll(TestSessionLocal, device_id, 60, nc=nc)
+    await fire_poll(TestSessionLocal, device_id, 60)
 
-    publish.assert_not_called()
+    assert await _outbox_rows() == []
 
 
 @pytest.mark.asyncio
-async def test_publish_failure_swallowed(monkeypatch):
-    """If NATS publish raises, fire_poll still completes and updates the row."""
+async def test_status_update_persists_alongside_enqueue(monkeypatch):
+    """The status row commit and the outbox row land together."""
     now = datetime.now(timezone.utc)
     device_id = _setup_driver_outcomes(monkeypatch, login_status="FAILED", status_status=None)
     await _existing_row(device_id, now, consecutive_failures=2, last_status="HEALTHY")
 
-    from unittest.mock import MagicMock
-
-    nc = MagicMock()
-    js_mock = MagicMock()
-    js_mock.publish = AsyncMock(side_effect=RuntimeError("nats down"))
-    nc.jetstream = MagicMock(return_value=js_mock)
-
-    await fire_poll(TestSessionLocal, device_id, 60, nc=nc)
+    await fire_poll(TestSessionLocal, device_id, 60)
 
     async with TestSessionLocal() as db:
         row = await db.get(DeviceHealthStatus, device_id)
         assert row.consecutive_failures == 3
         assert row.last_status == "UNREACHABLE"
+    assert len(await _outbox_rows()) == 1
 
 
 @pytest.mark.asyncio
-async def test_no_publish_when_nc_is_none(monkeypatch):
-    """If NATS wasn't available at startup, scheduler still polls but skips publish."""
-    now = datetime.now(timezone.utc)
-    device_id = _setup_driver_outcomes(monkeypatch, login_status="FAILED", status_status=None)
-    await _existing_row(device_id, now, consecutive_failures=2, last_status="HEALTHY")
+async def test_notify_disabled_knob_suppresses_enqueue(monkeypatch):
+    """`HEALTH_POLL_NOTIFY_ENABLED=false` suppresses the enqueue on a crossing.
 
-    # Should not raise even though nc=None.
-    await fire_poll(TestSessionLocal, device_id, 60, nc=None)
-
-    async with TestSessionLocal() as db:
-        row = await db.get(DeviceHealthStatus, device_id)
-        assert row.consecutive_failures == 3
-
-
-@pytest.mark.asyncio
-async def test_notify_disabled_knob_silences_publish(monkeypatch):
-    """`HEALTH_POLL_NOTIFY_ENABLED=false` disables the publish even on threshold crossing."""
+    The status update still commits; only the event staging is gated off.
+    """
     now = datetime.now(timezone.utc)
     device_id = _setup_driver_outcomes(monkeypatch, login_status="FAILED", status_status=None)
     await _existing_row(device_id, now, consecutive_failures=2, last_status="HEALTHY")
@@ -556,10 +568,12 @@ async def test_notify_disabled_knob_silences_publish(monkeypatch):
         False,
     )
 
-    nc, publish = _make_nc_mock()
-    await fire_poll(TestSessionLocal, device_id, 60, nc=nc)
+    await fire_poll(TestSessionLocal, device_id, 60)
 
-    publish.assert_not_called()
+    assert await _outbox_rows() == []
+    async with TestSessionLocal() as db:
+        row = await db.get(DeviceHealthStatus, device_id)
+        assert row.consecutive_failures == 3
 
 
 # --- _decide_transition unit tests ---

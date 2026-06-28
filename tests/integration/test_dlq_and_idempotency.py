@@ -14,6 +14,7 @@ test_health_alerting_flow.py; if the host cannot reach NATS the test skips.
 
 import asyncio
 import io
+import json
 import os
 import tarfile
 import uuid
@@ -72,6 +73,41 @@ async def _find_in_execution_dlq(marker: bytes, *, timeout: float = 15.0) -> byt
         await nc.close()
 
 
+async def _fetch_reservation_event(
+    reservation_id: str, event: str = "reservation.created", *, timeout: float = 30.0
+) -> bytes | None:
+    """Return the raw bytes of the `event` message for `reservation_id` from
+    HERD_RESERVATIONS, or None on timeout.
+
+    Reading is non-destructive (ephemeral pull consumer over a limits-retention
+    stream). Used to capture a real producer-published event so the test can
+    re-publish it and exercise the consumer's event_id idempotency guard.
+    """
+    nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
+    try:
+        js = nc.jetstream()
+        await js.add_stream(name="HERD_RESERVATIONS", subjects=["herd.reservations.*"])
+        sub = await js.pull_subscribe("herd.reservations.*", stream="HERD_RESERVATIONS")
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                msgs = await sub.fetch(100, timeout=2)
+            except (nats.errors.TimeoutError, asyncio.TimeoutError):
+                msgs = []
+            for m in msgs:
+                await m.ack()
+                try:
+                    body = json.loads(m.data)
+                except Exception:  # noqa: BLE001 - skip non-JSON
+                    continue
+                if body.get("event") == event and body.get("reservation_id") == reservation_id:
+                    return m.data
+            await asyncio.sleep(0.3)
+        return None
+    finally:
+        await nc.close()
+
+
 async def test_poison_reservation_event_is_retained_in_dlq():
     """An undecodable reservation event lands on herd.reservations.dlq.execution
     in the HERD_DLQ stream with its original bytes preserved (not void-dropped)."""
@@ -94,14 +130,15 @@ async def test_poison_reservation_event_is_retained_in_dlq():
 
 # --- Redelivery idempotency -------------------------------------------------
 #
-# The only way to force a JetStream redelivery AFTER an action has already
-# succeeded is an ack-timeout: a FAILED/raised driver action is acked, not
-# NAK'd (nats_consumer records FAILED and continues), and the upstream-5xx NAK
-# fires before any driver action runs. So this test makes every driver action
-# sleep so the L2 handler runs longer than the 30s ack_wait. create_vlan still
-# commits SUCCESS at ~18s (well before 30s), so the redelivery at 30s skips it
-# via the dedupe_key=stream:sequence guard. The redelivery is then fast (it skips
-# the slow dedupe-guarded ops), so it acks and the delivery count is bounded at 2.
+# A raised/failed driver action is ACKed (the consumer records FAILED and
+# continues), not NAK'd, and the pull consumers do not redeliver on a late ack,
+# so neither a driver failure nor a slow handler forces a redelivery of an
+# already-succeeded op. The faithful way to exercise the guard is the outbox's
+# own at-least-once path: re-publish the exact reservation.created event the
+# producer emitted (same payload event_id, a NEW stream sequence, as a relay
+# republish after a dedup-window-expired outage would). The consumer keys its
+# idempotency on the payload event_id (issue #21), so the re-seen event skips the
+# already-succeeded create_vlan while the non-guarded login re-runs.
 
 
 def _mock_l2_tarball() -> bytes:
@@ -155,6 +192,11 @@ async def slow_l2_template(base_url, admin_token, slow_l2_driver):
                     "fields": [
                         {"key": "model", "label": "Model", "type": "string"},
                         {"key": "mock_sleep_ms", "label": "Mock sleep ms", "type": "string"},
+                        {
+                            "key": "mock_raise_actions",
+                            "label": "Mock raise actions",
+                            "type": "string",
+                        },
                     ],
                 }
             ],
@@ -166,7 +208,7 @@ async def slow_l2_template(base_url, admin_token, slow_l2_driver):
         await client.delete(f"/inventory/templates/{template['id']}")
 
 
-async def _create_switch(client, template_id, name, sleep_ms):
+async def _create_switch(client, template_id, name, sleep_ms, raise_actions=""):
     resp = await client.post(
         "/inventory/devices",
         json={
@@ -174,7 +216,11 @@ async def _create_switch(client, template_id, name, sleep_ms):
             "template_id": template_id,
             "topology_type": "PHYSICAL",
             "status": "AVAILABLE",
-            "field_data": {"model": "sw", "mock_sleep_ms": str(sleep_ms)},
+            "field_data": {
+                "model": "sw",
+                "mock_sleep_ms": str(sleep_ms),
+                "mock_raise_actions": raise_actions,
+            },
         },
     )
     resp.raise_for_status()
@@ -224,20 +270,26 @@ async def _runs(client, reservation_id, action, status=None):
 async def test_redelivery_does_not_rerun_succeeded_create_vlan(
     admin_client, slow_l2_template, fresh_device
 ):
-    """A real JetStream redelivery must not re-run an already-succeeded create_vlan.
+    """A re-published event (same event_id, new stream sequence) must not re-run
+    an already-succeeded create_vlan.
 
-    Each driver action sleeps 9s, so delivery 1's handler runs ~36s and exceeds
-    the 30s ack_wait, forcing a redelivery at 30s. create_vlan commits SUCCESS at
-    ~18s, so the redelivery skips it (dedupe_key=stream:sequence guard) and only
-    re-runs the non-guarded login. Asserts login ran >=2 times (a redelivery
-    happened) while create_vlan succeeded exactly once (the guard held).
-
-    This is the slowest test in the suite (~45s); the 30s suite timeout is
-    overridden per-test above.
+    Provision normally so create_vlan commits SUCCESS, capture the exact
+    reservation.created event the producer emitted, then re-publish it verbatim.
+    JetStream assigns a new sequence, so the consumer sees a fresh message, but it
+    keys idempotency on the payload event_id, so it skips the already-succeeded
+    create_vlan while the non-guarded login re-runs. Asserts login ran >=2 times
+    (the re-published event was delivered and processed) while create_vlan
+    succeeded exactly once (the event_id guard held across the resequencing).
     """
+    try:
+        _probe = await nats.connect(NATS_URL_HOST, connect_timeout=5)
+        await _probe.close()
+    except Exception as exc:  # noqa: BLE001 - host may not reach NATS in some envs
+        pytest.skip(f"NATS unreachable from test host: {exc}")
+
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_switch(
-        admin_client, slow_l2_template["id"], f"mock-l2-slow-{suffix}", sleep_ms=9000
+        admin_client, slow_l2_template["id"], f"mock-l2-slow-{suffix}", sleep_ms=0
     )
     reservation = None
     connection = None
@@ -245,26 +297,43 @@ async def test_redelivery_does_not_rerun_succeeded_create_vlan(
         connection = await _connect(admin_client, fresh_device["id"], switch["id"], "eth1")
         reservation = await _reserve(admin_client, fresh_device["id"])
 
-        # Wait for the redelivery: login is not dedupe-guarded, so it runs on
-        # every delivery. >=2 login runs proves the message was redelivered.
-        deadline = asyncio.get_event_loop().time() + 90
-        login_count = 0
+        # 1. First delivery provisions normally: wait for create_vlan SUCCESS.
+        deadline = asyncio.get_event_loop().time() + 60
         while asyncio.get_event_loop().time() < deadline:
-            login_count = len(await _runs(admin_client, reservation["id"], "login"))
-            if login_count >= 2:
+            if await _runs(admin_client, reservation["id"], "create_vlan", status="SUCCESS"):
                 break
             await asyncio.sleep(1.0)
-        assert login_count >= 2, (
-            f"no redelivery observed (login ran {login_count} time(s)); the test's "
-            "ack-timeout assumption did not hold"
-        )
+        first = await _runs(admin_client, reservation["id"], "create_vlan", status="SUCCESS")
+        assert len(first) == 1, f"create_vlan did not succeed once on first delivery: {len(first)}"
+        login_before = len(await _runs(admin_client, reservation["id"], "login"))
 
+        # 2. Capture the producer's reservation.created event and re-publish it
+        #    verbatim. Same payload event_id, new JetStream sequence.
+        raw = await _fetch_reservation_event(reservation["id"])
+        assert raw is not None, "could not capture the reservation.created event from the stream"
+        await _publish_raw(raw)
+
+        # 3. The re-published event is delivered (login re-runs) but create_vlan is
+        #    skipped by the event_id guard.
+        deadline = asyncio.get_event_loop().time() + 60
+        login_after = login_before
+        while asyncio.get_event_loop().time() < deadline:
+            login_after = len(await _runs(admin_client, reservation["id"], "login"))
+            if login_after > login_before:
+                break
+            await asyncio.sleep(1.0)
+        assert login_after > login_before, (
+            f"the re-published event was never processed (login stayed at {login_before}); "
+            "delivery did not happen"
+        )
+        # Settle, then assert the guard held: still exactly one create_vlan SUCCESS.
+        await asyncio.sleep(3.0)
         create_success = await _runs(
             admin_client, reservation["id"], "create_vlan", status="SUCCESS"
         )
         assert len(create_success) == 1, (
-            f"create_vlan succeeded {len(create_success)} times across a redelivery; "
-            "the dedupe_key guard failed to skip the already-applied op"
+            f"create_vlan succeeded {len(create_success)} times across a re-publish; "
+            "the event_id guard failed to skip the already-applied op"
         )
     finally:
         if reservation:

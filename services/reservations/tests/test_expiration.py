@@ -6,11 +6,23 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base, engine
+from app.models.outbox import OutboxEvent
 from app.models.reservation import Reservation, ReservationStatus
 from app.tasks.expiration import _run_expiration_cycle
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def _outbox_rows(subject=None):
+    """Read staged outbox rows (optionally by subject) for assertions (issue #21)."""
+    async with TestSessionLocal() as session:
+        stmt = select(OutboxEvent)
+        if subject is not None:
+            stmt = stmt.where(OutboxEvent.subject == subject)
+        return (await session.execute(stmt.order_by(OutboxEvent.created_at))).scalars().all()
+
 
 NOW = datetime.now(timezone.utc)
 PAST = NOW - timedelta(hours=2)
@@ -240,45 +252,44 @@ async def test_expiration_releases_all_device_ids_without_exclusivity_check():
 
 
 @pytest.mark.asyncio
-async def test_expiration_publishes_completed_event():
-    """Regression (#77): auto-completing an ACTIVE reservation publishes a
-    reservation.completed event on herd.reservations.completed, mirroring the
-    manual release path so execution deprovisions and notifications renders it."""
+async def test_expiration_stages_completed_event():
+    """Regression (#77), now via the outbox (issue #21): auto-completing an ACTIVE
+    reservation stages a reservation.completed event on herd.reservations.completed
+    in the same transaction as the COMPLETED row, mirroring the manual release
+    path so execution deprovisions and notifications renders it."""
     device_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
     res_id = await _insert_reservation(
         ReservationStatus.ACTIVE, PAST - timedelta(hours=2), PAST, device_ids=device_ids
     )
     res = await _get_reservation(res_id)
     user_id = str(res.user_id)
-    nats = AsyncMock()
     with patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_expiration_cycle(nats)
-    pub.assert_awaited_once()
-    conn, subject, event = pub.await_args[0]
-    assert conn is nats
-    assert subject == "herd.reservations.completed"
+        await _run_expiration_cycle()
+    rows = await _outbox_rows("herd.reservations.completed")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.published_at is None
+    event = row.payload
     assert event["event"] == "reservation.completed"
     assert event["reservation_id"] == str(res_id)
     assert event["user_id"] == user_id
     assert set(event["device_ids"]) == set(device_ids)
     assert event["topology_type"] == "PHYSICAL"
     assert "topology_id" in event
+    assert event["event_id"] == str(row.id)
 
 
 @pytest.mark.asyncio
-async def test_expiration_publishes_one_completed_event_per_reservation():
-    """One reservation.completed event per auto-completed reservation."""
+async def test_expiration_stages_one_completed_event_per_reservation():
+    """One reservation.completed outbox row per auto-completed reservation."""
     await _insert_reservation(ReservationStatus.ACTIVE, PAST - timedelta(hours=2), PAST)
     await _insert_reservation(ReservationStatus.ACTIVE, PAST - timedelta(hours=2), PAST)
-    nats = AsyncMock()
     with patch("app.tasks.expiration._update_device_statuses", new=AsyncMock()):
-        with patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub:
-            await _run_expiration_cycle(nats)
-    assert pub.await_count == 2
-    for call in pub.await_args_list:
-        assert call[0][1] == "herd.reservations.completed"
-        assert call[0][2]["event"] == "reservation.completed"
+        await _run_expiration_cycle()
+    rows = await _outbox_rows("herd.reservations.completed")
+    assert len(rows) == 2
+    for row in rows:
+        assert row.payload["event"] == "reservation.completed"
 
 
 @pytest.mark.asyncio
@@ -287,7 +298,6 @@ async def test_activation_emits_created_not_completed():
     (so execution provisions and notifications fire), never reservation.completed
     (issue #132)."""
     await _insert_reservation(ReservationStatus.PENDING, PAST, FUTURE)
-    nats = AsyncMock()
     with (
         patch(
             "app.tasks.expiration._fetch_devices_best_effort",
@@ -297,11 +307,11 @@ async def test_activation_emits_created_not_completed():
         patch(
             "app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()
         ) as fork_mock,
-        patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub,
     ):
-        await _run_expiration_cycle(nats)
-    subjects = [call.args[1] for call in pub.await_args_list]
-    events = [call.args[2]["event"] for call in pub.await_args_list]
+        await _run_expiration_cycle()
+    rows = await _outbox_rows()
+    subjects = [r.subject for r in rows]
+    events = [r.payload["event"] for r in rows]
     assert "herd.reservations.created" in subjects
     assert "reservation.created" in events
     assert "reservation.completed" not in events
@@ -326,7 +336,6 @@ async def test_activation_threads_booking_user_into_fork():
         user_id=booking_user_id,
         topology_id=topology_id,
     )
-    nats = AsyncMock()
     with (
         patch(
             "app.tasks.expiration._fetch_devices_best_effort",
@@ -336,9 +345,8 @@ async def test_activation_threads_booking_user_into_fork():
         patch(
             "app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()
         ) as fork_mock,
-        patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()),
     ):
-        await _run_expiration_cycle(nats)
+        await _run_expiration_cycle()
     fork_mock.assert_awaited_once()
     assert fork_mock.call_args.args[0] == res_id
     assert fork_mock.call_args.args[1] == topology_id
@@ -361,12 +369,12 @@ async def test_activation_inventory_failure_stays_pending():
             new=AsyncMock(side_effect=RuntimeError("inventory down")),
         ),
         patch("app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()),
-        patch("app.tasks.expiration._publish_nats_event", new=AsyncMock()) as pub,
     ):
-        await _run_expiration_cycle(AsyncMock())
+        await _run_expiration_cycle()
     res = await _get_reservation(res_id)
     assert res.status == ReservationStatus.PENDING
-    created = [c for c in pub.await_args_list if c.args[2].get("event") == "reservation.created"]
+    # No reservation.created is staged when activation reverts to PENDING.
+    created = [r for r in await _outbox_rows() if r.payload.get("event") == "reservation.created"]
     assert created == []
 
 

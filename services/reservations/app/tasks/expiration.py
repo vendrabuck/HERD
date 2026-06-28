@@ -5,16 +5,17 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import and_, select
 
 from app.config import settings
 from app.database import AsyncSessionLocal
+from app.models.outbox import OutboxEvent
 from app.models.reservation import Reservation, ReservationStatus
 from app.services.reservation_service import (
     _create_reservation_fork_best_effort,
     _fetch_devices_best_effort,
-    _publish_nats_event,
     _reservation_created_event,
     _update_device_statuses,
 )
@@ -26,20 +27,20 @@ COMPLETED_SUBJECT = "herd.reservations.completed"
 CREATED_SUBJECT = "herd.reservations.created"
 
 
-async def _run_reminder_cycle(nats_conn) -> None:
-    """Emit one reservation.expiring_soon event per reservation in the lead window.
+async def _run_reminder_cycle() -> None:
+    """Stage one reservation.expiring_soon event per reservation in the lead window.
 
     Selects ACTIVE reservations whose end_time is in the future but within
     `expiry_reminder_lead_seconds` of now and that have not been reminded yet
-    (expiry_reminder_sent_at is null). Stamps the timestamp inside the same
-    transaction so a row is claimed before its event is published; this dedupes
-    the reminder per reservation across ticks. A lead window of 0 disables the
-    reminder entirely.
+    (expiry_reminder_sent_at is null). Stamps the timestamp and stages the
+    outbox event inside the same transaction (issue #21), so a row is claimed
+    and its event durably enqueued atomically; this dedupes the reminder per
+    reservation across ticks. A lead window of 0 disables the reminder entirely.
 
-    The event is published after the row is committed. If the publish fails it
-    is logged (never raised); the reminder is not re-attempted because the row
-    is already stamped, matching the at-most-once intent (a missed reminder is
-    preferable to a duplicate, and the user still gets the completion event).
+    The relay publishes the staged event; because the stamp and the event commit
+    together, a reminded reservation is never reminded again, matching the
+    at-most-once intent (a missed publish is impossible now, and a duplicate is
+    prevented by the stamp).
     """
     lead = settings.expiry_reminder_lead_seconds
     if lead <= 0:
@@ -60,35 +61,35 @@ async def _run_reminder_cycle(nats_conn) -> None:
             )
         )
         due = result.scalars().all()
-        # Snapshot the payload fields while the row (and its eager-loaded
-        # devices) is attached, then stamp and commit before publishing.
-        pending: list[dict] = []
+        # Stamp the row and stage its event in the same transaction. The
+        # eager-loaded devices are still attached here, so the payload is built
+        # before the commit.
         for res in due:
-            pending.append(
+            enqueue_event(
+                db,
+                OutboxEvent,
+                EXPIRING_SOON_SUBJECT,
                 {
                     "event": "reservation.expiring_soon",
                     "reservation_id": str(res.id),
                     "user_id": str(res.user_id),
                     "device_ids": [str(d) for d in res.device_ids],
                     "end_time": res.end_time.isoformat(),
-                }
+                },
             )
             res.expiry_reminder_sent_at = now
+            logger.info(
+                "Staging expiring_soon reminder for reservation %s",
+                res.id,
+                extra={
+                    "action": "reservation_expiring_soon",
+                    "reservation_id": str(res.id),
+                },
+            )
         await db.commit()
 
-    for event in pending:
-        logger.info(
-            "Emitting expiring_soon reminder for reservation %s",
-            event["reservation_id"],
-            extra={
-                "action": "reservation_expiring_soon",
-                "reservation_id": event["reservation_id"],
-            },
-        )
-        await _publish_nats_event(nats_conn, EXPIRING_SOON_SUBJECT, event)
 
-
-async def _activate_pending_reservation(reservation_id: uuid.UUID, nats_conn=None) -> bool:
+async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
     """Provision and activate one claimed (PENDING_PROVISION) reservation.
 
     This is the deferred half of create_reservation's immediate path (issue #132):
@@ -149,20 +150,22 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID, nats_conn=Non
             )
             return False
 
-    # Mark ACTIVE and snapshot the event payload while the row is attached.
+    # Mark ACTIVE and stage reservation.created in the same transaction (issue
+    # #21), so the event commits atomically with the ACTIVE row. The payload is
+    # built while the row (and its eager-loaded devices) is attached, before the
+    # commit.
     async with AsyncSessionLocal() as db:
         res = await db.get(Reservation, reservation_id)
         if res is None or res.status != ReservationStatus.PENDING_PROVISION:
             return False
         res.status = ReservationStatus.ACTIVE
+        enqueue_event(db, OutboxEvent, CREATED_SUBJECT, _reservation_created_event(res))
         await db.commit()
-        await db.refresh(res)
-        event = _reservation_created_event(res)
 
-    # Editable per-reservation fork (best-effort, never raises) then the single
-    # reservation.created emit, mirroring create_reservation's steps 8 and 9.
+    # Editable per-reservation fork (best-effort, never raises), mirroring
+    # create_reservation's step 8. The reservation.created event is already
+    # staged above and the relay will publish it.
     await _create_reservation_fork_best_effort(reservation_id, topology_id, created_by=str(user_id))
-    await _publish_nats_event(nats_conn, CREATED_SUBJECT, event)
     logger.info(
         "Scheduled reservation activated: %s",
         reservation_id,
@@ -171,22 +174,22 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID, nats_conn=Non
     return True
 
 
-async def _run_expiration_cycle(nats_conn=None) -> None:
+async def _run_expiration_cycle() -> None:
     """Single expiration cycle: activate pending, complete expired.
 
     Auto-completion is the normal end-of-life path for a reservation (most end by
     reaching end_time, not by manual release). For each reservation it completes,
-    this emits a reservation.completed event on the same subject and with the same
-    payload shape as the manual release path (release_reservation), so the
+    this stages a reservation.completed event on the same subject and with the
+    same payload shape as the manual release path (release_reservation), so the
     execution service deprovisions (L1 disconnect, L2 VLAN teardown) and
     notifications renders the completion. Without it the devices are flipped to
     AVAILABLE in inventory while their config stays wired, letting a new
     reservation be booked on top of stale, never-torn-down config.
 
-    The event is published after the transaction commits, once per completed
-    reservation. Publishing is best-effort (errors are logged, never raised by
-    _publish_nats_event); if nats_conn is None the publish is a no-op, consistent
-    with the rest of the service treating NATS as non-fatal.
+    The event is staged in the same transaction that lands the reservation in
+    COMPLETED (issue #21), so the event exists iff the completion committed; the
+    relay publishes it. The inventory release below is best-effort and runs after
+    the commit.
     """
     now = datetime.now(timezone.utc)
 
@@ -226,16 +229,19 @@ async def _run_expiration_cycle(nats_conn=None) -> None:
             )
         )
         expired = result.scalars().all()
-        # Snapshot the completion payload while the row (and its eager-loaded
-        # device_ids) is attached. Mirror the manual release_reservation payload
-        # exactly: same subject, event name, and fields, so execution and
-        # notifications consumers handle an auto-expiry identically to a manual
-        # release. device_ids is the reservation's full set (every device in the
-        # topology), not just the exclusive subset released in inventory below.
-        completed_events: list[dict] = []
+        # Stage the completion event in the same transaction that lands COMPLETED.
+        # Mirror the manual release_reservation payload exactly: same subject,
+        # event name, and fields, so execution and notifications consumers handle
+        # an auto-expiry identically to a manual release. device_ids is the
+        # reservation's full set (every device in the topology), not just the
+        # exclusive subset released in inventory below. The eager-loaded
+        # device_ids is read here while the row is attached, before the commit.
         for res in expired:
             res.status = ReservationStatus.COMPLETED
-            completed_events.append(
+            enqueue_event(
+                db,
+                OutboxEvent,
+                COMPLETED_SUBJECT,
                 {
                     "event": "reservation.completed",
                     "reservation_id": str(res.id),
@@ -243,7 +249,7 @@ async def _run_expiration_cycle(nats_conn=None) -> None:
                     "device_ids": [str(d) for d in res.device_ids],
                     "topology_id": str(res.topology_id) if res.topology_id else None,
                     "topology_type": res.topology_type.value,
-                }
+                },
             )
             logger.info(
                 "Auto-completed reservation %s",
@@ -258,7 +264,7 @@ async def _run_expiration_cycle(nats_conn=None) -> None:
     # reservation.created (issue #132). Each is independent and best-effort; a
     # deferred one stays PENDING for a later tick.
     for reservation_id in activate_ids:
-        await _activate_pending_reservation(reservation_id, nats_conn)
+        await _activate_pending_reservation(reservation_id)
 
     # Release only exclusive devices for completed reservations. Uses the same
     # best-effort fetch + internal-token status update as the cancel/release
@@ -280,32 +286,24 @@ async def _run_expiration_cycle(nats_conn=None) -> None:
         if exclusive_ids:
             await _update_device_statuses(exclusive_ids, "AVAILABLE")
 
-    # Emit a completion event per auto-completed reservation, after the commit,
-    # so consumers tear down the topology (execution deprovision/disconnect) and
-    # render the completion (notifications). Same helper the manual release path
-    # uses; best-effort, never raised.
-    for event in completed_events:
-        await _publish_nats_event(nats_conn, COMPLETED_SUBJECT, event)
 
-
-async def expiration_loop(interval_seconds: int = 60, nats_conn=None) -> None:
+async def expiration_loop(interval_seconds: int = 60) -> None:
     """Run expiration cycles forever at the given interval.
 
     Each tick runs the state-machine cycle (activate/complete) and then the
-    upcoming-expiry reminder cycle. Both cycles need the NATS connection: the
-    expiration cycle publishes reservation.completed for auto-completed
-    reservations and the reminder cycle publishes reservation.expiring_soon. If
-    NATS is unavailable (nats_conn is None) the publishes are no-ops, consistent
-    with the rest of the service treating NATS as non-fatal.
+    upcoming-expiry reminder cycle. Both cycles stage their NATS events
+    (reservation.completed, reservation.created, reservation.expiring_soon) into
+    the outbox in the same transaction as the state change (issue #21); the
+    outbox relay publishes them, so the loop no longer needs a NATS connection.
     """
     logger.info("Expiration loop started, interval=%ds", interval_seconds)
     while True:
         try:
-            await _run_expiration_cycle(nats_conn)
+            await _run_expiration_cycle()
         except Exception:
             logger.error("Expiration cycle failed", exc_info=True)
         try:
-            await _run_reminder_cycle(nats_conn)
+            await _run_reminder_cycle()
         except Exception:
             logger.error("Expiry reminder cycle failed", exc_info=True)
         await asyncio.sleep(interval_seconds)

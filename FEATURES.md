@@ -141,6 +141,13 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   of a reservation's end time. Per-channel and per-event opt-outs live in user
   preferences; outbound channels default off. Bidirectional chat (slash commands,
   replies) and per-user channel credentials remain out of scope.
+- **Durable event delivery** (Shipped): reservation lifecycle and device-health
+  events are staged in a per-service transactional outbox in the same database
+  transaction as the state change, then drained to NATS by a background relay that
+  retries across a messaging outage and prunes old rows, so an outage delays delivery
+  instead of silently dropping a provisioning or notification event. Consumers dedupe
+  on a stable per-event id, so a relay republish is recognized as a duplicate rather
+  than reprocessed. (Issue #21.)
 - **Structured JSON logging** (Shipped): every service emits JSON logs with request
   middleware and business-event logging; per-service log level configurable.
 - **Config service** (Shipped): zero-database web UI for configuring HERD on first

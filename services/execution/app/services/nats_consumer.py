@@ -7,27 +7,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import httpx
+from herd_common.outbox import event_dedupe_key
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-
-
-def _dedupe_key_from_msg(msg) -> str | None:
-    """Build a stable per-message dedupe key from JetStream metadata.
-
-    Uses "<stream>:<stream-sequence>", identical across redeliveries of the same
-    message and distinct for every new publish. Returns None when the metadata is
-    unavailable (e.g. a non-JetStream test stub), so idempotency is simply skipped
-    rather than failing the message. Mirrors the notifications consumer.
-    """
-    meta = getattr(msg, "metadata", None)
-    seq = getattr(meta, "sequence", None)
-    stream_seq = getattr(seq, "stream", None)
-    stream = getattr(meta, "stream", None)
-    if stream_seq is None:
-        return None
-    return f"{stream or 'stream'}:{stream_seq}"
 
 
 # Map NATS event types to driver actions
@@ -42,6 +26,11 @@ EVENT_ACTIONS = {
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
 NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
+# Pull-consumer fetch tuning. A pull consumer re-establishes on the next fetch
+# after a broker reconnect, which a push subscription does not do reliably, so it
+# survives a NATS restart (issue #21).
+NATS_FETCH_BATCH = 10
+NATS_FETCH_TIMEOUT_SECONDS = 5
 # DLQ subject is 4 tokens so the consumer's 3-token "herd.reservations.*" filter
 # (single-token wildcard matches exactly one token) does NOT match it. If it did,
 # every DLQ'd message would be redelivered to this same consumer: a poison message
@@ -1178,7 +1167,10 @@ async def process_reservation_message(
         return "dlq"
 
     try:
-        await handler(event_data, session_factory, _dedupe_key_from_msg(msg))
+        # Key idempotency on the stable producer-stamped event_id when present
+        # (issue #21), so a relay republish under a new stream sequence still
+        # dedupes; fall back to "<stream>:<sequence>" for pre-outbox events.
+        await handler(event_data, session_factory, event_dedupe_key(event_data, msg))
     except PermanentEventError as exc:
         # Non-retryable (e.g. VLAN pool exhausted): the in-use set is unchanged
         # between attempts, so retrying only burns max_deliver and delays the DLQ.
@@ -1247,7 +1239,14 @@ async def start_nats_consumer(app) -> None:
     from nats.js.api import ConsumerConfig
 
     try:
-        nc = await nats.connect(settings.nats_url)
+        # Retry reconnect forever so the durable consumer and the health-event
+        # outbox relay resume after a broker restart instead of giving up at the
+        # default 60-attempt cap.
+        nc = await nats.connect(
+            settings.nats_url,
+            max_reconnect_attempts=-1,
+            reconnect_time_wait=2,
+        )
         app.state.nats = nc
         js = nc.jetstream()
 
@@ -1266,10 +1265,9 @@ async def start_nats_consumer(app) -> None:
         # this service so other consumers (e.g., notifications) have their own durable
         # offset. The DLQ subject (NATS_DLQ_SUBJECT) is intentionally outside this filter
         # so DLQ'd messages are not redelivered to this consumer; see NATS_DLQ_SUBJECT.
-        sub = await js.subscribe(
+        psub = await js.pull_subscribe(
             "herd.reservations.*",
             durable="execution-consumer",
-            manual_ack=True,
             config=ConsumerConfig(
                 max_deliver=NATS_MAX_DELIVER,
                 ack_wait=NATS_ACK_WAIT_SECONDS,
@@ -1293,15 +1291,30 @@ async def start_nats_consumer(app) -> None:
             return _SessionCtx()
 
         async def _consumer_loop():
-            async for msg in sub.messages:
+            while True:
                 try:
-                    await process_reservation_message(
-                        msg, js, handle_reservation_event, _get_db_session
-                    )
+                    msgs = await psub.fetch(NATS_FETCH_BATCH, timeout=NATS_FETCH_TIMEOUT_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+                except (nats.errors.TimeoutError, asyncio.TimeoutError):
+                    # No messages this cycle; fetch again. The fetch also
+                    # re-establishes delivery after a broker reconnect, which a
+                    # push subscription does not do reliably (issue #21).
+                    continue
                 except Exception:
-                    # process_reservation_message never raises on its own; this
-                    # catches ack/nak/publish failures so the loop keeps draining.
-                    logger.error("Unexpected error in NATS consumer loop", exc_info=True)
+                    # Connection lost or reconnecting; pause then re-fetch.
+                    logger.warning("NATS pull fetch failed; will retry", exc_info=True)
+                    await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
+                    continue
+                for msg in msgs:
+                    try:
+                        await process_reservation_message(
+                            msg, js, handle_reservation_event, _get_db_session
+                        )
+                    except Exception:
+                        # process_reservation_message never raises on its own; this
+                        # catches ack/nak/publish failures so the loop keeps draining.
+                        logger.error("Unexpected error in NATS consumer loop", exc_info=True)
 
         app.state.nats_consumer_task = asyncio.create_task(_consumer_loop())
         logger.info("NATS consumer started")

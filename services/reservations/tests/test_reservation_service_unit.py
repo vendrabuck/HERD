@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.database import Base
+from app.models.outbox import OutboxEvent
 from app.models.reservation import (
     Reservation,
     ReservationDevice,
@@ -20,7 +21,6 @@ from app.services.reservation_service import (
     _create_reservation_fork_best_effort,
     _fetch_devices,
     _fetch_devices_best_effort,
-    _publish_nats_event,
     _update_device_statuses,
     cancel_reservation,
     create_reservation,
@@ -31,6 +31,15 @@ from app.services.reservation_service import (
 )
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+async def _outbox(db, subject=None):
+    """Return outbox rows (optionally filtered by subject) for assertions."""
+    stmt = select(OutboxEvent)
+    if subject is not None:
+        stmt = stmt.where(OutboxEvent.subject == subject)
+    return (await db.execute(stmt.order_by(OutboxEvent.created_at))).scalars().all()
+
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 engine = create_async_engine(TEST_DATABASE_URL, echo=False)
@@ -321,32 +330,40 @@ async def test_calendar_visibility_subset_and_empty_set():
         assert await list_calendar_reservations(db, *window, visible_device_ids=set()) == []
 
 
-# --- _publish_nats_event ---
+# --- outbox enqueue (issue #21) ---
 
 
 @pytest.mark.asyncio
-async def test_publish_nats_event_none_connection():
-    # Should return without error
-    await _publish_nats_event(None, "herd.test", {"event": "test"})
-
-
-@pytest.mark.asyncio
-async def test_publish_nats_event_success():
-    mock_js = AsyncMock()
-    mock_nc = MagicMock()
-    mock_nc.jetstream.return_value = mock_js
-    await _publish_nats_event(mock_nc, "herd.test", {"event": "test"})
-    mock_js.publish.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_publish_nats_event_exception_logged():
-    mock_js = AsyncMock()
-    mock_js.publish.side_effect = Exception("NATS down")
-    mock_nc = MagicMock()
-    mock_nc.jetstream.return_value = mock_js
-    # Should not raise
-    await _publish_nats_event(mock_nc, "herd.test", {"event": "test"})
+async def test_create_reservation_exclusive_enqueues_created_event_in_txn():
+    """An immediate exclusive create lands ACTIVE and stages exactly one
+    reservation.created outbox row, unpublished, carrying the reservation id and
+    an event_id, in the same transaction as the ACTIVE row (issue #21)."""
+    async with TestSessionLocal() as db:
+        devices = [_make_device(DEVICE_A)]
+        data = ReservationCreate(
+            device_ids=[DEVICE_A],
+            start_time=NOW,
+            end_time=NOW + timedelta(hours=3),
+        )
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices",
+                new=AsyncMock(return_value=devices),
+            ),
+            patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
+            patch(
+                "app.services.reservation_service._create_reservation_fork_best_effort",
+                new=AsyncMock(),
+            ),
+        ):
+            res = await create_reservation(db, data, USER_ID, "token")
+        assert res.status == ReservationStatus.ACTIVE
+        rows = await _outbox(db, "herd.reservations.created")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.published_at is None
+        assert row.payload["reservation_id"] == str(res.id)
+        assert row.payload["event_id"] == str(row.id)
 
 
 # --- _update_device_statuses ---
@@ -426,7 +443,6 @@ async def test_create_reservation_success():
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=devices),
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
         ):
             res = await create_reservation(db, data, USER_ID, "token", username="testuser")
@@ -449,7 +465,6 @@ async def test_create_reservation_future_is_pending_and_defers_provisioning():
         )
         update_mock = AsyncMock()
         fork_mock = AsyncMock()
-        publish_mock = AsyncMock()
         with (
             patch(
                 "app.services.reservation_service._fetch_devices",
@@ -460,13 +475,13 @@ async def test_create_reservation_future_is_pending_and_defers_provisioning():
                 "app.services.reservation_service._create_reservation_fork_best_effort",
                 new=fork_mock,
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=publish_mock),
         ):
             res = await create_reservation(db, data, USER_ID, "token")
         assert res.status == ReservationStatus.PENDING
         update_mock.assert_not_called()
         fork_mock.assert_not_awaited()
-        publish_mock.assert_not_awaited()
+        # A deferred PENDING booking stages no event: emission semantics unchanged.
+        assert await _outbox(db) == []
 
 
 @pytest.mark.asyncio
@@ -570,7 +585,6 @@ async def test_create_reservation_non_exclusive_reserved_ok():
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=devices),
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
         ):
             res = await create_reservation(db, data, USER_ID, "token")
@@ -596,10 +610,9 @@ async def test_create_reservation_conflict():
 
 
 @pytest.mark.asyncio
-async def test_create_reservation_nats_event_published():
+async def test_create_reservation_nats_event_enqueued():
     async with TestSessionLocal() as db:
         devices = [_make_device(DEVICE_A)]
-        mock_nats = MagicMock()
         data = ReservationCreate(
             device_ids=[DEVICE_A],
             start_time=NOW,
@@ -610,13 +623,11 @@ async def test_create_reservation_nats_event_published():
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=devices),
             ),
-            patch(
-                "app.services.reservation_service._publish_nats_event", new=AsyncMock()
-            ) as mock_pub,
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
         ):
-            await create_reservation(db, data, USER_ID, "token", nats_conn=mock_nats)
-            mock_pub.assert_called_once()
+            await create_reservation(db, data, USER_ID, "token")
+        rows = await _outbox(db, "herd.reservations.created")
+        assert len(rows) == 1
 
 
 @pytest.mark.asyncio
@@ -635,7 +646,6 @@ async def test_create_reservation_non_exclusive_skips_pending_provision():
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=devices),
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             patch("app.services.reservation_service._update_device_statuses", new=mock_update),
         ):
             res = await create_reservation(db, data, USER_ID, "token")
@@ -659,9 +669,6 @@ async def test_create_reservation_fails_when_inventory_exhausts_retries():
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=devices),
             ),
-            patch(
-                "app.services.reservation_service._publish_nats_event", new=AsyncMock()
-            ) as mock_pub,
             patch("app.services.reservation_service._update_device_statuses", new=mock_update),
             # Collapse backoff delays so the test runs fast.
             patch("herd_common.retry.asyncio.sleep", new=AsyncMock()),
@@ -671,8 +678,9 @@ async def test_create_reservation_fails_when_inventory_exhausts_retries():
 
         # _update_device_statuses was retried 3 times (default attempts).
         assert mock_update.await_count == 3
-        # NATS event was never emitted on the failure path.
-        mock_pub.assert_not_called()
+        # No event is staged on the failure path: the FAILED commit carries no
+        # outbox row, so nothing is ever published.
+        assert await _outbox(db) == []
 
         # Reservation row persists in FAILED state for audit.
         from sqlalchemy import select
@@ -726,7 +734,6 @@ async def test_create_reservation_reverts_partially_reserved_devices_on_failure(
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=devices),
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
             # Collapse backoff delays so the test runs fast.
             patch("herd_common.retry.asyncio.sleep", new=AsyncMock()),
@@ -889,10 +896,14 @@ async def test_cancel_reservation_success():
                 new=AsyncMock(return_value=[_make_device(DEVICE_A)]),
             ),
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             cancelled = await cancel_reservation(db, res.id, USER_ID, "token")
         assert cancelled.status == ReservationStatus.CANCELLED
+        # The cancel commits with exactly one staged reservation.cancelled event.
+        rows = await _outbox(db, "herd.reservations.cancelled")
+        assert len(rows) == 1
+        assert rows[0].published_at is None
+        assert rows[0].payload["reservation_id"] == str(res.id)
 
 
 @pytest.mark.asyncio
@@ -933,7 +944,6 @@ async def test_cancel_failed_is_terminal_no_release_no_event():
         res = await _insert_reservation(db, status=ReservationStatus.FAILED)
         fetch_mock = AsyncMock(return_value=[_make_device(DEVICE_A)])
         update_mock = AsyncMock()
-        publish_mock = AsyncMock()
         with (
             patch(
                 "app.services.reservation_service._fetch_devices_best_effort",
@@ -943,14 +953,14 @@ async def test_cancel_failed_is_terminal_no_release_no_event():
                 "app.services.reservation_service._update_device_statuses",
                 new=update_mock,
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=publish_mock),
         ):
             result = await cancel_reservation(db, res.id, USER_ID, "token")
+        # Terminal cancel is a no-op: no event is staged.
+        assert await _outbox(db) == []
 
     assert result is not None
     assert result.status == ReservationStatus.FAILED, "FAILED must stay FAILED for audit"
     update_mock.assert_not_awaited()
-    publish_mock.assert_not_awaited()
     fetch_mock.assert_not_awaited()
 
 
@@ -967,10 +977,14 @@ async def test_release_reservation_success():
                 new=AsyncMock(return_value=[_make_device(DEVICE_A)]),
             ),
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
         ):
             released = await release_reservation(db, res.id, USER_ID, "token")
         assert released.status == ReservationStatus.COMPLETED
+        # The release commits with exactly one staged reservation.completed event.
+        rows = await _outbox(db, "herd.reservations.completed")
+        assert len(rows) == 1
+        assert rows[0].published_at is None
+        assert rows[0].payload["reservation_id"] == str(res.id)
 
 
 @pytest.mark.asyncio
@@ -1011,7 +1025,6 @@ async def test_cancel_reservation_retries_and_logs_when_release_fails(caplog):
                 "app.services.reservation_service._update_device_statuses",
                 new=update_mock,
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             caplog.at_level("ERROR", logger="app.services.reservation_service"),
         ):
             cancelled = await cancel_reservation(db, res.id, USER_ID, "token")
@@ -1046,7 +1059,6 @@ async def test_cancel_reservation_release_succeeds_after_one_retry(caplog):
                 "app.services.reservation_service._update_device_statuses",
                 new=update_mock,
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             caplog.at_level("ERROR", logger="app.services.reservation_service"),
         ):
             cancelled = await cancel_reservation(db, res.id, USER_ID, "token")
@@ -1076,7 +1088,6 @@ async def test_release_reservation_retries_and_logs_when_inventory_fails(caplog)
                 "app.services.reservation_service._update_device_statuses",
                 new=update_mock,
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             caplog.at_level("ERROR", logger="app.services.reservation_service"),
         ):
             released = await release_reservation(db, res.id, USER_ID, "token")
@@ -1216,11 +1227,7 @@ async def test_update_reservation_no_changes():
         original_end = res.end_time
         original_purpose = res.purpose
 
-        with patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ):
-            result = await update_reservation(db, res.id, USER_ID, ReservationUpdate())
+        result = await update_reservation(db, res.id, USER_ID, ReservationUpdate())
         assert result is not None
         assert result.end_time == original_end
         assert result.purpose == original_purpose
@@ -1278,10 +1285,6 @@ async def test_update_reservation_extend_non_exclusive_skips_conflict():
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=[non_excl_device]),
             ),
-            patch(
-                "app.services.reservation_service._publish_nats_event",
-                new=AsyncMock(),
-            ),
         ):
             result = await update_reservation(
                 db,
@@ -1316,10 +1319,6 @@ async def test_update_reservation_remove_non_exclusive_no_status_change():
                 new=mock_fetch,
             ),
             patch(
-                "app.services.reservation_service._publish_nats_event",
-                new=AsyncMock(),
-            ),
-            patch(
                 "app.services.reservation_service._update_device_statuses",
                 new=mock_update_statuses,
             ),
@@ -1344,7 +1343,7 @@ async def test_update_reservation_remove_non_exclusive_no_status_change():
 async def test_update_reservation_metadata_only_omits_end_time():
     """A purpose-only edit must not advertise an unchanged end time.
 
-    The published reservation.updated payload should flag end_time_changed=False
+    The staged reservation.updated payload should flag end_time_changed=False
     and carry a null end_time so the notifications consumer suppresses the
     misleading "ends <time>" notification.
     """
@@ -1354,18 +1353,15 @@ async def test_update_reservation_metadata_only_omits_end_time():
         res = await _insert_reservation(db, device_ids=[DEVICE_A])
         original_end = res.end_time
 
-        mock_publish = AsyncMock()
-        with patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=mock_publish,
-        ):
-            result = await update_reservation(
-                db, res.id, USER_ID, ReservationUpdate(purpose="new purpose")
-            )
+        result = await update_reservation(
+            db, res.id, USER_ID, ReservationUpdate(purpose="new purpose")
+        )
 
         assert result is not None
         assert result.end_time == original_end
-        payload = mock_publish.call_args.args[2]
+        rows = await _outbox(db, "herd.reservations.updated")
+        assert len(rows) == 1
+        payload = rows[0].payload
         assert payload["event"] == "reservation.updated"
         assert payload["end_time_changed"] is False
         assert payload["end_time"] is None
@@ -1382,17 +1378,12 @@ async def test_update_reservation_same_end_time_not_flagged_changed():
         res = await _insert_reservation(db, device_ids=[DEVICE_A])
         same_end = res.end_time
 
-        mock_publish = AsyncMock()
-        with patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=mock_publish,
-        ):
-            result = await update_reservation(
-                db, res.id, USER_ID, ReservationUpdate(end_time=same_end)
-            )
+        result = await update_reservation(db, res.id, USER_ID, ReservationUpdate(end_time=same_end))
 
         assert result is not None
-        payload = mock_publish.call_args.args[2]
+        rows = await _outbox(db, "herd.reservations.updated")
+        assert len(rows) == 1
+        payload = rows[0].payload
         assert payload["end_time_changed"] is False
         assert payload["end_time"] is None
 
@@ -1407,15 +1398,10 @@ async def test_update_reservation_changed_end_time_is_flagged_and_carried():
         new_end = NOW + timedelta(hours=6)
         non_excl_device = _make_device(DEVICE_A, exclusive=False)
 
-        mock_publish = AsyncMock()
         with (
             patch(
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(return_value=[non_excl_device]),
-            ),
-            patch(
-                "app.services.reservation_service._publish_nats_event",
-                new=mock_publish,
             ),
         ):
             result = await update_reservation(
@@ -1427,9 +1413,14 @@ async def test_update_reservation_changed_end_time_is_flagged_and_carried():
             )
 
         assert result is not None
-        payload = mock_publish.call_args.args[2]
+        rows = await _outbox(db, "herd.reservations.updated")
+        assert len(rows) == 1
+        payload = rows[0].payload
         assert payload["end_time_changed"] is True
-        assert payload["end_time"] == result.end_time.isoformat()
+        # The event is staged pre-commit from the new end_time the user set, so it
+        # carries the tz-aware value (preserved by the Postgres tz column; the
+        # SQLite unit backend drops tz on the roundtripped result).
+        assert payload["end_time"] == new_end.isoformat()
 
 
 # --- fork-on-activation (issue #25) ---
@@ -1578,7 +1569,6 @@ async def test_create_reservation_invokes_fork_when_topology_present():
                 "app.services.reservation_service._validate_topology_connectivity",
                 new=AsyncMock(),
             ),
-            patch("app.services.reservation_service._publish_nats_event", new=AsyncMock()),
             patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
             patch(
                 "app.services.reservation_service._create_reservation_fork_best_effort",

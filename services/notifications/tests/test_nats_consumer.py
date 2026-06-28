@@ -12,6 +12,7 @@ from app.schemas.preferences import NotificationPreferences
 from app.services import nats_consumer
 from app.services.dispatchers.base import DispatchMessage
 from app.services.preferences_client import PreferencesClient, set_preferences_client
+from herd_common.outbox import event_dedupe_key
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -323,17 +324,25 @@ async def test_process_message_naks_when_prefs_client_fails():
     js.publish.assert_not_awaited()
 
 
-# --- idempotency: dedupe key from NATS metadata ---
+# --- idempotency: dedupe key resolution (outbox event_id, issue #21) ---
 
 
-def test_dedupe_key_from_msg_uses_stream_and_sequence():
+def test_dedupe_key_prefers_payload_event_id():
+    # With a stamped event_id the key is the stable id, regardless of sequence.
+    eid = str(uuid.uuid4())
     msg = _FakeMsg(b"{}", stream_seq=42, stream="HERD_RESERVATIONS")
-    assert nats_consumer._dedupe_key_from_msg(msg) == "HERD_RESERVATIONS:42"
+    assert event_dedupe_key({"event": "reservation.created", "event_id": eid}, msg) == eid
 
 
-def test_dedupe_key_from_msg_none_when_no_sequence():
+def test_dedupe_key_falls_back_to_stream_and_sequence():
+    # No event_id (a pre-outbox event): fall back to "<stream>:<sequence>".
+    msg = _FakeMsg(b"{}", stream_seq=42, stream="HERD_RESERVATIONS")
+    assert event_dedupe_key({"event": "reservation.created"}, msg) == "HERD_RESERVATIONS:42"
+
+
+def test_dedupe_key_none_when_no_event_id_and_no_sequence():
     # The default _FakeMsg has no sequence metadata (non-JetStream stub).
-    assert nats_consumer._dedupe_key_from_msg(_FakeMsg(b"{}")) is None
+    assert event_dedupe_key({"event": "reservation.created"}, _FakeMsg(b"{}")) is None
 
 
 @pytest.mark.asyncio
@@ -380,6 +389,100 @@ async def test_redelivered_message_creates_one_notification():
     assert rows[0].dedupe_key == "HERD_RESERVATIONS:7"
 
 
+@pytest.mark.asyncio
+async def test_republished_event_same_id_new_sequence_dedupes_to_one():
+    """The outbox property (issue #21): two deliveries carrying the same payload
+    `event_id` but DIFFERENT stream sequences (a relay republish after an outage
+    lands the event under a new JetStream sequence) collapse to a single
+    notification row, because dedup now keys on the stable event_id."""
+    user_id = str(uuid.uuid4())
+    event_id = str(uuid.uuid4())
+    payload = json.dumps(
+        {
+            "event": "reservation.created",
+            "event_id": event_id,
+            "user_id": user_id,
+            "device_ids": [str(uuid.uuid4())],
+            "end_time": "2026-04-21T00:00:00+00:00",
+        }
+    ).encode()
+    js = AsyncMock()
+
+    # Different stream sequences: a pre-outbox <stream>:<seq> key would treat
+    # these as two distinct messages and create two rows.
+    first = _FakeMsg(payload, num_delivered=1, stream_seq=7)
+    second = _FakeMsg(payload, num_delivered=1, stream_seq=99)
+
+    assert (
+        await nats_consumer.process_message(first, js, nats_consumer.handle_event, _session_factory)
+        == "ack"
+    )
+    assert (
+        await nats_consumer.process_message(
+            second, js, nats_consumer.handle_event, _session_factory
+        )
+        == "ack"
+    )
+
+    async with _SessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Notification).where(Notification.user_id == uuid.UUID(user_id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    # The row is keyed on the stable event_id, not the stream sequence.
+    assert rows[0].dedupe_key == event_id
+
+
+@pytest.mark.asyncio
+async def test_no_event_id_falls_back_to_stream_sequence_key():
+    """Backward compat: a pre-outbox event (no `event_id`) is keyed on
+    "<stream>:<sequence>", so two deliveries at different sequences are treated
+    as distinct messages and each persists its own row."""
+    user_id = str(uuid.uuid4())
+    payload = json.dumps(
+        {
+            "event": "reservation.created",
+            "user_id": user_id,
+            "device_ids": [str(uuid.uuid4())],
+            "end_time": "2026-04-21T00:00:00+00:00",
+        }
+    ).encode()
+    js = AsyncMock()
+
+    first = _FakeMsg(payload, num_delivered=1, stream_seq=7)
+    second = _FakeMsg(payload, num_delivered=1, stream_seq=8)
+
+    assert (
+        await nats_consumer.process_message(first, js, nats_consumer.handle_event, _session_factory)
+        == "ack"
+    )
+    assert (
+        await nats_consumer.process_message(
+            second, js, nats_consumer.handle_event, _session_factory
+        )
+        == "ack"
+    )
+
+    async with _SessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Notification).where(Notification.user_id == uuid.UUID(user_id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    keys = sorted(r.dedupe_key for r in rows)
+    assert keys == ["HERD_RESERVATIONS:7", "HERD_RESERVATIONS:8"]
+
+
 # --- start_nats_consumer / stop_nats_consumer (connection + subscription wiring) ---
 
 
@@ -390,23 +493,28 @@ class _FakeApp:
         self.state = types.SimpleNamespace()
 
 
+class _FakeNatsTimeout(Exception):
+    """Stand-in for nats.errors.TimeoutError, raised by an idle fetch()."""
+
+
 class _FakeSubscription:
-    """A JetStream pull-style subscription whose `.messages` yields a fixed
-    list once, then blocks forever (mirrors the real never-ending stream)."""
+    """A JetStream pull subscription whose `fetch()` returns a fixed list once,
+    then raises TimeoutError forever (mirrors an idle pull consumer that the
+    loop keeps polling until the test cancels it)."""
 
     def __init__(self, msgs):
-        self._msgs = msgs
+        self._msgs = list(msgs)
+        self._drained = False
 
-    @property
-    def messages(self):
-        async def _gen():
-            for m in self._msgs:
-                yield m
-            # The real subscription never ends; block so the loop task stays
-            # alive until the test cancels it (as stop_nats_consumer would).
-            await asyncio.Event().wait()
-
-        return _gen()
+    async def fetch(self, batch, timeout=None):
+        if not self._drained and self._msgs:
+            self._drained = True
+            return self._msgs
+        # Yield to the event loop before raising: the real fetch blocks for
+        # `timeout`, so without a sleep here the consumer loop would busy-spin and
+        # starve the test's own await points.
+        await asyncio.sleep(0.02)
+        raise _FakeNatsTimeout()
 
 
 class _FakeJetStream:
@@ -422,7 +530,7 @@ class _FakeJetStream:
             raise RuntimeError("stream exists / cannot update")
         self.added_streams.append((name, tuple(subjects)))
 
-    async def subscribe(self, subject_pattern, durable, manual_ack, config):
+    async def pull_subscribe(self, subject_pattern, durable, config):
         self.subscribe_calls.append(
             {"subject": subject_pattern, "durable": durable, "config": config}
         )
@@ -451,6 +559,9 @@ def _install_fake_nats(monkeypatch, connect_impl):
     fake_nats.connect = connect_impl
     fake_js = types.ModuleType("nats.js")
     fake_js_api = types.ModuleType("nats.js.api")
+    fake_errors = types.ModuleType("nats.errors")
+    fake_errors.TimeoutError = _FakeNatsTimeout
+    fake_nats.errors = fake_errors
 
     class _ConsumerConfig:
         def __init__(self, **kwargs):
@@ -460,6 +571,7 @@ def _install_fake_nats(monkeypatch, connect_impl):
     monkeypatch.setitem(sys.modules, "nats", fake_nats)
     monkeypatch.setitem(sys.modules, "nats.js", fake_js)
     monkeypatch.setitem(sys.modules, "nats.js.api", fake_js_api)
+    monkeypatch.setitem(sys.modules, "nats.errors", fake_errors)
     return _ConsumerConfig
 
 
@@ -468,7 +580,7 @@ async def test_start_nats_consumer_wires_both_subscriptions(monkeypatch):
     js = _FakeJetStream()
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -515,7 +627,7 @@ async def test_start_nats_consumer_loop_processes_a_message(monkeypatch):
     js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: res_sub})
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -561,7 +673,7 @@ async def test_start_nats_consumer_loop_swallows_unexpected_errors(monkeypatch):
     js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: sub})
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -591,7 +703,7 @@ async def test_start_nats_consumer_tolerates_add_stream_failure(monkeypatch):
     js = _FakeJetStream(add_stream_error=True)
     conn = _FakeNatsConn(js)
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
@@ -609,7 +721,7 @@ async def test_start_nats_consumer_tolerates_add_stream_failure(monkeypatch):
 async def test_start_nats_consumer_swallows_connect_failure(monkeypatch):
     """A broker that is unreachable is logged; the app boots without consumers."""
 
-    async def _connect(url):
+    async def _connect(url, **kwargs):
         raise RuntimeError("connection refused")
 
     _install_fake_nats(monkeypatch, _connect)

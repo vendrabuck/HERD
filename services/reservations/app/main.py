@@ -5,9 +5,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
+from herd_common.outbox import run_outbox_relay
 
 from app.config import settings
-from app.database import Base, engine
+from app.database import AsyncSessionLocal, Base, engine
+from app.models.outbox import OutboxEvent
 from app.routers.reservations import router as reservations_router
 
 setup_logging("reservations", level=settings.log_level)
@@ -24,7 +26,15 @@ async def lifespan(app: FastAPI):
     try:
         import nats
 
-        nc = await nats.connect(settings.nats_url)
+        # Retry reconnect forever (max_reconnect_attempts=-1): the outbox relay
+        # depends on this connection recovering after a broker restart, otherwise
+        # buffered events would be stranded once the default 60-attempt cap gave
+        # up and closed the connection.
+        nc = await nats.connect(
+            settings.nats_url,
+            max_reconnect_attempts=-1,
+            reconnect_time_wait=2,
+        )
         app.state.nats = nc
         logger.info("Connected to NATS at %s", settings.nats_url)
         js = nc.jetstream()
@@ -39,16 +49,35 @@ async def lifespan(app: FastAPI):
     # Start expiration background task
     from app.tasks.expiration import expiration_loop
 
-    expiration_task = asyncio.create_task(
-        expiration_loop(settings.expiration_interval_seconds, nats_conn=app.state.nats)
+    expiration_task = asyncio.create_task(expiration_loop(settings.expiration_interval_seconds))
+
+    # Start the transactional-outbox relay (issue #21): drain unpublished outbox
+    # rows to JetStream and prune old ones. get_nats is read each tick so a
+    # reconnect (or a connection that was None at startup) is picked up.
+    outbox_task = asyncio.create_task(
+        run_outbox_relay(
+            AsyncSessionLocal,
+            lambda: getattr(app.state, "nats", None),
+            OutboxEvent,
+            name="reservations-outbox",
+            tick_seconds=settings.outbox_relay_tick_seconds,
+            batch_size=settings.outbox_batch_size,
+            retention_seconds=settings.outbox_retention_seconds,
+        )
     )
 
     yield
 
-    # Cancel expiration task
+    # Cancel background tasks
     expiration_task.cancel()
     try:
         await expiration_task
+    except asyncio.CancelledError:
+        pass
+
+    outbox_task.cancel()
+    try:
+        await outbox_task
     except asyncio.CancelledError:
         pass
 

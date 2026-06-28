@@ -581,6 +581,27 @@ async def test_handle_event_disconnect_action():
 # --- start/stop_nats_consumer ---
 
 
+class _StubTimeoutError(Exception):
+    """Real exception standing in for nats.errors.TimeoutError so the pull
+    consumer loop's `except` clause has a class that inherits BaseException."""
+
+
+class _StubPullSub:
+    """Fake pull subscription: fetch() returns the queued messages once, then
+    raises TimeoutError after yielding (mirrors an idle pull consumer)."""
+
+    def __init__(self, msgs):
+        self._msgs = list(msgs)
+        self._drained = False
+
+    async def fetch(self, batch, timeout=None):
+        if not self._drained and self._msgs:
+            self._drained = True
+            return self._msgs
+        await asyncio.sleep(0.02)
+        raise _StubTimeoutError()
+
+
 def _patched_nats_modules(mock_nats):
     """Register mocks for `nats`, `nats.js`, and `nats.js.api` so the consumer's
     `from nats.js.api import ConsumerConfig` import resolves during tests."""
@@ -588,6 +609,9 @@ def _patched_nats_modules(mock_nats):
     nats_js_api.ConsumerConfig = MagicMock(return_value=MagicMock())
     nats_js = MagicMock()
     nats_js.api = nats_js_api
+    # The pull loop catches nats.errors.TimeoutError; it must be a real class.
+    mock_nats.errors = MagicMock()
+    mock_nats.errors.TimeoutError = _StubTimeoutError
     return {
         "nats": mock_nats,
         "nats.js": nats_js,
@@ -678,14 +702,8 @@ async def test_start_nats_consumer_success():
     ).encode()
     mock_msg.ack = AsyncMock()
 
-    # Create an async iterator that yields one message then raises CancelledError
-    async def _message_iter():
-        yield mock_msg
-        await asyncio.sleep(3600)
-
-    mock_sub = MagicMock()
-    mock_sub.messages = _message_iter()
-    mock_js.subscribe = AsyncMock(return_value=mock_sub)
+    # Pull subscription: fetch returns the message once, then times out.
+    mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([mock_msg]))
 
     mock_nats_module = MagicMock()
     mock_nats_module.connect = AsyncMock(return_value=mock_nc)
@@ -696,7 +714,7 @@ async def test_start_nats_consumer_success():
     # Verify stream was created
     mock_js.add_stream.assert_called_once()
     # Verify subscription was created
-    mock_js.subscribe.assert_called_once()
+    mock_js.pull_subscribe.assert_called_once()
     # Verify consumer task was stored
     assert hasattr(mock_app.state, "nats_consumer_task")
 
@@ -724,14 +742,8 @@ async def test_start_nats_consumer_stream_create_failure():
     mock_nc.jetstream = MagicMock(return_value=mock_js)
     mock_js.add_stream.side_effect = Exception("stream error")
 
-    # Subscription with no messages
-    async def _empty_iter():
-        await asyncio.sleep(3600)
-        yield  # never reached
-
-    mock_sub = MagicMock()
-    mock_sub.messages = _empty_iter()
-    mock_js.subscribe = AsyncMock(return_value=mock_sub)
+    # Pull subscription with no messages (fetch always times out).
+    mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([]))
 
     mock_nats_module = MagicMock()
     mock_nats_module.connect = AsyncMock(return_value=mock_nc)
@@ -740,7 +752,7 @@ async def test_start_nats_consumer_stream_create_failure():
         await start_nats_consumer(mock_app)
 
     # Stream creation failed but subscribe still happened
-    mock_js.subscribe.assert_called_once()
+    mock_js.pull_subscribe.assert_called_once()
 
     # Clean up
     task = mock_app.state.nats_consumer_task

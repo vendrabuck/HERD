@@ -125,10 +125,6 @@ async def _create_test_reservation(client, device_ids=None, **overrides):
             new=AsyncMock(),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -148,10 +144,6 @@ async def test_create_reservation(client):
                     make_device_response(DEVICE_B, "PHYSICAL"),
                 ]
             ),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -208,10 +200,6 @@ async def test_conflict_detection(client):
             new=AsyncMock(return_value=[make_device_response(DEVICE_A, "PHYSICAL")]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -250,10 +238,6 @@ async def test_list_reservations(client):
             new=AsyncMock(return_value=[make_device_response(DEVICE_A, "PHYSICAL")]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -277,10 +261,6 @@ async def test_cancel_reservation(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A, "PHYSICAL")]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -951,10 +931,6 @@ async def test_non_exclusive_device_no_conflict(client):
             new=AsyncMock(return_value=[shared_device]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -975,10 +951,6 @@ async def test_non_exclusive_device_no_conflict(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[shared_device]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1005,10 +977,6 @@ async def test_exclusive_device_still_conflicts(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[exclusive_device]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1056,10 +1024,6 @@ async def test_mixed_exclusive_non_exclusive(client):
             new=AsyncMock(return_value=[shared_device, exclusive_device]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -1080,10 +1044,6 @@ async def test_mixed_exclusive_non_exclusive(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[shared_device]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1126,10 +1086,6 @@ async def test_create_reservation_duplicate_device_ids(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[device]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1345,10 +1301,6 @@ async def test_create_reservation_blocked_by_invalid_topology(client):
             new=AsyncMock(side_effect=ValueError("Topology has unreachable edges")),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -1380,10 +1332,6 @@ async def test_create_reservation_validation_called_when_topology_present(client
             new=validate_mock,
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -1413,10 +1361,6 @@ async def test_create_reservation_validation_skipped_without_topology(client):
         patch(
             "app.services.reservation_service._validate_topology_connectivity",
             new=validate_mock,
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1451,10 +1395,6 @@ async def test_non_exclusive_device_status_not_changed(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[shared_device, exclusive_device]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1640,10 +1580,6 @@ async def test_create_reservation_non_exclusive_skips_status_update(client):
             new=AsyncMock(return_value=[shared]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=mock_update,
         ),
@@ -1671,10 +1607,6 @@ async def test_create_reservation_mixed_exclusive_status_update(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[shared, exclusive]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1706,10 +1638,6 @@ async def test_cancel_non_exclusive_skips_status_update(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[shared]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1779,10 +1707,6 @@ async def test_release_non_exclusive_skips_status_update(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[shared]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -1900,10 +1824,6 @@ async def test_update_reservation_extend_end_time(client):
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
         ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
     ):
         patch_resp = await client.patch(f"/{res_id}", json={"end_time": new_end})
     assert patch_resp.status_code == 200
@@ -1917,11 +1837,7 @@ async def test_update_reservation_shorten_end_time(client):
     res_id = resp.json()["id"]
 
     new_end = (NOW + timedelta(hours=2)).isoformat()
-    with patch(
-        "app.services.reservation_service._publish_nats_event",
-        new=AsyncMock(),
-    ):
-        patch_resp = await client.patch(f"/{res_id}", json={"end_time": new_end})
+    patch_resp = await client.patch(f"/{res_id}", json={"end_time": new_end})
     assert patch_resp.status_code == 200
 
 
@@ -1931,11 +1847,7 @@ async def test_update_reservation_purpose(client):
     assert resp.status_code == 201
     res_id = resp.json()["id"]
 
-    with patch(
-        "app.services.reservation_service._publish_nats_event",
-        new=AsyncMock(),
-    ):
-        patch_resp = await client.patch(f"/{res_id}", json={"purpose": "Updated purpose"})
+    patch_resp = await client.patch(f"/{res_id}", json={"purpose": "Updated purpose"})
     assert patch_resp.status_code == 200
     assert patch_resp.json()["purpose"] == "Updated purpose"
 
@@ -1962,10 +1874,6 @@ async def test_update_completed_reservation_rejected(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2010,10 +1918,6 @@ async def test_update_reservation_conflict_on_extension(client):
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
         ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
     ):
         patch_resp = await client.patch(f"/{res_a_id}", json={"end_time": conflict_end})
     assert patch_resp.status_code == 409
@@ -2037,10 +1941,6 @@ async def test_update_reservation_add_device(client):
             new=AsyncMock(return_value=[make_device_response(d) for d in new_ids]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -2061,10 +1961,6 @@ async def test_update_reservation_remove_device(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2094,10 +1990,6 @@ async def test_update_reservation_device_change_breaks_topology_rejected(client)
         patch(
             "app.services.reservation_service._validate_topology_connectivity",
             new=AsyncMock(side_effect=ValueError("Topology has unreachable edges")),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2131,10 +2023,6 @@ async def test_update_reservation_device_change_valid_topology_succeeds(client):
             new=validate_mock,
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -2164,10 +2052,6 @@ async def test_update_reservation_device_change_no_topology_skips_validation(cli
         patch(
             "app.services.reservation_service._validate_topology_connectivity",
             new=validate_mock,
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2203,10 +2087,6 @@ async def test_update_reservation_add_unavailable_device_rejected(client):
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A), unavailable]),
         ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
     ):
         patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A, DEVICE_B]})
     assert patch_resp.status_code == 400
@@ -2228,10 +2108,6 @@ async def test_update_reservation_topology_mismatch_rejected(client):
                     make_device_response(DEVICE_CLOUD, "CLOUD"),
                 ]
             ),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
     ):
         patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A, DEVICE_CLOUD]})
@@ -2324,10 +2200,6 @@ async def test_create_reservation_non_admin_visible_device_succeeds(non_admin_cl
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -2351,10 +2223,6 @@ async def test_create_reservation_admin_skips_visibility(admin_client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2384,10 +2252,6 @@ async def test_create_reservation_visibility_fetch_failure_allows(non_admin_clie
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2445,10 +2309,6 @@ async def test_update_reservation_inventory_unreachable_on_extension(client):
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(side_effect=Exception("Connection refused")),
         ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
     ):
         # Should still succeed (no conflict, falls back to treating all as exclusive)
         patch_resp = await client.patch(f"/{res_id}", json={"end_time": new_end})
@@ -2472,10 +2332,6 @@ async def test_update_reservation_add_non_exclusive_device(client):
             new=AsyncMock(return_value=[make_device_response(DEVICE_A), non_excl]),
         ),
         patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
-        patch(
             "app.services.reservation_service._update_device_statuses",
             new=AsyncMock(),
         ),
@@ -2497,10 +2353,6 @@ async def test_update_reservation_inventory_unreachable_on_device_change(client)
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(side_effect=RuntimeError("Connection refused")),
         ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
-        ),
     ):
         patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A, DEVICE_B]})
     assert patch_resp.status_code == 503
@@ -2517,10 +2369,6 @@ async def test_update_reservation_device_not_found_on_change(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(side_effect=ValueError("Device not found")),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
     ):
         patch_resp = await client.patch(f"/{res_id}", json={"device_ids": [DEVICE_A, DEVICE_B]})
@@ -2539,10 +2387,6 @@ async def test_update_reservation_remove_device_releases_exclusive(client):
         patch(
             "app.services.reservation_service._fetch_devices",
             new=AsyncMock(return_value=[make_device_response(DEVICE_A)]),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2617,10 +2461,6 @@ async def test_update_reservation_conflict_on_added_device(client):
             new=AsyncMock(
                 return_value=[make_device_response(DEVICE_A), make_device_response(DEVICE_B)]
             ),
-        ),
-        patch(
-            "app.services.reservation_service._publish_nats_event",
-            new=AsyncMock(),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
