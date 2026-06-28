@@ -1251,3 +1251,80 @@ async def test_handle_event_opens_single_client_for_whole_event():
         await handle_reservation_event(event_data, AsyncMock())
 
     assert len(created) == 1, f"expected exactly one AsyncClient per event, got {len(created)}"
+
+
+# --- dedupe key switch: payload event_id over stream:sequence (issue #21) ---
+#
+# process_reservation_message now resolves the handler's idempotency key via
+# herd_common.outbox.event_dedupe_key, which prefers the producer-stamped
+# payload event_id. The stable id survives an outbox relay republish under a
+# new JetStream sequence, so a duplicate delivery still dedupes to one effect;
+# pre-outbox events with no event_id fall back to "<stream>:<sequence>".
+
+
+def _make_msg_with_seq(payload: bytes, *, stream: str = "HERD_RESERVATIONS", seq: int = 1):
+    """Fake JetStream msg carrying full metadata (stream + stream sequence)."""
+    msg = MagicMock()
+    msg.data = payload
+    msg.metadata = SimpleNamespace(
+        num_delivered=1,
+        stream=stream,
+        sequence=SimpleNamespace(stream=seq),
+    )
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_process_message_keys_on_payload_event_id():
+    """When the payload carries event_id, the handler is keyed on it, not the seq."""
+    js = _make_js()
+    eid = str(uuid.uuid4())
+    payload = json.dumps({"event": "reservation.created", "event_id": eid}).encode()
+    msg = _make_msg_with_seq(payload, seq=42)
+    handler = AsyncMock()
+
+    result = await process_reservation_message(msg, js, handler, session_factory=lambda: None)
+
+    assert result == "ack"
+    # handler(event_data, session_factory, dedupe_key)
+    _args, _kwargs = handler.call_args
+    assert _args[2] == eid
+    assert _args[2] != "HERD_RESERVATIONS:42"
+
+
+@pytest.mark.asyncio
+async def test_process_message_same_event_id_different_sequence_dedupes():
+    """Two deliveries with the same event_id but different stream sequence resolve
+    to the same key, so a relay republish dedupes to one effect."""
+    js = _make_js()
+    eid = str(uuid.uuid4())
+    payload = json.dumps({"event": "reservation.created", "event_id": eid}).encode()
+
+    keys = []
+    handler = AsyncMock(side_effect=lambda *a, **k: keys.append(a[2]))
+
+    await process_reservation_message(
+        _make_msg_with_seq(payload, seq=7), js, handler, session_factory=lambda: None
+    )
+    await process_reservation_message(
+        _make_msg_with_seq(payload, seq=99), js, handler, session_factory=lambda: None
+    )
+
+    assert keys == [eid, eid]
+
+
+@pytest.mark.asyncio
+async def test_process_message_falls_back_to_stream_sequence_without_event_id():
+    """A pre-outbox event with no event_id keys on '<stream>:<sequence>'."""
+    js = _make_js()
+    payload = json.dumps({"event": "reservation.created"}).encode()
+    msg = _make_msg_with_seq(payload, stream="HERD_RESERVATIONS", seq=55)
+    handler = AsyncMock()
+
+    result = await process_reservation_message(msg, js, handler, session_factory=lambda: None)
+
+    assert result == "ack"
+    _args, _kwargs = handler.call_args
+    assert _args[2] == "HERD_RESERVATIONS:55"
