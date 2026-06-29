@@ -516,7 +516,8 @@ async def create_reservation(
 
     # 7. Mark exclusive devices as RESERVED in inventory with retry; non-exclusive
     #    devices stay AVAILABLE so no inventory call is needed. On exhausted retries
-    #    the reservation is flipped to FAILED and no NATS event is emitted.
+    #    the reservation is flipped to FAILED and a reservation.failed event is
+    #    staged in the same transaction (issue #33).
     if exclusive_uuid_ids:
         # Track which devices actually reached RESERVED across all retry attempts.
         # The POSTs run concurrently, so a partial failure leaves the succeeding
@@ -534,6 +535,25 @@ async def create_reservation(
             )
         except Exception as exc:
             reservation.status = ReservationStatus.FAILED
+            # Stage reservation.failed in the same transaction that lands the row
+            # in FAILED (issue #21), so the event exists iff the failure committed.
+            # This is the webhook/notification signal that provisioning gave up
+            # (issue #33 lists reservation.failed among the delivered events).
+            enqueue_event(
+                db,
+                OutboxEvent,
+                "herd.reservations.failed",
+                {
+                    "event": "reservation.failed",
+                    "reservation_id": str(reservation.id),
+                    "user_id": str(user_id),
+                    "device_ids": [str(d) for d in reservation.device_ids],
+                    "topology_id": str(reservation.topology_id)
+                    if reservation.topology_id
+                    else None,
+                    "topology_type": reservation.topology_type.value,
+                },
+            )
             await db.commit()
             await db.refresh(reservation)
             # Compensate: best-effort revert the devices that DID get set RESERVED
