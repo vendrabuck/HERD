@@ -82,6 +82,8 @@ services:
         condition: service_healthy
       reservations:
         condition: service_healthy
+      integration:
+        condition: service_healthy
 
   # --- PostgreSQL ---
   postgres:
@@ -249,6 +251,45 @@ services:
       nats:
         condition: service_healthy
       inventory:
+        condition: service_healthy
+
+  # --- Integration Service (versioned v1 external API facade) ---
+  integration:
+    build:
+      context: .
+      dockerfile: services/integration/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: integration
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      RESERVATIONS_SERVICE_URL: http://reservations:8000
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.integration.rule=PathPrefix(`/api/v1`)"
+      - "traefik.http.routers.integration.entrypoints=websecure"
+      - "traefik.http.routers.integration.tls=true"
+      - "traefik.http.services.integration.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.integration-strip.stripprefix.prefixes=/api/v1"
+      - "traefik.http.routers.integration.middlewares=integration-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      reservations:
         condition: service_healthy
 
   # --- ACL Service ---
