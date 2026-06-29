@@ -655,7 +655,8 @@ async def test_create_reservation_non_exclusive_skips_pending_provision():
 
 @pytest.mark.asyncio
 async def test_create_reservation_fails_when_inventory_exhausts_retries():
-    """Retries exhausted -> reservation persists as FAILED, no NATS event, RuntimeError raised."""
+    """Retries exhausted -> reservation persists as FAILED, a reservation.failed event is
+    staged in the same transaction (issue #33), RuntimeError raised."""
     async with TestSessionLocal() as db:
         devices = [_make_device(DEVICE_A)]
         data = ReservationCreate(
@@ -678,9 +679,14 @@ async def test_create_reservation_fails_when_inventory_exhausts_retries():
 
         # _update_device_statuses was retried 3 times (default attempts).
         assert mock_update.await_count == 3
-        # No event is staged on the failure path: the FAILED commit carries no
-        # outbox row, so nothing is ever published.
-        assert await _outbox(db) == []
+        # A reservation.failed event is staged atomically with the FAILED commit
+        # (issue #33), so the failure is delivered to webhooks/notifications.
+        rows = await _outbox(db)
+        assert len(rows) == 1
+        assert rows[0].subject == "herd.reservations.failed"
+        assert rows[0].payload["event"] == "reservation.failed"
+        assert rows[0].payload["reservation_id"]
+        assert rows[0].published_at is None
 
         # Reservation row persists in FAILED state for audit.
         from sqlalchemy import select
