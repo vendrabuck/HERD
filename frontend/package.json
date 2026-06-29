@@ -27,6 +27,7 @@
     "zustand": "^5.0.14"
   },
   "overrides": {
+    "@babel/core": "^7.29.6",
     "eslint-plugin-react-hooks": {
       "eslint": "$eslint"
     }
