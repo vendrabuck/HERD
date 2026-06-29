@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     nats_url: str = "nats://nats:4222"
     webhook_delivery_timeout_seconds: float = 10.0
     webhook_delivery_attempts: int = 4
+    # Test-only in-network 2xx sink for the live webhook delivery test. Off by
+    # default and enabled only in docker-compose.override.yml (never in prod),
+    # mirroring the HERD_FAULT_INJECTION seam convention.
+    webhook_test_sink_enabled: bool = False
 
     log_level: str = "INFO"
 

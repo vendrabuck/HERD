@@ -34,6 +34,10 @@ services:
 
   integration:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      # Test-only webhook delivery sink, dev/test stack only (never in make prod,
+      # which excludes this override). Mirrors the HERD_FAULT_INJECTION seam.
+      WEBHOOK_TEST_SINK_ENABLED: "true"
     volumes:
       - ./services/integration/app:/app/app
       - ./services/common/herd_common:/app/common/herd_common

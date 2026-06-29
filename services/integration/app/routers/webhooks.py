@@ -114,16 +114,18 @@ async def delete_webhook(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/echo", include_in_schema=False)
-async def echo_receiver(request: Request):
-    """Unauthenticated 200 sink for end-to-end delivery verification.
+# Test-only delivery sink. Registered by main.py ONLY when
+# settings.webhook_test_sink_enabled is true (set in docker-compose.override.yml,
+# never in prod), so this unauthenticated endpoint never exists in production. It
+# mirrors the repo's HERD_FAULT_INJECTION seam: a test affordance gated to the
+# dev/test stack. The services' /health routes are GET-only (405 on POST), so the
+# live webhook delivery test needs an in-network endpoint that returns 2xx to POST.
+test_sink_router = APIRouter(prefix="/webhooks", tags=["v1-webhooks-test-sink"])
 
-    Hidden from the OpenAPI schema (include_in_schema=False) so it stays out of
-    the v1 contract and the contract snapshot. It performs no writes; it exists
-    so an in-network delivery target reliably returns 2xx for a webhook POST,
-    because the services' /health routes are GET-only and would 405. Used by the
-    live webhook integration test as the reachable success receiver.
-    """
+
+@test_sink_router.post("/echo", include_in_schema=False)
+async def echo_receiver(request: Request):
+    """Unauthenticated 200 sink for end-to-end delivery verification (test stack only)."""
     body = await request.body()
     return {"ok": True, "received_bytes": len(body)}
 

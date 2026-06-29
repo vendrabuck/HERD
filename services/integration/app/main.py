@@ -11,6 +11,7 @@ from app.database import Base, engine
 from app.models import WebhookDelivery, WebhookSubscription  # noqa: F401
 from app.routers.reservations import router as reservations_router
 from app.routers.webhooks import router as webhooks_router
+from app.routers.webhooks import test_sink_router
 from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
 
 setup_logging("integration", level=settings.log_level)
@@ -46,6 +47,9 @@ app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(reservations_router)
 app.include_router(webhooks_router)
+# Test-only delivery sink, gated to the dev/test stack (never prod).
+if settings.webhook_test_sink_enabled:
+    app.include_router(test_sink_router)
 
 
 @app.get("/health")
