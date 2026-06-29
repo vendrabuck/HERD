@@ -1,0 +1,80 @@
+{
+  "paths": [
+    [
+      "GET",
+      "/health"
+    ],
+    [
+      "GET",
+      "/reservations"
+    ],
+    [
+      "POST",
+      "/reservations"
+    ],
+    [
+      "DELETE",
+      "/reservations/{reservation_id}"
+    ],
+    [
+      "GET",
+      "/reservations/{reservation_id}"
+    ],
+    [
+      "PUT",
+      "/reservations/{reservation_id}/release"
+    ]
+  ],
+  "schemas": {
+    "V1ReservationList": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "V1ReservationRequest": {
+      "properties": {
+        "device_ids": "array",
+        "end_time": "string",
+        "purpose": "anyOf",
+        "start_time": "string",
+        "topology_id": "anyOf"
+      },
+      "required": [
+        "device_ids",
+        "end_time",
+        "start_time"
+      ],
+      "type": "object"
+    },
+    "V1ReservationResponse": {
+      "properties": {
+        "created_at": "string",
+        "device_ids": "array",
+        "end_time": "string",
+        "id": "string",
+        "start_time": "string",
+        "status": "string",
+        "topology_id": "anyOf"
+      },
+      "required": [
+        "created_at",
+        "device_ids",
+        "end_time",
+        "id",
+        "start_time",
+        "status"
+      ],
+      "type": "object"
+    }
+  }
+}

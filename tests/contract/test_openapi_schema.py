@@ -42,6 +42,7 @@ SERVICES = [
     "ai",
     "user-profile",
     "notifications",
+    "v1",
 ]
 
 BASE_URL = os.getenv("HERD_BASE_URL", "https://localhost/api")
