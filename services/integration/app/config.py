@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     reservations_service_url: str = "http://reservations:8000"
     internal_api_token: str = ""
 
+    # Outbound webhook delivery (issue #33, phase 4).
+    nats_url: str = "nats://nats:4222"
+    webhook_delivery_timeout_seconds: float = 10.0
+    webhook_delivery_attempts: int = 4
+
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "case_sensitive": False}
