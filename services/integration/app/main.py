@@ -6,19 +6,26 @@ from herd_common.logging import RequestLoggingMiddleware, setup_logging
 
 from app.config import settings
 from app.database import Base, engine
+
+# Import models so Base.metadata.create_all picks up the webhook tables.
+from app.models import WebhookDelivery, WebhookSubscription  # noqa: F401
 from app.routers.reservations import router as reservations_router
+from app.routers.webhooks import router as webhooks_router
+from app.routers.webhooks import test_sink_router
+from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
 
 setup_logging("integration", level=settings.log_level)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # The facade itself is stateless, but the integration service owns its own
-    # schema so phase 4 (webhooks) can add tables cleanly. create_all is a no-op
-    # while no models are defined.
+    # The v1 facade is stateless, but the integration service owns its own schema
+    # for the webhook subscription and delivery tables (issue #33, phase 4).
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await start_nats_consumer(app)
     yield
+    await stop_nats_consumer(app)
 
 
 app = FastAPI(
@@ -39,6 +46,10 @@ app.add_middleware(
 app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(reservations_router)
+app.include_router(webhooks_router)
+# Test-only delivery sink, gated to the dev/test stack (never prod).
+if settings.webhook_test_sink_enabled:
+    app.include_router(test_sink_router)
 
 
 @app.get("/health")

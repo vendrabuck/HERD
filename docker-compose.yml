@@ -266,6 +266,7 @@ services:
       RESERVATIONS_SERVICE_URL: http://reservations:8000
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - herd-config:/etc/herd:ro
@@ -290,6 +291,8 @@ services:
       postgres:
         condition: service_healthy
       reservations:
+        condition: service_healthy
+      nats:
         condition: service_healthy
 
   # --- ACL Service ---
