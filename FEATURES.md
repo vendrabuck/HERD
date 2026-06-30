@@ -155,9 +155,20 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Integration
 
-- **External integration API and webhooks** (Planned): a stable external API for
-  CI/CD pipelines and test automation to reserve devices, build topologies, and
-  query availability, plus outbound webhooks for reservation and topology events.
+- **External integration API and webhooks** (Shipped): a stable, versioned
+  `/api/v1` surface owned by the `integration` service for CI/CD pipelines and
+  test automation to reserve and release devices, decoupled from the internal UI
+  endpoints. Automation authenticates with admin-minted API tokens (a token's
+  role can never exceed its principal's) exchanged for short-lived access JWTs,
+  and the facade forwards the caller's identity so RBAC, device-group visibility,
+  and ACL grants apply exactly as for interactive users. Admins register outbound
+  webhooks for reservation lifecycle events (`reservation.created`, `.updated`,
+  `.cancelled`, `.completed`, `.failed`, `.expiring_soon`); each delivery is
+  HMAC-SHA256 signed via `X-HERD-Signature`, at-least-once with retry and backoff,
+  idempotent on the payload `event_id`, dead-lettered on exhaustion, and recorded
+  in an inspectable delivery ledger. See
+  [docs/EXTERNAL_API.md](docs/EXTERNAL_API.md) and
+  [docs/api/v1-openapi.json](docs/api/v1-openapi.json). (Issue #33.)
 
 ## Multi-tenancy
 

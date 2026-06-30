@@ -85,6 +85,7 @@ over NATS JetStream.
 | AI Orchestrator | LLM-driven topology generation (configurable: Anthropic or OpenAI-compatible) |
 | User Profile | Per-user preferences (saved filters, page sizes, extras) |
 | Notifications | NATS consumer + in-app notifications + per-user prefs |
+| Integration | Versioned `/api/v1` reservation facade + outbound webhooks (NATS consumer) |
 
 Shared data layer: PostgreSQL 16 (schema-per-service) and NATS JetStream (async events).
 
@@ -182,6 +183,7 @@ Environment variables from `.env` take precedence over config page values.
 | AI Orchestrator | `/api/ai` |
 | User Profile | `/api/user-profile` |
 | Notifications | `/api/notifications` |
+| Integration | `/api/v1` |
 
 ### Development commands
 
@@ -189,7 +191,7 @@ Environment variables from `.env` take precedence over config page values.
 make up              # Start full stack (dev mode)
 make down            # Stop full stack
 make build           # Rebuild all images
-make test            # Run all backend tests (11 services)
+make test            # Run all backend tests (12 services)
 make test-frontend   # Run frontend tests (vitest)
 make test-e2e        # Run E2E browser tests (Docker Selenium, requires running stack)
 make coverage        # Run all backend tests with coverage report
@@ -422,7 +424,7 @@ the new `/settings` page.
 
 ## Testing
 
-Over 2,000 backend unit tests across the 11 services, around 460 frontend tests via vitest, and roughly 100 cross-service integration tests (a handful skipped: VLAN-fabric cases plus LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). Around 100 E2E browser tests via Selenium (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against a local `osixia/openldap` container (see `docs/ENV_VARS.md` LDAP section).
+Over 2,000 backend unit tests across the 12 services, around 460 frontend tests via vitest, and roughly 100 cross-service integration tests (a handful skipped: VLAN-fabric cases plus LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). Around 100 E2E browser tests via Selenium (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against a local `osixia/openldap` container (see `docs/ENV_VARS.md` LDAP section).
 
 Coverage targets 85%+ per backend service; run `make coverage` for the current per-service report (or `make coverage-<svc>` for one service with an HTML report). Outstanding test gaps are tracked in [docs/GAPS.md](docs/GAPS.md).
 
@@ -464,7 +466,7 @@ make test-load-ui        # Locust with web UI
 ## CI (GitHub Actions)
 
 Two jobs run on push/PR to main:
-- **backend**: install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 11 services (pytest), coverage report
+- **backend**: install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 12 services (pytest), coverage report
 - **frontend**: install deps (npm ci), lint (eslint), test (vitest), build (vite)
 
 ## Documentation

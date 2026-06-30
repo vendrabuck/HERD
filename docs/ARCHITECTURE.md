@@ -22,6 +22,7 @@ PostgreSQL 16 (a schema per service, no cross-schema joins) and NATS JetStream f
 | ai-orchestrator | LLM-driven topology generation (feature-gated) |
 | user-profile | Per-user preferences (saved filters, page sizes, extras) |
 | notifications | NATS consumer + in-app notifications + prefs proxy |
+| integration | Versioned `/api/v1` reservation facade + outbound webhooks (NATS consumer) |
 
 Each service has its own Docker container, its own Alembic migration chain, and its own `app/config.py` settings.
 
@@ -68,7 +69,7 @@ A fourth opt-in **retry+raise** mode uses `herd_common.retry.retry_with_backoff`
 
 Two source streams carry live work, plus a dedicated `HERD_DLQ` stream that retains dead-lettered messages (see below).
 
-**`HERD_RESERVATIONS`** carries `herd.reservations.*` subjects. The reservations service publishes `reservation.created`, `reservation.cancelled`, `reservation.completed`, `reservation.updated`. Two services consume them with independent durable consumers:
+**`HERD_RESERVATIONS`** carries `herd.reservations.*` subjects. The reservations service publishes `reservation.created`, `reservation.updated`, `reservation.cancelled`, `reservation.completed`, `reservation.failed`, and `reservation.expiring_soon`. Three services consume them with independent durable consumers:
 
 - **execution** (`execution-consumer`) triggers driver actions:
   - `reservation.created`: L1 connect_ports per switch; L2 create_vlan + add_to_vlan for each DUT port connected to an L2 switch.
@@ -76,10 +77,11 @@ Two source streams carry live work, plus a dedicated `HERD_DLQ` stream that reta
   - `reservation.updated`: L1 update_ports for added/removed devices.
   - Idempotent on redelivery: each mutating driver action records a stable `dedupe_key` on its `execution_runs` row, and the consumer skips any action whose `SUCCESS` run already carries that key. The key is the producer-stamped payload `event_id` (the outbox row id, issue #21), which survives a relay republish under a new stream sequence, falling back to the source message's NATS `stream:sequence` for events published before the outbox existed. A NAK retry re-runs only the action that failed, never the ones that already applied (`login`/`logout` are not deduped).
 - **notifications** (`notifications-consumer`) turns the same events into per-user in-app notifications, gated by the user's `extras.notifications` preferences in user-profile.
+- **integration** (`integration-webhooks-consumer`) fans each event out to admin-registered outbound webhooks as HMAC-signed POSTs, with a delivery ledger and dead-letter record (issue #33); see the integration-service section below.
 
 **`HERD_HEALTH`** carries `herd.health.status_changed`. The execution service's health-poll scheduler publishes a `device.health_transition` event when a polled device's `consecutive_failures` crosses the configured threshold (bad_news) or resets to zero (recovery). The notifications service consumes this stream with its own durable consumer (`notifications-health-consumer`) and fans the event out as in-app notifications to all admins plus any users with an active reservation on the device.
 
-All consumers use `ConsumerConfig(max_deliver=5, ack_wait=30, backoff=[1,5,15,60,120])` and publish poison messages (JSON decode errors) and exhausted deliveries to service-scoped DLQ subjects: `herd.reservations.dlq.execution` (execution), `herd.reservations.dlq.notifications` (notifications, reservations stream), and `herd.health.dlq.notifications` (notifications, health stream). See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq) for inspection.
+All consumers use `ConsumerConfig(max_deliver=5, ack_wait=30, backoff=[1,5,15,60,120])` and publish poison messages (JSON decode errors) and exhausted deliveries to service-scoped DLQ subjects: `herd.reservations.dlq.execution` (execution), `herd.reservations.dlq.notifications` (notifications, reservations stream), `herd.reservations.dlq.integration` (integration webhooks), and `herd.health.dlq.notifications` (notifications, health stream). See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq) for inspection.
 
 ### Transactional outbox (durable event delivery, issue #21)
 
@@ -88,6 +90,18 @@ The lifecycle and health events above were once published to JetStream after the
 Each producing service (reservations and execution) owns its own `outbox` table (reservations migration `0010`, execution migration `0010`); schema-per-service is preserved, there is no shared outbox table. The event row is staged in the same transaction as the state change it describes via `enqueue_event` (`herd_common.outbox`), so the event exists if and only if that transition committed. A background relay (`run_outbox_relay`) then drains it: it claims unpublished rows with `FOR UPDATE SKIP LOCKED` so multiple relay instances never double-publish, publishes each to JetStream with a `Nats-Msg-Id` header set to the outbox row id for publisher-side dedup within the stream's dedup window, marks the row published, and periodically prunes published rows past the retention window. A publish failure leaves the row unpublished and backs the relay off exponentially, so a NATS outage delays delivery instead of dropping it; the relay drains the backlog on the first healthy tick after the outage, which is what makes restart-recovery work.
 
 Consumers stay idempotent on a stable key resolved by `event_dedupe_key`: the producer stamps an `event_id` into each payload, and consumers key their existing dedupe ledgers on it (execution's `execution_runs` dedupe index, notifications' `(user_id, dedupe_key)` rows and `outbound_deliveries` ledger). Because `event_id` is stable, a relay republish under a new stream sequence is still recognized as a duplicate; the key falls back to `<stream>:<sequence>` for events published before the outbox existed, so a rolling deploy stays correct.
+
+A third consumer on `HERD_RESERVATIONS` lives in the `integration` service (durable `integration-webhooks-consumer`, DLQ subject `herd.reservations.dlq.integration`): it fans each reservation event out to every registered outbound webhook (see below).
+
+## Integration service: external API and webhooks (issue #33)
+
+The `integration` service is the stable external surface for automation, decoupled from the internal UI endpoints. It has two halves.
+
+**Versioned `/api/v1` reservation facade.** Traefik routes `/api/v1` to the integration service (stripping the prefix). The facade is a thin, synchronous hop that forwards the caller's bearer JWT to the reservations service, so RBAC, device-group visibility, and ACL grants are enforced downstream as the real user; the facade only validates that a JWT is present, freezes the v1 request/response contract (`app/schemas/reservation.py`, decoupled from reservations' internal schemas), and propagates upstream status codes (a slow or unreachable upstream surfaces as `503`). Endpoints: `POST /reservations` (reserve), `GET /reservations`, `GET /reservations/{id}`, `DELETE /reservations/{id}` (cancel), `PUT /reservations/{id}/release`.
+
+**Machine-token exchange.** Long-lived API tokens are minted by an admin in the auth service (`POST /api/auth/tokens`, role-capped at the principal's own role) and stored only as a hash. A machine exchanges its raw token at the public `POST /api/auth/tokens/exchange` for a short-lived access JWT (`auth_source=api_token`, no refresh token), then sends that JWT to `/api/v1`. Revocation is `DELETE /api/auth/tokens/{id}`.
+
+**Outbound webhook consumer and delivery.** Admins register subscriptions (`POST /api/v1/webhooks`: target URL, subscribed event types, shared HMAC secret). The durable consumer above loads every active subscription matching an event and POSTs a signed copy to each concurrently. Each delivery is signed `X-HERD-Signature: sha256=<hex>` (HMAC-SHA256 over the raw body bytes, keyed by the subscription secret; `herd_common.webhooks.sign_body`), retried with backoff, and recorded in a `webhook_deliveries` ledger that doubles as the at-least-once dedup record (unique on `(subscription_id, event_id)`) and the dead-letter record (`status="dead"` on retry exhaustion). A failing receiver lands a `dead` ledger row and never NAKs the NATS message, so one bad target cannot re-fan-out to the others or stall the stream. See [EXTERNAL_API.md](EXTERNAL_API.md).
 
 ## Reservation state machine
 
@@ -245,7 +259,7 @@ Container health: `docker compose ps` shows per-service `(healthy)` state. Each 
 
 ## Trade-offs accepted
 
-HERD is built as 11 independent services rather than a modular monolith. This section documents the trade-offs accepted by that choice so future contributors and adopters understand the design rationale; engineering choices are stronger when the costs are explicit.
+HERD is built as 12 independent services rather than a modular monolith. This section documents the trade-offs accepted by that choice so future contributors and adopters understand the design rationale; engineering choices are stronger when the costs are explicit.
 
 ### Why microservices
 
