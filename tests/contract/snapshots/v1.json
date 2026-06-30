@@ -23,6 +23,26 @@
     [
       "PUT",
       "/reservations/{reservation_id}/release"
+    ],
+    [
+      "GET",
+      "/webhooks"
+    ],
+    [
+      "POST",
+      "/webhooks"
+    ],
+    [
+      "DELETE",
+      "/webhooks/{webhook_id}"
+    ],
+    [
+      "GET",
+      "/webhooks/{webhook_id}"
+    ],
+    [
+      "GET",
+      "/webhooks/{webhook_id}/deliveries"
     ]
   ],
   "schemas": {
@@ -73,6 +93,83 @@
         "id",
         "start_time",
         "status"
+      ],
+      "type": "object"
+    },
+    "WebhookCreate": {
+      "properties": {
+        "description": "anyOf",
+        "event_types": "array",
+        "secret": "anyOf",
+        "target_url": "string"
+      },
+      "required": [
+        "event_types",
+        "target_url"
+      ],
+      "type": "object"
+    },
+    "WebhookCreated": {
+      "properties": {
+        "created_at": "string",
+        "created_by": "anyOf",
+        "description": "anyOf",
+        "event_types": "array",
+        "id": "string",
+        "is_active": "boolean",
+        "secret": "string",
+        "target_url": "string"
+      },
+      "required": [
+        "created_at",
+        "event_types",
+        "id",
+        "is_active",
+        "secret",
+        "target_url"
+      ],
+      "type": "object"
+    },
+    "WebhookDeliveryResponse": {
+      "properties": {
+        "attempts": "integer",
+        "created_at": "string",
+        "delivered_at": "anyOf",
+        "event_id": "string",
+        "event_type": "string",
+        "id": "string",
+        "last_error": "anyOf",
+        "response_status": "anyOf",
+        "status": "string",
+        "subscription_id": "string"
+      },
+      "required": [
+        "attempts",
+        "created_at",
+        "event_id",
+        "event_type",
+        "id",
+        "status",
+        "subscription_id"
+      ],
+      "type": "object"
+    },
+    "WebhookResponse": {
+      "properties": {
+        "created_at": "string",
+        "created_by": "anyOf",
+        "description": "anyOf",
+        "event_types": "array",
+        "id": "string",
+        "is_active": "boolean",
+        "target_url": "string"
+      },
+      "required": [
+        "created_at",
+        "event_types",
+        "id",
+        "is_active",
+        "target_url"
       ],
       "type": "object"
     }
