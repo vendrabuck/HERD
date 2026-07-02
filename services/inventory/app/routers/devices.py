@@ -28,6 +28,45 @@ router = APIRouter(tags=["devices"])
 
 _FAULT_STATUS_SENTINEL = "__herd_fault_status__"
 
+# Sentinel written over password-typed field values on non-admin reads. Matches
+# the config service's secret masking so the frontend renders a stable, obviously
+# redacted value. The key is retained (only its value is replaced) so the response
+# shape is unchanged for the UI.
+_REDACTED_VALUE = "********"
+
+
+def _password_field_keys(template: DeviceTemplate | None) -> set[str]:
+    """Bare field_data keys whose template field is type "password".
+
+    Mirrors the execution service's extract_password_keys, but over the bare keys
+    used in a device's field_data (execution prefixes them with HERD_ for the run
+    context env; inventory stores them unprefixed). Defensive against malformed
+    sections so a bad template never breaks a read.
+    """
+    if template is None or not template.sections:
+        return set()
+    keys: set[str] = set()
+    for section in template.sections:
+        if not isinstance(section, dict):
+            continue
+        for field in section.get("fields", []):
+            if isinstance(field, dict) and field.get("type") == "password":
+                key = field.get("key")
+                if key:
+                    keys.add(key)
+    return keys
+
+
+def _redact_field_data(field_data: dict, password_keys: set[str]) -> dict:
+    """Replace truthy password-typed values with the redaction sentinel.
+
+    Empty/None values are left untouched so a redacted response never implies a
+    secret exists where none was set.
+    """
+    if not password_keys:
+        return field_data
+    return {k: (_REDACTED_VALUE if k in password_keys and v else v) for k, v in field_data.items()}
+
 
 def _fault_injection_enabled() -> bool:
     return os.environ.get("HERD_FAULT_INJECTION", "").strip().lower() in {
@@ -57,9 +96,19 @@ class HealthConfigEntry(BaseModel):
     resolved_interval_seconds: int
 
 
-def _device_to_response(device: Device) -> DeviceResponse:
+def _device_to_response(
+    device: Device,
+    *,
+    redact_passwords: bool = False,
+    password_keys: set[str] | None = None,
+) -> DeviceResponse:
     template_poll = device.template.poll_interval_seconds if device.template else None
     resolved_poll = device.poll_interval_seconds or template_poll
+    field_data = device.field_data
+    if redact_passwords:
+        if password_keys is None:
+            password_keys = _password_field_keys(device.template)
+        field_data = _redact_field_data(field_data, password_keys)
     return DeviceResponse(
         id=device.id,
         name=device.name,
@@ -71,7 +120,7 @@ def _device_to_response(device: Device) -> DeviceResponse:
         template_part_number=device.template.part_number if device.template else None,
         topology_type=device.topology_type,
         status=device.status,
-        field_data=device.field_data,
+        field_data=field_data,
         driver_id=device.template.driver_id if device.template else None,
         driver_name=(
             device.template.driver.name if device.template and device.template.driver else None
@@ -139,8 +188,24 @@ async def get_devices(
         search=search,
     )
 
+    if is_admin:
+        items = [_device_to_response(d) for d in devices]
+    else:
+        # Redact password-typed field values for non-admins. Resolve each
+        # template's password-key set once per template_id: the template is
+        # eager-loaded on Device (lazy="joined"), so this reads already-loaded
+        # data and adds no per-device query.
+        pw_key_cache: dict[uuid.UUID, set[str]] = {}
+        items = []
+        for d in devices:
+            keys = pw_key_cache.get(d.template_id)
+            if keys is None:
+                keys = _password_field_keys(d.template)
+                pw_key_cache[d.template_id] = keys
+            items.append(_device_to_response(d, redact_passwords=True, password_keys=keys))
+
     return PaginatedDeviceResponse(
-        items=[_device_to_response(d) for d in devices],
+        items=items,
         total=total,
         skip=skip,
         limit=limit,
@@ -237,6 +302,9 @@ async def get_device_by_id(
         visible_ids = await _resolve_visible_device_ids(db, user_id, authorization)
         if device.id not in visible_ids:
             raise HTTPException(status_code=404, detail="Device not found")
+        # Non-admins may see the device but not its secrets: mask password-typed
+        # field values while keeping the keys so the response shape is stable.
+        return _device_to_response(device, redact_passwords=True)
     return _device_to_response(device)
 
 

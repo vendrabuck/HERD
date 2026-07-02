@@ -1442,3 +1442,153 @@ async def test_create_device_succeeds_when_template_identity_known(client):
     data = resp.json()
     assert data["template_vendor"] == "Cisco"
     assert data["template_model"] == "Catalyst 9300"
+
+
+# --- Password-typed field_data redaction on non-admin reads (issue #247) ---
+
+_PW_TEMPLATE_SECTIONS = [
+    {
+        "name": "Management",
+        "fields": [
+            {"key": "ip", "label": "IP", "type": "string"},
+            {"key": "login", "label": "Login", "type": "string"},
+            {"key": "password", "label": "Password", "type": "password"},
+            {"key": "enable_secret", "label": "Enable Secret", "type": "password"},
+        ],
+    }
+]
+
+
+async def _create_password_template(client) -> str:
+    driver_id = await _create_driver(client)
+    payload = {
+        "name": f"pw-tmpl-{uuid.uuid4()}",
+        "template_type": "device",
+        "driver_id": driver_id,
+        "vendor": "Cisco",
+        "model": "Catalyst 9300",
+        "sections": _PW_TEMPLATE_SECTIONS,
+    }
+    resp = await client.post("/templates", json=payload)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def _password_device_payload(template_id: str) -> dict:
+    return {
+        "name": f"pw-dev-{uuid.uuid4()}",
+        "template_id": template_id,
+        "topology_type": "PHYSICAL",
+        "status": "AVAILABLE",
+        "field_data": {
+            "ip": "10.0.0.1",
+            "login": "admin",
+            "password": "s3cr3t-pw",
+            "enable_secret": "en@ble",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_admin_get_device_masks_password_fields(client):
+    """A non-admin single-device read masks password-typed values, not the keys."""
+    tid = await _create_password_template(client)
+    created = await client.post("/devices", json=_password_device_payload(tid))
+    assert created.status_code == 201
+    device_id = created.json()["id"]
+
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.devices._resolve_visible_device_ids",
+        new=AsyncMock(return_value={uuid.UUID(device_id)}),
+    ):
+        resp = await client.get(f"/devices/{device_id}")
+    assert resp.status_code == 200
+    fd = resp.json()["field_data"]
+    # Password-typed values are masked; the keys survive so the shape is stable.
+    assert fd["password"] == "********"
+    assert fd["enable_secret"] == "********"
+    assert "password" in fd and "enable_secret" in fd
+    # Non-password fields pass through unchanged.
+    assert fd["ip"] == "10.0.0.1"
+    assert fd["login"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_non_admin_list_devices_masks_password_fields(client):
+    """The list endpoint masks password-typed values across returned devices."""
+    tid = await _create_password_template(client)
+    d1 = (await client.post("/devices", json=_password_device_payload(tid))).json()
+    d2 = (await client.post("/devices", json=_password_device_payload(tid))).json()
+
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.devices._resolve_visible_device_ids",
+        new=AsyncMock(return_value={uuid.UUID(d1["id"]), uuid.UUID(d2["id"])}),
+    ):
+        resp = await client.get("/devices")
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert len(items) >= 2
+    for item in items:
+        fd = item["field_data"]
+        assert fd["password"] == "********"
+        assert fd["enable_secret"] == "********"
+        assert fd["login"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_admin_get_device_returns_password_fields_unmasked(client):
+    """Admins retain the real password values: the device-edit form pre-fills
+    field_data, so masking for admins would overwrite secrets with the sentinel
+    on save. Admin-gated exposure matches the bulk-export policy."""
+    tid = await _create_password_template(client)
+    created = await client.post("/devices", json=_password_device_payload(tid))
+    device_id = created.json()["id"]
+
+    resp = await client.get(f"/devices/{device_id}")
+    assert resp.status_code == 200
+    fd = resp.json()["field_data"]
+    assert fd["password"] == "s3cr3t-pw"
+    assert fd["enable_secret"] == "en@ble"
+
+
+@pytest.mark.asyncio
+async def test_internal_get_device_returns_password_fields_unmasked(client):
+    """The internal-token endpoint returns real password values; the execution
+    service depends on them to provision devices."""
+    tid = await _create_password_template(client)
+    created = await client.post("/devices", json=_password_device_payload(tid))
+    device_id = created.json()["id"]
+
+    resp = await client.get(
+        f"/devices/{device_id}/internal",
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 200
+    fd = resp.json()["field_data"]
+    assert fd["password"] == "s3cr3t-pw"
+    assert fd["enable_secret"] == "en@ble"
+
+
+@pytest.mark.asyncio
+async def test_non_admin_empty_password_value_not_falsely_masked(client):
+    """An unset/empty password value is left as-is so a redacted read never
+    implies a secret exists where none was set."""
+    tid = await _create_password_template(client)
+    payload = _password_device_payload(tid)
+    payload["field_data"]["password"] = ""
+    del payload["field_data"]["enable_secret"]
+    created = await client.post("/devices", json=payload)
+    device_id = created.json()["id"]
+
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.devices._resolve_visible_device_ids",
+        new=AsyncMock(return_value={uuid.UUID(device_id)}),
+    ):
+        resp = await client.get(f"/devices/{device_id}")
+    assert resp.status_code == 200
+    fd = resp.json()["field_data"]
+    assert fd["password"] == ""
+    assert "enable_secret" not in fd
