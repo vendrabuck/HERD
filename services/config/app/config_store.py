@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import secrets
 
 import bcrypt
 
@@ -11,8 +12,6 @@ logger = logging.getLogger(__name__)
 DATA_DIR = os.environ.get("HERD_CONFIG_DATA_DIR", "/data/herd-config")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 AUTH_FILE = os.path.join(DATA_DIR, "config_auth.json")
-
-DEFAULT_PASSWORD = "admin123!"
 
 
 class ConfigAuthError(Exception):
@@ -34,10 +33,35 @@ def _check_password(password: str, hashed: str) -> bool:
 # -- Auth file --
 
 
+def _initial_password() -> tuple[str, bool]:
+    """Resolve the config-page password seeded on first boot.
+
+    Returns (password, changed). An operator-provided CONFIG_ADMIN_PASSWORD is
+    treated as a chosen credential (changed=True, so the write surface is
+    unlocked immediately). Otherwise a random one-time password is generated and
+    logged ONCE at WARNING for the operator to read from the container logs, and
+    marked unrotated (changed=False) so the write/apply surface stays locked
+    until it is changed. A guessable source-visible constant is never used: the
+    previous "admin123!" default let anyone reach the publicly-routed config
+    write surface (issue #256).
+    """
+    env_pw = os.environ.get("CONFIG_ADMIN_PASSWORD", "").strip()
+    if env_pw:
+        return env_pw, True
+    generated = secrets.token_urlsafe(24)
+    logger.warning(
+        "No CONFIG_ADMIN_PASSWORD set; generated a one-time config-page password: %s "
+        "Log in with it and change it; the config write surface is locked until you do.",
+        generated,
+    )
+    return generated, False
+
+
 def _default_auth() -> dict:
+    password, changed = _initial_password()
     return {
-        "password_hash": _hash_password(DEFAULT_PASSWORD),
-        "password_changed": False,
+        "password_hash": _hash_password(password),
+        "password_changed": changed,
     }
 
 

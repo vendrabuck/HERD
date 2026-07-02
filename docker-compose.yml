@@ -35,6 +35,14 @@ services:
       AI_MODEL: ${AI_MODEL:-claude-sonnet-4-6}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Config-page auth (issue #256). CONFIG_ADMIN_PASSWORD, when set, is the
+      # config-UI login password and unlocks the write surface. Unset: a random
+      # one-time password is generated and logged on first boot, and the write
+      # surface stays locked until it is changed. CONFIG_SESSION_SECRET pins the
+      # session-token signing key across replicas (issue #246); unset means a
+      # random per-process key.
+      CONFIG_ADMIN_PASSWORD: ${CONFIG_ADMIN_PASSWORD:-}
+      CONFIG_SESSION_SECRET: ${CONFIG_SESSION_SECRET:-}
     volumes:
       - herd-config:/data/herd-config
       - /var/run/docker.sock:/var/run/docker.sock:ro

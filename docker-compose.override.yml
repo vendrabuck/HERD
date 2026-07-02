@@ -1,6 +1,13 @@
 services:
   config:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # Dev/test/ephemeral stacks pin the config-page password to the historically
+    # documented value so the e2e/integration seed flow can log in and write; it
+    # also marks the surface rotated (unlocked). This override is excluded by
+    # `make prod`, so production falls back to the random one-time password
+    # (issue #256).
+    environment:
+      - CONFIG_ADMIN_PASSWORD=admin123!
     volumes:
       - ./services/config/app:/app/app
       - herd-config:/data/herd-config

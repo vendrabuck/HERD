@@ -143,8 +143,9 @@ cp .env.example .env
 make up        # dev mode: hot-reload + volume mounts
 
 # Open https://localhost, click the wrench icon on the login page,
-# log in with the config password admin123!, change the password, fill
-# out all required fields, and click "Save and Restart".
+# log in with the config password (set CONFIG_ADMIN_PASSWORD, or read the
+# one-time password from `make logs config`), change it, fill out all
+# required fields, and click "Save and Restart".
 ```
 
 **Option B: Configure via .env file**
@@ -300,8 +301,9 @@ make frontend-dev    # Run frontend dev server
 
 ### Config Service
 Standalone configuration UI with zero database dependency. Stores settings as JSON files
-on a shared Docker volume. Password-protected with its own authentication (default:
-admin123!, must be changed on first use). All environment variables from `.env.example`
+on a shared Docker volume. Password-protected with its own authentication (set
+`CONFIG_ADMIN_PASSWORD`, or a random one-time password is generated and logged on first
+boot and must be changed before the write surface unlocks). All environment variables from `.env.example`
 are exposed as configurable fields. On first startup with no config, login is blocked
 until the admin completes setup via the wrench icon on the login page. After saving,
 the service restarts all HERD containers via Docker API. All other services read

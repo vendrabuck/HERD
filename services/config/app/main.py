@@ -90,6 +90,23 @@ async def login(req: LoginRequest):
     }
 
 
+def require_password_rotated(_session: dict = Depends(require_config_session)) -> None:
+    """Gate the powerful config-write surface until the seeded password is rotated.
+
+    Layered on require_config_session: the caller is already authenticated, but a
+    deploy seeded with an auto-generated (unrotated) password must change it
+    before writing config or restarting the stack, so the surface never operates
+    under a seeded credential (issue #256). An operator who set
+    CONFIG_ADMIN_PASSWORD is already rotated and unaffected. Login, reads, and
+    change-password stay open so the operator can clear the lock.
+    """
+    if not is_password_changed():
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Change the config password before modifying or applying configuration",
+        )
+
+
 @app.post("/change-password")
 async def change_password_endpoint(
     req: ChangePasswordRequest,
@@ -122,7 +139,7 @@ async def get_settings(_session: dict = Depends(require_config_session)):
 @app.put("/settings")
 async def update_settings(
     req: SaveSettingsRequest,
-    _session: dict = Depends(require_config_session),
+    _rotated: None = Depends(require_password_rotated),
 ):
     # Merge: if a secret field is "********", keep the existing value
     existing = load_config()
@@ -139,7 +156,7 @@ async def update_settings(
 
 
 @app.post("/apply")
-async def apply_config(_session: dict = Depends(require_config_session)):
+async def apply_config(_rotated: None = Depends(require_password_rotated)):
     if not is_configured():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No configuration to apply")
     result = restart_services()
