@@ -93,11 +93,17 @@ async def exchange_api_token(db: AsyncSession, raw_token: str) -> str | None:
     token.last_used_at = now
     await db.commit()
 
+    # Re-check the principal's CURRENT role at exchange time: the token snapshots
+    # the role at creation, so a since-demoted principal must not keep elevated
+    # access. Clamp to the least-privileged of the token's role and the live role
+    # (min by rank) rather than failing outright, matching least-privilege.
+    effective_role = token.role if not _role_exceeds(token.role, principal.role) else principal.role
+
     payload = {
         "sub": str(principal.id),
         "username": principal.username,
         "email": principal.email,
-        "role": token.role.value,
+        "role": effective_role.value,
         "auth_source": "api_token",
     }
     return create_access_token(payload)
