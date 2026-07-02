@@ -127,6 +127,10 @@ The config page's initial password is the hardcoded default `admin123!`
 (`services/config/app/config_store.py`) and must be changed on first login; there is no
 environment variable for it. Config service auth is separate from HERD JWT.
 
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CONFIG_SESSION_SECRET` | random per process | HMAC key that signs and verifies the short-lived config-session token issued after config login (`services/config/app/auth.py`). If unset, a random secret is generated at process start, so sessions do not survive a config-service restart. Set it to a strong shared value only when you run multiple config replicas and need a session to verify across them. It is never a source-visible constant. |
+
 ## AI orchestrator
 
 The orchestrator supports two backends via `AI_PROVIDER`: `anthropic` (the AsyncAnthropic SDK, against either the hosted Anthropic API with `AI_API_KEY`, or a local Anthropic-compatible endpoint via `AI_BASE_URL` with no key) and `openai_compat` (the AsyncOpenAI SDK against any compatible chat-completions endpoint, including vLLM, Ollama, LM Studio, OpenAI proper, and Azure OpenAI). All three AI endpoints gate on `ai_is_configured()` and return 503 when the active provider is not configured: `anthropic` is configured when either `AI_API_KEY` or `AI_BASE_URL` is set; `openai_compat` needs `AI_BASE_URL`.

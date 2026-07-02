@@ -1,13 +1,31 @@
+import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-# Internal-only signing key for config session tokens.
-# This is not sensitive: the config service is standalone and these tokens
-# only grant access to config endpoints, not to HERD user data.
-_CONFIG_SESSION_SECRET = "herd-config-session-internal-key"
+
+def _load_session_secret() -> str:
+    """Resolve the config-session signing key.
+
+    An operator MAY pin the secret across replicas by setting
+    CONFIG_SESSION_SECRET in the environment. Otherwise a random per-process
+    secret is generated at import time. A hardcoded fallback is deliberately
+    not shipped: the previous constant let anyone forge a valid session from
+    the source-visible value and reach the config write surface. A generated
+    secret does not survive a restart, which matches the intended security
+    property that config sessions are ephemeral.
+    """
+    env_secret = os.environ.get("CONFIG_SESSION_SECRET", "").strip()
+    if env_secret:
+        return env_secret
+    return secrets.token_urlsafe(32)
+
+
+# Signing key for config session tokens. Never a source-visible constant.
+_CONFIG_SESSION_SECRET = _load_session_secret()
 _ALGORITHM = "HS256"
 _EXPIRE_MINUTES = 30
 
