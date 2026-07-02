@@ -140,6 +140,81 @@ async def test_exchange_valid_token_mints_jwt():
 
 
 @pytest.mark.asyncio
+async def test_exchange_clamps_role_when_principal_demoted():
+    # An admin-role token for an admin principal, then the principal is demoted.
+    principal = await _make_user(Role.ADMIN, username="demoted")
+    async with TestSessionLocal() as session:
+        _, raw = await create_api_token(
+            session,
+            name="admin-bot",
+            principal=principal,
+            role=Role.ADMIN,
+            expires_at=None,
+            created_by=None,
+        )
+
+    # Demote the owning principal to a plain user after the token was minted.
+    async with TestSessionLocal() as session:
+        from sqlalchemy import update
+
+        await session.execute(update(User).where(User.id == principal.id).values(role=Role.USER))
+        await session.commit()
+
+    async with TestSessionLocal() as session:
+        jwt_str = await exchange_api_token(session, raw)
+
+    assert jwt_str is not None
+    payload = verify_access_token(jwt_str)
+    # The minted JWT carries the clamped (current) role, not the snapshotted admin role.
+    assert payload["role"] == Role.USER.value
+
+
+@pytest.mark.asyncio
+async def test_exchange_role_unchanged_when_principal_role_unchanged():
+    # The normal case: the principal's role is unchanged, so the token role stands.
+    principal = await _make_user(Role.ADMIN, username="steady")
+    async with TestSessionLocal() as session:
+        _, raw = await create_api_token(
+            session,
+            name="admin-bot",
+            principal=principal,
+            role=Role.ADMIN,
+            expires_at=None,
+            created_by=None,
+        )
+
+    async with TestSessionLocal() as session:
+        jwt_str = await exchange_api_token(session, raw)
+
+    assert jwt_str is not None
+    payload = verify_access_token(jwt_str)
+    assert payload["role"] == Role.ADMIN.value
+
+
+@pytest.mark.asyncio
+async def test_exchange_keeps_lower_token_role_below_principal():
+    # The clamp is min, not "principal's role": a token whose role is lower than
+    # the principal's current role still mints the token's lower role.
+    principal = await _make_user(Role.ADMIN, username="lowertoken")
+    async with TestSessionLocal() as session:
+        _, raw = await create_api_token(
+            session,
+            name="user-bot",
+            principal=principal,
+            role=Role.USER,
+            expires_at=None,
+            created_by=None,
+        )
+
+    async with TestSessionLocal() as session:
+        jwt_str = await exchange_api_token(session, raw)
+
+    assert jwt_str is not None
+    payload = verify_access_token(jwt_str)
+    assert payload["role"] == Role.USER.value
+
+
+@pytest.mark.asyncio
 async def test_exchange_sets_last_used_at():
     principal = await _make_user(Role.USER, username="lastused")
     async with TestSessionLocal() as session:
