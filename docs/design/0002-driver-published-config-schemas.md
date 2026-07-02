@@ -18,7 +18,7 @@ must define class `Driver`), optional `driver_metadata.json`, optional
 `requirements.txt`, optional `lib/`/`_deps/` (`docs/DRIVERS.md:26-39`). Methods
 are per-connection-type: L1 (`login/logout/connect_ports/disconnect_ports/status`),
 L2 (`login/logout/create_vlan/add_to_vlan/remove_from_vlan/delete_vlan/status`),
-L3 planned, Management (`login/logout/configure/backup/status`)
+L3 (`login/logout/configure_route/remove_route/status`), Management (`login/logout/configure/backup/status`)
 (`docs/DRIVERS.md:14-19`, class sketches at `:140-219`, `:448-537`, `:601-609`).
 
 All current methods are instance methods taking `self` plus per-call args;
