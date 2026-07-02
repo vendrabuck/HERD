@@ -914,6 +914,20 @@ X-Internal-Token: <internal-api-token>
 Returns the resolved `poll_interval_seconds` per device for the execution
 service's health-poll scheduler to refresh from. Internal-token only.
 
+### Latest device config version (internal)
+
+```
+GET /api/inventory/devices/{device_id}/config-versions/latest/internal
+X-Internal-Token: <internal-api-token>
+```
+
+Returns the device's newest config version (highest `version_number`) with its
+full config payload. Used by the execution service's NATS consumer to read the
+`routes` array of a Layer 3 switch at reservation provisioning time; the
+consumer has no acting user, so it cannot use the JWT-gated config-version
+endpoints. Returns 404 when the device is unknown or has no config versions.
+Internal-token only.
+
 ### List admin user-ids (internal)
 
 ```

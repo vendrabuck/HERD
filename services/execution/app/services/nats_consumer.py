@@ -191,27 +191,56 @@ async def _fetch_template(template_id: str, client=None) -> dict | None:
         return resp.json()
 
 
+async def _fetch_latest_config(device_id: str, client=None) -> dict | None:
+    """Fetch a device's latest config version from the inventory service.
+
+    Feeds L3 route provisioning (issue #20): the consumer has no acting user,
+    so it reads the X-Internal-Token endpoint added for this purpose. Raises
+    TransientUpstreamError on a 5xx or transport error so the message NAKs and
+    retries; a non-200 below 500 (no versions, unknown device) returns None,
+    which the caller treats as "no routes to provision".
+
+    When `client` is provided it is reused (per-event connection pooling, issue
+    #137); when None a fresh client is opened for this one call as before.
+    """
+    url = f"{settings.inventory_service_url}/devices/{device_id}/config-versions/latest/internal"
+    async with _client_ctx(client) as c:
+        resp = await _get_internal(
+            c,
+            url,
+            what=f"fetch latest config for device {device_id}",
+            headers={"X-Internal-Token": settings.internal_api_token},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+
+
 class _FetchContext:
     """Per-event fetch context: one shared httpx client plus memoization caches.
 
-    Created once per reservation lifecycle event (issue #137) so the L1 and L2
-    resolver passes (and the later execution phase) reuse a single connection
-    pool and never re-fetch the same device's connections or the same far-end
-    device twice. This is a performance critical optimization: dense topologies
-    can have many connections, and without memoization each connection's
-    far-end device would be fetched N times. The caches map:
+    Created once per reservation lifecycle event (issue #137) so the L1, L2,
+    and L3 resolver passes (and the later execution phase) reuse a single
+    connection pool and never re-fetch the same device's connections or the
+    same far-end device twice. This is a performance critical optimization:
+    dense topologies can have many connections, and without memoization each
+    connection's far-end device would be fetched N times. The caches map:
       - conn_cache:   device_id -> list[connection dict]
       - device_cache: device_id -> device dict | None
+      - config_cache: device_id -> latest config version dict | None
 
-    A None entry in device_cache is a real cached "not found" (404), so a
-    missing far end is classified at most once per event. The client is owned
-    by the caller (handle_reservation_event); these helpers never close it.
+    A None entry in device_cache or config_cache is a real cached "not found"
+    (404), so a missing far end or config is classified at most once per
+    event. The client is owned by the caller (handle_reservation_event); these
+    helpers never close it.
     """
 
     def __init__(self, client):
         self._client = client
         self._conn_cache: dict[str, list[dict]] = {}
         self._device_cache: dict[str, dict | None] = {}
+        self._config_cache: dict[str, dict | None] = {}
 
     @property
     def client(self):
@@ -230,6 +259,12 @@ class _FetchContext:
         if device_id not in self._device_cache:
             self._device_cache[device_id] = await _fetch_device(device_id, self._client)
         return self._device_cache[device_id]
+
+    async def get_latest_config(self, device_id: str) -> dict | None:
+        """Return a device's latest config version, fetching at most once per event."""
+        if device_id not in self._config_cache:
+            self._config_cache[device_id] = await _fetch_latest_config(device_id, self._client)
+        return self._config_cache[device_id]
 
 
 async def _resolve_l1_switch_operations(
@@ -806,6 +841,382 @@ L2_EVENT_ACTIONS = {
 }
 
 
+async def _resolve_l3_switch_operations(
+    device_ids: list[str],
+    ctx: "_FetchContext | None" = None,
+) -> list[str]:
+    """Resolve which L3 switches serve a set of reserved devices.
+
+    Returns a deduplicated list of L3 switch device ids: a switch participates
+    in a reservation iff a cabling connection links a reserved device to it,
+    the same adjacency rule L1 and L2 use. Unlike L1/L2 no port names are
+    collected; the routes an L3 switch applies come from its own latest config
+    version, not from the topology edge (issue #20).
+
+    `ctx` carries the per-event shared client and memoization caches (issue
+    #137). When None (e.g. a direct unit-test call) a throwaway context with no
+    shared client is used, so connections/devices are fetched per call as before.
+    """
+    if ctx is None:
+        ctx = _FetchContext(None)
+    switches: list[str] = []
+    seen: set[str] = set()
+
+    for device_id in device_ids:
+        connections = await ctx.get_connections(device_id)
+        for conn in connections:
+            if str(conn.get("device_a_id")) == device_id:
+                other_device_id = str(conn.get("device_b_id"))
+            elif str(conn.get("device_b_id")) == device_id:
+                other_device_id = str(conn.get("device_a_id"))
+            else:
+                continue
+
+            if other_device_id in seen:
+                continue
+            other_device = await ctx.get_device(other_device_id)
+            if not other_device:
+                continue
+            if other_device.get("connection_type") != "Layer 3 Switch":
+                continue
+
+            seen.add(other_device_id)
+            switches.append(other_device_id)
+
+    return switches
+
+
+def _route_run_identity(destination, next_hop, interface) -> tuple[str, str]:
+    """Identity of one route within a switch+action, for the idempotency guard.
+
+    ExecutionRun exposes two free-form columns (port_a/port_b), but a route is
+    uniquely identified by three fields: (destination, next_hop, interface). Two
+    routes to the same prefix out the same interface via different next hops are
+    distinct ECMP paths and must NOT collapse into one guarded action. So
+    destination goes in port_a, and next_hop plus interface are packed into
+    port_b, letting all three fields participate in action_already_succeeded.
+    next_hop may be None (an interface route); it renders as empty.
+    """
+    return destination, f"{interface}|{next_hop or ''}"
+
+
+async def _execute_l3_switch_operations(
+    device_ids: list[str],
+    l3_action: str,
+    reservation_id: str | None,
+    user_id: str,
+    get_db_session,
+    dedupe_key: str | None = None,
+    ctx: "_FetchContext | None" = None,
+    remaining_device_ids: list[str] | None = None,
+) -> None:
+    """Resolve L3 switches for devices and execute route provisioning.
+
+    Provision applies exactly the routes the switch's latest inventory config
+    version declares at the moment of provisioning, pinned in
+    route_assignments; deprovision removes exactly the pinned set and never
+    re-derives from the config (issue #20).
+
+    State ordering differs from the L2 executor on purpose. L2 flips its VLAN
+    assignment to RELEASED before driving the switch because it can fall back
+    to a derived VLAN on redelivery. L3 has no such fallback, so deprovision
+    reads the ACTIVE assignments first, drives the switch, and releases each
+    switch's pin only AFTER that switch's routes were all removed cleanly. A
+    TransientUpstreamError propagates and NAKs (the rows stay ACTIVE for the
+    redelivery, whose per-route dedupe guards skip the removals that already
+    succeeded). A driver-result failure (remove_route returns success=False,
+    e.g. the switch is unreachable) does NOT raise and the message is ACKed, so
+    that switch's pin is deliberately kept ACTIVE rather than released: an
+    ACTIVE pin means "routes may still be installed", which stays accurate for
+    the stranded-teardown cleanup path (issue #244). Releasing it would falsely
+    record removal.
+
+    Args:
+        device_ids: devices to resolve switch adjacency for
+        l3_action: "provision" (configure_route per pinned route) or
+            "deprovision" (remove_route per pinned route)
+        reservation_id: reservation UUID string
+        user_id: user UUID string
+        get_db_session: async context manager that yields an AsyncSession
+        dedupe_key: source-message key; a route action whose SUCCESS run
+            already carries it is skipped on redelivery (issue #133).
+        ctx: per-event fetch context (shared client + caches, issue #137).
+        remaining_device_ids: only for the reservation.updated removal path;
+            the post-edit device set. A switch is deprovisioned only when it is
+            no longer adjacent to any of these devices, so a switch still
+            serving the reservation keeps its routes.
+    """
+    if not reservation_id:
+        logger.warning("No reservation_id for L3 operations, skipping")
+        return
+
+    if ctx is None:
+        ctx = _FetchContext(None)
+
+    from app.services.route_service import (
+        assign_routes,
+        get_pinned_routes,
+        get_route_assignments,
+        release_routes_for_device,
+    )
+
+    # Build the per-switch route work. For provision the routes come from the
+    # pinned assignment (created here on first delivery); for deprovision they
+    # come exclusively from the stored ACTIVE assignments.
+    switch_routes: dict[str, list[dict]] = {}
+
+    if l3_action == "provision":
+        switch_ids = await _resolve_l3_switch_operations(device_ids, ctx)
+        if not switch_ids:
+            logger.info("No L3 switch operations needed for reservation %s", reservation_id)
+            return
+        async with get_db_session() as db:
+            for sid in switch_ids:
+                pinned = await get_pinned_routes(db, reservation_id, sid)
+                if pinned is None:
+                    detail = await ctx.get_latest_config(sid)
+                    fetched = ((detail or {}).get("config") or {}).get("routes") or []
+                    if not fetched:
+                        logger.info(
+                            "L3 switch %s has no routes in its latest config version; "
+                            "skipping for reservation %s",
+                            sid,
+                            reservation_id,
+                        )
+                        continue
+                    pinned = await assign_routes(db, reservation_id, sid, fetched)
+                if pinned:
+                    switch_routes[sid] = pinned
+    else:
+        async with get_db_session() as db:
+            assignments = await get_route_assignments(db, reservation_id)
+        if remaining_device_ids is not None:
+            # reservation.updated removal: deprovision only the switches that no
+            # longer serve any remaining reserved device.
+            removed_switches = set(await _resolve_l3_switch_operations(device_ids, ctx))
+            still_serving = set(await _resolve_l3_switch_operations(remaining_device_ids, ctx))
+            departing = removed_switches - still_serving
+            assignments = [a for a in assignments if str(a.device_id) in departing]
+        for a in assignments:
+            switch_routes[str(a.device_id)] = a.routes
+
+    if not switch_routes:
+        logger.info("No L3 switch operations needed for reservation %s", reservation_id)
+        return
+
+    from datetime import datetime, timezone
+
+    from app.services.driver_loader import load_driver
+    from app.services.driver_sandbox import execute_driver_method
+    from app.services.execution_service import (
+        action_already_succeeded,
+        build_context,
+        create_execution_run,
+        extract_password_keys,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+
+    method = "configure_route" if l3_action == "provision" else "remove_route"
+
+    # Deprovision releases a switch's pin only after all its routes were removed
+    # cleanly; a switch that failed to load, failed login, or had any FAILED
+    # remove_route keeps its ACTIVE pin (see docstring). Skipped-already-removed
+    # routes on redelivery count as clean.
+    cleanly_removed: set[str] = set()
+
+    for switch_id, routes in switch_routes.items():
+        switch_data = await ctx.get_device(switch_id)
+        if not switch_data:
+            logger.error("L3 switch %s not found", switch_id)
+            continue
+
+        template_data = await _fetch_template(switch_data.get("template_id", ""), ctx.client)
+        if not template_data:
+            logger.error("Template for L3 switch %s not found", switch_id)
+            continue
+
+        switch_uuid = uuid.UUID(switch_id)
+        user_uuid = uuid.UUID(user_id)
+        res_uuid = uuid.UUID(reservation_id)
+
+        context = build_context(switch_data, switch_uuid, user_uuid, res_uuid)
+        password_keys = extract_password_keys(template_data)
+        redacted = redact_context_for_logging(context, password_keys)
+
+        driver_id = uuid.UUID(switch_data["driver_id"])
+        driver_sha256 = switch_data.get("driver_sha256", "unknown")
+        driver_filename = switch_data.get("driver_filename", "driver.zip")
+        connection_type = switch_data.get("connection_type", "Layer 3 Switch")
+
+        async with get_db_session() as db:
+            try:
+                driver_path = await load_driver(
+                    db, driver_id, driver_sha256, driver_filename, connection_type
+                )
+            except Exception as e:
+                logger.error("Failed to load driver for L3 switch %s: %s", switch_id, e)
+                continue
+
+            # Login
+            login_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "login",
+                user_uuid,
+                redacted,
+                res_uuid,
+                dedupe_key=dedupe_key,
+            )
+            started = datetime.now(timezone.utc)
+            login_result = execute_driver_method(
+                driver_path, "login", context, password_keys=password_keys
+            )
+            if login_result["success"]:
+                await update_execution_run(
+                    db,
+                    login_run,
+                    "SUCCESS",
+                    output=json.dumps(login_result["output"], default=str),
+                    started_at=started,
+                    completed_at=datetime.now(timezone.utc),
+                    duration_ms=login_result["duration_ms"],
+                )
+            else:
+                await update_execution_run(
+                    db,
+                    login_run,
+                    "FAILED",
+                    error=login_result.get("error"),
+                    started_at=started,
+                    completed_at=datetime.now(timezone.utc),
+                    duration_ms=login_result["duration_ms"],
+                )
+                logger.error("Login failed for L3 switch %s, skipping route operations", switch_id)
+                continue
+
+            # One configure_route/remove_route per pinned route, each guarded so
+            # a redelivered message only retries the routes that did not succeed.
+            # The guard identity is (destination, next_hop, interface) packed
+            # into the port_a/port_b columns by _route_run_identity, so ECMP
+            # siblings (same prefix + interface, different next hop) stay
+            # distinct instead of collapsing into one guarded action.
+            switch_routes_ok = True
+            for route in routes:
+                destination = route.get("destination")
+                next_hop = route.get("next_hop")
+                interface = route.get("interface")
+                ident_a, ident_b = _route_run_identity(destination, next_hop, interface)
+                if await action_already_succeeded(
+                    db, dedupe_key, switch_uuid, method, ident_a, ident_b
+                ):
+                    logger.info(
+                        "Skipping already-applied %s on switch %s route %s via %s; "
+                        "idempotent replay",
+                        method,
+                        switch_id,
+                        destination,
+                        interface,
+                    )
+                    continue
+                route_kwargs = {
+                    "destination": destination,
+                    "next_hop": next_hop,
+                    "interface": interface,
+                }
+                run = await create_execution_run(
+                    db,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    method,
+                    user_uuid,
+                    redacted,
+                    res_uuid,
+                    ident_a,
+                    ident_b,
+                    method_kwargs=route_kwargs,
+                    dedupe_key=dedupe_key,
+                )
+                op_started = datetime.now(timezone.utc)
+                result = execute_driver_method(
+                    driver_path,
+                    method,
+                    context,
+                    method_kwargs=route_kwargs,
+                    password_keys=password_keys,
+                )
+                status = "SUCCESS" if result["success"] else "FAILED"
+                if not result["success"]:
+                    switch_routes_ok = False
+                await update_execution_run(
+                    db,
+                    run,
+                    status,
+                    output=json.dumps(result["output"], default=str)
+                    if result.get("output")
+                    else None,
+                    error=result.get("error"),
+                    started_at=op_started,
+                    completed_at=datetime.now(timezone.utc),
+                    duration_ms=result["duration_ms"],
+                )
+
+            if l3_action == "deprovision" and switch_routes_ok:
+                cleanly_removed.add(switch_id)
+
+            # Logout
+            logout_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "logout",
+                user_uuid,
+                redacted,
+                res_uuid,
+                dedupe_key=dedupe_key,
+            )
+            logout_started = datetime.now(timezone.utc)
+            logout_result = execute_driver_method(
+                driver_path, "logout", context, password_keys=password_keys
+            )
+            status = "SUCCESS" if logout_result["success"] else "FAILED"
+            await update_execution_run(
+                db,
+                logout_run,
+                status,
+                output=(
+                    json.dumps(logout_result["output"], default=str)
+                    if logout_result.get("output")
+                    else None
+                ),
+                error=logout_result.get("error"),
+                started_at=logout_started,
+                completed_at=datetime.now(timezone.utc),
+                duration_ms=logout_result["duration_ms"],
+            )
+
+    # Release LAST, and only for switches whose routes were all removed cleanly
+    # (see docstring). A transient failure has already raised and NAKed; a
+    # driver-result failure leaves that switch out of cleanly_removed so its pin
+    # stays ACTIVE as an accurate "routes may still be installed" record.
+    if l3_action == "deprovision" and cleanly_removed:
+        async with get_db_session() as db:
+            for sid in cleanly_removed:
+                await release_routes_for_device(db, reservation_id, sid)
+
+
+# Map NATS events to L3 actions
+L3_EVENT_ACTIONS = {
+    "reservation.created": "provision",
+    "reservation.cancelled": "deprovision",
+    "reservation.completed": "deprovision",
+}
+
+
 async def _execute_switch_operations(
     device_ids: list[str],
     action: str,
@@ -1089,6 +1500,15 @@ async def handle_reservation_event(
                     dedupe_key,
                     ctx,
                 )
+                await _execute_l3_switch_operations(
+                    added_ids,
+                    "provision",
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    dedupe_key,
+                    ctx,
+                )
             if removed_ids:
                 await _execute_switch_operations(
                     removed_ids,
@@ -1108,6 +1528,19 @@ async def handle_reservation_event(
                     dedupe_key,
                     ctx,
                 )
+                # L3 deprovision on edit is adjacency-aware: a switch still
+                # serving a remaining device keeps its routes, so pass the
+                # post-edit device set for the still-serving check.
+                await _execute_l3_switch_operations(
+                    removed_ids,
+                    "deprovision",
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    dedupe_key,
+                    ctx,
+                    remaining_device_ids=event_data.get("device_ids", []),
+                )
         else:
             device_ids = event_data.get("device_ids", [])
             await _execute_switch_operations(
@@ -1118,6 +1551,12 @@ async def handle_reservation_event(
             if l2_action:
                 await _execute_l2_switch_operations(
                     device_ids, l2_action, reservation_id, user_id, get_db_session, dedupe_key, ctx
+                )
+            # L3 switch operations
+            l3_action = L3_EVENT_ACTIONS.get(event_type)
+            if l3_action:
+                await _execute_l3_switch_operations(
+                    device_ids, l3_action, reservation_id, user_id, get_db_session, dedupe_key, ctx
                 )
 
     logger.info(

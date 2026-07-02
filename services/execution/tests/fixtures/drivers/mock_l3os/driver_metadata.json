@@ -1,0 +1,7 @@
+{
+  "supports_dry_run": true,
+  "version": "1.0",
+  "vendor": "MockFRR",
+  "model": "MockRouter-7000",
+  "notes": "Test fixture; uses an in-process MockTransport recorder, never opens a real socket. Used by services/execution/tests/test_golden_transcripts.py to pin CLI output."
+}

@@ -189,6 +189,39 @@ async def diff_config_versions(
 
 
 @router.get(
+    "/devices/{device_id}/config-versions/latest/internal",
+    response_model=DeviceConfigVersionDetail,
+)
+async def get_latest_config_version_internal(
+    device_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Get a device's latest config version. Internal service-to-service endpoint.
+
+    Serves the execution service's L3 route provisioning (issue #20): the NATS
+    consumer has no acting user, so it cannot call the JWT-gated config-version
+    endpoints. Latest means highest version_number, deliberately NOT the
+    current_config_version_id pointer, which tracks what a configure action
+    last applied rather than the newest validated intent.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    await _load_device(db, device_id)
+    version = (
+        await db.execute(
+            select(DeviceConfigVersion)
+            .where(DeviceConfigVersion.device_id == device_id)
+            .order_by(DeviceConfigVersion.version_number.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if version is None:
+        raise HTTPException(status_code=404, detail="No config versions for device")
+    return DeviceConfigVersionDetail.model_validate(version)
+
+
+@router.get(
     "/devices/{device_id}/config-versions/{version_id}",
     response_model=DeviceConfigVersionDetail,
 )

@@ -15,11 +15,11 @@ driver.
 |---|---|---|
 | Layer 1 Switch | Physical port cross-connect | login, logout, connect_ports, disconnect_ports, status |
 | Layer 2 Switch | VLAN management | login, logout, create_vlan, add_to_vlan, remove_from_vlan, delete_vlan, status |
-| Layer 3 Switch | Routing management (future) | login, logout, configure_route, remove_route, status |
+| Layer 3 Switch | Static route provisioning | login, logout, configure_route, remove_route, status |
 | Management | DUT session management | login, logout, configure, backup, status |
 
-Layer 1 Switch, Layer 2 Switch, and Management contracts are implemented.
-Layer 3 Switch is documented here as a planned interface.
+All four contracts are implemented and invoked by the execution service at
+reservation lifecycle events.
 
 ---
 
@@ -590,17 +590,135 @@ to the driver.
 
 ---
 
-## Future: Layer 3 Switch contract (planned)
+## Layer 3 Switch driver contract
+
+Layer 3 switches provide routed forwarding between reserved segments. The execution
+service calls L3 drivers when reservations are created or ended, installing or removing
+the static routes the switch's stored configuration declares.
+
+### Class definition
 
 ```python
 class Driver:
-    def __init__(self, context: dict): ...
-    def login(self) -> dict: ...
-    def logout(self) -> dict: ...
-    def configure_route(self, destination: str, next_hop: str, interface: str) -> dict: ...
-    def remove_route(self, destination: str, next_hop: str, interface: str) -> dict: ...
-    def status(self) -> dict: ...
+    """Layer 3 Switch driver.
+
+    The execution service instantiates this class once per operation batch,
+    passing all device parameters and execution metadata in the context dict.
+    """
+
+    def __init__(self, context: dict):
+        self.context = context
+
+    def login(self) -> dict:
+        """Establish a session with the switch.
+
+        Returns:
+            dict with at minimum {"success": bool}.
+        """
+        ...
+
+    def logout(self) -> dict:
+        """Tear down the session with the switch.
+
+        Returns:
+            dict with at minimum {"success": bool}.
+        """
+        ...
+
+    def configure_route(self, destination: str, next_hop: str | None, interface: str) -> dict:
+        """Install one static route.
+
+        Called once per route during provisioning.
+
+        Args:
+            destination: destination prefix (e.g. "10.0.0.0/24")
+            next_hop: next-hop address, or None for an interface route
+            interface: the switch's own egress interface name
+
+        Returns:
+            dict with at minimum {"success": bool}.
+        """
+        ...
+
+    def remove_route(self, destination: str, next_hop: str | None, interface: str) -> dict:
+        """Remove one static route.
+
+        Called once per route during deprovisioning, with exactly the values
+        the matching configure_route call received.
+
+        Args:
+            destination: destination prefix
+            next_hop: next-hop address, or None for an interface route
+            interface: the switch's own egress interface name
+
+        Returns:
+            dict with at minimum {"success": bool}.
+        """
+        ...
+
+    def status(self) -> dict:
+        """Health check: verify the switch is reachable.
+
+        Returns:
+            dict with at minimum {"reachable": bool}.
+        """
+        ...
 ```
+
+### When methods are called
+
+| Event | Sequence |
+|---|---|
+| Reservation created (DUTs connected through L3 switch) | login(), configure_route(destination, next_hop, interface) for each route, logout() |
+| Reservation cancelled or completed | login(), remove_route(destination, next_hop, interface) for each route, logout() |
+| Device added to HERD or admin health check | login(), status(), logout() |
+
+When multiple reserved devices connect through the same L3 switch, the execution service
+batches them: one login/logout wrapping all per-route calls for that switch.
+
+### Route derivation
+
+An L3 switch participates in a reservation when a cabling connection links a reserved
+device to it, the same adjacency rule L1 and L2 use. The routes themselves do NOT come
+from the topology edge: they are the `routes` array of the switch's latest inventory
+config version (the vendor-neutral "Layer 3 Switch" schema; see the AI-config schema
+section). A switch with no config version, or whose latest config declares no routes,
+is skipped without error.
+
+At provision time the execution service pins the exact route list in its
+`route_assignments` state, and deprovision removes exactly that pinned set. A config
+version written mid-reservation therefore never changes what gets removed: remove_route
+always receives the same values configure_route received. There is no fallback
+re-derivation; if no pinned assignment exists at deprovision time the switch is skipped
+with a log line.
+
+A route's `next_hop` is optional in the config schema. When omitted, the driver receives
+`next_hop=None` and should install an interface route.
+
+### Interface identity
+
+The interface argument is the L3 switch's own interface name (as stored in the switch's
+config version), not a DUT-side name, consistent with the switch-side identity rule for
+L1 and L2 ports.
+
+### Optional configure support
+
+`configure(**config)` is not part of the required L3 method set, but inventory apply
+jobs and the AI dry-run-then-confirm flow invoke `configure`. An L3 driver that should
+also accept full config pushes through those paths must implement it; the checked-in
+`drivers/mock_l3` package is the worked example.
+
+---
+
+## Return values (Layer 3)
+
+| Method | Required keys |
+|---|---|
+| login | `{"success": bool}` |
+| logout | `{"success": bool}` |
+| configure_route | `{"success": bool}` |
+| remove_route | `{"success": bool}` |
+| status | `{"reachable": bool}` |
 
 ## Management driver contract
 
