@@ -110,6 +110,10 @@
     ],
     [
       "GET",
+      "/devices/{device_id}/config-versions/latest/internal"
+    ],
+    [
+      "GET",
       "/devices/{device_id}/config-versions/{version_id}"
     ],
     [

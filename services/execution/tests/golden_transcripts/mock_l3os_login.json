@@ -1,0 +1,20 @@
+{
+  "driver": "mock_l3os",
+  "action": "login",
+  "method_kwargs": {},
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "enable",
+      "response": "ok",
+      "exit_status": "ok"
+    },
+    {
+      "seq": 2,
+      "command": "configure terminal",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

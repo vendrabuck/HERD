@@ -67,6 +67,12 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Conflict detection** (Shipped): time-window conflict checks for exclusive devices.
 - **Automatic expiration** (Shipped): pending reservations activate and active
   reservations complete on schedule.
+- **Automatic infrastructure provisioning** (Shipped): reservation lifecycle events
+  drive the connected infrastructure through drivers: Layer 1 port cross-connects,
+  Layer 2 VLAN creation and membership (fabric-aware, conflict-free VLAN ids), and
+  Layer 3 static routes taken from the switch's latest config version, pinned at
+  provision time so teardown removes exactly what was applied. Deprovisioning runs
+  on cancel or completion.
 - **Live editing** (Shipped): modify device lists, extend end times, and update
   purpose on an active reservation.
 - **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,

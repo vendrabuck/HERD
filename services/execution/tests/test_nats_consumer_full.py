@@ -294,9 +294,13 @@ def _event_patches(execute_fn=None, load_driver_fn=None, fetch_device_fn=None, o
         ),
         patch("app.services.driver_loader.load_driver", new=load_driver_fn),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
-        # Mock L2 operations to avoid HTTP calls in L1-focused tests
+        # Mock L2 and L3 operations to avoid HTTP calls in L1-focused tests
         patch(
             "app.services.nats_consumer._execute_l2_switch_operations",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.services.nats_consumer._execute_l3_switch_operations",
             new=AsyncMock(),
         ),
     ]

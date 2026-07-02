@@ -182,6 +182,19 @@ def test_validate_l1_driver_against_l2_type():
     assert any("delete_vlan" in e for e in errors)
 
 
+def test_validate_l1_driver_against_l3_type():
+    """An L3 package missing configure_route/remove_route is rejected with a
+    clear missing-required-method error (issue #20 acceptance criterion)."""
+    zip_bytes = _make_zip(VALID_L1_DRIVER)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest = Path(tmpdir) / "driver"
+        extract_driver_package(zip_bytes, "test.zip", dest)
+        errors = validate_driver(dest, "Layer 3 Switch")
+    assert len(errors) == 2
+    assert any("configure_route" in e for e in errors)
+    assert any("remove_route" in e for e in errors)
+
+
 def test_required_methods_dict_completeness():
     """All connection types have required methods defined."""
     assert "Layer 1 Switch" in REQUIRED_METHODS

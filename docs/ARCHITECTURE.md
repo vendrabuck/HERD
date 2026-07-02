@@ -72,9 +72,9 @@ Two source streams carry live work, plus a dedicated `HERD_DLQ` stream that reta
 **`HERD_RESERVATIONS`** carries `herd.reservations.*` subjects. The reservations service publishes `reservation.created`, `reservation.updated`, `reservation.cancelled`, `reservation.completed`, `reservation.failed`, and `reservation.expiring_soon`. Three services consume them with independent durable consumers:
 
 - **execution** (`execution-consumer`) triggers driver actions:
-  - `reservation.created`: L1 connect_ports per switch; L2 create_vlan + add_to_vlan for each DUT port connected to an L2 switch.
-  - `reservation.cancelled / completed`: L1 disconnect_ports; L2 remove_from_vlan + delete_vlan.
-  - `reservation.updated`: L1 update_ports for added/removed devices.
+  - `reservation.created`: L1 connect_ports per switch; L2 create_vlan + add_to_vlan for each DUT port connected to an L2 switch; L3 configure_route for each route in an adjacent L3 switch's latest config version, with the applied set pinned in `route_assignments`.
+  - `reservation.cancelled / completed`: L1 disconnect_ports; L2 remove_from_vlan + delete_vlan; L3 remove_route for exactly the pinned route set (never re-derived from the config), released only after the driver ran.
+  - `reservation.updated`: L1 update_ports for added/removed devices; L2 provision/deprovision for added/removed devices; L3 provisions added adjacency and deprovisions a switch only when it no longer serves any remaining reserved device.
   - Idempotent on redelivery: each mutating driver action records a stable `dedupe_key` on its `execution_runs` row, and the consumer skips any action whose `SUCCESS` run already carries that key. The key is the producer-stamped payload `event_id` (the outbox row id, issue #21), which survives a relay republish under a new stream sequence, falling back to the source message's NATS `stream:sequence` for events published before the outbox existed. A NAK retry re-runs only the action that failed, never the ones that already applied (`login`/`logout` are not deduped).
 - **notifications** (`notifications-consumer`) turns the same events into per-user in-app notifications, gated by the user's `extras.notifications` preferences in user-profile.
 - **integration** (`integration-webhooks-consumer`) fans each event out to admin-registered outbound webhooks as HMAC-signed POSTs, with a delivery ledger and dead-letter record (issue #33); see the integration-service section below.

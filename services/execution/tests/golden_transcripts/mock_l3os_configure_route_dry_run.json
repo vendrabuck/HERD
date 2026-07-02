@@ -1,0 +1,18 @@
+{
+  "driver": "mock_l3os",
+  "action": "configure_route",
+  "method_kwargs": {
+    "destination": "10.0.0.0/24",
+    "next_hop": "192.168.1.1",
+    "interface": "eth0"
+  },
+  "dry_run": true,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "ip route 10.0.0.0/24 192.168.1.1 eth0",
+      "response": "(simulated)",
+      "exit_status": "simulated"
+    }
+  ]
+}

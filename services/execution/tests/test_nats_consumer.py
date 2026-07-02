@@ -25,6 +25,21 @@ from app.services.nats_consumer import (
     process_reservation_message,
 )
 
+
+@pytest.fixture(autouse=True)
+def _mock_l3_executor():
+    """Keep this module focused on L1/L2: the L3 executor added by issue #20
+    would otherwise run inside every handle_reservation_event test here and
+    attempt real HTTP fetches. L3 behavior has its own suite in
+    test_nats_consumer_l3.py.
+    """
+    with patch(
+        "app.services.nats_consumer._execute_l3_switch_operations",
+        new_callable=AsyncMock,
+    ):
+        yield
+
+
 # --- EVENT_ACTIONS mapping ---
 
 

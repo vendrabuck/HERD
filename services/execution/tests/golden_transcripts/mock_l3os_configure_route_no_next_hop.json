@@ -1,0 +1,18 @@
+{
+  "driver": "mock_l3os",
+  "action": "configure_route",
+  "method_kwargs": {
+    "destination": "10.1.0.0/24",
+    "next_hop": null,
+    "interface": "eth1"
+  },
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "ip route 10.1.0.0/24 eth1",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}

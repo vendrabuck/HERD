@@ -3,6 +3,7 @@ from app.models.driver_cache import DriverCache
 from app.models.execution_command import ExecutionCommand
 from app.models.execution_run import ExecutionRun
 from app.models.outbox import OutboxEvent
+from app.models.route_assignment import RouteAssignment
 from app.models.vlan_assignment import VlanAssignment
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "ExecutionCommand",
     "ExecutionRun",
     "OutboxEvent",
+    "RouteAssignment",
     "VlanAssignment",
 ]

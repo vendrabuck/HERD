@@ -863,3 +863,64 @@ async def test_restore_re_validates_against_published_schema(client):
             json={},
         )
     assert restore.status_code == 422
+
+
+# --- GET /devices/{id}/config-versions/latest/internal (issue #20) ---
+
+
+@pytest.mark.asyncio
+async def test_latest_internal_returns_highest_version(client):
+    """The internal endpoint serves the newest version with its full config."""
+    device_id = await _create_device(client)
+    for i in range(3):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions",
+            json={"config": {"vlan": 100 + i}},
+        )
+        assert resp.status_code == 201
+
+    resp = await client.get(
+        f"/devices/{device_id}/config-versions/latest/internal",
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["version_number"] == 3
+    assert data["config"] == {"vlan": 102}
+
+
+@pytest.mark.asyncio
+async def test_latest_internal_bad_token(client):
+    device_id = await _create_device(client)
+    resp = await client.get(
+        f"/devices/{device_id}/config-versions/latest/internal",
+        headers={"X-Internal-Token": "wrong"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_latest_internal_missing_token(client):
+    device_id = await _create_device(client)
+    resp = await client.get(f"/devices/{device_id}/config-versions/latest/internal")
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_latest_internal_no_versions_404(client):
+    device_id = await _create_device(client)
+    resp = await client.get(
+        f"/devices/{device_id}/config-versions/latest/internal",
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 404
+    assert "No config versions" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_latest_internal_unknown_device_404(client):
+    resp = await client.get(
+        f"/devices/{uuid.uuid4()}/config-versions/latest/internal",
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 404

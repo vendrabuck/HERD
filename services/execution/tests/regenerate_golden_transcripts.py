@@ -109,6 +109,71 @@ CASES = [
         "method_kwargs": {},
         "dry_run": False,
     },
+    {
+        "id": "mock_l3os_login",
+        "driver": "mock_l3os",
+        "action": "login",
+        "method_kwargs": {},
+        "dry_run": False,
+    },
+    {
+        "id": "mock_l3os_logout",
+        "driver": "mock_l3os",
+        "action": "logout",
+        "method_kwargs": {},
+        "dry_run": False,
+    },
+    {
+        "id": "mock_l3os_configure_route",
+        "driver": "mock_l3os",
+        "action": "configure_route",
+        "method_kwargs": {
+            "destination": "10.0.0.0/24",
+            "next_hop": "192.168.1.1",
+            "interface": "eth0",
+        },
+        "dry_run": False,
+    },
+    {
+        "id": "mock_l3os_configure_route_no_next_hop",
+        "driver": "mock_l3os",
+        "action": "configure_route",
+        "method_kwargs": {
+            "destination": "10.1.0.0/24",
+            "next_hop": None,
+            "interface": "eth1",
+        },
+        "dry_run": False,
+    },
+    {
+        "id": "mock_l3os_configure_route_dry_run",
+        "driver": "mock_l3os",
+        "action": "configure_route",
+        "method_kwargs": {
+            "destination": "10.0.0.0/24",
+            "next_hop": "192.168.1.1",
+            "interface": "eth0",
+        },
+        "dry_run": True,
+    },
+    {
+        "id": "mock_l3os_remove_route",
+        "driver": "mock_l3os",
+        "action": "remove_route",
+        "method_kwargs": {
+            "destination": "10.0.0.0/24",
+            "next_hop": "192.168.1.1",
+            "interface": "eth0",
+        },
+        "dry_run": False,
+    },
+    {
+        "id": "mock_l3os_status",
+        "driver": "mock_l3os",
+        "action": "status",
+        "method_kwargs": {},
+        "dry_run": False,
+    },
 ]
 
 

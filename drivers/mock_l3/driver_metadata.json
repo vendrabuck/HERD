@@ -1,0 +1,7 @@
+{
+  "name": "Mock Layer 3 Switch Driver",
+  "version": "0.1.0",
+  "connection_type": "Layer 3 Switch",
+  "supports_dry_run": true,
+  "notes": "Hardware-free L3 switch driver for integration tests. Acknowledges route operations (configure_route, remove_route, including interface routes with next_hop None) deterministically and supports failure injection via HERD_mock_fail_actions / HERD_mock_raise_actions / HERD_mock_sleep_ms field_data. Not for production use."
+}

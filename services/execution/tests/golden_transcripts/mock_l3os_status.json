@@ -1,0 +1,14 @@
+{
+  "driver": "mock_l3os",
+  "action": "status",
+  "method_kwargs": {},
+  "dry_run": false,
+  "expected_commands": [
+    {
+      "seq": 1,
+      "command": "do show ip route summary",
+      "response": "ok",
+      "exit_status": "ok"
+    }
+  ]
+}
