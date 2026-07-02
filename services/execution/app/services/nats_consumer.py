@@ -14,12 +14,16 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-# Map NATS event types to driver actions
+# Map NATS event types to driver actions. reservation.failed is best-effort
+# teardown of whatever provisioning had already landed when the reservation
+# gave up (issue #244); handle_reservation_event drives it applied-state-only,
+# so a reservation that failed before any driver action ran tears down nothing.
 EVENT_ACTIONS = {
     "reservation.created": "connect_ports",
     "reservation.cancelled": "disconnect_ports",
     "reservation.completed": "disconnect_ports",
     "reservation.updated": "update_ports",
+    "reservation.failed": "disconnect_ports",
 }
 
 # JetStream consumer policy. Redelivery backoff tracks max_deliver length.
@@ -459,6 +463,7 @@ async def _execute_l2_switch_operations(
     get_db_session,
     dedupe_key: str | None = None,
     ctx: "_FetchContext | None" = None,
+    failed_cleanup: bool = False,
 ) -> None:
     """Resolve L2 switch operations for devices and execute VLAN provisioning.
 
@@ -473,6 +478,13 @@ async def _execute_l2_switch_operations(
             carries it is skipped on redelivery (issue #133).
         ctx: per-event fetch context (shared client + caches, issue #137). When
             None a throwaway context is created so a direct call still works.
+        failed_cleanup: reservation.failed teardown (issue #244), deprovision
+            only. Drives teardown strictly from the stored ACTIVE
+            vlan_assignments: a switch with no stored assignment never got
+            create_vlan, so there is no derived-VLAN fallback and no driver
+            call for it. Rows are read first and RELEASED only after the
+            switches were driven (the L3 release-after ordering), so a
+            transient NAK mid-teardown redelivers with the rows still ACTIVE.
     """
     if not reservation_id:
         logger.warning("No reservation_id for L2 operations, skipping")
@@ -483,7 +495,32 @@ async def _execute_l2_switch_operations(
 
     operations = await _resolve_l2_switch_operations(device_ids, ctx)
 
-    if l2_action == "deprovision":
+    if l2_action == "deprovision" and failed_cleanup:
+        # reservation.failed (issue #244): tear down exactly what the stored
+        # assignments say was assigned, and nothing else. The cancel/complete
+        # branch below releases the rows up front because it can fall back to a
+        # derived VLAN on redelivery; this path has no fallback by design, so
+        # it reads the rows here and releases them at the end instead.
+        from app.services.vlan_service import get_vlan_assignments
+
+        async with get_db_session() as db:
+            assignments = await get_vlan_assignments(db, reservation_id)
+
+        if not assignments:
+            logger.info(
+                "No ACTIVE VLAN assignments for FAILED reservation %s; no L2 state to tear down",
+                reservation_id,
+            )
+            return
+
+        switch_vlan = {}
+        for a in assignments:
+            for sid in a.switch_device_ids:
+                switch_vlan[sid] = a.vlan_id
+        operations = [op for op in operations if op["switch_device_id"] in switch_vlan]
+        for op in operations:
+            op["vlan_id"] = switch_vlan[op["switch_device_id"]]
+    elif l2_action == "deprovision":
         # For deprovisioning, look up stored VLAN assignments first.
         # If assignments exist, use the stored VLAN IDs.
         # If not (legacy reservation), fall back to derived VLAN ID.
@@ -832,12 +869,26 @@ async def _execute_l2_switch_operations(
                 duration_ms=logout_result["duration_ms"],
             )
 
+    # reservation.failed teardown releases the rows only now, after the
+    # switches were driven (see the failed_cleanup docstring). A transient
+    # upstream error has already raised and NAKed above, keeping the rows
+    # ACTIVE for the redelivery; driver-result failures do not raise and the
+    # teardown is best-effort, matching the cancel path's posture.
+    if l2_action == "deprovision" and failed_cleanup:
+        from app.services.vlan_service import release_vlan
 
-# Map NATS events to L2 actions
+        async with get_db_session() as db:
+            await release_vlan(db, reservation_id)
+
+
+# Map NATS events to L2 actions. reservation.failed tears down only what the
+# stored vlan_assignments record as assigned (issue #244); see failed_cleanup
+# in _execute_l2_switch_operations.
 L2_EVENT_ACTIONS = {
     "reservation.created": "provision",
     "reservation.cancelled": "deprovision",
     "reservation.completed": "deprovision",
+    "reservation.failed": "deprovision",
 }
 
 
@@ -1209,11 +1260,15 @@ async def _execute_l3_switch_operations(
                 await release_routes_for_device(db, reservation_id, sid)
 
 
-# Map NATS events to L3 actions
+# Map NATS events to L3 actions. reservation.failed needs no special flag
+# here: deprovision already removes exactly the pinned ACTIVE route_assignments
+# and releases each switch's pin only after clean removal, so a reservation
+# that failed before pinning tears down nothing (issue #244).
 L3_EVENT_ACTIONS = {
     "reservation.created": "provision",
     "reservation.cancelled": "deprovision",
     "reservation.completed": "deprovision",
+    "reservation.failed": "deprovision",
 }
 
 
@@ -1225,6 +1280,7 @@ async def _execute_switch_operations(
     get_db_session,
     dedupe_key: str | None = None,
     ctx: "_FetchContext | None" = None,
+    only_applied_pairs: bool = False,
 ) -> None:
     """Resolve L1 switch operations for devices and execute driver methods.
 
@@ -1238,6 +1294,11 @@ async def _execute_switch_operations(
             carries it is skipped on redelivery (issue #133).
         ctx: per-event fetch context (shared client + caches, issue #137). When
             None a throwaway context is created so a direct call still works.
+        only_applied_pairs: reservation.failed teardown (issue #244). A FAILED
+            reservation may have half-provisioned, so only pairs with a SUCCESS
+            connect_ports run for this reservation are torn down; a pair that
+            was never cross-connected gets no disconnect_ports. With no applied
+            pairs on a switch the driver is not even logged into.
     """
     if ctx is None:
         ctx = _FetchContext(None)
@@ -1253,6 +1314,7 @@ async def _execute_switch_operations(
     from app.services.driver_sandbox import execute_driver_method
     from app.services.execution_service import (
         action_already_succeeded,
+        action_succeeded_for_reservation,
         build_context,
         create_execution_run,
         extract_password_keys,
@@ -1307,6 +1369,22 @@ async def _execute_switch_operations(
             # rather than re-login just to do nothing.
             pending_pairs = []
             for port_a, port_b in port_pairs:
+                if only_applied_pairs and not await action_succeeded_for_reservation(
+                    db, res_uuid, switch_uuid, "connect_ports", port_a, port_b
+                ):
+                    # Applied-state guard (issue #244): this pair was never
+                    # cross-connected for the FAILED reservation, so there is
+                    # nothing to tear down on it.
+                    logger.info(
+                        "Skipping %s on switch %s (%s to %s); connect_ports never "
+                        "succeeded for reservation %s",
+                        action,
+                        switch_id,
+                        port_a,
+                        port_b,
+                        reservation_id,
+                    )
+                    continue
                 if await action_already_succeeded(
                     db, dedupe_key, switch_uuid, action, port_a, port_b
                 ):
@@ -1543,14 +1621,34 @@ async def handle_reservation_event(
                 )
         else:
             device_ids = event_data.get("device_ids", [])
+            # reservation.failed teardown (issue #244) is applied-state-only:
+            # the reservation may have half-provisioned (or never provisioned),
+            # so L1 tears down only pairs whose connect_ports succeeded and L2
+            # only what the stored vlan_assignments record. L3's deprovision is
+            # already pinned-set-driven, so it needs no flag.
+            failed_cleanup = event_type == "reservation.failed"
             await _execute_switch_operations(
-                device_ids, action, reservation_id, user_id, get_db_session, dedupe_key, ctx
+                device_ids,
+                action,
+                reservation_id,
+                user_id,
+                get_db_session,
+                dedupe_key,
+                ctx,
+                only_applied_pairs=failed_cleanup,
             )
             # L2 switch operations
             l2_action = L2_EVENT_ACTIONS.get(event_type)
             if l2_action:
                 await _execute_l2_switch_operations(
-                    device_ids, l2_action, reservation_id, user_id, get_db_session, dedupe_key, ctx
+                    device_ids,
+                    l2_action,
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    dedupe_key,
+                    ctx,
+                    failed_cleanup=failed_cleanup,
                 )
             # L3 switch operations
             l3_action = L3_EVENT_ACTIONS.get(event_type)

@@ -80,14 +80,6 @@ reports become common (`services/reservations/app/services/reporting_service.py:
 
 ## Reliability and correctness
 
-- **Partial provisioning is not cleaned up on `reservation.failed` ([#244](https://github.com/vendrabuck/HERD/issues/244)).**
-  When provisioning exhausts retries and lands in FAILED, driver actions that already
-  succeeded (L1 cross-connects, L2 VLANs, L3 routes) stay applied and their assignment
-  rows stay ACTIVE. The execution consumer has no `reservation.failed` action mapping.
-  The L3 route-assignment table added in [#20](https://github.com/vendrabuck/HERD/issues/20)
-  makes the L3 slice of this cleanup tractable (the pinned set is inspectable), which is a
-  small argument for extending the same state-tracking pattern to L1/L2 as part of the
-  fix.
 - **AI provider misconfiguration returns 500 instead of 503 ([#245](https://github.com/vendrabuck/HERD/issues/245)).**
   An unrecognized `AI_PROVIDER` makes `get_ai_client` raise a bare `RuntimeError` that
   escapes as a 500 before the route's 503 gate runs, because the client is a FastAPI

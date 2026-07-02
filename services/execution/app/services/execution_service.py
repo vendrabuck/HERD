@@ -98,6 +98,41 @@ async def action_already_succeeded(
     return result.scalar_one_or_none() is not None
 
 
+async def action_succeeded_for_reservation(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | None,
+    device_id: uuid.UUID,
+    action: str,
+    port_a: str | None,
+    port_b: str | None,
+) -> bool:
+    """Has this driver action ever SUCCEEDED for this reservation, any message?
+
+    Applied-state guard for the reservation.failed teardown (issue #244): a
+    FAILED reservation is torn down only where provisioning actually landed,
+    so an L1 pair whose connect_ports never succeeded gets no disconnect_ports.
+    Unlike action_already_succeeded this is keyed on reservation_id rather than
+    the source message's dedupe_key, because the provision runs it looks for
+    were recorded by a different message (reservation.created or
+    reservation.updated), which carries a different key.
+
+    Returns False when reservation_id is None: with no reservation to scope
+    the lookup to, nothing counts as applied.
+    """
+    if reservation_id is None:
+        return False
+    conditions = [
+        ExecutionRun.reservation_id == reservation_id,
+        ExecutionRun.device_id == device_id,
+        ExecutionRun.action == action,
+        ExecutionRun.status == "SUCCESS",
+        ExecutionRun.port_a.is_(None) if port_a is None else ExecutionRun.port_a == port_a,
+        ExecutionRun.port_b.is_(None) if port_b is None else ExecutionRun.port_b == port_b,
+    ]
+    result = await db.execute(select(ExecutionRun.id).where(*conditions).limit(1))
+    return result.scalar_one_or_none() is not None
+
+
 async def update_execution_run(
     db: AsyncSession,
     run: ExecutionRun,

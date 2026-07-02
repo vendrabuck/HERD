@@ -224,6 +224,7 @@ class Driver:
 |---|---|
 | Reservation created (DUTs connected through L1 switch) | login(), connect_ports(a, b) for each port pair, logout() |
 | Reservation cancelled or completed | login(), disconnect_ports(a, b) for each port pair, logout() |
+| Reservation failed | login(), disconnect_ports(a, b) for each pair whose connect_ports succeeded, logout(); a switch with no applied pairs is not contacted |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
 When multiple port pairs go through the same L1 switch in a single reservation, the
@@ -552,6 +553,7 @@ class Driver:
 |---|---|
 | Reservation created (DUTs connected through L2 switch) | login(), create_vlan(vlan_id), add_to_vlan(port, vlan_id, tag) for each port, logout() |
 | Reservation cancelled or completed | login(), remove_from_vlan(port, vlan_id) for each port, delete_vlan(vlan_id), logout() |
+| Reservation failed | same as cancelled, but driven strictly from the stored VLAN assignment; a switch that never got create_vlan is not contacted |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
 Unlike L1 operations (which pair two ports), L2 operations are per-port: each DUT port
@@ -671,6 +673,7 @@ class Driver:
 |---|---|
 | Reservation created (DUTs connected through L3 switch) | login(), configure_route(destination, next_hop, interface) for each route, logout() |
 | Reservation cancelled or completed | login(), remove_route(destination, next_hop, interface) for each route, logout() |
+| Reservation failed | same as cancelled: remove_route for each pinned route; a switch with no pinned assignment is skipped |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
 When multiple reserved devices connect through the same L3 switch, the execution service
