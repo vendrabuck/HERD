@@ -9,7 +9,7 @@ Common failure modes and how to diagnose them. Organized by what the user sees.
 `config.json` has not been written to the `herd-config` volume, so the login page is gating behind the setup flow. Two fixes:
 
 - Put every required value in `.env` (see `.env.example`) and `make restart`. The config service's first-start auto-bootstrap will write `config.json` from the env on boot, and the login form will enable. Check `docker compose logs config` for a message like `Config bootstrapped from environment` or a warning naming the missing var.
-- Or click the wrench icon on the login page, log in with `admin123!`, fill in required settings, and click **Save and Restart**.
+- Or click the wrench icon on the login page, log in with the config-page password (set `CONFIG_ADMIN_PASSWORD`, or read the one-time password from `docker compose logs config`), fill in required settings, and click **Save and Restart**.
 
 See [OPERATIONS.md](OPERATIONS.md#config-service-first-run).
 

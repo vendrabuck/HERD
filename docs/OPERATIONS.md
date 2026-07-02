@@ -44,13 +44,13 @@ If any required var is missing, the config service logs a warning listing them a
 
 1. Open `https://<host>`.
 2. Click the wrench icon on the login page.
-3. Log in with `admin123!` (the default config-page password).
-4. You'll be forced to change the password (min 8, max 32 chars).
+3. Log in with the config-page password: set `CONFIG_ADMIN_PASSWORD` to choose it, or read the random one-time password the config service logs on first boot (`docker compose logs config`).
+4. If you used the random one-time password, you must change it (min 8, max 32 chars) before the config write and apply actions unlock.
 5. Fill in the required database, auth, and API-token fields (same required list as above). The superadmin fields are optional; if you skip them, create the first admin account through the UI afterward.
 6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts every other container via the Docker socket.
 7. Once containers come back healthy (`docker compose ps`), the login form re-enables and you can sign in as the superadmin.
 
-`.env` values take precedence over config-page values. A mixed approach is fine: put secrets in `.env`, let the UI manage everything else. The config UI's own password is unaffected by Option A, so the wrench icon still prompts for `admin123!` on first visit.
+`.env` values take precedence over config-page values. A mixed approach is fine: put secrets in `.env`, let the UI manage everything else. The config UI's own password is independent of the app config: set `CONFIG_ADMIN_PASSWORD` to pin it, otherwise the wrench icon accepts the random one-time password logged on first boot.
 
 ## Upgrade path
 

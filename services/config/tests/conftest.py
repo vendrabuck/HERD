@@ -13,6 +13,12 @@ def tmp_config_dir(monkeypatch):
     for field in CONFIG_SCHEMA:
         monkeypatch.delenv(field["key"], raising=False)
 
+    # Seed a known config-page password by default so the login/write tests are
+    # deterministic and the write surface is unlocked (an operator-set
+    # CONFIG_ADMIN_PASSWORD counts as rotated, issue #256). Tests that exercise
+    # the random-seed / locked branch clear this var themselves.
+    monkeypatch.setenv("CONFIG_ADMIN_PASSWORD", "test-config-pass")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         monkeypatch.setenv("HERD_CONFIG_DATA_DIR", tmpdir)
         # Patch the module-level variables in config_store

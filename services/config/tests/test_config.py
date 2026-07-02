@@ -3,7 +3,6 @@ import os
 
 import pytest
 from app.config_store import (
-    DEFAULT_PASSWORD,
     ConfigAuthError,
     change_password,
     is_configured,
@@ -17,6 +16,12 @@ from app.config_store import (
 from app.main import app
 from httpx import ASGITransport, AsyncClient
 
+# The known config-page password the conftest seeds via CONFIG_ADMIN_PASSWORD.
+# An operator-set password is treated as rotated (write surface unlocked).
+CFG_PASSWORD = "test-config-pass"
+# The old hardcoded default that must no longer be accepted (issue #256).
+OLD_DEFAULT_PASSWORD = "admin123!"
+
 
 @pytest.fixture
 def async_client():
@@ -29,7 +34,7 @@ def async_client():
 
 class TestConfigStore:
     def test_default_password_verification(self):
-        assert verify_password(DEFAULT_PASSWORD) is True
+        assert verify_password(CFG_PASSWORD) is True
 
     def test_wrong_password_rejected(self):
         assert verify_password("wrong-password") is False
@@ -37,17 +42,22 @@ class TestConfigStore:
     def test_change_password(self):
         change_password("newpass123")
         assert verify_password("newpass123") is True
-        assert verify_password(DEFAULT_PASSWORD) is False
+        assert verify_password(CFG_PASSWORD) is False
 
-    def test_password_changed_flag(self):
+    def test_password_changed_flag(self, monkeypatch):
+        # With no operator-set password the seed is random and unrotated, so the
+        # flag starts False and flips True on change (issue #256).
+        monkeypatch.delenv("CONFIG_ADMIN_PASSWORD", raising=False)
         assert is_password_changed() is False
         change_password("newpass123")
         assert is_password_changed() is True
 
-    def test_load_auth_creates_default(self, tmp_config_dir):
+    def test_load_auth_creates_file(self, tmp_config_dir):
         auth = load_auth()
         assert "password_hash" in auth
-        assert auth["password_changed"] is False
+        # CONFIG_ADMIN_PASSWORD is set by the conftest, so the seed counts as
+        # operator-chosen (rotated).
+        assert auth["password_changed"] is True
         assert os.path.exists(os.path.join(tmp_config_dir, "config_auth.json"))
 
     def test_not_configured_initially(self):
@@ -124,7 +134,7 @@ class TestCorruptAuthFile:
         # Recovery is operator-driven, not silent: the corrupt file is left in
         # place (no default regenerated) so the admin password is not reset.
         auth_path = self._corrupt_auth(tmp_config_dir)
-        assert verify_password(DEFAULT_PASSWORD) is False
+        assert verify_password(CFG_PASSWORD) is False
         with open(auth_path) as f:
             assert f.read() == "{bad"
 
@@ -147,7 +157,8 @@ class TestStatusEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert data["configured"] is False
-        assert data["password_changed"] is False
+        # Operator password set via conftest => reported rotated.
+        assert data["password_changed"] is True
 
     @pytest.mark.asyncio
     async def test_status_configured(self, async_client, tmp_config_dir):
@@ -173,11 +184,12 @@ class TestStatusEndpoint:
 class TestLoginEndpoint:
     @pytest.mark.asyncio
     async def test_login_success(self, async_client):
-        resp = await async_client.post("/login", json={"password": DEFAULT_PASSWORD})
+        resp = await async_client.post("/login", json={"password": CFG_PASSWORD})
         assert resp.status_code == 200
         data = resp.json()
         assert "token" in data
-        assert data["password_changed"] is False
+        # Operator password set via conftest => reported rotated.
+        assert data["password_changed"] is True
 
     @pytest.mark.asyncio
     async def test_login_wrong_password(self, async_client):
@@ -190,7 +202,7 @@ class TestLoginEndpoint:
         auth_path = os.path.join(tmp_config_dir, "config_auth.json")
         with open(auth_path, "w") as f:
             f.write("{bad")
-        resp = await async_client.post("/login", json={"password": DEFAULT_PASSWORD})
+        resp = await async_client.post("/login", json={"password": CFG_PASSWORD})
         assert resp.status_code == 401
 
 
@@ -198,7 +210,7 @@ class TestChangePasswordEndpoint:
     @pytest.mark.asyncio
     async def test_change_password(self, async_client):
         # Login first
-        login_resp = await async_client.post("/login", json={"password": DEFAULT_PASSWORD})
+        login_resp = await async_client.post("/login", json={"password": CFG_PASSWORD})
         token = login_resp.json()["token"]
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -216,7 +228,7 @@ class TestChangePasswordEndpoint:
 
     @pytest.mark.asyncio
     async def test_change_password_too_short(self, async_client):
-        login_resp = await async_client.post("/login", json={"password": DEFAULT_PASSWORD})
+        login_resp = await async_client.post("/login", json={"password": CFG_PASSWORD})
         token = login_resp.json()["token"]
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -229,7 +241,7 @@ class TestChangePasswordEndpoint:
 
     @pytest.mark.asyncio
     async def test_change_password_too_long(self, async_client):
-        login_resp = await async_client.post("/login", json={"password": DEFAULT_PASSWORD})
+        login_resp = await async_client.post("/login", json={"password": CFG_PASSWORD})
         token = login_resp.json()["token"]
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -264,7 +276,7 @@ class TestSchemaEndpoint:
 
 class TestSettingsEndpoints:
     async def _login(self, client):
-        resp = await client.post("/login", json={"password": DEFAULT_PASSWORD})
+        resp = await client.post("/login", json={"password": CFG_PASSWORD})
         return {"Authorization": f"Bearer {resp.json()['token']}"}
 
     @pytest.mark.asyncio
@@ -404,7 +416,7 @@ class TestLoadEnvValues:
 
 class TestApplyEndpoint:
     async def _login(self, client):
-        resp = await client.post("/login", json={"password": DEFAULT_PASSWORD})
+        resp = await client.post("/login", json={"password": CFG_PASSWORD})
         return {"Authorization": f"Bearer {resp.json()['token']}"}
 
     @pytest.mark.asyncio
@@ -417,3 +429,87 @@ class TestApplyEndpoint:
     async def test_apply_unauthenticated(self, async_client):
         resp = await async_client.post("/apply")
         assert resp.status_code in (401, 403)
+
+
+# -- issue #256: no guessable default, rotate-before-write lockout --
+
+
+_REQUIRED_VALUES = {
+    "POSTGRES_USER": "herd",
+    "POSTGRES_PASSWORD": "secret",
+    "POSTGRES_DB": "herddb",
+    "AUTH_SECRET_KEY": "mysecret",
+    "INTERNAL_API_TOKEN": "tok123",
+}
+
+_FAKE_SEED = "rand-seed-pw-abc123def456"
+
+
+def _patch_random_seed(monkeypatch):
+    """Drop CONFIG_ADMIN_PASSWORD and pin the generated password to a known value
+    so the random-seed branch is deterministic for the test."""
+    monkeypatch.delenv("CONFIG_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setattr("app.config_store.secrets.token_urlsafe", lambda n=24: _FAKE_SEED)
+
+
+class TestSecureSeed:
+    def test_old_default_password_rejected(self, monkeypatch):
+        # The historical hardcoded default must never be accepted on a fresh
+        # deploy that did not opt into it.
+        _patch_random_seed(monkeypatch)
+        assert verify_password(OLD_DEFAULT_PASSWORD) is False
+
+    def test_random_seed_used_and_unrotated(self, monkeypatch):
+        _patch_random_seed(monkeypatch)
+        assert verify_password(_FAKE_SEED) is True
+        assert is_password_changed() is False
+
+    def test_env_password_is_used_and_marks_rotated(self):
+        # conftest sets CONFIG_ADMIN_PASSWORD=CFG_PASSWORD.
+        assert verify_password(CFG_PASSWORD) is True
+        assert is_password_changed() is True
+
+
+class TestWriteSurfaceLockout:
+    @pytest.mark.asyncio
+    async def test_put_settings_locked_until_rotated(self, async_client, monkeypatch):
+        _patch_random_seed(monkeypatch)
+        login = await async_client.post("/login", json={"password": _FAKE_SEED})
+        assert login.status_code == 200
+        headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+        # Unrotated seed: the write surface is locked.
+        locked = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert locked.status_code == 403
+
+        # Rotating the password clears the lock.
+        changed = await async_client.post(
+            "/change-password", json={"new_password": "newpass123"}, headers=headers
+        )
+        assert changed.status_code == 200
+        unlocked = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert unlocked.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_apply_locked_until_rotated(self, async_client, monkeypatch):
+        _patch_random_seed(monkeypatch)
+        login = await async_client.post("/login", json={"password": _FAKE_SEED})
+        headers = {"Authorization": f"Bearer {login.json()['token']}"}
+        # The rotation gate runs before the not-configured check, so an
+        # unrotated seed gets 403 regardless of configured state.
+        resp = await async_client.post("/apply", headers=headers)
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_write_allowed_with_operator_password(self, async_client):
+        # conftest's operator password is rotated, so the surface is open.
+        login = await async_client.post("/login", json={"password": CFG_PASSWORD})
+        headers = {"Authorization": f"Bearer {login.json()['token']}"}
+        resp = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert resp.status_code == 200
