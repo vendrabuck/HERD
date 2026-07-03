@@ -12,10 +12,18 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.models.device import Device, DeviceStatus, TopologyType
 from app.models.template import DeviceTemplate
-from app.schemas.device import DeviceCreate, DeviceResponse, DeviceUpdate, PaginatedDeviceResponse
+from app.schemas.device import (
+    DeviceCreate,
+    DeviceResponse,
+    DeviceUpdate,
+    InternalDeviceCreate,
+    PaginatedDeviceResponse,
+)
 from app.services.inventory_service import (
     create_device,
+    create_dynamic_instance_device,
     delete_device,
+    delete_dynamic_instance_device,
     get_device,
     list_devices,
     set_device_status,
@@ -230,6 +238,37 @@ async def create_new_device(
     return _device_to_response(device)
 
 
+@router.post(
+    "/devices/internal", response_model=DeviceResponse, status_code=status.HTTP_201_CREATED
+)
+async def create_dynamic_device_internal(
+    body: InternalDeviceCreate,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Materialize a dynamic-template instance as a device. Internal token only.
+
+    Accepts only dynamic templates (422 otherwise). Used by the execution service
+    after a recipe's create_instance succeeds; the created device is RESERVED and
+    joined to the No Pool group like every device.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    device = await create_dynamic_instance_device(
+        db,
+        template_id=body.template_id,
+        reservation_id=body.reservation_id,
+        name=body.name,
+        field_data=body.field_data,
+    )
+    logger.info(
+        "Dynamic device created: %s",
+        device.name,
+        extra={"action": "device_create_internal", "device_id": str(device.id)},
+    )
+    return _device_to_response(device)
+
+
 @router.get("/devices/health-config", response_model=list[HealthConfigEntry])
 async def list_devices_health_config(
     db: AsyncSession = Depends(get_db),
@@ -360,6 +399,31 @@ async def delete_device_by_id(
         "Device deleted: %s",
         device_id,
         extra={"action": "device_delete", "device_id": str(device_id)},
+    )
+
+
+@router.delete("/devices/{device_id}/internal", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_dynamic_device_internal(
+    device_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Delete a dynamic-instance device. Internal token only.
+
+    404 if the device is absent; 409 if it is not a dynamic instance, since this
+    surface only manages dynamic instances (physical devices are admin-managed).
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    outcome = await delete_dynamic_instance_device(db, device_id)
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="Device not found")
+    if outcome == "not_dynamic":
+        raise HTTPException(status_code=409, detail="Device is not a dynamic instance")
+    logger.info(
+        "Dynamic device deleted: %s",
+        device_id,
+        extra={"action": "device_delete_internal", "device_id": str(device_id)},
     )
 
 

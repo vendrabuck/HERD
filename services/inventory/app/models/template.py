@@ -10,6 +10,7 @@ from app.database import Base
 _schema = settings.db_schema or None
 
 _driver_fk = f"{_schema}.driver_packages.id" if _schema else "driver_packages.id"
+_hypervisor_fk = f"{_schema}.hypervisors.id" if _schema else "hypervisors.id"
 
 
 class DeviceTemplate(Base):
@@ -23,6 +24,12 @@ class DeviceTemplate(Base):
     )
     driver_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey(_driver_fk), nullable=True
+    )
+    # Set only on "dynamic" templates: the hypervisor a materialized instance
+    # is created on. Nullable; enforced present for dynamic templates and absent
+    # otherwise at the schema and service layers.
+    hypervisor_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey(_hypervisor_fk), nullable=True
     )
     exclusive: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="1"

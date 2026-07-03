@@ -14,6 +14,7 @@ from app.routers.device_configs import router as device_configs_router
 from app.routers.device_groups import router as device_groups_router
 from app.routers.devices import router as devices_router
 from app.routers.drivers import router as drivers_router
+from app.routers.hypervisors import router as hypervisors_router
 from app.routers.ports import router as ports_router
 from app.routers.templates import router as templates_router
 from app.storage import init_storage
@@ -103,6 +104,7 @@ app.include_router(device_configs_router)
 app.include_router(device_groups_router)
 app.include_router(devices_router)
 app.include_router(drivers_router)
+app.include_router(hypervisors_router)
 app.include_router(ports_router)
 app.include_router(templates_router)
 

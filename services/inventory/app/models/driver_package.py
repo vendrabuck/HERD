@@ -16,6 +16,7 @@ class ConnectionType(str, enum.Enum):
     L1_SWITCH = "Layer 1 Switch"
     L2_SWITCH = "Layer 2 Switch"
     L3_SWITCH = "Layer 3 Switch"
+    HYPERVISOR = "Hypervisor"
 
 
 VALID_CONNECTION_TYPES = {ct.value for ct in ConnectionType}

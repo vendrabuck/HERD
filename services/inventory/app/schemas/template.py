@@ -77,8 +77,9 @@ class SectionDefinition(BaseModel):
 
 class TemplateCreate(BaseModel):
     name: str
-    template_type: Literal["device", "port"] = "device"
+    template_type: Literal["device", "port", "dynamic"] = "device"
     driver_id: uuid.UUID | None = None
+    hypervisor_id: uuid.UUID | None = None
     exclusive: bool = True
     icon: str | None = None
     description: str | None = None
@@ -115,10 +116,22 @@ class TemplateCreate(BaseModel):
     def validate_sections(self):
         if len(self.sections) == 0:
             raise ValueError("At least one section is required")
-        if self.driver_id is not None and self.template_type != "device":
-            raise ValueError("driver_id is only valid on device templates")
+        # hypervisor_id is meaningful only on dynamic templates.
+        if self.hypervisor_id is not None and self.template_type != "dynamic":
+            raise ValueError("hypervisor_id is only valid on dynamic templates")
+        # driver_id rides both device and dynamic templates (device driver, recipe).
+        if self.driver_id is not None and self.template_type not in ("device", "dynamic"):
+            raise ValueError("driver_id is only valid on device or dynamic templates")
         if self.template_type == "device" and self.driver_id is None:
             raise ValueError("Device templates must have a driver")
+        if self.template_type == "dynamic":
+            # A dynamic template needs BOTH a recipe driver and a hypervisor.
+            if self.driver_id is None:
+                raise ValueError("Dynamic templates must have a driver")
+            if self.hypervisor_id is None:
+                raise ValueError("Dynamic templates must have a hypervisor")
+        # vendor/model identity is required only for device templates; dynamic
+        # templates are exempt from the "unknown" identity rule.
         if self.template_type == "device":
             if not self.vendor or not self.vendor.strip():
                 raise ValueError("vendor is required for device templates")
@@ -130,6 +143,7 @@ class TemplateCreate(BaseModel):
 class TemplateUpdate(BaseModel):
     name: str | None = None
     driver_id: uuid.UUID | None = None
+    hypervisor_id: uuid.UUID | None = None
     exclusive: bool | None = None
     icon: str | None = None
     description: str | None = None
@@ -166,6 +180,7 @@ class TemplateResponse(BaseModel):
     template_type: str
     driver_id: uuid.UUID | None = None
     driver_name: str | None = None
+    hypervisor_id: uuid.UUID | None = None
     connection_type: str | None = None
     exclusive: bool
     icon: str | None

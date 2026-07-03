@@ -12,20 +12,29 @@ from app.models.template import DeviceTemplate
 from app.schemas.device import DeviceCreate, DeviceUpdate
 
 
-def validate_field_data(template: DeviceTemplate, field_data: dict[str, Any]) -> None:
-    """Validate field_data against the template's section/field definitions."""
+def validate_field_data(
+    template: DeviceTemplate, field_data: dict[str, Any], allow_unknown: bool = False
+) -> None:
+    """Validate field_data against the template's section/field definitions.
+
+    allow_unknown is set only on the internal dynamic-instance create path: a
+    recipe's create_instance result contributes instance attributes (management
+    address, instance ref, etc.) that are not template fields, so unknown keys
+    must be tolerated there. Every other caller rejects unknown keys.
+    """
     all_fields: dict[str, dict] = {}
     for section in template.sections:
         for field in section["fields"]:
             all_fields[field["key"]] = field
 
     # Check for unknown keys
-    unknown = set(field_data.keys()) - set(all_fields.keys())
-    if unknown:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown fields: {', '.join(sorted(unknown))}",
-        )
+    if not allow_unknown:
+        unknown = set(field_data.keys()) - set(all_fields.keys())
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown fields: {', '.join(sorted(unknown))}",
+            )
 
     # Apply defaults for missing/empty fields
     for key, defn in all_fields.items():
@@ -212,6 +221,108 @@ async def delete_device(db: AsyncSession, device_id: uuid.UUID) -> bool:
     await db.delete(device)
     await db.commit()
     return True
+
+
+# Upper bound on the name-disambiguation loop for generated dynamic-instance
+# names. A count this high never happens in practice (one reservation would need
+# this many instances of one template); the cap just guarantees termination if
+# name generation ever fought a pathological set of pre-existing collisions.
+_MAX_NAME_ATTEMPTS = 10_000
+
+
+async def _insert_dynamic_device(
+    db: AsyncSession,
+    name: str,
+    template_id: uuid.UUID,
+    field_data: dict[str, Any],
+) -> Device | None:
+    """Insert one RESERVED dynamic-instance device; return None on a name clash."""
+    device = Device(
+        name=name,
+        template_id=template_id,
+        topology_type=TopologyType.CLOUD,
+        status=DeviceStatus.RESERVED,
+        field_data=field_data,
+    )
+    db.add(device)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        return None
+    await db.refresh(device)
+    return device
+
+
+async def create_dynamic_instance_device(
+    db: AsyncSession,
+    template_id: uuid.UUID,
+    reservation_id: uuid.UUID,
+    name: str | None = None,
+    field_data: dict[str, Any] | None = None,
+) -> Device:
+    """Materialize a dynamic template as a RESERVED device (internal path only).
+
+    Accepts only dynamic templates. When name is omitted the server generates
+    "<template-name>-<first 8 chars of reservation_id>-<n>", disambiguating n on
+    collision. field_data is validated against the template but tolerates unknown
+    keys, since the recipe's create_instance result carries instance attributes
+    that are not template fields.
+    """
+    result = await db.execute(select(DeviceTemplate).where(DeviceTemplate.id == template_id))
+    template = result.scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=422, detail="Template not found")
+    if template.template_type != "dynamic":
+        raise HTTPException(status_code=422, detail="Template is not a dynamic template")
+
+    field_data = dict(field_data or {})
+    validate_field_data(template, field_data, allow_unknown=True)
+
+    # Ports are created from the template's port sub-templates exactly as the
+    # admin create path (create_device) does, which is to say none are created
+    # here: a device/dynamic template carries no embedded port sub-templates, so
+    # both paths add a bare device row.
+
+    if name is not None:
+        device = await _insert_dynamic_device(db, name, template_id, field_data)
+        if device is None:
+            raise HTTPException(status_code=409, detail=f"Device with name '{name}' already exists")
+    else:
+        prefix = f"{template.name}-{str(reservation_id)[:8]}"
+        device = None
+        n = 1
+        while device is None and n <= _MAX_NAME_ATTEMPTS:
+            device = await _insert_dynamic_device(db, f"{prefix}-{n}", template_id, field_data)
+            n += 1
+        if device is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Could not generate a unique device name for prefix '{prefix}'",
+            )
+
+    # Auto-assign to "No Pool" default device group, like every device.
+    from app.services.device_group_service import add_device_to_no_pool
+
+    await add_device_to_no_pool(db, device.id)
+    return device
+
+
+async def delete_dynamic_instance_device(db: AsyncSession, device_id: uuid.UUID) -> str:
+    """Delete a dynamic-instance device (internal path only).
+
+    Returns "deleted" on success, "not_found" if absent, "not_dynamic" if the
+    device's template is not dynamic (this surface only manages dynamic
+    instances). The caller maps these to 204/404/409.
+    """
+    device = await get_device(db, device_id)
+    if not device:
+        return "not_found"
+    if device.template is None or device.template.template_type != "dynamic":
+        return "not_dynamic"
+    await db.delete(device)
+    await db.commit()
+    return "deleted"
 
 
 async def set_device_status(
