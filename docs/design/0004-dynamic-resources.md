@@ -1,7 +1,7 @@
 # Decision: Dynamic Resources, Hypervisor-Backed Templates, Issue #32
 
-Status: Proposed 2026-07-03. Six decision points below carry recommended
-defaults and await sign-off. No code in this doc. Context verified against
+Status: Accepted 2026-07-03; all six decision points below were resolved to
+their recommended defaults. No code in this doc. Context verified against
 the live HERD-public tree on 2026-07-03 (main at the secrets-service merge).
 
 ## Context
@@ -175,7 +175,7 @@ Instance creation takes minutes, not the 30s driver default, so recipe
 actions get `recipe_timeout_seconds` (default 300). `RLIMIT_CPU` stays at
 60s; waiting on a hypervisor API is not CPU time.
 
-## Decision points (defaults chosen, awaiting sign-off)
+## Decision points (resolved 2026-07-03 to the recommended defaults)
 
 1. Activation gate: gate `ACTIVE` on the create-step callback for
    dynamic-carrying reservations (default) versus activating immediately
