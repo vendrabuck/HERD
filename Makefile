@@ -97,7 +97,7 @@ master-quick:  ## Fast gate: format + lint + unit + frontend + build
 	$(MAKE) format
 	@echo ""
 	@echo "=== Linting Python ==="
-	uv run ruff check services/
+	uv run ruff check services/ $(ROOT_PY)
 	@echo ""
 	@echo "=== Linting frontend ==="
 	cd frontend && npx eslint src --max-warnings 0
