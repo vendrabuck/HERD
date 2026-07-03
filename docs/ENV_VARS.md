@@ -29,7 +29,9 @@ These must be set before the stack will run. The config service first-run flow w
 | Variable | Example / format | Used by | Purpose |
 |---|---|---|---|
 | `AUTH_SECRET_KEY` | 64-char hex string (`openssl rand -hex 32`) | auth, inventory, reservations, cabling, acl, execution, ai-orchestrator | HMAC secret used to sign and verify JWTs. MUST match across all services. Changing it invalidates every existing token. |
-| `INTERNAL_API_TOKEN` | 64-char hex string | reservations, inventory, execution, cabling, user-profile, notifications | Shared secret for service-to-service calls that use the `X-Internal-Token` header. Must match across all services that speak to each other. |
+| `INTERNAL_API_TOKEN` | 64-char hex string | reservations, inventory, execution, cabling, user-profile, notifications, integration, secrets | Shared secret for service-to-service calls that use the `X-Internal-Token` header. Must match across all services that speak to each other. |
+| `SECRETS_KEK` | base64-encoded 32 bytes (`python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`) | secrets | Key-encryption key for the credential store. No default: the secrets service refuses to boot without a valid value (the dev/test compose override supplies a dev-only key; production must set it). Losing it makes stored secrets unrecoverable. |
+| `SECRETS_KEK_PREVIOUS` | same format, normally unset | secrets | Set only during a KEK rotation window: at boot, stored keys that fail under `SECRETS_KEK` are unwrapped with this and re-wrapped under the new KEK. Unset it once a boot has completed with both present. |
 | `POSTGRES_USER` | `herd` | postgres, all backend services | Database owner. |
 | `POSTGRES_PASSWORD` | strong password | postgres, all backend services | Database password. |
 | `POSTGRES_DB` | `herd` | postgres, all backend services | Database name. |

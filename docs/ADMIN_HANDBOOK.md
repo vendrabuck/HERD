@@ -166,16 +166,26 @@ The execution service runs driver code on infrastructure at reservation lifecycl
 
 Execution is mostly event-driven via NATS: reservation lifecycle events trigger L1 port connect/disconnect and L2 VLAN provision/deprovision automatically. Manual `/execute` is for AI commits with configs and for ad-hoc admin actions.
 
-## ACL grants (topologies and reservations)
+## ACL grants (topologies, reservations, secrets)
 
-Device-level access is via device groups (above). ACL grants are for topology and reservation resources.
+Device-level access is via device groups (above). ACL grants are for topology, reservation, and secret resources.
 
-- `POST /api/acl/grants` creates a grant: `{resource_type: "device|topology|reservation", resource_id, group_id, permission: "view|manage"}` (`group_id` is the user-group UUID).
+- `POST /api/acl/grants` creates a grant: `{resource_type: "device|topology|reservation|secret", resource_id, group_id, permission: "view|manage"}` (`group_id` is the user-group UUID).
 - `manage` implies `view`.
 - `POST /api/acl/check` checks if a user has a given permission on a resource.
 - `GET /api/acl/resources?user_id=&resource_type=&permission=` lists resources accessible to a user.
 
 In practice you rarely need manual ACL grants for daily use; the defaults (topologies are visible to admins; reservations are visible to their owner and admins) cover most cases.
+
+## Secrets (encrypted credential store)
+
+Admins manage named secrets in the secrets service; values are encrypted at rest and a database dump alone never yields plaintext (see `docs/ARCHITECTURE.md`).
+
+- `POST /api/secrets/secrets` creates a secret: `{name, type, description, data: {key: value, ...}}`. The response carries metadata only; plaintext is never echoed on create, list, or get.
+- `GET /api/secrets/secrets/{id}/value` reveals the plaintext. Non-admin reveal requires a `manage` grant on the secret (`view` sees metadata only, and gets 403 on reveal).
+- `PUT /api/secrets/secrets/{id}` replaces the payload (re-encrypted wholesale); `DELETE` removes it.
+- `POST /api/secrets/keys/rotate` (admin) introduces a new encryption-key version and re-encrypts every secret.
+- `SECRETS_KEK` in `.env` is the key-encryption key; the service refuses to boot without it. See `docs/ENV_VARS.md` for generation and the `SECRETS_KEK_PREVIOUS` rotation flow.
 
 ## Routine checks
 

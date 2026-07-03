@@ -23,7 +23,13 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   [docs/ROLES.md](docs/ROLES.md).
 - **User groups** (Shipped): organize users into teams with bulk member management.
 - **Resource-level ACL grants** (Shipped): group-based view and manage grants on
-  topologies and reservations.
+  topologies, reservations, and secrets.
+- **Encrypted-at-rest credential store** (Shipped): a dedicated secrets service
+  holding named secrets whose payloads are AES-GCM envelope-encrypted (an
+  environment-supplied key-encryption key wraps per-version data-encryption
+  keys), with ACL-gated reveal, an internal-token retrieval surface for
+  automated provisioning, and online key rotation. See
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Device group visibility** (Shipped): non-admin users only see devices in their
   assigned groups.
 

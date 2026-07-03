@@ -25,7 +25,7 @@ HERD is a lab reservation and topology-management platform built as independent 
 - `Shipped` Resource-level access control. Group-based view and manage grants on topologies and reservations, providing the foundation for multi-tenant isolation.
 - `Planned` SAML / OIDC single sign-on. A third authentication method alongside local and directory auth, for federated enterprise identity.
 - `Planned` Directory group mapping and sync. Mirror directory groups into HERD groups and periodically reconcile membership, including deactivating users removed upstream.
-- `Planned` Encrypted-at-rest credential store. An access-controlled secret store for credentials that future provisioning features require, with fields encrypted at rest. This is a prerequisite for dynamic resource provisioning.
+- `Shipped` Encrypted-at-rest credential store. A dedicated secrets service holding named secrets whose payloads are AES-GCM envelope-encrypted, with group-based grants via the ACL service, an internal-token retrieval surface, and online key rotation. This unblocks dynamic resource provisioning.
 - `Exploring` Audit logging service. A comprehensive, tamper-evident trail of user actions and system events, aimed at troubleshooting and compliance reporting.
 - `Exploring` Compliance posture (including FedRAMP alignment). Longer-range hardening toward recognized control frameworks: the audit trail, SSO, encrypted secrets, and least-privilege access above are the building blocks. FedRAMP-style alignment is an aspirational target that would shape configuration defaults, logging, and access controls rather than a near-term deliverable.
 
@@ -50,7 +50,7 @@ HERD is a lab reservation and topology-management platform built as independent 
 
 - `Planned` Network element objects. Place non-device elements on the canvas, such as a shared VLAN segment or an external cloud, with many-to-one connections, so a topology can model shared infrastructure rather than only point-to-point device links.
 - `Partial` Editable reservation topologies. Give each reservation an editable fork of its parent topology: edit loosely during the reservation, reconcile on save, and capture an immutable as-built record at teardown, so the master template stays clean while reservations evolve. Shipped so far: the per-reservation fork (fork, fork connections, and fork versions, created on activation). Reconcile-on-save and the immutable as-built record are still planned.
-- `Planned` Dynamic resources. A dynamic template type backed by registered hypervisors, where service recipes run as sandboxed jobs to bring a resource into existence when a reservation starts and tear it down at the end. This depends on the encrypted credential store above.
+- `Planned` Dynamic resources. A dynamic template type backed by registered hypervisors, where service recipes run as sandboxed jobs to bring a resource into existence when a reservation starts and tear it down at the end. The encrypted credential store it depends on has shipped.
 - `Planned` First-class Layer 3 routing. Promote Layer 3 routing to a dedicated connection type with a decoupled configuration model, replacing the current minimal representation. An initial version is shipped.
 
 ## Future considerations

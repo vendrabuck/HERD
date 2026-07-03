@@ -301,7 +301,7 @@ All new users are auto-assigned to this group on registration.
 ## ACL Grant Management
 
 The ACL service provides resource-level access control via group-based grants. Grants
-tie a user group to a specific resource (device, topology, or reservation) with a
+tie a user group to a specific resource (device, topology, reservation, or secret) with a
 permission level ("view" or "manage"). "manage" implies "view": a check for "view"
 permission also succeeds when the group has "manage".
 
@@ -330,8 +330,24 @@ Content-Type: application/json
 ```
 
 Returns HTTP 201. Returns 409 if the exact grant already exists.
-`resource_type` values: `device`, `topology`, `reservation`.
+`resource_type` values: `device`, `topology`, `reservation`, `secret`.
 `permission` values: `view`, `manage`.
+
+### Secrets service permissions
+
+The secrets service (`/api/secrets`) gates on the `secret` resource type:
+
+| Endpoint | user (no grant) | user + `view` | user + `manage` | admin |
+|---|---|---|---|---|
+| `GET /api/secrets/secrets` | empty list | listed | listed | all |
+| `GET /api/secrets/secrets/{id}` | 404 | metadata | metadata | metadata |
+| `GET /api/secrets/secrets/{id}/value` | 404 | 403 | plaintext | plaintext |
+| create, update, delete, `POST /keys/rotate` | 403 | 403 | 403 | allowed |
+
+A caller with no grant gets 404 (existence is not confirmed); a `view` caller
+requesting plaintext gets 403. `GET /api/secrets/internal/secrets/{id}/value`
+is service-to-service only (`X-Internal-Token`; 403 on a missing or wrong
+token).
 
 ### Delete a grant
 
