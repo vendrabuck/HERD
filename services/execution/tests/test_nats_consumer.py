@@ -686,10 +686,17 @@ async def test_handle_created_event_calls_l2_provision():
     ):
         await handle_reservation_event(event_data, mock_session)
         mock_l1.assert_called_once_with(
-            ["device-1"], "connect_ports", rid, uid, mock_session, None, ANY
+            ["device-1"],
+            "connect_ports",
+            rid,
+            uid,
+            mock_session,
+            None,
+            ANY,
+            only_applied_pairs=False,
         )
         mock_l2.assert_called_once_with(
-            ["device-1"], "provision", rid, uid, mock_session, None, ANY
+            ["device-1"], "provision", rid, uid, mock_session, None, ANY, failed_cleanup=False
         )
 
 
@@ -717,10 +724,17 @@ async def test_handle_cancelled_event_calls_l2_deprovision():
     ):
         await handle_reservation_event(event_data, mock_session)
         mock_l1.assert_called_once_with(
-            ["device-1"], "disconnect_ports", rid, uid, mock_session, None, ANY
+            ["device-1"],
+            "disconnect_ports",
+            rid,
+            uid,
+            mock_session,
+            None,
+            ANY,
+            only_applied_pairs=False,
         )
         mock_l2.assert_called_once_with(
-            ["device-1"], "deprovision", rid, uid, mock_session, None, ANY
+            ["device-1"], "deprovision", rid, uid, mock_session, None, ANY, failed_cleanup=False
         )
 
 
