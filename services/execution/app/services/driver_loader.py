@@ -34,6 +34,10 @@ REQUIRED_METHODS = {
     ],
     "Layer 3 Switch": ["login", "logout", "configure_route", "remove_route", "status"],
     "Management": ["login", "logout", "configure", "backup", "status"],
+    # A dynamic-resource recipe (ADR 0004, issue #32): an ordinary driver
+    # package whose connection_type is Hypervisor. create_instance materializes
+    # an instance and destroy_instance idempotently removes it.
+    "Hypervisor": ["login", "logout", "create_instance", "destroy_instance", "status"],
 }
 
 

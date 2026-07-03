@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     cabling_service_url: str = "http://cabling:8000"
     acl_service_url: str = "http://acl:8000"
     reservations_service_url: str = "http://reservations:8000"
+    secrets_service_url: str = "http://secrets:8000"
 
     # NATS
     nats_url: str = "nats://nats:4222"
@@ -23,6 +24,11 @@ class Settings(BaseSettings):
     driver_cache_path: str = "/data/driver-cache"
     execution_timeout_seconds: int = 30
     status_check_timeout_seconds: int = 10
+    # Hypervisor recipe actions (create_instance/destroy_instance) wait on a
+    # hypervisor API for minutes, not the 30s driver default (ADR 0004). This is
+    # the wall-clock subprocess timeout; RLIMIT_CPU stays at 60s since waiting on
+    # a remote API is not CPU time.
+    recipe_timeout_seconds: int = 300
 
     # Driver-subprocess resource limits (POSIX rlimits applied via preexec_fn).
     # Each limit is applied to the driver child only; 0 leaves that limit

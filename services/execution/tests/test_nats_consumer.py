@@ -28,14 +28,21 @@ from app.services.nats_consumer import (
 
 @pytest.fixture(autouse=True)
 def _mock_l3_executor():
-    """Keep this module focused on L1/L2: the L3 executor added by issue #20
+    """Keep this module focused on L1/L2: the executors added by later issues
     would otherwise run inside every handle_reservation_event test here and
-    attempt real HTTP fetches. L3 behavior has its own suite in
-    test_nats_consumer_l3.py.
+    attempt real HTTP/DB work. The L3 executor (issue #20) and the dynamic
+    teardown (issue #32) have their own suites (test_nats_consumer_l3.py and
+    test_nats_consumer_dynamic.py).
     """
-    with patch(
-        "app.services.nats_consumer._execute_l3_switch_operations",
-        new_callable=AsyncMock,
+    with (
+        patch(
+            "app.services.nats_consumer._execute_l3_switch_operations",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "app.services.nats_consumer._execute_dynamic_teardown",
+            new_callable=AsyncMock,
+        ),
     ):
         yield
 
@@ -850,9 +857,12 @@ async def test_process_message_permanent_error_dlqs_on_first_delivery(caplog):
     msg.ack.assert_awaited_once()
     msg.nak.assert_not_awaited()
 
-    # Distinct exhaustion-tagged signal, separate from the generic DLQ-exhausted path.
+    # Distinct permanent-error signal, separate from the generic DLQ-exhausted
+    # path. PermanentEventError now covers config errors beyond VLAN exhaustion
+    # (e.g. a dynamic recipe's missing template/hypervisor/secret), so the marker
+    # is the action tag plus the "permanent error" phrase.
     assert any(
-        "exhaustion" in rec.getMessage().lower()
+        "permanent error" in rec.getMessage().lower()
         and getattr(rec, "action", None) == "nats_dlq_permanent"
         for rec in caplog.records
     )
