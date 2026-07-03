@@ -36,7 +36,7 @@ def _batch(resource_type: str = "device", permission: str = "view") -> BatchChec
 # --- CheckRequest ---
 
 
-@pytest.mark.parametrize("resource_type", ["device", "topology", "reservation"])
+@pytest.mark.parametrize("resource_type", ["device", "topology", "reservation", "secret"])
 def test_check_request_accepts_valid_resource_types(resource_type):
     req = _check(resource_type=resource_type)
     assert req.resource_type == resource_type
@@ -54,7 +54,7 @@ def test_check_request_rejects_unknown_resource_type():
     msg = str(exc.value)
     assert "resource_type must be one of" in msg
     # The allow-list is rendered sorted, so the wording is deterministic.
-    assert "device, reservation, topology" in msg
+    assert "device, reservation, secret, topology" in msg
 
 
 def test_check_request_rejects_unknown_permission():
@@ -68,7 +68,7 @@ def test_check_request_rejects_unknown_permission():
 # --- BatchCheckRequest ---
 
 
-@pytest.mark.parametrize("resource_type", ["device", "topology", "reservation"])
+@pytest.mark.parametrize("resource_type", ["device", "topology", "reservation", "secret"])
 def test_batch_check_request_accepts_valid_resource_types(resource_type):
     req = _batch(resource_type=resource_type)
     assert req.resource_type == resource_type
@@ -85,7 +85,7 @@ def test_batch_check_request_rejects_unknown_resource_type():
         _batch(resource_type="vlan")
     msg = str(exc.value)
     assert "resource_type must be one of" in msg
-    assert "device, reservation, topology" in msg
+    assert "device, reservation, secret, topology" in msg
 
 
 def test_batch_check_request_rejects_unknown_permission():

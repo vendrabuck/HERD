@@ -43,8 +43,9 @@ class WebhookSubscription(Base):
     # List of subject-or-event names, e.g. ["reservation.created","reservation.failed"].
     event_types: Mapped[list] = mapped_column(_json_type, nullable=False, default=list)
     # The shared HMAC secret used to sign deliveries. Stored in plaintext because
-    # we must have the cleartext key to compute each signature; encryption-at-rest
-    # for this column is tracked separately as issue #39.
+    # we must have the cleartext key to compute each signature; issue #39 shipped
+    # the encrypted secrets service, and migrating this column into it is a
+    # candidate follow-up.
     secret: Mapped[str] = mapped_column(String(512), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     description: Mapped[str | None] = mapped_column(String(1024), nullable=True)

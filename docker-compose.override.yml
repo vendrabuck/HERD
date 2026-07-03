@@ -49,6 +49,17 @@ services:
       - ./services/integration/app:/app/app
       - ./services/common/herd_common:/app/common/herd_common
 
+  secrets:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      # Dev/test-only KEK so the ephemeral stack boots without setup (never in
+      # make prod, which excludes this override; prod refuses to boot without a
+      # real SECRETS_KEK in .env). Mirrors the WEBHOOK_TEST_SINK_ENABLED seam.
+      SECRETS_KEK: ${SECRETS_KEK:-aGVyZC1kZXYtc3RhY2sta2VrLTMyLWJ5dGVzLW9rISE=}
+    volumes:
+      - ./services/secrets/app:/app/app
+      - ./services/common/herd_common:/app/common/herd_common
+
   cabling:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:

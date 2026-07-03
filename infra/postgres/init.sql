@@ -31,6 +31,9 @@ CREATE SCHEMA IF NOT EXISTS ai_orchestrator;
 -- Integration service schema (external /api/v1 facade + outbound webhooks)
 CREATE SCHEMA IF NOT EXISTS integration;
 
+-- Secrets service schema (encrypted-at-rest credential store)
+CREATE SCHEMA IF NOT EXISTS secrets;
+
 -- Grant the herd user access to all schemas
 GRANT ALL PRIVILEGES ON SCHEMA auth TO herd;
 GRANT ALL PRIVILEGES ON SCHEMA inventory TO herd;
@@ -42,6 +45,7 @@ GRANT ALL PRIVILEGES ON SCHEMA execution TO herd;
 GRANT ALL PRIVILEGES ON SCHEMA notifications TO herd;
 GRANT ALL PRIVILEGES ON SCHEMA ai_orchestrator TO herd;
 GRANT ALL PRIVILEGES ON SCHEMA integration TO herd;
+GRANT ALL PRIVILEGES ON SCHEMA secrets TO herd;
 
 -- Set default search path
-ALTER DATABASE herd SET search_path TO public, auth, inventory, reservations, acl, user_profile, cabling, execution, notifications, ai_orchestrator, integration;
+ALTER DATABASE herd SET search_path TO public, auth, inventory, reservations, acl, user_profile, cabling, execution, notifications, ai_orchestrator, integration, secrets;

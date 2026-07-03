@@ -12,6 +12,7 @@ members = [
     "services/ai-orchestrator",
     "services/notifications",
     "services/integration",
+    "services/secrets",
 ]
 
 [tool.ruff]

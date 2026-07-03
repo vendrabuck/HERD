@@ -92,6 +92,8 @@ services:
         condition: service_healthy
       integration:
         condition: service_healthy
+      secrets:
+        condition: service_healthy
 
   # --- PostgreSQL ---
   postgres:
@@ -301,6 +303,50 @@ services:
       reservations:
         condition: service_healthy
       nats:
+        condition: service_healthy
+
+  # --- Secrets Service (encrypted-at-rest credential store) ---
+  secrets:
+    build:
+      context: .
+      dockerfile: services/secrets/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DB_SCHEMA: secrets
+      SECRET_KEY: ${AUTH_SECRET_KEY}
+      ALGORITHM: ${AUTH_ALGORITHM:-HS256}
+      ACL_SERVICE_URL: http://acl:8000
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      # No default, deliberately: the service refuses to boot without a valid
+      # base64 32-byte key (issue #246 lesson). The dev/test override supplies
+      # one; production must set it in .env.
+      SECRETS_KEK: ${SECRETS_KEK:-}
+      SECRETS_KEK_PREVIOUS: ${SECRETS_KEK_PREVIOUS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - herd-config:/etc/herd:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.secrets.rule=PathPrefix(`/api/secrets`)"
+      - "traefik.http.routers.secrets.entrypoints=websecure"
+      - "traefik.http.routers.secrets.tls=true"
+      - "traefik.http.services.secrets.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.secrets-strip.stripprefix.prefixes=/api/secrets"
+      - "traefik.http.routers.secrets.middlewares=secrets-strip"
+    networks:
+      - herd-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      acl:
         condition: service_healthy
 
   # --- ACL Service ---

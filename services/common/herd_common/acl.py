@@ -23,19 +23,27 @@ logger = logging.getLogger(__name__)
 _ACL_HTTP_TIMEOUT_SECONDS = 5.0
 
 
-async def _explicit_acl_manage(
+async def user_has_grant(
+    *,
     user_id: str,
-    device_id: str,
+    resource_type: str,
+    resource_id: str,
+    permission: str,
     authorization: str,
     acl_service_url: str,
 ) -> bool:
-    """Ask the ACL service whether the user has an explicit `manage` grant."""
+    """Ask the ACL service whether the user has an explicit grant.
+
+    Generic over resource_type/permission (issue #39 added the `secret`
+    resource type). Closed-by-default: network error, non-200, or malformed
+    JSON returns False.
+    """
     url = f"{acl_service_url.rstrip('/')}/check"
     body = {
         "user_id": user_id,
-        "resource_type": "device",
-        "resource_id": device_id,
-        "permission": "manage",
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "permission": permission,
     }
     headers = {"Authorization": authorization}
     try:
@@ -50,6 +58,23 @@ async def _explicit_acl_manage(
         return bool(resp.json().get("allowed", False))
     except ValueError:
         return False
+
+
+async def _explicit_acl_manage(
+    user_id: str,
+    device_id: str,
+    authorization: str,
+    acl_service_url: str,
+) -> bool:
+    """Ask the ACL service whether the user has an explicit `manage` grant."""
+    return await user_has_grant(
+        user_id=user_id,
+        resource_type="device",
+        resource_id=device_id,
+        permission="manage",
+        authorization=authorization,
+        acl_service_url=acl_service_url,
+    )
 
 
 async def _owns_active_reservation(

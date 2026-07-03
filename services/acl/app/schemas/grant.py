@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
-VALID_RESOURCE_TYPES = {"device", "topology", "reservation"}
+VALID_RESOURCE_TYPES = {"device", "topology", "reservation", "secret"}
 VALID_PERMISSIONS = {"view", "manage"}
 
 

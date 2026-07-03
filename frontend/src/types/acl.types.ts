@@ -1,7 +1,7 @@
 export interface Grant {
   id: string;
   group_id: string;
-  resource_type: "device" | "topology" | "reservation";
+  resource_type: "device" | "topology" | "reservation" | "secret";
   resource_id: string;
   permission: "view" | "manage";
   granted_by: string | null;
@@ -10,7 +10,7 @@ export interface Grant {
 
 export interface GrantCreate {
   group_id: string;
-  resource_type: "device" | "topology" | "reservation";
+  resource_type: "device" | "topology" | "reservation" | "secret";
   resource_id: string;
   permission: "view" | "manage";
 }
