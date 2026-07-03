@@ -34,6 +34,8 @@ def _template_to_response(template: DeviceTemplate) -> TemplateResponse:
         template_type=template.template_type,
         driver_id=template.driver_id,
         driver_name=template.driver.name if template.driver else None,
+        driver_sha256=template.driver.sha256 if template.driver else None,
+        driver_filename=template.driver.filename if template.driver else None,
         hypervisor_id=template.hypervisor_id,
         connection_type=template.driver.connection_type if template.driver else None,
         exclusive=template.exclusive,
