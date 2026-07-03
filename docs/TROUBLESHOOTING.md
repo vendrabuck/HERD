@@ -200,6 +200,32 @@ The notifications service consumes the same `herd.reservations.*` events on its 
 
 Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on `herd.reservations.<event-type>`. Check both `herd.reservations.dlq.execution` (execution) and `herd.reservations.dlq.notifications` so you don't miss the half of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 
+## Secrets service
+
+### Secrets container restarts in a loop or exits at boot
+
+By design: the secrets service refuses to start on missing, malformed, or
+mismatched key material rather than serve secrets it cannot encrypt or
+decrypt. `docker compose logs secrets` shows the exact `KekError`:
+
+- "SECRETS_KEK is not set": add it to `.env` (base64-encoded 32 bytes; see
+  `docs/ENV_VARS.md` for the generation one-liner). Under `make up` the dev
+  override supplies a dev-only key, so this appears mostly under `make prod`.
+- "not valid base64" or "must decode to exactly 32 bytes": the value is hex or
+  truncated; regenerate with the documented python one-liner (not
+  `openssl rand -hex`).
+- "does not unwrap with SECRETS_KEK": the key changed since secrets were
+  stored. Restore the original key, or set the old key as
+  `SECRETS_KEK_PREVIOUS` and the new one as `SECRETS_KEK` to rotate (see
+  OPERATIONS.md). If the original key is lost, stored secrets are
+  unrecoverable by design; delete and recreate them.
+
+### Reveal returns 403 or 404 for a non-admin
+
+Expected gating, not an outage: no grant on the secret returns 404, a `view`
+grant returns metadata but 403 on `/value` (plaintext needs `manage`). See the
+secrets matrix in [ROLES.md](ROLES.md).
+
 ## Logs and where to look
 
 - **Global tail**: `make logs` (all containers).
