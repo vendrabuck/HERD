@@ -180,6 +180,11 @@ class TemplateResponse(BaseModel):
     template_type: str
     driver_id: uuid.UUID | None = None
     driver_name: str | None = None
+    # Derived through template.driver so the execution service can load the
+    # recipe/driver package (load_driver needs sha256 + filename). Null when the
+    # template has no driver (port templates). Mirrors DeviceResponse.
+    driver_sha256: str | None = None
+    driver_filename: str | None = None
     hypervisor_id: uuid.UUID | None = None
     connection_type: str | None = None
     exclusive: bool
