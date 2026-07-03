@@ -137,6 +137,39 @@ To rotate:
 
 The SAN in `server.crt` must match the hostname or IP users hit (e.g. `IP:192.0.2.10` or `DNS:lab.example.com`). Bumping this requires regenerating the server cert with the new SAN.
 
+## Secrets-service key rotation
+
+Two independent rotations; know which one you need (see `docs/ARCHITECTURE.md`
+for the envelope-encryption model):
+
+**KEK rotation** (the environment key leaked or is due for rotation). Cheap:
+it re-wraps stored data-encryption keys and never touches secret rows.
+
+1. Generate a new key: `python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`.
+2. In `.env`, move the current `SECRETS_KEK` value to `SECRETS_KEK_PREVIOUS`
+   and set `SECRETS_KEK` to the new key.
+3. `docker compose up -d secrets` (recreate so the new env applies; a plain
+   restart does not re-read `.env`). Boot re-wraps every stored key under the
+   new KEK and logs `keyring_rewrapped`.
+4. Remove `SECRETS_KEK_PREVIOUS` from `.env`. Done; the old KEK is dead.
+
+**DEK rotation** (rotate the key that actually encrypts values). O(number of
+secrets), all in one transaction:
+
+```
+POST /api/secrets/keys/rotate      (admin JWT)
+```
+
+introduces a new key version, re-encrypts every secret to it, and retires (but
+retains) prior versions so nothing becomes undecryptable. Verify with a reveal
+afterwards.
+
+Losing `SECRETS_KEK` with no `SECRETS_KEK_PREVIOUS` window makes stored
+secrets unrecoverable; there is no backdoor. Keep the KEK in whatever secret
+management wraps your `.env`, and note that database backups (above) are
+useless for secret recovery without the KEK from the same era, which is a
+feature.
+
 ## Backup and restore
 
 What to preserve:

@@ -46,11 +46,19 @@ CORS_ORIGINS=https://localhost,https://<your-host-ip>
 
 INTERNAL_API_TOKEN=<generate with: openssl rand -hex 32>
 
+SECRETS_KEK=<generate with: python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())">
+
 NATS_URL=nats://nats:4222
 ```
 
 The `AUTH_SECRET_KEY` and `INTERNAL_API_TOKEN` should be unique random strings.
 The superadmin account is created on first startup only; these values are ignored on subsequent restarts.
+
+`SECRETS_KEK` is the encryption key for the secrets service (base64-encoded 32
+bytes, not hex). It is required for `make prod`; the dev stack (`make up`)
+supplies a dev-only key via `docker-compose.override.yml` so you can defer it
+during evaluation. Store it safely: losing the KEK makes stored secrets
+unrecoverable, and there is no default.
 
 ## 3. TLS certificates (HTTPS)
 
