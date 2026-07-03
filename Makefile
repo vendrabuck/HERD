@@ -3,8 +3,8 @@
 # SERVICES:    every backend service with a pytest suite.
 # DB_SERVICES: subset that owns a Postgres schema and ships Alembic migrations.
 #              These are also the services worth opening a shell into.
-SERVICES := common auth inventory reservations cabling acl execution config ai-orchestrator user-profile notifications integration
-DB_SERVICES := auth inventory reservations cabling acl execution user-profile notifications ai-orchestrator integration
+SERVICES := common auth inventory reservations cabling acl execution config ai-orchestrator user-profile notifications integration secrets
+DB_SERVICES := auth inventory reservations cabling acl execution user-profile notifications ai-orchestrator integration secrets
 
 # Root-level Python helper scripts. These live outside services/ so they are not
 # covered by the workspace ruff config's default discovery, so lint/format target
