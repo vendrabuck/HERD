@@ -8,7 +8,7 @@ already exists, the non-functional work, and the refactors worth doing before th
 codebase grows further.
 
 It doubles as the scoping document for a larger refactor. Nothing here is a new feature;
-it is all about making the current twelve services faster, safer, and easier to change.
+it is all about making the current thirteen services faster, safer, and easier to change.
 Each item is grounded in a specific file and, where one exists, a tracking issue. Items
 are ordered within each section by impact.
 

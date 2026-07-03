@@ -23,6 +23,7 @@ PostgreSQL 16 (a schema per service, no cross-schema joins) and NATS JetStream f
 | user-profile | Per-user preferences (saved filters, page sizes, extras) |
 | notifications | NATS consumer + in-app notifications + prefs proxy |
 | integration | Versioned `/api/v1` reservation facade + outbound webhooks (NATS consumer) |
+| secrets | Encrypted-at-rest credential store (envelope encryption, ACL-gated) |
 
 Each service has its own Docker container, its own Alembic migration chain, and its own `app/config.py` settings.
 
@@ -102,6 +103,28 @@ The `integration` service is the stable external surface for automation, decoupl
 **Machine-token exchange.** Long-lived API tokens are minted by an admin in the auth service (`POST /api/auth/tokens`, role-capped at the principal's own role) and stored only as a hash. A machine exchanges its raw token at the public `POST /api/auth/tokens/exchange` for a short-lived access JWT (`auth_source=api_token`, no refresh token), then sends that JWT to `/api/v1`. Revocation is `DELETE /api/auth/tokens/{id}`.
 
 **Outbound webhook consumer and delivery.** Admins register subscriptions (`POST /api/v1/webhooks`: target URL, subscribed event types, shared HMAC secret). The durable consumer above loads every active subscription matching an event and POSTs a signed copy to each concurrently. Each delivery is signed `X-HERD-Signature: sha256=<hex>` (HMAC-SHA256 over the raw body bytes, keyed by the subscription secret; `herd_common.webhooks.sign_body`), retried with backoff, and recorded in a `webhook_deliveries` ledger that doubles as the at-least-once dedup record (unique on `(subscription_id, event_id)`) and the dead-letter record (`status="dead"` on retry exhaustion). A failing receiver lands a `dead` ledger row and never NAKs the NATS message, so one bad target cannot re-fan-out to the others or stall the stream. See [EXTERNAL_API.md](EXTERNAL_API.md).
+
+## Secrets service: encrypted-at-rest credential store (issue #39)
+
+The `secrets` service holds named secrets whose payloads are envelope-encrypted:
+values are AES-GCM-encrypted by a data-encryption key (DEK), and each DEK is
+stored only wrapped by the key-encryption key supplied via `SECRETS_KEK`
+(base64, 32 bytes). A database dump alone never yields plaintext. GCM associated
+data binds every ciphertext to its (secret id, key version) pair and every
+wrapped DEK to its version, so moving ciphertext between rows fails the auth tag
+instead of decrypting. The service refuses to boot on missing, malformed, or
+mismatched key material.
+
+Authorization rides the ACL service's `secret` resource type: admins manage
+secrets; a group `manage` grant reveals plaintext (`GET /secrets/{id}/value`),
+a `view` grant sees metadata only. `GET /internal/secrets/{id}/value` (and
+`/internal/secrets/by-name/{name}/value`) is the `X-Internal-Token` surface
+that automated provisioning (the planned dynamic-resources feature) consumes.
+`POST /keys/rotate` introduces a new DEK version and re-encrypts every secret;
+KEK rotation is `SECRETS_KEK_PREVIOUS` plus a restart, which re-wraps stored
+DEKs without touching secret rows. Plaintext appears only in value responses,
+never in metadata, logs, or events. See
+[docs/design/0003-encrypted-credential-store.md](design/0003-encrypted-credential-store.md).
 
 ## Reservation state machine
 
