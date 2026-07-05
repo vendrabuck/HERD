@@ -17,9 +17,14 @@ driver.
 | Layer 2 Switch | VLAN management | login, logout, create_vlan, add_to_vlan, remove_from_vlan, delete_vlan, status |
 | Layer 3 Switch | Static route provisioning | login, logout, configure_route, remove_route, status |
 | Management | DUT session management | login, logout, configure, backup, status |
+| Hypervisor | Dynamic-resource service recipe (materialize/destroy an instance) | login, logout, create_instance, destroy_instance, status |
 
-All four contracts are implemented and invoked by the execution service at
-reservation lifecycle events.
+The four physical-device contracts (Layer 1/2/3 Switch, Management) are implemented and
+invoked by the execution service at reservation lifecycle events. The fifth, Hypervisor,
+is the service-recipe contract for dynamic resources (ADR 0004, issue #32): it rides a
+dynamic template's `driver_id` instead of a device's, and it is invoked by a dedicated
+create/teardown flow rather than the L1/L2/L3 reservation lifecycle. See the dedicated
+section below.
 
 ---
 
@@ -768,6 +773,143 @@ current SHA. The checked-in `drivers/frr_mgmt/driver.py` is the worked example:
 its `config_schema()` returns an object schema for `{commands, command}` (raw
 vtysh config lines), which the registry's `additionalProperties: false`
 Management schema would otherwise reject.
+
+## Hypervisor driver contract (dynamic resources, ADR 0004, issue #32)
+
+A service recipe is an ordinary driver package whose `connection_type` is `Hypervisor`.
+It backs the dynamic-resources feature: a `dynamic` inventory template pairs a recipe
+(via the template's `driver_id`) with a registered hypervisor (via `hypervisor_id`), and
+booking that template materializes an instance per reservation instead of referencing a
+pre-existing device. Reusing the ordinary driver package format means upload, storage,
+SHA256 caching, and `driver_metadata.json` all apply unchanged; only the required-method
+set and the invocation path differ from the four physical-device contracts above.
+
+### Class definition
+
+```python
+class Driver:
+    """Hypervisor recipe driver.
+
+    Invoked by the execution service's reservation.provision_requested handler
+    (create) and by its teardown path on reservation.completed / .cancelled /
+    .failed / .updated (destroy), never by the L1/L2/L3 reservation lifecycle
+    flow, and never with a HERD_device_id in context (there is no device yet at
+    create time).
+    """
+
+    def __init__(self, context: dict):
+        self.context = context
+
+    def login(self) -> dict:
+        """Establish a session with the hypervisor endpoint.
+
+        Returns:
+            dict with at minimum {"success": bool}.
+        """
+        ...
+
+    def logout(self) -> dict:
+        """Tear down the hypervisor session.
+
+        Returns:
+            dict with at minimum {"success": bool}.
+        """
+        ...
+
+    def create_instance(self) -> dict:
+        """Materialize one instance on the hypervisor.
+
+        Returns:
+            {"success": bool, "instance_ref": str, "field_data": dict}.
+            instance_ref is the hypervisor-side identity (e.g. a VM id), persisted
+            immediately so a later failure can still tear the instance down.
+            field_data carries instance attributes (management address, etc.)
+            that become the materialized device's field_data, merged with the
+            request's own parameters.
+        """
+        ...
+
+    def destroy_instance(self, instance_ref: str) -> dict:
+        """Destroy one instance.
+
+        MUST be idempotent: destroying an already-absent instance (a redelivered
+        teardown, or one that races a manual deletion on the hypervisor) returns
+        success rather than an error.
+
+        Returns:
+            dict with at minimum {"success": bool}.
+        """
+        ...
+
+    def status(self) -> dict:
+        """Health check: verify the hypervisor endpoint is reachable.
+
+        Returns:
+            dict with at minimum {"reachable": bool}.
+        """
+        ...
+```
+
+### When methods are called
+
+| Event | Sequence |
+|---|---|
+| `reservation.provision_requested` (a dynamic-carrying reservation enters `PENDING_PROVISION`) | per requested instance: login(), create_instance(), logout() |
+| `reservation.completed` / `.cancelled` / `.failed` | per CREATING/ACTIVE ledger row for the reservation: login(), destroy_instance(instance_ref), logout() |
+| `reservation.updated` (devices removed from the reservation) | same as above, restricted to the ledger rows behind the removed devices |
+
+Unlike the four physical-device contracts, a Hypervisor recipe is never invoked on
+`reservation.created`: instance creation runs on the dedicated `provision_requested`
+event, which only fires for a reservation that actually requested a dynamic instance.
+
+### Context reference
+
+There is no device row to build a create-time context from, so the Hypervisor context is
+assembled differently from the other four contracts
+(`services/execution/app/services/nats_consumer.py::_build_recipe_context`):
+
+| Key | Description |
+|---|---|
+| `HERD_<field>` | one entry per field defined in the dynamic template's sections, valued from that field's `default` (template defaults stand in for field_data, since no device exists yet) |
+| `HERD_hypervisor_endpoint` | the registered hypervisor's `endpoint` |
+| `HERD_hypervisor_type` | the registered hypervisor's free-string `hypervisor_type` (e.g. `proxmox`, `vsphere`, `libvirt`) |
+| `HERD_request_id` | the dynamic-instance ledger's per-request id (see Determinism below) |
+| `HERD_reservation_id` | the booking reservation |
+| `HERD_user_id` | the booking user |
+| `HERD_secret_<key>` | one entry per key in the hypervisor's resolved secret value (fetched from the secrets service at `GET /internal/secrets/{id}/value`). Password-typed: these keys travel only in the sandbox's context temp file, never the child process environment, the same exclusion mechanism used for template password fields. |
+
+### Determinism contract
+
+`HERD_request_id` is stable across NATS redelivery: it identifies one requested instance
+for the lifetime of its dynamic-instance ledger row. `create_instance` MUST derive its
+hypervisor-side resource name (VM name, tag, or whatever identity the hypervisor's API
+uses) from `HERD_request_id`, not from a freshly generated value. The redelivery-safety
+story for dynamic resources depends on it: if a create is redelivered after a NAK, the
+recipe must land on the same instance the first attempt would have created, not a second
+one. For the same reason, `destroy_instance` must be idempotent: a redelivered teardown,
+or one whose instance is already gone, is success, not failure.
+
+### Timeout
+
+Recipe actions (`login`, `create_instance`, `destroy_instance`, `logout`) run under
+`RECIPE_TIMEOUT_SECONDS` (default 300s), not the standard `EXECUTION_TIMEOUT_SECONDS`
+(default 30s) the four physical-device contracts use: a hypervisor create or destroy can
+legitimately take minutes. `DRIVER_RLIMIT_CPU_SECONDS` (default 60s) is unaffected, since
+waiting on a remote hypervisor API is wall-clock time, not CPU time.
+
+### Return values
+
+| Method | Required keys |
+|---|---|
+| login | `{"success": bool}` |
+| logout | `{"success": bool}` |
+| create_instance | `{"success": bool, "instance_ref": str, "field_data": dict}` |
+| destroy_instance | `{"success": bool}` |
+| status | `{"reachable": bool}` |
+
+No mock Hypervisor test driver ships in this repository as of this writing; the
+integration-test harness for the contract (analogous to `drivers/mock_l1`,
+`drivers/mock_l2`, and `drivers/mock_l3`) lands separately.
 
 ## Packaging quickstart
 

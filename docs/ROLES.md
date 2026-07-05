@@ -18,6 +18,7 @@ in their JWT access token and enforced independently by each service.
 | View backend connections | yes | yes | yes |
 | Create, update, delete templates | | yes | yes |
 | Upload, update, delete drivers | | yes | yes |
+| Register, update, delete hypervisors | | yes | yes |
 | Add devices to inventory | | yes | yes |
 | Update devices in inventory | | yes | yes |
 | Remove devices from inventory | | yes | yes |
@@ -700,6 +701,85 @@ Returns HTTP 204. Blocked if templates reference the driver (409).
 
 ---
 
+## Hypervisor Management (Admin Operations, ADR 0004)
+
+Hypervisors back the dynamic-resources feature (issue #32): a `dynamic` template pairs
+a registered hypervisor with a recipe driver package to materialize an instance per
+reservation. Registering, updating, and deleting hypervisors requires admin or
+superadmin role; there is no user-visible read surface (unlike templates and drivers,
+which any authenticated user may list).
+
+### List hypervisors
+
+```
+GET /api/inventory/hypervisors
+Authorization: Bearer <admin-token>
+```
+
+### Get a hypervisor
+
+```
+GET /api/inventory/hypervisors/{hypervisor_id}
+Authorization: Bearer <admin-token>
+```
+
+### Register a hypervisor
+
+```
+POST /api/inventory/hypervisors
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{
+  "name": "proxmox-lab-1",
+  "description": "Primary Proxmox cluster",
+  "endpoint": "https://proxmox.lab.internal:8006",
+  "hypervisor_type": "proxmox",
+  "secret_id": "uuid-of-secret",
+  "enabled": true
+}
+```
+
+Returns HTTP 201. Hypervisor names must be unique (409 on duplicate). `secret_id` must
+reference an existing secret in the secrets service (422 if it does not; 503 if the
+secrets service is unreachable); the credential itself is never accepted inline.
+`hypervisor_type` is a free string in v1 (e.g. `proxmox`, `vsphere`, `libvirt`).
+
+### Update a hypervisor
+
+```
+PUT /api/inventory/hypervisors/{hypervisor_id}
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{ "endpoint": "https://proxmox2.lab.internal:8006" }
+```
+
+Any combination of fields can be updated; omitted fields are unchanged. `secret_id` is
+re-validated against the secrets service only when the update actually changes it.
+
+### Delete a hypervisor
+
+```
+DELETE /api/inventory/hypervisors/{hypervisor_id}
+Authorization: Bearer <admin-token>
+```
+
+Returns HTTP 204. Blocked (409) while any template still references the hypervisor.
+
+### Get a hypervisor (internal)
+
+```
+GET /api/inventory/hypervisors/{hypervisor_id}/internal
+X-Internal-Token: <internal-api-token>
+```
+
+Service-to-service read used by the execution service's dynamic-resources create and
+teardown flows to resolve a hypervisor's endpoint, type, and secret reference.
+Internal-token only.
+
+---
+
 ## Port Management (Admin Operations)
 
 Ports are children of devices, typed by a port template. Any authenticated user can
@@ -814,6 +894,28 @@ Authorization: Bearer <any-authenticated-token>
 Supports query params: `range_start` (required), `range_end` (required),
 `status` (list, optional), `device_id` (optional). Non-admin users see only
 reservations for devices visible through their device group permissions.
+
+---
+
+## Provision-Result Callback (Internal, ADR 0004)
+
+```
+POST /api/reservations/internal/{reservation_id}/provision-result
+X-Internal-Token: <internal-api-token>
+Content-Type: application/json
+
+{ "succeeded": true, "device_ids": ["uuid-of-materialized-device"], "error": null }
+```
+
+Reported by the execution service once it has resolved every dynamic instance a
+reservation booked. Guarded by `X-Internal-Token`; idempotent per reservation, so a
+duplicate or late callback (one arriving after the timeout backstop already failed the
+reservation, or a user cancelled it) is a no-op that returns 200 with `applied: false`
+rather than resurrecting or re-transitioning the row. On success, the materialized
+device ids are attached to the reservation and it activates (staging
+`reservation.created` so physical L1/L2/L3 provisioning and the topology fork proceed);
+on failure it lands `FAILED` and stages `reservation.failed`, which drives the
+execution-side dynamic-instance teardown. See [ARCHITECTURE.md](ARCHITECTURE.md#dynamic-resources-hypervisor-backed-templates-adr-0004-issue-32).
 
 ---
 
@@ -1018,6 +1120,42 @@ Authorization: Bearer <admin-token>
 
 Returns HTTP 204 on success.
 
+### Materialize a dynamic instance (internal, ADR 0004)
+
+```
+POST /api/inventory/devices/internal
+X-Internal-Token: <internal-api-token>
+Content-Type: application/json
+
+{
+  "template_id": "uuid-of-dynamic-template",
+  "reservation_id": "uuid-of-reservation",
+  "name": null,
+  "field_data": { "image": "ubuntu-24.04", "cpu": 2, "memory_mb": 4096 }
+}
+```
+
+Used by the execution service after a dynamic-resources recipe's `create_instance`
+succeeds; not reachable with an admin JWT. Accepts only a `dynamic` template (422
+otherwise). The created device is `RESERVED` and joined to the "No Pool" device group
+like every device; when `name` is omitted, one is generated as
+`<template-name>-<first-8-chars-of-reservation-id>-<n>`. `field_data` is validated
+against the template's fields but tolerates unknown keys, since the recipe's
+`create_instance` result carries instance attributes (e.g. a management address) that
+are not template fields. Returns HTTP 201.
+
+### Delete a dynamic instance (internal, ADR 0004)
+
+```
+DELETE /api/inventory/devices/{device_id}/internal
+X-Internal-Token: <internal-api-token>
+```
+
+Used by the execution service after a dynamic-resources recipe's `destroy_instance`
+succeeds. Returns HTTP 204; 404 if the device is absent; 409 if the device exists but
+is not a dynamic instance, since this surface only manages dynamic instances (physical
+devices stay admin-managed through the endpoints above).
+
 ---
 
 ## Backend Connection Management (Admin Operations)
@@ -1099,7 +1237,15 @@ Authorization: Bearer <admin-token>
 | `/api/inventory/devices/{id}` | PUT | | yes | yes |
 | `/api/inventory/devices/{id}` | DELETE | | yes | yes |
 | `/api/inventory/devices/{id}/status` | POST | internal | internal | internal |
+| `/api/inventory/devices/internal` | POST | internal | internal | internal |
+| `/api/inventory/devices/{id}/internal` | DELETE | internal | internal | internal |
 | `/api/inventory/drivers/{id}/internal-download` | GET | internal | internal | internal |
+| `/api/inventory/hypervisors` | GET | | yes | yes |
+| `/api/inventory/hypervisors/{id}` | GET | | yes | yes |
+| `/api/inventory/hypervisors` | POST | | yes | yes |
+| `/api/inventory/hypervisors/{id}` | PUT | | yes | yes |
+| `/api/inventory/hypervisors/{id}` | DELETE | | yes | yes |
+| `/api/inventory/hypervisors/{id}/internal` | GET | internal | internal | internal |
 | `/api/inventory/devices/{id}/ports` | GET | yes | yes | yes |
 | `/api/inventory/devices/{id}/ports` | POST | | yes | yes |
 | `/api/inventory/devices/{id}/ports/bulk` | POST | | yes | yes |
@@ -1122,6 +1268,7 @@ Authorization: Bearer <admin-token>
 | `/api/reservations/{id}` | GET | yes | yes | yes |
 | `/api/reservations/{id}` | DELETE | yes | yes | yes |
 | `/api/reservations/{id}/release` | PUT | yes | yes | yes |
+| `/api/reservations/internal/{id}/provision-result` | POST | internal | internal | internal |
 | `/api/cabling/connections` | GET | yes | yes | yes |
 | `/api/cabling/connections/{id}` | GET | yes | yes | yes |
 | `/api/cabling/connections` | POST | | yes | yes |

@@ -84,6 +84,32 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,
   status filters, and click-to-view details.
 
+## Dynamic resources
+
+- **Hypervisor-backed dynamic templates** (Shipped): a `dynamic` template type
+  materializes an instance from a registered hypervisor when a reservation needs it,
+  rather than referencing a pre-existing device row. Admins register hypervisors
+  (endpoint, a free-string hypervisor type, and a secrets-service credential reference
+  validated at registration) and pair a dynamic template with both a hypervisor and a
+  recipe driver package: an ordinary driver with a new `Hypervisor` connection type
+  (`login`, `logout`, `create_instance`, `destroy_instance`, `status`) that reuses the
+  existing sandbox, cache, and metadata machinery. Booking a dynamic template lists it
+  under `dynamic_requests` on the reservation; a reservation carrying any dynamic
+  request always books through `PENDING_PROVISION` and activates only once the
+  execution service reports every requested instance materialized, so `ACTIVE` keeps
+  meaning "usable". Execution runs the recipe's `login`/`create_instance`/`logout` in
+  the sandbox, materializes a successful create as a real inventory device (visible to
+  topology, health polling, ACLs, and the AI tools like any other device), and records
+  the outcome in an instance ledger; a recipe must derive its hypervisor-side resource
+  name deterministically from the per-instance request id so a NATS redelivery
+  converges on the same instance instead of duplicating it. Completion, cancellation,
+  or failure tears the instance down from that ledger, mirroring the applied-state
+  discipline used for L2/L3 teardown. A configurable timeout (default 900s) fails a
+  reservation stuck in `PENDING_PROVISION` if the completion callback is ever lost, so
+  provisioning can never strand a booking. See
+  [docs/design/0004-dynamic-resources.md](docs/design/0004-dynamic-resources.md) and
+  [docs/DRIVERS.md](docs/DRIVERS.md). (Issue #32.)
+
 ## AI features
 
 - **LLM-driven topology generation** (Shipped): natural-language prompts plus
