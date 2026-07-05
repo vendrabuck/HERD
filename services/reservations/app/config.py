@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     # expiry_reminder_sent_at. 0 disables the reminder.
     expiry_reminder_lead_seconds: int = 3600
 
+    # Dynamic-resource provisioning backstop (ADR 0004, issue #32). A
+    # PENDING_PROVISION reservation carrying dynamic requests that has not
+    # received the execution service's provision-result callback within this
+    # many seconds is failed by the expiration task, so a lost callback never
+    # strands a reservation. 0 disables the backstop.
+    provision_timeout_seconds: int = 900
+
     # Reservation create-time window validation.
     # A start_time earlier than now minus this grace is rejected, so a user
     # cannot book a window that already passed. The grace tolerates clock skew

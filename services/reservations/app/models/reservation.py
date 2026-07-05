@@ -98,6 +98,16 @@ class Reservation(Base):
         creator=lambda device_id: ReservationDevice(device_id=_as_uuid(device_id)),
     )
 
+    # Dynamic instance requests (ADR 0004, issue #32). selectin for the same
+    # MissingGreenlet reason as devices: the provision_requested payload and the
+    # expiration task's backstop read these outside a lazy-load context.
+    dynamic_requests: Mapped[list["ReservationDynamicRequest"]] = relationship(
+        "ReservationDynamicRequest",
+        back_populates="reservation",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
 
 class ReservationDevice(Base):
     """One device membership of a reservation.
@@ -125,3 +135,33 @@ class ReservationDevice(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     reservation: Mapped["Reservation"] = relationship("Reservation", back_populates="devices")
+
+
+class ReservationDynamicRequest(Base):
+    """One requested dynamic instance of a reservation (ADR 0004, issue #32).
+
+    `id` is the request_id the execution service keys its create idempotency
+    on (the dynamic_instances ledger's unique request_id), so it must be stable
+    across event redeliveries: it is minted once here at booking time.
+    `template_id` is a bare UUID, NOT a foreign key: templates are owned by the
+    inventory service's database, validated over HTTP at booking time.
+    """
+
+    __tablename__ = "reservation_dynamic_requests"
+    __table_args__ = (
+        Index("ix_reservation_dynamic_requests_reservation_id", "reservation_id"),
+        *([{"schema": _schema}] if _schema else [{}]),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    reservation_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(f"{_fk_prefix}reservations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    template_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    reservation: Mapped["Reservation"] = relationship(
+        "Reservation", back_populates="dynamic_requests"
+    )
