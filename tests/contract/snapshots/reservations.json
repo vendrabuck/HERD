@@ -33,6 +33,10 @@
       "/internal/{reservation_id}"
     ],
     [
+      "POST",
+      "/internal/{reservation_id}/provision-result"
+    ],
+    [
       "GET",
       "/reports/utilization"
     ],
@@ -84,6 +88,26 @@
       ],
       "type": "object"
     },
+    "DynamicRequestResponse": {
+      "properties": {
+        "id": "string",
+        "template_id": "string"
+      },
+      "required": [
+        "id",
+        "template_id"
+      ],
+      "type": "object"
+    },
+    "DynamicRequestSpec": {
+      "properties": {
+        "template_id": "string"
+      },
+      "required": [
+        "template_id"
+      ],
+      "type": "object"
+    },
     "GroupBucket": {
       "properties": {
         "group_id": "anyOf",
@@ -123,9 +147,34 @@
       ],
       "type": "object"
     },
+    "ProvisionResultRequest": {
+      "properties": {
+        "device_ids": "array",
+        "error": "anyOf",
+        "succeeded": "boolean"
+      },
+      "required": [
+        "succeeded"
+      ],
+      "type": "object"
+    },
+    "ProvisionResultResponse": {
+      "properties": {
+        "applied": "boolean",
+        "reservation_id": "string",
+        "status": "#/components/schemas/ReservationStatus"
+      },
+      "required": [
+        "applied",
+        "reservation_id",
+        "status"
+      ],
+      "type": "object"
+    },
     "ReservationCreate": {
       "properties": {
         "device_ids": "array",
+        "dynamic_requests": "array",
         "end_time": "string",
         "purpose": "anyOf",
         "start_time": "string",
@@ -159,6 +208,7 @@
       "properties": {
         "created_at": "string",
         "device_ids": "array",
+        "dynamic_requests": "array",
         "end_time": "string",
         "id": "string",
         "modified_by": "anyOf",
