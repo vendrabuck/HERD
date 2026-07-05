@@ -34,6 +34,16 @@ class DeviceCreate(BaseModel):
         return _validate_poll_interval(v)
 
 
+class InternalDeviceCreate(BaseModel):
+    # Internal dynamic-instance create (X-Internal-Token). name is server-generated
+    # when omitted; field_data tolerates unknown keys because the recipe's
+    # create_instance result contributes non-template instance attributes.
+    template_id: uuid.UUID
+    reservation_id: uuid.UUID
+    name: str | None = None
+    field_data: dict[str, Any] = {}
+
+
 class DeviceUpdate(BaseModel):
     name: str | None = None
     topology_type: TopologyType | None = None

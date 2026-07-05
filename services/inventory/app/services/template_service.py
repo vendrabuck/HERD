@@ -6,9 +6,41 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
+from app.models.driver_package import ConnectionType, DriverPackage
 from app.models.port import Port
 from app.models.template import DeviceTemplate
 from app.schemas.template import TemplateCreate, TemplateUpdate
+
+
+async def _validate_driver_connection_type(
+    db: AsyncSession, template_type: str, driver_id: uuid.UUID | None
+) -> None:
+    """Enforce the connection-type contract between a template and its driver.
+
+    A dynamic template's driver is a recipe and must be a Hypervisor package; a
+    device template's driver must not be (a device driver configures hardware,
+    not a hypervisor). Port templates have no driver and are unaffected. A
+    missing driver row is left to the caller's own not-found handling.
+    """
+    if driver_id is None:
+        return
+    if template_type not in ("device", "dynamic"):
+        return
+    result = await db.execute(select(DriverPackage).where(DriverPackage.id == driver_id))
+    driver = result.scalar_one_or_none()
+    if driver is None:
+        return
+    is_hypervisor = driver.connection_type == ConnectionType.HYPERVISOR.value
+    if template_type == "dynamic" and not is_hypervisor:
+        raise HTTPException(
+            status_code=422,
+            detail="Dynamic templates require a Hypervisor-type driver",
+        )
+    if template_type == "device" and is_hypervisor:
+        raise HTTPException(
+            status_code=422,
+            detail="Device templates cannot use a Hypervisor-type driver",
+        )
 
 
 async def list_templates(
@@ -32,10 +64,12 @@ async def get_template(db: AsyncSession, template_id: uuid.UUID) -> DeviceTempla
 
 
 async def create_template(db: AsyncSession, data: TemplateCreate) -> DeviceTemplate:
+    await _validate_driver_connection_type(db, data.template_type, data.driver_id)
     template = DeviceTemplate(
         name=data.name,
         template_type=data.template_type,
         driver_id=data.driver_id,
+        hypervisor_id=data.hypervisor_id,
         exclusive=data.exclusive,
         icon=data.icon,
         description=data.description,
@@ -68,6 +102,10 @@ async def update_template(
     if not template:
         return None
     update_data = data.model_dump(exclude_unset=True)
+    # template_type is immutable after create, so re-check the driver against the
+    # existing type whenever driver_id is being changed.
+    if "driver_id" in update_data:
+        await _validate_driver_connection_type(db, template.template_type, update_data["driver_id"])
     if modified_by is not None:
         template.modified_by = modified_by
     if "sections" in update_data and update_data["sections"] is not None:
