@@ -14,7 +14,7 @@ PostgreSQL 16 (a schema per service, no cross-schema joins) and NATS JetStream f
 |---|---|
 | config | Standalone configuration UI, no DB |
 | auth | JWT auth (local or LDAP/AD), RBAC, user/group mgmt |
-| inventory | Templates, devices, ports, drivers, device groups |
+| inventory | Templates, devices, ports, drivers, device groups, hypervisor registry |
 | reservations | Time-window reservations, conflict detection, auto-expire |
 | cabling | Connections, topology persistence, pathfinding |
 | acl | Resource-level grants (topology, reservation) |
@@ -70,15 +70,16 @@ A fourth opt-in **retry+raise** mode uses `herd_common.retry.retry_with_backoff`
 
 Two source streams carry live work, plus a dedicated `HERD_DLQ` stream that retains dead-lettered messages (see below).
 
-**`HERD_RESERVATIONS`** carries `herd.reservations.*` subjects. The reservations service publishes `reservation.created`, `reservation.updated`, `reservation.cancelled`, `reservation.completed`, `reservation.failed`, and `reservation.expiring_soon`. Three services consume them with independent durable consumers:
+**`HERD_RESERVATIONS`** carries `herd.reservations.*` subjects. The reservations service publishes `reservation.created`, `reservation.updated`, `reservation.cancelled`, `reservation.completed`, `reservation.failed`, `reservation.expiring_soon`, and `reservation.provision_requested`. Three services consume them with independent durable consumers:
 
 - **execution** (`execution-consumer`) triggers driver actions:
   - `reservation.created`: L1 connect_ports per switch; L2 create_vlan + add_to_vlan for each DUT port connected to an L2 switch; L3 configure_route for each route in an adjacent L3 switch's latest config version, with the applied set pinned in `route_assignments`.
-  - `reservation.cancelled / completed`: L1 disconnect_ports; L2 remove_from_vlan + delete_vlan; L3 remove_route for exactly the pinned route set (never re-derived from the config), released only after the driver ran.
-  - `reservation.updated`: L1 update_ports for added/removed devices; L2 provision/deprovision for added/removed devices; L3 provisions added adjacency and deprovisions a switch only when it no longer serves any remaining reserved device.
-  - `reservation.failed`: best-effort teardown of whatever provisioning landed before the failure (issue #244). Applied-state only: L1 disconnect_ports only for pairs whose connect_ports succeeded for the reservation; L2 remove_from_vlan + delete_vlan driven strictly from the stored `vlan_assignments` (no derived-VLAN fallback), with the rows released only after the switches were driven; L3 remove_route for the pinned set, same as cancelled/completed. A reservation that failed before any provisioning tears down nothing.
+  - `reservation.cancelled / completed`: L1 disconnect_ports; L2 remove_from_vlan + delete_vlan; L3 remove_route for exactly the pinned route set (never re-derived from the config), released only after the driver ran. Any dynamic instances the reservation booked are torn down from the `dynamic_instances` ledger the same way (see Dynamic resources below).
+  - `reservation.updated`: L1 update_ports for added/removed devices; L2 provision/deprovision for added/removed devices; L3 provisions added adjacency and deprovisions a switch only when it no longer serves any remaining reserved device; dynamic instances behind removed devices are torn down.
+  - `reservation.failed`: best-effort teardown of whatever provisioning landed before the failure (issue #244). Applied-state only: L1 disconnect_ports only for pairs whose connect_ports succeeded for the reservation; L2 remove_from_vlan + delete_vlan driven strictly from the stored `vlan_assignments` (no derived-VLAN fallback), with the rows released only after the switches were driven; L3 remove_route for the pinned set, same as cancelled/completed; dynamic instances tear down from the ledger, same as cancelled/completed. A reservation that failed before any provisioning tears down nothing.
+  - `reservation.provision_requested`: a separate branch, entirely apart from the L1/L2/L3 flows above, that materializes a dynamic-carrying reservation's requested instances; see Dynamic resources below.
   - Idempotent on redelivery: each mutating driver action records a stable `dedupe_key` on its `execution_runs` row, and the consumer skips any action whose `SUCCESS` run already carries that key. The key is the producer-stamped payload `event_id` (the outbox row id, issue #21), which survives a relay republish under a new stream sequence, falling back to the source message's NATS `stream:sequence` for events published before the outbox existed. A NAK retry re-runs only the action that failed, never the ones that already applied (`login`/`logout` are not deduped).
-- **notifications** (`notifications-consumer`) turns the same events into per-user in-app notifications, gated by the user's `extras.notifications` preferences in user-profile.
+- **notifications** (`notifications-consumer`) turns the same events into per-user in-app notifications, gated by the user's `extras.notifications` preferences in user-profile. `reservation.provision_requested` is not one of the events it (or the integration webhooks consumer below) reacts to; it exists solely to trigger the execution-side create flow.
 - **integration** (`integration-webhooks-consumer`) fans each event out to admin-registered outbound webhooks as HMAC-signed POSTs, with a delivery ledger and dead-letter record (issue #33); see the integration-service section below.
 
 **`HERD_HEALTH`** carries `herd.health.status_changed`. The execution service's health-poll scheduler publishes a `device.health_transition` event when a polled device's `consecutive_failures` crosses the configured threshold (bad_news) or resets to zero (recovery). The notifications service consumes this stream with its own durable consumer (`notifications-health-consumer`) and fans the event out as in-app notifications to all admins plus any users with an active reservation on the device.
@@ -120,7 +121,10 @@ Authorization rides the ACL service's `secret` resource type: admins manage
 secrets; a group `manage` grant reveals plaintext (`GET /secrets/{id}/value`),
 a `view` grant sees metadata only. `GET /internal/secrets/{id}/value` (and
 `/internal/secrets/by-name/{name}/value`) is the `X-Internal-Token` surface
-that automated provisioning (the planned dynamic-resources feature) consumes.
+that automated provisioning consumes: inventory calls it once at hypervisor
+registration to confirm a referenced secret exists, and execution's recipe
+runner calls it on every dynamic-instance create or teardown to resolve the
+hypervisor's credential (see Dynamic resources below).
 `POST /keys/rotate` introduces a new DEK version and re-encrypts every secret;
 KEK rotation is `SECRETS_KEK_PREVIOUS` plus a restart, which re-wraps stored
 DEKs without touching secret rows. Plaintext appears only in value responses,
@@ -135,13 +139,13 @@ Transitions (from state, to state, trigger):
 |---|---|---|
 | PENDING | PENDING_PROVISION | expiration task claims a scheduled reservation at start_time |
 | PENDING | CANCELLED | user cancels before activation |
-| PENDING_PROVISION | ACTIVE | inventory status flip succeeds |
-| PENDING_PROVISION | FAILED | provisioning retries exhausted |
+| PENDING_PROVISION | ACTIVE | inventory status flip succeeds (physical-only reservations), or the execution service's provision-result callback reports success (dynamic-carrying reservations) |
+| PENDING_PROVISION | FAILED | provisioning retries exhausted (physical-only reservations), or the provision-result callback reports failure, or the provisioning timeout backstop fires with no callback (dynamic-carrying reservations) |
 | ACTIVE | COMPLETED | end_time passes (expiration task) |
 | ACTIVE | CANCELLED | user cancels an active hold |
 
 - `PENDING` is the state for scheduled-future reservations. A booking whose `start_time` is more than `RESERVATION_START_GRACE_SECONDS` ahead is created `PENDING` with no provisioning (its row still holds the window for conflict detection); within the grace, a "start now" booking is provisioned immediately. The expiration task provisions a `PENDING` reservation at `start_time`: it claims the row to `PENDING_PROVISION`, flips inventory, enqueues `reservation.created` to the outbox in the same transaction, and creates the fork, the same work the immediate path does. A flip failure at activation reverts the claim to `PENDING` so a later tick retries (it does not `FAIL` the booking).
-- `PENDING_PROVISION` is the transient provisioning state, entered either at create (immediate booking) or when the expiration task claims a scheduled `PENDING` reservation: the inventory status flip retries; success -> `ACTIVE`, exhausted retries -> `FAILED` (immediate path) or revert to `PENDING` (scheduled path).
+- `PENDING_PROVISION` is the transient provisioning state, entered either at create (immediate booking) or when the expiration task claims a scheduled `PENDING` reservation. For a physical-only reservation, the inventory status flip retries; success -> `ACTIVE`, exhausted retries -> `FAILED` (immediate path) or revert to `PENDING` (scheduled path). A reservation carrying any `dynamic_requests` (ADR 0004, issue #32) always books through `PENDING_PROVISION`, even with no exclusive devices to flip, and stays there until the execution service's `POST /internal/{reservation_id}/provision-result` callback (`X-Internal-Token`, idempotent per reservation) resolves it: success attaches the materialized device ids and activates exactly like the physical path (staging `reservation.created` so L1/L2/L3 provisioning and the fork proceed once the dynamic devices exist); failure lands `FAILED` and releases any exclusive physical devices back to `AVAILABLE`. A duplicate or late callback is a no-op. Because a lost callback would otherwise strand the reservation, the expiration task's cycle also fails any `PENDING_PROVISION` reservation with dynamic requests whose row has not been touched in `PROVISION_TIMEOUT_SECONDS` (default 900s; `0` disables the backstop). See Dynamic resources below.
 - `FAILED` rows persist for audit but hold no devices.
 - `CANCELLED` and `COMPLETED` are terminal states.
 - `_check_conflicts` treats `PENDING`, `PENDING_PROVISION`, and `ACTIVE` as conflicting; two concurrent creates for the same exclusive device race safely.
@@ -215,7 +219,8 @@ security note below):
   - `Layer 1 Switch`: login, logout, connect_ports, disconnect_ports, status
   - `Layer 2 Switch`: login, logout, create_vlan, add_to_vlan, remove_from_vlan, delete_vlan, status
   - `Layer 3 Switch`: login, logout, configure_route, remove_route, status
-- Runtime: device context is passed via a temp JSON file. Non-secret context values are also exposed as `HERD_`-prefixed env vars for observability; password-typed fields are stripped from the env and reach the driver only through the temp file. Method kwargs go via argv. Timeout defaults to 30s (10s for `status`).
+  - `Hypervisor`: login, logout, create_instance, destroy_instance, status. This is a dynamic-resources recipe (ADR 0004, issue #32), not a physical-device driver; see Dynamic resources below.
+- Runtime: device context is passed via a temp JSON file. Non-secret context values are also exposed as `HERD_`-prefixed env vars for observability; password-typed fields are stripped from the env and reach the driver only through the temp file. Method kwargs go via argv. Timeout defaults to 30s (10s for `status`); a `Hypervisor` recipe's actions instead run under `RECIPE_TIMEOUT_SECONDS` (default 300s), since a hypervisor create or destroy can take minutes.
 - Resource limits: the child gets POSIX `setrlimit` caps for address space (256 MB), CPU time (60s), open files, and processes, each configurable (0 disables a limit). A driver killed by a limit is recorded as failed with the signal.
 - Dependencies: a package `requirements.txt` is installed at runtime only when `ALLOW_DRIVER_PIP_INSTALL` is set; otherwise drivers vendor deps into `_deps/`. Off by default because a runtime `pip install` pulls network code as the service user.
 - Driver cache: local disk at `/data/driver-cache/`, keyed by SHA256. Stale caches auto-invalidate.
@@ -223,6 +228,71 @@ security note below):
 Security note: this is process separation with resource caps, not a security sandbox. There is no namespace, seccomp, filesystem, or network isolation, and the child runs as the execution service's own user, so a driver can reach the network and read files that user can read. Driver upload is admin-only for this reason; driver packages are trusted code. The resource limits are POSIX-only.
 
 See [DRIVERS.md](DRIVERS.md) for the developer-facing contract and packaging guide.
+
+## Dynamic resources: hypervisor-backed templates (ADR 0004, issue #32)
+
+A `dynamic` template type materializes an instance per reservation from a registered
+hypervisor, instead of referencing a pre-existing device row.
+
+**Hypervisor registry (inventory).** Admins register hypervisors at `POST /hypervisors`
+(name, endpoint, a free-string `hypervisor_type` such as `proxmox`/`vsphere`/`libvirt`,
+and a `secret_id` referencing the secrets service, validated once at registration and
+re-validated only when a later `PUT` actually changes `secret_id`); `GET
+/hypervisors/{id}/internal` (`X-Internal-Token`) is the execution-side read. Deleting a
+hypervisor is blocked (409) while any template still references it. A dynamic template
+(`template_type="dynamic"`) requires both `driver_id` (a `Hypervisor`-connection-type
+recipe package) and `hypervisor_id`; its field sections describe instance parameters
+(image, cpu, memory) exactly like a device template's fields. `POST /devices` continues
+to reject any non-`"device"` template; dynamic instances enter inventory only through
+the internal path below.
+
+**Booking.** `ReservationCreate.dynamic_requests` lists the dynamic templates to
+materialize (one entry per instance requested, no dedup, capped at 50 per reservation).
+A reservation carrying any dynamic request always books through `PENDING_PROVISION` and
+never straight to `ACTIVE` (see Reservation state machine above), whether created
+immediately or claimed by the expiration task's scheduled path; once any exclusive
+physical devices have flipped to `RESERVED`, reservations stages a
+`herd.reservations.provision_requested` outbox event.
+
+**Provisioning (execution).** The execution consumer's `reservation.provision_requested`
+handler, a branch entirely separate from the L1/L2/L3 flows, processes each requested
+instance: fetch the template, its hypervisor, and the hypervisor's secret value; load
+the recipe package; run `login`, `create_instance`, `logout` in the sandbox under
+`RECIPE_TIMEOUT_SECONDS`. On a successful `create_instance`, `POST /devices/internal`
+materializes the instance as a real inventory device (status `RESERVED`, joined to the
+"No Pool" device group like every device, `field_data` merged from the request
+parameters and the recipe's result), and the outcome is recorded in execution's
+`dynamic_instances` ledger (id, reservation_id, template_id, hypervisor_id, device_id,
+instance_ref, status `CREATING`/`ACTIVE`/`DESTROYED`, error, timestamps): the direct peer
+of the L2 `VlanAssignment` and L3 `RouteAssignment` applied-state ledgers. A recipe must
+derive its hypervisor-side resource name deterministically from the request's
+`HERD_request_id` context key, so a NATS redelivery of the same create converges on the
+same instance rather than leaking a duplicate (see [DRIVERS.md](DRIVERS.md) for the full
+context contract). Once every requested instance for the reservation reaches `ACTIVE`,
+execution posts the result to reservations; the ledger row insert happens before any
+hypervisor action runs, so a NAK mid-create leaves a row an idempotent retry can resume
+against.
+
+**Activation callback and timeout backstop (reservations).** This closes a gap the
+design explicitly called out: before this feature, execution had no way to report a
+provisioning outcome back to reservations. `POST
+/internal/{reservation_id}/provision-result` fills it; see Reservation state machine
+above for the transition semantics.
+
+**Teardown.** `reservation.completed`, `.cancelled`, and `.failed` drive execution to
+tear down every `CREATING`/`ACTIVE` ledger row for that reservation (`reservation.updated`
+tears down only the rows behind removed devices): `login`, `destroy_instance`, `logout`,
+then delete the materialized device (`DELETE /devices/{id}/internal`, where a 404 counts
+as already gone), then mark the row `DESTROYED`. Mirroring the L3 applied-state
+discipline (issue #244): a driver-result failure from `destroy_instance` leaves the row
+`ACTIVE` as an accurate "instance may still exist" record rather than raising, while a
+transient upstream error NAKs the message for redelivery; `destroy_instance` must
+therefore be idempotent, since a redelivered teardown (or one that finds the instance
+already gone) must still return success. A row with no `instance_ref` (nothing was ever
+created hypervisor-side) is retired directly.
+
+See [docs/design/0004-dynamic-resources.md](design/0004-dynamic-resources.md) for the
+accepted design and [DRIVERS.md](DRIVERS.md) for the Hypervisor driver contract.
 
 ## AI orchestrator
 
@@ -322,3 +392,4 @@ The other nine services are candidates to merge into a single FastAPI app with m
 - [DRIVERS.md](DRIVERS.md) for the driver execution model.
 - [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md) for the canvas and connectivity validation.
 - [BULK_IMPORT_EXPORT.md](BULK_IMPORT_EXPORT.md) for the CSV/JSON file schemas and cross-instance reference resolution.
+- [design/0004-dynamic-resources.md](design/0004-dynamic-resources.md) for the hypervisor-backed dynamic-resources design (issue #32).

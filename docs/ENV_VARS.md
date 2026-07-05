@@ -96,10 +96,11 @@ Read by services that need to call other services. The defaults assume the compo
 | `AUTH_SERVICE_URL` | `http://auth:8000` | inventory, acl (forward user JWT to resolve groups) |
 | `INVENTORY_SERVICE_URL` | `http://inventory:8000` | reservations, execution, ai-orchestrator, cabling (device-group boundary check) |
 | `CABLING_SERVICE_URL` | `http://cabling:8000` | execution, ai-orchestrator, reservations (connectivity validation via `/validate/internal`) |
-| `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | ai-orchestrator, inventory (apply scheduler checks reservation activity via `/internal/{id}`) |
+| `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | ai-orchestrator, inventory (apply scheduler checks reservation activity via `/internal/{id}`), execution (dynamic-resources provision-result callback, `/internal/{id}/provision-result`, ADR 0004) |
 | `EXECUTION_SERVICE_URL` | `http://execution:8000` | ai-orchestrator, inventory (apply scheduler dispatches configure runs) |
 | `ACL_SERVICE_URL` | `http://acl:8000` | inventory, execution (carve-out check for non-admin configure on managed devices) |
 | `USER_PROFILE_SERVICE_URL` | `http://user-profile:8000` | notifications (read prefs via internal endpoint and proxy PUT/GET) |
+| `SECRETS_SERVICE_URL` | `http://secrets:8000` | inventory (validate a hypervisor's secret reference at registration/update), execution (resolve a hypervisor's secret value for a dynamic-resources recipe run, ADR 0004) |
 
 If you run a service on a different host or port, update the URL in `.env` or the config UI. Paths should NOT include `/api/<service>` prefix; that's Traefik's prefix, not the app's route.
 
@@ -211,6 +212,7 @@ Same shape, different `AI_BASE_URL`:
 |---|---|---|
 | `EXECUTION_TIMEOUT_SECONDS` | `30` | Subprocess timeout for a driver method call (non-status). |
 | `STATUS_CHECK_TIMEOUT_SECONDS` | `10` | Shorter timeout for the `status` method. |
+| `RECIPE_TIMEOUT_SECONDS` | `300` | Wall-clock subprocess timeout for a `Hypervisor`-connection-type recipe's `login`/`create_instance`/`destroy_instance`/`logout` calls, run by the NATS consumer's dynamic-resources create and teardown flows (ADR 0004, issue #32), not `POST /execution/execute`. Longer than `EXECUTION_TIMEOUT_SECONDS` because a hypervisor create or destroy can take minutes; `DRIVER_RLIMIT_CPU_SECONDS` still applies unchanged, since waiting on a remote API is not CPU time. |
 | `DRIVER_CACHE_PATH` | `/data/driver-cache` | Local driver cache path. Volume-backed. |
 | `DRIVER_RLIMIT_AS_BYTES` | `268435456` | POSIX `RLIMIT_AS` (address space) for the driver subprocess, in bytes; 256 MB default. `0` disables. Raise or disable for numpy/pandas/BLAS drivers, which reserve large virtual address space. |
 | `DRIVER_RLIMIT_CPU_SECONDS` | `60` | POSIX `RLIMIT_CPU` for the driver subprocess, in seconds. `0` disables. |
@@ -297,6 +299,7 @@ The notifications service runs two durable NATS consumers: one on `herd.reservat
 | `EXPIRY_REMINDER_LEAD_SECONDS` | `3600` | Lead window before `end_time` in which the expiration task publishes a `reservation.expiring_soon` event onto `HERD_RESERVATIONS` (ROADMAP #40). An ACTIVE reservation whose `end_time` is within this many seconds of now, and still in the future, gets exactly one reminder, deduped via `expiry_reminder_sent_at`. `0` disables the reminder. |
 | `RESERVATION_START_GRACE_SECONDS` | `300` | On create, a `start_time` earlier than now minus this grace is rejected (422), so a user cannot book a window that already passed. The grace tolerates clock skew and "start now". It also sets the scheduled-vs-immediate boundary: a `start_time` more than this grace in the future is created `PENDING` and provisioned by the expiration task at start_time, while a booking within the grace is provisioned immediately. The expiration loop activates `PENDING` reservations whose start has ticked past. |
 | `RESERVATION_MAX_DURATION_SECONDS` | `2592000` | On create, a window longer than this (default 30 days) is rejected (422), guarding against runaway or typo'd bookings. `0` disables the cap. |
+| `PROVISION_TIMEOUT_SECONDS` | `900` | Dynamic-resources provisioning backstop (ADR 0004, issue #32). A `PENDING_PROVISION` reservation carrying `dynamic_requests` whose row has not been updated in this many seconds is failed by the expiration task (`reservation.failed` is staged), so a lost provision-result callback from the execution service can never strand a reservation. Physical-only `PENDING_PROVISION` reservations are unaffected; they resolve inside the create call or the scheduled path's retry-next-tick revert. `0` disables the backstop. |
 | `OUTBOX_RELAY_TICK_SECONDS` | `5.0` | Transactional outbox relay (issue #21) poll cadence in seconds: how often the relay drains unpublished `outbox` rows to JetStream. A NATS outage backs this off exponentially and a healthy tick resets it. |
 | `OUTBOX_BATCH_SIZE` | `100` | Maximum outbox rows the relay publishes per tick. Each row is claimed with `FOR UPDATE SKIP LOCKED` and published with a `Nats-Msg-Id` header for publisher-side dedup. |
 | `OUTBOX_RETENTION_SECONDS` | `604800` | How long published outbox rows are retained before the relay prunes them; default 7 days. |
