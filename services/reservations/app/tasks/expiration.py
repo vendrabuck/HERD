@@ -7,16 +7,23 @@ from datetime import datetime, timedelta, timezone
 
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, select
+from sqlalchemy import and_, exists, select
 
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.outbox import OutboxEvent
-from app.models.reservation import Reservation, ReservationStatus
+from app.models.reservation import (
+    Reservation,
+    ReservationDynamicRequest,
+    ReservationStatus,
+)
 from app.services.reservation_service import (
     _create_reservation_fork_best_effort,
     _fetch_devices_best_effort,
+    _provision_requested_event,
+    _release_exclusive_devices_best_effort,
     _reservation_created_event,
+    _reservation_failed_event,
     _update_device_statuses,
 )
 
@@ -25,6 +32,8 @@ logger = logging.getLogger(__name__)
 EXPIRING_SOON_SUBJECT = "herd.reservations.expiring_soon"
 COMPLETED_SUBJECT = "herd.reservations.completed"
 CREATED_SUBJECT = "herd.reservations.created"
+FAILED_SUBJECT = "herd.reservations.failed"
+PROVISION_REQUESTED_SUBJECT = "herd.reservations.provision_requested"
 
 
 async def _run_reminder_cycle() -> None:
@@ -158,6 +167,27 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
         res = await db.get(Reservation, reservation_id)
         if res is None or res.status != ReservationStatus.PENDING_PROVISION:
             return False
+        if res.dynamic_requests:
+            # Gated activation (ADR 0004): a dynamic-carrying reservation stays
+            # PENDING_PROVISION with its devices RESERVED; stage
+            # provision_requested and let the execution service's callback (or
+            # the timeout backstop) own the next transition. The fork and
+            # reservation.created follow in the callback path. Publishing after
+            # the flip (not at the claim) keeps the retry-next-tick revert
+            # above from orphaning instances against a PENDING reservation.
+            enqueue_event(
+                db, OutboxEvent, PROVISION_REQUESTED_SUBJECT, _provision_requested_event(res)
+            )
+            await db.commit()
+            logger.info(
+                "Scheduled dynamic reservation handed to provisioning: %s",
+                reservation_id,
+                extra={
+                    "action": "scheduled_provision_requested",
+                    "reservation_id": str(reservation_id),
+                },
+            )
+            return True
         res.status = ReservationStatus.ACTIVE
         enqueue_event(db, OutboxEvent, CREATED_SUBJECT, _reservation_created_event(res))
         await db.commit()
@@ -257,6 +287,40 @@ async def _run_expiration_cycle() -> None:
                 extra={"action": "auto_complete", "reservation_id": str(res.id)},
             )
 
+        # Timeout backstop (ADR 0004): fail dynamic-carrying reservations stuck
+        # in PENDING_PROVISION past provision_timeout_seconds, so a lost
+        # provision-result callback never strands a reservation. updated_at is
+        # the transition timestamp: nothing touches a stuck row after it enters
+        # PENDING_PROVISION. Physical-only PENDING_PROVISION reservations are
+        # excluded; they resolve inside the create call or the claim path's
+        # retry-next-tick revert. reservation.failed drives execution-side
+        # instance teardown. A timeout of 0 disables the backstop rather than
+        # instantly failing every in-flight provisioning.
+        stuck: list[Reservation] = []
+        if settings.provision_timeout_seconds > 0:
+            deadline = now - timedelta(seconds=settings.provision_timeout_seconds)
+            result = await db.execute(
+                select(Reservation).where(
+                    and_(
+                        Reservation.status == ReservationStatus.PENDING_PROVISION,
+                        Reservation.updated_at <= deadline,
+                        exists().where(ReservationDynamicRequest.reservation_id == Reservation.id),
+                    )
+                )
+            )
+            stuck = list(result.scalars().all())
+            for res in stuck:
+                res.status = ReservationStatus.FAILED
+                enqueue_event(db, OutboxEvent, FAILED_SUBJECT, _reservation_failed_event(res))
+                logger.error(
+                    "Provisioning timed out for reservation %s; failing it",
+                    res.id,
+                    extra={
+                        "action": "provision_timeout_failed",
+                        "reservation_id": str(res.id),
+                    },
+                )
+
         await db.commit()
 
     # Provision each claimed reservation now that the claim is committed and the
@@ -285,6 +349,14 @@ async def _run_expiration_cycle() -> None:
                 exclusive_ids.append(did)
         if exclusive_ids:
             await _update_device_statuses(exclusive_ids, "AVAILABLE")
+
+    # Release the timed-out reservations' exclusive devices back to AVAILABLE
+    # (the create path's orphaned-RESERVED discipline: FAILED is outside the
+    # conflict status set, so a RESERVED device would be unbookable forever).
+    for res in stuck:
+        await _release_exclusive_devices_best_effort(
+            res.id, list(res.device_ids), "provision_timeout_release"
+        )
 
 
 async def expiration_loop(interval_seconds: int = 60) -> None:

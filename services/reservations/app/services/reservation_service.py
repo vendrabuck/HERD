@@ -26,6 +26,7 @@ from app.models.outbox import OutboxEvent
 from app.models.reservation import (
     Reservation,
     ReservationDevice,
+    ReservationDynamicRequest,
     ReservationStatus,
     TopologyType,
 )
@@ -90,6 +91,52 @@ async def _fetch_devices_best_effort(
             return resp.json()
 
         return await asyncio.gather(*[fetch_one(did) for did in device_ids], return_exceptions=True)
+
+
+async def _fetch_dynamic_templates(template_ids: list[uuid.UUID], token: str) -> list[dict]:
+    """Fetch template info from the inventory service concurrently (ADR 0004).
+
+    All-or-nothing, mirroring _fetch_devices: templates referenced by dynamic
+    requests are validated at the service boundary before booking, so a missing
+    template raises ValueError (422) and a transport failure bubbles up for the
+    caller to convert to RuntimeError (503).
+    """
+    async with httpx.AsyncClient() as client:
+
+        async def fetch_one(template_id: uuid.UUID) -> dict:
+            resp = await client.get(
+                f"{settings.inventory_service_url}/templates/{template_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 404:
+                raise ValueError(f"Template {template_id} not found in inventory")
+            resp.raise_for_status()
+            return resp.json()
+
+        return await asyncio.gather(*[fetch_one(tid) for tid in template_ids])
+
+
+async def _validate_dynamic_requests(dynamic_requests, token: str) -> None:
+    """Validate every dynamic request's template exists and is a dynamic template.
+
+    Raises ValueError (422) for a missing or wrong-type template and RuntimeError
+    (503) when inventory is unreachable, matching the device-validation
+    error-code conventions on the create path.
+    """
+    unique_ids = list(dict.fromkeys(req.template_id for req in dynamic_requests))
+    try:
+        templates = await _fetch_dynamic_templates(unique_ids, token)
+    except ValueError as exc:
+        raise exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
+
+    non_dynamic = [str(t["id"]) for t in templates if t.get("template_type") != "dynamic"]
+    if non_dynamic:
+        raise ValueError(
+            f"The following templates are not dynamic templates: {', '.join(non_dynamic)}"
+        )
 
 
 async def _validate_topology_connectivity(topology_id: uuid.UUID) -> None:
@@ -374,6 +421,83 @@ def _reservation_created_event(reservation: Reservation) -> dict:
     }
 
 
+def _provision_requested_event(reservation: Reservation) -> dict:
+    """Build the reservation.provision_requested payload (ADR 0004, issue #32).
+
+    Field names are pinned by the execution consumer's _handle_provision_requested:
+    it reads reservation_id, user_id, and dynamic_requests entries as
+    {"id", "template_id"}, where id is the ledger request_id its create
+    idempotency keys on. enqueue_event stamps event_id.
+    """
+    return {
+        "event": "reservation.provision_requested",
+        "reservation_id": str(reservation.id),
+        "user_id": str(reservation.user_id),
+        "device_ids": [str(d) for d in reservation.device_ids],
+        "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
+        "topology_type": reservation.topology_type.value,
+        "dynamic_requests": [
+            {"id": str(r.id), "template_id": str(r.template_id)}
+            for r in reservation.dynamic_requests
+        ],
+    }
+
+
+def _reservation_failed_event(reservation: Reservation) -> dict:
+    """Build the reservation.failed payload, shared by every FAILED transition.
+
+    Same shape as the create-path inventory-flip failure so the execution
+    teardown consumer and webhooks handle a callback failure or a timeout
+    backstop identically.
+    """
+    return {
+        "event": "reservation.failed",
+        "reservation_id": str(reservation.id),
+        "user_id": str(reservation.user_id),
+        "device_ids": [str(d) for d in reservation.device_ids],
+        "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
+        "topology_type": reservation.topology_type.value,
+    }
+
+
+async def _release_exclusive_devices_best_effort(
+    reservation_id: uuid.UUID, device_ids: list[uuid.UUID], log_action: str
+) -> None:
+    """Release a FAILED reservation's exclusive devices back to AVAILABLE.
+
+    Same discipline as the create path's revert: a FAILED reservation is
+    excluded from the conflict status set, so devices left RESERVED would be
+    orphaned (unbookable, nothing referencing them). Best-effort with bounded
+    retry; the FAILED transition is already committed and is never reverted.
+    """
+    fetch_results = await _fetch_devices_best_effort(device_ids)
+    exclusive_ids: list[uuid.UUID] = []
+    for did, result in zip(device_ids, fetch_results):
+        if isinstance(result, BaseException) or result.get("exclusive", True):
+            exclusive_ids.append(did)
+    if not exclusive_ids:
+        return
+    try:
+        await retry_with_backoff(
+            lambda: _update_device_statuses(exclusive_ids, "AVAILABLE", raise_on_failure=True),
+            attempts=3,
+            initial_delay=0.5,
+            factor=2.0,
+            max_delay=5.0,
+        )
+    except Exception as exc:
+        logger.error(
+            "Inventory release failed after retries for failed reservation %s",
+            reservation_id,
+            extra={
+                "action": log_action,
+                "reservation_id": str(reservation_id),
+                "device_ids": [str(d) for d in exclusive_ids],
+            },
+            exc_info=exc,
+        )
+
+
 async def create_reservation(
     db: AsyncSession,
     data: ReservationCreate,
@@ -401,6 +525,13 @@ async def create_reservation(
     # in the cabling graph. Reservations without a topology are unaffected.
     if data.topology_id is not None:
         await _validate_topology_connectivity(data.topology_id)
+
+    # 2c. Validate dynamic requests against inventory (ADR 0004): every
+    # template must exist and be a dynamic template. Reservations without
+    # dynamic requests are unaffected.
+    has_dynamic = bool(data.dynamic_requests)
+    if has_dynamic:
+        await _validate_dynamic_requests(data.dynamic_requests, token)
 
     # Partition devices into exclusive vs non-exclusive
     exclusive_ids = {str(d["id"]) for d in devices if d.get("exclusive", True)}
@@ -460,7 +591,10 @@ async def create_reservation(
         # Scheduled: hold the window (the row is visible to _check_conflicts) but
         # defer all provisioning to the activation cycle at start_time.
         initial_status = ReservationStatus.PENDING
-    elif exclusive_uuid_ids:
+    elif exclusive_uuid_ids or has_dynamic:
+        # A dynamic-carrying reservation always books through PENDING_PROVISION
+        # and activates only on the provision-result callback (ADR 0004), even
+        # when it has no exclusive devices to flip.
         initial_status = ReservationStatus.PENDING_PROVISION
     else:
         initial_status = ReservationStatus.ACTIVE
@@ -475,6 +609,9 @@ async def create_reservation(
         end_time=data.end_time,
         status=initial_status,
     )
+    reservation.dynamic_requests = [
+        ReservationDynamicRequest(template_id=req.template_id) for req in data.dynamic_requests
+    ]
     db.add(reservation)
     # The cascaded reservation_devices rows flush in this same commit, so the
     # PENDING_PROVISION reservation and its device memberships become visible
@@ -491,6 +628,19 @@ async def create_reservation(
             OutboxEvent,
             "herd.reservations.created",
             _reservation_created_event(reservation),
+        )
+    elif initial_status == ReservationStatus.PENDING_PROVISION and not exclusive_uuid_ids:
+        # Dynamic requests with no exclusive devices: there is no inventory flip
+        # to wait for, so stage provision_requested atomically with the booking.
+        # With exclusive devices the event is staged only after the flip below
+        # succeeds, so execution never creates instances for a booking that is
+        # about to land in FAILED.
+        await db.flush()
+        enqueue_event(
+            db,
+            OutboxEvent,
+            "herd.reservations.provision_requested",
+            _provision_requested_event(reservation),
         )
     await db.commit()
     # expire_on_commit=False keeps the eager-loaded devices collection populated
@@ -543,16 +693,7 @@ async def create_reservation(
                 db,
                 OutboxEvent,
                 "herd.reservations.failed",
-                {
-                    "event": "reservation.failed",
-                    "reservation_id": str(reservation.id),
-                    "user_id": str(user_id),
-                    "device_ids": [str(d) for d in reservation.device_ids],
-                    "topology_id": str(reservation.topology_id)
-                    if reservation.topology_id
-                    else None,
-                    "topology_type": reservation.topology_type.value,
-                },
+                _reservation_failed_event(reservation),
             )
             await db.commit()
             await db.refresh(reservation)
@@ -589,10 +730,85 @@ async def create_reservation(
                 f"Failed to reserve devices in inventory after retries: {exc}"
             ) from exc
 
+        if has_dynamic:
+            # Gated activation (ADR 0004): the exclusive devices are RESERVED,
+            # but the reservation stays PENDING_PROVISION until the execution
+            # service posts the provision result. Stage provision_requested now
+            # that the flip committed cleanly; the callback (or the timeout
+            # backstop) owns the next transition.
+            enqueue_event(
+                db,
+                OutboxEvent,
+                "herd.reservations.provision_requested",
+                _provision_requested_event(reservation),
+            )
+        else:
+            reservation.status = ReservationStatus.ACTIVE
+            # Stage reservation.created in the same transaction that lands the row
+            # in ACTIVE (issue #21), so the event exists iff provisioning
+            # committed. The old fire-and-forget post-commit publish could drop it
+            # if NATS was down.
+            enqueue_event(
+                db,
+                OutboxEvent,
+                "herd.reservations.created",
+                _reservation_created_event(reservation),
+            )
+        await db.commit()
+        await db.refresh(reservation)
+
+    # 8. Create the editable per-reservation fork in cabling now that the
+    #    reservation is ACTIVE (issue #25). Best-effort: a fork-create failure must
+    #    not strand the provisioned reservation, so this never raises. Skipped when
+    #    there is no parent topology (Case A lazy-create). A dynamic-carrying
+    #    reservation is still PENDING_PROVISION here; its fork is created by the
+    #    provision-result callback when it activates.
+    if reservation.status == ReservationStatus.ACTIVE:
+        await _create_reservation_fork_best_effort(
+            reservation.id, reservation.topology_id, created_by=str(user_id)
+        )
+
+    return reservation
+
+
+async def apply_provision_result(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    *,
+    succeeded: bool,
+    device_ids: list[str],
+    error: str | None = None,
+) -> tuple[Reservation | None, bool]:
+    """Apply the execution service's provision-result callback (ADR 0004).
+
+    Returns (reservation, applied). None means the reservation does not exist.
+    applied=False means the callback was a no-op: only a reservation still in
+    PENDING_PROVISION transitions, so a duplicate callback, or one arriving
+    after the timeout backstop failed the reservation or the user cancelled it,
+    never resurrects or re-transitions the row.
+
+    Success attaches the materialized device ids, activates, and stages the
+    existing reservation.created event, so physical L1/L2/L3 provisioning and
+    notifications run exactly as today, after the dynamic devices exist; the
+    editable fork is created best-effort like every other activation path.
+    Failure lands FAILED and stages reservation.failed, whose execution-side
+    consumer owns dynamic-instance teardown; the exclusive physical devices are
+    released back to AVAILABLE here (the create path's orphaned-RESERVED
+    discipline).
+    """
+    reservation = await db.get(Reservation, reservation_id)
+    if reservation is None:
+        return None, False
+    if reservation.status != ReservationStatus.PENDING_PROVISION:
+        return reservation, False
+
+    if succeeded:
+        existing = {str(d) for d in reservation.device_ids}
+        for did in device_ids:
+            if did not in existing:
+                reservation.device_ids.append(uuid.UUID(did))
+                existing.add(did)
         reservation.status = ReservationStatus.ACTIVE
-        # Stage reservation.created in the same transaction that lands the row in
-        # ACTIVE (issue #21), so the event exists iff provisioning committed. The
-        # old fire-and-forget post-commit publish could drop it if NATS was down.
         enqueue_event(
             db,
             OutboxEvent,
@@ -601,16 +817,42 @@ async def create_reservation(
         )
         await db.commit()
         await db.refresh(reservation)
+        logger.info(
+            "Reservation activated by provision result: %s",
+            reservation_id,
+            extra={
+                "action": "reservation_provision_result_success",
+                "reservation_id": str(reservation_id),
+            },
+        )
+        await _create_reservation_fork_best_effort(
+            reservation.id, reservation.topology_id, created_by=str(reservation.user_id)
+        )
+        return reservation, True
 
-    # 8. Create the editable per-reservation fork in cabling now that the
-    #    reservation is ACTIVE (issue #25). Best-effort: a fork-create failure must
-    #    not strand the provisioned reservation, so this never raises. Skipped when
-    #    there is no parent topology (Case A lazy-create).
-    await _create_reservation_fork_best_effort(
-        reservation.id, reservation.topology_id, created_by=str(user_id)
+    reservation.status = ReservationStatus.FAILED
+    enqueue_event(
+        db,
+        OutboxEvent,
+        "herd.reservations.failed",
+        _reservation_failed_event(reservation),
     )
-
-    return reservation
+    await db.commit()
+    await db.refresh(reservation)
+    logger.error(
+        "Reservation failed by provision result: %s: %s",
+        reservation_id,
+        error,
+        extra={
+            "action": "reservation_provision_result_failed",
+            "reservation_id": str(reservation_id),
+            "error": error,
+        },
+    )
+    await _release_exclusive_devices_best_effort(
+        reservation.id, list(reservation.device_ids), "reservation_provision_failed_release"
+    )
+    return reservation, True
 
 
 async def list_user_reservations(

@@ -16,6 +16,8 @@ from app.models.reservation import Reservation, ReservationDevice, ReservationSt
 from app.schemas.reservation import (
     OwnsActiveResponse,
     PaginatedReservationResponse,
+    ProvisionResultRequest,
+    ProvisionResultResponse,
     ReservationCreate,
     ReservationInternalStatus,
     ReservationResponse,
@@ -30,6 +32,7 @@ from app.services.reporting_service import (
     rollup_by_group,
 )
 from app.services.reservation_service import (
+    apply_provision_result,
     cancel_reservation,
     create_reservation,
     get_reservation,
@@ -324,6 +327,40 @@ async def get_reservation_internal_status(
         is_active=is_active,
         start_time=start,
         end_time=end,
+    )
+
+
+@router.post("/internal/{reservation_id}/provision-result", response_model=ProvisionResultResponse)
+async def post_provision_result(
+    reservation_id: uuid.UUID,
+    body: ProvisionResultRequest,
+    x_internal_token: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Provision-result callback from the execution service (ADR 0004, issue #32).
+
+    Guarded by X-Internal-Token. Idempotent per reservation: only a reservation
+    still in PENDING_PROVISION transitions (success activates and stages
+    reservation.created; failure lands FAILED and stages reservation.failed). A
+    duplicate or late callback returns 200 with applied=False and never
+    resurrects a reservation the timeout backstop or a user cancel already
+    moved on.
+    """
+    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    reservation, applied = await apply_provision_result(
+        db,
+        reservation_id,
+        succeeded=body.succeeded,
+        device_ids=body.device_ids,
+        error=body.error,
+    )
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    return ProvisionResultResponse(
+        reservation_id=reservation.id,
+        status=reservation.status,
+        applied=applied,
     )
 
 

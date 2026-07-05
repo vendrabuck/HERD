@@ -36,12 +36,28 @@ def _dedupe_preserve_order(values: list[uuid.UUID]) -> list[uuid.UUID]:
     return result
 
 
+class DynamicRequestSpec(BaseModel):
+    """One requested dynamic instance (ADR 0004, issue #32).
+
+    Listing the same template_id N times requests N instances of it; there is
+    deliberately no dedupe.
+    """
+
+    template_id: uuid.UUID
+
+
 class ReservationCreate(BaseModel):
     device_ids: list[uuid.UUID] = Field(max_length=200)
     topology_id: uuid.UUID | None = None
     purpose: str | None = Field(default=None, max_length=2000)
     start_time: datetime
     end_time: datetime
+    # Dynamic instance requests (ADR 0004). Each entry materializes one
+    # hypervisor-backed instance; a reservation carrying any of these books
+    # through PENDING_PROVISION and activates only on the provision-result
+    # callback. Instances are hypervisor-bound, so the cap is deliberately
+    # tighter than the 200-device cap.
+    dynamic_requests: list[DynamicRequestSpec] = Field(default_factory=list, max_length=50)
 
     @field_validator("device_ids")
     @classmethod
@@ -95,6 +111,15 @@ class ReservationUpdate(BaseModel):
         return _dedupe_preserve_order(v)
 
 
+class DynamicRequestResponse(BaseModel):
+    """A booked dynamic instance request; `id` is the execution-side request_id."""
+
+    id: uuid.UUID
+    template_id: uuid.UUID
+
+    model_config = {"from_attributes": True}
+
+
 class ReservationResponse(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
@@ -111,6 +136,7 @@ class ReservationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     modified_by: uuid.UUID | None = None
+    dynamic_requests: list[DynamicRequestResponse] = []
 
     model_config = {"from_attributes": True}
 
@@ -149,6 +175,31 @@ class ReservationInternalStatus(BaseModel):
     end_time: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ProvisionResultRequest(BaseModel):
+    """Body of the execution service's provision-result callback (ADR 0004).
+
+    device_ids are the inventory devices the dynamic instances materialized as;
+    on success they are attached to the reservation before it activates.
+    """
+
+    succeeded: bool
+    device_ids: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class ProvisionResultResponse(BaseModel):
+    """Outcome of a provision-result post.
+
+    applied=False means the callback was a no-op: the reservation had already
+    left PENDING_PROVISION (duplicate callback, timeout backstop, or a user
+    cancel won the race) and was not re-transitioned.
+    """
+
+    reservation_id: uuid.UUID
+    status: ReservationStatus
+    applied: bool
 
 
 class PaginatedReservationResponse(BaseModel):
