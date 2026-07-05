@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 from herd_common.outbox import event_dedupe_key
+from herd_common.retry import retry_with_backoff
 
 from app.config import settings
 
@@ -219,6 +220,52 @@ async def _fetch_latest_config(device_id: str, client=None) -> dict | None:
         if resp.status_code != 200:
             return None
         return resp.json()
+
+
+async def _fetch_hypervisor(hypervisor_id: str, client=None) -> dict | None:
+    """Fetch a hypervisor's internal record from the inventory service (issue #32).
+
+    Mirrors _fetch_template exactly: raises TransientUpstreamError on a 5xx or
+    transport error so the message NAKs and retries; a non-200 below 500 (a
+    genuine 404) returns None, which the create flow treats as a permanent
+    config error.
+    """
+    url = f"{settings.inventory_service_url}/hypervisors/{hypervisor_id}/internal"
+    async with _client_ctx(client) as c:
+        resp = await _get_internal(
+            c,
+            url,
+            what=f"fetch hypervisor {hypervisor_id}",
+            headers={"X-Internal-Token": settings.internal_api_token},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+
+
+async def _fetch_secret_value(secret_id: str, client=None) -> dict | None:
+    """Fetch a secret's decrypted data dict from the secrets service (issue #32).
+
+    Reads GET /internal/secrets/{id}/value (X-Internal-Token) and returns the
+    `data` mapping of secret key-values. Raises TransientUpstreamError on a 5xx
+    or transport error so the message NAKs and retries; a genuine 404 returns
+    None (a permanent config error to the create flow). Mirrors the _fetch_*
+    idiom exactly.
+    """
+    url = f"{settings.secrets_service_url}/internal/secrets/{secret_id}/value"
+    async with _client_ctx(client) as c:
+        resp = await _get_internal(
+            c,
+            url,
+            what=f"fetch secret {secret_id}",
+            headers={"X-Internal-Token": settings.internal_api_token},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get("data", {}) if isinstance(data, dict) else {}
 
 
 class _FetchContext:
@@ -1518,6 +1565,700 @@ async def _execute_switch_operations(
             )
 
 
+# --- Dynamic resources (ADR 0004, issue #32) --------------------------------
+#
+# A recipe is an ordinary driver package with connection_type "Hypervisor". The
+# create flow handles the new reservation.provision_requested event: for each
+# requested instance it loads the recipe, runs login/create_instance/logout in
+# the sandbox, materializes the result as an inventory device, and records the
+# outcome in the dynamic_instances ledger. Teardown drives from that ledger on
+# the lifecycle events, the peer of the L2/L3 applied-state teardown. This whole
+# path is inert until phase 3 publishes provision_requested; unknown events keep
+# flowing exactly as before.
+
+# Lifecycle events that tear down dynamic instances of the whole reservation.
+# reservation.updated is handled separately (only removed devices), so it is not
+# in this set.
+DYNAMIC_TEARDOWN_EVENTS = {
+    "reservation.completed",
+    "reservation.cancelled",
+    "reservation.failed",
+}
+
+
+def _build_recipe_context(
+    template: dict,
+    hypervisor: dict,
+    secret_data: dict,
+    request_id: str,
+    reservation_id: str,
+    user_id: str,
+) -> tuple[dict, set[str]]:
+    """Build the sandbox context for a Hypervisor recipe and its secret keys.
+
+    Template field defaults arrive as the usual HERD_<field> keys (there is no
+    device row yet, so defaults stand in for field_data). The recipe also gets
+    the hypervisor endpoint/type and the request/reservation/user ids.
+    HERD_request_id is deterministic per requested instance, so a recipe MUST
+    name its hypervisor-side resources from it: the redelivery idempotency story
+    relies on a retried create naming the same instance rather than leaking a
+    duplicate. Every secret value is merged under HERD_secret_<key>, and all such
+    keys are returned so the caller can list them in password_keys; they then
+    travel only in the context temp file, never the child environment.
+    """
+    context: dict = {}
+    for section in template.get("sections", []):
+        for field in section.get("fields", []):
+            key = field.get("key")
+            if key is None:
+                continue
+            context[f"HERD_{key}"] = field.get("default")
+
+    context["HERD_hypervisor_endpoint"] = hypervisor.get("endpoint")
+    context["HERD_hypervisor_type"] = hypervisor.get("hypervisor_type")
+    context["HERD_request_id"] = str(request_id)
+    context["HERD_reservation_id"] = str(reservation_id)
+    context["HERD_user_id"] = str(user_id)
+
+    secret_keys: set[str] = set()
+    for key, value in (secret_data or {}).items():
+        ctx_key = f"HERD_secret_{key}"
+        context[ctx_key] = value
+        secret_keys.add(ctx_key)
+    return context, secret_keys
+
+
+async def _run_recipe_step(
+    db,
+    device_id: uuid.UUID,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    action: str,
+    user_id: uuid.UUID,
+    redacted: dict,
+    reservation_id: uuid.UUID,
+    driver_path: str,
+    context: dict,
+    password_keys: set[str],
+    *,
+    dedupe_key: str | None = None,
+    method_kwargs: dict | None = None,
+) -> dict:
+    """Run one recipe method in the sandbox, recording an ExecutionRun row.
+
+    The same login/op/logout ExecutionRun bookkeeping the L1/L2/L3 flows do, so
+    recipe actions are auditable alongside physical provisioning. There is no
+    device yet for a create, so device_id is the hypervisor id: the recipe acts
+    on the hypervisor, and create and teardown runs group under it. Recipe steps
+    get the long recipe timeout, not the 30s driver default.
+    """
+    from datetime import datetime, timezone
+
+    from app.services.driver_sandbox import execute_driver_method
+    from app.services.execution_service import create_execution_run, update_execution_run
+
+    run = await create_execution_run(
+        db,
+        device_id,
+        driver_id,
+        driver_sha256,
+        action,
+        user_id,
+        redacted,
+        reservation_id,
+        method_kwargs=method_kwargs,
+        dedupe_key=dedupe_key,
+    )
+    started = datetime.now(timezone.utc)
+    result = execute_driver_method(
+        driver_path,
+        action,
+        context,
+        method_kwargs=method_kwargs,
+        password_keys=password_keys,
+        timeout=settings.recipe_timeout_seconds,
+    )
+    status = "SUCCESS" if result["success"] else "FAILED"
+    await update_execution_run(
+        db,
+        run,
+        status,
+        output=json.dumps(result["output"], default=str) if result.get("output") else None,
+        error=result.get("error"),
+        started_at=started,
+        completed_at=datetime.now(timezone.utc),
+        duration_ms=result["duration_ms"],
+    )
+    return result
+
+
+def _recipe_reported_success(result: dict) -> bool:
+    """True when both the sandbox ran and the recipe's own success flag is set.
+
+    create_instance and destroy_instance return {"success": bool, ...}; a driver
+    that runs cleanly (sandbox success) but reports success=False is a
+    driver-result failure, distinct from a sandbox error. Login/logout carry no
+    such flag, so callers check result["success"] directly for those.
+    """
+    if not result.get("success"):
+        return False
+    output = result.get("output") or {}
+    return bool(output.get("success"))
+
+
+async def _create_dynamic_device(
+    client, template_id: str, reservation_id: str, field_data: dict
+) -> dict | None:
+    """POST /devices/internal to materialize an instance as a device.
+
+    Returns the created device dict (with its id) on 201. Raises
+    TransientUpstreamError on a 5xx or transport error so the message NAKs; a
+    4xx returns None, which the caller treats as a permanent config error.
+    """
+    url = f"{settings.inventory_service_url}/devices/internal"
+    body = {
+        "template_id": template_id,
+        "reservation_id": reservation_id,
+        "field_data": field_data,
+    }
+    try:
+        resp = await client.post(
+            url,
+            json=body,
+            headers={"X-Internal-Token": settings.internal_api_token},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        raise TransientUpstreamError(f"create dynamic device: transport error: {exc}") from exc
+    if resp.status_code >= 500:
+        raise TransientUpstreamError(f"create dynamic device: upstream {resp.status_code}")
+    if resp.status_code == 201:
+        return resp.json()
+    logger.error(
+        "Inventory rejected dynamic device create for template %s: %s",
+        template_id,
+        resp.status_code,
+    )
+    return None
+
+
+async def _delete_dynamic_device(client, device_id: str) -> bool:
+    """DELETE /devices/{id}/internal. True on 204 or 404 (already gone).
+
+    Raises TransientUpstreamError on a 5xx or transport error so the teardown
+    NAKs. An unexpected 4xx returns False; the caller leaves the ledger row
+    ACTIVE rather than falsely recording the instance as destroyed.
+    """
+    url = f"{settings.inventory_service_url}/devices/{device_id}/internal"
+    try:
+        resp = await client.delete(
+            url,
+            headers={"X-Internal-Token": settings.internal_api_token},
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        raise TransientUpstreamError(
+            f"delete dynamic device {device_id}: transport error: {exc}"
+        ) from exc
+    if resp.status_code >= 500:
+        raise TransientUpstreamError(
+            f"delete dynamic device {device_id}: upstream {resp.status_code}"
+        )
+    if resp.status_code in (204, 404):
+        return True
+    logger.warning("Unexpected status %s deleting dynamic device %s", resp.status_code, device_id)
+    return False
+
+
+async def _post_provision_result(
+    client, reservation_id: str, *, succeeded: bool, device_ids: list[str], error: str | None
+) -> None:
+    """POST the provision-result callback to reservations; raise on any failure."""
+    url = f"{settings.reservations_service_url}/internal/{reservation_id}/provision-result"
+    body = {"succeeded": succeeded, "device_ids": device_ids, "error": error}
+    resp = await client.post(
+        url,
+        json=body,
+        headers={"X-Internal-Token": settings.internal_api_token},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+
+async def _post_provision_result_best_effort(
+    reservation_id: str, *, succeeded: bool, device_ids: list[str], error: str | None
+) -> None:
+    """Post the provision-result callback with retry-then-log (3 attempts).
+
+    Mirrors the fork-hook precedent. If the callback still fails after retries
+    it is logged and swallowed: the reservations-side timeout backstop
+    (provision_timeout_seconds) transitions a stuck PENDING_PROVISION
+    reservation to FAILED, so a lost callback does not strand the reservation.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            await retry_with_backoff(
+                lambda: _post_provision_result(
+                    client,
+                    reservation_id,
+                    succeeded=succeeded,
+                    device_ids=device_ids,
+                    error=error,
+                ),
+                attempts=3,
+            )
+        except Exception:
+            logger.error(
+                "provision-result callback failed after retries for reservation %s; "
+                "relying on the reservations timeout backstop",
+                reservation_id,
+                exc_info=True,
+            )
+
+
+async def _maybe_post_provision_failure(event_data: dict, reason: str) -> None:
+    """Best-effort failure callback for a dead-lettered provision_requested.
+
+    Only fires for reservation.provision_requested. Reservations responds to the
+    failure callback by transitioning to FAILED and publishing reservation.failed,
+    whose teardown handler owns instance cleanup, so we deliberately do NOT tear
+    down already-created instances here (that would race the teardown handler).
+    Any error is swallowed; the timeout backstop covers a lost callback.
+    """
+    if event_data.get("event") != "reservation.provision_requested":
+        return
+    reservation_id = event_data.get("reservation_id")
+    if not reservation_id:
+        return
+    async with httpx.AsyncClient() as client:
+        try:
+            await _post_provision_result(
+                client, reservation_id, succeeded=False, device_ids=[], error=reason
+            )
+        except Exception:
+            logger.error(
+                "Best-effort provision-failure callback failed for reservation %s",
+                reservation_id,
+                exc_info=True,
+            )
+
+
+async def _fetch_recipe_deps(
+    template_id: str, hypervisor_id: str | None, client
+) -> tuple[dict | None, dict | None, dict | None]:
+    """Fetch (template, hypervisor, secret_data) for a recipe run.
+
+    Any of the three being None means a 404 (a missing config resource); the
+    caller decides whether that is a permanent create-flow error or a teardown
+    that should leave the row ACTIVE. A 5xx or transport error has already raised
+    TransientUpstreamError inside the fetch helpers.
+    """
+    template = await _fetch_template(template_id, client)
+    if template is None:
+        return None, None, None
+    if hypervisor_id is None:
+        hypervisor_id = template.get("hypervisor_id")
+    if not hypervisor_id:
+        return template, None, None
+    hypervisor = await _fetch_hypervisor(hypervisor_id, client)
+    if hypervisor is None:
+        return template, None, None
+    secret = await _fetch_secret_value(hypervisor.get("secret_id"), client)
+    return template, hypervisor, secret
+
+
+async def _provision_one_instance(
+    req: dict,
+    reservation_id: str,
+    user_id: str,
+    get_db_session,
+    dedupe_key: str | None,
+    client,
+) -> str:
+    """Create one dynamic instance and return its materialized device id.
+
+    Idempotent on the ledger: a redelivery that finds the row already ACTIVE with
+    a device skips the whole create. A missing template/hypervisor/secret (404)
+    is a PermanentEventError (config error retry cannot heal); a driver-result
+    failure or sandbox error raises so the message NAKs with the row left
+    CREATING for an idempotent retry.
+    """
+    from app.services.driver_loader import load_driver
+    from app.services.dynamic_instance_service import (
+        get_by_request_id,
+        insert_or_get_creating,
+        mark_active,
+        set_instance_ref,
+    )
+    from app.services.execution_service import (
+        extract_password_keys,
+        redact_context_for_logging,
+    )
+
+    request_id = req.get("id")
+    template_id = req.get("template_id")
+
+    async with get_db_session() as db:
+        existing = await get_by_request_id(db, request_id)
+        if existing is not None and existing.status == "ACTIVE" and existing.device_id is not None:
+            logger.info(
+                "Dynamic instance for request %s already ACTIVE (device %s); skipping",
+                request_id,
+                existing.device_id,
+            )
+            return str(existing.device_id)
+
+    template, hypervisor, secret = await _fetch_recipe_deps(template_id, None, client)
+    if template is None:
+        raise PermanentEventError(f"template {template_id} not found for request {request_id}")
+    if hypervisor is None:
+        raise PermanentEventError(
+            f"hypervisor for template {template_id} not found for request {request_id}"
+        )
+    if secret is None:
+        raise PermanentEventError(f"hypervisor secret not found for request {request_id}")
+
+    hypervisor_id = template.get("hypervisor_id")
+
+    # Insert (or reuse) the CREATING ledger row before any hypervisor action, so
+    # a NAK mid-create leaves a row to retry against.
+    async with get_db_session() as db:
+        row = await insert_or_get_creating(
+            db, request_id, reservation_id, template_id, hypervisor_id
+        )
+        if row.status == "ACTIVE" and row.device_id is not None:
+            return str(row.device_id)
+
+    context, secret_keys = _build_recipe_context(
+        template, hypervisor, secret, request_id, reservation_id, user_id
+    )
+    password_keys = extract_password_keys(template) | secret_keys
+    redacted = redact_context_for_logging(context, password_keys)
+
+    driver_id = uuid.UUID(template["driver_id"])
+    driver_sha256 = template.get("driver_sha256") or "unknown"
+    driver_filename = template.get("driver_filename") or "driver.zip"
+    connection_type = template.get("connection_type") or "Hypervisor"
+
+    # The recipe acts on the hypervisor; there is no device yet, so ExecutionRun
+    # rows for the create are keyed on the hypervisor id.
+    hypervisor_uuid = uuid.UUID(str(hypervisor_id))
+    user_uuid = uuid.UUID(user_id)
+    res_uuid = uuid.UUID(reservation_id)
+
+    async with get_db_session() as db:
+        driver_path = await load_driver(
+            db, driver_id, driver_sha256, driver_filename, connection_type
+        )
+
+        login = await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "login",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+            dedupe_key=dedupe_key,
+        )
+        if not login["success"]:
+            raise RuntimeError(
+                f"recipe login failed for request {request_id}: {login.get('error')}"
+            )
+
+        create = await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "create_instance",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+            dedupe_key=dedupe_key,
+        )
+        # Always log out so a failed create does not leak a hypervisor session.
+        await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "logout",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+            dedupe_key=dedupe_key,
+        )
+
+        if not _recipe_reported_success(create):
+            raise RuntimeError(
+                f"recipe create_instance did not succeed for request {request_id}: "
+                f"{create.get('error')}"
+            )
+
+        output = create.get("output") or {}
+        instance_ref = output.get("instance_ref")
+        field_data = output.get("field_data") or {}
+
+        # Persist the hypervisor-side handle immediately: if the device create
+        # below fails and NAKs, teardown can still destroy the instance.
+        await set_instance_ref(db, request_id, instance_ref)
+
+    device = await _create_dynamic_device(client, template_id, reservation_id, field_data)
+    if device is None:
+        raise PermanentEventError(
+            f"inventory rejected dynamic device create for request {request_id}"
+        )
+    device_id = device["id"]
+
+    async with get_db_session() as db:
+        await mark_active(db, request_id, device_id, instance_ref)
+
+    logger.info(
+        "Materialized dynamic instance for request %s as device %s",
+        request_id,
+        device_id,
+    )
+    return str(device_id)
+
+
+async def _handle_provision_requested(
+    event_data: dict, get_db_session, dedupe_key: str | None = None
+) -> None:
+    """Create every dynamic instance a reservation booked, then report success.
+
+    Raises out to process_reservation_message on any failure (transient NAK,
+    permanent DLQ); only when all requests are ACTIVE does it post the success
+    callback. The success callback is retry-then-log, so a lost callback falls
+    to the reservations timeout backstop rather than NAK'ing an already-done
+    provisioning.
+    """
+    reservation_id = event_data.get("reservation_id")
+    user_id = event_data.get("user_id")
+    requests = event_data.get("dynamic_requests", [])
+
+    if not reservation_id:
+        logger.warning("provision_requested with no reservation_id; skipping")
+        return
+
+    logger.info(
+        "Processing provision_requested",
+        extra={"reservation_id": reservation_id, "request_count": len(requests)},
+    )
+
+    device_ids: list[str] = []
+    async with httpx.AsyncClient() as client:
+        for req in requests:
+            device_id = await _provision_one_instance(
+                req, reservation_id, user_id, get_db_session, dedupe_key, client
+            )
+            device_ids.append(device_id)
+
+    # Reached only when every request is ACTIVE.
+    await _post_provision_result_best_effort(
+        reservation_id, succeeded=True, device_ids=device_ids, error=None
+    )
+    logger.info(
+        "Completed provision_requested",
+        extra={"reservation_id": reservation_id, "device_count": len(device_ids)},
+    )
+
+
+async def _teardown_one_instance(
+    row,
+    reservation_id: str,
+    user_id: str,
+    get_db_session,
+    client,
+) -> None:
+    """Destroy one dynamic instance, mirroring the L3 teardown discipline.
+
+    A CREATING row with no instance_ref has nothing hypervisor-side; mark it
+    DESTROYED. Otherwise load the recipe and run login/destroy_instance/logout,
+    then delete the materialized device (404 is success), then mark DESTROYED. A
+    driver-result failure does NOT raise (ACK, row stays ACTIVE as an accurate
+    may-still-exist record); a TransientUpstreamError raises and NAKs.
+    """
+    from app.services.driver_loader import load_driver
+    from app.services.dynamic_instance_service import mark_destroyed
+    from app.services.execution_service import (
+        extract_password_keys,
+        redact_context_for_logging,
+    )
+
+    request_id = row.request_id
+    device_id = str(row.device_id) if row.device_id is not None else None
+
+    # Nothing was created hypervisor-side: no instance_ref means create_instance
+    # never landed. Delete any stray device and retire the row.
+    if not row.instance_ref:
+        if device_id is not None:
+            await _delete_dynamic_device(client, device_id)
+        async with get_db_session() as db:
+            await mark_destroyed(db, request_id)
+        return
+
+    template, hypervisor, secret = await _fetch_recipe_deps(
+        str(row.template_id), str(row.hypervisor_id), client
+    )
+    if template is None or hypervisor is None or secret is None:
+        # The recipe's config is gone (404), so we cannot drive destroy_instance.
+        # Leave the row ACTIVE as a may-still-exist record and ACK (retrying will
+        # not resurrect a deleted template); do not raise.
+        logger.warning(
+            "Cannot load recipe deps to destroy instance for request %s; leaving "
+            "ledger row ACTIVE as a may-still-exist record",
+            request_id,
+        )
+        return
+
+    context, secret_keys = _build_recipe_context(
+        template, hypervisor, secret, request_id, reservation_id, user_id
+    )
+    password_keys = extract_password_keys(template) | secret_keys
+    redacted = redact_context_for_logging(context, password_keys)
+
+    driver_id = uuid.UUID(template["driver_id"])
+    driver_sha256 = template.get("driver_sha256") or "unknown"
+    driver_filename = template.get("driver_filename") or "driver.zip"
+    connection_type = template.get("connection_type") or "Hypervisor"
+
+    hypervisor_uuid = uuid.UUID(str(row.hypervisor_id))
+    user_uuid = uuid.UUID(user_id)
+    res_uuid = uuid.UUID(reservation_id)
+
+    async with get_db_session() as db:
+        try:
+            driver_path = await load_driver(
+                db, driver_id, driver_sha256, driver_filename, connection_type
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to load recipe to destroy request %s: %s; leaving ACTIVE",
+                request_id,
+                e,
+            )
+            return
+
+        login = await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "login",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+        )
+        if not login["success"]:
+            logger.error(
+                "Recipe login failed during teardown of request %s; leaving ACTIVE",
+                request_id,
+            )
+            return
+
+        destroy = await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "destroy_instance",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+            method_kwargs={"instance_ref": row.instance_ref},
+        )
+        await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "logout",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+        )
+
+    if not _recipe_reported_success(destroy):
+        # Driver-result failure (the L3 discipline): ACK, leave the row ACTIVE as
+        # an accurate "instance may still exist" record, and log it.
+        logger.error(
+            "destroy_instance did not cleanly succeed for request %s; leaving "
+            "ledger row ACTIVE (instance may still exist)",
+            request_id,
+        )
+        return
+
+    # Instance is gone hypervisor-side; retire its device (404 = already gone).
+    if device_id is not None:
+        deleted = await _delete_dynamic_device(client, device_id)
+        if not deleted:
+            logger.error(
+                "Device delete failed for request %s after destroy_instance; "
+                "leaving ledger row ACTIVE",
+                request_id,
+            )
+            return
+
+    async with get_db_session() as db:
+        await mark_destroyed(db, request_id)
+    logger.info("Destroyed dynamic instance for request %s", request_id)
+
+
+async def _execute_dynamic_teardown(
+    reservation_id: str | None,
+    user_id: str,
+    get_db_session,
+    client,
+    removed_device_ids: list[str] | None = None,
+) -> None:
+    """Tear down a reservation's dynamic instances from the ledger (issue #32).
+
+    When removed_device_ids is None every CREATING/ACTIVE row of the reservation
+    is torn down (complete, cancel, fail); when it is a list only rows whose
+    materialized device is in it are (the reservation.updated removal path).
+    Already-DESTROYED rows are excluded by list_teardown_candidates, so a
+    redelivery is a no-op for them.
+    """
+    if not reservation_id:
+        return
+
+    from app.services.dynamic_instance_service import list_teardown_candidates
+
+    async with get_db_session() as db:
+        candidates = await list_teardown_candidates(db, reservation_id)
+
+    if removed_device_ids is not None:
+        removed = {str(d) for d in removed_device_ids}
+        candidates = [
+            c for c in candidates if c.device_id is not None and str(c.device_id) in removed
+        ]
+    if not candidates:
+        return
+
+    for row in candidates:
+        await _teardown_one_instance(row, reservation_id, user_id, get_db_session, client)
+
+
 async def handle_reservation_event(
     event_data: dict, get_db_session, dedupe_key: str | None = None
 ) -> None:
@@ -1531,6 +2272,14 @@ async def handle_reservation_event(
             actions (issue #133). None when JetStream metadata is unavailable.
     """
     event_type = event_data.get("event", "")
+
+    # Dynamic-resource create (ADR 0004, issue #32) is its own event, entirely
+    # separate from physical L1/L2/L3 provisioning. Inert until phase 3 publishes
+    # provision_requested.
+    if event_type == "reservation.provision_requested":
+        await _handle_provision_requested(event_data, get_db_session, dedupe_key)
+        return
+
     action = EVENT_ACTIONS.get(event_type)
     if not action:
         logger.warning("Unknown reservation event type: %s", event_type)
@@ -1619,6 +2368,16 @@ async def handle_reservation_event(
                     ctx,
                     remaining_device_ids=event_data.get("device_ids", []),
                 )
+                # Dynamic instances whose materialized device was removed are
+                # torn down here (issue #32); instances still in the reservation
+                # are left running.
+                await _execute_dynamic_teardown(
+                    reservation_id,
+                    user_id,
+                    get_db_session,
+                    client,
+                    removed_device_ids=removed_ids,
+                )
         else:
             device_ids = event_data.get("device_ids", [])
             # reservation.failed teardown (issue #244) is applied-state-only:
@@ -1656,6 +2415,10 @@ async def handle_reservation_event(
                 await _execute_l3_switch_operations(
                     device_ids, l3_action, reservation_id, user_id, get_db_session, dedupe_key, ctx
                 )
+            # Dynamic-instance teardown (issue #32) runs after physical teardown
+            # on complete/cancel/fail, never on reservation.created.
+            if event_type in DYNAMIC_TEARDOWN_EVENTS:
+                await _execute_dynamic_teardown(reservation_id, user_id, get_db_session, client)
 
     logger.info(
         "Completed processing reservation event",
@@ -1709,13 +2472,13 @@ async def process_reservation_message(
         # dedupes; fall back to "<stream>:<sequence>" for pre-outbox events.
         await handler(event_data, session_factory, event_dedupe_key(event_data, msg))
     except PermanentEventError as exc:
-        # Non-retryable (e.g. VLAN pool exhausted): the in-use set is unchanged
-        # between attempts, so retrying only burns max_deliver and delays the DLQ.
-        # Route to the DLQ on the FIRST delivery with a distinct exhaustion phrase.
+        # Non-retryable (e.g. VLAN pool exhausted, or a dynamic recipe's missing
+        # template/hypervisor/secret): the condition is unchanged between
+        # attempts, so retrying only burns max_deliver and delays the DLQ. Route
+        # to the DLQ on the FIRST delivery with a distinct phrase.
         num_delivered = getattr(getattr(msg, "metadata", None), "num_delivered", 1) or 1
         logger.error(
-            "Permanent error (VLAN exhaustion) processing NATS message; "
-            "routing to DLQ on first delivery (no retry)",
+            "Permanent error processing NATS message; routing to DLQ on first delivery (no retry)",
             extra={
                 "action": "nats_dlq_permanent",
                 "delivered": num_delivered,
@@ -1724,6 +2487,11 @@ async def process_reservation_message(
             exc_info=exc,
         )
         await _publish_to_dlq(js, msg.data)
+        # For a dead-lettered provision_requested, tell reservations the
+        # provisioning failed so it can transition to FAILED and publish
+        # reservation.failed (whose teardown handler owns instance cleanup); we
+        # do NOT tear down here. No-op for every other event.
+        await _maybe_post_provision_failure(event_data, str(exc))
         await msg.ack()
         return "dlq"
     except Exception as exc:
@@ -1742,6 +2510,10 @@ async def process_reservation_message(
                 exc_info=exc,
             )
             await _publish_to_dlq(js, msg.data)
+            # Same failure callback as the permanent branch: a provision_requested
+            # that exhausted retries reports failure so reservations fails the
+            # reservation and its teardown handler cleans up. No-op otherwise.
+            await _maybe_post_provision_failure(event_data, str(exc))
             await msg.ack()
             return "dlq"
         # Transient error: NAK so JetStream applies the backoff delay and redelivers.
