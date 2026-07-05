@@ -78,6 +78,10 @@
     ],
     [
       "POST",
+      "/devices/internal"
+    ],
+    [
+      "POST",
       "/devices/resolve-by-name"
     ],
     [
@@ -127,6 +131,10 @@
     [
       "POST",
       "/devices/{device_id}/config-versions/{version_id}/schedule"
+    ],
+    [
+      "DELETE",
+      "/devices/{device_id}/internal"
     ],
     [
       "GET",
@@ -187,6 +195,30 @@
     [
       "GET",
       "/health"
+    ],
+    [
+      "GET",
+      "/hypervisors"
+    ],
+    [
+      "POST",
+      "/hypervisors"
+    ],
+    [
+      "DELETE",
+      "/hypervisors/{hypervisor_id}"
+    ],
+    [
+      "GET",
+      "/hypervisors/{hypervisor_id}"
+    ],
+    [
+      "PUT",
+      "/hypervisors/{hypervisor_id}"
+    ],
+    [
+      "GET",
+      "/hypervisors/{hypervisor_id}/internal"
     ],
     [
       "DELETE",
@@ -726,6 +758,92 @@
       ],
       "type": "object"
     },
+    "HypervisorCreate": {
+      "properties": {
+        "description": "anyOf",
+        "enabled": "boolean",
+        "endpoint": "string",
+        "hypervisor_type": "string",
+        "name": "string",
+        "secret_id": "string"
+      },
+      "required": [
+        "endpoint",
+        "hypervisor_type",
+        "name",
+        "secret_id"
+      ],
+      "type": "object"
+    },
+    "HypervisorInternalResponse": {
+      "properties": {
+        "enabled": "boolean",
+        "endpoint": "string",
+        "hypervisor_type": "string",
+        "id": "string",
+        "name": "string",
+        "secret_id": "string"
+      },
+      "required": [
+        "enabled",
+        "endpoint",
+        "hypervisor_type",
+        "id",
+        "name",
+        "secret_id"
+      ],
+      "type": "object"
+    },
+    "HypervisorResponse": {
+      "properties": {
+        "created_at": "string",
+        "description": "anyOf",
+        "enabled": "boolean",
+        "endpoint": "string",
+        "hypervisor_type": "string",
+        "id": "string",
+        "modified_by": "anyOf",
+        "name": "string",
+        "secret_id": "string",
+        "updated_at": "string"
+      },
+      "required": [
+        "created_at",
+        "enabled",
+        "endpoint",
+        "hypervisor_type",
+        "id",
+        "name",
+        "secret_id",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "HypervisorUpdate": {
+      "properties": {
+        "description": "anyOf",
+        "enabled": "anyOf",
+        "endpoint": "anyOf",
+        "hypervisor_type": "anyOf",
+        "name": "anyOf",
+        "secret_id": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "InternalDeviceCreate": {
+      "properties": {
+        "field_data": "object",
+        "name": "anyOf",
+        "reservation_id": "string",
+        "template_id": "string"
+      },
+      "required": [
+        "reservation_id",
+        "template_id"
+      ],
+      "type": "object"
+    },
     "PaginatedApplyJobs": {
       "properties": {
         "items": "array",
@@ -787,6 +905,21 @@
       "type": "object"
     },
     "PaginatedDriverResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
+    "PaginatedHypervisorResponse": {
       "properties": {
         "items": "array",
         "limit": "integer",
@@ -907,6 +1040,7 @@
         "description": "anyOf",
         "driver_id": "anyOf",
         "exclusive": "boolean",
+        "hypervisor_id": "anyOf",
         "icon": "anyOf",
         "model": "anyOf",
         "name": "string",
@@ -930,6 +1064,7 @@
         "driver_id": "anyOf",
         "driver_name": "anyOf",
         "exclusive": "boolean",
+        "hypervisor_id": "anyOf",
         "icon": "anyOf",
         "id": "string",
         "model": "string",
@@ -962,6 +1097,7 @@
         "description": "anyOf",
         "driver_id": "anyOf",
         "exclusive": "anyOf",
+        "hypervisor_id": "anyOf",
         "icon": "anyOf",
         "model": "anyOf",
         "name": "anyOf",

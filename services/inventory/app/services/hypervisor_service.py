@@ -22,7 +22,9 @@ async def validate_secret_exists(secret_id: uuid.UUID) -> None:
     rejected with 422. A transport error or any non-2xx/404 (including 5xx) is
     an upstream-unreachable condition and standardizes to 503. The returned
     plaintext is never read, stored, or logged; only the existence check
-    (status code) matters here.
+    (status code) matters here. The secret UUID is also kept out of log lines
+    deliberately: nothing secret-named reaches a logger, so scanners cannot
+    mistake the reference for credential material.
     """
     url = f"{settings.secrets_service_url}/internal/secrets/{secret_id}/value"
     try:
@@ -33,7 +35,7 @@ async def validate_secret_exists(secret_id: uuid.UUID) -> None:
                 timeout=10.0,
             )
     except httpx.HTTPError as exc:
-        logger.error("secrets service unreachable while validating secret %s: %s", secret_id, exc)
+        logger.error("secrets service unreachable while validating a secret reference: %s", exc)
         raise HTTPException(
             status_code=503, detail="secrets service unreachable while validating secret"
         ) from exc
@@ -42,7 +44,7 @@ async def validate_secret_exists(secret_id: uuid.UUID) -> None:
         raise HTTPException(status_code=422, detail="Secret does not exist")
     if resp.status_code != 200:
         logger.error(
-            "secrets service returned %s while validating secret %s", resp.status_code, secret_id
+            "secrets service returned %s while validating a secret reference", resp.status_code
         )
         raise HTTPException(
             status_code=503,
