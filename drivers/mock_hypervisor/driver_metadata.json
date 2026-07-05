@@ -1,0 +1,7 @@
+{
+  "name": "Mock Hypervisor Driver",
+  "version": "0.1.0",
+  "connection_type": "Hypervisor",
+  "supports_dry_run": true,
+  "notes": "Hardware-free Hypervisor recipe driver for the dynamic-resources integration tests (ADR 0004, issue #32). create_instance names its fake instance deterministically from context HERD_request_id and returns {success, instance_ref, field_data}; destroy_instance is an idempotent acknowledgement. Failure injection via HERD_mock_fail_actions / HERD_mock_raise_actions / HERD_mock_sleep_ms context values (template field defaults for dynamic templates). Not for production use."
+}
