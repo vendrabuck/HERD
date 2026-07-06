@@ -342,6 +342,169 @@ async def test_omitted_dynamic_field_regression_activates_immediately(client):
     assert await _outbox_rows("herd.reservations.provision_requested") == []
 
 
+# --- Booking: dynamic-only (no physical device) ------------------------------
+
+
+async def test_dynamic_only_booking_lands_pending_provision_cloud(client):
+    """A booking with zero devices and a dynamic request is accepted, books
+    PENDING_PROVISION, and derives topology_type CLOUD (issue #274)."""
+    resp = await _create_dynamic_reservation(client, device_ids=[])
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["status"] == "PENDING_PROVISION"
+    assert data["device_ids"] == []
+    assert data["topology_type"] == "CLOUD"
+    assert len(data["dynamic_requests"]) == 1
+
+
+async def test_dynamic_only_stages_provision_requested_cloud(client):
+    """The provision_requested payload for a dynamic-only booking carries an
+    empty device list and topology_type CLOUD."""
+    resp = await _create_dynamic_reservation(client, device_ids=[])
+    assert resp.status_code == 201
+    data = resp.json()
+    rows = await _outbox_rows("herd.reservations.provision_requested")
+    assert len(rows) == 1
+    payload = dict(rows[0].payload)
+    payload.pop("event_id")
+    assert payload == {
+        "event": "reservation.provision_requested",
+        "reservation_id": data["id"],
+        "user_id": USER_ID,
+        "device_ids": [],
+        "topology_id": None,
+        "topology_type": "CLOUD",
+        "dynamic_requests": [{"id": data["dynamic_requests"][0]["id"], "template_id": TEMPLATE_ID}],
+    }
+    assert await _outbox_rows("herd.reservations.created") == []
+
+
+async def test_dynamic_only_booking_flips_no_devices(client):
+    """With no physical devices there is no inventory status flip to make."""
+    update_mock = AsyncMock()
+    resp = await _create_dynamic_reservation(client, device_ids=[], update_mock=update_mock)
+    assert resp.status_code == 201
+    update_mock.assert_not_called()
+
+
+async def test_dynamic_only_conflict_detection_unaffected(client):
+    """Two dynamic-only bookings in the same window do not conflict: there are
+    no physical devices, so the conflict query never degenerates or reports a
+    false collision."""
+    first = await _create_dynamic_reservation(client, device_ids=[])
+    second = await _create_dynamic_reservation(client, device_ids=[])
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] != second.json()["id"]
+
+
+async def test_neither_device_nor_dynamic_request_422_wording(client):
+    """A booking with neither a device nor a dynamic request is rejected with a
+    pinned 422 (schema-level model validation)."""
+    resp = await client.post(
+        "/",
+        json={"device_ids": [], "start_time": START, "end_time": END},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert (
+        detail[0]["msg"]
+        == "Value error, A reservation must include at least one device or dynamic request"
+    )
+
+
+async def test_dynamic_only_callback_success_attaches_instances(internal_client):
+    """A success callback activates a dynamic-only reservation and attaches the
+    materialized instance device ids (the reservation started with none)."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        device_ids=[],
+        dynamic_template_ids=[TEMPLATE_ID],
+    )
+    inst_a = str(uuid.uuid4())
+    inst_b = str(uuid.uuid4())
+    fork_mock = AsyncMock()
+    with patch(
+        "app.services.reservation_service._create_reservation_fork_best_effort",
+        new=fork_mock,
+    ):
+        resp = await internal_client.post(
+            f"/internal/{rid}/provision-result",
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            json={"succeeded": True, "device_ids": [inst_a, inst_b], "error": None},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"reservation_id": str(rid), "status": "ACTIVE", "applied": True}
+
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.ACTIVE
+    assert {str(d) for d in res.device_ids} == {inst_a, inst_b}
+    fork_mock.assert_awaited_once()
+
+    created = await _outbox_rows("herd.reservations.created")
+    assert len(created) == 1
+    assert set(created[0].payload["device_ids"]) == {inst_a, inst_b}
+
+
+async def test_dynamic_only_callback_failure_no_device_release(internal_client):
+    """A failure callback on a dynamic-only reservation lands FAILED and stages
+    reservation.failed with no device-release side effect: the exclusive set is
+    empty, so the release path is a clean no-op."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        device_ids=[],
+        dynamic_template_ids=[TEMPLATE_ID],
+    )
+    update_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=update_mock,
+        ),
+    ):
+        resp = await internal_client.post(
+            f"/internal/{rid}/provision-result",
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            json={"succeeded": False, "device_ids": [], "error": "create_instance failed"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"reservation_id": str(rid), "status": "FAILED", "applied": True}
+
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.FAILED
+    failed = await _outbox_rows("herd.reservations.failed")
+    assert len(failed) == 1
+    assert failed[0].payload["reservation_id"] == str(rid)
+    update_mock.assert_not_called()
+
+
+async def test_dynamic_only_timeout_backstop_no_device_release():
+    """The timeout backstop fails a stuck dynamic-only reservation cleanly, with
+    no device release for the empty exclusive set."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        device_ids=[],
+        dynamic_template_ids=[TEMPLATE_ID],
+        updated_at=NOW - timedelta(hours=2),
+    )
+    update_mock = AsyncMock()
+    p1, p2, p3, p4 = _patch_expiration_inventory(update_mock=update_mock)
+    # device_ids is empty, so the release loop's zip over (ids, fetch_results)
+    # is empty and the mocked fetch return value is immaterial.
+    with p1, p2, p3, p4:
+        await _run_expiration_cycle()
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.FAILED
+    failed = await _outbox_rows("herd.reservations.failed")
+    assert len(failed) == 1
+    assert failed[0].payload["reservation_id"] == str(rid)
+    update_mock.assert_not_called()
+
+
 # --- Booking: template validation against inventory --------------------------
 
 

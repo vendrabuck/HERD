@@ -513,13 +513,19 @@ async def create_reservation(
     except Exception as exc:
         raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
 
-    # 2. Validate topology_type uniformity
-    topology_types = {d["topology_type"] for d in devices}
-    if len(topology_types) > 1:
-        raise ValueError(
-            f"All devices must share the same topology type. Found: {', '.join(topology_types)}"
-        )
-    topology_type = TopologyType(topology_types.pop())
+    # 2. Derive topology_type. A dynamic-only booking has no physical devices to
+    # read it from, so it is CLOUD by construction (ADR 0004 materializes dynamic
+    # instances as CLOUD inventory devices); issue #274. With physical devices the
+    # existing all-or-nothing uniformity rule stands.
+    if devices:
+        topology_types = {d["topology_type"] for d in devices}
+        if len(topology_types) > 1:
+            raise ValueError(
+                f"All devices must share the same topology type. Found: {', '.join(topology_types)}"
+            )
+        topology_type = TopologyType(topology_types.pop())
+    else:
+        topology_type = TopologyType.CLOUD
 
     # 2b. If a topology is referenced, validate every edge maps to a real path
     # in the cabling graph. Reservations without a topology are unaffected.
@@ -636,6 +642,14 @@ async def create_reservation(
         # succeeds, so execution never creates instances for a booking that is
         # about to land in FAILED.
         await db.flush()
+        # A dynamic-only booking (empty device_ids) never populated the `devices`
+        # collection in-memory, so refresh it before the payload builder reads the
+        # device_ids association proxy: an unloaded selectin collection would
+        # otherwise lazy-load in the sync builder and raise MissingGreenlet (#274).
+        # A booking with non-exclusive physical devices already has the collection
+        # materialized by the association-proxy creator, so it needs no refresh.
+        if not data.device_ids:
+            await db.refresh(reservation)
         enqueue_event(
             db,
             OutboxEvent,
