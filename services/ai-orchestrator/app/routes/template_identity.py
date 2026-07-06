@@ -77,7 +77,7 @@ async def suggest_identity(
     except AIProviderUnavailableError as e:
         # Configured but unreachable endpoint: a 503, matching the issue #131
         # standardization. Caught before AIError (its subclass).
-        logger.warning("ai_template_identity_provider_unreachable")
+        logger.warning("ai_template_identity_provider_unreachable: %s", e)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             AI_PROVIDER_UNREACHABLE_DETAIL,
