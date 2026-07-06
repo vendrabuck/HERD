@@ -61,9 +61,10 @@ class ReservationCreate(BaseModel):
 
     @field_validator("device_ids")
     @classmethod
-    def device_ids_not_empty(cls, v: list[uuid.UUID]) -> list[uuid.UUID]:
-        if not v:
-            raise ValueError("At least one device must be specified")
+    def dedupe_device_ids(cls, v: list[uuid.UUID]) -> list[uuid.UUID]:
+        # device_ids may be empty for a dynamic-only booking (ADR 0004, issue
+        # #274); the device-or-dynamic requirement is enforced cross-field in
+        # require_device_or_dynamic below. This validator only dedupes.
         return _dedupe_preserve_order(v)
 
     @field_validator("end_time")
@@ -73,6 +74,20 @@ class ReservationCreate(BaseModel):
         if start and v <= start:
             raise ValueError("end_time must be after start_time")
         return v
+
+    @model_validator(mode="after")
+    def require_device_or_dynamic(self) -> "ReservationCreate":
+        """Reject a booking that reserves nothing at all.
+
+        device_ids may be empty only when the booking carries at least one
+        dynamic request (ADR 0004, issue #274): a dynamic-only lab needs no
+        pre-existing physical device. A request with neither is meaningless and
+        is rejected here rather than deeper in the service, where an empty
+        device fetch would otherwise derive no topology_type.
+        """
+        if not self.device_ids and not self.dynamic_requests:
+            raise ValueError("A reservation must include at least one device or dynamic request")
+        return self
 
     @model_validator(mode="after")
     def validate_window(self) -> "ReservationCreate":
