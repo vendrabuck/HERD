@@ -82,7 +82,7 @@ async def generate_topology(
             # Configured but unreachable endpoint (connect/DNS/TLS/timeout): a 503,
             # matching the issue #131 upstream-unreachable standardization, not the
             # 502 used for a live provider that returned an unusable response.
-            logger.warning("ai_provider_unreachable")
+            logger.warning("ai_provider_unreachable: %s", e)
             raise GeneratorError(503, AI_PROVIDER_UNREACHABLE_DETAIL) from e
         except AIError as e:
             logger.exception("ai_error")

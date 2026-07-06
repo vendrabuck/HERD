@@ -268,7 +268,7 @@ async def reservation_assistant(
         # standardization. Caught before AIError (its subclass); rolls back the
         # flushed user turn like the other failure branches so no orphan persists.
         await db.rollback()
-        logger.warning("ai_assistant_provider_unreachable")
+        logger.warning("ai_assistant_provider_unreachable: %s", exc)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             AI_PROVIDER_UNREACHABLE_DETAIL,
@@ -445,14 +445,14 @@ async def reservation_assistant_stream(
                     )
                 },
             )
-        except AIProviderUnavailableError:
+        except AIProviderUnavailableError as exc:
             # A configured-but-unreachable provider that fails once the stream has
             # already opened: a 503 status line is no longer possible, so surface
             # it as the existing `error` event shape with a diagnosable message
             # rather than dropping the connection. Roll back the flushed user turn
             # so no orphan persists, exactly as the AIError branch does.
             await db.rollback()
-            logger.warning("ai_assistant_stream_provider_unreachable")
+            logger.warning("ai_assistant_stream_provider_unreachable: %s", exc)
             yield _sse("error", {"message": AI_PROVIDER_UNREACHABLE_DETAIL})
         except AIError:
             # Log the exception detail server-side; the client-facing error frame
