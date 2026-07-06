@@ -1,11 +1,13 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.outbox import run_outbox_relay
+from herd_common.schema_init import create_all_and_stamp
 
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
@@ -18,8 +20,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await create_all_and_stamp(
+        engine,
+        Base.metadata,
+        schema=settings.db_schema,
+        script_location=Path(__file__).resolve().parents[1] / "migrations",
+        log=logger,
+    )
 
     # Connect to NATS (non-fatal if unavailable)
     app.state.nats = None

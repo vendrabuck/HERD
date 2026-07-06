@@ -226,6 +226,43 @@ Expected gating, not an outage: no grant on the secret returns 404, a `view`
 grant returns metadata but 403 on `/value` (plaintext needs `manage`). See the
 secrets matrix in [ROLES.md](ROLES.md).
 
+## Migrations and database volumes
+
+### `make migrate` fails with "already exists", or a route 500s on a column that is in the code
+
+Symptom: `make migrate` (or `make migrate-<svc>`) aborts almost immediately with a
+`DuplicateObject` / `already exists` error such as `type "role" already exists` or
+`relation "..." already exists`; and/or a route 500s referencing a column that is present
+in the models and migrations but missing from the running database (the #32
+`device_templates.hypervisor_id` case is the worked example).
+
+Root cause: the dev stacks create each service's tables at startup with SQLAlchemy
+`create_all` (a convenience so `make up` needs no migration step). On a long-lived dev
+volume that predates this fix, `create_all` never wrote an `alembic_version` row, so the
+schema is unmanaged. Two consequences: `create_all` cannot ALTER an existing table to add
+a newly merged column, so the column is silently absent and the route 500s; and each
+service's Alembic chain runs from base against objects that already exist, so
+`make migrate` fails on the first `CREATE` it re-attempts and cannot repair the gap.
+
+Going forward, a service that creates a genuinely fresh schema now stamps the Alembic head
+at startup, so a later `make migrate` applies only new increments. A schema created by the
+old unstamped `create_all` cannot be safely stamped after the fact (stamping head would
+falsely claim every merged migration is applied and keep hiding the missing column), so on
+such a volume the service logs a loud startup warning naming this fix. The fix for an
+already-broken dev volume is to recreate it:
+
+```bash
+make down
+docker compose down -v   # drops the postgres (and other) volumes; dev data is disposable
+make up
+```
+
+The stack comes back with fresh, stamped schemas. This discards local dev data by design;
+for a stack whose data you need, apply the missing migration by hand instead
+(`docker compose exec <svc> alembic stamp <the revision before the new one>` then
+`alembic upgrade head`, matching the service's own chain). Production runs migrations, not
+`create_all`, so this does not apply to a `make prod` stack.
+
 ## Logs and where to look
 
 - **Global tail**: `make logs` (all containers).

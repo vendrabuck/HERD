@@ -18,10 +18,12 @@ visibility rules apply.
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
+from herd_common.schema_init import create_all_and_stamp
 
 from app.config import settings
 from app.database import Base, engine
@@ -48,8 +50,13 @@ async def lifespan(app: FastAPI):
 
         async with engine.begin() as conn:
             await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.db_schema}"))
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await create_all_and_stamp(
+        engine,
+        Base.metadata,
+        schema=settings.db_schema,
+        script_location=Path(__file__).resolve().parents[1] / "migrations",
+        log=logger,
+    )
 
     sweeper_task = asyncio.create_task(
         conversation_sweeper_loop(interval_seconds=settings.assistant_sweeper_interval_seconds)
