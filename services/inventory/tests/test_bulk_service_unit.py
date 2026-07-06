@@ -246,6 +246,111 @@ async def test_import_templates_existing_name_is_update(db_setup):
 
 
 @pytest.mark.asyncio
+async def test_import_templates_row_omitting_vendor_model_preserves_existing(db_setup):
+    """Issue #283: an update row that omits vendor/model must leave the stored
+    (NOT NULL) values untouched, not null them and fail the constraint. The row
+    still applies the fields it does carry (here, a new description)."""
+    async with TestSessionLocal() as db:
+        tmpl = DeviceTemplate(
+            name="Keep",
+            template_type="device",
+            vendor="Acme",
+            model="M1",
+            description="original",
+            sections=[{"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}],
+        )
+        db.add(tmpl)
+        await db.commit()
+        tmpl_id = tmpl.id
+
+        report = await import_templates(
+            db,
+            _json_bytes([{"name": "Keep", "description": "edited"}]),
+            "json",
+            dry_run=False,
+            actor_id=uuid.uuid4(),
+        )
+        assert report.updated == 1
+        assert report.rejected == 0
+        refreshed = await db.get(DeviceTemplate, tmpl_id)
+        assert refreshed.vendor == "Acme"
+        assert refreshed.model == "M1"
+        assert refreshed.description == "edited"
+
+
+@pytest.mark.asyncio
+async def test_import_templates_omitting_exclusive_preserves_existing(db_setup):
+    """A row that omits the exclusive column preserves the stored value rather
+    than coercing the missing cell to the True default, which would silently
+    flip a non-exclusive template."""
+    async with TestSessionLocal() as db:
+        tmpl = DeviceTemplate(
+            name="Shared",
+            template_type="device",
+            vendor="Acme",
+            model="M1",
+            exclusive=False,
+            sections=[{"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}],
+        )
+        db.add(tmpl)
+        await db.commit()
+        tmpl_id = tmpl.id
+
+        report = await import_templates(
+            db,
+            _json_bytes([{"name": "Shared", "description": "x"}]),
+            "json",
+            dry_run=False,
+            actor_id=uuid.uuid4(),
+        )
+        assert report.updated == 1
+        refreshed = await db.get(DeviceTemplate, tmpl_id)
+        assert refreshed.exclusive is False
+
+
+@pytest.mark.asyncio
+async def test_import_templates_omitting_driver_preserves_existing(db_setup):
+    """A row that omits driver_name preserves the stored driver_id rather than
+    nulling it and orphaning the template from its driver."""
+    async with TestSessionLocal() as db:
+        driver = DriverPackage(
+            name="KeepDrv",
+            connection_type="Management",
+            filename="d.zip",
+            storage_key="k",
+            size_bytes=1,
+            sha256="abc",
+            uploaded_by="admin",
+        )
+        db.add(driver)
+        await db.commit()
+        await db.refresh(driver)
+        drv_id = driver.id
+        tmpl = DeviceTemplate(
+            name="HasDriver",
+            template_type="device",
+            driver_id=drv_id,
+            vendor="Acme",
+            model="M1",
+            sections=[{"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}],
+        )
+        db.add(tmpl)
+        await db.commit()
+        tmpl_id = tmpl.id
+
+        report = await import_templates(
+            db,
+            _json_bytes([{"name": "HasDriver", "description": "x"}]),
+            "json",
+            dry_run=False,
+            actor_id=uuid.uuid4(),
+        )
+        assert report.updated == 1
+        refreshed = await db.get(DeviceTemplate, tmpl_id)
+        assert refreshed.driver_id == drv_id
+
+
+@pytest.mark.asyncio
 async def test_import_devices_bad_enum_rolls_back_via_generic_except(db_setup):
     """A bad status enum raises a Pydantic ValidationError (generic Exception
     branch), rejected with a rollback."""
@@ -303,33 +408,47 @@ async def test_import_devices_unknown_field_rolls_back_via_http_exception(db_set
 
 
 @pytest.mark.asyncio
-async def test_import_templates_duplicate_in_batch_rejects_via_http_exception(db_setup):
-    """Two rows with the same name: the first creates, the second resolves the
-    now-existing template and takes the update branch, which nulls the required
-    vendor/model and hits a NOT NULL IntegrityError. That surfaces as
-    HTTPException with the generic constraint detail (not a name conflict, since
-    the failing constraint is not name uniqueness) and the row is rejected with
-    a rollback (the except-HTTPException branch of import_templates)."""
+async def test_import_templates_hypervisor_driver_on_device_rejects_via_http_exception(db_setup):
+    """The except-HTTPException reject branch of import_templates. A row that
+    points an existing device template at a Hypervisor-type driver makes
+    update_template raise HTTPException(422) (device templates cannot use a
+    Hypervisor driver, enforced by _validate_driver_connection_type). The row is
+    rejected with its detail as the reason and a rollback, and the batch
+    survives."""
     section = {"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}
-    row = {
-        "name": "DupBatch",
-        "template_type": "port",
-        "exclusive": True,
-        "sections": [section],
-    }
     async with TestSessionLocal() as db:
+        driver = DriverPackage(
+            name="HvDrv",
+            connection_type="Hypervisor",
+            filename="d.zip",
+            storage_key="k",
+            size_bytes=1,
+            sha256="abc",
+            uploaded_by="admin",
+        )
+        db.add(driver)
+        await _seed_template(db, "DeviceTpl")
+        await db.commit()
+
         report = await import_templates(
             db,
-            _json_bytes([dict(row), dict(row)]),
+            _json_bytes(
+                [
+                    {
+                        "name": "DeviceTpl",
+                        "template_type": "device",
+                        "driver_name": "HvDrv",
+                        "sections": [section],
+                    }
+                ]
+            ),
             "json",
             dry_run=False,
             actor_id=uuid.uuid4(),
         )
-    assert report.created == 1
     assert report.rejected == 1
     reason = [r.reason for r in report.rows if r.action == "reject"][0]
-    assert reason == "Template violates a database constraint"
-    assert "already exists" not in reason
+    assert "Hypervisor" in reason
 
 
 @pytest.mark.asyncio

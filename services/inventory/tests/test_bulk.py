@@ -236,6 +236,53 @@ async def test_template_then_device_json_roundtrip(client):
 
 
 @pytest.mark.asyncio
+async def test_template_reimport_omitting_vendor_model_preserves_them(client):
+    """Issue #283: exporting a template, stripping vendor/model from the row, and
+    re-importing takes the update path and preserves the stored (NOT NULL)
+    vendor/model instead of nulling them and rejecting the row."""
+    await _create_template(client, name="Firewall", vendor="Juniper", model="EX3300")
+    items = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    assert items[0]["vendor"] == "Juniper"
+    row = dict(items[0])
+    row.pop("vendor", None)
+    row.pop("model", None)
+    resp = await client.post(
+        "/templates/import",
+        params={"format": "json"},
+        files={"file": ("t.json", io.BytesIO(json.dumps([row]).encode()), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["updated"] == 1
+    assert report["created"] == 0
+    assert report["rejected"] == 0
+    after = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    assert after[0]["vendor"] == "Juniper"
+    assert after[0]["model"] == "EX3300"
+
+
+@pytest.mark.asyncio
+async def test_template_reexport_reimport_is_noop_update(client):
+    """The export/import round-trip invariant: re-importing an unedited export is
+    an update that changes nothing (issue #283). Every exported field is applied
+    back to its own value, so a second export matches the first byte-for-byte."""
+    await _create_template(client, name="Firewall", vendor="Juniper", model="EX3300")
+    before = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    resp = await client.post(
+        "/templates/import",
+        params={"format": "json"},
+        files={"file": ("t.json", io.BytesIO(json.dumps(before).encode()), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["updated"] == 1
+    assert report["created"] == 0
+    assert report["rejected"] == 0
+    after = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    assert after == before
+
+
+@pytest.mark.asyncio
 async def test_device_csv_roundtrip(client):
     template = await _create_template(client, name="Firewall")
     await _create_device(client, template["id"], name="FW-01")
