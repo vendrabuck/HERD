@@ -282,6 +282,12 @@ async def _insert_dynamic_device(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
+        # With no request_id, NULLs never collide on the unique constraint, so
+        # the violation can only be the name. Skipping the classifier here also
+        # keeps a device NAME containing the substring "request_id" (which
+        # asyncpg echoes in its Key (name)=(...) detail) from misclassifying.
+        if request_id is None:
+            return "name"
         return _unique_conflict_target(exc)
     await db.refresh(device)
     return device
