@@ -28,6 +28,19 @@ class AIError(Exception):
     """
 
 
+class AIProviderUnavailableError(AIError):
+    """Raised when the configured provider endpoint is unreachable at the
+    transport layer: connection refused, DNS failure, TLS/CA verification
+    failure, or a connect/read timeout from the SDK's HTTP client.
+
+    A subclass of AIError so any existing `except AIError` still catches it,
+    but distinct so routes can map an unreachable-but-configured provider to
+    HTTP 503 (per the issue #131 upstream-unreachable standardization) while a
+    live provider that returned an API error (auth, 4xx, 5xx) stays 502. Only
+    unreachable-class failures raise this; provider API errors stay AIError.
+    """
+
+
 @dataclass(frozen=True)
 class TextBlock:
     text: str

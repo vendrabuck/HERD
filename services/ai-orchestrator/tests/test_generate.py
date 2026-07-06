@@ -9,7 +9,13 @@ from app.main import app
 from app.routes.generate import _inventory_provider
 from app.services import generator as generator_module
 from app.services import usage_repo
-from app.services.ai_client import AIError, get_ai_client
+from app.services.ai_client import (
+    AI_NOT_CONFIGURED_DETAIL,
+    AI_PROVIDER_UNREACHABLE_DETAIL,
+    AIError,
+    AIProviderUnavailableError,
+    get_ai_client,
+)
 from app.services.inventory_client import InventorySummary
 from app.services.llm_provider import Usage
 from httpx import ASGITransport, AsyncClient
@@ -160,6 +166,53 @@ async def test_generate_503_when_key_blank(async_client, monkeypatch):
     async with async_client as client:
         resp = await client.post("/generate", data={"prompt": "hi"}, headers=headers)
     assert resp.status_code == 503
+
+
+async def test_generate_503_on_unknown_provider(async_client, monkeypatch):
+    """AI_PROVIDER set to an unrecognized value (a typo like 'athropic') degrades
+    to 503 at the get_ai_client dependency, not the 500 issue #245 reported. The
+    AIClient dependency is deliberately NOT overridden so this exercises the real
+    dependency-resolution path that runs BEFORE the route's ai_is_configured gate.
+    """
+    monkeypatch.setattr(config_module.settings, "ai_provider", "athropic")
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "hi"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_NOT_CONFIGURED_DETAIL
+
+
+async def test_generate_503_on_construction_failure(async_client, monkeypatch):
+    """A provider that blows up while being CONSTRUCTED (issue #280: an ai_ca_cert
+    path that does not exist) degrades to 503 at the dependency boundary rather
+    than a 500. Dependency NOT overridden, so the real construction path runs."""
+    monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    monkeypatch.setattr(config_module.settings, "ai_ca_cert", "/nonexistent/ca-bundle.pem")
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "hi"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_NOT_CONFIGURED_DETAIL
+
+
+async def test_generate_503_on_provider_unreachable(async_client, monkeypatch):
+    """A configured provider whose endpoint is unreachable (the provider raised
+    AIProviderUnavailableError) surfaces as 503, matching the issue #131
+    upstream-unreachable standardization, not the 502 used for a live provider
+    that returned an unusable response."""
+    _override_inventory({"EX3400": 1})
+    _override_resolver(monkeypatch)
+    _override_ai(raises=AIProviderUnavailableError("endpoint unreachable"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_PROVIDER_UNREACHABLE_DETAIL
 
 
 async def test_generate_returns_proposal_when_ai_succeeds(async_client, monkeypatch):

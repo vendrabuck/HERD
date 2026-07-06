@@ -13,10 +13,12 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-from anthropic import AsyncAnthropic
+import httpx
+from anthropic import APIConnectionError, AsyncAnthropic
 
 from app.services.llm_provider import (
     AIError,
+    AIProviderUnavailableError,
     ContentBlock,
     Message,
     ProviderResponse,
@@ -113,6 +115,15 @@ class AnthropicProvider:
             sdk_msg = await (asyncio.wait_for(coro, timeout_s) if timeout_s is not None else coro)
         except asyncio.TimeoutError as exc:
             raise AIError(f"AI call exceeded {timeout_s}s") from exc
+        except (APIConnectionError, httpx.TransportError) as exc:
+            # APIConnectionError (base of APITimeoutError) covers connection
+            # refused, DNS failure, and TLS/CA verification failure; the bare
+            # httpx.TransportError catch is belt-and-suspenders for a transport
+            # error that reaches here unwrapped. A live endpoint returning an API
+            # error (APIStatusError, auth) is NOT caught here and stays an AIError.
+            raise AIProviderUnavailableError(
+                f"AI provider endpoint unreachable: {type(exc).__name__}: {exc}"
+            ) from exc
 
         return _response_from_anthropic(sdk_msg, self._model)
 
@@ -163,6 +174,10 @@ class AnthropicProvider:
                 final = await stream.get_final_message()
         except asyncio.TimeoutError as exc:
             raise AIError(f"AI call exceeded {timeout_s}s") from exc
+        except (APIConnectionError, httpx.TransportError) as exc:
+            raise AIProviderUnavailableError(
+                f"AI provider endpoint unreachable: {type(exc).__name__}: {exc}"
+            ) from exc
 
         yield StreamDone(response=_response_from_anthropic(final, self._model))
 

@@ -7,9 +7,14 @@ by either a hosted API key OR a base_url for a local keyless endpoint.
 
 import pytest
 from app import config as config_module
-from app.services.ai_client import ai_is_configured, get_ai_client
+from app.services.ai_client import (
+    AI_NOT_CONFIGURED_DETAIL,
+    ai_is_configured,
+    get_ai_client,
+)
 from app.services.providers.anthropic_provider import AnthropicProvider
 from app.services.providers.openai_provider import OpenAICompatProvider
+from fastapi import HTTPException
 
 # --- ai_is_configured: anthropic provider ---
 
@@ -88,7 +93,28 @@ def test_get_ai_client_constructs_openai_compat_provider(monkeypatch):
     assert isinstance(client._provider, OpenAICompatProvider)
 
 
-def test_get_ai_client_raises_on_unknown_provider(monkeypatch):
+def test_get_ai_client_503_on_unknown_provider(monkeypatch):
+    """An unrecognized ai_provider is the same state ai_is_configured() reports as
+    unconfigured, so get_ai_client degrades to a 503 (issue #245) with the exact
+    unconfigured-gate detail rather than escaping the dependency as a 500."""
     monkeypatch.setattr(config_module.settings, "ai_provider", "totally-not-real")
-    with pytest.raises(RuntimeError, match="unknown ai_provider"):
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-whatever")
+    with pytest.raises(HTTPException) as exc:
         get_ai_client()
+    assert exc.value.status_code == 503
+    assert exc.value.detail == AI_NOT_CONFIGURED_DETAIL
+    assert ai_is_configured() is False
+
+
+def test_get_ai_client_503_on_construction_failure(monkeypatch):
+    """A provider that raises while being CONSTRUCTED (issue #280: an ai_ca_cert
+    path that does not exist blows up in the TLS context build) degrades to a 503
+    at the dependency boundary, not a 500 before any gate is reached."""
+    monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-ant-x")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    monkeypatch.setattr(config_module.settings, "ai_ca_cert", "/nonexistent/path/to/ca-bundle.pem")
+    with pytest.raises(HTTPException) as exc:
+        get_ai_client()
+    assert exc.value.status_code == 503
+    assert exc.value.detail == AI_NOT_CONFIGURED_DETAIL

@@ -13,7 +13,15 @@ from app.database import Base, engine
 from app.main import app
 from app.routes.reservation_assistant import get_reservation_seed_dep
 from app.services import usage_repo
-from app.services.ai_client import AIError, AssistantTurnResult, TurnSegment, get_ai_client
+from app.services.ai_client import (
+    AI_NOT_CONFIGURED_DETAIL,
+    AI_PROVIDER_UNREACHABLE_DETAIL,
+    AIError,
+    AIProviderUnavailableError,
+    AssistantTurnResult,
+    TurnSegment,
+    get_ai_client,
+)
 from app.services.llm_provider import TextBlock
 from app.services.reservation_context import (
     ReservationNotFoundError,
@@ -164,6 +172,33 @@ async def test_503_when_api_key_blank(async_client, monkeypatch):
     async with async_client as client:
         resp = await client.post(_url(), json={"question": "hello"}, headers=headers)
     assert resp.status_code == 503
+
+
+async def test_503_on_unknown_provider(async_client, monkeypatch):
+    """AI_PROVIDER set to an unrecognized value degrades to 503 at the
+    get_ai_client dependency, not the 500 issue #245 reported. The AIClient
+    dependency is NOT overridden here, so the real dependency-resolution path
+    (which runs before the route's ai_is_configured gate) is exercised."""
+    monkeypatch.setattr(config_module.settings, "ai_provider", "athropic")
+    _override_seed()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "hi"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_NOT_CONFIGURED_DETAIL
+
+
+async def test_buffered_provider_unreachable_returns_503(async_client):
+    """A configured provider whose endpoint is unreachable surfaces as 503 with
+    the pinned unreachable detail, not the 502 used for a live-provider failure
+    (issue #280, aligned with the issue #131 standardization)."""
+    _override_seed()
+    _override_ai(raises=AIProviderUnavailableError("connection refused"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "hi"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_PROVIDER_UNREACHABLE_DETAIL
 
 
 async def test_over_quota_returns_429_without_calling_ai(async_client, monkeypatch):
@@ -711,6 +746,23 @@ async def test_stream_emits_error_event_on_ai_failure(async_client):
     # (CWE-209), it is logged server-side instead.
     assert events[-1][1]["message"] == "Assistant call failed"
     assert "model exploded" not in events[-1][1]["message"]
+
+
+async def test_stream_provider_unreachable_emits_error_event(async_client):
+    """A configured-but-unreachable provider that fails once the stream has
+    opened cannot set a 503 status line, so the failure rides an SSE `error`
+    event carrying the diagnosable unreachable message (issue #280). The stream
+    ends cleanly rather than dropping the connection."""
+    _override_seed()
+    _override_streaming_ai([], raises=AIProviderUnavailableError("connection refused"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "q"}, headers=headers)
+    # HTTP 200 (stream opened); the failure is an in-band error event.
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    assert events[-1][0] == "error"
+    assert events[-1][1]["message"] == AI_PROVIDER_UNREACHABLE_DETAIL
 
 
 async def test_stream_requires_auth(async_client):

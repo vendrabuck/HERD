@@ -9,7 +9,12 @@ from app.config import settings
 from app.database import get_db
 from app.schemas.generate import ExtractedFile, GenerateResponse
 from app.services import usage_repo
-from app.services.ai_client import AIClient, ai_is_configured, get_ai_client
+from app.services.ai_client import (
+    AI_NOT_CONFIGURED_DETAIL,
+    AIClient,
+    ai_is_configured,
+    get_ai_client,
+)
 from app.services.extractor import ExtractionError, extract_files
 from app.services.generator import GeneratorError, generate_topology
 from app.services.inventory_client import InventorySummary, fetch_inventory_summary
@@ -75,7 +80,7 @@ async def generate(
     if not ai_is_configured():
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "AI orchestrator is not configured",
+            AI_NOT_CONFIGURED_DETAIL,
         )
 
     user_id = uuid.UUID(user["sub"])
