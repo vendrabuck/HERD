@@ -385,18 +385,27 @@ async def import_templates(
                     await create_template(db, create)
                 report.rows.append(RowResult(row=index, action="create", identity=name))
             else:
-                update = TemplateUpdate(
-                    name=name,
-                    driver_id=driver_id,
-                    exclusive=exclusive,
-                    icon=raw_row.get("icon") or None,
-                    description=raw_row.get("description") or None,
-                    vendor=raw_row.get("vendor") or None,
-                    model=raw_row.get("model") or None,
-                    part_number=raw_row.get("part_number") or None,
-                    sections=sections,
-                    poll_interval_seconds=poll,
-                )
+                # Build the update kwargs conditionally: a field the row omits is
+                # left out so update_template's exclude_unset preserves the stored
+                # value. Coercing a missing field to None instead would overwrite
+                # it, and for the NOT NULL columns (vendor, model, sections) fail
+                # the constraint and reject an otherwise valid update (issue #283).
+                # An exported file re-imported unedited must be a no-op update.
+                update_kwargs: dict[str, Any] = {"name": name}
+                if driver_id is not None:
+                    update_kwargs["driver_id"] = driver_id
+                exclusive_cell = raw_row.get("exclusive")
+                if exclusive_cell is not None and exclusive_cell != "":
+                    update_kwargs["exclusive"] = _coerce_bool(exclusive_cell, True)
+                for field in ("icon", "description", "vendor", "model", "part_number"):
+                    value = raw_row.get(field)
+                    if value not in (None, ""):
+                        update_kwargs[field] = value
+                if sections:
+                    update_kwargs["sections"] = sections
+                if poll is not None:
+                    update_kwargs["poll_interval_seconds"] = poll
+                update = TemplateUpdate(**update_kwargs)
                 if not dry_run:
                     await update_template(db, existing.id, update, modified_by=actor_id)
                 report.rows.append(RowResult(row=index, action="update", identity=name))
