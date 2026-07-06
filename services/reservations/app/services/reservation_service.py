@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 import httpx
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, exists, false, select, text
+from sqlalchemy import and_, exists, false, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -771,6 +771,42 @@ async def create_reservation(
     return reservation
 
 
+async def _claim_provision_transition(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    new_status: ReservationStatus,
+) -> bool:
+    """Atomically move a reservation out of PENDING_PROVISION (issue #276).
+
+    A conditional UPDATE ... WHERE status = PENDING_PROVISION is a compare-and-
+    swap: of the two writers that can leave this state (the provision-result
+    callback here and the expiration task's timeout backstop), exactly one finds
+    the row still PENDING_PROVISION and performs the transition. Both paths read
+    the status and then write it, so without this CAS a success callback landing
+    between the backstop's SELECT and its COMMIT could be overwritten to FAILED
+    (or the reverse), after which teardown would destroy instances the user
+    believes are active. Returns True iff this call performed the transition; a
+    False return is the loser and must be a clean no-op (no event, no device
+    flip, no teardown).
+
+    synchronize_session is off, so a lost CAS never mutates the caller's
+    in-memory object; a winner re-reads via db.refresh where it needs the new
+    status. A conditional UPDATE is enforceable on both Postgres and the
+    in-memory SQLite used by unit tests, where SELECT ... FOR UPDATE is a silent
+    no-op.
+    """
+    result = await db.execute(
+        update(Reservation)
+        .where(
+            Reservation.id == reservation_id,
+            Reservation.status == ReservationStatus.PENDING_PROVISION,
+        )
+        .values(status=new_status)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
 async def apply_provision_result(
     db: AsyncSession,
     reservation_id: uuid.UUID,
@@ -800,6 +836,18 @@ async def apply_provision_result(
     if reservation is None:
         return None, False
     if reservation.status != ReservationStatus.PENDING_PROVISION:
+        # Already terminal: a duplicate or late callback, a user cancel, or the
+        # timeout backstop that already moved the row on. No transition, no event.
+        return reservation, False
+
+    target = ReservationStatus.ACTIVE if succeeded else ReservationStatus.FAILED
+    # Compare-and-swap the transition (issue #276). If the timeout backstop (or a
+    # concurrent callback) committed a terminal status between the db.get above
+    # and here, this claim matches zero rows and we lose: reload the winner's
+    # status and no-op with applied=False, emitting no event and touching no
+    # devices, so we never resurrect or double-transition the row.
+    if not await _claim_provision_transition(db, reservation_id, target):
+        await db.refresh(reservation)
         return reservation, False
 
     if succeeded:
@@ -808,7 +856,8 @@ async def apply_provision_result(
             if did not in existing:
                 reservation.device_ids.append(uuid.UUID(did))
                 existing.add(did)
-        reservation.status = ReservationStatus.ACTIVE
+        # The CAS already wrote ACTIVE; stage reservation.created in the same
+        # transaction so the event commits atomically with the transition.
         enqueue_event(
             db,
             OutboxEvent,
@@ -830,7 +879,8 @@ async def apply_provision_result(
         )
         return reservation, True
 
-    reservation.status = ReservationStatus.FAILED
+    # The CAS already wrote FAILED; stage reservation.failed in the same
+    # transaction so the event commits atomically with the transition.
     enqueue_event(
         db,
         OutboxEvent,

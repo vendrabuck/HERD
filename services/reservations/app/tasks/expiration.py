@@ -18,6 +18,7 @@ from app.models.reservation import (
     ReservationStatus,
 )
 from app.services.reservation_service import (
+    _claim_provision_transition,
     _create_reservation_fork_best_effort,
     _fetch_devices_best_effort,
     _provision_requested_event,
@@ -308,9 +309,19 @@ async def _run_expiration_cycle() -> None:
                     )
                 )
             )
-            stuck = list(result.scalars().all())
-            for res in stuck:
-                res.status = ReservationStatus.FAILED
+            candidates = list(result.scalars().all())
+            for res in candidates:
+                # Compare-and-swap the transition (issue #276). A provision-result
+                # callback that committed ACTIVE (or FAILED) between the SELECT
+                # above and here wins the row instead, and our conditional UPDATE
+                # matches zero rows: skip it, staging no duplicate reservation.failed
+                # and, crucially, never tearing down instances the callback just
+                # activated. Only rows this call actually failed join `stuck`, so
+                # the release loop below never touches a reservation another
+                # writer just activated.
+                if not await _claim_provision_transition(db, res.id, ReservationStatus.FAILED):
+                    continue
+                stuck.append(res)
                 enqueue_event(db, OutboxEvent, FAILED_SUBJECT, _reservation_failed_event(res))
                 logger.error(
                     "Provisioning timed out for reservation %s; failing it",
