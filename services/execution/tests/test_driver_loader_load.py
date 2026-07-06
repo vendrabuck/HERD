@@ -11,6 +11,7 @@ import pytest
 from app.database import Base
 from app.models.driver_cache import DriverCache
 from app.services.driver_loader import (
+    DriverPackageError,
     download_driver_package,
     extract_config_schema_json,
     extract_driver_package,
@@ -221,13 +222,15 @@ async def test_load_driver_extraction_failure(db):
             mock_settings.driver_cache_path = cache_root
             mock_settings.inventory_service_url = "http://test"
             mock_settings.internal_api_token = "token"
-            with pytest.raises(RuntimeError, match="Failed to extract"):
+            # A structurally invalid archive is a permanent package error, not a
+            # transient RuntimeError (issue #279).
+            with pytest.raises(DriverPackageError, match="Failed to extract"):
                 await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
 
 
 @pytest.mark.asyncio
 async def test_load_driver_validation_failure(db):
-    """Driver zip without required methods raises ValueError."""
+    """Driver zip without required methods raises DriverPackageError (issue #279)."""
     bad_driver = """
 class Driver:
     def __init__(self, context): pass
@@ -246,7 +249,7 @@ class Driver:
             mock_settings.driver_cache_path = cache_root
             mock_settings.inventory_service_url = "http://test"
             mock_settings.internal_api_token = "token"
-            with pytest.raises(ValueError, match="validation failed"):
+            with pytest.raises(DriverPackageError, match="validation failed"):
                 await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
 
 

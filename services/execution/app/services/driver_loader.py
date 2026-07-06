@@ -20,6 +20,22 @@ DEFAULT_DRIVER_METADATA: dict = {"supports_dry_run": False}
 
 logger = logging.getLogger(__name__)
 
+
+class DriverPackageError(Exception):
+    """A driver package can never load as-is; retry cannot fix it.
+
+    Raised for structural defects that are fixed for a given SHA256 and so
+    reproduce identically on every redelivery: a structurally invalid archive
+    (unsupported format, corrupt zip/tar), a missing driver.py, a driver.py
+    that fails to import (unparseable), a missing Driver class, an unknown
+    connection type, or a Driver missing a method the connection type requires.
+    Distinct from a download failure (inventory unreachable), which stays a
+    transient RuntimeError. The dynamic-provisioning consumer maps this to a
+    PermanentEventError so a broken recipe dead-letters on first delivery
+    instead of NAK'ing through the full retry ladder (issue #279).
+    """
+
+
 # Required methods per connection type
 REQUIRED_METHODS = {
     "Layer 1 Switch": ["login", "logout", "connect_ports", "disconnect_ports", "status"],
@@ -257,7 +273,9 @@ async def load_driver(
     """Load a driver package: check cache, download if needed, extract, validate, cache.
 
     Returns the local path to the extracted driver directory.
-    Raises ValueError on validation failure, RuntimeError on download/extraction failure.
+    Raises RuntimeError on a download failure (transient: inventory unreachable),
+    DriverPackageError on a structurally invalid archive or a validation failure
+    (permanent: the package can never load as-is).
     """
     # Check cache first
     cached_path = await get_cached_driver(db, driver_id, driver_sha256)
@@ -279,13 +297,13 @@ async def load_driver(
         extract_driver_package(package_bytes, driver_filename, dest_dir)
     except Exception as e:
         shutil.rmtree(dest_dir, ignore_errors=True)
-        raise RuntimeError(f"Failed to extract driver {driver_id}: {e}") from e
+        raise DriverPackageError(f"Failed to extract driver {driver_id}: {e}") from e
 
     # Validate
     errors = validate_driver(dest_dir, connection_type)
     if errors:
         shutil.rmtree(dest_dir, ignore_errors=True)
-        raise ValueError(f"Driver validation failed: {'; '.join(errors)}")
+        raise DriverPackageError(f"Driver validation failed: {'; '.join(errors)}")
 
     # Capture driver_metadata.json (opt-in capability declaration). Default-shape
     # if missing so the cache always reflects "we looked and this is what we saw".

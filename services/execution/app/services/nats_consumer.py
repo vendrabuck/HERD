@@ -1884,12 +1884,13 @@ async def _provision_one_instance(
     """Create one dynamic instance and return its materialized device id.
 
     Idempotent on the ledger: a redelivery that finds the row already ACTIVE with
-    a device skips the whole create. A missing template/hypervisor/secret (404)
-    is a PermanentEventError (config error retry cannot heal); a driver-result
-    failure or sandbox error raises so the message NAKs with the row left
-    CREATING for an idempotent retry.
+    a device skips the whole create. A missing template/hypervisor/secret (404),
+    or a structurally broken recipe package that can never load, is a
+    PermanentEventError (retry cannot heal); a driver-result failure or sandbox
+    error raises so the message NAKs with the row left CREATING for an idempotent
+    retry.
     """
-    from app.services.driver_loader import load_driver
+    from app.services.driver_loader import DriverPackageError, load_driver
     from app.services.dynamic_instance_service import (
         get_by_request_id,
         insert_or_get_creating,
@@ -1953,9 +1954,23 @@ async def _provision_one_instance(
     res_uuid = uuid.UUID(reservation_id)
 
     async with get_db_session() as db:
-        driver_path = await load_driver(
-            db, driver_id, driver_sha256, driver_filename, connection_type
-        )
+        try:
+            driver_path = await load_driver(
+                db, driver_id, driver_sha256, driver_filename, connection_type
+            )
+        except DriverPackageError as exc:
+            # A structurally broken recipe (invalid archive, missing Driver class,
+            # a missing required Hypervisor method, unparseable driver.py) can
+            # never load, so NAK'ing through the full max_deliver ladder only
+            # delays the DLQ. Dead-letter on first delivery with a diagnosable
+            # reason (issue #279). This raises out of the per-instance loop, so a
+            # broken package fails the whole provision_requested event, matching
+            # the missing-config-resource permanent path above. A download failure
+            # (inventory unreachable) stays a transient RuntimeError and is left
+            # to propagate as a NAK.
+            raise PermanentEventError(
+                f"recipe package cannot load for request {request_id}: {exc}"
+            ) from exc
 
         login = await _run_recipe_step(
             db,
