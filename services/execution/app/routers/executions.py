@@ -20,7 +20,11 @@ from app.schemas.execution import (
     ManualExecuteRequest,
     PaginatedExecutionRunResponse,
 )
-from app.services.driver_loader import get_driver_config_schema, load_driver
+from app.services.driver_loader import (
+    DriverPackageError,
+    get_driver_config_schema,
+    load_driver,
+)
 from app.services.execution_service import (
     fetch_device,
     fetch_template,
@@ -229,7 +233,7 @@ async def get_driver_config_schema_endpoint(
     }
     try:
         await load_driver(db, driver_id, sha256, filename, connection_type)
-    except (ValueError, RuntimeError) as exc:
+    except (DriverPackageError, ValueError, RuntimeError) as exc:
         logger.warning(
             "Could not load driver %s to read config schema: %s",
             driver_id,

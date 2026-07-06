@@ -59,6 +59,29 @@ def _mock_hv_tarball() -> bytes:
     return buf.getvalue()
 
 
+# A structurally broken recipe: valid archive and a driver.py that imports
+# cleanly, but with NO class named Driver. Inventory does not validate package
+# structure on upload (only filename/type/size), so this seeds fine; the
+# execution service's load_driver rejects it at validation time, which the
+# consumer classifies as a permanent, first-delivery DLQ (issue #279).
+_BROKEN_RECIPE_PY = "class NotADriver:\n    pass\n"
+
+
+def _broken_recipe_tarball() -> bytes:
+    """Build a .tar.gz recipe package whose driver.py defines no Driver class."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, content in (
+            ("driver.py", _BROKEN_RECIPE_PY),
+            ("driver_metadata.json", json.dumps({"supports_dry_run": False})),
+        ):
+            data = content.encode()
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 def _admin_session_client(base_url, admin_token):
     return httpx.AsyncClient(
         base_url=base_url,
@@ -185,6 +208,40 @@ async def failing_dynamic_template(base_url, admin_token, hv_driver, hypervisor)
                 },
             ],
         )
+        resp = await client.post("/inventory/templates", json=payload)
+        resp.raise_for_status()
+        template = resp.json()
+        yield template
+        await client.delete(f"/inventory/templates/{template['id']}")
+
+
+@pytest.fixture(scope="session")
+async def broken_recipe_driver(base_url, admin_token):
+    """Upload a structurally broken Hypervisor recipe (no Driver class).
+
+    Passes inventory's upload checks (a valid Hypervisor-type archive) but can
+    never load in the execution sandbox, exercising the issue #279 first-delivery
+    DLQ classification.
+    """
+    async with _admin_session_client(base_url, admin_token) as client:
+        files = {"file": ("broken_recipe.tar.gz", _broken_recipe_tarball(), "application/gzip")}
+        data = {
+            "name": f"broken-hv-{uuid.uuid4().hex[:8]}",
+            "connection_type": "Hypervisor",
+            "description": "integration broken hypervisor recipe (no Driver class)",
+        }
+        resp = await client.post("/inventory/drivers", files=files, data=data)
+        resp.raise_for_status()
+        driver = resp.json()
+        yield driver
+        await client.delete(f"/inventory/drivers/{driver['id']}")
+
+
+@pytest.fixture(scope="session")
+async def broken_dynamic_template(base_url, admin_token, broken_recipe_driver, hypervisor):
+    """A dynamic template bound to the structurally broken recipe package."""
+    async with _admin_session_client(base_url, admin_token) as client:
+        payload = _dynamic_template_payload(broken_recipe_driver["id"], hypervisor["id"], [])
         resp = await client.post("/inventory/templates", json=payload)
         resp.raise_for_status()
         template = resp.json()
@@ -416,6 +473,66 @@ async def test_create_failure_lands_failed_with_no_orphans(
         retained = await find_in_execution_dlq(reservation["id"].encode())
         assert retained is not None, (
             "exhausted provision_requested was not retained on herd.reservations.dlq.execution"
+        )
+        assert json.loads(retained)["event"] == "reservation.provision_requested"
+
+
+@pytest.mark.timeout(120)
+async def test_broken_recipe_package_dead_letters_on_first_delivery(
+    admin_client, broken_dynamic_template, fresh_device
+):
+    """Permanent-package path (issue #279): a structurally broken recipe (no
+    Driver class) can never load, so the consumer dead-letters the
+    provision_requested event on the FIRST delivery rather than NAK'ing through
+    the backoff ladder. The reservation lands in FAILED fast, no recipe method
+    ever runs (no ExecutionRun rows), no device is materialized, and the
+    physical DUT is released, matching the existing permanent-failure outcome.
+
+    First-delivery proof is twofold: (1) NO create_instance/login runs exist,
+    since load_driver fails before any sandbox step (contrast
+    test_create_failure_lands_failed_with_no_orphans, which records five
+    create_instance attempts across the ladder); and (2) FAILED arrives inside a
+    60s window, which is reachable for the immediate DLQ but impossible for the
+    retry ladder ([1, 5, 15, 60, 120]s needs >= 81s of backoff to exhaust)."""
+    nats_error = await probe_nats()
+
+    reservation = await _reserve_dynamic(
+        admin_client, fresh_device["id"], broken_dynamic_template["id"]
+    )
+    assert reservation["status"] == "PENDING_PROVISION", reservation
+
+    # 60s is below the >= 81s the ladder needs to exhaust, so reaching FAILED
+    # here can only be the first-delivery DLQ, not a retried transient failure.
+    failed = await _poll_reservation_status(
+        admin_client, reservation["id"], "FAILED", timeout=60.0, interval=1.0
+    )
+    assert failed is not None, (
+        "reservation never landed in FAILED within 60s; a broken package must "
+        "dead-letter on first delivery, not ride the retry ladder"
+    )
+
+    # The recipe never executed: load_driver failed before login/create_instance.
+    creates = await _runs(admin_client, reservation["id"], "create_instance")
+    assert creates == [], f"a broken package must not run create_instance: {creates}"
+    logins = await _runs(admin_client, reservation["id"], "login")
+    assert logins == [], f"a broken package must not reach recipe login: {logins}"
+
+    # No orphaned dynamic device: create never ran, so nothing with the generated
+    # name prefix may exist in inventory.
+    prefix = f"{broken_dynamic_template['name']}-{reservation['id'][:8]}"
+    orphans = await _devices_with_prefix(admin_client, prefix)
+    assert orphans == [], f"orphaned dynamic devices left in inventory: {orphans}"
+
+    # The failure callback releases the exclusive physical device.
+    status = await _poll_device_status(admin_client, fresh_device["id"], "AVAILABLE")
+    assert status == "AVAILABLE", f"physical device stuck in {status} after FAILED"
+
+    # DLQ retention (skipped silently when the host cannot reach NATS; under make
+    # master / the compose stack the 4222 port is published, so it runs).
+    if nats_error is None:
+        retained = await find_in_execution_dlq(reservation["id"].encode())
+        assert retained is not None, (
+            "broken-package provision_requested was not retained on herd.reservations.dlq.execution"
         )
         assert json.loads(retained)["event"] == "reservation.provision_requested"
 

@@ -27,7 +27,11 @@ from app.database import Base
 from app.models.dynamic_instance import DynamicInstance
 from app.models.execution_run import ExecutionRun
 from app.services import nats_consumer
-from app.services.driver_loader import extract_driver_package, validate_driver
+from app.services.driver_loader import (
+    DriverPackageError,
+    extract_driver_package,
+    validate_driver,
+)
 from app.services.dynamic_instance_service import (
     get_by_request_id,
     insert_or_get_creating,
@@ -468,6 +472,133 @@ async def test_transient_5xx_naks():
     patches[0] = patch(
         "app.services.nats_consumer._fetch_template",
         new=AsyncMock(side_effect=TransientUpstreamError("upstream 503")),
+    )
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once()
+    msg.ack.assert_not_awaited()
+    js.publish.assert_not_awaited()
+
+
+# --- broken recipe package classification (issue #279) ----------------------
+#
+# A structurally broken package (missing Driver class, missing a required
+# Hypervisor method, invalid archive, unparseable driver.py) can never load, so
+# load_driver raises DriverPackageError. The create path maps that to a
+# PermanentEventError, dead-lettering on FIRST delivery instead of NAK'ing
+# through the full max_deliver ladder. A download failure (inventory
+# unreachable) stays a transient RuntimeError and still NAKs for retry.
+
+# The message load_driver pins for a missing Driver class (see
+# driver_loader.validate_driver + load_driver); the recipe path wraps it.
+_VALIDATION_MSG = "Driver validation failed: driver.py must define a class named Driver"
+
+
+def _broken_package_patches(execute, exc):
+    """create-flow patches with load_driver raising `exc` (a package failure)."""
+    patches = _create_patches(execute)
+    patches[3] = patch(
+        "app.services.driver_loader.load_driver",
+        new=AsyncMock(side_effect=exc),
+    )
+    return patches
+
+
+async def test_broken_package_raises_permanent_with_diagnosable_message():
+    """A DriverPackageError from the recipe load becomes a PermanentEventError
+    whose message names the request and carries the underlying reason."""
+    calls, execute = _recipe_execute({})
+    patches = _broken_package_patches(execute, DriverPackageError(_VALIDATION_MSG))
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        with pytest.raises(PermanentEventError) as excinfo:
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    message = str(excinfo.value)
+    assert "recipe package cannot load" in message
+    assert REQUEST_ID in message
+    # The diagnosable underlying reason is preserved for the DLQ log/callback.
+    assert "must define a class named Driver" in message
+    # No recipe method ran: the package never loaded, so login/create never fired.
+    assert calls == []
+
+
+async def test_broken_package_dlqs_on_first_delivery_with_failure_callback():
+    """The whole event dead-letters on the FIRST delivery (no retry ladder) and
+    the best-effort failure callback fires so reservations fails fast."""
+    calls, execute = _recipe_execute({})
+    posted = AsyncMock()
+    js = MagicMock()
+    js.publish = AsyncMock()
+    msg = MagicMock()
+    msg.data = json.dumps(_event()).encode()
+    # First delivery: a permanent failure must DLQ here, not ride the ladder.
+    msg.metadata = SimpleNamespace(num_delivered=1)
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
+
+    patches = _broken_package_patches(execute, DriverPackageError(_VALIDATION_MSG))
+    patches.append(patch("app.services.nats_consumer._post_provision_result", new=posted))
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "dlq"
+    js.publish.assert_awaited_once_with(NATS_DLQ_SUBJECT, msg.data)
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()
+    # The recipe never executed: no NAK ladder, no sandbox steps.
+    assert calls == []
+    # Failure callback fired with an empty device set: reservations transitions
+    # to FAILED without waiting for the 900s timeout backstop.
+    posted.assert_awaited_once()
+    assert posted.await_args.kwargs["succeeded"] is False
+    assert posted.await_args.kwargs["device_ids"] == []
+    assert _VALIDATION_MSG in posted.await_args.kwargs["error"]
+
+
+async def test_broken_package_leaves_row_creating_for_teardown():
+    """The permanent create failure leaves the CREATING ledger row (inserted
+    before the load) for the reservation.failed teardown handler to retire."""
+    calls, execute = _recipe_execute({})
+    patches = _broken_package_patches(execute, DriverPackageError(_VALIDATION_MSG))
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        with pytest.raises(PermanentEventError):
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "CREATING"
+    assert rows[0].instance_ref is None
+    assert rows[0].device_id is None
+
+
+async def test_recipe_download_failure_still_naks():
+    """A transient load failure (inventory unreachable: RuntimeError from the
+    download step) is NOT permanent; it NAKs so JetStream retries with backoff."""
+    calls, execute = _recipe_execute({})
+    js = MagicMock()
+    js.publish = AsyncMock()
+    msg = MagicMock()
+    msg.data = json.dumps(_event()).encode()
+    msg.metadata = SimpleNamespace(num_delivered=1)
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
+
+    patches = _broken_package_patches(
+        execute, RuntimeError("Failed to download driver abc: connect error")
     )
     with ExitStack() as stack:
         for p in patches:
