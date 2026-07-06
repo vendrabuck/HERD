@@ -6,6 +6,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 COPY services/common/ /app/common/
 COPY services/ai-orchestrator/pyproject.toml .
+COPY services/ai-orchestrator/alembic.ini .
+COPY services/ai-orchestrator/migrations/ migrations/
 COPY services/ai-orchestrator/app/ app/
 
 RUN uv pip install --system -e /app/common && uv pip install --system --no-sources -e .

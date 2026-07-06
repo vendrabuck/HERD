@@ -1,8 +1,10 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
+from herd_common.schema_init import create_all_and_stamp
 
 from app.config import settings
 from app.database import Base, engine
@@ -21,8 +23,12 @@ setup_logging("integration", level=settings.log_level)
 async def lifespan(app: FastAPI):
     # The v1 facade is stateless, but the integration service owns its own schema
     # for the webhook subscription and delivery tables (issue #33, phase 4).
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await create_all_and_stamp(
+        engine,
+        Base.metadata,
+        schema=settings.db_schema,
+        script_location=Path(__file__).resolve().parents[1] / "migrations",
+    )
     await start_nats_consumer(app)
     yield
     await stop_nats_consumer(app)
