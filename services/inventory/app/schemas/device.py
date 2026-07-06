@@ -38,10 +38,15 @@ class InternalDeviceCreate(BaseModel):
     # Internal dynamic-instance create (X-Internal-Token). name is server-generated
     # when omitted; field_data tolerates unknown keys because the recipe's
     # create_instance result contributes non-template instance attributes.
+    # request_id is the caller's idempotency key (issue #275): a redelivered
+    # create carrying the same request_id converges on the existing device row
+    # instead of materializing a duplicate. Omitting it preserves the prior,
+    # always-create behavior.
     template_id: uuid.UUID
     reservation_id: uuid.UUID
     name: str | None = None
     field_data: dict[str, Any] = {}
+    request_id: uuid.UUID | None = None
 
 
 class DeviceUpdate(BaseModel):

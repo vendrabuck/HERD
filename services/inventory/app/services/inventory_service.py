@@ -230,26 +230,59 @@ async def delete_device(db: AsyncSession, device_id: uuid.UUID) -> bool:
 _MAX_NAME_ATTEMPTS = 10_000
 
 
+def _unique_conflict_target(exc: IntegrityError) -> str:
+    """Which column a unique-violation IntegrityError hit: "request_id" or "name".
+
+    Portable across asyncpg (Postgres) and aiosqlite (SQLite), the same idiom as
+    template_service._integrity_kind. Postgres surfaces a "Key (request_id)=..."
+    detail (and a "request_id"-named constraint); SQLite surfaces
+    "UNIQUE constraint failed: devices.request_id". Both carry the substring
+    "request_id" for a request_id collision, so it is checked first; anything
+    else (including the devices.name unique constraint) is treated as a name
+    collision, preserving the prior behavior where every IntegrityError on this
+    insert meant a name clash. Distinguishing the two matters because a name
+    collision must retry with the next generated name while a request_id
+    collision must return the existing row (issue #275).
+    """
+    text = str(getattr(exc, "orig", exc)).lower()
+    if "request_id" in text:
+        return "request_id"
+    return "name"
+
+
+async def _get_device_by_request_id(db: AsyncSession, request_id: uuid.UUID) -> Device | None:
+    result = await db.execute(select(Device).where(Device.request_id == request_id))
+    return result.unique().scalar_one_or_none()
+
+
 async def _insert_dynamic_device(
     db: AsyncSession,
     name: str,
     template_id: uuid.UUID,
     field_data: dict[str, Any],
-) -> Device | None:
-    """Insert one RESERVED dynamic-instance device; return None on a name clash."""
+    request_id: uuid.UUID | None = None,
+) -> Device | str:
+    """Insert one RESERVED dynamic-instance device.
+
+    Returns the Device on success, or the conflict target ("name" or
+    "request_id") when the commit hits a unique constraint, so the caller can
+    retry a name collision but return the existing row on a request_id collision
+    (issue #275).
+    """
     device = Device(
         name=name,
         template_id=template_id,
         topology_type=TopologyType.CLOUD,
         status=DeviceStatus.RESERVED,
         field_data=field_data,
+        request_id=request_id,
     )
     db.add(device)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        return None
+        return _unique_conflict_target(exc)
     await db.refresh(device)
     return device
 
@@ -260,6 +293,7 @@ async def create_dynamic_instance_device(
     reservation_id: uuid.UUID,
     name: str | None = None,
     field_data: dict[str, Any] | None = None,
+    request_id: uuid.UUID | None = None,
 ) -> Device:
     """Materialize a dynamic template as a RESERVED device (internal path only).
 
@@ -268,6 +302,13 @@ async def create_dynamic_instance_device(
     collision. field_data is validated against the template but tolerates unknown
     keys, since the recipe's create_instance result carries instance attributes
     that are not template fields.
+
+    Idempotent on request_id (issue #275): a redelivered create carrying a
+    request_id that already materialized a device returns that existing row
+    instead of erroring, so the execution consumer converges on one device row
+    across a NATS redelivery. The endpoint returns 201 in both the fresh and the
+    return-existing cases: the response body is the same device shape either way,
+    so the consumer needs no branching on a 200-vs-201 distinction.
     """
     result = await db.execute(select(DeviceTemplate).where(DeviceTemplate.id == template_id))
     template = result.scalar_one_or_none()
@@ -279,22 +320,48 @@ async def create_dynamic_instance_device(
     field_data = dict(field_data or {})
     validate_field_data(template, field_data, allow_unknown=True)
 
+    # Fast path: a redelivery whose request_id already has a device converges on
+    # it without re-inserting. The insert paths below still re-check on a
+    # request_id IntegrityError to cover a concurrent create that raced this one.
+    if request_id is not None:
+        existing = await _get_device_by_request_id(db, request_id)
+        if existing is not None:
+            return existing
+
     # Ports are created from the template's port sub-templates exactly as the
     # admin create path (create_device) does, which is to say none are created
     # here: a device/dynamic template carries no embedded port sub-templates, so
     # both paths add a bare device row.
 
     if name is not None:
-        device = await _insert_dynamic_device(db, name, template_id, field_data)
-        if device is None:
+        outcome = await _insert_dynamic_device(db, name, template_id, field_data, request_id)
+        if outcome == "request_id":
+            existing = await _get_device_by_request_id(db, request_id)
+            if existing is not None:
+                return existing
             raise HTTPException(status_code=409, detail=f"Device with name '{name}' already exists")
+        if outcome == "name":
+            raise HTTPException(status_code=409, detail=f"Device with name '{name}' already exists")
+        device = outcome
     else:
         prefix = f"{template.name}-{str(reservation_id)[:8]}"
-        device = None
+        device: Device | None = None
         n = 1
         while device is None and n <= _MAX_NAME_ATTEMPTS:
-            device = await _insert_dynamic_device(db, f"{prefix}-{n}", template_id, field_data)
-            n += 1
+            outcome = await _insert_dynamic_device(
+                db, f"{prefix}-{n}", template_id, field_data, request_id
+            )
+            if outcome == "request_id":
+                # A concurrent create with this request_id won the race; converge
+                # on its row rather than burning name attempts that all collide.
+                existing = await _get_device_by_request_id(db, request_id)
+                if existing is not None:
+                    return existing
+                break
+            if outcome == "name":
+                n += 1
+                continue
+            device = outcome
         if device is None:
             raise HTTPException(
                 status_code=409,

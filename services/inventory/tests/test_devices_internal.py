@@ -231,6 +231,130 @@ async def test_internal_create_bad_token_403(client):
     assert resp.json()["detail"] == "Invalid internal token"
 
 
+# --- Internal create idempotency on request_id (issue #275) ---
+
+
+@pytest.mark.asyncio
+async def test_internal_create_same_request_id_returns_same_device(client):
+    # A redelivered create carrying the same request_id must converge on one
+    # device row (201 both times, same id), not materialize a duplicate.
+    tid = await _create_dynamic_template(client, "Linux VM")
+    req = str(uuid.uuid4())
+    body = {
+        "template_id": tid,
+        "reservation_id": str(uuid.uuid4()),
+        "request_id": req,
+        "field_data": {"image": "ubuntu"},
+    }
+    first = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    second = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["name"] == second.json()["name"]
+
+
+@pytest.mark.asyncio
+async def test_internal_create_different_request_ids_create_different_devices(client):
+    tid = await _create_dynamic_template(client, "Linux VM")
+    rid = str(uuid.uuid4())
+    b1 = {
+        "template_id": tid,
+        "reservation_id": rid,
+        "request_id": str(uuid.uuid4()),
+        "field_data": {"image": "ubuntu"},
+    }
+    b2 = {**b1, "request_id": str(uuid.uuid4())}
+    first = await client.post("/devices/internal", headers=_TOKEN, json=b1)
+    second = await client.post("/devices/internal", headers=_TOKEN, json=b2)
+    assert first.json()["id"] != second.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_internal_create_omitted_request_id_always_creates(client):
+    # No request_id: the prior always-create behavior is preserved (two rows).
+    tid = await _create_dynamic_template(client, "Linux VM")
+    rid = str(uuid.uuid4())
+    body = {"template_id": tid, "reservation_id": rid, "field_data": {"image": "ubuntu"}}
+    first = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    second = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    assert first.json()["id"] != second.json()["id"]
+    assert first.json()["name"].endswith("-1")
+    assert second.json()["name"].endswith("-2")
+
+
+@pytest.mark.asyncio
+async def test_internal_create_name_collision_retry_with_request_id_set(client):
+    # The generated-name disambiguation loop must still work when request_id is
+    # set: two distinct request_ids on the same reservation collide on the -1
+    # name and the second must land on -2, not return the first.
+    tid = await _create_dynamic_template(client, "Linux VM")
+    rid = str(uuid.uuid4())
+    b1 = {
+        "template_id": tid,
+        "reservation_id": rid,
+        "request_id": str(uuid.uuid4()),
+        "field_data": {"image": "ubuntu"},
+    }
+    b2 = {**b1, "request_id": str(uuid.uuid4())}
+    first = await client.post("/devices/internal", headers=_TOKEN, json=b1)
+    second = await client.post("/devices/internal", headers=_TOKEN, json=b2)
+    assert first.json()["name"].endswith("-1")
+    assert second.json()["name"].endswith("-2")
+    assert first.json()["id"] != second.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_internal_create_explicit_name_same_request_id_returns_existing(client):
+    tid = await _create_dynamic_template(client)
+    req = str(uuid.uuid4())
+    body = {
+        "template_id": tid,
+        "reservation_id": str(uuid.uuid4()),
+        "name": "my-vm-01",
+        "request_id": req,
+        "field_data": {"image": "ubuntu"},
+    }
+    first = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    second = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_internal_create_explicit_name_collision_new_request_id_409(client):
+    # A brand-new request_id reusing an already-taken explicit name is a genuine
+    # name conflict, not an idempotent replay, so it still 409s with the pinned
+    # wording.
+    tid = await _create_dynamic_template(client)
+    first = await client.post(
+        "/devices/internal",
+        headers=_TOKEN,
+        json={
+            "template_id": tid,
+            "reservation_id": str(uuid.uuid4()),
+            "name": "dup-name",
+            "request_id": str(uuid.uuid4()),
+            "field_data": {"image": "ubuntu"},
+        },
+    )
+    assert first.status_code == 201
+    second = await client.post(
+        "/devices/internal",
+        headers=_TOKEN,
+        json={
+            "template_id": tid,
+            "reservation_id": str(uuid.uuid4()),
+            "name": "dup-name",
+            "request_id": str(uuid.uuid4()),
+            "field_data": {"image": "ubuntu"},
+        },
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"] == "Device with name 'dup-name' already exists"
+
+
 # --- Internal delete ---
 
 
