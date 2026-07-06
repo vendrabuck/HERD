@@ -93,6 +93,61 @@ def test_tool_choice_none_in_translation_raises():
 
 
 @pytest.mark.asyncio
+async def test_call_maps_connection_error_to_unavailable():
+    """A transport-layer failure surfaces from the SDK as APIConnectionError; the
+    provider translates it to AIProviderUnavailableError so a configured-but-
+    unreachable endpoint maps to 503, not a bare 500/502 (issue #280)."""
+    import httpx
+    from app.services.llm_provider import AIProviderUnavailableError
+    from openai import APIConnectionError
+
+    provider = OpenAICompatProvider(api_key="sk-test", base_url=None, model="test-model")
+    req = httpx.Request("POST", "http://vllm.test/v1/chat/completions")
+    provider._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=AsyncMock(side_effect=APIConnectionError(request=req))
+            )
+        )
+    )
+    with pytest.raises(AIProviderUnavailableError):
+        await provider.call(
+            system="sys",
+            messages=[Message(role="user", content=[TextBlock(text="hi")])],
+            tools=None,
+            tool_choice=ToolChoiceAuto(),
+            max_tokens=100,
+            timeout_s=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_call_maps_raw_httpx_transport_error_to_unavailable():
+    """A raw httpx.TransportError that reaches the call boundary unwrapped is also
+    classified as unreachable (belt-and-suspenders for the SDK connection type)."""
+    import httpx
+    from app.services.llm_provider import AIProviderUnavailableError
+
+    provider = OpenAICompatProvider(api_key="sk-test", base_url=None, model="test-model")
+    provider._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+            )
+        )
+    )
+    with pytest.raises(AIProviderUnavailableError):
+        await provider.call(
+            system="sys",
+            messages=[Message(role="user", content=[TextBlock(text="hi")])],
+            tools=None,
+            tool_choice=ToolChoiceAuto(),
+            max_tokens=100,
+            timeout_s=None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_call_drops_tools_and_tool_choice_when_none():
     provider, create_mock = _provider_with_response(_sdk_completion(content="ok"))
     await provider.call(

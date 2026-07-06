@@ -33,7 +33,15 @@ from app.schemas.assistant import (
     ToolCallSummary,
 )
 from app.services import conversation_repo, usage_repo
-from app.services.ai_client import AIClient, AIError, ai_is_configured, get_ai_client
+from app.services.ai_client import (
+    AI_NOT_CONFIGURED_DETAIL,
+    AI_PROVIDER_UNREACHABLE_DETAIL,
+    AIClient,
+    AIError,
+    AIProviderUnavailableError,
+    ai_is_configured,
+    get_ai_client,
+)
 from app.services.reservation_context import (
     ContextDeadlineExceededError,
     ReservationNotFoundError,
@@ -209,7 +217,7 @@ async def reservation_assistant(
     if not ai_is_configured():
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "AI orchestrator is not configured",
+            AI_NOT_CONFIGURED_DETAIL,
         )
 
     user_id = uuid.UUID(user["sub"])
@@ -254,6 +262,16 @@ async def reservation_assistant(
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,
             f"Assistant did not respond within {settings.assistant_overall_deadline_s:.0f}s",
+        ) from exc
+    except AIProviderUnavailableError as exc:
+        # Configured but unreachable endpoint: a 503, matching the issue #131
+        # standardization. Caught before AIError (its subclass); rolls back the
+        # flushed user turn like the other failure branches so no orphan persists.
+        await db.rollback()
+        logger.warning("ai_assistant_provider_unreachable")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            AI_PROVIDER_UNREACHABLE_DETAIL,
         ) from exc
     except AIError as exc:
         # Roll back first so the failed turn's user message never persists, then
@@ -333,7 +351,7 @@ async def reservation_assistant_stream(
     if not ai_is_configured():
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "AI orchestrator is not configured",
+            AI_NOT_CONFIGURED_DETAIL,
         )
 
     user_id = uuid.UUID(user["sub"])
@@ -427,6 +445,15 @@ async def reservation_assistant_stream(
                     )
                 },
             )
+        except AIProviderUnavailableError:
+            # A configured-but-unreachable provider that fails once the stream has
+            # already opened: a 503 status line is no longer possible, so surface
+            # it as the existing `error` event shape with a diagnosable message
+            # rather than dropping the connection. Roll back the flushed user turn
+            # so no orphan persists, exactly as the AIError branch does.
+            await db.rollback()
+            logger.warning("ai_assistant_stream_provider_unreachable")
+            yield _sse("error", {"message": AI_PROVIDER_UNREACHABLE_DETAIL})
         except AIError:
             # Log the exception detail server-side; the client-facing error frame
             # carries a generic message so no backend exception string leaks

@@ -27,10 +27,13 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from fastapi import HTTPException, status
+
 from app.config import settings
 from app.services.config_validator import ALLOWED_CONFIG_KEYS
 from app.services.llm_provider import (
     AIError,
+    AIProviderUnavailableError,
     ContentBlock,
     LLMProvider,
     Message,
@@ -51,13 +54,27 @@ if TYPE_CHECKING:
     from app.services.tools import ToolDispatcher
 
 __all__ = [
+    "AI_NOT_CONFIGURED_DETAIL",
+    "AI_PROVIDER_UNREACHABLE_DETAIL",
     "AIClient",
     "AIError",
+    "AIProviderUnavailableError",
     "AssistantTurnResult",
     "TurnSegment",
     "ai_is_configured",
     "get_ai_client",
 ]
+
+# Client-facing 503 detail for a provider that is not usable. Kept as a single
+# constant so the route gates, the unknown-provider branch, and a construction
+# failure all surface the byte-identical string (an endpoint test pins it).
+AI_NOT_CONFIGURED_DETAIL = "AI orchestrator is not configured"
+
+# Client-facing 503 detail for a configured provider whose endpoint is
+# unreachable. Deliberately generic: it is diagnosable (the provider is down)
+# without echoing the raw transport exception to the client (CWE-209); the full
+# error is logged server-side by the route.
+AI_PROVIDER_UNREACHABLE_DETAIL = "AI provider is unreachable"
 
 
 @dataclass(frozen=True)
@@ -878,23 +895,41 @@ def ai_is_configured() -> bool:
 
 
 def get_ai_client() -> AIClient:
-    """Dependency provider. Tests override this via app.dependency_overrides."""
-    if settings.ai_provider == "anthropic":
-        provider: LLMProvider = AnthropicProvider(
-            api_key=settings.ai_api_key,
-            model=settings.ai_model,
-            base_url=settings.ai_base_url or None,
-            verify_tls=settings.ai_tls_verify,
-            ca_cert=settings.ai_ca_cert or None,
-        )
-    elif settings.ai_provider == "openai_compat":
-        provider = OpenAICompatProvider(
-            api_key=settings.ai_api_key,
-            base_url=settings.ai_base_url or None,
-            model=settings.ai_model,
-            verify_tls=settings.ai_tls_verify,
-            ca_cert=settings.ai_ca_cert or None,
-        )
-    else:
-        raise RuntimeError(f"unknown ai_provider: {settings.ai_provider!r}")
+    """Dependency provider. Tests override this via app.dependency_overrides.
+
+    Resolved as a FastAPI dependency BEFORE the route body, so it must not let a
+    misconfiguration escape as a 500: this dep is the only place the route's
+    later `if not ai_is_configured()` gate cannot reach. Two states are degraded
+    to a clean 503 here (matching the route gate) instead:
+
+    - an unrecognized ai_provider, the state ai_is_configured() already reports
+      as unconfigured (issue #245); and
+    - a provider that raises while being CONSTRUCTED, e.g. an ai_ca_cert path
+      that does not exist blowing up in the TLS context build (issue #280).
+
+    A construction error's detail is logged server-side; the client sees only
+    the generic not-configured string so an internal path is never echoed.
+    """
+    if settings.ai_provider not in ("anthropic", "openai_compat"):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AI_NOT_CONFIGURED_DETAIL)
+    try:
+        if settings.ai_provider == "anthropic":
+            provider: LLMProvider = AnthropicProvider(
+                api_key=settings.ai_api_key,
+                model=settings.ai_model,
+                base_url=settings.ai_base_url or None,
+                verify_tls=settings.ai_tls_verify,
+                ca_cert=settings.ai_ca_cert or None,
+            )
+        else:
+            provider = OpenAICompatProvider(
+                api_key=settings.ai_api_key,
+                base_url=settings.ai_base_url or None,
+                model=settings.ai_model,
+                verify_tls=settings.ai_tls_verify,
+                ca_cert=settings.ai_ca_cert or None,
+            )
+    except Exception as exc:
+        logger.warning("ai_client_construction_failed: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AI_NOT_CONFIGURED_DETAIL) from exc
     return AIClient(provider=provider, max_tokens=settings.ai_max_tokens)

@@ -293,6 +293,52 @@ async def test_call_propagates_sdk_exceptions():
 
 
 @pytest.mark.asyncio
+async def test_call_maps_connection_error_to_unavailable():
+    """A transport-layer failure (connection refused, DNS, TLS/CA) surfaces from
+    the SDK as APIConnectionError; the provider translates it to
+    AIProviderUnavailableError so a configured-but-unreachable endpoint maps to
+    503, not a bare 500/502 (issue #280)."""
+    import httpx
+    from anthropic import APIConnectionError
+    from app.services.llm_provider import AIProviderUnavailableError
+
+    provider = AnthropicProvider(api_key="sk-ant-fake", model="claude-opus-4-7")
+    req = httpx.Request("POST", "https://api.anthropic.test/v1/messages")
+    provider._client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(side_effect=APIConnectionError(request=req)))
+    )
+    with pytest.raises(AIProviderUnavailableError):
+        await provider.call(
+            system="sys",
+            messages=[Message(role="user", content=[TextBlock(text="hi")])],
+            tools=None,
+            tool_choice=ToolChoiceAuto(),
+            max_tokens=100,
+            timeout_s=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_call_stream_maps_connection_error_to_unavailable():
+    """The streaming path classifies the same transport failure the buffered path
+    does, so an unreachable provider on a streamed turn also raises
+    AIProviderUnavailableError (which the route renders as an SSE error event)."""
+    import httpx
+    from anthropic import APIConnectionError
+    from app.services.llm_provider import AIProviderUnavailableError
+
+    provider = AnthropicProvider(api_key="sk-ant-fake", model="claude-opus-4-7")
+    req = httpx.Request("POST", "https://api.anthropic.test/v1/messages")
+
+    def _raise(**_kwargs):
+        raise APIConnectionError(request=req)
+
+    provider._client = SimpleNamespace(messages=SimpleNamespace(stream=_raise))
+    with pytest.raises(AIProviderUnavailableError):
+        await _drain(provider)
+
+
+@pytest.mark.asyncio
 async def test_call_passes_max_tokens_and_system_through():
     provider, create_mock = _provider_with_response([_sdk_text("ok")])
     await provider.call(

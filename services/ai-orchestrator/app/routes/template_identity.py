@@ -18,7 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_db
 from app.services import usage_repo
-from app.services.ai_client import AIClient, AIError, ai_is_configured, get_ai_client
+from app.services.ai_client import (
+    AI_NOT_CONFIGURED_DETAIL,
+    AI_PROVIDER_UNREACHABLE_DETAIL,
+    AIClient,
+    AIError,
+    AIProviderUnavailableError,
+    ai_is_configured,
+    get_ai_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +62,7 @@ async def suggest_identity(
     if not ai_is_configured():
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "AI orchestrator is not configured",
+            AI_NOT_CONFIGURED_DETAIL,
         )
 
     user_id = uuid.UUID(admin["sub"])
@@ -66,6 +74,14 @@ async def suggest_identity(
             description=body.description,
             sections=body.sections,
         )
+    except AIProviderUnavailableError as e:
+        # Configured but unreachable endpoint: a 503, matching the issue #131
+        # standardization. Caught before AIError (its subclass).
+        logger.warning("ai_template_identity_provider_unreachable")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            AI_PROVIDER_UNREACHABLE_DETAIL,
+        ) from e
     except AIError as e:
         logger.warning("ai_template_identity_suggestion_failed: %s", e)
         raise HTTPException(

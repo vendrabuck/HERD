@@ -6,7 +6,12 @@ from collections import Counter, defaultdict
 from pydantic import ValidationError
 
 from app.schemas.generate import ExtractedFile, GenerateResponse
-from app.services.ai_client import AIClient, AIError
+from app.services.ai_client import (
+    AI_PROVIDER_UNREACHABLE_DETAIL,
+    AIClient,
+    AIError,
+    AIProviderUnavailableError,
+)
 from app.services.extractor import render_file_context
 from app.services.inventory_client import InventorySummary, fetch_available_devices
 from app.services.llm_provider import Usage
@@ -73,6 +78,12 @@ async def generate_topology(
                 repair_feedback=repair_feedback,
             )
             total_usage.add(attempt_usage)
+        except AIProviderUnavailableError as e:
+            # Configured but unreachable endpoint (connect/DNS/TLS/timeout): a 503,
+            # matching the issue #131 upstream-unreachable standardization, not the
+            # 502 used for a live provider that returned an unusable response.
+            logger.warning("ai_provider_unreachable")
+            raise GeneratorError(503, AI_PROVIDER_UNREACHABLE_DETAIL) from e
         except AIError as e:
             logger.exception("ai_error")
             raise GeneratorError(502, f"AI returned no usable response: {e}") from e

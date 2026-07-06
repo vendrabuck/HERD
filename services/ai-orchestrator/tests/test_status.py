@@ -64,6 +64,20 @@ async def test_status_enabled_for_openai_compat_with_base_url(async_client, monk
 
 
 @pytest.mark.asyncio
+async def test_status_disabled_for_unknown_provider(async_client, monkeypatch):
+    """An unrecognized ai_provider (typo) reports enabled=false, the same
+    unconfigured state get_ai_client degrades to a 503 (issue #245). Proves the
+    status endpoint and the dependency gate agree on an unknown provider even
+    when a key is set."""
+    monkeypatch.setattr(config_module.settings, "ai_provider", "athropic")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-ant-real")
+    async with async_client as client:
+        resp = await client.get("/status")
+    assert resp.status_code == 200
+    assert resp.json()["enabled"] is False
+
+
+@pytest.mark.asyncio
 async def test_status_disabled_for_openai_compat_without_base_url(async_client, monkeypatch):
     monkeypatch.setattr(config_module.settings, "ai_provider", "openai_compat")
     monkeypatch.setattr(config_module.settings, "ai_base_url", "")
