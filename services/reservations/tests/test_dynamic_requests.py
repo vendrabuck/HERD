@@ -30,7 +30,7 @@ from app.routers.reservations import bearer_scheme
 from app.tasks.expiration import _run_expiration_cycle
 from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -748,6 +748,121 @@ async def test_timeout_backstop_ignores_physical_only_reservation():
     res = await _get_reservation(rid)
     assert res.status == ReservationStatus.PENDING_PROVISION
     assert await _outbox_rows("herd.reservations.failed") == []
+
+
+# --- Same-instant race: backstop vs provision-result callback (#276) ----------
+
+
+async def test_claim_provision_transition_is_single_winner():
+    """The conditional UPDATE is a compare-and-swap: it transitions a
+    PENDING_PROVISION row exactly once, and a second attempt matches zero rows.
+    This is the primitive both the callback and the backstop share to guarantee
+    at most one writer wins."""
+    from app.services.reservation_service import _claim_provision_transition
+
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION, dynamic_template_ids=[TEMPLATE_ID]
+    )
+    async with TestSessionLocal() as session:
+        first = await _claim_provision_transition(session, rid, ReservationStatus.ACTIVE)
+        await session.commit()
+    async with TestSessionLocal() as session:
+        second = await _claim_provision_transition(session, rid, ReservationStatus.FAILED)
+        await session.commit()
+    assert first is True
+    assert second is False
+    # The first writer's transition stands; the loser did not overwrite it.
+    assert (await _get_reservation(rid)).status == ReservationStatus.ACTIVE
+
+
+async def test_success_callback_loses_race_to_backstop_is_clean_noop(internal_client):
+    """A success callback that reads PENDING_PROVISION but reaches its conditional
+    write after the timeout backstop already committed FAILED must be a clean
+    no-op: applied=False, status stays FAILED, no reservation.created event, no
+    fork, and the dynamic device is never attached."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION, dynamic_template_ids=[TEMPLATE_ID]
+    )
+
+    from app.services import reservation_service as svc
+
+    real_claim = svc._claim_provision_transition
+
+    async def racing_claim(db, reservation_id, new_status):
+        # Simulate the backstop winning the row between the callback's read and
+        # its conditional write: commit FAILED first, then run the real CAS,
+        # which now matches zero rows.
+        await db.execute(
+            update(Reservation)
+            .where(Reservation.id == reservation_id)
+            .values(status=ReservationStatus.FAILED)
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        return await real_claim(db, reservation_id, new_status)
+
+    fork_mock = AsyncMock()
+    dyn_device = str(uuid.uuid4())
+    with (
+        patch.object(svc, "_claim_provision_transition", new=racing_claim),
+        patch(
+            "app.services.reservation_service._create_reservation_fork_best_effort",
+            new=fork_mock,
+        ),
+    ):
+        resp = await internal_client.post(
+            f"/internal/{rid}/provision-result",
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            json={"succeeded": True, "device_ids": [dyn_device], "error": None},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"reservation_id": str(rid), "status": "FAILED", "applied": False}
+
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.FAILED
+    # The loser attached no device and emitted no created event.
+    assert [str(d) for d in res.device_ids] == [DEVICE_A]
+    assert await _outbox_rows("herd.reservations.created") == []
+    fork_mock.assert_not_awaited()
+
+
+async def test_backstop_loses_race_to_success_callback_is_clean_noop():
+    """A backstop tick that selects a stuck PENDING_PROVISION row but reaches its
+    conditional write after a success callback already committed ACTIVE must be a
+    clean no-op: status stays ACTIVE, no reservation.failed event, and no device
+    teardown of the reservation the callback just activated."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        dynamic_template_ids=[TEMPLATE_ID],
+        updated_at=NOW - timedelta(hours=2),
+    )
+
+    import app.tasks.expiration as expmod
+
+    real_claim = expmod._claim_provision_transition
+
+    async def racing_claim(db, reservation_id, new_status):
+        # Simulate a success callback activating this row between the backstop's
+        # SELECT and its conditional write.
+        await db.execute(
+            update(Reservation)
+            .where(Reservation.id == reservation_id)
+            .values(status=ReservationStatus.ACTIVE)
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        return await real_claim(db, reservation_id, new_status)
+
+    update_mock = AsyncMock()
+    p1, p2, p3, p4 = _patch_expiration_inventory(update_mock=update_mock)
+    with p1, p2, p3, p4, patch.object(expmod, "_claim_provision_transition", new=racing_claim):
+        await _run_expiration_cycle()
+
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.ACTIVE
+    assert await _outbox_rows("herd.reservations.failed") == []
+    # No teardown: the winner's exclusive device is not released to AVAILABLE.
+    update_mock.assert_not_called()
 
 
 async def test_timeout_backstop_disabled_when_zero(monkeypatch):
