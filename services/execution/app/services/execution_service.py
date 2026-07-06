@@ -18,6 +18,7 @@ from app.config import settings
 from app.models.execution_command import ExecutionCommand
 from app.models.execution_run import ExecutionRun
 from app.services.driver_loader import (
+    DriverPackageError,
     get_driver_config_schema,
     get_driver_metadata,
     load_driver,
@@ -407,7 +408,7 @@ async def run_driver_action(
         driver_path = await load_driver(
             db, driver_id, driver_sha256, driver_filename, connection_type
         )
-    except (ValueError, RuntimeError) as e:
+    except (DriverPackageError, ValueError, RuntimeError) as e:
         run = await update_execution_run(db, run, status="FAILED", error=str(e))
         logger.error("Driver load failed", extra={"run_id": str(run.id), "error": str(e)})
         return run

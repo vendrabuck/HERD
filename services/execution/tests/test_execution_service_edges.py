@@ -17,6 +17,7 @@ import pytest
 from app.database import Base
 from app.models.execution_run import ExecutionRun
 from app.services import execution_service as ex_service
+from app.services.driver_loader import DriverPackageError
 from app.services.driver_sandbox import DryRunRefused
 from app.services.execution_service import (
     insert_command_log,
@@ -133,6 +134,34 @@ async def test_list_execution_runs_created_after_and_before(db):
     assert total == 3
     items, total = await list_execution_runs(db, status_filter="FAILED")
     assert total == 0
+
+
+# --- run_driver_action broken driver package (issue #279) ---
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_driver_package_error_records_failed(db, monkeypatch):
+    """A structurally broken package on the manual-execute path is a FAILED run.
+
+    load_driver raises DriverPackageError for validation failures since issue
+    #279 (previously ValueError), so this handler must catch it: an escape here
+    would turn a broken package into a 500 instead of a recorded FAILED run.
+    """
+    monkeypatch.setattr(
+        ex_service,
+        "load_driver",
+        AsyncMock(side_effect=DriverPackageError("Driver validation failed: no Driver class")),
+    )
+
+    run = await run_driver_action(
+        db,
+        _device_data(),
+        _template_data(),
+        "status",
+        USER_ID,
+    )
+    assert run.status == "FAILED"
+    assert "Driver validation failed: no Driver class" in run.error
 
 
 # --- run_driver_action DryRunRefused (lines 368-380) ---
