@@ -304,9 +304,12 @@ async def test_import_devices_unknown_field_rolls_back_via_http_exception(db_set
 
 @pytest.mark.asyncio
 async def test_import_templates_duplicate_in_batch_rejects_via_http_exception(db_setup):
-    """Two rows with the same NEW name: the first creates, the second's create
-    hits an IntegrityError surfaced as HTTPException(409) and is rejected with a
-    rollback (the except-HTTPException branch of import_templates)."""
+    """Two rows with the same name: the first creates, the second resolves the
+    now-existing template and takes the update branch, which nulls the required
+    vendor/model and hits a NOT NULL IntegrityError. That surfaces as
+    HTTPException with the generic constraint detail (not a name conflict, since
+    the failing constraint is not name uniqueness) and the row is rejected with
+    a rollback (the except-HTTPException branch of import_templates)."""
     section = {"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}
     row = {
         "name": "DupBatch",
@@ -324,7 +327,9 @@ async def test_import_templates_duplicate_in_batch_rejects_via_http_exception(db
         )
     assert report.created == 1
     assert report.rejected == 1
-    assert "already exists" in [r.reason for r in report.rows if r.action == "reject"][0]
+    reason = [r.reason for r in report.rows if r.action == "reject"][0]
+    assert reason == "Template violates a database constraint"
+    assert "already exists" not in reason
 
 
 @pytest.mark.asyncio
