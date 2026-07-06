@@ -835,6 +835,7 @@
       "properties": {
         "field_data": "object",
         "name": "anyOf",
+        "request_id": "anyOf",
         "reservation_id": "string",
         "template_id": "string"
       },

@@ -251,6 +251,11 @@ async def create_dynamic_device_internal(
     Accepts only dynamic templates (422 otherwise). Used by the execution service
     after a recipe's create_instance succeeds; the created device is RESERVED and
     joined to the No Pool group like every device.
+
+    Idempotent on body.request_id (issue #275): a redelivered create carrying a
+    request_id that already materialized a device returns that same device with
+    201, so a NATS redelivery converges on one device row instead of orphaning a
+    duplicate. Omitting request_id preserves the prior always-create behavior.
     """
     if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
         raise HTTPException(status_code=403, detail="Invalid internal token")
@@ -260,6 +265,7 @@ async def create_dynamic_device_internal(
         reservation_id=body.reservation_id,
         name=body.name,
         field_data=body.field_data,
+        request_id=body.request_id,
     )
     logger.info(
         "Dynamic device created: %s",

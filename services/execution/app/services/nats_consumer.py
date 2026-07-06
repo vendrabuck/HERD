@@ -1707,19 +1707,25 @@ def _recipe_reported_success(result: dict) -> bool:
 
 
 async def _create_dynamic_device(
-    client, template_id: str, reservation_id: str, field_data: dict
+    client, template_id: str, reservation_id: str, field_data: dict, request_id: str | None = None
 ) -> dict | None:
     """POST /devices/internal to materialize an instance as a device.
 
     Returns the created device dict (with its id) on 201. Raises
     TransientUpstreamError on a 5xx or transport error so the message NAKs; a
     4xx returns None, which the caller treats as a permanent config error.
+
+    request_id is the booking's dynamic-request id and makes the create
+    idempotent (issue #275): a redelivered provision_requested re-posts the same
+    request_id, so inventory returns the already-materialized device row instead
+    of creating a second one that the ledger would orphan.
     """
     url = f"{settings.inventory_service_url}/devices/internal"
     body = {
         "template_id": template_id,
         "reservation_id": reservation_id,
         "field_data": field_data,
+        "request_id": request_id,
     }
     try:
         resp = await client.post(
@@ -2014,7 +2020,9 @@ async def _provision_one_instance(
         # below fails and NAKs, teardown can still destroy the instance.
         await set_instance_ref(db, request_id, instance_ref)
 
-    device = await _create_dynamic_device(client, template_id, reservation_id, field_data)
+    device = await _create_dynamic_device(
+        client, template_id, reservation_id, field_data, request_id
+    )
     if device is None:
         raise PermanentEventError(
             f"inventory rejected dynamic device create for request {request_id}"

@@ -360,11 +360,14 @@ async def test_provision_happy_path_records_runs_ledger_device_and_callback():
     assert str(rows[0].device_id) == DEVICE_ID
     assert rows[0].instance_ref == "vm-100"
 
-    # Device create call shape: (client, template_id, reservation_id, field_data).
+    # Device create call shape: (client, template_id, reservation_id, field_data,
+    # request_id). The ledger request_id is threaded through so a redelivered
+    # create is idempotent inventory-side (issue #275).
     args = create_dev.await_args.args
     assert args[1] == TEMPLATE_ID
     assert args[2] == RES_ID
     assert args[3] == {"mgmt_ip": "10.0.0.9"}
+    assert args[4] == REQUEST_ID
 
     # Success callback body.
     callback.assert_awaited_once()
@@ -514,17 +517,23 @@ class _Resp:
 async def test_create_dynamic_device_maps_status_codes():
     client = AsyncMock()
     client.post = AsyncMock(return_value=_Resp(201, {"id": DEVICE_ID}))
-    got = await _create_dynamic_device(client, TEMPLATE_ID, RES_ID, {"k": "v"})
+    got = await _create_dynamic_device(client, TEMPLATE_ID, RES_ID, {"k": "v"}, REQUEST_ID)
     assert got == {"id": DEVICE_ID}
     body = client.post.await_args.kwargs["json"]
-    assert body == {"template_id": TEMPLATE_ID, "reservation_id": RES_ID, "field_data": {"k": "v"}}
+    # request_id is carried so inventory can dedupe a redelivered create (issue #275).
+    assert body == {
+        "template_id": TEMPLATE_ID,
+        "reservation_id": RES_ID,
+        "field_data": {"k": "v"},
+        "request_id": REQUEST_ID,
+    }
 
     client.post = AsyncMock(return_value=_Resp(500))
     with pytest.raises(TransientUpstreamError):
-        await _create_dynamic_device(client, TEMPLATE_ID, RES_ID, {})
+        await _create_dynamic_device(client, TEMPLATE_ID, RES_ID, {}, REQUEST_ID)
 
     client.post = AsyncMock(return_value=_Resp(422))
-    assert await _create_dynamic_device(client, TEMPLATE_ID, RES_ID, {}) is None
+    assert await _create_dynamic_device(client, TEMPLATE_ID, RES_ID, {}, REQUEST_ID) is None
 
 
 async def test_delete_dynamic_device_maps_status_codes():

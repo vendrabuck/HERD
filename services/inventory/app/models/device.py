@@ -44,6 +44,15 @@ class Device(Base):
         default=DeviceStatus.AVAILABLE,
     )
     field_data: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Idempotency key for the internal dynamic-instance create (issue #275). When
+    # execution redelivers a provision_requested event it re-posts the same
+    # request_id, so a unique constraint plus return-existing semantics converge
+    # on one device row rather than orphaning a duplicate. Null for every
+    # admin-created device; Postgres and SQLite both allow multiple NULLs in a
+    # unique column, so those rows are unaffected.
+    request_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, unique=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
