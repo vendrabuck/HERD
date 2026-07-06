@@ -12,6 +12,56 @@ from app.models.template import DeviceTemplate
 from app.schemas.template import TemplateCreate, TemplateUpdate
 
 
+def _integrity_kind(exc: IntegrityError) -> str:
+    """Classify an IntegrityError, portably across asyncpg and aiosqlite.
+
+    Production runs asyncpg (Postgres), which exposes a SQLSTATE on
+    ``exc.orig`` (23505 unique_violation, 23503 foreign_key_violation). Unit
+    tests run aiosqlite (SQLite), which carries no SQLSTATE, only message text
+    ("UNIQUE constraint failed: ..." or "FOREIGN KEY constraint failed").
+    Returns "unique", "foreign_key", or "unknown"; the caller maps each to a
+    distinct HTTP response so a foreign-key failure is never reported as a
+    name conflict.
+    """
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate == "23505":
+        return "unique"
+    if sqlstate == "23503":
+        return "foreign_key"
+    text = str(getattr(exc, "orig", exc)).lower()
+    if "unique constraint failed" in text:
+        return "unique"
+    if "foreign key constraint failed" in text:
+        return "foreign_key"
+    return "unknown"
+
+
+def _integrity_http_error(exc: IntegrityError, name: str) -> HTTPException:
+    """Map a template-write IntegrityError to an accurate HTTPException.
+
+    A unique-name collision keeps the historical 409 wording. A foreign-key
+    failure (a referenced driver or hypervisor row absent at insert time)
+    returns 422, matching the phase 1 validation layer's 422 for a referenced
+    row that does not exist. Anything unclassified gets a safe generic 409 that
+    does not claim a name conflict.
+    """
+    kind = _integrity_kind(exc)
+    if kind == "foreign_key":
+        return HTTPException(
+            status_code=422,
+            detail="Referenced hypervisor or driver does not exist",
+        )
+    if kind == "unique":
+        return HTTPException(
+            status_code=409,
+            detail=f"Template with name '{name}' already exists",
+        )
+    return HTTPException(
+        status_code=409,
+        detail="Template violates a database constraint",
+    )
+
+
 async def _validate_driver_connection_type(
     db: AsyncSession, template_type: str, driver_id: uuid.UUID | None
 ) -> None:
@@ -82,12 +132,9 @@ async def create_template(db: AsyncSession, data: TemplateCreate) -> DeviceTempl
     db.add(template)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=f"Template with name '{data.name}' already exists",
-        )
+        raise _integrity_http_error(exc, data.name)
     await db.refresh(template)
     return template
 
@@ -114,13 +161,10 @@ async def update_template(
         setattr(template, field, value)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
         conflict_name = data.name or template.name
-        raise HTTPException(
-            status_code=409,
-            detail=f"Template with name '{conflict_name}' already exists",
-        )
+        raise _integrity_http_error(exc, conflict_name)
     await db.refresh(template)
     return template
 
