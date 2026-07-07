@@ -5,7 +5,9 @@ Requires a running stack. An admin registers a webhook subscription via
 on HERD_RESERVATIONS, and the integration service's NATS consumer delivers a
 signed POST to the registered target. We assert the delivery ledger:
 
-  - a reachable 2xx receiver yields exactly one `delivered` row (idempotent), and
+  - a reachable 2xx receiver yields exactly one `delivered` row for the test's
+    own event (idempotent; scoped by event_id, since neighboring tests' events
+    also deliver to the subscription, issue #295), and
   - an unreachable / non-2xx receiver exhausts retries into a `dead` row,
     proving a failing target does not block delivery to others or the stream.
 
@@ -16,10 +18,12 @@ not usable as a 2xx target.
 """
 
 import asyncio
+import json
 import socket
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from _nats_helpers import fetch_reservation_event
 
 pytestmark = pytest.mark.asyncio
 
@@ -67,13 +71,23 @@ async def _register_webhook(admin_client, target_url: str) -> dict:
     return resp.json()
 
 
-async def _poll_for_status(admin_client, webhook_id: str, statuses: set[str]) -> list[dict]:
-    """Poll the delivery ledger until a row with one of `statuses` appears."""
+async def _poll_for_status(
+    admin_client, webhook_id: str, statuses: set[str], event_id: str | None = None
+) -> list[dict]:
+    """Poll the delivery ledger until a row with one of `statuses` appears.
+
+    When `event_id` is given, only rows for that event are considered (and
+    returned): tests run against a shared stack, so a neighboring test's
+    in-flight reservation event also delivers to this subscription, and an
+    unscoped poll can be satisfied by that leaked row (issue #295).
+    """
     deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT_SECONDS
     while asyncio.get_event_loop().time() < deadline:
         resp = await admin_client.get(f"/v1/webhooks/{webhook_id}/deliveries")
         assert resp.status_code == 200, resp.text
         rows = resp.json()
+        if event_id is not None:
+            rows = [r for r in rows if r["event_id"] == event_id]
         if any(r["status"] in statuses for r in rows):
             return rows
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -95,10 +109,27 @@ async def test_webhook_delivered_exactly_once(admin_client, fresh_device):
         assert create.status_code == 201, create.text
         reservation_id = create.json()["id"]
 
-        rows = await _poll_for_status(admin_client, webhook_id, {"delivered"})
+        # Scope the assertion to THIS test's event. Other tests create
+        # reservations against the same stack, and a neighboring
+        # reservation.created event still in flight when this subscription is
+        # registered is also (correctly) delivered to it, so counting all
+        # delivered rows on the subscription is racy (issue #295). Read our
+        # reservation's event off HERD_RESERVATIONS (matched on the unique
+        # reservation_id) and pin the ledger checks to its producer-stamped
+        # event_id, which is exactly the ledger row's idempotency key.
+        raw_event = await fetch_reservation_event(
+            reservation_id, "reservation.created", timeout=POLL_TIMEOUT_SECONDS
+        )
+        assert raw_event is not None, "reservation.created never appeared on the stream"
+        expected_event_id = json.loads(raw_event)["event_id"]
+
+        rows = await _poll_for_status(
+            admin_client, webhook_id, {"delivered"}, event_id=expected_event_id
+        )
         delivered = [r for r in rows if r["status"] == "delivered"]
-        assert delivered, f"no delivered row appeared; ledger={rows}"
-        # Idempotent: a redelivered event must not double-send.
+        assert delivered, f"no delivered row for event {expected_event_id}; ledger={rows}"
+        # Idempotent: a redelivered event must not double-send. Exactly one
+        # delivered row for this event_id; do not weaken this to >= 1.
         assert len(delivered) == 1, f"expected exactly one delivered row, got {delivered}"
         assert delivered[0]["event_type"] == "reservation.created"
         assert delivered[0]["response_status"] == 200
