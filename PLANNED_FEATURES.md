@@ -44,7 +44,7 @@ HERD is a lab reservation and topology-management platform built as independent 
 
 - `Shipped` LLM-driven topology generation. Describe a lab in natural language; the model proposes a topology resolved against real, available inventory (never invented devices), rendered as a reviewable proposal before a transactional commit that creates the topology and reservation together, with optional per-device configuration.
 - `Shipped` AI reservation assistant. A multi-turn assistant scoped to a single reservation, with read-only inspection tools (device, ports, current and historical config, reachability, recent executions) that run under the caller's own permissions. Optional write tools, off by default, can propose and schedule configuration changes through the existing apply pipeline with a dry-run-then-confirm flow.
-- `Planned` AI-assisted service-recipe authoring. As dynamic provisioning matures, let the assistant draft automation recipes (for example, configuration playbooks) for an administrator to review and approve, rather than authoring them by hand.
+- `Shipped` AI-assisted service-recipe authoring. An admin describes a recipe in natural language; the AI drafts the Hypervisor driver package, validated in the execution sandbox (structural, policy, simulated dry-run) with bounded auto-repair, and a review panel on the drivers page gates the explicit admin approval that uploads it. Dark by default behind AI_RECIPE_AUTHORING_ENABLED.
 
 ## Topology and resource modeling
 

@@ -907,9 +907,40 @@ waiting on a remote hypervisor API is wall-clock time, not CPU time.
 | destroy_instance | `{"success": bool}` |
 | status | `{"reachable": bool}` |
 
-No mock Hypervisor test driver ships in this repository as of this writing; the
-integration-test harness for the contract (analogous to `drivers/mock_l1`,
-`drivers/mock_l2`, and `drivers/mock_l3`) lands separately.
+`drivers/mock_hypervisor/` is the checked-in reference for this contract: a
+hardware-free recipe that honors dry-run on every method, keys create-side
+idempotency off `HERD_request_id`, and drives the live integration suite
+(the analogue of `drivers/mock_l1`, `mock_l2`, and `mock_l3`).
+
+## Generated recipes (AI-assisted authoring, issue #28)
+
+When `AI_RECIPE_AUTHORING_ENABLED` is on, an admin can have the AI draft a
+Hypervisor recipe package from a natural-language description (see
+[AI_RECIPES.md](AI_RECIPES.md) for the flow). AI-drafted packages must satisfy
+a STRICTER contract than hand-written ones, enforced by the execution
+service's internal `POST /internal/validate-package` pipeline before the
+draft is ever shown for review:
+
+- `driver_metadata.json` must declare `supports_dry_run: true`, and every
+  mutating method must honor `context["dry_run"]`: the validator executes the
+  full lifecycle (`login`, `create_instance`, `status`, `destroy_instance`,
+  `logout`) in the sandbox with `dry_run` set and a synthetic context, so a
+  recipe that skips simulation fails validation.
+- Standard-library imports only: no `_deps/` vendoring, no
+  `requirements.txt`. Package-local modules and the sandbox-provided
+  `driver_transcript` helper are allowed (and `record_command` is
+  encouraged; the transcript is what the reviewing admin reads).
+- No inline credential string literals; credentials arrive only via the
+  context under `password_keys`.
+- Provenance: the metadata carries `generated_by` (model id), `draft_id`,
+  and `generated_at`, injected by the service (not the model), so an
+  uploaded recipe is auditable back to its drafting session.
+
+Structural validation of an unapproved draft is AST-based and never imports
+the package in the service process; everything that must execute the code
+runs in the rlimit sandbox. Hand-written packages are unaffected: the load
+path (`validate_driver`) and the upload endpoint behave exactly as before,
+and `_deps/` vendoring remains available to human authors.
 
 ## Packaging quickstart
 

@@ -1,4 +1,9 @@
-export type ConnectionType = "Management" | "Layer 1 Switch" | "Layer 2 Switch" | "Layer 3 Switch";
+export type ConnectionType =
+  | "Management"
+  | "Layer 1 Switch"
+  | "Layer 2 Switch"
+  | "Layer 3 Switch"
+  | "Hypervisor";
 
 export interface DriverPackageInfo {
   id: string;

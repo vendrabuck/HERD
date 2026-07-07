@@ -41,6 +41,19 @@ vi.mock("@/api/drivers", () => ({
   useDownloadDriver: () => mockDownloadDriver,
 }));
 
+// AI status drives the conditional Draft with AI button (issue #28). Default
+// to the feature being off; individual tests flip it on.
+const mockUseAIStatus = vi.fn();
+vi.mock("@/api/ai", () => ({
+  useAIStatus: () => mockUseAIStatus(),
+}));
+
+vi.mock("@/api/recipes", () => ({
+  useDraftRecipe: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useRefineRecipeDraft: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  recipePackageFile: vi.fn(),
+}));
+
 import { DriversPage } from "@/pages/admin/DriversPage";
 
 const SAMPLE_DRIVERS = [
@@ -76,6 +89,9 @@ describe("DriversPage", () => {
     mockUsePaginatedDrivers.mockReturnValue({
       data: { items: SAMPLE_DRIVERS, total: 2 },
       isLoading: false,
+    });
+    mockUseAIStatus.mockReturnValue({
+      data: { enabled: true, recipe_authoring: false },
     });
   });
 
@@ -163,6 +179,40 @@ describe("DriversPage", () => {
     )!;
     fireEvent.click(submitBtn);
     expect(mockToastError).toHaveBeenCalledWith("File is required");
+  });
+
+  it("hides Draft with AI when recipe authoring is off", () => {
+    render(<DriversPage />);
+    expect(screen.queryByRole("button", { name: "Draft with AI" })).not.toBeInTheDocument();
+  });
+
+  it("hides Draft with AI when AI itself is unconfigured", () => {
+    mockUseAIStatus.mockReturnValue({
+      data: { enabled: false, recipe_authoring: true },
+    });
+    render(<DriversPage />);
+    expect(screen.queryByRole("button", { name: "Draft with AI" })).not.toBeInTheDocument();
+  });
+
+  it("shows Draft with AI and opens the panel when the flag is on", () => {
+    mockUseAIStatus.mockReturnValue({
+      data: { enabled: true, recipe_authoring: true },
+    });
+    const showModalSpy = vi.fn();
+    HTMLDialogElement.prototype.showModal = showModalSpy;
+    render(<DriversPage />);
+    const btn = screen.getByRole("button", { name: "Draft with AI" });
+    fireEvent.click(btn);
+    expect(showModalSpy).toHaveBeenCalled();
+    expect(screen.getByText("Draft Recipe with AI")).toBeInTheDocument();
+  });
+
+  it("upload select offers the Hypervisor connection type", () => {
+    render(<DriversPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Upload Driver" }));
+    const select = screen.getByLabelText("Connection Type");
+    const options = Array.from(select.querySelectorAll("option")).map((o) => o.textContent);
+    expect(options).toContain("Hypervisor");
   });
 
   it("delete button shows confirm dialog", () => {
