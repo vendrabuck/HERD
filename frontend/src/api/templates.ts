@@ -55,10 +55,11 @@ async function deleteTemplate(id: string): Promise<void> {
   await apiClient.delete(`/inventory/templates/${id}`);
 }
 
-export function useTemplates(templateType?: string) {
+export function useTemplates(templateType?: string, options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["templates", templateType ?? "all"],
     queryFn: () => fetchTemplates(templateType),
+    enabled: options?.enabled ?? true,
   });
 }
 
