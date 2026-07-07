@@ -1234,6 +1234,7 @@ Authorization: Bearer <admin-token>
 | `/api/inventory/drivers/{id}` | DELETE | | yes | yes |
 | `/api/inventory/devices` | GET | yes | yes | yes |
 | `/api/inventory/devices/{id}` | GET | yes | yes | yes |
+| `/api/inventory/devices/batch` | POST | yes | yes | yes |
 | `/api/inventory/devices` | POST | | yes | yes |
 | `/api/inventory/devices/{id}` | PUT | | yes | yes |
 | `/api/inventory/devices/{id}` | DELETE | | yes | yes |

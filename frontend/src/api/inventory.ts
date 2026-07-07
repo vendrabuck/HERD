@@ -45,16 +45,33 @@ export async function fetchDevice(id: string): Promise<Device> {
   return resp.data;
 }
 
+// The server caps a batch-fetch request at 500 ids (422 beyond); chunk larger
+// canvases into multiple requests rather than tripping the cap.
+const DEVICE_BATCH_LIMIT = 500;
+
+// Fetch many devices in one round-trip. Ids the caller cannot see, or that no
+// longer exist, are omitted from the response (the server never fails the
+// whole batch over one id), matching how the old per-id GET's 404 was treated.
+async function fetchDevicesBatch(ids: string[]): Promise<Device[]> {
+  const resp = await apiClient.post<{ items: Device[] }>("/inventory/devices/batch", {
+    device_ids: ids,
+  });
+  return resp.data.items;
+}
+
 // Re-fetch each referenced device and rebuild the canvas nodes' device payload
 // from inventory, so a topology loaded from persisted data is resilient to thin
 // seeded nodes ({ device: { id } } with no name/topology_type) and to devices
 // that were renamed/retyped after the canvas was saved. Defense in depth: the
 // seed now writes full payloads, but persisted/stale canvases predate that.
 //
-// A node whose device was deleted (fetch fails) is kept as-is rather than
-// dropped, so the editor still shows it and validation can flag it as missing.
-// A node with no device id (an intentional empty/missing-device slot) is left
-// untouched. Fetches run in parallel and individual failures never throw.
+// A node whose device was deleted or is not visible (omitted from the batch
+// response) is kept as-is rather than dropped, so the editor still shows it
+// and validation can flag it as missing. A node with no device id (an
+// intentional empty/missing-device slot) is left untouched. All unique ids
+// travel in a single POST /inventory/devices/batch (chunked past the server
+// cap) instead of one GET per device, and a failed fetch never throws: every
+// node just keeps its existing data.
 export async function hydrateCanvasNodes(data: CanvasData): Promise<CanvasData> {
   const nodes = data.nodes ?? [];
 
@@ -67,19 +84,18 @@ export async function hydrateCanvasNodes(data: CanvasData): Promise<CanvasData> 
   );
   if (ids.length === 0) return data;
 
-  const entries = await Promise.all(
-    ids.map(async (id): Promise<[string, Device | null]> => {
-      try {
-        return [id, await fetchDevice(id)];
-      } catch {
-        // Deleted or unreachable device: leave the node's existing data in place.
-        return [id, null];
-      }
-    }),
-  );
+  const chunks: string[][] = [];
+  for (let i = 0; i < ids.length; i += DEVICE_BATCH_LIMIT) {
+    chunks.push(ids.slice(i, i + DEVICE_BATCH_LIMIT));
+  }
+  // allSettled: a failed batch request (outage, 5xx) hydrates nothing for its
+  // chunk but never throws, so every affected node just keeps its existing
+  // data, same as the old per-device catch behavior.
+  const results = await Promise.allSettled(chunks.map(fetchDevicesBatch));
   const fresh = new Map<string, Device>();
-  for (const [id, device] of entries) {
-    if (device) fresh.set(id, device);
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    for (const device of result.value) fresh.set(device.id, device);
   }
 
   const hydratedNodes = nodes.map((node) => {

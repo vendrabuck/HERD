@@ -116,13 +116,22 @@ function canvasWith(nodeDevices: Array<Record<string, unknown> | undefined>): Ca
   } as CanvasData;
 }
 
+// Mock the batch endpoint: returns the given devices as {"items": [...]} and
+// records each request's device_ids body so tests can pin call count and payload.
+function mockBatch(devices: Array<Record<string, unknown>>, capturedBodies: string[][] = []) {
+  server.use(
+    http.post("/api/inventory/devices/batch", async ({ request }) => {
+      const body = (await request.json()) as { device_ids: string[] };
+      capturedBodies.push(body.device_ids);
+      return HttpResponse.json({ items: devices });
+    }),
+  );
+  return capturedBodies;
+}
+
 describe("hydrateCanvasNodes", () => {
   it("fills thin nodes with the fetched name, topology_type, and label", async () => {
-    server.use(
-      http.get("/api/inventory/devices/dev-1", () =>
-        HttpResponse.json(device({ id: "dev-1", name: "L1-Edge-01", topology_type: "CLOUD" })),
-      ),
-    );
+    mockBatch([device({ id: "dev-1", name: "L1-Edge-01", topology_type: "CLOUD" })]);
 
     const hydrated = await hydrateCanvasNodes(canvasWith([{ id: "dev-1" }]));
 
@@ -134,26 +143,27 @@ describe("hydrateCanvasNodes", () => {
     expect(data.topologyType).toBe("CLOUD");
   });
 
-  it("dedupes repeated device ids into a single fetch", async () => {
-    let calls = 0;
-    server.use(
-      http.get("/api/inventory/devices/dev-1", () => {
-        calls += 1;
-        return HttpResponse.json(device({ id: "dev-1", name: "Shared" }));
-      }),
+  it("issues one batch POST for all nodes, with repeated ids deduped", async () => {
+    const bodies = mockBatch([
+      device({ id: "dev-1", name: "Shared" }),
+      device({ id: "dev-2", name: "Other" }),
+    ]);
+
+    const hydrated = await hydrateCanvasNodes(
+      canvasWith([{ id: "dev-1" }, { id: "dev-1" }, { id: "dev-2" }]),
     );
 
-    const hydrated = await hydrateCanvasNodes(canvasWith([{ id: "dev-1" }, { id: "dev-1" }]));
-
-    expect(calls).toBe(1);
+    // One request total; its body carries each unique id exactly once.
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toEqual(["dev-1", "dev-2"]);
     expect((hydrated.nodes[0].data as DeviceNodeData).device.name).toBe("Shared");
     expect((hydrated.nodes[1].data as DeviceNodeData).device.name).toBe("Shared");
+    expect((hydrated.nodes[2].data as DeviceNodeData).device.name).toBe("Other");
   });
 
-  it("keeps a node whose device was deleted (404) without throwing", async () => {
-    server.use(
-      http.get("/api/inventory/devices/gone", () => new HttpResponse(null, { status: 404 })),
-    );
+  it("keeps a node whose device is omitted from the batch (deleted or not visible)", async () => {
+    // Server omits "gone" entirely; the whole batch still succeeds.
+    mockBatch([]);
 
     const original = canvasWith([{ id: "gone", name: "stale-name" }]);
     const hydrated = await hydrateCanvasNodes(original);
@@ -166,41 +176,41 @@ describe("hydrateCanvasNodes", () => {
   });
 
   it("leaves empty (missing-device) nodes untouched and does not fetch", async () => {
-    let calls = 0;
-    server.use(
-      http.get("/api/inventory/devices/:id", () => {
-        calls += 1;
-        return HttpResponse.json(device());
-      }),
-    );
+    const bodies = mockBatch([device()]);
 
     const hydrated = await hydrateCanvasNodes(canvasWith([undefined]));
 
-    expect(calls).toBe(0);
+    expect(bodies).toHaveLength(0);
     expect(hydrated.nodes[0].data).toEqual({});
   });
 
-  it("hydrates surviving nodes even when a sibling device 404s", async () => {
-    server.use(
-      http.get("/api/inventory/devices/ok", () =>
-        HttpResponse.json(device({ id: "ok", name: "Alive" })),
-      ),
-      http.get("/api/inventory/devices/gone", () => new HttpResponse(null, { status: 404 })),
-    );
+  it("hydrates surviving nodes even when a sibling device is omitted", async () => {
+    mockBatch([device({ id: "ok", name: "Alive" })]);
 
     const hydrated = await hydrateCanvasNodes(canvasWith([{ id: "ok" }, { id: "gone" }]));
 
     expect((hydrated.nodes[0].data as DeviceNodeData).device.name).toBe("Alive");
-    // The 404 node keeps its thin reference (id only), still present.
+    // The omitted node keeps its thin reference (id only), still present.
     expect((hydrated.nodes[1].data as DeviceNodeData).device.name).toBeUndefined();
   });
 
-  it("sets type 'deviceNode' on a typeless device node so it renders, not as a blank box", async () => {
+  it("keeps every node's existing data when the batch request itself fails", async () => {
     server.use(
-      http.get("/api/inventory/devices/dev-1", () =>
-        HttpResponse.json(device({ id: "dev-1", name: "Repaired" })),
-      ),
+      http.post("/api/inventory/devices/batch", () => new HttpResponse(null, { status: 500 })),
     );
+
+    const hydrated = await hydrateCanvasNodes(canvasWith([{ id: "dev-1", name: "stale" }]));
+
+    // Never throws; the node survives with its persisted data and renders as
+    // a DeviceNode.
+    expect(hydrated.nodes).toHaveLength(1);
+    const data = hydrated.nodes[0].data as DeviceNodeData;
+    expect((data.device as unknown as Record<string, unknown>).name).toBe("stale");
+    expect(hydrated.nodes[0].type).toBe("deviceNode");
+  });
+
+  it("sets type 'deviceNode' on a typeless device node so it renders, not as a blank box", async () => {
+    mockBatch([device({ id: "dev-1", name: "Repaired" })]);
 
     // A topology persisted before the seed fix: device-backed node with type null.
     const canvas = {
@@ -221,10 +231,8 @@ describe("hydrateCanvasNodes", () => {
     expect((hydrated.nodes[0].data as DeviceNodeData).device.name).toBe("Repaired");
   });
 
-  it("sets type 'deviceNode' even when the device fetch fails (typeless 404 node)", async () => {
-    server.use(
-      http.get("/api/inventory/devices/gone", () => new HttpResponse(null, { status: 404 })),
-    );
+  it("sets type 'deviceNode' even when the device is omitted (typeless stale node)", async () => {
+    mockBatch([]);
 
     const canvas = {
       nodes: [

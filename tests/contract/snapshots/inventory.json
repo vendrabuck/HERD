@@ -65,6 +65,10 @@
       "/devices"
     ],
     [
+      "POST",
+      "/devices/batch"
+    ],
+    [
       "GET",
       "/devices/export"
     ],
@@ -414,6 +418,24 @@
       },
       "required": [
         "user_group_ids"
+      ],
+      "type": "object"
+    },
+    "DeviceBatchRequest": {
+      "properties": {
+        "device_ids": "array"
+      },
+      "required": [
+        "device_ids"
+      ],
+      "type": "object"
+    },
+    "DeviceBatchResponse": {
+      "properties": {
+        "items": "array"
+      },
+      "required": [
+        "items"
       ],
       "type": "object"
     },
