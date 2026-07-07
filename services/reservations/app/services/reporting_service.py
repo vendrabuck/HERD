@@ -15,6 +15,8 @@ from app.models.reservation import Reservation, ReservationStatus
 from app.schemas.reservation import (
     DayBucket,
     DeviceBucket,
+    FleetDeviceBucket,
+    FleetSection,
     GroupBucket,
     TopologyTypeBucket,
     UserBucket,
@@ -58,16 +60,40 @@ async def build_utilization_report(
     window_start: datetime,
     window_end: datetime,
     status_filter: list[ReservationStatus] | None,
+    fleet_status_filter: list[ReservationStatus] | None = None,
+    fleet_devices: list[dict] | None = None,
 ) -> UtilizationReport:
+    """Aggregate reservation hours over a window.
+
+    The legacy sections (by_user/by_device/by_topology_type/by_day) honor
+    status_filter. The fleet section honors fleet_status_filter, which may
+    differ: the route defaults it to ACTIVE+COMPLETED so in-flight usage
+    counts toward utilization, while the legacy default stays COMPLETED.
+    Both are gathered in one query over the union and bucketed per section
+    in the same pass. fleet_devices is inventory's device list (id/name/
+    status dicts); None means inventory was unreachable or was not asked,
+    and the fleet section is omitted (report.fleet stays None).
+    """
     if window_end <= window_start:
         raise ValueError("window_end must be after window_start")
+
+    if fleet_status_filter is None:
+        fleet_status_filter = status_filter
+    legacy_set = set(status_filter) if status_filter else None
+    fleet_set = set(fleet_status_filter) if fleet_status_filter else None
+    if legacy_set is None or (fleet_devices is not None and fleet_set is None):
+        query_statuses = None  # at least one section wants every status
+    elif fleet_devices is not None:
+        query_statuses = legacy_set | fleet_set
+    else:
+        query_statuses = legacy_set
 
     stmt = select(Reservation).where(
         Reservation.end_time > window_start,
         Reservation.start_time < window_end,
     )
-    if status_filter:
-        stmt = stmt.where(Reservation.status.in_(status_filter))
+    if query_statuses:
+        stmt = stmt.where(Reservation.status.in_(query_statuses))
 
     result = await db.execute(stmt)
     reservations = result.scalars().all()
@@ -87,6 +113,8 @@ async def build_utilization_report(
     topology_count: dict[TopologyType, int] = defaultdict(int)
     day_hours: dict[str, float] = defaultdict(float)
     day_count: dict[str, int] = defaultdict(int)
+    fleet_device_hours: dict[uuid.UUID, float] = defaultdict(float)
+    fleet_device_count: dict[uuid.UUID, int] = defaultdict(int)
     total_hours = 0.0
 
     window_start = _as_utc(window_start)
@@ -99,27 +127,37 @@ async def build_utilization_report(
         if hours <= 0:
             continue
 
-        user_hours[r.user_id] += hours
-        user_count[r.user_id] += 1
-        user_names.setdefault(r.user_id, r.owner_name or "")
-        topology_hours[r.topology_type] += hours
-        topology_count[r.topology_type] += 1
-        total_hours += hours
+        in_legacy = legacy_set is None or r.status in legacy_set
+        in_fleet = fleet_devices is not None and (fleet_set is None or r.status in fleet_set)
 
-        seen_days: set[str] = set()
-        for day, day_slice_hours in _split_hours_per_day(effective_start, effective_end):
-            day_hours[day] += day_slice_hours
-            if day not in seen_days:
-                day_count[day] += 1
-                seen_days.add(day)
+        if in_legacy:
+            user_hours[r.user_id] += hours
+            user_count[r.user_id] += 1
+            user_names.setdefault(r.user_id, r.owner_name or "")
+            topology_hours[r.topology_type] += hours
+            topology_count[r.topology_type] += 1
+            total_hours += hours
 
+            seen_days: set[str] = set()
+            for day, day_slice_hours in _split_hours_per_day(effective_start, effective_end):
+                day_hours[day] += day_slice_hours
+                if day not in seen_days:
+                    day_count[day] += 1
+                    seen_days.add(day)
+
+        if not in_legacy and not in_fleet:
+            continue
         for raw_id in r.device_ids or []:
             try:
                 device_id = uuid.UUID(str(raw_id))
             except (ValueError, TypeError):
                 continue
-            device_hours[device_id] += hours
-            device_count[device_id] += 1
+            if in_legacy:
+                device_hours[device_id] += hours
+                device_count[device_id] += 1
+            if in_fleet:
+                fleet_device_hours[device_id] += hours
+                fleet_device_count[device_id] += 1
 
     by_user = sorted(
         (
@@ -165,6 +203,12 @@ async def build_utilization_report(
         for d in sorted(day_hours)
     ]
 
+    fleet = None
+    if fleet_devices is not None:
+        fleet = _build_fleet_section(
+            fleet_devices, fleet_device_hours, fleet_device_count, window_start, window_end
+        )
+
     return UtilizationReport(
         window_start=window_start,
         window_end=window_end,
@@ -174,7 +218,111 @@ async def build_utilization_report(
         by_device=by_device,
         by_topology_type=by_topology_type,
         by_day=by_day,
+        fleet=fleet,
     )
+
+
+def _build_fleet_section(
+    fleet_devices: list[dict],
+    fleet_device_hours: dict[uuid.UUID, float],
+    fleet_device_count: dict[uuid.UUID, int],
+    window_start: datetime,
+    window_end: datetime,
+) -> FleetSection:
+    """Join reserved hours against the full inventory device list.
+
+    Every inventory device appears, including ones with zero bookings (those
+    ARE the idle list). The denominator is the full window for every device:
+    device status has no history table, so a downtime-adjusted denominator
+    would be invented data; current status ships as a column instead.
+    utilization_pct is deliberately not clamped: conflict detection caps it
+    at 100 only when CANCELLED/FAILED are excluded, and a value over 100
+    under a wider filter is information.
+
+    Devices deleted from inventory but present in reservation history are
+    omitted here; they still appear in the legacy by_device section.
+    """
+    window_hours = (window_end - window_start).total_seconds() / 3600.0
+    buckets: list[FleetDeviceBucket] = []
+    total_reserved = 0.0
+    idle = 0
+    for d in fleet_devices:
+        try:
+            device_id = uuid.UUID(str(d["id"]))
+        except (KeyError, ValueError, TypeError):
+            logger.warning("fleet report skipping inventory device with unusable id: %r", d)
+            continue
+        hours = fleet_device_hours.get(device_id, 0.0)
+        total_reserved += hours
+        if hours <= 0:
+            idle += 1
+        buckets.append(
+            FleetDeviceBucket(
+                device_id=device_id,
+                name=str(d.get("name") or ""),
+                status=str(d.get("status") or ""),
+                reservation_count=fleet_device_count.get(device_id, 0),
+                hours=round(hours, 4),
+                utilization_pct=round(hours / window_hours * 100.0, 2) if window_hours else 0.0,
+            )
+        )
+    buckets.sort(key=lambda b: (-b.utilization_pct, b.name))
+    denominator = len(buckets) * window_hours
+    return FleetSection(
+        device_count=len(buckets),
+        idle_device_count=idle,
+        window_hours=round(window_hours, 4),
+        total_reserved_hours=round(total_reserved, 4),
+        utilization_pct=round(total_reserved / denominator * 100.0, 2) if denominator else 0.0,
+        devices=buckets,
+    )
+
+
+async def fetch_fleet_devices(auth_header: str | None) -> list[dict] | None:
+    """Fetch the full device list from inventory for the fleet section.
+
+    Paginates GET /devices with the forwarded admin JWT (an admin caller sees
+    every device). Returns None on any failure so the report degrades to
+    fleet=null instead of failing outright, matching fetch_user_groups_map
+    and fetch_execution_run_count.
+    """
+    if not auth_header:
+        return None
+    devices: list[dict] = []
+    skip = 0
+    limit = 500
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while True:
+                resp = await client.get(
+                    f"{settings.inventory_service_url}/devices",
+                    params={"skip": skip, "limit": limit},
+                    headers={"Authorization": auth_header},
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "inventory /devices returned %s while building the fleet report",
+                        resp.status_code,
+                    )
+                    return None
+                data = resp.json() or {}
+                items = data.get("items") or []
+                devices.extend(items)
+                total = data.get("total")
+                skip += limit
+                if len(items) < limit or (isinstance(total, int) and len(devices) >= total):
+                    break
+                if skip >= 100_000:
+                    # Safety valve: a fleet this large means something is wrong
+                    # (or reporting needs a server-side aggregation rethink).
+                    logger.warning(
+                        "fleet report device fetch aborted after %s devices", len(devices)
+                    )
+                    return None
+    except httpx.HTTPError as exc:
+        logger.warning("inventory service unreachable while building the fleet report: %s", exc)
+        return None
+    return devices
 
 
 async def fetch_user_groups_map(
@@ -283,8 +431,10 @@ async def fetch_execution_run_count(
 def report_to_csv(report: UtilizationReport, section: str) -> str:
     """Render one section of a UtilizationReport as CSV text.
 
-    Supported sections: "user", "device". "template" is a client-side rollup
-    because it requires joining against the inventory service.
+    Supported sections: "user", "device", "fleet". "template" is a client-side
+    rollup because it requires joining against the inventory service. "fleet"
+    requires report.fleet to be populated; the route turns an unpopulated
+    fleet into a 503 before calling this.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -296,6 +446,23 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
         writer.writerow(["device_id", "hours", "reservation_count"])
         for b in report.by_device:
             writer.writerow([str(b.device_id), f"{b.hours:.4f}", b.reservation_count])
+    elif section == "fleet":
+        if report.fleet is None:
+            raise ValueError("fleet section is not populated on this report")
+        writer.writerow(
+            ["device_id", "name", "status", "hours", "utilization_pct", "reservation_count"]
+        )
+        for b in report.fleet.devices:
+            writer.writerow(
+                [
+                    str(b.device_id),
+                    b.name,
+                    b.status,
+                    f"{b.hours:.4f}",
+                    f"{b.utilization_pct:.2f}",
+                    b.reservation_count,
+                ]
+            )
     else:
         raise ValueError(f"Unsupported CSV section: {section}")
     return buf.getvalue()

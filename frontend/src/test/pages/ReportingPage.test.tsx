@@ -86,6 +86,39 @@ const REPORT = {
   ],
   by_day: [{ day: "2026-05-15", reservation_count: 2, hours: 8.0 }],
   by_group: [{ group_id: "grp-1", group_name: "Platform Eng", reservation_count: 7, hours: 42.5 }],
+  fleet: {
+    device_count: 3,
+    idle_device_count: 1,
+    window_hours: 720.0,
+    total_reserved_hours: 42.5,
+    utilization_pct: 1.97,
+    devices: [
+      {
+        device_id: "dev-fw-1",
+        name: "fw-edge-01",
+        status: "AVAILABLE",
+        reservation_count: 5,
+        hours: 25.0,
+        utilization_pct: 3.5,
+      },
+      {
+        device_id: "dev-fw-2",
+        name: "fw-edge-02",
+        status: "RESERVED",
+        reservation_count: 2,
+        hours: 17.5,
+        utilization_pct: 2.4,
+      },
+      {
+        device_id: "dev-sw-3",
+        name: "sw-core-03",
+        status: "MAINTENANCE",
+        reservation_count: 0,
+        hours: 0.0,
+        utilization_pct: 0.0,
+      },
+    ],
+  },
 };
 
 function mockDevices() {
@@ -130,8 +163,10 @@ describe("ReportingPage", () => {
       screen.getByRole("heading", { name: "Utilization Report" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "30 days" })).toBeInTheDocument();
+    // The device name now renders in both the By Device table and the fleet
+    // table, so assert on the collection rather than a unique match.
     await waitFor(() =>
-      expect(screen.getByText("fw-edge-01")).toBeInTheDocument(),
+      expect(screen.getAllByText("fw-edge-01").length).toBeGreaterThan(0),
     );
   });
 
@@ -162,8 +197,9 @@ describe("ReportingPage", () => {
     expect(screen.getByText("user-bbb")).toBeInTheDocument();
 
     // Device rows resolve names through the device index from inventory.
-    expect(screen.getByText("fw-edge-01")).toBeInTheDocument();
-    expect(screen.getByText("fw-edge-02")).toBeInTheDocument();
+    // Names appear in both the By Device table and the fleet table.
+    expect(screen.getAllByText("fw-edge-01").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("fw-edge-02").length).toBeGreaterThan(0);
 
     // Group and topology buckets render their labels.
     expect(screen.getByText("Platform Eng")).toBeInTheDocument();
@@ -218,6 +254,66 @@ describe("ReportingPage", () => {
     renderWithProviders(<ReportingPage />);
     await waitFor(() =>
       expect(screen.getByText(/Failed to load report/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("renders fleet utilization stats and per-device rates", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const fleetHeading = await screen.findByText("Fleet Utilization");
+    const fleetCard = fleetHeading.closest("div")?.parentElement as HTMLElement;
+
+    // Summary stats: fleet-wide pct, device count, idle count.
+    await waitFor(() =>
+      expect(within(fleetCard).getByText("2.0%")).toBeInTheDocument(),
+    );
+    expect(within(fleetCard).getByText("Idle in window")).toBeInTheDocument();
+
+    // Per-device rows carry name, current status, and the rate.
+    expect(within(fleetCard).getByText("sw-core-03")).toBeInTheDocument();
+    expect(within(fleetCard).getByText("MAINTENANCE")).toBeInTheDocument();
+    expect(within(fleetCard).getByText("3.5%")).toBeInTheDocument();
+    expect(within(fleetCard).getByText("0.0%")).toBeInTheDocument();
+  });
+
+  it("filters the fleet table to idle devices with the toggle", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const fleetHeading = await screen.findByText("Fleet Utilization");
+    const fleetCard = fleetHeading.closest("div")?.parentElement as HTMLElement;
+    await waitFor(() =>
+      expect(within(fleetCard).getByText("sw-core-03")).toBeInTheDocument(),
+    );
+
+    fireEvent.click(within(fleetCard).getByLabelText("Idle only"));
+
+    // Only the zero-booking device survives the filter.
+    expect(within(fleetCard).getByText("sw-core-03")).toBeInTheDocument();
+    expect(within(fleetCard).queryByText("fw-edge-01")).not.toBeInTheDocument();
+    expect(within(fleetCard).queryByText("fw-edge-02")).not.toBeInTheDocument();
+  });
+
+  it("shows an unavailable notice when the fleet section is null", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json({ ...REPORT, fleet: null }),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+    await waitFor(() =>
+      expect(
+        screen.getByText(/fleet utilization is unavailable/i),
+      ).toBeInTheDocument(),
     );
   });
 

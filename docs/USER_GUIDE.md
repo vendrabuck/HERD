@@ -95,7 +95,7 @@ Useful for finding a free window before creating a reservation.
 
 ### Reporting (admins only)
 
-**Reporting** in the nav is admin-only. It shows a utilization report for a 7-day, 30-day, or custom window: total reservation-hours, reservations counted, and execution runs at the top; a daily trend chart; tables broken out by user, device, group (cost center), topology type, and template; and CSV download per table. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#utilization-report).
+**Reporting** in the nav is admin-only. It shows a utilization report for a 7-day, 30-day, or custom window: total reservation-hours, reservations counted, and execution runs at the top; a daily trend chart; a fleet utilization card with per-device utilization rates and an idle-device filter; tables broken out by user, device, group (cost center), topology type, and template; and CSV download per table. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#utilization-report).
 
 ## Inventory
 
