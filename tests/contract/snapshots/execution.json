@@ -29,6 +29,10 @@
       "/health"
     ],
     [
+      "POST",
+      "/internal/validate-package"
+    ],
+    [
       "GET",
       "/runs"
     ],
@@ -106,6 +110,34 @@
         "consecutive_failures",
         "device_id",
         "last_status"
+      ],
+      "type": "object"
+    },
+    "DryRunMethodReport": {
+      "properties": {
+        "action": "string",
+        "duration_ms": "anyOf",
+        "error": "anyOf",
+        "output": "anyOf",
+        "passed": "boolean",
+        "success": "boolean",
+        "transcript": "array"
+      },
+      "required": [
+        "action",
+        "passed",
+        "success"
+      ],
+      "type": "object"
+    },
+    "DryRunReport": {
+      "properties": {
+        "error": "anyOf",
+        "methods": "array",
+        "passed": "boolean"
+      },
+      "required": [
+        "passed"
       ],
       "type": "object"
     },
@@ -187,6 +219,55 @@
         "limit",
         "skip",
         "total"
+      ],
+      "type": "object"
+    },
+    "SchemaReport": {
+      "properties": {
+        "error": "anyOf",
+        "present": "boolean",
+        "schema": "anyOf"
+      },
+      "required": [
+        "present"
+      ],
+      "type": "object"
+    },
+    "SectionReport": {
+      "properties": {
+        "errors": "array",
+        "passed": "boolean"
+      },
+      "required": [
+        "passed"
+      ],
+      "type": "object"
+    },
+    "ValidatePackageRequest": {
+      "properties": {
+        "connection_type": "string",
+        "filename": "string",
+        "package_b64": "string"
+      },
+      "required": [
+        "package_b64"
+      ],
+      "type": "object"
+    },
+    "ValidationReport": {
+      "properties": {
+        "dry_run": "#/components/schemas/DryRunReport",
+        "policy": "#/components/schemas/SectionReport",
+        "schema": "#/components/schemas/SchemaReport",
+        "structural": "#/components/schemas/SectionReport",
+        "valid": "boolean"
+      },
+      "required": [
+        "dry_run",
+        "policy",
+        "schema",
+        "structural",
+        "valid"
       ],
       "type": "object"
     }

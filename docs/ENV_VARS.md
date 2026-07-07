@@ -213,6 +213,8 @@ Same shape, different `AI_BASE_URL`:
 | `EXECUTION_TIMEOUT_SECONDS` | `30` | Subprocess timeout for a driver method call (non-status). |
 | `STATUS_CHECK_TIMEOUT_SECONDS` | `10` | Shorter timeout for the `status` method. |
 | `RECIPE_TIMEOUT_SECONDS` | `300` | Wall-clock subprocess timeout for a `Hypervisor`-connection-type recipe's `login`/`create_instance`/`destroy_instance`/`logout` calls, run by the NATS consumer's dynamic-resources create and teardown flows (ADR 0004, issue #32), not `POST /execution/execute`. Longer than `EXECUTION_TIMEOUT_SECONDS` because a hypervisor create or destroy can take minutes; `DRIVER_RLIMIT_CPU_SECONDS` still applies unchanged, since waiting on a remote API is not CPU time. |
+| `VALIDATE_PACKAGE_MAX_BYTES` | `10485760` | Size cap on the decoded archive accepted by the internal `POST /internal/validate-package` endpoint (ADR 0005, issue #28), which validates unapproved AI-drafted recipe packages without loading them as drivers. Matches inventory's `DRIVER_MAX_SIZE_BYTES` default. |
+| `VALIDATE_DRY_RUN_TIMEOUT_SECONDS` | `10` | Per-method wall-clock timeout for the validate-package endpoint's sandboxed dry-run lifecycle. Dry-run methods simulate and return without wire I/O, so they get a status-check-style timeout, not `RECIPE_TIMEOUT_SECONDS`. |
 | `DRIVER_CACHE_PATH` | `/data/driver-cache` | Local driver cache path. Volume-backed. |
 | `DRIVER_RLIMIT_AS_BYTES` | `268435456` | POSIX `RLIMIT_AS` (address space) for the driver subprocess, in bytes; 256 MB default. `0` disables. Raise or disable for numpy/pandas/BLAS drivers, which reserve large virtual address space. |
 | `DRIVER_RLIMIT_CPU_SECONDS` | `60` | POSIX `RLIMIT_CPU` for the driver subprocess, in seconds. `0` disables. |

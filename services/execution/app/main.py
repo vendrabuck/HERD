@@ -15,6 +15,7 @@ from app.models import *  # noqa: F401, F403
 from app.models.outbox import OutboxEvent
 from app.routers.executions import router as executions_router
 from app.routers.health import router as health_router
+from app.routers.validation import router as validation_router
 from app.services.health_scheduler import start_health_scheduler, stop_health_scheduler
 from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
 
@@ -147,6 +148,7 @@ app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(executions_router)
 app.include_router(health_router)
+app.include_router(validation_router)
 
 
 @app.get("/health")
