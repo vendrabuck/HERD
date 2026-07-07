@@ -6,8 +6,15 @@ import type { ReactNode } from "react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
 beforeAll(() => {
-  HTMLDialogElement.prototype.showModal = vi.fn();
-  HTMLDialogElement.prototype.close = vi.fn();
+  // Toggle the `open` property so tests can observe whether a <dialog> (the
+  // create-reservation modal) is actually shown; jsdom has no real dialog
+  // behavior.
+  HTMLDialogElement.prototype.showModal = vi.fn(function (this: HTMLDialogElement) {
+    this.open = true;
+  });
+  HTMLDialogElement.prototype.close = vi.fn(function (this: HTMLDialogElement) {
+    this.open = false;
+  });
 });
 
 // The reservation detail modal pulls in heavy nested UI (AI tab, inventory tab,
@@ -53,6 +60,10 @@ const RESERVATION = {
 beforeEach(() => {
   server.use(
     http.get("/api/inventory/devices", () =>
+      HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
+    ),
+    // The create-reservation modal fetches dynamic templates once opened.
+    http.get("/api/inventory/templates", () =>
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
     ),
   );
@@ -131,5 +142,32 @@ describe("ReservationsPage", () => {
         screen.getByText("Failed to load reservations"),
       ).toBeInTheDocument(),
     );
+  });
+
+  it("shows a New Reservation button that opens the create modal", async () => {
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 }),
+      ),
+    );
+    renderWithProviders(<ReservationsPage />);
+    await waitFor(() =>
+      expect(screen.getByText("No reservations yet")).toBeInTheDocument(),
+    );
+
+    // With no reservation rows there is exactly one <dialog>: the create
+    // modal, closed until the button is clicked.
+    const dialog = document.querySelector("dialog");
+    expect(dialog?.open).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "New Reservation" }));
+    expect(dialog?.open).toBe(true);
+    expect(screen.getByText("Create Reservation")).toBeInTheDocument();
+    // The non-canvas entry point preselects no devices.
+    expect(screen.getByText("0 devices selected")).toBeInTheDocument();
+
+    // Closing via Cancel returns the dialog to its closed state.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(dialog?.open).toBe(false);
   });
 });

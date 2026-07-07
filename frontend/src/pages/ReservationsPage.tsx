@@ -5,6 +5,7 @@ import { useAllDeviceNames } from "@/api/inventory";
 import { Pagination } from "@/components/ui/Pagination";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
+import { CreateReservationModal } from "@/components/reservations/CreateReservationModal";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { EmptyState } from "@/components/ui/EmptyState";
 import type { Reservation } from "@/types/reservation.types";
@@ -86,6 +87,7 @@ function ReservationRow({
 export function ReservationsPage() {
   const [skip, setSkip] = useState(0);
   const [selectedReservation, setSelectedReservation] = useState<Reservation | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const limit = 50;
   const { data, isLoading, isError } = usePaginatedReservations(skip, limit);
   const { data: deviceNames } = useAllDeviceNames();
@@ -109,6 +111,12 @@ export function ReservationsPage() {
           {data && (
             <span className="text-sm text-gray-400">({total})</span>
           )}
+          <button
+            onClick={() => setCreateOpen(true)}
+            className="ml-auto px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            New Reservation
+          </button>
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
@@ -158,6 +166,12 @@ export function ReservationsPage() {
           reservation={selectedReservation}
           deviceNames={deviceNames ?? new Map()}
           onClose={() => setSelectedReservation(null)}
+        />
+
+        <CreateReservationModal
+          open={createOpen}
+          deviceIds={[]}
+          onClose={() => setCreateOpen(false)}
         />
       </div>
     </div>
