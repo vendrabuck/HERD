@@ -595,3 +595,189 @@ def test_path_count_cap_does_not_truncate_collapsed_parallel_cables():
     paths = find_all_shortest_paths(graph, dut1, dut2)
     assert len(paths) == 1
     assert paths[0][1].device_id == sw
+
+
+# ---- Batch endpoint tests (issue #249) ----
+
+
+@pytest.mark.asyncio
+async def test_batch_multiple_pairs_single_graph_build(admin_client, user_client, monkeypatch):
+    """The batch endpoint builds the adjacency graph exactly once for N pairs."""
+    from app.routes import pathfind as pathfind_route
+    from app.services.pathfind_service import build_adjacency_graph
+
+    a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_connection(admin_client, a, "eth1", b, "eth1")
+    await _seed_connection(admin_client, b, "eth2", c, "eth1")
+    await _seed_connection(admin_client, c, "eth2", d, "eth1")
+
+    calls = []
+
+    async def counting_build(db, device_ids=None):
+        calls.append(device_ids)
+        return await build_adjacency_graph(db, device_ids=device_ids)
+
+    monkeypatch.setattr(pathfind_route, "build_adjacency_graph", counting_build)
+
+    resp = await user_client.post(
+        "/pathfind/batch",
+        json={
+            "pairs": [
+                {"source_device_id": str(a), "target_device_id": str(b)},
+                {"source_device_id": str(a), "target_device_id": str(c)},
+                {"source_device_id": str(a), "target_device_id": str(d)},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["results"]) == 3
+    assert all(r["reachable"] is True for r in data["results"])
+    # One graph build for the whole batch, scoped to every requested endpoint.
+    assert len(calls) == 1
+    assert calls[0] == {a, b, c, d}
+
+
+@pytest.mark.asyncio
+async def test_batch_preserves_request_order_and_echoes_pairs(admin_client, user_client):
+    """Results come back in request order, each echoing its requested pair."""
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_connection(admin_client, a, "eth1", b, "0/0/1")
+    await _seed_connection(admin_client, b, "0/0/2", c, "eth1")
+
+    pairs = [
+        {"source_device_id": str(c), "target_device_id": str(a)},
+        {"source_device_id": str(a), "target_device_id": str(b)},
+        {"source_device_id": str(b), "target_device_id": str(c)},
+    ]
+    resp = await user_client.post("/pathfind/batch", json={"pairs": pairs})
+    assert resp.status_code == 200
+    results = resp.json()["results"]
+    assert [(r["source_device_id"], r["target_device_id"]) for r in results] == [
+        (p["source_device_id"], p["target_device_id"]) for p in pairs
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_result_matches_single_endpoint_shape(admin_client, user_client):
+    """Each batch entry is byte-for-byte the single response plus the pair echo."""
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_connection(admin_client, a, "eth1", b, "0/0/1")
+    await _seed_connection(admin_client, b, "0/7/1", c, "eth1")
+
+    single = await user_client.post(
+        "/pathfind",
+        json={"source_device_id": str(a), "target_device_id": str(c)},
+    )
+    batch = await user_client.post(
+        "/pathfind/batch",
+        json={"pairs": [{"source_device_id": str(a), "target_device_id": str(c)}]},
+    )
+    entry = batch.json()["results"][0]
+    assert entry.pop("source_device_id") == str(a)
+    assert entry.pop("target_device_id") == str(c)
+    assert entry == single.json()
+
+
+@pytest.mark.asyncio
+async def test_batch_no_path_pair_matches_single_no_path(admin_client, user_client):
+    """An unreachable pair in a batch uses the single endpoint's no-path shape."""
+    a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_connection(admin_client, a, "eth1", b, "eth1")
+    await _seed_connection(admin_client, c, "eth1", d, "eth1")
+
+    resp = await user_client.post(
+        "/pathfind/batch",
+        json={
+            "pairs": [
+                {"source_device_id": str(a), "target_device_id": str(b)},
+                {"source_device_id": str(a), "target_device_id": str(d)},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    reachable, unreachable = resp.json()["results"]
+    assert reachable["reachable"] is True
+    assert unreachable["reachable"] is False
+    assert unreachable["hop_count"] == 0
+    assert unreachable["paths"] == []
+
+
+@pytest.mark.asyncio
+async def test_batch_same_device_pair(admin_client, user_client):
+    """Source == target inside a batch: trivially reachable with 1 hop."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _seed_connection(admin_client, a, "eth1", b, "eth1")
+
+    resp = await user_client.post(
+        "/pathfind/batch",
+        json={"pairs": [{"source_device_id": str(a), "target_device_id": str(a)}]},
+    )
+    result = resp.json()["results"][0]
+    assert result["reachable"] is True
+    assert result["hop_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_empty_pairs_returns_empty_results(user_client):
+    """An empty pairs list is valid and returns an empty results list."""
+    resp = await user_client.post("/pathfind/batch", json={"pairs": []})
+    assert resp.status_code == 200
+    assert resp.json() == {"results": []}
+
+
+@pytest.mark.asyncio
+async def test_batch_over_cap_returns_422(user_client):
+    """More than MAX_BATCH_PAIRS pairs is rejected with 422 by the schema."""
+    from app.schemas.pathfind import MAX_BATCH_PAIRS
+
+    pair = {"source_device_id": str(uuid.uuid4()), "target_device_id": str(uuid.uuid4())}
+    resp = await user_client.post(
+        "/pathfind/batch",
+        json={"pairs": [pair] * (MAX_BATCH_PAIRS + 1)},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_batch_at_cap_accepted(user_client):
+    """Exactly MAX_BATCH_PAIRS pairs is accepted (boundary check)."""
+    from app.schemas.pathfind import MAX_BATCH_PAIRS
+
+    pair = {"source_device_id": str(uuid.uuid4()), "target_device_id": str(uuid.uuid4())}
+    resp = await user_client.post(
+        "/pathfind/batch",
+        json={"pairs": [pair] * MAX_BATCH_PAIRS},
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["results"]) == MAX_BATCH_PAIRS
+
+
+@pytest.mark.asyncio
+async def test_batch_missing_pair_field_returns_422(user_client):
+    """A pair missing target_device_id is rejected with 422."""
+    resp = await user_client.post(
+        "/pathfind/batch",
+        json={"pairs": [{"source_device_id": str(uuid.uuid4())}]},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_batch_unauthenticated(admin_client):
+    """Batch pathfind without auth returns 401/403, same as the single endpoint."""
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_db] = _override_get_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        resp = await ac.post(
+            "/pathfind/batch",
+            json={
+                "pairs": [
+                    {
+                        "source_device_id": str(uuid.uuid4()),
+                        "target_device_id": str(uuid.uuid4()),
+                    }
+                ]
+            },
+        )
+    assert resp.status_code in (401, 403)

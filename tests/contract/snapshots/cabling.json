@@ -37,6 +37,10 @@
       "/pathfind"
     ],
     [
+      "POST",
+      "/pathfind/batch"
+    ],
+    [
       "GET",
       "/templates"
     ],
@@ -338,6 +342,41 @@
       },
       "required": [
         "device_id"
+      ],
+      "type": "object"
+    },
+    "PathfindBatchRequest": {
+      "properties": {
+        "pairs": "array"
+      },
+      "required": [
+        "pairs"
+      ],
+      "type": "object"
+    },
+    "PathfindBatchResponse": {
+      "properties": {
+        "results": "array"
+      },
+      "required": [
+        "results"
+      ],
+      "type": "object"
+    },
+    "PathfindBatchResult": {
+      "properties": {
+        "hop_count": "integer",
+        "paths": "array",
+        "reachable": "boolean",
+        "source_device_id": "string",
+        "target_device_id": "string"
+      },
+      "required": [
+        "hop_count",
+        "paths",
+        "reachable",
+        "source_device_id",
+        "target_device_id"
       ],
       "type": "object"
     },

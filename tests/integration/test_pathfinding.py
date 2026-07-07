@@ -107,6 +107,76 @@ async def test_cache_invalidation_on_connection_delete(admin_client):
             await admin_client.delete(f"/cabling/connections/{conn_ab}")
 
 
+async def test_batch_pathfind_resolves_pairs_in_order(admin_client):
+    """One batch request resolves reachable and unreachable pairs, preserving order.
+
+    Chain a -> b -> c plus an isolated device d: (a, c) is reachable through b,
+    (a, d) is not, and each batch entry echoes its requested pair with the same
+    shape the single endpoint returns (issue #249).
+    """
+    a, b, c, d = (str(uuid.uuid4()) for _ in range(4))
+    conn_ids = []
+    try:
+        conn_ids.append((await _create_connection(admin_client, a, b, "eth1", "eth1"))["id"])
+        conn_ids.append((await _create_connection(admin_client, b, c, "eth2", "eth1"))["id"])
+
+        resp = await admin_client.post(
+            "/cabling/pathfind/batch",
+            json={
+                "pairs": [
+                    {"source_device_id": a, "target_device_id": c},
+                    {"source_device_id": a, "target_device_id": d},
+                    {"source_device_id": c, "target_device_id": a},
+                ]
+            },
+        )
+        resp.raise_for_status()
+        results = resp.json()["results"]
+        assert len(results) == 3
+
+        # Request order is preserved and each entry echoes its pair.
+        assert [(r["source_device_id"], r["target_device_id"]) for r in results] == [
+            (a, c),
+            (a, d),
+            (c, a),
+        ]
+
+        # Reachable pair matches the single endpoint's result exactly.
+        single = await _pathfind(admin_client, a, c)
+        first = dict(results[0])
+        assert first.pop("source_device_id") == a
+        assert first.pop("target_device_id") == c
+        assert first == single
+
+        # Unreachable pair uses the single endpoint's no-path shape.
+        assert results[1]["reachable"] is False
+        assert results[1]["hop_count"] == 0
+        assert results[1]["paths"] == []
+
+        # Reverse direction is reachable too (undirected cabling graph).
+        assert results[2]["reachable"] is True
+    finally:
+        for cid in conn_ids:
+            await admin_client.delete(f"/cabling/connections/{cid}")
+
+
+async def test_batch_pathfind_empty_pairs_returns_empty_results(admin_client):
+    """An empty pairs list is accepted and yields an empty results list."""
+    resp = await admin_client.post("/cabling/pathfind/batch", json={"pairs": []})
+    resp.raise_for_status()
+    assert resp.json() == {"results": []}
+
+
+async def test_batch_pathfind_over_cap_rejected(admin_client):
+    """A pair list beyond the server cap (2000) is rejected with 422."""
+    pair = {"source_device_id": str(uuid.uuid4()), "target_device_id": str(uuid.uuid4())}
+    resp = await admin_client.post(
+        "/cabling/pathfind/batch",
+        json={"pairs": [pair] * 2001},
+    )
+    assert resp.status_code == 422
+
+
 async def test_cache_invalidation_on_connection_create(admin_client):
     """Creating a new cable makes a previously-unreachable pair reachable."""
     a, b = str(uuid.uuid4()), str(uuid.uuid4())

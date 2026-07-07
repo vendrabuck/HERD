@@ -59,13 +59,14 @@ outbox relay claims with `FOR UPDATE SKIP LOCKED`, and per-event connection pool
 all in the frontend data layer fanning out per item because the backend exposes no batch
 endpoints.
 
-- **Per-pair pathfind fan-out ([#249](https://github.com/vendrabuck/HERD/issues/249)).**
-  The reservation Routes tab issues one `POST /cabling/pathfind` per device pair
-  (n(n-1)/2 requests for n reserved devices, 435 at n=30), and the topology editor issues
-  one per edge on every canvas load. Each server call rebuilds the entire fabric
-  component (`services/cabling/app/services/pathfind_service.py:19-88`). A single batch
-  pathfind endpoint that builds the graph once and answers all pairs collapses O(pairs)
-  graph builds to one. Design-work-sized; highest-impact perf item.
+- **Per-pair pathfind fan-out ([#249](https://github.com/vendrabuck/HERD/issues/249), landed).**
+  The reservation Routes tab used to issue one `POST /cabling/pathfind` per device pair
+  (n(n-1)/2 requests for n reserved devices, 435 at n=30), and the topology editor one
+  per edge on every canvas load, with each server call rebuilding the entire fabric
+  component (`services/cabling/app/services/pathfind_service.py` `build_adjacency_graph`).
+  `POST /cabling/pathfind/batch` now builds the graph once and answers all pairs
+  (capped at 2000 per request) in memory, and `usePathfindPairs` sends one request, so
+  both UI paths collapsed O(pairs) graph builds to one.
 - **Per-device hydration fan-out ([#250](https://github.com/vendrabuck/HERD/issues/250)).**
   The topology editor fetches each canvas device with an individual
   `GET /inventory/devices/{id}` on every open. A `POST /inventory/devices/batch` (one

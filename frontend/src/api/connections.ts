@@ -1,5 +1,10 @@
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
-import type { PathfindResponse, Connection, ConnectionCreate } from "@/types/connection.types";
+import type {
+  PathfindResponse,
+  PathfindBatchResponse,
+  Connection,
+  ConnectionCreate,
+} from "@/types/connection.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
 
@@ -106,6 +111,36 @@ export interface DevicePair {
   targetDeviceId: string;
 }
 
+// Server-side cap on pairs per batch request (MAX_BATCH_PAIRS in the cabling
+// service); pair lists beyond it are split into sequential chunks.
+const PATHFIND_BATCH_LIMIT = 2000;
+
+// One POST /cabling/pathfind/batch resolves every pair against a single
+// server-side adjacency-graph build (issue #249). Results preserve request
+// order, so each chunk's results zip back onto the chunk by index.
+async function findPathsBatch(pairs: DevicePair[]): Promise<Map<string, PathfindResponse>> {
+  const map = new Map<string, PathfindResponse>();
+  for (let i = 0; i < pairs.length; i += PATHFIND_BATCH_LIMIT) {
+    const chunk = pairs.slice(i, i + PATHFIND_BATCH_LIMIT);
+    const resp = await apiClient.post<PathfindBatchResponse>("/cabling/pathfind/batch", {
+      pairs: chunk.map((p) => ({
+        source_device_id: p.sourceDeviceId,
+        target_device_id: p.targetDeviceId,
+      })),
+    });
+    chunk.forEach((pair, idx) => {
+      const result = resp.data.results[idx];
+      if (!result) return;
+      map.set(`${pair.sourceDeviceId}::${pair.targetDeviceId}`, {
+        reachable: result.reachable,
+        hop_count: result.hop_count,
+        paths: result.paths,
+      });
+    });
+  }
+  return map;
+}
+
 export function usePathfindPairs(pairs: DevicePair[]) {
   const key = pairs
     .map((p) => `${p.sourceDeviceId}:${p.targetDeviceId}`)
@@ -114,26 +149,7 @@ export function usePathfindPairs(pairs: DevicePair[]) {
 
   return useQuery({
     queryKey: ["pathfind", "pairs", key],
-    queryFn: async () => {
-      const results = await Promise.all(
-        pairs.map(async (p) => {
-          try {
-            const resp = await findPath(p.sourceDeviceId, p.targetDeviceId);
-            return { pair: p, result: resp };
-          } catch {
-            return {
-              pair: p,
-              result: { reachable: false, hop_count: 0, paths: [] } as PathfindResponse,
-            };
-          }
-        }),
-      );
-      const map = new Map<string, PathfindResponse>();
-      for (const { pair, result } of results) {
-        map.set(`${pair.sourceDeviceId}::${pair.targetDeviceId}`, result);
-      }
-      return map;
-    },
+    queryFn: () => findPathsBatch(pairs),
     enabled: pairs.length > 0,
     staleTime: 2 * 60 * 1000,
   });

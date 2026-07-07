@@ -62,7 +62,7 @@ A red edge is a hard signal: the **Reserve Topology** button is disabled wheneve
 
 ### Connectivity check
 
-The check uses the cabling service's pathfind endpoint, which rebuilds the `Connection` adjacency graph per request. Every canvas load resolves the state of every edge in one batched call. When you draw a new edge, change endpoints, or an admin updates physical cabling, the affected edges revalidate automatically and immediately reflect the latest cabling state.
+The check uses the cabling service's batch pathfind endpoint (`POST /cabling/pathfind/batch`), which builds the `Connection` adjacency graph once per request and resolves every edge's device pair against it in memory. Every canvas load resolves the state of every edge in one batched call. When you draw a new edge, change endpoints, or an admin updates physical cabling, the affected edges revalidate automatically and immediately reflect the latest cabling state.
 
 To express overlay links between physically isolated sites (for example, an MPLS tunnel between two labs), add a virtual device representing the tunnel and cable it into both fabrics in the cabling service. The validator then sees a real path and the topology edge turns green.
 
