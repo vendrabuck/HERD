@@ -543,6 +543,76 @@ class AIClient:
 
         raise AIError("AI did not return a suggest_identity tool_use block")
 
+    async def draft_recipe(
+        self,
+        *,
+        prompt: str,
+        hypervisor_type: str | None = None,
+        previous_driver_py: str | None = None,
+        previous_metadata_json: str | None = None,
+        repair_feedback: str = "",
+    ) -> tuple[dict[str, Any], Usage]:
+        """Force a single draft_recipe tool call; return the parsed dict and usage.
+
+        Mirrors propose_topology's shape (ADR 0005, issue #28): single forced
+        tool_use, structured output via input_schema. The model returns only
+        driver_py, a small metadata subset (name/version/notes), and an
+        explanation; the service owns connection_type, supports_dry_run, and
+        provenance and injects them itself, so a model cannot weaken the
+        generated-recipe contract by emitting different values.
+
+        `previous_driver_py`/`previous_metadata_json` seed a refine round with
+        the stored draft; `repair_feedback` carries the validator's report (or
+        the admin's feedback) for the bounded auto-repair loop in
+        recipe_author. The returned Usage lets the route meter every attempt.
+        """
+        # Lazy import: recipe_author owns the recipe prompt and tool schema
+        # (they are recipe-domain content, not client plumbing).
+        from app.services.recipe_author import DRAFT_RECIPE_TOOL, RECIPE_SYSTEM_PROMPT
+
+        parts = [f"=== TASK ===\n{prompt}"]
+        if hypervisor_type:
+            parts.append(f"=== TARGET HYPERVISOR TYPE ===\n{hypervisor_type}")
+        if previous_driver_py:
+            parts.append(
+                "=== CURRENT DRAFT driver.py (revise this, do not start over) ===\n"
+                f"{previous_driver_py}"
+            )
+        if previous_metadata_json:
+            parts.append(f"=== CURRENT DRAFT driver_metadata.json ===\n{previous_metadata_json}")
+        if repair_feedback:
+            parts.append(
+                "=== CORRECTION ===\n"
+                "Your previous draft failed validation or the administrator "
+                "asked for changes. Fix the issues below and call draft_recipe "
+                f"again with the complete revised files.\n{repair_feedback}"
+            )
+        user_content = "\n\n".join(parts)
+
+        resp = await self._call_provider(
+            system=RECIPE_SYSTEM_PROMPT,
+            messages=[Message(role="user", content=[TextBlock(text=user_content)])],
+            tools=[DRAFT_RECIPE_TOOL],
+            tool_choice=ToolChoiceTool(name="draft_recipe"),
+            max_tokens=self._max_tokens,
+            timeout_s=None,
+        )
+
+        for block in resp.content:
+            if isinstance(block, ToolUseBlock) and block.name == "draft_recipe":
+                logger.info(
+                    "ai_recipe_draft",
+                    extra={
+                        "model": resp.raw_model,
+                        "input_tokens": resp.usage.input_tokens,
+                        "output_tokens": resp.usage.output_tokens,
+                        "stop_reason": resp.stop_reason,
+                    },
+                )
+                return dict(block.input), resp.usage
+
+        raise AIError("AI did not return a draft_recipe tool_use block")
+
     async def answer_reservation_question_with_tools(
         self,
         *,

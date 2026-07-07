@@ -30,6 +30,7 @@ from app.database import Base, engine
 from app.routes.commit import router as commit_router
 from app.routes.generate import router as generate_router
 from app.routes.quota import router as quota_router
+from app.routes.recipes import router as recipes_router
 from app.routes.reservation_assistant import router as reservation_assistant_router
 from app.routes.template_identity import router as template_identity_router
 from app.routes.usage import router as usage_router
@@ -94,6 +95,7 @@ app.include_router(reservation_assistant_router)
 app.include_router(template_identity_router)
 app.include_router(quota_router)
 app.include_router(usage_router)
+app.include_router(recipes_router)
 
 
 @app.get("/health")
@@ -107,4 +109,7 @@ async def ai_status():
         "enabled": ai_is_configured(),
         "provider": settings.ai_provider,
         "model": settings.ai_model,
+        # Conditional-UI signal for the DriversPage panel (ADR 0005): the
+        # feature is usable only when this AND enabled are both true.
+        "recipe_authoring": settings.ai_recipe_authoring_enabled,
     }

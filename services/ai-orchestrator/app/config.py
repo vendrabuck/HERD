@@ -64,6 +64,20 @@ class Settings(BaseSettings):
     # can be flipped per environment once a confirmation UI is in place.
     ai_write_tools_enabled: bool = False
 
+    # AI-assisted recipe authoring (ADR 0005, issue #28). Default off: the
+    # feature asks an LLM to draft code that will run against lab
+    # infrastructure after admin approval, so an operator must opt in per
+    # deployment. Enforced at the route boundary, mirroring
+    # ai_write_tools_enabled.
+    ai_recipe_authoring_enabled: bool = False
+    # Bounded auto-repair: total drafting attempts (the initial draft plus
+    # repair rounds fed the validator's report) one request may spend.
+    ai_recipe_max_attempts: int = 3
+    # The recipe validator is execution's internal endpoint, authenticated
+    # with X-Internal-Token; this service historically ran on forwarded user
+    # JWTs only, so the token is new here and must match the stack-wide value.
+    internal_api_token: str = ""
+
     inventory_service_url: str = "http://inventory:8000"
     cabling_service_url: str = "http://cabling:8000"
     reservations_service_url: str = "http://reservations:8000"
