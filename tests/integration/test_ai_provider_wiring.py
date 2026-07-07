@@ -60,10 +60,11 @@ async def test_ai_status_provider_value_is_known(base_url):
 
 async def test_ai_status_payload_shape_is_stable(base_url):
     """Shape contract: status returns exactly the documented keys; the
-    frontend treats this payload as a public schema."""
+    frontend treats this payload as a public schema. recipe_authoring joined
+    in issue #28 phase 2 (the conditional-UI signal for the drafting panel)."""
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
         body = (await client.get(f"{base_url}/ai/status")).json()
-    assert set(body.keys()) == {"enabled", "provider", "model"}, (
+    assert set(body.keys()) == {"enabled", "provider", "model", "recipe_authoring"}, (
         f"unexpected keys in status: {sorted(body.keys())}"
     )
 
