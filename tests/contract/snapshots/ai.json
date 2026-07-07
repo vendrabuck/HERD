@@ -18,6 +18,18 @@
     ],
     [
       "POST",
+      "/recipes/draft"
+    ],
+    [
+      "GET",
+      "/recipes/draft/{draft_id}"
+    ],
+    [
+      "POST",
+      "/recipes/draft/{draft_id}/refine"
+    ],
+    [
+      "POST",
       "/reservations/{reservation_id}/assistant"
     ],
     [
@@ -150,6 +162,49 @@
       ],
       "type": "object"
     },
+    "DraftRequest": {
+      "properties": {
+        "hypervisor_type": "anyOf",
+        "prompt": "string"
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "DraftResponse": {
+      "properties": {
+        "attempts": "integer",
+        "created_at": "string",
+        "draft_id": "string",
+        "driver_metadata": "object",
+        "driver_py": "string",
+        "explanation": "anyOf",
+        "hypervisor_type": "anyOf",
+        "model": "anyOf",
+        "package_b64": "string",
+        "prompt": "string",
+        "updated_at": "string",
+        "valid": "boolean",
+        "validation": "anyOf"
+      },
+      "required": [
+        "attempts",
+        "created_at",
+        "draft_id",
+        "driver_metadata",
+        "driver_py",
+        "explanation",
+        "hypervisor_type",
+        "model",
+        "package_b64",
+        "prompt",
+        "updated_at",
+        "valid",
+        "validation"
+      ],
+      "type": "object"
+    },
     "GenerateResponse": {
       "properties": {
         "devices": "array",
@@ -205,6 +260,15 @@
       "required": [
         "source_role",
         "target_role"
+      ],
+      "type": "object"
+    },
+    "RefineRequest": {
+      "properties": {
+        "feedback": "string"
+      },
+      "required": [
+        "feedback"
       ],
       "type": "object"
     },
