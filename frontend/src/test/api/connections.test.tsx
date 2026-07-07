@@ -115,28 +115,84 @@ describe("connections api hooks", () => {
     });
   });
 
-  it("usePathfindPairs aggregates results into a map keyed by pair", async () => {
+  it("usePathfindPairs issues ONE batch request and maps results by pair", async () => {
+    let requestCount = 0;
+    let capturedBody: unknown = null;
     server.use(
-      http.post("/api/cabling/pathfind", () =>
-        HttpResponse.json({ reachable: true, hop_count: 2, paths: [] }),
-      ),
+      http.post("/api/cabling/pathfind/batch", async ({ request }) => {
+        requestCount += 1;
+        const body = (await request.json()) as {
+          pairs: { source_device_id: string; target_device_id: string }[];
+        };
+        capturedBody = body;
+        return HttpResponse.json({
+          results: body.pairs.map((p, idx) => ({
+            source_device_id: p.source_device_id,
+            target_device_id: p.target_device_id,
+            reachable: idx === 0,
+            hop_count: idx === 0 ? 2 : 0,
+            paths: [],
+          })),
+        });
+      }),
     );
     const { result } = renderHook(
       () =>
         usePathfindPairs([
           { sourceDeviceId: "d1", targetDeviceId: "d2" },
+          { sourceDeviceId: "d1", targetDeviceId: "d3" },
+          { sourceDeviceId: "d2", targetDeviceId: "d3" },
         ]),
       { wrapper },
     );
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // Three pairs, exactly one HTTP request.
+    expect(requestCount).toBe(1);
+    expect(
+      (capturedBody as { pairs: unknown[] }).pairs,
+    ).toHaveLength(3);
     const map = result.current.data!;
     expect(map.get("d1::d2")?.reachable).toBe(true);
+    expect(map.get("d1::d2")?.hop_count).toBe(2);
+    expect(map.get("d1::d3")?.reachable).toBe(false);
+    expect(map.get("d2::d3")?.reachable).toBe(false);
   });
 
-  it("usePathfindPairs handles a per-pair error by recording unreachable", async () => {
+  it("usePathfindPairs splits pair lists beyond the batch cap into chunks", async () => {
+    const chunkSizes: number[] = [];
     server.use(
-      http.post("/api/cabling/pathfind", () =>
-        HttpResponse.json({ detail: "no path" }, { status: 500 }),
+      http.post("/api/cabling/pathfind/batch", async ({ request }) => {
+        const body = (await request.json()) as {
+          pairs: { source_device_id: string; target_device_id: string }[];
+        };
+        chunkSizes.push(body.pairs.length);
+        return HttpResponse.json({
+          results: body.pairs.map((p) => ({
+            source_device_id: p.source_device_id,
+            target_device_id: p.target_device_id,
+            reachable: true,
+            hop_count: 2,
+            paths: [],
+          })),
+        });
+      }),
+    );
+    const pairs = Array.from({ length: 2001 }, (_, i) => ({
+      sourceDeviceId: "src",
+      targetDeviceId: `tgt-${i}`,
+    }));
+    const { result } = renderHook(() => usePathfindPairs(pairs), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // 2001 pairs against a 2000-pair server cap: two requests, all results kept.
+    expect(chunkSizes).toEqual([2000, 1]);
+    expect(result.current.data!.size).toBe(2001);
+    expect(result.current.data!.get("src::tgt-2000")?.reachable).toBe(true);
+  });
+
+  it("usePathfindPairs surfaces a batch request failure as a query error", async () => {
+    server.use(
+      http.post("/api/cabling/pathfind/batch", () =>
+        HttpResponse.json({ detail: "boom" }, { status: 500 }),
       ),
     );
     const { result } = renderHook(
@@ -146,7 +202,7 @@ describe("connections api hooks", () => {
         ]),
       { wrapper },
     );
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data!.get("d1::d2")?.reachable).toBe(false);
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
   });
 });

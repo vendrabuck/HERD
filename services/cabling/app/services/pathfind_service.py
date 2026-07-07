@@ -116,6 +116,27 @@ async def find_all_shortest_paths_async(
     return await asyncio.to_thread(find_all_shortest_paths, graph, source_id, target_id)
 
 
+async def find_all_shortest_paths_batch_async(
+    graph: dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]],
+    pairs: list[tuple[uuid.UUID, uuid.UUID]],
+) -> list[list[list[PathHop]]]:
+    """Run the per-pair BFS for a whole batch inside one worker thread.
+
+    The batch endpoint builds the adjacency graph once and then resolves every
+    (source, target) pair against it in memory. Dispatching one thread per
+    pair would cost a thread-pool hop per pair; running the whole loop in a
+    single ``asyncio.to_thread`` call keeps the event loop free for the same
+    price as one offload. Results are returned in request order, one
+    path-list per pair (empty list when unreachable), matching the single-pair
+    ``find_all_shortest_paths`` semantics exactly.
+    """
+
+    def _run() -> list[list[list[PathHop]]]:
+        return [find_all_shortest_paths(graph, src, tgt) for src, tgt in pairs]
+
+    return await asyncio.to_thread(_run)
+
+
 def find_all_shortest_paths(
     graph: dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]],
     source_id: uuid.UUID,

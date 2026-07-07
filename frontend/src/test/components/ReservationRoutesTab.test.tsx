@@ -31,22 +31,29 @@ function deviceNamesHandler(items: { id: string; name: string }[]) {
   );
 }
 
-// Build a /api/cabling/pathfind handler keyed on the source/target in the body.
+// Build a /api/cabling/pathfind/batch handler keyed on each pair in the body.
+// Unmatched pairs come back unreachable, mirroring the real endpoint's no-path
+// shape; results preserve request order.
 function pathfindHandler(
   routes: Record<
     string,
     { reachable: boolean; hop_count: number; paths: unknown[] }
   >,
 ) {
-  return http.post("/api/cabling/pathfind", async ({ request }) => {
+  return http.post("/api/cabling/pathfind/batch", async ({ request }) => {
     const body = (await request.json()) as {
-      source_device_id: string;
-      target_device_id: string;
+      pairs: { source_device_id: string; target_device_id: string }[];
     };
-    const key = `${body.source_device_id}::${body.target_device_id}`;
-    const match = routes[key];
-    if (match) return HttpResponse.json(match);
-    return HttpResponse.json({ reachable: false, hop_count: 0, paths: [] });
+    const results = body.pairs.map((pair) => {
+      const key = `${pair.source_device_id}::${pair.target_device_id}`;
+      const match = routes[key] ?? { reachable: false, hop_count: 0, paths: [] };
+      return {
+        source_device_id: pair.source_device_id,
+        target_device_id: pair.target_device_id,
+        ...match,
+      };
+    });
+    return HttpResponse.json({ results });
   });
 }
 
@@ -61,7 +68,7 @@ describe("ReservationRoutesTab", () => {
   it("shows the discovering state while routes are loading", () => {
     server.use(
       deviceNamesHandler([]),
-      http.post("/api/cabling/pathfind", async () => {
+      http.post("/api/cabling/pathfind/batch", async () => {
         await new Promise(() => {});
         return HttpResponse.json({});
       }),
@@ -136,12 +143,10 @@ describe("ReservationRoutesTab", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders an empty state when the route map has no entries", async () => {
+  it("renders the error state when the batch pathfind request fails", async () => {
     server.use(
       deviceNamesHandler([]),
-      // Return null-ish results: an empty map means neither reachable nor
-      // explicitly-unreachable pairs are present.
-      http.post("/api/cabling/pathfind", () =>
+      http.post("/api/cabling/pathfind/batch", () =>
         HttpResponse.json({ detail: "boom" }, { status: 500 }),
       ),
     );
@@ -149,10 +154,10 @@ describe("ReservationRoutesTab", () => {
       <ReservationRoutesTab deviceIds={[DEVICE_A, DEVICE_B]} />,
     );
 
-    // usePathfindPairs swallows per-pair errors into reachable:false results,
-    // so a failed pathfind surfaces as an unreachable card rather than an error.
+    // With one batch request, a request failure means no routes at all were
+    // resolved; the tab surfaces its error state instead of guessing per pair.
     await waitFor(() =>
-      expect(screen.getByText("Unreachable")).toBeInTheDocument(),
+      expect(screen.getByText("Failed to load routes.")).toBeInTheDocument(),
     );
   });
 });

@@ -24,6 +24,15 @@ export interface PathfindResponse {
   paths: PathHop[][];
 }
 
+export interface PathfindBatchResult extends PathfindResponse {
+  source_device_id: string;
+  target_device_id: string;
+}
+
+export interface PathfindBatchResponse {
+  results: PathfindBatchResult[];
+}
+
 export interface ConnectionCreate {
   device_a_id: string;
   port_a: string;
