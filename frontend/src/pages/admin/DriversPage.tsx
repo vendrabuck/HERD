@@ -8,6 +8,8 @@ import {
   useDeleteDriver,
   useDownloadDriver,
 } from "@/api/drivers";
+import { useAIStatus } from "@/api/ai";
+import { RecipeDraftPanel } from "@/components/admin/RecipeDraftPanel";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
@@ -18,6 +20,7 @@ const CONNECTION_TYPES: ConnectionType[] = [
   "Layer 1 Switch",
   "Layer 2 Switch",
   "Layer 3 Switch",
+  "Hypervisor",
 ];
 
 function formatBytes(bytes: number): string {
@@ -40,7 +43,13 @@ export function DriversPage() {
 
   const isAdmin = user?.role === "admin" || user?.role === "superadmin";
 
+  const aiStatus = useAIStatus();
+  const recipeAuthoringOn = Boolean(
+    aiStatus.data?.enabled && aiStatus.data?.recipe_authoring,
+  );
+
   const [showUpload, setShowUpload] = useState(false);
+  const [showRecipePanel, setShowRecipePanel] = useState(false);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [uploadName, setUploadName] = useState("");
   const [uploadDesc, setUploadDesc] = useState("");
@@ -131,12 +140,22 @@ export function DriversPage() {
       <div className="px-6 xl:px-12 2xl:px-16 py-8">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-gray-900">Drivers</h2>
-          <button
-            onClick={() => setShowUpload(true)}
-            className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
-          >
-            Upload Driver
-          </button>
+          <div className="flex gap-2">
+            {recipeAuthoringOn && (
+              <button
+                onClick={() => setShowRecipePanel(true)}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                Draft with AI
+              </button>
+            )}
+            <button
+              onClick={() => setShowUpload(true)}
+              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
+            >
+              Upload Driver
+            </button>
+          </div>
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
@@ -304,6 +323,8 @@ export function DriversPage() {
           </div>
         </div>
       </Modal>
+
+      <RecipeDraftPanel open={showRecipePanel} onClose={() => setShowRecipePanel(false)} />
 
       <ConfirmDialog
         open={deleteId !== null}

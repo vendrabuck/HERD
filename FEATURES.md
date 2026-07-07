@@ -129,6 +129,15 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   must opt into dry-run via a `driver_metadata.json` declaring
   `supports_dry_run: true`; the inventory schedule endpoint, AI tool, and
   execution sandbox all refuse dry-runs against drivers that did not opt in.
+- **AI-assisted recipe authoring** (Shipped): an admin describes a dynamic-resource
+  recipe in natural language and the AI drafts the driver package, which is
+  validated in the execution sandbox (AST structural checks, a stricter
+  generated-recipe policy, and a simulated dry-run of the full lifecycle) with
+  a bounded auto-repair loop before the admin ever sees it. A review panel on
+  the drivers page shows the code, the validation report, and the dry-run
+  transcripts; nothing runs against real infrastructure and nothing is
+  uploaded until the admin explicitly approves. Dark by default behind
+  `AI_RECIPE_AUTHORING_ENABLED`. See [docs/AI_RECIPES.md](docs/AI_RECIPES.md).
 - **Pluggable LLM provider** (Shipped): decouple the AI features from a single
   proprietary provider. Set `AI_PROVIDER=openai_compat` and `AI_BASE_URL` to
   point HERD at any OpenAI-compatible chat-completions endpoint (vLLM, Ollama,

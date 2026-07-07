@@ -18,6 +18,7 @@ in their JWT access token and enforced independently by each service.
 | View backend connections | yes | yes | yes |
 | Create, update, delete templates | | yes | yes |
 | Upload, update, delete drivers | | yes | yes |
+| Draft recipes with AI (gated by AI_RECIPE_AUTHORING_ENABLED) | | yes | yes |
 | Register, update, delete hypervisors | | yes | yes |
 | Add devices to inventory | | yes | yes |
 | Update devices in inventory | | yes | yes |

@@ -27,6 +27,48 @@ export interface AIGenerateRequest {
 
 export interface AIStatusResponse {
   enabled: boolean;
+  // Conditional-UI signal for the recipe drafting panel (issue #28); the
+  // panel is usable only when this AND enabled are both true.
+  recipe_authoring?: boolean;
+}
+
+export interface RecipeValidationSection {
+  passed: boolean;
+  errors: string[];
+}
+
+export interface RecipeDryRunMethod {
+  action: string;
+  passed: boolean;
+  success: boolean;
+  output: Record<string, unknown> | null;
+  error: string | null;
+  duration_ms: number | null;
+  transcript: Record<string, unknown>[];
+}
+
+export interface RecipeValidationReport {
+  valid: boolean;
+  structural: RecipeValidationSection;
+  policy: RecipeValidationSection;
+  schema: { present: boolean; schema: Record<string, unknown> | null; error: string | null };
+  dry_run: { passed: boolean; methods: RecipeDryRunMethod[]; error: string | null };
+}
+
+export interface RecipeDraftResponse {
+  draft_id: string;
+  valid: boolean;
+  attempts: number;
+  model: string | null;
+  prompt: string;
+  hypervisor_type: string | null;
+  explanation: string | null;
+  driver_py: string;
+  driver_metadata: Record<string, unknown>;
+  validation: RecipeValidationReport | null;
+  package_b64: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface AIGenerateResponse {
