@@ -26,7 +26,7 @@ export function useUtilizationReport(query: UtilizationQuery, enabled = true) {
   });
 }
 
-export type UtilizationCsvSection = "user" | "device";
+export type UtilizationCsvSection = "user" | "device" | "fleet";
 
 export async function downloadUtilizationCsv(
   query: UtilizationQuery,

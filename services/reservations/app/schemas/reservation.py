@@ -256,6 +256,27 @@ class GroupBucket(BaseModel):
     hours: float
 
 
+class FleetDeviceBucket(BaseModel):
+    device_id: uuid.UUID
+    name: str
+    # Inventory's current DeviceStatus (AVAILABLE/RESERVED/OFFLINE/MAINTENANCE),
+    # carried as a plain string: the enum is owned by the inventory service and
+    # reservations must not import another service's model.
+    status: str
+    reservation_count: int
+    hours: float
+    utilization_pct: float
+
+
+class FleetSection(BaseModel):
+    device_count: int
+    idle_device_count: int
+    window_hours: float
+    total_reserved_hours: float
+    utilization_pct: float
+    devices: list[FleetDeviceBucket]
+
+
 class UtilizationReport(BaseModel):
     window_start: datetime
     window_end: datetime
@@ -267,3 +288,6 @@ class UtilizationReport(BaseModel):
     by_day: list[DayBucket] = []
     by_group: list[GroupBucket] = []
     execution_run_count: int | None = None
+    # None when the inventory service could not be reached; the rest of the
+    # report is still served (same degrade contract as execution_run_count).
+    fleet: FleetSection | None = None

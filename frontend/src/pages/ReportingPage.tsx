@@ -7,7 +7,7 @@ import {
   type UtilizationCsvSection,
 } from "@/api/reporting";
 import { useDevices } from "@/api/inventory";
-import type { DayBucket, DeviceBucket } from "@/types/reporting.types";
+import type { DayBucket, DeviceBucket, FleetSection } from "@/types/reporting.types";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatCard } from "@/components/ui/StatCard";
 import { EmptyRow } from "@/components/ui/EmptyState";
@@ -181,6 +181,14 @@ export function ReportingPage() {
         )}
 
         <DailyTrendChart data={report.data?.by_day ?? []} loading={report.isLoading} />
+
+        <FleetUtilizationCard
+          fleet={report.data?.fleet ?? null}
+          loaded={Boolean(report.data)}
+          loading={report.isLoading}
+          canDownload={canDownload && Boolean(report.data?.fleet)}
+          onDownload={() => handleServerCsv("fleet")}
+        />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-4 gap-6">
           <TableCard
@@ -364,6 +372,123 @@ export function ReportingPage() {
           </TableCard>
         </div>
       </div>
+    </div>
+  );
+}
+
+function FleetUtilizationCard({
+  fleet,
+  loaded,
+  loading,
+  canDownload,
+  onDownload,
+}: {
+  fleet: FleetSection | null;
+  loaded: boolean;
+  loading: boolean;
+  canDownload: boolean;
+  onDownload: () => void;
+}) {
+  const [idleOnly, setIdleOnly] = useState(false);
+  const rows = useMemo(() => {
+    if (!fleet) return [];
+    return idleOnly ? fleet.devices.filter((d) => d.reservation_count === 0) : fleet.devices;
+  }, [fleet, idleOnly]);
+
+  return (
+    <Card>
+      <CardHeader
+        title="Fleet Utilization"
+        action={
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={idleOnly}
+                onChange={(e) => setIdleOnly(e.target.checked)}
+                className="rounded border-gray-300"
+              />
+              Idle only
+            </label>
+            <CsvButton onClick={onDownload} disabled={!canDownload} label="Download CSV" />
+          </div>
+        }
+      />
+      <div className="px-4 pt-3 pb-1 text-xs text-gray-500">
+        Every inventory device against the full selected window. Counts active and completed
+        reservations by default; device status is as of now (status history is not tracked).
+      </div>
+      {loading ? (
+        <div className="p-4">
+          <SkeletonRows />
+        </div>
+      ) : loaded && !fleet ? (
+        <div className="p-4">
+          <AlertStrip variant="warning">
+            Inventory service was unreachable; fleet utilization is unavailable for this window.
+          </AlertStrip>
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-3 gap-4 px-4 py-3 border-b border-gray-100">
+            <FleetStat
+              label="Fleet utilization"
+              value={fleet ? `${fleet.utilization_pct.toFixed(1)}%` : "n/a"}
+            />
+            <FleetStat label="Devices" value={fleet ? String(fleet.device_count) : "n/a"} />
+            <FleetStat
+              label="Idle in window"
+              value={fleet ? String(fleet.idle_device_count) : "n/a"}
+            />
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-left">
+              <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
+                <tr>
+                  <th className="px-4 py-3">Device</th>
+                  <th className="px-4 py-3">Status</th>
+                  <th className="px-4 py-3 text-right">Utilization</th>
+                  <th className="px-4 py-3 text-right">Hours</th>
+                  <th className="px-4 py-3 text-right">Count</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {rows.map((d) => (
+                  <tr key={d.device_id} className="hover:bg-gray-50">
+                    <td className="px-4 py-2 font-medium text-gray-900">
+                      {d.name || d.device_id.slice(0, 8)}
+                    </td>
+                    <td className="px-4 py-2 text-xs text-gray-500">{d.status}</td>
+                    <td className="px-4 py-2 text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        <div className="w-24 h-1.5 bg-gray-100 rounded overflow-hidden">
+                          <div
+                            className="h-full bg-gray-900"
+                            style={{ width: `${Math.min(d.utilization_pct, 100)}%` }}
+                          />
+                        </div>
+                        <span className="tabular-nums w-14">{d.utilization_pct.toFixed(1)}%</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">{formatHours(d.hours)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{d.reservation_count}</td>
+                  </tr>
+                ))}
+                {fleet && rows.length === 0 && <EmptyRow colSpan={5} />}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function FleetStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-xs text-gray-500 uppercase">{label}</div>
+      <div className="text-lg font-semibold text-gray-900 tabular-nums">{value}</div>
     </div>
   );
 }

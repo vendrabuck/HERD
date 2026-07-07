@@ -169,7 +169,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Operations and observability
 
 - **Reporting and analytics** (Shipped): admin-only utilization dashboards by user,
-  device, topology type, day, and group, with CSV export.
+  device, topology type, day, and group, with CSV export. Includes a fleet
+  utilization section: a per-device utilization rate against the full window, an
+  idle-device view (devices with zero bookings in the window), and fleet-wide
+  summary numbers, counting active plus completed reservations by default.
 - **Notifications and dispatch channels** (Shipped): durable NATS consumers turn
   reservation lifecycle and device-health events into per-user notifications. The
   in-app bell ships alongside opt-in email, chat (Slack-style), and outbound-webhook

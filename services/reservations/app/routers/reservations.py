@@ -27,6 +27,7 @@ from app.schemas.reservation import (
 from app.services.reporting_service import (
     build_utilization_report,
     fetch_execution_run_count,
+    fetch_fleet_devices,
     fetch_user_groups_map,
     report_to_csv,
     rollup_by_group,
@@ -43,6 +44,11 @@ from app.services.reservation_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default reservation statuses for the fleet-utilization section. Includes
+# ACTIVE (unlike the legacy sections' COMPLETED-only default) so a window
+# touching the present does not under-report in-flight usage.
+FLEET_DEFAULT_STATUS_FILTER = [ReservationStatus.ACTIVE, ReservationStatus.COMPLETED]
 
 router = APIRouter(tags=["reservations"])
 bearer_scheme = HTTPBearer()
@@ -139,11 +145,23 @@ async def get_utilization_report(
     _admin: dict = Depends(require_admin),
 ):
     status_filter = status if status else [ReservationStatus.COMPLETED]
+    # The fleet section defaults to ACTIVE+COMPLETED so a reservation running
+    # right now counts toward utilization; an explicit ?status= applies to
+    # every section so a caller-chosen filter stays internally consistent.
+    fleet_filter = status if status else FLEET_DEFAULT_STATUS_FILTER
+    auth_header = request.headers.get("Authorization")
+    fleet_devices = await fetch_fleet_devices(auth_header)
     try:
-        report = await build_utilization_report(db, start, end, status_filter)
+        report = await build_utilization_report(
+            db,
+            start,
+            end,
+            status_filter,
+            fleet_status_filter=fleet_filter,
+            fleet_devices=fleet_devices,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    auth_header = request.headers.get("Authorization")
     report.execution_run_count = await fetch_execution_run_count(start, end, auth_header)
     user_ids = [b.user_id for b in report.by_user]
     user_groups = await fetch_user_groups_map(user_ids, auth_header)
@@ -153,16 +171,33 @@ async def get_utilization_report(
 
 @router.get("/reports/utilization.csv")
 async def get_utilization_report_csv(
+    request: Request,
     start: datetime = Query(...),
     end: datetime = Query(...),
-    section: str = Query("user", pattern="^(user|device)$"),
+    section: str = Query("user", pattern="^(user|device|fleet)$"),
     status: list[ReservationStatus] | None = Query(None),
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
     status_filter = status if status else [ReservationStatus.COMPLETED]
+    fleet_devices = None
+    fleet_filter = None
+    if section == "fleet":
+        # Only the fleet section needs the inventory join; skip the HTTP
+        # round-trip for the other sections.
+        fleet_filter = status if status else FLEET_DEFAULT_STATUS_FILTER
+        fleet_devices = await fetch_fleet_devices(request.headers.get("Authorization"))
+        if fleet_devices is None:
+            raise HTTPException(status_code=503, detail="Inventory service is unreachable")
     try:
-        report = await build_utilization_report(db, start, end, status_filter)
+        report = await build_utilization_report(
+            db,
+            start,
+            end,
+            status_filter,
+            fleet_status_filter=fleet_filter,
+            fleet_devices=fleet_devices,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     body = report_to_csv(report, section)

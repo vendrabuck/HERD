@@ -64,6 +64,7 @@ def test_reporting_rollup_table_cards(admin_browser, base_url):
         "By Group (cost center)",
         "By Topology Type",
         "By Template",
+        "Fleet Utilization",
         "Daily trend (reservation-hours)",
     ):
         assert title in body, f"rollup section missing: {title}"
@@ -73,5 +74,5 @@ def test_reporting_csv_buttons_render(admin_browser, base_url):
     """The Download CSV actions render on the exportable cards."""
     _open_reporting(admin_browser, base_url)
     buttons = admin_browser.find_elements(By.XPATH, "//button[normalize-space()='Download CSV']")
-    # By User, By Device, and By Template each carry one.
-    assert len(buttons) == 3
+    # By User, By Device, By Template, and Fleet Utilization each carry one.
+    assert len(buttons) == 4

@@ -32,6 +32,24 @@ export interface GroupBucket {
   hours: number;
 }
 
+export interface FleetDeviceBucket {
+  device_id: string;
+  name: string;
+  status: string;
+  reservation_count: number;
+  hours: number;
+  utilization_pct: number;
+}
+
+export interface FleetSection {
+  device_count: number;
+  idle_device_count: number;
+  window_hours: number;
+  total_reserved_hours: number;
+  utilization_pct: number;
+  devices: FleetDeviceBucket[];
+}
+
 export interface UtilizationReport {
   window_start: string;
   window_end: string;
@@ -43,6 +61,8 @@ export interface UtilizationReport {
   by_day: DayBucket[];
   by_group: GroupBucket[];
   execution_run_count: number | null;
+  // null when the inventory service was unreachable server-side.
+  fleet: FleetSection | null;
 }
 
 export interface UtilizationQuery {

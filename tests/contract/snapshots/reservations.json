@@ -108,6 +108,44 @@
       ],
       "type": "object"
     },
+    "FleetDeviceBucket": {
+      "properties": {
+        "device_id": "string",
+        "hours": "number",
+        "name": "string",
+        "reservation_count": "integer",
+        "status": "string",
+        "utilization_pct": "number"
+      },
+      "required": [
+        "device_id",
+        "hours",
+        "name",
+        "reservation_count",
+        "status",
+        "utilization_pct"
+      ],
+      "type": "object"
+    },
+    "FleetSection": {
+      "properties": {
+        "device_count": "integer",
+        "devices": "array",
+        "idle_device_count": "integer",
+        "total_reserved_hours": "number",
+        "utilization_pct": "number",
+        "window_hours": "number"
+      },
+      "required": [
+        "device_count",
+        "devices",
+        "idle_device_count",
+        "total_reserved_hours",
+        "utilization_pct",
+        "window_hours"
+      ],
+      "type": "object"
+    },
     "GroupBucket": {
       "properties": {
         "group_id": "anyOf",
@@ -291,6 +329,7 @@
         "by_topology_type": "array",
         "by_user": "array",
         "execution_run_count": "anyOf",
+        "fleet": "anyOf",
         "total_hours": "number",
         "total_reservations": "integer",
         "window_end": "string",
