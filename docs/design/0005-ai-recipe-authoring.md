@@ -1,9 +1,9 @@
 # Decision: AI-Assisted Service-Recipe Authoring, Issue #28
 
-Status: Draft 2026-07-07. The three product-level decision points below were
-resolved with the owner on 2026-07-07; engineering-level defaults are marked
-as such. No code in this doc. Context verified against the live tree on
-2026-07-07 (main at the fleet-utilization merge).
+Status: Accepted 2026-07-07. The three product-level decision points below
+were resolved with the owner on 2026-07-07 and the engineering defaults were
+accepted in review. No code in this doc. Context verified against the live
+tree on 2026-07-07 (main at the fleet-utilization merge).
 
 ## Context
 
