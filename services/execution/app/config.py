@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     # a remote API is not CPU time.
     recipe_timeout_seconds: int = 300
 
+    # Recipe-package validation (ADR 0005, issue #28). The validate-package
+    # internal endpoint checks unapproved (AI-drafted) packages: size cap on
+    # the decoded archive, and a per-method wall-clock timeout for the
+    # sandboxed dry-run lifecycle. Dry-run methods simulate and return, so
+    # they get the short status-check-style timeout, not recipe_timeout.
+    validate_package_max_bytes: int = 10_485_760
+    validate_dry_run_timeout_seconds: int = 10
+
     # Driver-subprocess resource limits (POSIX rlimits applied via preexec_fn).
     # Each limit is applied to the driver child only; 0 leaves that limit
     # unlimited. RLIMIT_AS bounds virtual address space, so library-heavy
