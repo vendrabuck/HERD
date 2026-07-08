@@ -1,6 +1,7 @@
 """Unit tests for the fork-on-activation models and POST /internal/forks (issue #25)."""
 
 import uuid
+from unittest.mock import patch
 
 import pytest
 from app.config import settings
@@ -14,8 +15,10 @@ from app.models.fork import (
     ReservationFork,
 )
 from app.models.topology import Topology, TopologyVersion
+from app.services.fork_service import create_fork
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 INTERNAL_TOKEN = "test-internal-token"
@@ -453,3 +456,129 @@ async def test_create_fork_skips_unreachable_edge(client):
             .all()
         )
         assert conns == []
+
+
+# --- IntegrityError-on-commit race (concurrent activation, DB-level idempotency) ---
+
+
+@pytest.mark.asyncio
+async def test_create_fork_returns_winner_on_commit_integrity_error():
+    """Two concurrent activations both pass the pre-check and race the insert.
+
+    The unique constraint on reservation_id serializes them: the loser's commit
+    raises IntegrityError, and the handler must roll back the loser's partial rows
+    (fork, fork_connections, fork_versions) and return the winner's fork, so the
+    contract stays idempotent. Simulated deterministically by wrapping the loser's
+    commit: the winner lands through an independent session only after the loser's
+    pre-check has already run, then the commit raises IntegrityError.
+    """
+    # Parent topology with one committed edge over a real physical connection, so
+    # the loser flushes fork_connections and fork_versions rows that must vanish.
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    async with TestSessionLocal() as db:
+        db.add(
+            Connection(
+                device_a_id=dev_a,
+                port_a="eth0",
+                device_b_id=dev_b,
+                port_b="eth1",
+                created_by="admin",
+            )
+        )
+        await db.commit()
+
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "n2", "data": {"device": {"id": str(dev_b)}}},
+        ],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2"}],
+    }
+    topo_id, _ = await _make_topology_with_version(canvas)
+
+    rid = uuid.uuid4()
+    state: dict = {"attempts": 0, "winner_id": None}
+
+    async with TestSessionLocal() as db:
+
+        async def racing_commit():
+            state["attempts"] += 1
+            # The DB aborts the loser's transaction on the constraint violation:
+            # its flushed fork/connection/version rows never persist.
+            await db.rollback()
+            # The concurrent winner commits its fork through an independent
+            # session, after the loser's pre-check already found nothing.
+            async with TestSessionLocal() as other:
+                winner = ReservationFork(reservation_id=rid)
+                other.add(winner)
+                await other.flush()
+                other.add(ForkVersion(fork_id=winner.id, version_number=1))
+                await other.commit()
+                state["winner_id"] = winner.id
+            raise IntegrityError("INSERT", {}, Exception("uq reservation_fork.reservation_id"))
+
+        with patch.object(db, "commit", side_effect=racing_commit):
+            fork = await create_fork(
+                db,
+                reservation_id=rid,
+                parent_topology_id=topo_id,
+                parent_version_id=None,
+            )
+
+        # The loser returned the winner's row, after exactly one commit attempt
+        # (the handler re-queries; it does not retry the insert).
+        assert state["attempts"] == 1
+        assert fork.id == state["winner_id"]
+        assert fork.reservation_id == rid
+
+    async with TestSessionLocal() as db:
+        forks = (
+            (await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid)))
+            .scalars()
+            .all()
+        )
+        assert len(forks) == 1
+        assert forks[0].id == state["winner_id"]
+        # No partial loser rows: every surviving version belongs to the winner,
+        # and the loser's snapshotted fork_connections were rolled back.
+        versions = (await db.execute(select(ForkVersion))).scalars().all()
+        assert [v.fork_id for v in versions] == [state["winner_id"]]
+        conns = (await db.execute(select(ForkConnection))).scalars().all()
+        assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_create_fork_reraises_integrity_error_when_no_winner_exists():
+    """An IntegrityError with no winning fork row re-raises after rollback.
+
+    The commit can fail on a constraint other than the reservation_id unique (the
+    fork_connections or fork_versions uniques share the transaction); then the
+    re-query finds nothing and the handler must propagate the original error
+    rather than return None or loop.
+    """
+    rid = uuid.uuid4()
+    err = IntegrityError("INSERT", {}, Exception("uq_fork_versions_fork_version"))
+
+    async with TestSessionLocal() as db:
+
+        async def failing_commit():
+            raise err
+
+        with patch.object(db, "commit", side_effect=failing_commit):
+            with pytest.raises(IntegrityError) as excinfo:
+                await create_fork(
+                    db,
+                    reservation_id=rid,
+                    parent_topology_id=None,
+                    parent_version_id=None,
+                )
+        # The bare raise propagates the original exception instance.
+        assert excinfo.value is err
+
+    async with TestSessionLocal() as db:
+        forks = (
+            (await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid)))
+            .scalars()
+            .all()
+        )
+        assert forks == []
