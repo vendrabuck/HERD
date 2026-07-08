@@ -30,7 +30,7 @@
       <li><a href="#open">Where it lives</a></li>
       <li><a href="#read">Reading the report</a></li>
       <li><a href="#window">Choosing a window</a></li>
-      <li><a href="#tables">The five tables</a></li>
+      <li><a href="#tables">The fleet card and the five tables</a></li>
       <li><a href="#csv">Exporting CSV</a></li>
     </ul>
     <p class="eyebrow">Admin track</p>
@@ -102,7 +102,8 @@
       <li><b>Window picker.</b> 7 days, 30 days, or Custom (two date pickers, UTC-anchored so the numbers match the backend regardless of your timezone).</li>
       <li><b>Headline cards.</b> Total reservation-hours, reservation count, and execution runs for the window.</li>
       <li><b>Daily trend.</b> Reservation-hours per day. A booking spanning midnight is counted on both days correctly.</li>
-      <li><b>Download CSV.</b> Per-table export for the By User, By Device, and By Template tables.</li>
+      <li><b>Download CSV.</b> Per-table export for the By User, By Device, By Template, and Fleet Utilization tables.</li>
+      <li><b>Fleet Utilization.</b> Every inventory device with a utilization rate against the full window, current status, and an "Idle only" filter for zero-booking devices. Unlike the tables below, this section counts active as well as completed reservations by default, so in-flight usage shows up in a window that includes today.</li>
     </ol>
 
     <h2 class="sec" id="read">Two things to know first</h2>
@@ -118,13 +119,14 @@
     <p>Pick <b>7 days</b> for a weekly standup number, <b>30 days</b> (the default) for a monthly review, or <b>Custom</b> for a quarter, a fiscal period, or a specific incident window. The date pickers are UTC-anchored, so what you select is exactly what the backend filters on &mdash; no off-by-a-day timezone surprises in the export.</p>
 
     <h2 class="sec" id="tables">The breakdowns</h2>
-    <p class="sectitle">The five tables</p>
+    <p class="sectitle">The fleet card and the five tables</p>
     <div class="cardgrid c2" style="margin-top:18px;">
       <div class="gcard" style="cursor:default;"><span class="num">01</span><h3>By User</h3><p>Owner name, hours, reservation count. "Who is the lab's heaviest user?"</p></div>
       <div class="gcard" style="cursor:default;"><span class="num">02</span><h3>By Device</h3><p>Device (with template), hours, count. Spot the over- and under-used gear.</p></div>
       <div class="gcard" style="cursor:default;"><span class="num">03</span><h3>By Group (cost center)</h3><p>User-group hours. People in several groups count against each; ungrouped land in <code>Ungrouped</code>.</p></div>
       <div class="gcard" style="cursor:default;"><span class="num">04</span><h3>By Topology Type</h3><p><span class="badge physical">PHYSICAL</span> vs <span class="badge cloud">CLOUD</span> split of hours and count.</p></div>
-      <div class="gcard" style="cursor:default;grid-column:span 2;"><span class="num">05</span><h3>By Template</h3><p>Template name, hours, count. Devices deleted since their booking show up under template <code>Unknown</code> &mdash; expected, not a bug.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">05</span><h3>By Template</h3><p>Template name, hours, count. Devices deleted since their booking show up under template <code>Unknown</code> &mdash; expected, not a bug.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">06</span><h3>Fleet Utilization</h3><p>Per-device utilization rate over the whole window, idle-device view, and fleet-wide summary. The denominator is always the full window; a box down for maintenance shows a low rate with its current status next to it.</p></div>
     </div>
 
     <h2 class="sec" id="csv">For the spreadsheet</h2>
