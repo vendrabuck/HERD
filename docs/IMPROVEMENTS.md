@@ -67,11 +67,12 @@ endpoints.
   `POST /cabling/pathfind/batch` now builds the graph once and answers all pairs
   (capped at 2000 per request) in memory, and `usePathfindPairs` sends one request, so
   both UI paths collapsed O(pairs) graph builds to one.
-- **Per-device hydration fan-out ([#250](https://github.com/vendrabuck/HERD/issues/250)).**
-  The topology editor fetches each canvas device with an individual
-  `GET /inventory/devices/{id}` on every open. A `POST /inventory/devices/batch` (one
-  `id.in_(...)` query, same visibility filter) replaces n round trips with one.
-  Fix-now-sized on the backend.
+- **Per-device hydration fan-out ([#250](https://github.com/vendrabuck/HERD/issues/250), landed).**
+  The topology editor used to fetch each canvas device with an individual
+  `GET /inventory/devices/{id}` on every open. `POST /inventory/devices/batch` (one
+  `id.in_(...)` query, capped at 500 ids, with the same visibility filtering and
+  password redaction as the existing device reads) now replaces n round trips with
+  one; the editor's hydration calls it.
 
 Deferred-but-known: fleet-scale health-poll tiering
 ([#24](https://github.com/vendrabuck/HERD/issues/24)) remains the roadmap item for the

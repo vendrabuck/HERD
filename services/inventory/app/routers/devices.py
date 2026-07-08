@@ -3,7 +3,7 @@ import os
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,7 @@ from app.services.inventory_service import (
     delete_device,
     delete_dynamic_instance_device,
     get_device,
+    get_devices_by_ids,
     list_devices,
     set_device_status,
     update_device,
@@ -102,6 +103,24 @@ class ResolveByNameResponse(BaseModel):
 class HealthConfigEntry(BaseModel):
     device_id: uuid.UUID
     resolved_interval_seconds: int
+
+
+# Cap on ids per batch-fetch request. Matches the list endpoint's max page size
+# (limit le=500); the request validator rejects a longer raw list with 422
+# before deduplication, so the bound is deterministic for callers.
+DEVICE_BATCH_MAX_IDS = 500
+
+
+class DeviceBatchRequest(BaseModel):
+    device_ids: list[uuid.UUID] = Field(max_length=DEVICE_BATCH_MAX_IDS)
+
+
+class DeviceBatchResponse(BaseModel):
+    # Devices the caller may see, in no guaranteed order. Requested ids that do
+    # not exist or fall outside the caller's visibility are omitted (never a
+    # per-batch 403/404), so a batch response leaks no existence information a
+    # sequence of single GETs would not.
+    items: list[DeviceResponse]
 
 
 def _device_to_response(
@@ -320,6 +339,63 @@ async def resolve_devices_by_name(
         return ResolveByNameResponse(resolved={})
     rows = (await db.execute(select(Device).where(Device.name.in_(names)))).unique().scalars().all()
     return ResolveByNameResponse(resolved={d.name: d.id for d in rows})
+
+
+@router.post("/devices/batch", response_model=DeviceBatchResponse)
+async def get_devices_batch(
+    body: DeviceBatchRequest,
+    authorization: str | None = Header(None),
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Fetch many devices by id in one round-trip (issue #250).
+
+    Replaces the frontend's per-device GET fan-out when hydrating a topology
+    canvas. Ids are deduplicated; requested ids that do not exist, or that a
+    non-admin cannot see through their group assignments, are OMITTED from the
+    response rather than failing the whole batch, mirroring how the per-id GET
+    route's 404 was treated by callers. Non-admin visibility uses the same
+    group-resolved id set as GET /devices and GET /devices/{id} (fail-closed:
+    401 on a malformed token subject, 503 propagated on an auth-service
+    outage), and password-typed field values are redacted exactly as on those
+    routes. Unlike the list route, no dut_only filter is forced: this endpoint
+    resolves explicit ids (like the single GET it replaces), so a granted
+    infrastructure switch on a canvas still hydrates for a non-admin.
+    """
+    ids = list(dict.fromkeys(body.device_ids))
+    if not ids:
+        return DeviceBatchResponse(items=[])
+
+    role = payload.get("role", "user")
+    is_admin = role in ("admin", "superadmin")
+    if not is_admin:
+        # Fail closed: a malformed token subject is an auth error, not a reason
+        # to fall through to fetching every requested device.
+        try:
+            user_id = uuid.UUID(payload["sub"])
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=401, detail="invalid token subject") from exc
+        visible_ids = await _resolve_visible_device_ids(db, user_id, authorization)
+        ids = [i for i in ids if i in visible_ids]
+        if not ids:
+            return DeviceBatchResponse(items=[])
+
+    devices = await get_devices_by_ids(db, ids)
+
+    if is_admin:
+        return DeviceBatchResponse(items=[_device_to_response(d) for d in devices])
+    # Redact password-typed field values for non-admins, resolving each
+    # template's password-key set once per template_id (same pattern as the
+    # list route; the template is eager-loaded so this adds no queries).
+    pw_key_cache: dict[uuid.UUID, set[str]] = {}
+    items = []
+    for d in devices:
+        keys = pw_key_cache.get(d.template_id)
+        if keys is None:
+            keys = _password_field_keys(d.template)
+            pw_key_cache[d.template_id] = keys
+        items.append(_device_to_response(d, redact_passwords=True, password_keys=keys))
+    return DeviceBatchResponse(items=items)
 
 
 @router.get("/devices/{device_id}", response_model=DeviceResponse)

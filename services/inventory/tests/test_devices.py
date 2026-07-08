@@ -1571,6 +1571,163 @@ async def test_internal_get_device_returns_password_fields_unmasked(client):
     assert fd["enable_secret"] == "en@ble"
 
 
+# --- POST /devices/batch (issue #250) ---
+
+
+@pytest.mark.asyncio
+async def test_batch_admin_gets_all_requested_and_unknown_ids_omitted(client):
+    """Admin batch fetch returns every existing requested device; ids with no
+    device row are silently omitted, never a 404 for the whole batch."""
+    tid = await _create_template(client)
+    d1 = (await client.post("/devices", json=_device_payload(tid))).json()
+    d2 = (await client.post("/devices", json={**_device_payload(tid), "name": "FW-02"})).json()
+    unknown = str(uuid.uuid4())
+
+    resp = await client.post("/devices/batch", json={"device_ids": [d1["id"], d2["id"], unknown]})
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert {i["id"] for i in items} == {d1["id"], d2["id"]}
+    # Full DeviceResponse payloads travel, same shape as the single GET.
+    by_id = {i["id"]: i for i in items}
+    assert by_id[d1["id"]]["name"] == "FW-01"
+    assert by_id[d1["id"]]["template_name"] == "Firewall"
+
+
+@pytest.mark.asyncio
+async def test_batch_empty_list_returns_empty_items(client):
+    resp = await client.post("/devices/batch", json={"device_ids": []})
+    assert resp.status_code == 200
+    assert resp.json() == {"items": []}
+
+
+@pytest.mark.asyncio
+async def test_batch_over_cap_returns_422(client):
+    ids = [str(uuid.uuid4()) for _ in range(501)]
+    resp = await client.post("/devices/batch", json={"device_ids": ids})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_batch_at_cap_accepted(client):
+    """Exactly 500 ids is within the cap (boundary pin for the 422 threshold)."""
+    ids = [str(uuid.uuid4()) for _ in range(500)]
+    resp = await client.post("/devices/batch", json={"device_ids": ids})
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_batch_dedupes_repeated_ids(client):
+    tid = await _create_template(client)
+    d1 = (await client.post("/devices", json=_device_payload(tid))).json()
+
+    resp = await client.post("/devices/batch", json={"device_ids": [d1["id"], d1["id"], d1["id"]]})
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == d1["id"]
+
+
+@pytest.mark.asyncio
+async def test_batch_non_admin_gets_only_visible_with_passwords_redacted(client):
+    """A non-admin batch returns only devices in their visibility set, the
+    invisible id is omitted (not 403/404), and password-typed field values are
+    masked while non-password fields pass through."""
+    tid = await _create_password_template(client)
+    visible = (await client.post("/devices", json=_password_device_payload(tid))).json()
+    hidden = (await client.post("/devices", json=_password_device_payload(tid))).json()
+
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.devices._resolve_visible_device_ids",
+        new=AsyncMock(return_value={uuid.UUID(visible["id"])}),
+    ):
+        resp = await client.post(
+            "/devices/batch", json={"device_ids": [visible["id"], hidden["id"]]}
+        )
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert [i["id"] for i in items] == [visible["id"]]
+    fd = items[0]["field_data"]
+    assert fd["password"] == "********"
+    assert fd["enable_secret"] == "********"
+    assert fd["ip"] == "10.0.0.1"
+    assert fd["login"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_batch_non_admin_with_no_visible_ids_returns_empty(client):
+    tid = await _create_template(client)
+    d1 = (await client.post("/devices", json=_device_payload(tid))).json()
+
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.devices._resolve_visible_device_ids",
+        new=AsyncMock(return_value=set()),
+    ):
+        resp = await client.post("/devices/batch", json={"device_ids": [d1["id"]]})
+    assert resp.status_code == 200
+    assert resp.json() == {"items": []}
+
+
+@pytest.mark.asyncio
+async def test_batch_fails_closed_on_auth_outage(client):
+    """Auth service down during visibility resolution: 503 propagates, the
+    batch never falls open to returning every requested device."""
+    from fastapi import HTTPException
+
+    tid = await _create_template(client)
+    d1 = (await client.post("/devices", json=_device_payload(tid))).json()
+
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.devices._resolve_visible_device_ids",
+        new=AsyncMock(side_effect=HTTPException(status_code=503, detail="auth down")),
+    ):
+        resp = await client.post("/devices/batch", json={"device_ids": [d1["id"]]})
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_batch_malformed_token_subject_returns_401(client):
+    """A non-admin token with a non-UUID sub fails closed with 401."""
+    tid = await _create_template(client)
+    d1 = (await client.post("/devices", json=_device_payload(tid))).json()
+
+    app.dependency_overrides[get_current_user_payload] = lambda: {
+        "sub": "not-a-uuid",
+        "username": "broken",
+        "role": "user",
+    }
+    resp = await client.post("/devices/batch", json={"device_ids": [d1["id"]]})
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "invalid token subject"
+
+
+@pytest.mark.asyncio
+async def test_batch_admin_passwords_not_redacted(client):
+    """Admins keep real password values on the batch route, matching the list
+    and single-GET policy (the edit form pre-fills field_data)."""
+    tid = await _create_password_template(client)
+    d1 = (await client.post("/devices", json=_password_device_payload(tid))).json()
+
+    resp = await client.post("/devices/batch", json={"device_ids": [d1["id"]]})
+    assert resp.status_code == 200
+    fd = resp.json()["items"][0]["field_data"]
+    assert fd["password"] == "s3cr3t-pw"
+    assert fd["enable_secret"] == "en@ble"
+
+
+@pytest.mark.asyncio
+async def test_batch_invalid_token_returns_401(no_auth_client):
+    resp = await no_auth_client.post(
+        "/devices/batch",
+        json={"device_ids": [str(uuid.uuid4())]},
+        headers={"Authorization": "Bearer garbage"},
+    )
+    assert resp.status_code == 401
+
+
 @pytest.mark.asyncio
 async def test_non_admin_empty_password_value_not_falsely_masked(client):
     """An unset/empty password value is left as-is so a redacted read never
