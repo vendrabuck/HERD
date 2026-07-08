@@ -54,8 +54,9 @@ The images below are design-system mockups rendered from the HERD UI kit, not ca
 - Reservation detail view with device inventory, hop-by-hop route visualization, schedule editing, and live device list modification
 - Automatic reservation expiration: pending reservations activate, active reservations complete on schedule
 - Gantt-style reservation calendar with day, week, and month views
-- Utilization reporting dashboard (by user, device, topology type, day, and group) with CSV export
+- Utilization reporting dashboard (by user, device, topology type, day, and group) with CSV export, plus a fleet utilization section: per-device utilization rate against the full window, idle-device view, and fleet-wide summary
 - AI-assisted topology generation (feature-gated by a configured LLM provider; ships with Anthropic and OpenAI-compatible backends, the latter covers vLLM, Ollama, LM Studio, OpenAI, and Azure OpenAI): natural-language prompts + optional file attachments propose a topology rendered as ghost nodes with Accept/Modify/Reject human-in-the-loop review
+- AI-assisted recipe authoring (dark by default behind `AI_RECIPE_AUTHORING_ENABLED`): an admin describes a dynamic-resource recipe in plain language, the AI drafts the driver package, the execution sandbox validates it (structure, policy, simulated dry-run) with bounded auto-repair, and a review panel gates the explicit admin approval that uploads it (see [docs/AI_RECIPES.md](docs/AI_RECIPES.md))
 - Device group visibility controls: non-admin users only see devices in their assigned groups
 - Local or LDAP/Active Directory authentication (pluggable via `AUTH_METHOD`); LDAP users JIT-provision in HERD on first bind
 - Per-user preferences (saved filters, page sizes, notification settings) with a Settings page under the user menu
@@ -82,7 +83,7 @@ over NATS JetStream.
 | Cabling | Connections, topology persistence, pathfinding |
 | ACL | Resource-level grants (topology, reservation) |
 | Execution | Driver execution sandbox, NATS event consumer (DLQ) |
-| AI Orchestrator | LLM-driven topology generation (configurable: Anthropic or OpenAI-compatible) |
+| AI Orchestrator | LLM-driven topology generation, reservation assistant, and recipe drafting (configurable: Anthropic or OpenAI-compatible) |
 | User Profile | Per-user preferences (saved filters, page sizes, extras) |
 | Notifications | NATS consumer + in-app notifications + per-user prefs |
 | Integration | Versioned `/api/v1` reservation facade + outbound webhooks (NATS consumer) |

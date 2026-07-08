@@ -19,7 +19,7 @@ PostgreSQL 16 (a schema per service, no cross-schema joins) and NATS JetStream f
 | cabling | Connections, topology persistence, pathfinding |
 | acl | Resource-level grants (topology, reservation) |
 | execution | Driver execution subprocess, NATS consumer (DLQ) |
-| ai-orchestrator | LLM-driven topology generation (feature-gated) |
+| ai-orchestrator | LLM topology generation, reservation assistant, recipe drafting (feature-gated) |
 | user-profile | Per-user preferences (saved filters, page sizes, extras) |
 | notifications | NATS consumer + in-app notifications + prefs proxy |
 | integration | Versioned `/api/v1` reservation facade + outbound webhooks (NATS consumer) |
