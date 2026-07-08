@@ -456,8 +456,9 @@ async def run_driver_action(
     # Execute in sandbox. The sandbox blocks on subprocess.run, so it runs in
     # a worker thread: otherwise a slow driver would stall the event loop,
     # and the health scheduler's bounded-concurrency polls (issue #24) could
-    # never actually overlap. The semaphore in run_tick, not the thread pool,
-    # is what bounds live driver subprocesses.
+    # never actually overlap. The run_tick semaphore bounds the scheduler's
+    # polls; other callers of this function (manual executions, provisioning)
+    # are bounded only by the shared default thread pool.
     started_at = datetime.now(timezone.utc)
     run = await update_execution_run(db, run, status="RUNNING", started_at=started_at)
 

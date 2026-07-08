@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,41 @@ SYSTEM_POLL_USER_ID = uuid.UUID(int=0)
 # forward by this much before firing. If the poll crashes, the row
 # becomes due again after the window expires.
 CLAIM_WINDOW = timedelta(minutes=5)
+
+
+def _default_executor_cap() -> int:
+    """asyncio's default ThreadPoolExecutor size on this host.
+
+    Mirrors the CPython formula (min(32, cpus + 4)). Polls run their driver
+    subprocesses via asyncio.to_thread on that shared pool, so a configured
+    health_poll_max_concurrency above this cap cannot actually run in
+    parallel; run_health_scheduler_loop warns at startup when it is exceeded.
+    """
+    return min(32, (os.cpu_count() or 1) + 4)
+
+
+def _warn_if_concurrency_exceeds_pool() -> None:
+    """Startup guard for the over-admission foot-gun (issue #24 QA).
+
+    Polls run their driver subprocesses through asyncio.to_thread, which
+    shares the default executor with every other to_thread caller in the
+    service. Admitting more polls than the pool can run leaves the excess
+    claimed-but-queued; a poll starved past the CLAIM_WINDOW gets re-claimed
+    by a peer replica and double-polled, defeating the bound the setting
+    exists to provide.
+    """
+    executor_cap = _default_executor_cap()
+    if settings.health_poll_max_concurrency > executor_cap:
+        logger.warning(
+            "health_poll_max_concurrency=%s exceeds the default thread pool "
+            "(%s workers on this host); polls above the pool size will queue "
+            "while claimed. Keep the setting at or below %s, or scale poller "
+            "replicas instead.",
+            settings.health_poll_max_concurrency,
+            executor_cap,
+            executor_cap,
+        )
+
 
 # Polling tiers (issue #24). A device moves to IN_USE on reservation
 # created/updated and back to IDLE on completed/cancelled/failed, driven
@@ -272,13 +308,17 @@ async def apply_tier_transition(session_factory, device_ids, tier: str) -> None:
     """Move a set of devices to a polling tier, persisted on their status rows.
 
     Moving to in-use with a configured in-use interval also pulls next_poll_at
-    earlier (never later) so the faster cadence starts now rather than after
-    the current idle interval elapses. Moving to idle never touches
-    next_poll_at: the slower cadence takes effect when the next poll
-    reschedules. A device with no status row yet (reserved before its first
-    registry seed) gets one inserted for the in-use transition so it does not
-    idle through the whole reservation; for idle there is nothing to record
-    since idle is the column default.
+    earlier (never later) so the faster cadence starts promptly rather than
+    after the current idle interval elapses. A poll already in flight when the
+    transition commits reschedules unconditionally on completion, so the
+    shortening can be clobbered for that one cycle; the next poll resolves the
+    in-use interval, so the cadence converges within one poll. Moving to idle
+    never touches next_poll_at: the slower cadence takes effect when the next
+    poll reschedules. A device with no status row yet (reserved before its
+    first registry seed) gets one inserted for the in-use transition; its
+    first poll still waits for the device to appear in the polling registry
+    (up to health_poll_registry_refresh_seconds), but it enters that first
+    poll already on the in-use tier.
 
     `session_factory` accepts either an async_sessionmaker or the NATS
     consumer's get_db_session convention; both yield a session via
@@ -323,7 +363,19 @@ async def apply_tier_transition(session_factory, device_ids, tier: str) -> None:
                 db.add(DeviceHealthStatus(device_id=did, next_poll_at=now, poll_tier=tier))
                 await db.commit()
             except IntegrityError:
+                # The registry seeder inserted this row (idle, its default)
+                # between our UPDATE and this INSERT. Losing the insert race
+                # must not lose the tier, or the device idles through its
+                # whole reservation: re-apply the tier UPDATE now that the
+                # row exists.
                 await db.rollback()
+                await db.execute(
+                    update(DeviceHealthStatus)
+                    .where(DeviceHealthStatus.device_id == did)
+                    .values(**values)
+                    .execution_options(synchronize_session=False)
+                )
+                await db.commit()
 
 
 async def apply_reservation_event_tiers(session_factory, event_type: str, event_data: dict) -> None:
@@ -576,8 +628,15 @@ async def run_tick(
     stats = {"rows_due": 0, "rows_claimed": 0, "polls_fired": 0, "polls_deferred": 0}
     to_fire: list[tuple[uuid.UUID, int]] = []
     async with session_factory() as db:
-        stats["rows_due"] = await _due_count(db, now)
         due = await _due_rows(db, now)
+        # rows_due stays exact either way: a partial batch means the LIMIT did
+        # not bind, so len(due) IS the total; only a full batch needs the
+        # unbounded COUNT, so a backed-up fleet is visible without paying an
+        # O(backlog) count on every healthy tick.
+        if len(due) < settings.health_poll_batch_size:
+            stats["rows_due"] = len(due)
+        else:
+            stats["rows_due"] = await _due_count(db, now)
         for row in due:
             interval = _registry.get(row.device_id)
             if interval is None:
@@ -651,6 +710,7 @@ async def run_health_scheduler_loop(
         settings.health_poll_batch_size,
         settings.health_poll_max_concurrency,
     )
+    _warn_if_concurrency_exceeds_pool()
     while True:
         tick_failed = False
         try:

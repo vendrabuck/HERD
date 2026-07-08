@@ -14,6 +14,7 @@ import logging
 import os
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -232,7 +233,11 @@ async def test_sequential_ticks_do_not_double_poll(monkeypatch):
 @pytest.mark.asyncio
 async def test_concurrent_ticks_claim_each_row_exactly_once(monkeypatch):
     """Two poller instances against one schema: the conditional-update claim
-    arbitrates, so every device fires exactly once across both ticks."""
+    arbitrates, so every device fires exactly once across both ticks.
+
+    Scope note: SQLite ignores FOR UPDATE SKIP LOCKED, so this pins the
+    conditional-UPDATE guard (the correctness guarantee) only; the SKIP
+    LOCKED fast path is exercised on the live Postgres stack."""
     now = datetime.now(timezone.utc)
     ids = {await _seed_row(next_poll_at=now - timedelta(seconds=10)) for _ in range(3)}
 
@@ -596,3 +601,129 @@ def test_mount_api_routers_poller_only_mounts_nothing(monkeypatch):
     baseline = len(app.routes)
     assert main_module.mount_api_routers(app) is False
     assert len(app.routes) == baseline
+
+
+# --- QA-pass regressions (post-review hardening) ---
+
+
+@pytest.mark.asyncio
+async def test_in_use_transition_survives_seeder_insert_race():
+    """The registry seeder inserting the row between the tier UPDATE and the
+    missing-row INSERT must not cost the device its in-use tier: the handler
+    re-applies the tier UPDATE against the row that won the insert race,
+    instead of swallowing the conflict and leaving the device idle for the
+    whole reservation."""
+    device_id = uuid.uuid4()
+    commits = {"n": 0}
+
+    @asynccontextmanager
+    async def racing_factory():
+        async with TestSessionLocal() as db:
+            real_commit = db.commit
+
+            async def commit():
+                commits["n"] += 1
+                if commits["n"] == 2:
+                    # Commit 1 is the bulk tier UPDATE; commit 2 is the
+                    # missing-row INSERT. The seeder's idle row lands here,
+                    # after the existence SELECT saw nothing, so the INSERT
+                    # hits a real primary-key conflict.
+                    async with TestSessionLocal() as other:
+                        other.add(
+                            DeviceHealthStatus(
+                                device_id=device_id,
+                                next_poll_at=datetime.now(timezone.utc),
+                                poll_tier=TIER_IDLE,
+                            )
+                        )
+                        await other.commit()
+                await real_commit()
+
+            db.commit = commit
+            yield db
+
+    await apply_tier_transition(racing_factory, [str(device_id)], TIER_IN_USE)
+
+    row = await _get_row(device_id)
+    assert row is not None
+    assert row.poll_tier == TIER_IN_USE
+    # Three commits: UPDATE, failed INSERT, re-applied UPDATE.
+    assert commits["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_reservation_event_redelivery_is_idempotent(monkeypatch):
+    """A redelivered lifecycle event re-applies the same tier and does not
+    move an already-shortened schedule (the CASE only ever pulls earlier)."""
+    monkeypatch.setattr(health_scheduler.settings, "health_poll_in_use_interval_seconds", 60)
+    now = datetime.now(timezone.utc)
+    device_id = await _seed_row(next_poll_at=now + timedelta(hours=1))
+    event = {"device_ids": [str(device_id)]}
+
+    await apply_reservation_event_tiers(TestSessionLocal, "reservation.created", event)
+    first = await _get_row(device_id)
+    first_next = _as_utc(first.next_poll_at)
+    assert first.poll_tier == TIER_IN_USE
+
+    await apply_reservation_event_tiers(TestSessionLocal, "reservation.created", event)
+    second = await _get_row(device_id)
+    assert second.poll_tier == TIER_IN_USE
+    assert abs((_as_utc(second.next_poll_at) - first_next).total_seconds()) < 1
+
+
+@pytest.mark.asyncio
+async def test_rows_due_skips_count_when_batch_not_full(monkeypatch):
+    """A partial batch means the LIMIT did not bind, so len(due) is already
+    the exact total and the O(backlog) COUNT query is skipped entirely."""
+    monkeypatch.setattr(health_scheduler.settings, "health_poll_batch_size", 5)
+    now = datetime.now(timezone.utc)
+    for _ in range(2):
+        await _seed_row(next_poll_at=now - timedelta(seconds=10))
+
+    calls = {"n": 0}
+    real_count = health_scheduler._due_count
+
+    async def counting(db, ts):
+        calls["n"] += 1
+        return await real_count(db, ts)
+
+    monkeypatch.setattr(health_scheduler, "_due_count", counting)
+    monkeypatch.setattr(health_scheduler, "fire_poll", AsyncMock())
+    stats = await run_tick(TestSessionLocal, client=None)
+
+    assert stats["rows_due"] == 2
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rows_due_counts_backlog_when_batch_full(monkeypatch):
+    """A full batch may hide backlog, so the unbounded COUNT runs and
+    rows_due reports the true total, not the batch size."""
+    monkeypatch.setattr(health_scheduler.settings, "health_poll_batch_size", 2)
+    now = datetime.now(timezone.utc)
+    for _ in range(3):
+        await _seed_row(next_poll_at=now - timedelta(seconds=10))
+
+    monkeypatch.setattr(health_scheduler, "fire_poll", AsyncMock())
+    stats = await run_tick(TestSessionLocal, client=None)
+
+    assert stats["rows_due"] == 3
+    assert stats["polls_fired"] == 2
+
+
+def test_concurrency_over_thread_pool_warns(monkeypatch, caplog):
+    """max_concurrency above the shared default executor cannot actually run
+    in parallel; the scheduler must call the foot-gun out at startup."""
+    cap = health_scheduler._default_executor_cap()
+    monkeypatch.setattr(health_scheduler.settings, "health_poll_max_concurrency", cap + 1)
+    with caplog.at_level(logging.WARNING, logger="app.services.health_scheduler"):
+        health_scheduler._warn_if_concurrency_exceeds_pool()
+    assert any("health_poll_max_concurrency" in r.getMessage() for r in caplog.records)
+
+
+def test_concurrency_at_pool_size_does_not_warn(monkeypatch, caplog):
+    cap = health_scheduler._default_executor_cap()
+    monkeypatch.setattr(health_scheduler.settings, "health_poll_max_concurrency", cap)
+    with caplog.at_level(logging.WARNING, logger="app.services.health_scheduler"):
+        health_scheduler._warn_if_concurrency_exceeds_pool()
+    assert not caplog.records
