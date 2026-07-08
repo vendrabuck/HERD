@@ -15,7 +15,18 @@ Race safety mirrors `inventory.apply_scheduler`:
 SELECT ... FOR UPDATE SKIP LOCKED to fetch due rows, then a
 conditional UPDATE that pushes next_poll_at forward by a five-minute
 "claim window" before firing. If the poll crashes mid-flight, the
-window expires and the row becomes due again.
+window expires and the row becomes due again. The claim doubles as the
+multi-replica guard (issue #24): concurrent pollers against one schema
+each win a disjoint set of rows, so poller replicas scale horizontally.
+
+Fleet-scale bounds (issue #24): each tick claims at most
+`health_poll_batch_size` due rows and runs at most
+`health_poll_max_concurrency` polls (driver subprocesses) at once.
+Devices carry a persisted polling tier ("idle" or "in_use") flipped by
+the reservation lifecycle events the NATS consumer already processes;
+`health_poll_in_use_interval_seconds` / `health_poll_idle_interval_seconds`
+override the registry-resolved interval per tier, with 0 (the default)
+meaning no override.
 
 This module never raises out of the loop; a poll that crashes is
 logged and the row resweeps on the next tick.
@@ -31,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from herd_common.outbox import enqueue_event
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -57,6 +68,22 @@ SYSTEM_POLL_USER_ID = uuid.UUID(int=0)
 # forward by this much before firing. If the poll crashes, the row
 # becomes due again after the window expires.
 CLAIM_WINDOW = timedelta(minutes=5)
+
+# Polling tiers (issue #24). A device moves to IN_USE on reservation
+# created/updated and back to IDLE on completed/cancelled/failed, driven
+# by the reservation lifecycle events this service already consumes.
+TIER_IDLE = "idle"
+TIER_IN_USE = "in_use"
+
+# Which consumed reservation events flip a reservation's devices to which
+# tier. reservation.updated is handled separately (post-edit device set to
+# in-use, removed devices to idle), so it appears in neither set.
+TIER_IN_USE_EVENTS = {"reservation.created"}
+TIER_IDLE_EVENTS = {
+    "reservation.completed",
+    "reservation.cancelled",
+    "reservation.failed",
+}
 
 
 # --- Registry: which devices to poll ---
@@ -168,13 +195,19 @@ async def _seed_missing_status_rows(
 # --- Tick: pick due rows, claim, fire ---
 
 
-async def _due_rows(db: AsyncSession, now: datetime, limit: int = 10) -> list[DeviceHealthStatus]:
+async def _due_rows(
+    db: AsyncSession, now: datetime, limit: int | None = None
+) -> list[DeviceHealthStatus]:
     """SELECT ... FOR UPDATE SKIP LOCKED for due polling rows.
 
     Same pattern as inventory.apply_scheduler._due_jobs. SQLite ignores
     FOR UPDATE; the conditional UPDATE in _claim_row is the actual
-    race-safety guard.
+    race-safety guard. The LIMIT (health_poll_batch_size, issue #24) bounds
+    how many rows one tick even considers; rows past it stay due for later
+    ticks or for another poller replica.
     """
+    if limit is None:
+        limit = settings.health_poll_batch_size
     rows = await db.execute(
         select(DeviceHealthStatus)
         .where(DeviceHealthStatus.next_poll_at <= now)
@@ -183,6 +216,16 @@ async def _due_rows(db: AsyncSession, now: datetime, limit: int = 10) -> list[De
         .with_for_update(skip_locked=True)
     )
     return list(rows.scalars().all())
+
+
+async def _due_count(db: AsyncSession, now: datetime) -> int:
+    """Total due rows, unbounded by the batch limit (tick observability)."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(DeviceHealthStatus)
+        .where(DeviceHealthStatus.next_poll_at <= now)
+    )
+    return int(result.scalar() or 0)
 
 
 async def _claim_row(db: AsyncSession, device_id: uuid.UUID, now: datetime) -> bool:
@@ -205,6 +248,103 @@ async def _claim_row(db: AsyncSession, device_id: uuid.UUID, now: datetime) -> b
     )
     await db.commit()
     return (result.rowcount or 0) > 0
+
+
+# --- Tiered intervals (issue #24) ---
+
+
+def _effective_interval(registry_interval: int, tier: str | None) -> int:
+    """Resolve the poll interval for a device given its tier.
+
+    A tier override of 0 (the default) means "no override": the
+    registry-resolved interval (device or template poll_interval_seconds)
+    applies unchanged, which is exactly the pre-tier behavior. An unknown or
+    NULL tier is treated as idle, matching the column default.
+    """
+    if tier == TIER_IN_USE and settings.health_poll_in_use_interval_seconds > 0:
+        return settings.health_poll_in_use_interval_seconds
+    if tier != TIER_IN_USE and settings.health_poll_idle_interval_seconds > 0:
+        return settings.health_poll_idle_interval_seconds
+    return registry_interval
+
+
+async def apply_tier_transition(session_factory, device_ids, tier: str) -> None:
+    """Move a set of devices to a polling tier, persisted on their status rows.
+
+    Moving to in-use with a configured in-use interval also pulls next_poll_at
+    earlier (never later) so the faster cadence starts now rather than after
+    the current idle interval elapses. Moving to idle never touches
+    next_poll_at: the slower cadence takes effect when the next poll
+    reschedules. A device with no status row yet (reserved before its first
+    registry seed) gets one inserted for the in-use transition so it does not
+    idle through the whole reservation; for idle there is nothing to record
+    since idle is the column default.
+
+    `session_factory` accepts either an async_sessionmaker or the NATS
+    consumer's get_db_session convention; both yield a session via
+    `async with session_factory() as db`.
+    """
+    if not device_ids:
+        return
+    ids: list[uuid.UUID] = []
+    for did in device_ids:
+        try:
+            ids.append(uuid.UUID(str(did)))
+        except (ValueError, TypeError):
+            continue
+    if not ids:
+        return
+    now = datetime.now(timezone.utc)
+    values: dict = {"poll_tier": tier}
+    if tier == TIER_IN_USE and settings.health_poll_in_use_interval_seconds > 0:
+        target = now + timedelta(seconds=settings.health_poll_in_use_interval_seconds)
+        values["next_poll_at"] = case(
+            (DeviceHealthStatus.next_poll_at > target, target),
+            else_=DeviceHealthStatus.next_poll_at,
+        )
+    async with session_factory() as db:
+        await db.execute(
+            update(DeviceHealthStatus)
+            .where(DeviceHealthStatus.device_id.in_(ids))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        if tier != TIER_IN_USE:
+            return
+        existing = await db.execute(
+            select(DeviceHealthStatus.device_id).where(DeviceHealthStatus.device_id.in_(ids))
+        )
+        have = set(existing.scalars().all())
+        for did in ids:
+            if did in have:
+                continue
+            try:
+                db.add(DeviceHealthStatus(device_id=did, next_poll_at=now, poll_tier=tier))
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+
+
+async def apply_reservation_event_tiers(session_factory, event_type: str, event_data: dict) -> None:
+    """Map one consumed reservation lifecycle event onto tier transitions.
+
+    created moves the reservation's devices to in-use; completed, cancelled,
+    and failed move them back to idle (conflict detection guarantees a device
+    is in at most one active reservation, so idling the whole set is safe).
+    updated moves the post-edit device set to in-use and the removed devices
+    to idle. Every transition is an absolute UPDATE, so a redelivered event
+    re-applies the same tier idempotently.
+    """
+    if event_type == "reservation.updated":
+        await apply_tier_transition(session_factory, event_data.get("device_ids", []), TIER_IN_USE)
+        await apply_tier_transition(
+            session_factory, event_data.get("removed_device_ids", []), TIER_IDLE
+        )
+    elif event_type in TIER_IN_USE_EVENTS:
+        await apply_tier_transition(session_factory, event_data.get("device_ids", []), TIER_IN_USE)
+    elif event_type in TIER_IDLE_EVENTS:
+        await apply_tier_transition(session_factory, event_data.get("device_ids", []), TIER_IDLE)
 
 
 def _next_poll_at(
@@ -404,7 +544,85 @@ async def fire_poll(
     )
 
 
-# --- Loop ---
+# --- Tick and loop ---
+
+
+async def run_tick(
+    session_factory: async_sessionmaker[AsyncSession],
+    client: httpx.AsyncClient | None,
+    nc=None,
+) -> dict:
+    """One scheduler tick: refresh registry if due, claim, fire, report.
+
+    At most `health_poll_batch_size` due rows are considered and at most
+    `health_poll_max_concurrency` polls run at once (issue #24). The claim is
+    taken only AFTER the semaphore is acquired, so a row never sits claimed
+    while waiting for a slot: the five-minute CLAIM_WINDOW only has to outlive
+    one in-flight poll (bounded by the per-action driver timeouts, well under
+    the window), and a peer poller replica that claims a still-waiting row
+    simply wins the conditional update and this replica skips it. The tick
+    awaits every poll before returning, so a single replica never overlaps
+    its own ticks.
+
+    Returns the tick stats that are also emitted as the `health_tick`
+    structured log: rows_due (total due, unbounded by the batch),
+    rows_claimed, polls_fired, and polls_deferred (polls that found the
+    semaphore full and had to wait).
+    """
+    now = datetime.now(timezone.utc)
+    async with session_factory() as db:
+        await _refresh_registry_if_due(client, now, db)
+
+    stats = {"rows_due": 0, "rows_claimed": 0, "polls_fired": 0, "polls_deferred": 0}
+    to_fire: list[tuple[uuid.UUID, int]] = []
+    async with session_factory() as db:
+        stats["rows_due"] = await _due_count(db, now)
+        due = await _due_rows(db, now)
+        for row in due:
+            interval = _registry.get(row.device_id)
+            if interval is None:
+                # Device dropped from registry; don't poll it. Push
+                # next_poll_at far enough out that the row doesn't
+                # reappear every tick.
+                row.next_poll_at = now + timedelta(
+                    seconds=settings.health_poll_registry_refresh_seconds
+                )
+                await db.commit()
+                continue
+            to_fire.append((row.device_id, _effective_interval(interval, row.poll_tier)))
+
+    sem = asyncio.Semaphore(max(1, settings.health_poll_max_concurrency))
+
+    async def _claim_and_fire(device_id: uuid.UUID, interval: int) -> None:
+        if sem.locked():
+            stats["polls_deferred"] += 1
+        async with sem:
+            async with session_factory() as db:
+                claimed = await _claim_row(db, device_id, now)
+            if not claimed:
+                return
+            stats["rows_claimed"] += 1
+            stats["polls_fired"] += 1
+            try:
+                await fire_poll(session_factory, device_id, interval, nc=nc)
+            except Exception:
+                logger.exception("fire_poll crashed for device %s", device_id)
+
+    if to_fire:
+        await asyncio.gather(*(_claim_and_fire(did, interval) for did, interval in to_fire))
+
+    log = logger.info if stats["rows_due"] else logger.debug
+    log(
+        "health_tick",
+        extra={
+            "action": "health_tick",
+            "rows_due": stats["rows_due"],
+            "rows_claimed": stats["rows_claimed"],
+            "polls_fired": stats["polls_fired"],
+            "polls_deferred": stats["polls_deferred"],
+        },
+    )
+    return stats
 
 
 async def run_health_scheduler_loop(
@@ -413,10 +631,11 @@ async def run_health_scheduler_loop(
 ) -> None:
     """Long-running poll loop. Cancellable via task.cancel().
 
-    Each tick refreshes the registry if due, then picks up to 10 due
-    rows and fires each one. Tick-level failures (e.g. DB unreachable)
-    back off exponentially up to a cap; a healthy tick resets to the
-    base interval.
+    Each tick refreshes the registry if due, then claims up to
+    `health_poll_batch_size` due rows and fires them under the
+    `health_poll_max_concurrency` semaphore (see run_tick). Tick-level
+    failures (e.g. DB unreachable) back off exponentially up to a cap; a
+    healthy tick resets to the base interval.
 
     `nc` is the NATS client used to publish health-transition events
     (iter 2). Pass None to disable publishing without changing the
@@ -426,37 +645,17 @@ async def run_health_scheduler_loop(
     max_backoff = max(base_interval * 10, 300)
     current_backoff = base_interval
     logger.info(
-        "health scheduler started; tick=%ss refresh=%ss",
+        "health scheduler started; tick=%ss refresh=%ss batch=%s concurrency=%s",
         base_interval,
         settings.health_poll_registry_refresh_seconds,
+        settings.health_poll_batch_size,
+        settings.health_poll_max_concurrency,
     )
     while True:
         tick_failed = False
         try:
-            now = datetime.now(timezone.utc)
             async with httpx.AsyncClient() as client:
-                async with session_factory() as db:
-                    await _refresh_registry_if_due(client, now, db)
-                async with session_factory() as db:
-                    due = await _due_rows(db, now)
-                    for row in due:
-                        device_id = row.device_id
-                        interval = _registry.get(device_id)
-                        if interval is None:
-                            # Device dropped from registry; don't poll it.
-                            # Push next_poll_at far enough out that the
-                            # row doesn't reappear every tick.
-                            row.next_poll_at = now + timedelta(
-                                seconds=settings.health_poll_registry_refresh_seconds
-                            )
-                            await db.commit()
-                            continue
-                        if not await _claim_row(db, device_id, now):
-                            continue
-                        try:
-                            await fire_poll(session_factory, device_id, interval, nc=nc)
-                        except Exception:
-                            logger.exception("fire_poll crashed for device %s", device_id)
+                await run_tick(session_factory, client, nc=nc)
         except asyncio.CancelledError:
             logger.info("health scheduler cancelled; exiting loop")
             raise

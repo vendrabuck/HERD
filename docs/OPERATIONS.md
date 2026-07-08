@@ -234,6 +234,7 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 
 - Postgres: single node by default. Horizontal scaling would require adding a pooler (PgBouncer) and replication; not in the default compose.
 - Services are stateless; scale by bumping `replicas` in compose and putting Traefik or another load balancer in front. Today they run 1x each.
+- Health polling scales horizontally (issue #24): run extra execution replicas with `EXECUTION_POLLER_ONLY=true` (background machinery only, no API routers) and set `HEALTH_POLL_SCHEDULER_ENABLED=false` on the API replicas for a clean split. Concurrent pollers against one schema are safe: due rows are claimed via `SELECT ... FOR UPDATE SKIP LOCKED` plus a conditional update, so two replicas never poll the same device. Bound each replica with `HEALTH_POLL_BATCH_SIZE` and `HEALTH_POLL_MAX_CONCURRENCY`, and watch the per-tick `health_tick` log (`rows_due` versus `polls_fired`) to decide when to add a replica.
 - NATS JetStream is a single node; message persistence is in the `nats` volume. For HA, cluster three NATS nodes.
 - Execution service's driver cache (`/data/driver-cache`) grows with driver churn; size the volume accordingly.
 

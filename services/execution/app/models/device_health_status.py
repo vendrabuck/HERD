@@ -32,6 +32,13 @@ class DeviceHealthStatus(Base):
         server_default=func.now(),
         index=True,
     )
+    # Polling tier (issue #24): "idle" or "in_use", flipped by consumed
+    # reservation lifecycle events. Persisted (not derived at poll time)
+    # because the events are acked exactly once and never replay, so an
+    # in-memory tier would be lost on a service restart.
+    poll_tier: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="idle", server_default="idle"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

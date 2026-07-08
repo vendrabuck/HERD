@@ -75,6 +75,28 @@ class Settings(BaseSettings):
     # silence alerts without rolling back the publisher code.
     health_poll_notify_enabled: bool = True
 
+    # Fleet-scale polling (issue #24). batch_size caps how many due rows one
+    # tick claims; max_concurrency caps how many driver polls (each a driver
+    # subprocess) are in flight at once within this replica. Defaults match the
+    # pre-#24 behavior exactly: 10 rows per tick, polls fired one at a time.
+    health_poll_batch_size: int = 10
+    health_poll_max_concurrency: int = 1
+
+    # Event-driven tier intervals (issue #24): a device under an active
+    # reservation polls on the in-use cadence, everything else on the idle
+    # cadence, driven by the consumed reservation lifecycle events. 0 disables
+    # the override so the registry-resolved interval (device or template
+    # poll_interval_seconds) applies; both default 0 to preserve the pre-tier
+    # cadence exactly.
+    health_poll_in_use_interval_seconds: int = 0
+    health_poll_idle_interval_seconds: int = 0
+
+    # Run-mode split (issue #24): a poller-only replica skips mounting the HTTP
+    # API routers at startup (only the bare /health liveness route remains) so
+    # the same image can run a horizontally scaled poller fleet next to API
+    # replicas (which set health_poll_scheduler_enabled=false).
+    execution_poller_only: bool = False
+
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "case_sensitive": False}
