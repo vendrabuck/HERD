@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import uuid
@@ -452,12 +453,18 @@ async def run_driver_action(
     # Fetch the driver's metadata for the dry-run gate (cheap: cached row read).
     driver_metadata = await get_driver_metadata(db, driver_id)
 
-    # Execute in sandbox
+    # Execute in sandbox. The sandbox blocks on subprocess.run, so it runs in
+    # a worker thread: otherwise a slow driver would stall the event loop,
+    # and the health scheduler's bounded-concurrency polls (issue #24) could
+    # never actually overlap. The run_tick semaphore bounds the scheduler's
+    # polls; other callers of this function (manual executions, provisioning)
+    # are bounded only by the shared default thread pool.
     started_at = datetime.now(timezone.utc)
     run = await update_execution_run(db, run, status="RUNNING", started_at=started_at)
 
     try:
-        result = execute_driver_method(
+        result = await asyncio.to_thread(
+            execute_driver_method,
             driver_path=driver_path,
             action=action,
             context=context,

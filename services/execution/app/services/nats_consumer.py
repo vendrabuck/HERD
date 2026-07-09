@@ -11,6 +11,7 @@ from herd_common.outbox import event_dedupe_key
 from herd_common.retry import retry_with_backoff
 
 from app.config import settings
+from app.services.health_scheduler import apply_reservation_event_tiers
 
 logger = logging.getLogger(__name__)
 
@@ -2318,6 +2319,19 @@ async def handle_reservation_event(
             "reservation_id": reservation_id,
         },
     )
+
+    # Health-poll tier transitions (issue #24): the same lifecycle events that
+    # drive provisioning move the reservation's devices between the in-use and
+    # idle polling tiers. Best-effort by design: the tier is a cadence hint, so
+    # a failure here must never NAK an otherwise-processable provisioning
+    # message; the absolute-UPDATE transition is re-applied by the next
+    # lifecycle event touching the device.
+    try:
+        await apply_reservation_event_tiers(get_db_session, event_type, event_data)
+    except Exception:
+        logger.warning(
+            "health tier transition failed for reservation %s", reservation_id, exc_info=True
+        )
 
     # One httpx client and one set of memoization caches for the whole event, so
     # the L1 and L2 passes pool connections and never re-fetch a device's

@@ -146,9 +146,27 @@ app.add_middleware(
 
 app.add_middleware(RequestLoggingMiddleware)
 
-app.include_router(executions_router)
-app.include_router(health_router)
-app.include_router(validation_router)
+
+def mount_api_routers(target: FastAPI) -> bool:
+    """Mount the HTTP API routers unless this replica runs poller-only.
+
+    EXECUTION_POLLER_ONLY=true (issue #24) turns the replica into a background
+    worker: the NATS consumer, health scheduler, and outbox relay all run, but
+    only the bare /health liveness route is served. Consumed at startup, so the
+    same image serves both roles; API replicas pair it with
+    HEALTH_POLL_SCHEDULER_ENABLED=false for a clean split. Returns whether the
+    routers were mounted.
+    """
+    if settings.execution_poller_only:
+        logger.info("execution_poller_only set; HTTP API routers not mounted")
+        return False
+    target.include_router(executions_router)
+    target.include_router(health_router)
+    target.include_router(validation_router)
+    return True
+
+
+mount_api_routers(app)
 
 
 @app.get("/health")
