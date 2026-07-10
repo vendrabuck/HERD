@@ -189,7 +189,9 @@ The validator is exposed via two endpoints sharing one implementation:
   reserved, so JWT-forward against the public endpoint would 403.
 
 Both endpoints rebuild the adjacency graph per request via
-`build_adjacency_graph` and run `find_all_shortest_paths` over it. When the
+`build_adjacency_graph`, then resolve every non-proposal, non-missing-device
+edge's shortest paths in a single `find_all_shortest_paths_batch_async` call
+rather than one BFS per edge (issue #313). When the
 caller passes the topology's device set, the rebuild loads only the edges in
 that connected component (iterative frontier expansion, so off-canvas
 intermediates that realize a topology edge are still pulled in) rather than
