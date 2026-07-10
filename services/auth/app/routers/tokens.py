@@ -16,6 +16,7 @@ from app.schemas.api_token import (
     ExchangeTokenResponse,
 )
 from app.services.api_token_service import (
+    _role_exceeds,
     create_api_token,
     exchange_api_token,
     list_api_tokens,
@@ -45,6 +46,23 @@ async def create_token(
     if principal is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Principal user not found"
+        )
+
+    # Authorization (issue #312): a caller must not mint a token that outranks
+    # itself. Guard both axes: the requested role, and the chosen principal's
+    # role. The principal axis is the escalation vector: without it an admin
+    # selects the superadmin as principal (the service's role-vs-principal check
+    # passes, superadmin does not exceed superadmin) and exchanges the token
+    # into a superadmin JWT. An equal-rank principal is allowed (an admin may
+    # mint an admin-role token for another admin machine account); only a
+    # strictly higher rank is refused. The service still enforces the
+    # token-cannot-exceed-its-principal invariant below.
+    if _role_exceeds(body.role, current_user.role) or _role_exceeds(
+        principal.role, current_user.role
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot mint a token whose role or principal exceeds your own role",
         )
 
     try:

@@ -367,6 +367,16 @@ async def regular_client():
 
 
 @pytest.fixture
+async def superadmin_client():
+    mock_super = _mock_user(Role.SUPERADMIN, "superuser")
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: mock_super
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
 async def anon_client():
     app.dependency_overrides[get_db] = override_get_db
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -420,6 +430,80 @@ async def test_create_role_exceeds_principal_400(admin_client):
         json={"name": "esc", "principal_id": str(principal.id), "role": "admin"},
     )
     assert resp.status_code == 400
+
+
+# --- Caller-role escalation guard (issue #312) ---
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_mint_superadmin_token(admin_client):
+    """The #312 escalation: an admin selects the superadmin as principal with a
+    superadmin role. The service's role-vs-principal check passes (superadmin
+    does not exceed superadmin), so only the caller-role guard stops it. Must be
+    403, and no token may be persisted (a created row could still be exchanged)."""
+    superadmin = await _make_user(Role.SUPERADMIN, username="thesuper")
+    resp = await admin_client.post(
+        "/tokens",
+        json={"name": "pwn", "principal_id": str(superadmin.id), "role": "superadmin"},
+    )
+    assert resp.status_code == 403
+
+    # Nothing was created: the escalation is fully blocked, not merely un-returned.
+    async with TestSessionLocal() as session:
+        rows = (await session.execute(select(ApiToken))).scalars().all()
+        assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_mint_for_superadmin_principal_even_at_admin_role(admin_client):
+    """Impersonation via a higher-ranked principal: even requesting only an
+    admin role, choosing the superadmin as principal is refused, because the
+    exchange clamps to min(token_role, principal_role) and the principal axis is
+    what an admin must not reach above."""
+    superadmin = await _make_user(Role.SUPERADMIN, username="super2")
+    resp = await admin_client.post(
+        "/tokens",
+        json={"name": "x", "principal_id": str(superadmin.id), "role": "admin"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_request_superadmin_role(admin_client):
+    """Requesting a role above the caller is refused with 403 (the caller-role
+    guard), which fires before the 400 role-vs-principal check."""
+    principal = await _make_user(Role.ADMIN, username="adminprin")
+    resp = await admin_client.post(
+        "/tokens",
+        json={"name": "x", "principal_id": str(principal.id), "role": "superadmin"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_superadmin_can_mint_superadmin_token(superadmin_client):
+    """Regression: the superadmin retains the ability the guard must not remove."""
+    superadmin = await _make_user(Role.SUPERADMIN, username="super3")
+    resp = await superadmin_client.post(
+        "/tokens",
+        json={"name": "ok", "principal_id": str(superadmin.id), "role": "superadmin"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["role"] == "superadmin"
+
+
+@pytest.mark.asyncio
+async def test_admin_can_mint_admin_token_for_admin_principal(admin_client):
+    """Equal-rank is allowed (documented policy, issue #312): an admin may mint
+    an admin-role token for another admin machine principal. Only strictly
+    higher rank is refused."""
+    other_admin = await _make_user(Role.ADMIN, username="otheradmin")
+    resp = await admin_client.post(
+        "/tokens",
+        json={"name": "peer", "principal_id": str(other_admin.id), "role": "admin"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["role"] == "admin"
 
 
 @pytest.mark.asyncio
