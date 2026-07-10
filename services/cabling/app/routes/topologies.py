@@ -18,7 +18,10 @@ from app.schemas.topology import (
     TopologyUpdate,
     TopologyValidationResponse,
 )
-from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
+from app.services.pathfind_service import (
+    build_adjacency_graph,
+    find_all_shortest_paths_batch_async,
+)
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
 
@@ -231,9 +234,19 @@ async def _run_topology_validation(
     # skips fabrics unrelated to this topology. Built once and reused across all
     # edges, as before.
     graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
-    invalid: list[InvalidEdge] = []
 
-    for edge in edges:
+    # First pass: skip proposal edges, classify missing-device edges immediately
+    # (same reason and fields as before), and defer the rest for pathfinding.
+    # `edge_results` is positional (one slot per edge in `edges`, None meaning
+    # "not invalid" or "proposal, skipped"), so the final invalid list can be
+    # reassembled in the exact original per-edge order regardless of how the
+    # batched pathfind call below resolves its pairs. `pending` carries the
+    # (edges-index, edge_id, layer, source_device, target_device) tuples for
+    # every edge that needs a path lookup, in edge order.
+    edge_results: list[InvalidEdge | None] = [None] * len(edges)
+    pending: list[tuple[int, str, str | None, uuid.UUID, uuid.UUID]] = []
+
+    for idx, edge in enumerate(edges):
         edge_id = str(edge.get("id") or "")
         edge_data = edge.get("data") or {}
         layer = edge_data.get("layer")
@@ -247,29 +260,36 @@ async def _run_topology_validation(
         target_device = node_to_device.get(target_node) if target_node else None
 
         if source_device is None or target_device is None:
-            invalid.append(
-                InvalidEdge(
-                    edge_id=edge_id,
-                    source_device_id=source_device,
-                    target_device_id=target_device,
-                    layer=layer,
-                    reason="missing_device",
-                )
+            edge_results[idx] = InvalidEdge(
+                edge_id=edge_id,
+                source_device_id=source_device,
+                target_device_id=target_device,
+                layer=layer,
+                reason="missing_device",
             )
             continue
 
-        paths = await find_all_shortest_paths_async(graph, source_device, target_device)
+        pending.append((idx, edge_id, layer, source_device, target_device))
+
+    # Second pass: one batched BFS call over every resolvable pair instead of
+    # one asyncio.to_thread hop per edge (issue #313, same fix class as
+    # #249/#250). Results are returned in request order, matching `pending`
+    # positionally, and an empty path-list means the same "no_path" outcome
+    # find_all_shortest_paths_async would have produced for that pair.
+    pairs = [(source_device, target_device) for _, _, _, source_device, target_device in pending]
+    all_paths = await find_all_shortest_paths_batch_async(graph, pairs)
+
+    for (idx, edge_id, layer, source_device, target_device), paths in zip(pending, all_paths):
         if not paths:
-            invalid.append(
-                InvalidEdge(
-                    edge_id=edge_id,
-                    source_device_id=source_device,
-                    target_device_id=target_device,
-                    layer=layer,
-                    reason="no_path",
-                )
+            edge_results[idx] = InvalidEdge(
+                edge_id=edge_id,
+                source_device_id=source_device,
+                target_device_id=target_device,
+                layer=layer,
+                reason="no_path",
             )
 
+    invalid = [result for result in edge_results if result is not None]
     return TopologyValidationResponse(valid=not invalid, invalid_edges=invalid)
 
 

@@ -891,6 +891,79 @@ async def test_validate_topology_missing_device_reference(user_client):
 
 
 @pytest.mark.asyncio
+async def test_validate_topology_multi_edge_mix_preserves_order(admin_client, user_client):
+    """Multiple edges (reachable, two no_path, missing_device, one proposal) in a
+    single topology pin the batched pathfind refactor (issue #313): the
+    validation loop now resolves all resolvable pairs in one
+    find_all_shortest_paths_batch_async call instead of one call per edge, and
+    this asserts the resulting InvalidEdge set (and its order) is unchanged
+    from the old per-edge-call behavior.
+    """
+    a1, a2 = uuid.uuid4(), uuid.uuid4()
+    b1, b2 = uuid.uuid4(), uuid.uuid4()
+    c1, c2 = uuid.uuid4(), uuid.uuid4()
+
+    # a1-a2 cabled directly (reachable). b-pair and c-pair each cabled
+    # internally but not to each other, so cross edges between them are
+    # unreachable (no_path).
+    await _seed_connection(admin_client, a1, "eth1", a2, "eth1")
+    await _seed_connection(admin_client, b1, "eth1", b2, "eth1")
+    await _seed_connection(admin_client, c1, "eth1", c2, "eth1")
+
+    canvas = {
+        "nodes": [
+            {"id": "nA1", "data": {"device": {"id": str(a1)}}},
+            {"id": "nA2", "data": {"device": {"id": str(a2)}}},
+            {"id": "nB1", "data": {"device": {"id": str(b1)}}},
+            {"id": "nB2", "data": {"device": {"id": str(b2)}}},
+            {"id": "nC1", "data": {"device": {"id": str(c1)}}},
+            {"id": "nC2", "data": {"device": {"id": str(c2)}}},
+            {"id": "nMissing", "data": {}},
+        ],
+        "edges": [
+            {
+                "id": "missing-1",
+                "source": "nA1",
+                "target": "nMissing",
+                "data": {"layer": "L2"},
+            },
+            {"id": "reachable-1", "source": "nA1", "target": "nA2", "data": {"layer": "L2"}},
+            {"id": "no-path-1", "source": "nB1", "target": "nC1", "data": {"layer": "L2"}},
+            {
+                "id": "proposal-1",
+                "source": "nB2",
+                "target": "nC2",
+                "data": {"layer": "L2", "isProposal": True},
+            },
+            {"id": "no-path-2", "source": "nB2", "target": "nC2", "data": {"layer": "L2"}},
+        ],
+    }
+
+    create = await user_client.post("/topologies", json={"name": "Mixed"})
+    topology_id = create.json()["id"]
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+
+    # Order must match edge order in the canvas: missing-1, then no-path-1,
+    # then no-path-2 (reachable-1 is valid, proposal-1 is skipped).
+    edge_ids = [e["edge_id"] for e in body["invalid_edges"]]
+    assert edge_ids == ["missing-1", "no-path-1", "no-path-2"]
+
+    reasons = {e["edge_id"]: e["reason"] for e in body["invalid_edges"]}
+    assert reasons["missing-1"] == "missing_device"
+    assert reasons["no-path-1"] == "no_path"
+    assert reasons["no-path-2"] == "no_path"
+
+    missing = body["invalid_edges"][0]
+    assert missing["source_device_id"] == str(a1)
+    assert missing["target_device_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_validate_topology_not_found(user_client):
     fake_id = str(uuid.uuid4())
     resp = await user_client.post(f"/topologies/{fake_id}/validate")
