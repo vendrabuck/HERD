@@ -1,8 +1,9 @@
 # Decision: Editable Reservation Topologies (Fork-on-Reserve), Issue #25
 
 Status: Accepted; P1-P2 shipped (fork models, tables, and creation in the
-cabling service). P3 reconcile-on-save is still open under issue #25. No code in
-this doc.
+cabling service). P3 reconcile-on-save is designed in ADR 0006
+(`0006-fork-reconcile-and-as-built.md`), which resolves this doc's open risks.
+No code in this doc.
 Context verified against the live HERD-public tree on 2026-06-09.
 
 ## Context
