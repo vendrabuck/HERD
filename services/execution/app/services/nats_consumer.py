@@ -32,6 +32,15 @@ EVENT_ACTIONS = {
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
 NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
+# Work-in-progress heartbeat cadence (issue #317). A provisioning handler runs
+# the driver sandbox for up to recipe_timeout_seconds (300s), far beyond
+# ack_wait (30s). While a message is being processed (or waits its turn behind a
+# slow one in the same fetch batch), the loop resets its ack timer on this
+# interval so JetStream does not redeliver a message that is still in flight and
+# double-execute its provisioning, possibly on a peer replica. Half of ack_wait
+# leaves margin for a late heartbeat. A crashed consumer stops heartbeating, so
+# ack_wait still expires and the message correctly redelivers.
+NATS_HEARTBEAT_SECONDS = NATS_ACK_WAIT_SECONDS // 2
 # Pull-consumer fetch tuning. A pull consumer re-establishes on the next fetch
 # after a broker reconnect, which a push subscription does not do reliably, so it
 # survives a NATS restart (issue #21).
@@ -49,6 +58,43 @@ NATS_FETCH_TIMEOUT_SECONDS = 5
 # inspection and replay (see docs/OPERATIONS.md). The _publish_to_dlq publish stays
 # best-effort and swallows errors so a DLQ outage cannot wedge the consumer.
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.execution"
+
+
+async def _run_sandbox(*args, **kwargs):
+    """Run the synchronous driver sandbox off the event loop (issue #317).
+
+    execute_driver_method blocks on subprocess.run for up to
+    recipe_timeout_seconds. Running it inline on the consumer's event-loop task
+    stalls the loop, starving the outbox relay, the health scheduler, and the
+    per-message ack heartbeat, and serializes every replica's provisioning on one
+    thread. This mirrors execution_service.run_driver_action's to_thread wrap
+    (added for the health path in #306); the consumer manages its own execution
+    runs, so it calls the sandbox directly rather than through run_driver_action.
+    Imported lazily to match the module's existing driver_sandbox import style.
+    """
+    from app.services.driver_sandbox import execute_driver_method
+
+    return await asyncio.to_thread(execute_driver_method, *args, **kwargs)
+
+
+async def _keep_messages_alive(messages: list, interval: float) -> None:
+    """Reset ack_wait on every still-in-flight message until it is settled.
+
+    Runs concurrently with the sequential batch processing (issue #317). Each
+    cycle sends work-in-progress to every message still in `messages`; the loop
+    removes a message as soon as it is acked/naked, so heartbeating stops for
+    settled messages. in_progress failures are swallowed: a heartbeat is
+    best-effort and must never wedge the consumer. Requires the driver calls to
+    run off-loop (see _run_sandbox), or this task could never get scheduled while
+    a provisioning handler holds the loop.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        for msg in list(messages):
+            try:
+                await msg.in_progress()
+            except Exception:
+                logger.debug("in_progress heartbeat failed; continuing", exc_info=True)
 
 
 class TransientUpstreamError(RuntimeError):
@@ -605,7 +651,6 @@ async def _execute_l2_switch_operations(
     from datetime import datetime, timezone
 
     from app.services.driver_loader import load_driver
-    from app.services.driver_sandbox import execute_driver_method
     from app.services.execution_service import (
         action_already_succeeded,
         build_context,
@@ -671,7 +716,7 @@ async def _execute_l2_switch_operations(
                 dedupe_key=dedupe_key,
             )
             started = datetime.now(timezone.utc)
-            login_result = execute_driver_method(
+            login_result = await _run_sandbox(
                 driver_path, "login", context, password_keys=password_keys
             )
             if login_result["success"]:
@@ -721,7 +766,7 @@ async def _execute_l2_switch_operations(
                         dedupe_key=dedupe_key,
                     )
                     op_started = datetime.now(timezone.utc)
-                    result = execute_driver_method(
+                    result = await _run_sandbox(
                         driver_path,
                         "create_vlan",
                         context,
@@ -770,7 +815,7 @@ async def _execute_l2_switch_operations(
                         dedupe_key=dedupe_key,
                     )
                     op_started = datetime.now(timezone.utc)
-                    result = execute_driver_method(
+                    result = await _run_sandbox(
                         driver_path,
                         "add_to_vlan",
                         context,
@@ -820,7 +865,7 @@ async def _execute_l2_switch_operations(
                         dedupe_key=dedupe_key,
                     )
                     op_started = datetime.now(timezone.utc)
-                    result = execute_driver_method(
+                    result = await _run_sandbox(
                         driver_path,
                         "remove_from_vlan",
                         context,
@@ -864,7 +909,7 @@ async def _execute_l2_switch_operations(
                         dedupe_key=dedupe_key,
                     )
                     op_started = datetime.now(timezone.utc)
-                    result = execute_driver_method(
+                    result = await _run_sandbox(
                         driver_path,
                         "delete_vlan",
                         context,
@@ -898,7 +943,7 @@ async def _execute_l2_switch_operations(
                 dedupe_key=dedupe_key,
             )
             logout_started = datetime.now(timezone.utc)
-            logout_result = execute_driver_method(
+            logout_result = await _run_sandbox(
                 driver_path, "logout", context, password_keys=password_keys
             )
             status = "SUCCESS" if logout_result["success"] else "FAILED"
@@ -1106,7 +1151,6 @@ async def _execute_l3_switch_operations(
     from datetime import datetime, timezone
 
     from app.services.driver_loader import load_driver
-    from app.services.driver_sandbox import execute_driver_method
     from app.services.execution_service import (
         action_already_succeeded,
         build_context,
@@ -1170,7 +1214,7 @@ async def _execute_l3_switch_operations(
                 dedupe_key=dedupe_key,
             )
             started = datetime.now(timezone.utc)
-            login_result = execute_driver_method(
+            login_result = await _run_sandbox(
                 driver_path, "login", context, password_keys=password_keys
             )
             if login_result["success"]:
@@ -1240,7 +1284,7 @@ async def _execute_l3_switch_operations(
                     dedupe_key=dedupe_key,
                 )
                 op_started = datetime.now(timezone.utc)
-                result = execute_driver_method(
+                result = await _run_sandbox(
                     driver_path,
                     method,
                     context,
@@ -1279,7 +1323,7 @@ async def _execute_l3_switch_operations(
                 dedupe_key=dedupe_key,
             )
             logout_started = datetime.now(timezone.utc)
-            logout_result = execute_driver_method(
+            logout_result = await _run_sandbox(
                 driver_path, "logout", context, password_keys=password_keys
             )
             status = "SUCCESS" if logout_result["success"] else "FAILED"
@@ -1359,7 +1403,6 @@ async def _execute_switch_operations(
     from datetime import datetime, timezone
 
     from app.services.driver_loader import load_driver
-    from app.services.driver_sandbox import execute_driver_method
     from app.services.execution_service import (
         action_already_succeeded,
         action_succeeded_for_reservation,
@@ -1461,7 +1504,7 @@ async def _execute_switch_operations(
                 dedupe_key=dedupe_key,
             )
             started = datetime.now(timezone.utc)
-            login_result = execute_driver_method(
+            login_result = await _run_sandbox(
                 driver_path, "login", context, password_keys=password_keys
             )
             if login_result["success"]:
@@ -1505,7 +1548,7 @@ async def _execute_switch_operations(
                     dedupe_key=dedupe_key,
                 )
                 op_started = datetime.now(timezone.utc)
-                result = execute_driver_method(
+                result = await _run_sandbox(
                     driver_path,
                     action,
                     context,
@@ -1546,7 +1589,7 @@ async def _execute_switch_operations(
                 dedupe_key=dedupe_key,
             )
             logout_started = datetime.now(timezone.utc)
-            logout_result = execute_driver_method(
+            logout_result = await _run_sandbox(
                 driver_path, "logout", context, password_keys=password_keys
             )
             status = "SUCCESS" if logout_result["success"] else "FAILED"
@@ -1655,7 +1698,6 @@ async def _run_recipe_step(
     """
     from datetime import datetime, timezone
 
-    from app.services.driver_sandbox import execute_driver_method
     from app.services.execution_service import create_execution_run, update_execution_run
 
     run = await create_execution_run(
@@ -1671,7 +1713,7 @@ async def _run_recipe_step(
         dedupe_key=dedupe_key,
     )
     started = datetime.now(timezone.utc)
-    result = execute_driver_method(
+    result = await _run_sandbox(
         driver_path,
         action,
         context,
@@ -2652,15 +2694,39 @@ async def start_nats_consumer(app) -> None:
                     logger.warning("NATS pull fetch failed; will retry", exc_info=True)
                     await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
                     continue
-                for msg in msgs:
+                # Heartbeat every fetched message while the batch is processed
+                # sequentially (issue #317): a slow provisioning handler must not
+                # let JetStream redeliver a message still in flight here, whether
+                # it is the one executing or one still queued behind it in this
+                # batch. Settled messages drop out of in_flight so their heartbeat
+                # stops. Driver calls run off-loop (_run_sandbox) so this task is
+                # actually scheduled while provisioning runs.
+                in_flight = list(msgs)
+                heartbeat = asyncio.create_task(
+                    _keep_messages_alive(in_flight, NATS_HEARTBEAT_SECONDS)
+                )
+                try:
+                    for msg in msgs:
+                        try:
+                            await process_reservation_message(
+                                msg, js, handle_reservation_event, _get_db_session
+                            )
+                        except Exception:
+                            # process_reservation_message never raises on its own; this
+                            # catches ack/nak/publish failures so the loop keeps draining.
+                            logger.error("Unexpected error in NATS consumer loop", exc_info=True)
+                        finally:
+                            # Stop heartbeating this message once it is settled.
+                            try:
+                                in_flight.remove(msg)
+                            except ValueError:
+                                pass
+                finally:
+                    heartbeat.cancel()
                     try:
-                        await process_reservation_message(
-                            msg, js, handle_reservation_event, _get_db_session
-                        )
-                    except Exception:
-                        # process_reservation_message never raises on its own; this
-                        # catches ack/nak/publish failures so the loop keeps draining.
-                        logger.error("Unexpected error in NATS consumer loop", exc_info=True)
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
 
         app.state.nats_consumer_task = asyncio.create_task(_consumer_loop())
         logger.info("NATS consumer started")
