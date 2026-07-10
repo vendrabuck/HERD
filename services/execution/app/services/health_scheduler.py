@@ -28,6 +28,11 @@ the reservation lifecycle events the NATS consumer already processes;
 override the registry-resolved interval per tier, with 0 (the default)
 meaning no override.
 
+Fleet-scale template cache (issue #316): a lab that shares a handful of
+templates across many devices otherwise re-fetches the same template from
+inventory on every single poll. `_fetch_template_cached` caches a fetched
+template by template_id for `template_cache_ttl_seconds` (default 300).
+
 This module never raises out of the loop; a poll that crashes is
 logged and the row resweeps on the next tick.
 """
@@ -226,6 +231,47 @@ async def _seed_missing_status_rows(
         except Exception:
             await db.rollback()
             logger.exception("seed_missing_status_rows: failed for %s", did)
+
+
+# --- Template cache: fleet-scale polls of devices sharing a template
+# should not each hit inventory (issue #316) ---
+
+# Same style as the registry cache above: a module-level dict, read/written
+# with no lock since dict access is atomic in CPython. Keyed by template_id,
+# storing (template_data, fetched_at) so a hit within
+# settings.template_cache_ttl_seconds skips the inventory round trip.
+#
+# This wraps fetch_template only for the health-poll path rather than
+# changing execution_service.fetch_template itself: that function is also
+# called from the on-demand executions router (manual execute, schedule,
+# provisioning) and from the NATS consumer's own separate cache, where a
+# just-edited template should be visible on the very next call. The health
+# poller tolerates a few minutes of staleness (it already tolerates the
+# registry's own refresh lag on the same cadence); those other call sites
+# should not silently inherit a TTL they were not asked for.
+_template_cache: dict[str, tuple[dict, datetime]] = {}
+
+
+async def _fetch_template_cached(template_id: str, now: datetime) -> dict:
+    """fetch_template with a short-TTL cache, scoped to the health-poll path.
+
+    A cache hit within `template_cache_ttl_seconds` returns the stored
+    template without calling inventory. A miss or expired entry calls
+    through to `fetch_template` and refreshes the cache on success.
+
+    fetch_template raises (HTTPException, 404 or 503-wrapped) on failure;
+    that exception propagates here unchanged and nothing is written to the
+    cache, so a failed fetch is never cached as a permanent negative. The
+    next poll simply tries again, exactly like the pre-cache behavior.
+    """
+    cached = _template_cache.get(template_id)
+    if cached is not None:
+        data, fetched_at = cached
+        if (now - fetched_at).total_seconds() < settings.template_cache_ttl_seconds:
+            return data
+    data = await fetch_template(template_id)
+    _template_cache[template_id] = (data, now)
+    return data
 
 
 # --- Tick: pick due rows, claim, fire ---
@@ -465,6 +511,10 @@ async def fire_poll(
     the status change committed (issue #21). The relay (main.py) publishes
     it to NATS. `nc` is retained for call-site compatibility but is unused:
     publishing is now the relay's job, not fire_poll's.
+
+    The template fetch goes through `_fetch_template_cached` (issue #316):
+    devices sharing a template hit the module-level cache instead of
+    inventory on every poll.
     """
     started = datetime.now(timezone.utc)
     last_status = "UNKNOWN"
@@ -473,7 +523,7 @@ async def fire_poll(
 
     try:
         device_data = await fetch_device(device_id)
-        template_data = await fetch_template(device_data["template_id"])
+        template_data = await _fetch_template_cached(device_data["template_id"], started)
     except Exception as exc:
         logger.warning(
             "health_poll_failed",
