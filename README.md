@@ -282,6 +282,8 @@ make frontend-dev    # Run frontend dev server
 - Snapshot states: HEALTHY, DEGRADED, UNREACHABLE, UNKNOWN; rendered as a colored badge on the device detail page
 - Failures past `HEALTH_POLL_MAX_CONSECUTIVE_FAILURES` (default 3) trigger exponential backoff with jitter so unreachable devices do not flood the audit log
 - Threshold crossings publish a `device.health_transition` NATS event; notifications fan out to admins + active reservation holders; emit-on-Nth-failure dedupe means flapping devices generate no notifications
+- Fleet-scale bounds: `HEALTH_POLL_BATCH_SIZE` (default 10) caps rows claimed per tick, `HEALTH_POLL_MAX_CONCURRENCY` (default 1) caps concurrent driver polls; devices carry a persisted poll tier (idle/in-use) driven by reservation lifecycle events, with optional per-tier interval overrides
+- `EXECUTION_POLLER_ONLY=true` runs a replica as background-only (health scheduler, NATS consumer, outbox relay), pairable with `HEALTH_POLL_SCHEDULER_ENABLED=false` API replicas to scale a poller fleet separately
 
 ### Pagination
 - All list endpoints return paginated responses with total count

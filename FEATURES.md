@@ -173,7 +173,12 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   notification fans out to all admins and to any users with an active
   reservation on that device. The emit-on-Nth-failure rule provides natural
   flap dedupe: a device that never accumulates threshold consecutive failures
-  generates no notifications.
+  generates no notifications. Fleet-scale bounds cap how many due rows one
+  scheduler tick claims and how many polls run concurrently, and each device
+  carries a persisted poll tier (idle or in-use) flipped by the reservation
+  lifecycle events the service already consumes, with optional per-tier
+  interval overrides. A poller-only run mode lets the background polling work
+  scale as its own replica fleet, separate from the API replicas.
 
 ## Operations and observability
 
