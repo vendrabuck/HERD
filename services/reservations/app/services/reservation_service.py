@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from herd_common.outbox import enqueue_event
@@ -36,24 +36,34 @@ logger = logging.getLogger(__name__)
 
 
 async def _fetch_devices(device_ids: list[uuid.UUID], token: str) -> list[dict]:
-    """Fetch device info from Inventory service concurrently. All-or-nothing:
-    if any device fetch fails, the whole call raises. Used by create/update
-    paths that must validate every device before committing.
+    """Fetch device info from Inventory service in a single batch call (issue #314).
+
+    Replaces the previous one-GET-per-id asyncio.gather fan-out with inventory's
+    POST /devices/batch (issue #250). Preserves the prior all-or-nothing
+    semantics exactly: the batch endpoint silently omits ids that are missing or
+    not visible to the caller (mirroring the per-id route's 404/403), so a
+    request id absent from the response is detected here and raised the same
+    way a per-id 404 used to.
     """
+    if not device_ids:
+        return []
+
     async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{settings.inventory_service_url}/devices/batch",
+            json={"device_ids": [str(did) for did in device_ids]},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        devices = resp.json()["items"]
 
-        async def fetch_one(device_id: uuid.UUID) -> dict:
-            resp = await client.get(
-                f"{settings.inventory_service_url}/devices/{device_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10.0,
-            )
-            if resp.status_code == 404:
-                raise ValueError(f"Device {device_id} not found in inventory")
-            resp.raise_for_status()
-            return resp.json()
+    found_ids = {uuid.UUID(str(d["id"])) for d in devices}
+    missing = [did for did in device_ids if did not in found_ids]
+    if missing:
+        raise ValueError(f"Device {missing[0]} not found in inventory")
 
-        return await asyncio.gather(*[fetch_one(did) for did in device_ids])
+    return devices
 
 
 async def _fetch_devices_best_effort(
@@ -944,7 +954,20 @@ async def list_calendar_reservations(
     visible_device_ids: set[str] | None = None,
 ) -> list[Reservation]:
     """Return all reservations overlapping the given time range (cross-user).
-    If visible_device_ids is provided, only include reservations where ALL devices are visible."""
+    If visible_device_ids is provided, only include reservations where ALL devices are visible.
+
+    Raises ValueError (422 at the router) when the requested window's span
+    exceeds calendar_max_span_days (issue #315): the endpoint has no LIMIT and
+    no pagination, so an unbounded client-controlled window would otherwise
+    load and hold an unbounded result set in memory. 0 disables the cap.
+    """
+    max_span_days = settings.calendar_max_span_days
+    if max_span_days > 0 and (range_end - range_start) > timedelta(days=max_span_days):
+        raise ValueError(
+            f"Calendar window cannot exceed {max_span_days} days "
+            f"(requested {range_start.isoformat()} to {range_end.isoformat()})"
+        )
+
     query = select(Reservation).where(
         and_(
             Reservation.start_time < range_end,

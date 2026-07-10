@@ -125,14 +125,17 @@ async def get_calendar_reservations(
         if visible is not None:
             visible_device_ids = visible
 
-    return await list_calendar_reservations(
-        db,
-        range_start=range_start,
-        range_end=range_end,
-        status_filter=status,
-        device_id=device_id,
-        visible_device_ids=visible_device_ids,
-    )
+    try:
+        return await list_calendar_reservations(
+            db,
+            range_start=range_start,
+            range_end=range_end,
+            status_filter=status,
+            device_id=device_id,
+            visible_device_ids=visible_device_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.get("/reports/utilization", response_model=UtilizationReport)

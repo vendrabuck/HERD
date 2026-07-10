@@ -313,6 +313,7 @@ The notifications service runs two durable NATS consumers: one on `herd.reservat
 | `OUTBOX_RELAY_TICK_SECONDS` | `5.0` | Transactional outbox relay (issue #21) poll cadence in seconds: how often the relay drains unpublished `outbox` rows to JetStream. A NATS outage backs this off exponentially and a healthy tick resets it. |
 | `OUTBOX_BATCH_SIZE` | `100` | Maximum outbox rows the relay publishes per tick. Each row is claimed with `FOR UPDATE SKIP LOCKED` and published with a `Nats-Msg-Id` header for publisher-side dedup. |
 | `OUTBOX_RETENTION_SECONDS` | `604800` | How long published outbox rows are retained before the relay prunes them; default 7 days. |
+| `CALENDAR_MAX_SPAN_DAYS` | `366` | `GET /calendar` has no `LIMIT` and no pagination, so a window (`range_end - range_start`) wider than this is rejected (422) rather than silently loading and holding an unbounded result set in memory (issue #315). `0` disables the cap. |
 
 The execution service runs the same outbox relay for the `device.health_transition` event, but it uses the `herd_common.outbox.run_outbox_relay` defaults (5s tick, 100 batch, 7-day retention) and exposes no environment overrides today.
 
