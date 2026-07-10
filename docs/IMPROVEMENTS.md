@@ -74,11 +74,10 @@ endpoints.
   password redaction as the existing device reads) now replaces n round trips with
   one; the editor's hydration calls it.
 
-Deferred-but-known: fleet-scale health-poll tiering
-([#24](https://github.com/vendrabuck/HERD/issues/24)) remains the roadmap item for the
-polling path; the reporting rollup loads an unbounded in-window result set into memory
-and is fine at current volumes but should gain a guard before long-window heavy-usage
-reports become common (`services/reservations/app/services/reporting_service.py:65-73`).
+Deferred-but-known: the reporting rollup loads an unbounded in-window result set into
+memory and is fine at current volumes but should gain a guard before long-window
+heavy-usage reports become common
+(`services/reservations/app/services/reporting_service.py:65-73`).
 
 ## Reliability and correctness
 
