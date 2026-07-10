@@ -52,8 +52,9 @@ authority today, but worth an allowlist when multi-tenancy lands).
 
 ## Performance and scalability
 
-The backend hot paths are in good shape: conflict detection is an indexed join, list and
-calendar endpoints paginate and eager-load, the reporting rollup batches its lookups, the
+The backend hot paths are in good shape: conflict detection is an indexed join, the list
+endpoints paginate and eager-load, the calendar endpoint bounds its window span (issue
+#315), the reporting rollup batches its lookups, the
 outbox relay claims with `FOR UPDATE SKIP LOCKED`, and per-event connection pooling
 (issue #137, landed) removed the provisioning fan-out. The remaining quantifiable costs are
 all in the frontend data layer fanning out per item because the backend exposes no batch
