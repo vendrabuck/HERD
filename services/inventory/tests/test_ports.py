@@ -1,6 +1,6 @@
 import io
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base, get_db
@@ -86,6 +86,19 @@ DEVICE_TEMPLATE_PAYLOAD = {
             "name": "General",
             "fields": [
                 {"key": "model", "label": "Model", "type": "string", "required": True},
+            ],
+        },
+    ],
+}
+
+PASSWORD_PORT_TEMPLATE_PAYLOAD = {
+    "name": "Secure Port",
+    "template_type": "port",
+    "sections": [
+        {
+            "name": "Auth",
+            "fields": [
+                {"key": "secret", "label": "Secret", "type": "password", "required": False},
             ],
         },
     ],
@@ -385,27 +398,89 @@ async def test_create_port_template_not_found(client):
 
 
 @pytest.mark.asyncio
-async def test_user_can_list_ports(client):
+async def test_user_lists_ports_of_visible_device(client):
+    """A non-admin sees ports of a device that is visible through their groups."""
     dt_id = await _create_device_template(client)
     dev_id = await _create_device(client, dt_id)
     pt_id = await _create_port_template(client)
     await client.post(f"/devices/{dev_id}/ports", json=_port_payload(pt_id))
     app.dependency_overrides[get_current_user_payload] = override_auth_user
-    resp = await client.get(f"/devices/{dev_id}/ports")
+    with patch(
+        "app.routers.ports._resolve_visible_device_ids",
+        new=AsyncMock(return_value={uuid.UUID(dev_id)}),
+    ):
+        resp = await client.get(f"/devices/{dev_id}/ports")
     assert resp.status_code == 200
     assert len(resp.json()) == 1
 
 
 @pytest.mark.asyncio
-async def test_user_can_get_port(client):
+async def test_user_gets_port_of_visible_device(client):
     dt_id = await _create_device_template(client)
     dev_id = await _create_device(client, dt_id)
     pt_id = await _create_port_template(client)
     create_resp = await client.post(f"/devices/{dev_id}/ports", json=_port_payload(pt_id))
     port_id = create_resp.json()["id"]
     app.dependency_overrides[get_current_user_payload] = override_auth_user
-    resp = await client.get(f"/ports/{port_id}")
+    with patch(
+        "app.routers.ports._resolve_visible_device_ids",
+        new=AsyncMock(return_value={uuid.UUID(dev_id)}),
+    ):
+        resp = await client.get(f"/ports/{port_id}")
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_user_denied_ports_of_invisible_device(client):
+    """Regression (issue #310): a non-admin must not read the ports of a device
+    outside their group visibility; both the list and single-port reads 404,
+    never exposing the port or its field_data."""
+    dt_id = await _create_device_template(client)
+    dev_id = await _create_device(client, dt_id)
+    pt_id = await _create_port_template(client)
+    create_resp = await client.post(f"/devices/{dev_id}/ports", json=_port_payload(pt_id))
+    port_id = create_resp.json()["id"]
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.ports._resolve_visible_device_ids",
+        new=AsyncMock(return_value=set()),  # user can see no devices
+    ):
+        list_resp = await client.get(f"/devices/{dev_id}/ports")
+        get_resp = await client.get(f"/ports/{port_id}")
+    assert list_resp.status_code == 404
+    assert get_resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_port_password_field_redacted_for_non_admin(client):
+    """Regression (issue #310): password-typed port field values are masked for
+    a non-admin read and returned raw for an admin, matching the device reads."""
+    dt_id = await _create_device_template(client)
+    dev_id = await _create_device(client, dt_id)
+    pt_resp = await client.post("/templates", json=PASSWORD_PORT_TEMPLATE_PAYLOAD)
+    assert pt_resp.status_code == 201
+    pt_id = pt_resp.json()["id"]
+    create_resp = await client.post(
+        f"/devices/{dev_id}/ports",
+        json={"name": "p1", "template_id": pt_id, "field_data": {"secret": "hunter2"}},
+    )
+    assert create_resp.status_code == 201
+    port_id = create_resp.json()["id"]
+
+    # Admin read returns the raw secret.
+    admin_resp = await client.get(f"/ports/{port_id}")
+    assert admin_resp.json()["field_data"]["secret"] == "hunter2"
+
+    # Non-admin read (device visible) masks it; the cleartext never appears.
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+    with patch(
+        "app.routers.ports._resolve_visible_device_ids",
+        new=AsyncMock(return_value={uuid.UUID(dev_id)}),
+    ):
+        user_resp = await client.get(f"/ports/{port_id}")
+    assert user_resp.status_code == 200
+    assert user_resp.json()["field_data"]["secret"] != "hunter2"
+    assert "hunter2" not in str(user_resp.json())
 
 
 @pytest.mark.asyncio
