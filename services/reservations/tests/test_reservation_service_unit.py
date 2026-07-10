@@ -97,17 +97,17 @@ async def _insert_reservation(
     return res
 
 
-# --- _fetch_devices ---
+# --- _fetch_devices (issue #314: single POST /devices/batch call) ---
 
 
 @pytest.mark.asyncio
 async def test_fetch_devices_success():
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {"id": str(DEVICE_A), "name": "dev-a"}
+    mock_resp.json.return_value = {"items": [{"id": str(DEVICE_A), "name": "dev-a"}]}
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = mock_resp
+    mock_client.post.return_value = mock_resp
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -115,15 +115,25 @@ async def test_fetch_devices_success():
         result = await _fetch_devices([DEVICE_A], "fake-token")
     assert len(result) == 1
     assert result[0]["name"] == "dev-a"
+    mock_client.post.assert_called_once()
+    call = mock_client.post.call_args
+    assert call.args[0].endswith("/devices/batch")
+    assert call.kwargs["json"] == {"device_ids": [str(DEVICE_A)]}
+    assert call.kwargs["headers"] == {"Authorization": "Bearer fake-token"}
 
 
 @pytest.mark.asyncio
-async def test_fetch_devices_404_raises_value_error():
+async def test_fetch_devices_missing_from_batch_raises_value_error():
+    """The batch endpoint omits missing/forbidden ids (issue #250); a
+    requested id absent from the response must still reject the whole
+    call, preserving the all-or-nothing semantics of the old per-id 404."""
     mock_resp = MagicMock()
-    mock_resp.status_code = 404
+    mock_resp.status_code = 200
+    # DEVICE_A was requested but is missing from the batch response.
+    mock_resp.json.return_value = {"items": []}
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = mock_resp
+    mock_client.post.return_value = mock_resp
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -133,13 +143,31 @@ async def test_fetch_devices_404_raises_value_error():
 
 
 @pytest.mark.asyncio
+async def test_fetch_devices_partial_batch_result_raises_value_error():
+    """One of two requested devices is missing from the batch response: the
+    whole call is rejected, not just the missing device (all-or-nothing)."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"items": [{"id": str(DEVICE_A), "name": "dev-a"}]}
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client):
+        with pytest.raises(ValueError, match="not found"):
+            await _fetch_devices([DEVICE_A, DEVICE_B], "fake-token")
+
+
+@pytest.mark.asyncio
 async def test_fetch_devices_server_error_raises():
     mock_resp = MagicMock()
     mock_resp.status_code = 500
     mock_resp.raise_for_status.side_effect = Exception("Server Error")
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = mock_resp
+    mock_client.post.return_value = mock_resp
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -867,6 +895,39 @@ async def test_list_calendar_visible_device_ids():
             visible_device_ids={str(DEVICE_A)},
         )
         assert len(results2) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_calendar_span_over_max_raises(monkeypatch):
+    """A window wider than calendar_max_span_days raises ValueError (issue #315)."""
+    from app.services import reservation_service as svc
+
+    monkeypatch.setattr(svc.settings, "calendar_max_span_days", 30)
+    async with TestSessionLocal() as db:
+        with pytest.raises(ValueError, match="30 days"):
+            await list_calendar_reservations(db, NOW, NOW + timedelta(days=31))
+
+
+@pytest.mark.asyncio
+async def test_list_calendar_span_at_max_succeeds(monkeypatch):
+    """A window exactly at calendar_max_span_days does not raise."""
+    from app.services import reservation_service as svc
+
+    monkeypatch.setattr(svc.settings, "calendar_max_span_days", 30)
+    async with TestSessionLocal() as db:
+        results = await list_calendar_reservations(db, NOW, NOW + timedelta(days=30))
+        assert results == []
+
+
+@pytest.mark.asyncio
+async def test_list_calendar_span_guard_disabled_when_zero(monkeypatch):
+    """calendar_max_span_days=0 disables the cap entirely."""
+    from app.services import reservation_service as svc
+
+    monkeypatch.setattr(svc.settings, "calendar_max_span_days", 0)
+    async with TestSessionLocal() as db:
+        results = await list_calendar_reservations(db, NOW, NOW + timedelta(days=3650))
+        assert results == []
 
 
 # --- get_reservation ---

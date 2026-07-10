@@ -1538,6 +1538,36 @@ async def test_calendar_requires_range_params(client):
 
 
 @pytest.mark.asyncio
+async def test_calendar_span_over_max_rejected(client):
+    """A window wider than calendar_max_span_days is rejected with 422
+    (issue #315), instead of silently loading an unbounded result set."""
+    from app.config import settings
+
+    range_start = NOW.isoformat()
+    range_end = (NOW + timedelta(days=settings.calendar_max_span_days + 1)).isoformat()
+    resp = await client.get(
+        "/calendar", params={"range_start": range_start, "range_end": range_end}
+    )
+    assert resp.status_code == 422
+    assert str(settings.calendar_max_span_days) in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_calendar_span_at_max_succeeds(client):
+    """A window just under (and at) calendar_max_span_days still succeeds."""
+    from app.config import settings
+
+    range_start = NOW.isoformat()
+    range_end = (
+        NOW + timedelta(days=settings.calendar_max_span_days) - timedelta(seconds=1)
+    ).isoformat()
+    resp = await client.get(
+        "/calendar", params={"range_start": range_start, "range_end": range_end}
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_calendar_empty_range(client):
     """No reservations in range returns []."""
     range_start = (NOW + timedelta(days=30)).isoformat()

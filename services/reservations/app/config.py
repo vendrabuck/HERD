@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     # Maximum reservation duration (end_time - start_time). 0 disables the cap.
     reservation_max_duration_seconds: int = 30 * 24 * 3600
 
+    # Maximum span (range_end - range_start) accepted by GET /calendar (issue
+    # #315). The endpoint has no LIMIT and no pagination, so an unbounded,
+    # client-controlled window can load and hold an unbounded result set in
+    # memory; a window wider than this is rejected with 422 rather than
+    # silently loading everything. 0 disables the cap.
+    calendar_max_span_days: int = 366
+
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "case_sensitive": False}
