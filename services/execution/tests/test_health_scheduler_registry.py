@@ -49,6 +49,7 @@ async def setup_db():
         await conn.run_sync(Base.metadata.create_all)
     health_scheduler._registry.clear()
     health_scheduler._registry_last_refresh = None
+    health_scheduler._template_cache.clear()
     yield
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)

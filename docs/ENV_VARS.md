@@ -240,6 +240,7 @@ The execution service also hosts the periodic health-poll scheduler (ROADMAP #13
 | `HEALTH_POLL_BACKOFF_CAP_SECONDS` | `3600` | Upper bound on backoff between polls. |
 | `HEALTH_POLL_MINIMUM_INTERVAL_SECONDS` | `30` | Currently unused: the 30-second floor on `poll_interval_seconds` is the hardcoded `MIN_POLL_INTERVAL_SECONDS` in inventory's `app/schemas/device.py`, so changing this variable has no effect. |
 | `HEALTH_POLL_NOTIFY_ENABLED` | `true` | Publish a `device.health_transition` NATS event when a device crosses the failure threshold (bad_news) or recovers. Set to `false` to silence alerts without rolling back the publisher code. |
+| `TEMPLATE_CACHE_TTL_SECONDS` | `300` | How long the health-poll path caches a fetched template (keyed by template_id) before re-fetching from inventory (issue #316). A lab sharing a handful of templates across many devices otherwise re-fetches the same template on every poll; a hit within this window skips the inventory call. Scoped to the health scheduler only, not the on-demand executions router or the NATS consumer's own cache, so a just-edited template is still immediately visible there. A failed fetch is never cached. |
 
 ## Inventory service (optional storage overrides)
 

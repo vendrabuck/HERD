@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     health_poll_in_use_interval_seconds: int = 0
     health_poll_idle_interval_seconds: int = 0
 
+    # Fleet-scale template cache (issue #316). Devices sharing a template
+    # (the common case) each re-fetched it from inventory on every poll,
+    # so a lab with a few templates and many devices multiplied inventory
+    # calls by O(polls). The health-poll path now caches a fetched template
+    # by template_id for this many seconds; a miss or expiry re-fetches.
+    # Matches the registry refresh cadence, since template metadata changes
+    # about as rarely as the registry does.
+    template_cache_ttl_seconds: int = 300
+
     # Run-mode split (issue #24): a poller-only replica skips mounting the HTTP
     # API routers at startup (only the bare /health liveness route remains) so
     # the same image can run a horizontally scaled poller fleet next to API

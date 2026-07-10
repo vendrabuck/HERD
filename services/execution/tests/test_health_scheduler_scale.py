@@ -57,11 +57,13 @@ async def setup_db():
     health_scheduler._registry.clear()
     # Mark the registry fresh so run_tick never tries a real inventory fetch.
     health_scheduler._registry_last_refresh = datetime.now(timezone.utc)
+    health_scheduler._template_cache.clear()
     yield
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     health_scheduler._registry.clear()
     health_scheduler._registry_last_refresh = None
+    health_scheduler._template_cache.clear()
 
 
 async def _seed_row(
