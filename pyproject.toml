@@ -29,7 +29,7 @@ filterwarnings = ["error"]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.15.20",
+    "ruff>=0.15.21",
     "pip-audit>=2.10.1",
     "selenium>=4.45.0",
     "pytest-timeout>=2.4.0",
