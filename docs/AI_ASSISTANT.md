@@ -94,7 +94,7 @@ Errors:
 - 404: reservation does not exist or caller does not own it; **or** a `conversation_id` was supplied that does not exist, was created by a different user, or belongs to a different reservation (404 not 403 to avoid leaking existence)
 - 422: question empty or longer than 4000 characters
 - 502: the LLM call failed or returned no text content
-- 503: no AI provider configured (`AI_API_KEY` blank under `AI_PROVIDER=anthropic`, or `AI_BASE_URL` blank under `AI_PROVIDER=openai_compat`)
+- 503: no AI provider configured (`AI_PROVIDER=anthropic` needs `AI_API_KEY` or `AI_BASE_URL` set, either one; `AI_PROVIDER=openai_compat` needs `AI_BASE_URL` set)
 - 504: assistant or seed gather exceeded its deadline (90s overall by default; configurable)
 
 Note: the iter-1 413 response (rendered context exceeded a size ceiling) no longer exists. Per-tool-result truncation handles oversized payloads instead, with a `... [truncated: N chars omitted]` marker appended to the affected tool result.

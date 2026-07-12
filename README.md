@@ -81,12 +81,13 @@ over NATS JetStream.
 | Inventory | Device templates, devices, ports, drivers, device groups |
 | Reservations | Conflict detection, topology enforcement, auto-expiration |
 | Cabling | Connections, topology persistence, pathfinding |
-| ACL | Resource-level grants (topology, reservation) |
+| ACL | Resource-level grants (device, topology, reservation, secret) |
 | Execution | Driver execution sandbox, NATS event consumer (DLQ) |
 | AI Orchestrator | LLM-driven topology generation, reservation assistant, and recipe drafting (configurable: Anthropic or OpenAI-compatible) |
 | User Profile | Per-user preferences (saved filters, page sizes, extras) |
 | Notifications | NATS consumer + in-app notifications + per-user prefs |
 | Integration | Versioned `/api/v1` reservation facade + outbound webhooks (NATS consumer) |
+| Secrets | Encrypted-at-rest credential store, ACL-gated, envelope encryption under an env-supplied KEK |
 
 Shared data layer: PostgreSQL 16 (schema-per-service) and NATS JetStream (async events).
 
@@ -246,7 +247,8 @@ make frontend-dev    # Run frontend dev server
 - Used by device groups and ACL service for permission resolution
 
 ### Reservation detail and live editing
-- Reservation detail modal with four tabs: Details, Inventory, Routes, Schedule
+- Reservation detail modal with five tabs: Details, Inventory, Routes, Schedule, and a
+  conditional AI Assistant tab (shown only when an AI provider is configured)
 - Inventory tab: expandable device rows with ports and connection information
 - Routes tab: hop-by-hop pathfinding visualization between all DUT pairs in the reservation
 - Schedule tab: inline editing of end time and purpose
@@ -344,8 +346,13 @@ infrastructure for cable route visualization. Connections can be filtered by dev
 Reads available to all authenticated users; writes require admin or superadmin role.
 
 ### ACL Service
-Resource-level access control via group-based grants for topologies and reservations.
-Device-level access is handled by device groups in the inventory service.
+Resource-level access control via group-based grants for devices, topologies,
+reservations, and secrets (`resource_type` one of `device`, `topology`, `reservation`,
+`secret`; permission `view` or `manage`, with `manage` implying `view`). Device
+visibility for non-admin users is primarily handled by device groups in the inventory
+service; ACL device grants layer narrower per-device carve-outs on top (for example,
+non-admin manual driver execution and the reservation-owner widening on device-config
+writes).
 
 ### Execution Service
 Runs user-authored Python driver code on infrastructure devices at reservation lifecycle
@@ -428,9 +435,39 @@ for list/mark-read/mark-all/delete plus a GET/PUT `/preferences` proxy. Frontend
 a bell icon with unread badge (30s polling) in the header and a Notifications section on
 the new `/settings` page.
 
+### Integration Service
+A stable, versioned external surface for automation (issue #33), separate from the
+internal endpoints the web UI calls. Two halves: an inbound `/api/v1` HTTP facade for
+reserving and releasing devices from CI/CD pipelines and test-automation systems, and
+outbound webhooks that POST reservation lifecycle events to admin-registered endpoints.
+The facade forwards the caller's identity to the internal services, so RBAC,
+device-group visibility, and ACL grants apply to an automation client exactly as they
+do to an interactive user. Automation authenticates with a long-lived, admin-minted API
+token (`/api/auth/tokens`, owned by the auth service) exchanged for a short-lived access
+JWT; a token's role can never exceed its principal's own role. Outbound webhook
+deliveries are HMAC-signed, retried up to `WEBHOOK_DELIVERY_ATTEMPTS` times, and recorded
+in a delivery ledger with a dead-letter record on exhaustion. Its own durable NATS
+consumer (`integration-webhooks-consumer`) drives delivery off the same reservation
+lifecycle stream execution and notifications consume. See
+[docs/EXTERNAL_API.md](docs/EXTERNAL_API.md) for the full contract.
+
+### Secrets Service
+An encrypted-at-rest credential store (ADR [docs/design/0003](docs/design/0003-encrypted-credential-store.md),
+issue #39), gated by ACL `secret`-resource grants rather than device-group visibility.
+Plaintext values are protected by envelope encryption: each secret is encrypted under a
+per-secret data key, which is itself wrapped by a key-encryption key (KEK) supplied via
+the required `SECRETS_KEK` environment variable; the service refuses to boot without a
+valid KEK, so there is never a source-visible default to leak. `POST /keys/rotate`
+introduces a new KEK version and re-encrypts every stored secret; `SECRETS_KEK_PREVIOUS`
+supports a rotation window where old and new keys are both present. Reveal
+(`GET /secrets/{id}/value`) requires a `manage` grant on the secret; a `view` grant sees
+metadata only. Hypervisors (dynamic-resources, ADR 0004) reference a secret by id rather
+than accepting credentials inline, and the execution service resolves the plaintext only
+at the point of use via secrets' internal, `X-Internal-Token`-gated endpoint.
+
 ## Testing
 
-Over 2,000 backend unit tests across the 13 services, around 460 frontend tests via vitest, and roughly 100 cross-service integration tests (a handful skipped: VLAN-fabric cases plus LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). Around 100 E2E browser tests via Selenium (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against a local `osixia/openldap` container (see `docs/ENV_VARS.md` LDAP section).
+Over 3,300 backend unit tests across the 13 services, around 480 frontend tests via vitest, and 155 cross-service integration tests (a handful self-skip: AI-config-dependent cases when no provider is configured, NATS-dependent cases when JetStream isn't reachable, and LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). 119 E2E browser tests via Selenium (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against a local `osixia/openldap` container (see `docs/ENV_VARS.md` LDAP section).
 
 Coverage targets 85%+ per backend service; run `make coverage` for the current per-service report (or `make coverage-<svc>` for one service with an HTML report). Outstanding test gaps are tracked in [docs/GAPS.md](docs/GAPS.md).
 
@@ -471,9 +508,11 @@ make test-load-ui        # Locust with web UI
 
 ## CI (GitHub Actions)
 
-Two jobs run on push/PR to main:
+Three jobs run on push/PR to main, plus a scheduled nightly workflow:
 - **backend**: install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 13 services (pytest), coverage report
 - **frontend**: install deps (npm ci), lint (eslint), test (vitest), build (vite)
+- **integration** (advisory): boots the full ephemeral stack and runs the contract and integration suites
+- **nightly** (scheduled, not on every PR): the heavier suites PR CI skips, contract, integration, e2e, and a seeded headless locust load run
 
 ## Documentation
 

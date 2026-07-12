@@ -3,9 +3,9 @@
 Tracking doc for test coverage not yet implemented. Shipped work lives under
 the usual service test directories; this file is the backlog.
 
-Last audit: 2026-05-04. When you close a gap, delete the entry. When a new one
-surfaces, add it with a severity tag (CRITICAL, HIGH, MEDIUM, LOW) and a
-concrete target file path.
+Last audit: 2026-05-04, refreshed 2026-07-12. When you close a gap, delete the
+entry. When a new one surfaces, add it with a severity tag (CRITICAL, HIGH,
+MEDIUM, LOW) and a concrete target file path.
 
 ## Contract and drift
 
@@ -50,17 +50,17 @@ concrete target file path.
 
 ## Frontend: pages and components
 
-**13 pages have zero Vitest coverage.** Only `DriversPage` is tested.
+**11 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
+`DeviceGroupDetailPage`, `DevicePage`, `DriversPage`, `InventoryPage`, `LoginPage`,
+`RegisterPage`, `ReportingPage`, `ReservationsPage`, `SettingsPage`); 12 pages remain
+untested.
 
 - [HIGH] Page smoke tests (render, key interactions):
-  - `frontend/src/pages/LoginPage.tsx`
-  - `frontend/src/pages/RegisterPage.tsx`
-  - `frontend/src/pages/ReservationsPage.tsx`
   - `frontend/src/pages/ReservationCalendarPage.tsx`
-  - `frontend/src/pages/SettingsPage.tsx`
   - `frontend/src/pages/TopologyEditorPage.tsx`
-  - `frontend/src/pages/ConfigPage.tsx`
-- [MEDIUM] Remaining pages: Dashboard, Device, Inventory, Templates, TemplateEditor, Reporting, Topology.
+- [MEDIUM] Remaining pages: Dashboard, Templates, TemplateEditor, Topology,
+  TopologyTemplates, and the admin-only AddDevice, DeviceGroups, GroupDetail, Groups,
+  and Users pages.
 
 **21 components have zero coverage.** Priorities:
 
@@ -86,7 +86,7 @@ Tests live under `frontend/src/test/api/`. Currently covered after this round:
 
 ## E2E
 
-`tests/e2e/` has 30 files and 116 tests. Remaining UI gaps:
+`tests/e2e/` has 31 files and 119 tests. Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,

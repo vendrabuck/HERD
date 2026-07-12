@@ -1,8 +1,9 @@
 """Locust load test definitions for HERD.
 
-Four user classes simulating different usage patterns:
+Five user classes simulating different usage patterns:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices and templates
+- BulkExporter: exports devices, templates, and topologies; dry-runs a device import
 - ACLChecker: batch checks permissions
 - NotificationUser: polls notifications and updates channel/event preferences
 

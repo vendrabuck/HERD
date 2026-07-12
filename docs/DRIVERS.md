@@ -37,11 +37,15 @@ must contain the following at its root:
 driver.py             # REQUIRED: must contain a class named Driver
 driver_metadata.json  # OPTIONAL: capability declarations (see "Dry-run support" below)
 requirements.txt      # OPTIONAL: pip dependencies installed before execution
-lib/                  # OPTIONAL: supporting Python modules importable by driver.py
+lib/                  # OPTIONAL: supporting Python modules, imported as lib.<module>
 ```
 
 The execution service extracts the archive, optionally installs dependencies from
-`requirements.txt`, then loads `driver.py` and instantiates the `Driver` class.
+`requirements.txt`, then loads `driver.py` and instantiates the `Driver` class. The
+package root is put on `PYTHONPATH` for the driver subprocess (a vendored `_deps/`
+directory, when present, is added as a second `PYTHONPATH` entry); `lib/` itself is never
+added as its own path entry, so its contents are importable only as the subpackage
+`lib.<module>` (`import lib.foo` or `from lib import foo`), not as a top-level module.
 
 ---
 
@@ -297,7 +301,8 @@ Device template fields of type "password" (e.g. switch credentials) are passed t
 driver in cleartext so the driver can authenticate with the device. These values are:
 
 - Passed to the subprocess via a temporary file on disk (not command-line arguments),
-  deleted immediately after the driver reads them
+  unlinked in a `finally` block after the subprocess returns (so the file exists for the
+  full duration of the driver run, not just until the driver's first read)
 - Redacted as `***REDACTED***` in all execution logs and stored execution run records
 - Never exposed in API responses beyond the execution service
 

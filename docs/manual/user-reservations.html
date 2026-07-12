@@ -115,13 +115,9 @@
                 </div>
                 <div class="hd-field"><label class="hd-label">Devices</label>
                   <div class="hd-card" data-anno="3" data-anno-pin="r" data-anno-arrow data-anno-pad="3" style="box-shadow:none;">
-                    <div class="hd-portgrid" style="padding:10px 14px;">
-                      <div class="pr" style="border:none;padding:5px 0;"><span style="width:16px;height:16px;border:2px solid var(--blue-600);border-radius:4px;background:var(--blue-600);"></span><span class="hd-glyph physical"></span><span style="font-weight:600;color:var(--gray-900)">fw-edge-01</span><span class="hd-badge available" style="margin-left:auto;">AVAILABLE</span></div>
-                      <div class="pr" style="border:none;padding:5px 0;"><span style="width:16px;height:16px;border:2px solid var(--blue-600);border-radius:4px;background:var(--blue-600);"></span><span class="hd-glyph physical"></span><span style="font-weight:600;color:var(--gray-900)">fw-edge-02</span><span class="hd-badge available" style="margin-left:auto;">AVAILABLE</span></div>
-                      <div class="pr" style="border:none;padding:5px 0;opacity:.5;"><span style="width:16px;height:16px;border:2px solid var(--gray-300);border-radius:4px;"></span><span class="hd-glyph physical"></span><span style="font-weight:600;color:var(--gray-900)">dut-server-14</span><span class="hd-badge reserved" style="margin-left:auto;">RESERVED</span></div>
-                    </div>
+                    <div style="padding:10px 14px;font-size:13px;color:var(--gray-700);">2 devices selected</div>
                   </div>
-                  <p class="hd-help">Greyed-out rows are exclusive devices already booked for your window.</p>
+                  <p class="hd-help">You pick devices on the topology canvas (or the equipment browser) before opening this form; it just shows the count. There's no picker here, and no greyed-out rows.</p>
                 </div>
               </div>
               <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Reserve</span></div>
@@ -129,19 +125,19 @@
           </div></div>
         </div>
       </div>
-      <p class="shotcap"><b>The new-reservation form.</b> Devices you can't see, or can't book, simply don't appear as options.</p>
+      <p class="shotcap"><b>The new-reservation form.</b> Device selection happens beforehand on the topology canvas; this form just books the window for whatever you already selected.</p>
     </figure>
 
     <ol class="legend">
       <li><b>Purpose.</b> A short human label so people (and the report) know what this booking was for. "HA failover regression," not "test."</li>
       <li><b>Start &amp; end.</b> Your time window. The reservation is dormant until the start time passes, then activates on its own.</li>
-      <li><b>Devices.</b> Tick what you need. The list only shows gear you have visibility on; already-booked <em>exclusive</em> devices are greyed out so you can't double-book them.</li>
+      <li><b>Devices.</b> Chosen beforehand on the <a href="user-topology.html">topology canvas</a>; this form just shows how many you picked. There's no separate device picker in the reservation form itself.</li>
       <li><b>Reserve.</b> Submit. The new reservation appears in your list immediately.</li>
     </ol>
 
     <div class="callout tip">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
-      <div><span class="ttl">Conflict on submit?</span><p>If a device you picked is exclusive and already booked in your window, the reservation is rejected and HERD tells you <strong>exactly which devices</strong> clashed. Adjust your window (check the <a href="#calendar">calendar</a>) or drop the conflicting device, then resubmit.</p></div>
+      <div><span class="ttl">Conflict on submit?</span><p>Conflicts aren't caught before you submit; if a device you picked is exclusive and already booked in your window, the reservation is rejected at submit time and HERD tells you <strong>exactly which devices</strong> clashed. Adjust your window (check the <a href="#calendar">calendar</a>) or drop the conflicting device on the topology canvas, then resubmit.</p></div>
     </div>
 
     <h2 class="sec" id="status">The colour code</h2>

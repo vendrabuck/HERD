@@ -13,11 +13,14 @@ Operational playbook for administrators. For the permission matrix, see [ROLES.m
 | Create/delete devices and ports | - | yes | yes |
 | Create/delete device groups and assign permissions | - | yes | yes |
 | Create/delete user groups and manage membership | - | yes | yes |
-| Execute drivers (`POST /execute`) | - | yes | yes |
-| Grant and revoke ACL grants (topologies, reservations) | - | yes | yes |
+| Execute drivers (`POST /execute`) | configure-only, with device manage grant | yes | yes |
+| Grant and revoke ACL grants (devices, topologies, reservations, secrets) | - | yes | yes |
 | Promote a user to admin or demote | - | - | yes |
 
-Full API-level matrix with every endpoint: [ROLES.md](ROLES.md).
+A non-admin may call `POST /api/execution/execute` when `action == "configure"` and the
+caller holds an ACL `manage` grant on the target device; every other non-admin call to
+that endpoint is rejected 403. Full API-level matrix with every endpoint:
+[ROLES.md](ROLES.md).
 
 ## First-day setup (after FRESH_SETUP.md)
 
@@ -43,7 +46,7 @@ A driver is a Python package that teaches HERD how to log into and configure a r
 3. Click **Upload**. Fill in:
    - **Name** (unique; e.g. `juniper-fw-mgmt`).
    - **Description** (what it drives).
-   - **Connection type** (`Management` for DUTs, `Layer 1 Switch` / `Layer 2 Switch` / `Layer 3 Switch` for infrastructure).
+   - **Connection type** (`Management` for DUTs, `Layer 1 Switch` / `Layer 2 Switch` / `Layer 3 Switch` for infrastructure, or `Hypervisor` for a dynamic-resources recipe driver).
    - **File** (the `.zip` or `.tar.gz`).
 4. Upload. The driver is stored locally under `/data/drivers/` by default (or in MinIO if configured) and validated on first use.
 
@@ -53,17 +56,20 @@ Drivers are reference-counted by templates: you can't delete a driver that a tem
 
 ### Templates
 
-Templates define the fields your devices carry. Two template types:
+Templates define the fields your devices carry. Three template types:
 
-- `device` templates define a class of Device. Must reference a driver.
+- `device` templates define a class of physical or cloud Device. Must reference a driver.
 - `port` templates define a class of Port. Ports are children of devices; no driver.
+- `dynamic` templates define a hypervisor-backed instance type (ADR 0004, issue #32):
+  they pair a registered hypervisor with a `Hypervisor`-connection-type recipe driver so
+  a reservation can materialize an instance rather than claim a physical device.
 
 Typical workflow:
 
-1. **Drivers > Templates > New template**.
+1. **Templates > New template** (Templates is its own top-level nav item).
 2. Pick `device` or `port`.
 3. If `device`, pick the driver and mark `exclusive` (default true). Exclusive devices enforce one-reservation-at-a-time; non-exclusive are shared infrastructure.
-4. Fill in **Vendor** and **Model** (e.g. `Juniper Networks` / `EX2300`). **Part number** is optional and only used when the template represents a specific orderable SKU. The **Suggest with AI** button (admin only, requires `AI_API_KEY`) infers vendor/model from the template name; review and edit before saving. Identity fields enable the AI reservation assistant to ground responses in actual hardware context.
+4. Fill in **Vendor** and **Model** (e.g. `Juniper Networks` / `EX2300`). **Part number** is optional and only used when the template represents a specific orderable SKU. The **Suggest with AI** button (admin only, requires an AI provider to be configured) infers vendor/model from the template name; review and edit before saving. Identity fields enable the AI reservation assistant to ground responses in actual hardware context.
 5. Add field sections with typed fields (`string`, `number`, `boolean`, `password`, `dropdown`). Add per-field defaults where useful. Password fields are masked in the UI and excluded from search.
 6. Save.
 
@@ -90,7 +96,7 @@ Device groups control which devices non-admin users can see.
 ### Setup
 
 1. **Device Groups > New group**. Name + description.
-2. **Add devices**: TransferList UI. Move from "Available" to "In group".
+2. **Add devices**: TransferList UI. Move from "Available Devices" to "Group Devices".
 3. **Add user-group permissions**: pick which user groups get access.
 4. Save.
 
@@ -108,17 +114,22 @@ Setup is symmetrical to device groups: **User Groups > New group**, add members,
 
 ## Promoting and demoting users
 
-Only superadmins. From the Users admin page, pick a user, use the role picker. Under the hood this is `PUT /api/auth/users/{id}/role` with the new role.
+Only superadmins. From the Users admin page, pick a user, use the role picker. Under the hood this is `PUT /api/auth/users/{id}/role` with the new role. Only `user` and `admin` are assignable; a request with `role: "superadmin"` is refused with HTTP 400, since the superadmin role can only be set outside the API (see [ROLES.md](ROLES.md#superadmin)).
 
 ## Reservations administration
 
 ### Viewing anyone's reservations
 
-The calendar is cross-user for every role. The reservations list (`/reservations`) is filtered to your own by default; admins have a view-all toggle.
+The calendar is cross-user for every role, filtered to device visibility. The
+reservations list (`/reservations`) is always scoped to your own reservations today,
+for every role including admin and superadmin; there is no admin view-all toggle.
 
 ### Cancelling someone else's reservation
 
-Admins can cancel any reservation. From the calendar or the reservation list, click in, then **Cancel**.
+Listing and cancelling are both owner-scoped today: an admin cannot cancel a
+reservation they do not own, even though they can see it on the cross-user calendar.
+To help a user with a stuck reservation, walk them through cancelling it themselves, or
+use direct database access as a last resort.
 
 ### Recovering a FAILED reservation
 
@@ -168,9 +179,12 @@ The execution service runs driver code on infrastructure at reservation lifecycl
 
 Execution is mostly event-driven via NATS: reservation lifecycle events trigger L1 port connect/disconnect and L2 VLAN provision/deprovision automatically. Manual `/execute` is for AI commits with configs and for ad-hoc admin actions.
 
-## ACL grants (topologies, reservations, secrets)
+## ACL grants (devices, topologies, reservations, secrets)
 
-Device-level access is via device groups (above). ACL grants are for topology, reservation, and secret resources.
+Device visibility for non-admin users is primarily via device groups (above); ACL
+device grants layer narrower per-device carve-outs on top (e.g. the execute-drivers
+carve-out above, and the reservation-owner widening on device-config writes). ACL also
+covers topology, reservation, and secret resources.
 
 - `POST /api/acl/grants` creates a grant: `{resource_type: "device|topology|reservation|secret", resource_id, group_id, permission: "view|manage"}` (`group_id` is the user-group UUID).
 - `manage` implies `view`.
@@ -199,12 +213,12 @@ Admins manage named secrets in the secrets service; values are encrypted at rest
 
 ## AI topology generation
 
-The AI feature is opt-in and keyed off `AI_API_KEY`:
+The AI feature is opt-in and gated by `ai_is_configured()`:
 
-- Set `AI_API_KEY` in `.env` (or via the config UI's AI Integration section) and `make restart`. The frontend checks `GET /api/ai/status` on load, so the **Use AI** button appears on the topology editor only when the key is non-empty.
+- For the default `AI_PROVIDER=anthropic`, either `AI_API_KEY` (hosted API) or `AI_BASE_URL` (a local Anthropic-compatible endpoint, e.g. vLLM) being set is enough. For `AI_PROVIDER=openai_compat`, `AI_BASE_URL` must be set. Set the relevant variable(s) in `.env` (or via the config UI's AI Integration section) and `make restart`. The frontend checks `GET /api/ai/status` on load, so the **Use AI** button appears on the topology editor only when the provider is configured.
 - Optional `AI_MODEL` (default `claude-sonnet-4-6`) lets you bias for quality (`claude-opus-4-7`) or cost (`claude-haiku-4-5`).
-- To turn the feature off cleanly, blank the key and `make restart`; users will see the button disappear on reload.
-- `/api/ai/status` is unauthenticated by design (no secret content, just `{"enabled": bool}`) so the frontend can decide whether to render the button before any user logs in.
+- To turn the feature off cleanly, blank the relevant variable(s) and `make restart`; users will see the button disappear on reload.
+- `/api/ai/status` is unauthenticated by design (no secret content) so the frontend can decide whether to render the button before any user logs in. It returns `{enabled, provider, model, recipe_authoring}`.
 
 See [AI_GENERATE.md](AI_GENERATE.md) for the user-facing flow and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#ai-topology-generation) for failure modes.
 

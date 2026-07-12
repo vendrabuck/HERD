@@ -147,6 +147,13 @@ JSON is the lossless round-trip format. Each item is a topology `name` plus its
 `data.device.id` is replaced by the device `name` under `data.device.name`; on
 import, that name resolves back to a local device id.
 
+Unlike devices and templates, topology import is **create-only today**: there is no
+name-based update-matching branch, so every import row always creates a new topology,
+even when a topology with the same `name` already exists. Re-importing the same file
+creates duplicate topologies rather than updating the original. The `identity` field on
+each row's report entry is still the topology `name`, but the `action` will always read
+`create`, never `update`.
+
 ```json
 {
   "resource": "topologies",

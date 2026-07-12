@@ -130,7 +130,7 @@
 
     <h2 class="sec" id="config">Every change, kept</h2>
     <p class="sectitle">Device configuration versions</p>
-    <p>Whenever a config is applied to a device &mdash; by hand, by a reservation, or by the <a href="user-assistant.html#write">AI assistant</a> &mdash; HERD snapshots it as a numbered <strong>version</strong>. The device's detail page lists them newest-first: who applied it, when, and the result.</p>
+    <p>Whenever a config is applied to a device &mdash; by hand, by a reservation, or by the <a href="user-assistant.html#write">AI assistant</a> &mdash; HERD snapshots it as a numbered <strong>version</strong>. The device's detail page lists them newest-first: who applied it, when, and its description.</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -139,9 +139,9 @@
             <div class="hd-body" style="padding:18px;">
               <div class="hd-card" style="max-width:600px;">
                 <div class="head">Configuration history <span style="font-weight:400;color:var(--gray-400);font-size:13px;">spine-sw-01</span></div>
-                <div class="hd-vrow"><span class="vn">v7</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">jordan</b> &middot; 2026-05-19 14:02 &middot; success</span><span class="vcur" data-anno="1" data-anno-pin="l" data-anno-arrow>CURRENT</span></div>
-                <div class="hd-vrow"><span class="vn">v6</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">sara.k</b> &middot; 2026-05-12 09:40 &middot; success</span><span class="hd-btn ghost sm" data-anno="2" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Diff</span></div>
-                <div class="hd-vrow"><span class="vn">v5</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">jordan</b> &middot; 2026-05-04 16:18 &middot; success</span><span class="hd-btn ghost sm" data-anno="3" data-anno-pin="r" data-anno-arrow>Restore</span></div>
+                <div class="hd-vrow"><span class="vn">v7</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">jordan</b> &middot; 2026-05-19 14:02</span><span class="vcur" data-anno="1" data-anno-pin="l" data-anno-arrow>CURRENT</span></div>
+                <div class="hd-vrow"><span class="vn">v6</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">sara.k</b> &middot; 2026-05-12 09:40</span><span class="hd-btn ghost sm" data-anno="2" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Diff</span></div>
+                <div class="hd-vrow"><span class="vn">v5</span><span class="vmeta">Applied by <b style="color:var(--gray-700)">jordan</b> &middot; 2026-05-04 16:18</span><span class="hd-btn ghost sm" data-anno="3" data-anno-pin="r" data-anno-arrow>Restore</span></div>
               </div>
             </div>
           </div>
@@ -153,7 +153,7 @@
     <ol class="legend">
       <li><b>Current.</b> The version live on the device right now.</li>
       <li><b>Diff.</b> Opens a unified diff between any version and the current one.</li>
-      <li><b>Restore.</b> Re-applies an older version as a new apply. (Blocked while an active reservation depends on the topology &mdash; same guard as topology restore.)</li>
+      <li><b>Restore.</b> Re-applies an older version as a new apply. Unlike topology restore, this has no reservation guard today; it re-applies regardless of any reservation on the device.</li>
     </ol>
 
     <h2 class="sec" id="diff">What changed</h2>

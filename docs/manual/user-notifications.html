@@ -133,7 +133,7 @@
 
     <h2 class="sec" id="settings">Making it quieter (or louder)</h2>
     <p class="sectitle">Tuning what you get</p>
-    <p>From <b>Settings</b>, open the Notifications section. Three levels of control &mdash; the master switch, which channels carry it, and which events you want at all:</p>
+    <p>From <b>Settings</b>, open the Notifications section. Two levels of control: which channels carry notifications (the in-app bell is one of the four toggles, there's no separate master switch), and which of six event types you want at all:</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -146,37 +146,37 @@
               <div class="hd-card" style="max-width:560px;">
                 <div class="head">Notifications</div>
                 <div style="padding:16px 18px;">
-                  <div class="hd-toggle on" data-anno="1" data-anno-pin="r" data-anno-arrow style="justify-content:space-between;width:100%;flex-direction:row-reverse;"><span class="sw"></span><span style="font-weight:500;color:var(--gray-700)">Show in-app notifications</span></div>
-                  <p class="hd-help" style="margin:6px 0 16px;">The master switch. Off = the bell goes silent but keeps history.</p>
-                  <div style="border-top:1px solid var(--gray-100);padding:14px 0;" data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
+                  <div style="padding-bottom:14px;" data-anno="1" data-anno-pin="r" data-anno-arrow data-anno-color="blue">
                     <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--gray-400);margin-bottom:8px;">Channels</div>
                     <div style="display:flex;gap:18px;flex-wrap:wrap;">
-                      <span class="hd-toggle on" style="gap:7px;"><span class="sw"></span>In-app</span>
+                      <span class="hd-toggle on" style="gap:7px;"><span class="sw"></span>Show in-app notifications</span>
                       <span class="hd-toggle on" style="gap:7px;"><span class="sw"></span>Email</span>
                       <span class="hd-toggle" style="gap:7px;"><span class="sw"></span>Chat</span>
                       <span class="hd-toggle" style="gap:7px;"><span class="sw"></span>Webhook</span>
                     </div>
                   </div>
-                  <div style="border-top:1px solid var(--gray-100);padding-top:14px;" data-anno="3" data-anno-pin="l" data-anno-arrow>
+                  <div style="border-top:1px solid var(--gray-100);padding-top:14px;" data-anno="2" data-anno-pin="l" data-anno-arrow>
                     <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--gray-400);margin-bottom:8px;">Events</div>
-                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation lifecycle</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation confirmed</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation updated</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation cancelled</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation completed</div>
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation expiring soon</div>
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--gray-300);border-radius:4px"></span> Device health changed</div>
                   </div>
-                  <div style="margin-top:14px;"><span class="hd-btn primary sm" data-anno="4" data-anno-pin="t" data-anno-arrow>Save</span></div>
+                  <div style="margin-top:14px;"><span class="hd-btn primary sm" data-anno="3" data-anno-pin="t" data-anno-arrow>Save</span></div>
                 </div>
               </div>
             </div>
           </div>
         </div>
       </div>
-      <p class="shotcap"><b>The Notifications settings.</b> Master switch on top, per-event checkboxes below.</p>
+      <p class="shotcap"><b>The Notifications settings.</b> Channel toggles on top, six per-event checkboxes below.</p>
     </figure>
 
     <ol class="legend">
-      <li><b>Show in-app notifications.</b> The master toggle. Turn it off to silence the bell entirely without deleting your history.</li>
-      <li><b>Channels.</b> Per-channel on/off. In-app and email shown on here; chat and webhook off. Each is independent, and outbound ones start off until you enable them.</li>
-      <li><b>Per-event toggles.</b> Opt out of whole event families. Here, device-health is unchecked. Anything unchecked stops arriving; missing entries default to on.</li>
+      <li><b>Channels.</b> Four independent toggles: in-app, email, chat, webhook. There's no separate master switch; turning off "Show in-app notifications" silences just the bell (without deleting history), the same way turning off email only stops email. In-app and email are on here; chat and webhook are off, and outbound channels start off until you enable them.</li>
+      <li><b>Per-event toggles.</b> Six individual checkboxes: the five reservation lifecycle events (confirmed, updated, cancelled, completed, expiring soon) plus device health changed. Here, device-health is unchecked. Anything unchecked stops arriving; missing entries default to on.</li>
       <li><b>Save.</b> Applies to new events immediately &mdash; no restart, no reload.</li>
     </ol>
 

@@ -330,7 +330,7 @@ The **notifications** service consumes two NATS streams with distinct durable co
 
 ## Frontend
 
-- **State**: Zustand stores (auth, topology). TanStack Query for server state.
+- **State**: Zustand stores (`authStore`, `topologyStore`, `configStore`, `preferencesStore`). TanStack Query for server state.
 - **Forms**: mostly uncontrolled inputs with submit handlers; React Hook Form is not used.
 - **Modals**: native `<dialog>` with two primitives (`Modal`, `ConfirmDialog`). Both use a callback ref so the native `cancel` listener survives parent re-renders.
 - **Canvas**: React Flow (`@xyflow/react`) with a custom `DeviceNode` and `LayerEdge`.
@@ -371,8 +371,8 @@ HERD is built as 12 independent services rather than a modular monolith. This se
 ### What that costs
 
 - **Cross-service queries are HTTP, not SQL.** The reservations service's reporting `by_group` rollup is N+1 (one call per distinct user) where a modular monolith would JOIN a single `auth.users` table once. The cross-service cost is paid in latency and code complexity.
-- **Nine Alembic migration trees, ten Dockerfiles, nine service configurations.** The nine DB-backed services each own a migration tree and an `app/config.py`; `config` ships a Dockerfile but has no database or Alembic tree, and `common` is a shared library with neither a Dockerfile nor a config. Cross-cutting changes (a new common field, a logging format change, a dependency bump) touch multiple services. Integration tests are the only end-to-end validation path for cross-service flows.
-- **Operational surface.** A first-time deployer brings up a Postgres with 9 schemas, NATS with the `HERD_RESERVATIONS` and `HERD_HEALTH` streams plus three DLQ subjects, and 10 service containers behind Traefik. The `config` service mitigates this by handling first-start setup through the UI, but the surface itself is real.
+- **Eleven Alembic migration trees, twelve Dockerfiles, eleven service configurations.** The eleven DB-backed services each own a migration tree and an `app/config.py`; `config` ships a Dockerfile but has no database or Alembic tree, and `common` is a shared library with neither a Dockerfile nor a config. Cross-cutting changes (a new common field, a logging format change, a dependency bump) touch multiple services. Integration tests are the only end-to-end validation path for cross-service flows.
+- **Operational surface.** A first-time deployer brings up a Postgres with 11 schemas, NATS with the `HERD_RESERVATIONS` and `HERD_HEALTH` streams plus four DLQ subjects, and 12 service containers behind Traefik. The `config` service mitigates this by handling first-start setup through the UI, but the surface itself is real.
 - **For a single-deployer adoption, a modular monolith would have lower operational overhead.** That is a fair criticism and acknowledged here.
 
 ### When the microservice trade-off pays off

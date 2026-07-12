@@ -17,32 +17,12 @@ correctness, performance, source-vs-symptom).
 
 ## Security
 
-Security work is tracked in three filed issues; the highest-severity item should be
-treated as release-blocking.
-
-- **Config service session token is forgeable (CRITICAL, [#246](https://github.com/vendrabuck/HERD/issues/246)).**
-  `services/config/app/auth.py:10` signs and verifies config-session tokens with a
-  hardcoded constant checked into source, and the config write surface
-  (`PUT /settings`, `POST /apply`, `POST /change-password`) is guarded only by that
-  session and routed on the public gateway. An unauthenticated remote caller can forge a
-  session and, at minimum, restart the whole stack (a DoS primitive via the mounted
-  Docker socket), lock the operator out, and read all non-secret config. Fix: derive the
-  session secret at process start (or from a required env var), never ship a constant, and
-  close or re-authenticate the write surface after first-boot.
-- **Device credentials returned in cleartext to any viewer (HIGH, [#247](https://github.com/vendrabuck/HERD/issues/247)).**
-  `services/inventory/app/routers/devices.py:74` returns `field_data` verbatim, including
-  `password`-typed fields, to any authenticated user who can see the device. The rest of
-  the system already treats these as secret (execution redacts them, the AI orchestrator
-  strips them, bulk export is admin-gated for exactly this reason). Fix: redact
-  password-typed keys on the non-admin read path, or expose them only over the
-  internal-token path execution already uses. This is distinct from the encrypted-store
-  roadmap item ([#39](https://github.com/vendrabuck/HERD/issues/39)); encryption at rest
-  does not fix an over-broad read audience.
-- **API token keeps its role after the principal is demoted (MEDIUM, [#248](https://github.com/vendrabuck/HERD/issues/248)).**
-  `services/auth/app/services/api_token_service.py:67-103` re-mints access JWTs with the
-  token's snapshotted role and never re-checks the principal's current role, and demotion
-  does not revoke tokens. Fix: clamp the minted role to `min(token.role, principal.role)`
-  at exchange time.
+The three issues previously tracked here (config session-secret forgeability #246,
+cleartext `field_data` password read #247, api-token role clamp #248) have all closed and
+are pruned per this doc's own rule. Remaining security-adjacent work is tracked in the
+issue queue rather than here (at the time of this refresh: the non-constant-time
+internal-token comparison noted below, and the assistant message-retention decision in
+[#338](https://github.com/vendrabuck/HERD/issues/338)).
 
 Two lower-severity observations were examined and deliberately not filed as bugs, but are
 worth noting for a hardening pass: most services compare the internal token with `!=`

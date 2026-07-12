@@ -78,7 +78,7 @@ make up
 ```
 
 This runs `docker compose up --build -d` which:
-- Builds all service images (config, auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, frontend)
+- Builds all service images (config, auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, integration, secrets, frontend)
 - Starts PostgreSQL 16, NATS JetStream, Traefik, and all application containers
 - Each service auto-creates its database tables on startup via SQLAlchemy `create_all`
 - The auth service seeds the superadmin account on first startup
@@ -96,8 +96,8 @@ make prod
 docker compose ps
 ```
 
-All containers should show `(healthy)`. Expect 14 services:
-postgres, nats, traefik, config, auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, frontend.
+All containers should show `(healthy)`. Expect 16 services:
+postgres, nats, traefik, config, auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, integration, secrets, frontend.
 
 Check logs if any service is unhealthy:
 
@@ -110,7 +110,7 @@ make logs
 - Web UI: `https://<your-host-ip>` (or `https://localhost`)
 - HTTP auto-redirects to HTTPS
 - Traefik dashboard: `http://<your-host-ip>:8080`
-- API endpoints: `https://<your-host-ip>/api/auth`, `/api/inventory`, `/api/reservations`, `/api/cabling`, `/api/acl`, `/api/execution`, `/api/ai`, `/api/config`, `/api/notifications`, `/api/user-profile`
+- API endpoints: `https://<your-host-ip>/api/auth`, `/api/inventory`, `/api/reservations`, `/api/cabling`, `/api/acl`, `/api/execution`, `/api/ai`, `/api/config`, `/api/notifications`, `/api/user-profile`, `/api/v1`, `/api/secrets`
 
 Log in with the superadmin credentials you set in `.env`.
 
