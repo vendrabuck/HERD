@@ -19,7 +19,10 @@ correctness, performance, source-vs-symptom).
 
 The three issues previously tracked here (config session-secret forgeability #246,
 cleartext `field_data` password read #247, api-token role clamp #248) have all closed and
-are pruned per this doc's own rule. No CRITICAL or HIGH security items are open today.
+are pruned per this doc's own rule. Remaining security-adjacent work is tracked in the
+issue queue rather than here (at the time of this refresh: the non-constant-time
+internal-token comparison noted below, and the assistant message-retention decision in
+[#338](https://github.com/vendrabuck/HERD/issues/338)).
 
 Two lower-severity observations were examined and deliberately not filed as bugs, but are
 worth noting for a hardening pass: most services compare the internal token with `!=`
