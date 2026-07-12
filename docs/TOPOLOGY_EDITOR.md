@@ -16,7 +16,7 @@ The palette is a floating, collapsible panel in the upper-left of the canvas. Yo
 
 The palette lists every DUT (Management-connection device) you have visibility on:
 
-- Already-reserved exclusive devices are hidden by default. Toggle **Show reserved resources** to include them.
+- Already-reserved exclusive devices are shown by default. Toggle **Show reserved resources** off to hide them.
 - Filters: search, template dropdown, topology type dropdown.
 - Search matches the device name (a case-insensitive substring match); it does not search field values.
 - Devices already on the canvas are hidden from the palette. Removing a node from the canvas restores it to the palette.
@@ -45,7 +45,13 @@ Click-and-drag from one device's handle to another's. A **Connection Modal** ope
 
 ### Topology-type enforcement
 
-Physical and cloud devices cannot be mixed in a single topology. This is enforced at the UI (invalid drops are blocked with a toast), in the reservation service (create-reservation validates uniformity), and in the database (topology_type enum).
+Physical and cloud devices cannot be mixed in a single topology. Dropping a device onto
+the canvas is never blocked by topology type; the check runs when you connect an edge
+between two devices. Drawing an edge between a physical and a cloud device is rejected
+with a toast (`Cannot connect PHYSICAL and CLOUD devices: topology types must match`)
+and the edge is not created. The reservation service also validates uniformity at
+create-reservation time, and the database enforces the `topology_type` enum, so the rule
+holds even if a client bypassed the editor.
 
 ## Edge visual indicators
 
@@ -70,7 +76,10 @@ You can also see pathfinding output per reservation on the **Routes** tab of the
 
 ## Saving
 
-Click **Save** in the toolbar. The first save prompts for a topology name. Subsequent saves update the existing topology.
+A topology's name is set once, at creation, on the Topology list page (**New topology**);
+the editor itself never prompts for a name. Click **Save** in the editor toolbar and an
+optional change-description field appears; leave it blank or describe what changed, then
+confirm. Every save updates the existing topology.
 
 The canvas is persisted by the cabling service under `/cabling/topologies/{id}`; the payload includes node positions, edge layers, and the currently selected layer filter. When you reopen the topology, the canvas loads exactly as you left it.
 
@@ -79,9 +88,9 @@ The canvas is persisted by the cabling service under `/cabling/topologies/{id}`;
 Every save writes a new version unless the canvas is byte-identical to the previous save, so you can roll back without cluttering the list with no-op entries.
 
 - Open the **History** sidebar from the toolbar to see the full version list (newest first), with the author name and saved timestamp.
-- **Preview** opens a version in a read-only view so you can check the state before restoring.
-- **Restore** rolls the current canvas back to that version. Restore is blocked when an active or pending reservation still references the topology; cancel or wait for the reservation to release and try again. The confirmation dialog lets you add a restore note and optionally restore the topology name as well; the restored version is saved as a new entry at the top of the list and marked "restored from v<N>".
-- **Compare**: tick exactly two versions and click Compare to see three sections: **Added**, **Removed**, **Modified** (with before/after JSON for each modified node or edge).
+- **View** opens a version in a read-only view so you can check the state before restoring; the button reads **Previewing** while that version is open.
+- **Restore** rolls the current canvas back to that version. Restore is blocked when an active or pending reservation still references the topology; cancel or wait for the reservation to release and try again. The confirmation dialog's optional description field is pre-filled with the placeholder "Restored from v<N>" and lets you optionally restore the topology name as well; the restored version is saved as a new entry at the top of the list.
+- **Compare**: tick exactly two versions and click Compare to see six sections: **Nodes added**, **Nodes removed**, **Nodes modified**, **Edges added**, **Edges removed**, **Edges modified** (with before/after JSON for each modified node or edge).
 
 Permissions: restoring requires admin or the topology's original creator; any authenticated user with read access to the topology can view the version list and run a diff.
 
@@ -94,13 +103,13 @@ If the AI orchestrator is configured, the toolbar includes a **Use AI** button. 
 - Pan: drag empty canvas
 - Select node: click
 - Multi-select: shift-click or drag-box
-- Delete selected: `Delete` / `Backspace`
+- Delete selected: `Delete` (the editor binds only `Delete`; `Backspace` does not delete)
 - Connect: drag from node handle to another node
-- Zoom: mouse wheel or the `+`/`-` buttons in the bottom-right mini-map
+- Zoom: mouse wheel, or the `+`/`-` controls in the bottom-left of the canvas. The mini-map sits in the bottom-right and is view-only (no zoom buttons of its own).
 
 ## Common issues
 
-- **"Can't drop the device here"**: you're trying to mix a physical device with a cloud device in the same topology. Create a separate topology for each topology type.
+- **"Cannot connect PHYSICAL and CLOUD devices: topology types must match"**: you tried to draw an edge between a physical device and a cloud device. Dropping both device types onto the same canvas is allowed; only connecting them is blocked. Create a separate topology for each topology type if you need to wire them independently.
 - **Palette is empty**: you have no device visibility. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#empty-device-list) and ask an admin to assign your user group to the relevant device group.
 - **Edge stays red with "no path" on L1**: either no physical cabling connects the two DUTs, or the switches between them are missing from inventory. Ask an admin to verify cabling entries.
 - **Edge has "uncabled port" badge**: the selected port has no physical connection recorded. Choose a different port or ask an admin to record the cabling.

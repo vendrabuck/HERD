@@ -108,7 +108,7 @@ If you run a service on a different host or port, update the URL in `.env` or th
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CORS_ORIGINS` | `https://localhost` | Comma-separated origins allowed by every backend's CORS middleware. Add your real hostname or IP to enable cross-host access. |
+| `CORS_ORIGINS` | `""` in code; `https://localhost` at the docker-compose level | Comma-separated origins allowed by every backend's CORS middleware. Each service's `app/config.py` defaults to an empty string; `docker-compose.yml` supplies `${CORS_ORIGINS:-https://localhost}` for every service, so a fresh `.env` (which also sets `CORS_ORIGINS=https://localhost`) gets `https://localhost` in practice. Add your real hostname or IP to enable cross-host access. |
 
 TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env var for cert paths. See [OPERATIONS.md](OPERATIONS.md#tls-certificate-rotation).
 
@@ -169,7 +169,7 @@ The orchestrator gained its first DB-backed feature in the multi-turn chat work;
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | (required) | Async Postgres URL, e.g. `postgresql+asyncpg://herd:...@postgres:5432/herd`. Provided by docker-compose. |
+| `DATABASE_URL` | `sqlite+aiosqlite:///:memory:` | Async Postgres URL, e.g. `postgresql+asyncpg://herd:...@postgres:5432/herd`. The in-code default is an in-memory SQLite URL (used by the service's own unit tests); docker-compose always supplies a real Postgres URL for the running stack. |
 | `DB_SCHEMA` | `ai_orchestrator` | Per-service schema for the orchestrator's tables. |
 
 ### Switching to a local LLM via vLLM
@@ -316,6 +316,19 @@ The notifications service runs two durable NATS consumers: one on `herd.reservat
 | `CALENDAR_MAX_SPAN_DAYS` | `366` | `GET /calendar` has no `LIMIT` and no pagination, so a window (`range_end - range_start`) wider than this is rejected (422) rather than silently loading and holding an unbounded result set in memory (issue #315). `0` disables the cap. |
 
 The execution service runs the same outbox relay for the `device.health_transition` event, but it uses the `herd_common.outbox.run_outbox_relay` defaults (5s tick, 100 batch, 7-day retention) and exposes no environment overrides today.
+
+## Integration service
+
+The integration service (issue #33) exposes the versioned `/api/v1` external reservation
+facade and fans reservation lifecycle events out to admin-registered outbound webhooks,
+consumed via its own NATS durable consumer.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DB_SCHEMA` | `integration` | Per-service schema for the integration service's tables. |
+| `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` | `10.0` | HTTP timeout for a single outbound webhook delivery attempt. |
+| `WEBHOOK_DELIVERY_ATTEMPTS` | `4` | Maximum delivery attempts (including the first) before a webhook delivery is recorded as dead-lettered. |
+| `WEBHOOK_TEST_SINK_ENABLED` | `false` | When true, exposes a test-only sink endpoint used to assert webhook deliveries in integration tests. Leave off outside test environments. |
 
 ## Frontend (Vite build-time)
 

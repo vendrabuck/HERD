@@ -108,8 +108,8 @@
               <div class="mhead"><h2>Upload driver</h2><span class="x">&times;</span></div>
               <div class="mbody">
                 <div class="hd-field"><label class="hd-label">Name</label><div class="hd-input" data-anno="1" data-anno-pin="r" data-anno-arrow>juniper-fw-mgmt</div><p class="hd-help">Unique. You'll pick this from templates later.</p></div>
-                <div class="hd-field"><label class="hd-label">Connection type</label><div class="hd-select" data-anno="2" data-anno-pin="r" data-anno-arrow>Management</div><p class="hd-help">Management = DUTs. Layer 1/2/3 Switch = infrastructure.</p></div>
-                <div class="hd-field"><label class="hd-label">Package file</label><div style="border:1px dashed var(--gray-300);border-radius:var(--radius-lg);padding:14px;text-align:center;color:var(--gray-400);font-size:13px;" data-anno="3" data-anno-pin="l" data-anno-arrow data-anno-color="blue">juniper-fw-mgmt.tar.gz</div><p class="hd-help">.zip or .tar.gz, up to 10 MB.</p></div>
+                <div class="hd-field"><label class="hd-label">Connection type</label><div class="hd-select" data-anno="2" data-anno-pin="r" data-anno-arrow>Management</div><p class="hd-help">Management = DUTs. Layer 1/2/3 Switch = infrastructure. Hypervisor = a dynamic-resources recipe driver.</p></div>
+                <div class="hd-field"><label class="hd-label">File (.zip or .tar.gz)</label><div style="border:1px dashed var(--gray-300);border-radius:var(--radius-lg);padding:14px;text-align:center;color:var(--gray-400);font-size:13px;" data-anno="3" data-anno-pin="l" data-anno-arrow data-anno-color="blue">juniper-fw-mgmt.tar.gz</div><p class="hd-help">.zip or .tar.gz, up to 10 MB.</p></div>
               </div>
               <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Upload</span></div>
             </div>
@@ -121,7 +121,7 @@
 
     <ol class="legend">
       <li><b>Name.</b> Unique and descriptive &mdash; e.g. <code>juniper-fw-mgmt</code>. Templates reference it by this name.</li>
-      <li><b>Connection type.</b> The big decision: <code>Management</code> for DUTs you reserve, or <code>Layer 1/2/3 Switch</code> for infrastructure.</li>
+      <li><b>Connection type.</b> The big decision: <code>Management</code> for DUTs you reserve, <code>Layer 1/2/3 Switch</code> for infrastructure, or <code>Hypervisor</code> for a dynamic-resources recipe driver.</li>
       <li><b>The package.</b> A <code>.zip</code> or <code>.tar.gz</code> (&le; 10 MB). Validated on first use.</li>
       <li><b>Upload.</b> Stored locally (or in object storage if configured).</li>
     </ol>

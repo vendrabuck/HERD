@@ -1205,7 +1205,7 @@ Authorization: Bearer <admin-token>
 | `/api/auth/register` | POST | open | open | open |
 | `/api/auth/login` | POST | open | open | open |
 | `/api/auth/refresh` | POST | open | open | open |
-| `/api/auth/logout` | POST | yes | yes | yes |
+| `/api/auth/logout` | POST | open | open | open |
 | `/api/auth/me` | GET | yes | yes | yes |
 | `/api/auth/groups` | GET | yes | yes | yes |
 | `/api/auth/groups/{id}` | GET | yes | yes | yes |
@@ -1268,9 +1268,12 @@ Authorization: Bearer <admin-token>
 | `/api/reservations/` | GET | yes | yes | yes |
 | `/api/reservations/calendar` | GET | yes | yes | yes |
 | `/api/reservations/{id}` | GET | yes | yes | yes |
+| `/api/reservations/{id}` | PATCH | yes (owner only) | yes (owner only) | yes (owner only) |
 | `/api/reservations/{id}` | DELETE | yes | yes | yes |
 | `/api/reservations/{id}/release` | PUT | yes | yes | yes |
 | `/api/reservations/internal/{id}/provision-result` | POST | internal | internal | internal |
+| `/api/reservations/reports/utilization` | GET | | yes | yes |
+| `/api/reservations/reports/utilization.csv` | GET | | yes | yes |
 | `/api/cabling/connections` | GET | yes | yes | yes |
 | `/api/cabling/connections/{id}` | GET | yes | yes | yes |
 | `/api/cabling/connections` | POST | | yes | yes |
@@ -1300,6 +1303,11 @@ Authorization: Bearer <admin-token>
 | `/api/acl/health` | GET | open | open | open |
 | `/api/execution/health` | GET | open | open | open |
 | `/api/user-profile/health` | GET | open | open | open |
+
+`POST /api/auth/logout` carries no auth dependency; it revokes the refresh token passed
+in the request body, mirroring `/login` and `/refresh`. `PATCH /api/reservations/{id}`
+is owner-scoped: any authenticated user may call it, but the update only ever applies to
+a reservation the caller owns (404 otherwise), with no admin bypass.
 
 ---
 

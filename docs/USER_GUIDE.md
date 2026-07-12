@@ -16,7 +16,7 @@ This guide walks a lab engineer through day-to-day use of HERD. If you are an ad
 
 1. Open `https://<your-host>` (e.g. `https://localhost` for a local install).
 2. The first time the site loads, you may see a banner about the system not being configured; that is for administrators. If you see it and the login form is disabled, ask your admin to finish the [config-service first-run](OPERATIONS.md#config-service-first-run).
-3. Click **Register** if you do not have an account, or **Log in** if you do. Registration gives you the default `user` role; promoting users to `admin` is handled by a superadmin (see [ROLES.md](ROLES.md)). If your admin has wired HERD up to your company's directory (LDAP / Active Directory), **Register** is disabled and your account is created automatically the first time you log in with your directory credentials; type your directory username (not necessarily your email) into the login form.
+3. Click **Register** if you do not have an account, or **Log in** if you do. Registration gives you the default `user` role; promoting users to `admin` is handled by a superadmin (see [ROLES.md](ROLES.md)). If your admin has wired HERD up to your company's directory (LDAP / Active Directory), the **Register** button still renders, but the backend rejects it with 409; your account is instead created automatically the first time you log in with your directory credentials, so use **Log in** and type your directory username (not necessarily your email) into the form.
 
 ### What you can see
 
@@ -95,28 +95,28 @@ Useful for finding a free window before creating a reservation.
 
 ### Reporting (admins only)
 
-**Reporting** in the nav is admin-only. It shows a utilization report for a 7-day, 30-day, or custom window: total reservation-hours, reservations counted, and execution runs at the top; a daily trend chart; a fleet utilization card with per-device utilization rates and an idle-device filter; tables broken out by user, device, group (cost center), topology type, and template; and CSV download per table. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#utilization-report).
+**Reporting** appears in the nav for every signed-in user, but the page itself denies
+non-admins (you'll be redirected if you land on it without the role). It shows a
+utilization report for a 7-day, 30-day, or custom window: total reservation-hours, reservations counted, and execution runs at the top; a daily trend chart; a fleet utilization card with per-device utilization rates and an idle-device filter; tables broken out by user, device, group (cost center), topology type, and template; and CSV download per table. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#utilization-report).
 
 ## Inventory
 
-The Inventory page lists devices you have visibility on. Each row shows:
+The Inventory page lists devices you have visibility on. The table has five columns:
 
-- Device name
-- Template (what it is)
-- Connection type (Management / Layer 1/2/3 Switch); regular users only see Management devices (DUTs)
-- Current status (`AVAILABLE`, `RESERVED`, etc.)
-- Topology type (`PHYSICAL` or `CLOUD`)
+- Name
+- Template
+- Topology (`PHYSICAL` or `CLOUD`)
+- Status (`AVAILABLE`, `RESERVED`, etc.)
+- ID
 
 Expand a row to see device audit info (who created/modified, when), device-group membership, and the device's ports. Each port row includes a **Connected To** link if the port is cabled to another device.
 
 Click a row to open the device detail page. A left-hand sidebar on that page shows the same audit and group information (created / modified dates, created-by and modified-by names, device groups, and the user groups that have access through each device group), so you do not need to navigate back to the table to see it.
 
-Filters at the top:
-
-- Search by name
-- Template dropdown
-- Topology type dropdown
-- "Show reserved" toggle (hides exclusive devices that are currently reserved)
+The Inventory page's only filter is a name search box (a case-insensitive substring
+match). The template dropdown, topology-type dropdown, and "Show reserved" toggle live
+in the topology editor's equipment palette (Equipment Browser), not on this page; see
+[TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#the-equipment-palette).
 
 ## Topology editor
 
@@ -130,9 +130,9 @@ See [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md) for the full walkthrough. In short:
 
 ## AI topology generation (optional feature)
 
-If your admin has enabled the Anthropic API integration, the topology editor gets a **Use AI** button. It takes a prompt (plus optional reference files) and proposes a topology you can accept, modify, or reject. See [AI_GENERATE.md](AI_GENERATE.md) for details.
+If your admin has configured an AI provider, the topology editor gets a **Use AI** button. It takes a prompt (plus optional reference files) and proposes a topology you can accept, modify, or reject. See [AI_GENERATE.md](AI_GENERATE.md) for details.
 
-If the button isn't there, the feature is off on this deployment (the backend's `AI_API_KEY` is blank). Nothing you can do as a user; ask your admin if it should be enabled.
+If the button isn't there, the feature is off on this deployment. The check is `ai_is_configured()`: for the default `anthropic` provider, either `AI_API_KEY` (hosted API) or `AI_BASE_URL` (a local Anthropic-compatible endpoint) being set is enough; for `openai_compat`, `AI_BASE_URL` must be set. Nothing you can do as a user; ask your admin if it should be enabled.
 
 ## Notifications
 
