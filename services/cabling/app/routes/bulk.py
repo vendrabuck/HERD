@@ -2,9 +2,10 @@
 
 Export streams every topology as CSV (a flat edge list) or JSON (the full canvas
 with device references carried by name). Import accepts an uploaded file,
-resolves device names to local ids via the inventory service, recreates each
-topology, and runs the existing validator so an unreachable edge is rejected.
-A dry_run import writes nothing and returns the per-row report.
+resolves device names to local ids via the inventory service, creates or updates
+each topology by name (a re-imported export updates the original rather than
+duplicating it), and runs the existing validator so an unreachable edge is
+rejected. A dry_run import writes nothing and returns the per-row report.
 
 RBAC matches the interactive topology surface: creating topologies is open to any
 authenticated user, so import is too; export likewise. The per-topology
@@ -68,12 +69,17 @@ async def import_topologies_endpoint(
 ):
     """Import topologies from CSV or JSON.
 
-    Each topology is validated through the existing build_adjacency_graph /
-    validate path before any write; one with an unreachable edge is rejected.
+    Each topology is matched by name: an existing topology is updated in place
+    (appending a new version), otherwise a new one is created. Each is validated
+    through the existing build_adjacency_graph / validate path before any write;
+    one with an unreachable edge is rejected. A topology held by another user's
+    active reservation is not silently rewired: a would-be update to its wiring
+    is rejected per-row (admins bypass this, matching the interactive PUT).
     Per-row error handling keeps one bad topology from aborting the batch. With
     dry_run=true nothing is written and the full report is returned.
     """
     raw = await file.read()
     actor_id = uuid.UUID(payload["sub"])
     actor_name = payload.get("username", "")
-    return await import_topologies(db, raw, format, dry_run, actor_id, actor_name)
+    actor_role = payload.get("role", "user")
+    return await import_topologies(db, raw, format, dry_run, actor_id, actor_name, actor_role)

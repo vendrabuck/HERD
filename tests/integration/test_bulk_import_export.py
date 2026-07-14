@@ -167,7 +167,9 @@ async def test_topology_import_rejects_unknown_device_name(admin_client):
 @pytest.mark.asyncio
 async def test_topology_export_roundtrips_isolated_node(admin_client, fresh_device):
     """A topology with a single device node (no edges) exports and re-imports,
-    resolving the device by name on the way back in."""
+    resolving the device by name on the way back in. Re-importing the exported
+    file updates the original in place by name rather than creating a duplicate
+    (issue #336)."""
     name = f"int-bulk-rt-{uuid.uuid4().hex[:8]}"
     create = await admin_client.post("/cabling/topologies", json={"name": name})
     assert create.status_code == 201, create.text
@@ -184,7 +186,6 @@ async def test_topology_export_roundtrips_isolated_node(admin_client, fresh_devi
         ],
         "edges": [],
     }
-    imported_id = None
     try:
         upd = await admin_client.put(f"/cabling/topologies/{tid}", json={"canvas_data": canvas})
         assert upd.status_code == 200, upd.text
@@ -209,13 +210,13 @@ async def test_topology_export_roundtrips_isolated_node(admin_client, fresh_devi
             },
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json()["created"] == 1
+        report = resp.json()
+        # Update-by-name: the existing topology is updated, not duplicated.
+        assert report["updated"] == 1
+        assert report["created"] == 0
         listing = await admin_client.get("/cabling/topologies", params={"limit": 500})
         dupes = [t for t in listing.json()["items"] if t["name"] == name]
-        # Two now exist: the original and the imported copy.
-        assert len(dupes) >= 2
-        imported_id = next(t["id"] for t in dupes if t["id"] != tid)
+        assert len(dupes) == 1, "re-import must update the original, not duplicate it"
+        assert dupes[0]["id"] == tid
     finally:
         await admin_client.delete(f"/cabling/topologies/{tid}")
-        if imported_id:
-            await admin_client.delete(f"/cabling/topologies/{imported_id}")

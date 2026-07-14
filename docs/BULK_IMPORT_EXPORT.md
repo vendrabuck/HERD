@@ -63,8 +63,10 @@ Every import returns a `BulkImportReport`:
 
 - `create`: a new resource would be (dry-run) or was (commit) created.
 - `update`: a resource matched by identity would be or was updated.
-- `skip`: reserved for byte-identical matches; not currently emitted by the
-  inventory importers, which always update on an identity match.
+- `skip`: reserved for byte-identical matches; not currently emitted by any
+  importer, which all report `update` on an identity match (the topology
+  importer treats a byte-identical re-import as a no-op update rather than a
+  `skip`).
 - `reject`: the row failed validation or reference resolution. The `reason`
   explains why. A reject never aborts the batch; every other row is still
   processed. Import is per-row transactional: a rejected row is rolled back and
@@ -147,12 +149,22 @@ JSON is the lossless round-trip format. Each item is a topology `name` plus its
 `data.device.id` is replaced by the device `name` under `data.device.name`; on
 import, that name resolves back to a local device id.
 
-Unlike devices and templates, topology import is **create-only today**: there is no
-name-based update-matching branch, so every import row always creates a new topology,
-even when a topology with the same `name` already exists. Re-importing the same file
-creates duplicate topologies rather than updating the original. The `identity` field on
-each row's report entry is still the topology `name`, but the `action` will always read
-`create`, never `update`.
+Topology import is update-by-name, matching devices and templates: a row whose
+`name` already exists updates that topology in place (rewriting its canvas and
+appending a new version), while a new `name` creates a new topology. Re-importing
+an exported file therefore updates the originals rather than creating duplicates,
+and each row's report `action` reads `update` or `create` accordingly. A
+byte-identical re-import is a no-op update (no new version is appended). If
+historical create-only imports left duplicate names behind, the update targets
+the earliest-created topology of that name.
+
+Update safety mirrors the interactive `PUT /topologies/{id}` reservation-scoped
+lock: a topology whose wiring would change while it is held by an active
+reservation owned by another user is not silently rewired. That row is rejected
+with the reason `topology is in use by an active reservation owned by another
+user; bulk import cannot rewire it`, and the rest of the batch still processes.
+Admins bypass this lock, and a user's own reservation never blocks their own
+import, exactly as the interactive edit path behaves.
 
 ```json
 {
