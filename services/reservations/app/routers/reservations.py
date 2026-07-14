@@ -6,6 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -231,7 +232,7 @@ async def owns_active_reservation_for_device(
     time-window check stays in Python so naive timestamps from the SQLite
     test backend are normalized to UTC consistently with Postgres.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
     now = datetime.now(timezone.utc)
@@ -275,7 +276,7 @@ async def list_active_reservation_users_for_device(
     Deduplicates: a user with multiple active reservations on the same
     device appears once.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
     now = datetime.now(timezone.utc)
@@ -319,7 +320,7 @@ async def list_reservations_for_topology(
     holds across visibility boundaries. Declared before /internal/{reservation_id}
     so the literal "by-topology" segment is not parsed as a reservation id.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     result = await db.execute(select(Reservation).where(Reservation.topology_id == topology_id))
     return [
@@ -345,7 +346,7 @@ async def get_reservation_internal_status(
     Guarded by X-Internal-Token. Returns status + is_active boolean (status ACTIVE
     AND within window) so callers do not need to replicate active-window logic.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     reservation = await db.get(Reservation, reservation_id)
     if not reservation:
@@ -384,7 +385,7 @@ async def post_provision_result(
     resurrects a reservation the timeout backstop or a user cancel already
     moved on.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     reservation, applied = await apply_provision_result(
         db,

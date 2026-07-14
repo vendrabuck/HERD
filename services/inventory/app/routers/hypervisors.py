@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -76,7 +77,7 @@ async def get_hypervisor_internal(
     x_internal_token: str = Header(...),
 ):
     """Get a hypervisor for service-to-service use, guarded by the internal token."""
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     hypervisor = await get_hypervisor(db, hypervisor_id)
     if not hypervisor:

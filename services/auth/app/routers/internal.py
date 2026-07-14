@@ -6,11 +6,11 @@ users by role without holding a real admin JWT. Token-only auth, no
 user context.
 """
 
-import hmac
 import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from herd_common.internal_auth import internal_token_matches
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,11 +40,10 @@ router = APIRouter(tags=["internal"])
 def _require_internal_token(x_internal_token: str = Header(...)) -> None:
     if not settings.internal_api_token:
         raise HTTPException(status_code=503, detail="Internal API token not configured")
-    # Constant-time comparison: a plain `!=` short-circuits on the first
-    # differing byte, leaking length and prefix timing that let an attacker
-    # recover the shared secret byte by byte. hmac.compare_digest runs in time
-    # independent of how many leading bytes match.
-    if not hmac.compare_digest(x_internal_token, settings.internal_api_token):
+    # Constant-time comparison via herd_common.internal_auth: a plain `!=`
+    # short-circuits on the first differing byte, leaking length and prefix
+    # timing that let an attacker recover the shared secret byte by byte.
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
 

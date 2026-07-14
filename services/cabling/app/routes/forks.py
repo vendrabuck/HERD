@@ -9,6 +9,7 @@ See docs/design/0001-editable-reservation-topologies.md (Decision 2).
 """
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +23,7 @@ router = APIRouter(prefix="/internal/forks", tags=["forks"])
 
 
 def _check_internal_token(token: str) -> None:
-    if not settings.internal_api_token or token != settings.internal_api_token:
+    if not internal_token_matches(token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
 

@@ -10,6 +10,7 @@ from herd_common.device_config import (
     validate_device_config,
     validate_device_config_with_schema,
 )
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -205,7 +206,7 @@ async def get_latest_config_version_internal(
     current_config_version_id pointer, which tracks what a configure action
     last applied rather than the newest validated intent.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     await _load_device(db, device_id)
     version = (
