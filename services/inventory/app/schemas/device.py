@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.device import DeviceStatus, TopologyType
 
@@ -10,6 +10,9 @@ from app.models.device import DeviceStatus, TopologyType
 # execution service: scheduling below this is meaningless because the tick
 # rate would dominate.
 MIN_POLL_INTERVAL_SECONDS = 30
+
+# Matches the devices.name column width (String(255), app/models/device.py).
+DEVICE_NAME_MAX_LENGTH = 255
 
 
 def _validate_poll_interval(v: int | None) -> int | None:
@@ -21,7 +24,7 @@ def _validate_poll_interval(v: int | None) -> int | None:
 
 
 class DeviceCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=DEVICE_NAME_MAX_LENGTH)
     template_id: uuid.UUID
     topology_type: TopologyType
     status: DeviceStatus = DeviceStatus.AVAILABLE
@@ -44,13 +47,13 @@ class InternalDeviceCreate(BaseModel):
     # always-create behavior.
     template_id: uuid.UUID
     reservation_id: uuid.UUID
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=DEVICE_NAME_MAX_LENGTH)
     field_data: dict[str, Any] = {}
     request_id: uuid.UUID | None = None
 
 
 class DeviceUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=DEVICE_NAME_MAX_LENGTH)
     topology_type: TopologyType | None = None
     status: DeviceStatus | None = None
     field_data: dict[str, Any] | None = None
