@@ -4,10 +4,15 @@ A topology export is its canvas (nodes plus edges). Because device references
 inside a canvas are raw UUIDs that will not match across instances, export
 rewrites each `node.data.device.id` to the device's name (which the canvas
 already carries as `node.data.device.name`). Import resolves those names back to
-the target instance's device ids over HTTP to the inventory service, recreates
-the topology and canvas, then runs the existing build_adjacency_graph / validate
+the target instance's device ids over HTTP to the inventory service, creates or
+updates the topology by name (a re-imported export updates the original rather
+than duplicating it), then runs the existing build_adjacency_graph / validate
 path so an imported topology with an unreachable edge is rejected exactly as an
 interactively drawn one is.
+
+An update matched by name is guarded by the same reservation-scoped lock as
+PUT /topologies/{id}: a topology held by another user's active reservation is
+not rewired, its row is rejected instead (admins bypass, matching the PUT).
 
 Per-row error handling means one bad topology is rejected with a reason without
 aborting the batch. A dry_run import runs full parsing, name resolution, and
@@ -22,11 +27,23 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.topology import Topology, TopologyVersion
 from app.schemas.bulk import BulkImportReport, RowResult
 from app.services.device_resolver import resolve_device_names
+from app.services.reservation_guard import find_blocking_reservations
+from app.services.version_service import commit_with_new_version
+
+# Pinned reject reason when an import row would rewire a topology currently held
+# by another user's active reservation. Mirrors the reservation-scoped lock on
+# PUT /topologies/{id}: bulk import must never silently rewire a topology out
+# from under a live reservation it does not own.
+_LOCKED_TOPOLOGY_REASON = (
+    "topology is in use by an active reservation owned by another user; "
+    "bulk import cannot rewire it"
+)
 
 # CSV export of a topology is a flat edge list: one row per canvas edge with the
 # endpoint device names. Nodes with no edges are not represented in CSV; CSV is
@@ -241,6 +258,7 @@ async def import_topologies(
     dry_run: bool,
     actor_id: uuid.UUID,
     actor_name: str,
+    actor_role: str = "user",
 ) -> BulkImportReport:
     if fmt == "json":
         records = parse_json_topologies(raw)
@@ -267,6 +285,8 @@ async def import_topologies(
     # Local import of the validator to avoid a circular import at module load
     # (routes/topologies imports nothing from here, but keep the dependency one-way).
     from app.routes.topologies import _run_topology_validation
+
+    is_admin = actor_role in ("admin", "superadmin")
 
     for index, rec in enumerate(records):
         name = (rec.get("name") or "").strip()
@@ -307,27 +327,83 @@ async def import_topologies(
                 )
                 continue
 
-            if not dry_run:
-                topology = Topology(
-                    name=name,
-                    created_by=actor_id,
-                    owner_name=actor_name,
-                    canvas_data=rewritten,
+            # Match by name to update in place, mirroring the inventory device
+            # and template importers so a re-imported export updates the original
+            # rather than creating a silent duplicate (issue #336). Topology names
+            # carry no unique constraint, so historical create-only imports may
+            # have left duplicates; pick the earliest-created row as the canonical
+            # target deterministically rather than raising on multiple matches.
+            existing = (
+                await db.execute(
+                    select(Topology)
+                    .where(Topology.name == name)
+                    .order_by(Topology.created_at.asc(), Topology.id.asc())
+                    .limit(1)
                 )
-                db.add(topology)
-                await db.flush()
+            ).scalar_one_or_none()
+
+            if existing is None:
+                if not dry_run:
+                    topology = Topology(
+                        name=name,
+                        created_by=actor_id,
+                        owner_name=actor_name,
+                        canvas_data=rewritten,
+                    )
+                    db.add(topology)
+                    await db.flush()
+                    snapshot = TopologyVersion(
+                        topology_id=topology.id,
+                        version_number=1,
+                        canvas_data=rewritten,
+                        name=name,
+                        description="Imported via bulk import",
+                        created_by=actor_id,
+                        author_name=actor_name,
+                    )
+                    db.add(snapshot)
+                    await db.commit()
+                report.rows.append(RowResult(row=index, action="create", identity=name))
+                continue
+
+            # Update path. Only a canvas that actually differs rewires the
+            # topology, so a byte-identical re-import is a no-op update (no new
+            # version row, no lock check needed), and the reservation-lock guard
+            # only runs when the wiring would change.
+            canvas_changed = rewritten != (existing.canvas_data or {"nodes": [], "edges": []})
+            if canvas_changed and not is_admin:
+                # Reservation-scoped lock, mirroring PUT /topologies/{id}: a
+                # topology held by another user's active reservation must not be
+                # rewired. The guard fails open if reservations is unreachable.
+                blocking = await find_blocking_reservations(existing.id, "")
+                others = [b for b in blocking if str(b.get("user_id") or "") != str(actor_id)]
+                if others:
+                    report.rows.append(
+                        RowResult(
+                            row=index,
+                            action="reject",
+                            identity=name,
+                            reason=_LOCKED_TOPOLOGY_REASON,
+                        )
+                    )
+                    continue
+
+            if not dry_run and canvas_changed:
+                existing.canvas_data = rewritten
+                existing.modified_by = actor_id
                 snapshot = TopologyVersion(
-                    topology_id=topology.id,
-                    version_number=1,
+                    topology_id=existing.id,
                     canvas_data=rewritten,
                     name=name,
-                    description="Imported via bulk import",
+                    description="Updated via bulk import",
                     created_by=actor_id,
                     author_name=actor_name,
                 )
-                db.add(snapshot)
-                await db.commit()
-            report.rows.append(RowResult(row=index, action="create", identity=name))
+                # version_number is allocated as max+1 under the unique
+                # constraint; commit_with_new_version serializes concurrent
+                # writers rather than risking a raw IntegrityError 500.
+                await commit_with_new_version(db, existing, snapshot)
+            report.rows.append(RowResult(row=index, action="update", identity=name))
         except HTTPException as exc:
             if not dry_run:
                 await db.rollback()
