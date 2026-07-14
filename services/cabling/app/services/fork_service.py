@@ -229,19 +229,26 @@ async def create_fork(
         status=ForkStatus_ACTIVE,
     )
     db.add(fork)
-    await db.flush()
 
-    await _snapshot_connections(db, fork.id, forked_canvas, created_by)
-
-    db.add(
-        ForkVersion(
-            fork_id=fork.id,
-            version_number=1,
-            canvas_data=forked_canvas,
-        )
-    )
-
+    # The guarded region must cover the INSERT, not just the commit (issue #304).
+    # Postgres checks the reservation_id unique constraint at flush time, so on the
+    # concurrent-activation race the loser's IntegrityError surfaces here, at
+    # db.flush(), on the most likely interleavings: it raises immediately if the
+    # winner already committed, or blocks on the winner's uncommitted index entry and
+    # raises when the winner commits. A try wrapping only db.commit() lets that flush
+    # error escape unhandled. _snapshot_connections's autoflushing SELECTs and the
+    # fork_versions insert share the same transaction and constraints, so they belong
+    # inside the guard too.
     try:
+        await db.flush()
+        await _snapshot_connections(db, fork.id, forked_canvas, created_by)
+        db.add(
+            ForkVersion(
+                fork_id=fork.id,
+                version_number=1,
+                canvas_data=forked_canvas,
+            )
+        )
         await db.commit()
     except IntegrityError:
         # A concurrent activation committed its fork first (unique reservation_id).

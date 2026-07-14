@@ -16,18 +16,69 @@ matches the existing convention and avoids holding a row lock across the request
 """
 
 import logging
+import uuid
+from collections.abc import Callable
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
+from app.models.fork import ForkVersion, ReservationFork
 from app.models.topology import Topology, TopologyVersion
 
 logger = logging.getLogger(__name__)
 
 # Each retry recomputes max+1 against the committed rows, so a small cap absorbs
-# realistic contention on a single topology; exhaustion signals a real anomaly.
+# realistic contention on a single scope (one topology, or one fork); exhaustion
+# signals a real anomaly.
 _MAX_ALLOCATE_RETRIES = 5
+
+
+async def _commit_with_new_version(
+    db: AsyncSession,
+    *,
+    version_column: InstrumentedAttribute,
+    scope_column: InstrumentedAttribute,
+    scope_id: uuid.UUID,
+    snapshot: Any,
+    reapply_pending: Callable[[], None],
+    scope_label: str,
+) -> None:
+    """Allocate ``max+1`` under a unique constraint and commit, with bounded retry.
+
+    The shared machinery behind both topology-version and fork-version allocation
+    (issue #25 P3a, ADR 0006 Decision 3). ``version_column`` is the version_number
+    column of the snapshot's model, ``scope_column``/``scope_id`` scope the ``max``
+    query to one owner (topology_id or fork_id), and ``reapply_pending`` re-applies
+    the owner-row field changes a rollback expires. Concurrent writers collide on
+    the unique constraint; the loser rolls back, recomputes ``max+1`` against the
+    now-committed rows, and retries up to ``_MAX_ALLOCATE_RETRIES``. Past the cap the
+    IntegrityError propagates rather than corrupting the version sequence.
+    """
+    for attempt in range(_MAX_ALLOCATE_RETRIES):
+        max_number = (
+            await db.execute(select(func.max(version_column)).where(scope_column == scope_id))
+        ).scalar() or 0
+        snapshot.version_number = max_number + 1
+        db.add(snapshot)
+        try:
+            await db.commit()
+            return
+        except IntegrityError:
+            await db.rollback()
+            if attempt == _MAX_ALLOCATE_RETRIES - 1:
+                logger.warning(
+                    "Version allocation for %s %s exhausted %d retries",
+                    scope_label,
+                    scope_id,
+                    _MAX_ALLOCATE_RETRIES,
+                )
+                raise
+            # Rollback expired both the snapshot's number and the owner-row field
+            # changes; re-apply the owner changes and loop to recompute max+1.
+            reapply_pending()
 
 
 async def commit_with_new_version(
@@ -55,30 +106,47 @@ async def commit_with_new_version(
         "modified_by": topology.modified_by,
     }
 
-    for attempt in range(_MAX_ALLOCATE_RETRIES):
-        max_number = (
-            await db.execute(
-                select(func.max(TopologyVersion.version_number)).where(
-                    TopologyVersion.topology_id == topology.id
-                )
-            )
-        ).scalar() or 0
-        snapshot.version_number = max_number + 1
-        db.add(snapshot)
-        try:
-            await db.commit()
-            return
-        except IntegrityError:
-            await db.rollback()
-            if attempt == _MAX_ALLOCATE_RETRIES - 1:
-                logger.warning(
-                    "Version allocation for topology %s exhausted %d retries",
-                    topology.id,
-                    _MAX_ALLOCATE_RETRIES,
-                )
-                raise
-            # Rollback expired both the snapshot's number and the topology field
-            # changes; re-apply the topology changes and loop to recompute max+1.
-            topology.name = pending_changes["name"]
-            topology.canvas_data = pending_changes["canvas_data"]
-            topology.modified_by = pending_changes["modified_by"]
+    def _reapply() -> None:
+        topology.name = pending_changes["name"]
+        topology.canvas_data = pending_changes["canvas_data"]
+        topology.modified_by = pending_changes["modified_by"]
+
+    await _commit_with_new_version(
+        db,
+        version_column=TopologyVersion.version_number,
+        scope_column=TopologyVersion.topology_id,
+        scope_id=topology.id,
+        snapshot=snapshot,
+        reapply_pending=_reapply,
+        scope_label="topology",
+    )
+
+
+async def commit_fork_with_new_version(
+    db: AsyncSession,
+    fork: ReservationFork,
+    snapshot: ForkVersion,
+) -> None:
+    """Commit a fork mutation together with a freshly numbered fork_versions snapshot.
+
+    The fork analogue of ``commit_with_new_version`` (issue #25 P3a). The caller has
+    already applied its canvas change to `fork` and built `snapshot` with every field
+    set except version_number. Allocation scopes to ``fork_id`` under
+    ``uq_fork_versions_fork_version`` and shares the same rollback-recompute-retry
+    loop, so concurrent saves of one fork serialize on the database exactly as
+    concurrent topology writers do.
+    """
+    pending_changes = {"canvas_data": fork.canvas_data}
+
+    def _reapply() -> None:
+        fork.canvas_data = pending_changes["canvas_data"]
+
+    await _commit_with_new_version(
+        db,
+        version_column=ForkVersion.version_number,
+        scope_column=ForkVersion.fork_id,
+        scope_id=fork.id,
+        snapshot=snapshot,
+        reapply_pending=_reapply,
+        scope_label="fork",
+    )
