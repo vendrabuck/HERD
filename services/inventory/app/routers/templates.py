@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -90,7 +91,7 @@ async def get_template_by_id_internal(
     x_internal_token: str = Header(...),
 ):
     """Get a single template. Internal service-to-service endpoint, guarded by token."""
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     template = await get_template(db, template_id)
     if not template:

@@ -2,6 +2,7 @@ import copy
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -306,7 +307,7 @@ async def validate_topology_internal(
     topology being reserved, so JWT-forward against the public /validate
     endpoint would 403 on the creator-or-admin check.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     topology = await db.get(Topology, topology_id)
     if not topology:

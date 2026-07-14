@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -25,7 +26,7 @@ async def get_fabric_internal(
 
     Internal service-to-service endpoint, guarded by token.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
     # Scope the load to the queried device's connected component. Component

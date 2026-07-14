@@ -3,6 +3,7 @@ import os
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.internal_auth import internal_token_matches
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -276,7 +277,7 @@ async def create_dynamic_device_internal(
     201, so a NATS redelivery converges on one device row instead of orphaning a
     duplicate. Omitting request_id preserves the prior always-create behavior.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     device = await create_dynamic_instance_device(
         db,
@@ -305,7 +306,7 @@ async def list_devices_health_config(
     template.poll_interval_seconds) is not null. The scheduler in the
     execution service refreshes this list periodically. Internal token only.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     resolved = func.coalesce(Device.poll_interval_seconds, DeviceTemplate.poll_interval_seconds)
     query = (
@@ -332,7 +333,7 @@ async def resolve_devices_by_name(
     instances) to local device ids. Names with no match are omitted from the
     response so the caller can reject the referencing rows.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     names = list({n for n in body.names if n})
     if not names:
@@ -436,7 +437,7 @@ async def get_device_by_id_internal(
     x_internal_token: str = Header(...),
 ):
     """Get a single device. Internal service-to-service endpoint, guarded by token."""
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     device = await get_device(db, device_id)
     if not device:
@@ -495,7 +496,7 @@ async def delete_dynamic_device_internal(
     404 if the device is absent; 409 if it is not a dynamic instance, since this
     surface only manages dynamic instances (physical devices are admin-managed).
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     outcome = await delete_dynamic_instance_device(db, device_id)
     if outcome == "not_found":
@@ -517,7 +518,7 @@ async def update_device_status_internal(
     x_internal_token: str = Header(...),
 ):
     """Update device status. Internal service-to-service endpoint, guarded by token."""
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     # Test-only fault-injection seam (issue #214). Double-gated: active only when
     # HERD_FAULT_INJECTION is set (dev/test compose override; never in `make prod`)

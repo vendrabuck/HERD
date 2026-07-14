@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -46,7 +47,7 @@ async def list_connections_internal(
     db: AsyncSession = Depends(get_db),
 ):
     """List connections. Internal service-to-service endpoint, guarded by token."""
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     items, total = await list_connections(db, device_id=device_id, skip=skip, limit=limit)
     return PaginatedConnectionResponse(items=items, total=total, skip=skip, limit=limit)

@@ -7,6 +7,7 @@ from datetime import datetime
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.auth import make_auth_dependencies
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -47,7 +48,7 @@ router = APIRouter(tags=["executions"])
 def _require_internal_token(x_internal_token: str = Header(None)) -> None:
     if not settings.internal_api_token:
         raise HTTPException(status_code=500, detail="Internal API token not configured")
-    if x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
 

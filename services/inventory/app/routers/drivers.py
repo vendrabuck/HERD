@@ -4,6 +4,7 @@ import uuid
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from herd_common.device_config import CONFIG_SCHEMAS
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -190,7 +191,7 @@ async def download_driver_file_internal(
     x_internal_token: str = Header(...),
 ):
     """Download a driver package file. Internal service-to-service endpoint."""
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     package, data = await download_driver(db, driver_id)
     content_type = "application/zip" if package.filename.endswith(".zip") else "application/gzip"
