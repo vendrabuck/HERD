@@ -509,7 +509,7 @@ make test-load-ui        # Locust with web UI
 ## CI (GitHub Actions)
 
 Three jobs run on push/PR to main, plus a scheduled nightly workflow:
-- **backend**: install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 13 services (pytest), coverage report
+- **backend**: lockfile drift check (uv lock --check), install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 13 services (pytest), coverage report
 - **frontend**: install deps (npm ci), lint (eslint), test (vitest), build (vite)
 - **integration** (advisory): boots the full ephemeral stack and runs the contract and integration suites
 - **nightly** (scheduled, not on every PR): the heavier suites PR CI skips, contract, integration, e2e, and a seeded headless locust load run
