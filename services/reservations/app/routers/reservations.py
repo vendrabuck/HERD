@@ -353,7 +353,7 @@ async def list_reservations_for_device(
     Declared before /internal/{reservation_id} so the literal "by-device"
     segment is not parsed as a reservation id.
     """
-    if not settings.internal_api_token or x_internal_token != settings.internal_api_token:
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     result = await db.execute(
         select(Reservation).where(
