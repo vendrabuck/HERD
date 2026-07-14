@@ -1682,9 +1682,9 @@ async def test_fork_resolve_missing_explicit_version_falls_through():
 
 
 def test_fork_node_to_device_map_skips_malformed_nodes():
-    """_node_to_device_map drops nodes missing an id or device id (line 85) and
-    nodes whose device id is not a UUID (lines 88-89)."""
-    from app.services.fork_service import _node_to_device_map
+    """node_to_device_map drops nodes missing an id or device id and nodes whose
+    device id is not a UUID. The shared resolver moved to fork_save_service in P3a."""
+    from app.services.fork_save_service import node_to_device_map as _node_to_device_map
 
     good = uuid.uuid4()
     canvas = {
@@ -1838,14 +1838,15 @@ async def test_fork_snapshot_empty_component_when_no_devices_resolve():
 @pytest.mark.asyncio
 async def test_fork_snapshot_skips_hop_with_null_port():
     """A defensive guard: a path hop carrying a None port is skipped rather than
-    written as a half-wired fork_connection (fork_service.py line 178).
+    written as a half-wired fork_connection (the resolver's port-None skip).
 
     Real connections never have NULL ports (the column is NOT NULL), so this guard
     is only reachable via a doctored path. We patch the pathfinder to return one
-    so the branch is pinned rather than left dead."""
+    so the branch is pinned rather than left dead. The resolver moved to
+    fork_save_service in P3a; create_fork calls it there."""
     from app.models.fork import ForkConnection
     from app.schemas.pathfind import PathHop
-    from app.services import fork_service
+    from app.services import fork_save_service, fork_service
     from sqlalchemy import select
 
     dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
@@ -1869,7 +1870,7 @@ async def test_fork_snapshot_skips_hop_with_null_port():
     async with TestSession() as db:
         topo_id, _ = await _make_parent_topology(db, canvas)
         with patch.object(
-            fork_service,
+            fork_save_service,
             "find_all_shortest_paths_async",
             new=AsyncMock(return_value=doctored),
         ):

@@ -15,6 +15,7 @@ bounded cap. A retry loop (rather than SELECT ... FOR UPDATE on the parent row)
 matches the existing convention and avoids holding a row lock across the request.
 """
 
+import inspect
 import logging
 import uuid
 from collections.abc import Callable
@@ -43,7 +44,7 @@ async def _commit_with_new_version(
     scope_column: InstrumentedAttribute,
     scope_id: uuid.UUID,
     snapshot: Any,
-    reapply_pending: Callable[[], None],
+    reapply_pending: Callable[[], Any],
     scope_label: str,
 ) -> None:
     """Allocate ``max+1`` under a unique constraint and commit, with bounded retry.
@@ -52,10 +53,13 @@ async def _commit_with_new_version(
     (issue #25 P3a, ADR 0006 Decision 3). ``version_column`` is the version_number
     column of the snapshot's model, ``scope_column``/``scope_id`` scope the ``max``
     query to one owner (topology_id or fork_id), and ``reapply_pending`` re-applies
-    the owner-row field changes a rollback expires. Concurrent writers collide on
-    the unique constraint; the loser rolls back, recomputes ``max+1`` against the
-    now-committed rows, and retries up to ``_MAX_ALLOCATE_RETRIES``. Past the cap the
-    IntegrityError propagates rather than corrupting the version sequence.
+    the owner-row field changes a rollback expires. It may be sync (the topology path)
+    or async (the fork save path, which must also re-stage its release-before-build
+    delta and re-run the port-claim query against the winner's committed rows);
+    an awaitable return is awaited. Concurrent writers collide on the unique
+    constraint; the loser rolls back, recomputes ``max+1`` against the now-committed
+    rows, and retries up to ``_MAX_ALLOCATE_RETRIES``. Past the cap the IntegrityError
+    propagates rather than corrupting the version sequence.
     """
     for attempt in range(_MAX_ALLOCATE_RETRIES):
         max_number = (
@@ -77,8 +81,11 @@ async def _commit_with_new_version(
                 )
                 raise
             # Rollback expired both the snapshot's number and the owner-row field
-            # changes; re-apply the owner changes and loop to recompute max+1.
-            reapply_pending()
+            # changes; re-apply the owner changes and loop to recompute max+1. The
+            # fork path's reapply is a coroutine, so await an awaitable result.
+            result = reapply_pending()
+            if inspect.isawaitable(result):
+                await result
 
 
 async def commit_with_new_version(
@@ -126,6 +133,7 @@ async def commit_fork_with_new_version(
     db: AsyncSession,
     fork: ReservationFork,
     snapshot: ForkVersion,
+    reconcile: Callable[[], Any] | None = None,
 ) -> None:
     """Commit a fork mutation together with a freshly numbered fork_versions snapshot.
 
@@ -135,11 +143,21 @@ async def commit_fork_with_new_version(
     ``uq_fork_versions_fork_version`` and shares the same rollback-recompute-retry
     loop, so concurrent saves of one fork serialize on the database exactly as
     concurrent topology writers do.
+
+    ``reconcile`` is the optional save-reconcile hook (ADR 0006 open risk 2). On a
+    version-race retry the rollback expires not just the canvas change but the whole
+    release-before-build delta, so the loser must re-read the old set, re-run the
+    cross-reservation port-claim query against the winner's committed rows, and
+    re-stage its deletes and inserts before the next version allocation. Passing it
+    here threads that recompute into the same retry loop; it is awaited after the
+    canvas reapply on each retry.
     """
     pending_changes = {"canvas_data": fork.canvas_data}
 
-    def _reapply() -> None:
+    async def _reapply() -> None:
         fork.canvas_data = pending_changes["canvas_data"]
+        if reconcile is not None:
+            await reconcile()
 
     await _commit_with_new_version(
         db,
