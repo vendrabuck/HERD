@@ -998,3 +998,649 @@ async def test_commit_fork_with_new_version_exhausts_retries_and_raises():
                 await commit_fork_with_new_version(db, fork, snapshot)
 
         assert attempts["n"] == vs._MAX_ALLOCATE_RETRIES
+
+
+# --- Set-arithmetic pure functions (issue #25 P3a, ADR 0006 Decision 3) ---
+
+
+def _spec(da, pa, db_dev, pb, layer="L1"):
+    from app.services.fork_save_service import WireSpec
+
+    return WireSpec(device_a_id=da, port_a=pa, device_b_id=db_dev, port_b=pb, layer=layer)
+
+
+class _FakeRow:
+    """A stand-in for a ForkConnection row for the pure set-arithmetic tests."""
+
+    def __init__(self, da, pa, db_dev, pb, layer="L1"):
+        self.device_a_id = da
+        self.port_a = pa
+        self.device_b_id = db_dev
+        self.port_b = pb
+        self.layer = layer
+        self.physical_connection_id = None
+
+
+def test_connection_identity_normalizes_orientation():
+    """A wire and its reverse share one canonical identity; layer participates."""
+    from app.services.fork_save_service import connection_identity
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    forward = connection_identity(a, "p0", b, "p1", "L1")
+    reverse = connection_identity(b, "p1", a, "p0", "L1")
+    assert forward == reverse
+    # A different layer over the same ports is a different identity.
+    assert connection_identity(a, "p0", b, "p1", "L2") != forward
+
+
+def test_reconcile_sets_release_build_unchanged():
+    """old MINUS new releases, new MINUS old builds, the intersection is untouched."""
+    from app.services.fork_save_service import reconcile_connection_sets
+
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    kept = _FakeRow(a, "p0", b, "p1")  # in both
+    gone = _FakeRow(a, "p2", c, "p3")  # old only
+    old = [kept, gone]
+    new = [
+        _spec(b, "p1", a, "p0"),  # same identity as kept, reversed orientation
+        _spec(a, "p4", c, "p5"),  # new only
+    ]
+    to_release, to_build, unchanged = reconcile_connection_sets(old, new)
+    assert to_release == [gone]
+    assert len(to_build) == 1
+    assert (to_build[0].device_a_id, to_build[0].port_a) == (a, "p4")
+    assert unchanged == 1
+
+
+def test_reconcile_sets_move_wire_across_layers():
+    """Moving a wire's layer over the same port pair is one release plus one build.
+
+    The ADR's move-a-wire case: release and build touch the same physical port pair,
+    differing only in layer, so it is never an in-place mutation.
+    """
+    from app.services.fork_save_service import reconcile_connection_sets
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    old = [_FakeRow(a, "p0", b, "p1", layer="L1")]
+    new = [_spec(a, "p0", b, "p1", layer="L2")]
+    to_release, to_build, unchanged = reconcile_connection_sets(old, new)
+    assert len(to_release) == 1 and to_release[0].layer == "L1"
+    assert len(to_build) == 1 and to_build[0].layer == "L2"
+    assert unchanged == 0
+
+
+# --- POST /internal/forks/{reservation_id}/save (issue #25 P3a reconcile) ---
+
+
+async def _make_physical(da, pa, db_dev, pb) -> uuid.UUID:
+    async with TestSessionLocal() as db:
+        conn = Connection(
+            device_a_id=da, port_a=pa, device_b_id=db_dev, port_b=pb, created_by="admin"
+        )
+        db.add(conn)
+        await db.commit()
+        return conn.id
+
+
+def _canvas(nodes: list[uuid.UUID], edges: list[tuple[int, int]]) -> dict:
+    return {
+        "nodes": [{"id": f"n{i}", "data": {"device": {"id": str(d)}}} for i, d in enumerate(nodes)],
+        "edges": [
+            {"id": f"e{k}", "source": f"n{s}", "target": f"n{t}"} for k, (s, t) in enumerate(edges)
+        ],
+    }
+
+
+def _endpoint_set(delta: dict) -> frozenset:
+    return frozenset(
+        {
+            (delta["device_a_id"], delta["port_a"]),
+            (delta["device_b_id"], delta["port_b"]),
+        }
+    )
+
+
+async def _fork_connections(fork_id: uuid.UUID) -> list[ForkConnection]:
+    async with TestSessionLocal() as db:
+        return (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+
+
+@pytest.mark.asyncio
+async def test_save_fork_requires_internal_token(client):
+    resp = await client.post(
+        f"/internal/forks/{uuid.uuid4()}/save",
+        json={"canvas_data": {"nodes": [], "edges": []}},
+        headers={"X-Internal-Token": "wrong"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_save_fork_404_when_absent(client):
+    resp = await client.post(
+        f"/internal/forks/{uuid.uuid4()}/save",
+        json={"canvas_data": {"nodes": [], "edges": []}},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Fork not found"
+
+
+@pytest.mark.asyncio
+async def test_save_fork_refuses_archived(client):
+    """An ARCHIVED fork refuses a save with 409, the same wording as the loose PUT."""
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        fork.status = ForkStatus_ARCHIVED
+        await db.commit()
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": {"nodes": [], "edges": []}},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 409
+    assert "archived" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_save_fork_builds_new_wire(client):
+    """Saving a canvas onto an empty fork builds its wiring and appends version 2."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["version_number"] == 2
+    assert body["released"] == []
+    assert body["unchanged_count"] == 0
+    assert len(body["built"]) == 1
+    assert _endpoint_set(body["built"][0]) == frozenset({(str(a), "a0"), (str(b), "b0")})
+
+    conns = await _fork_connections(uuid.UUID(body["fork_id"]))
+    assert len(conns) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fork_moves_wire(client):
+    """A fork wired A-B, re-saved as A-C, releases A-B and builds A-C in one version."""
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    await _make_physical(a, "a1", c, "c0")
+    # Parent topology wires A-B, so the created fork starts with that connection.
+    parent_canvas = _canvas([a, b], [(0, 1)])
+    topo_id, _ = await _make_topology_with_version(parent_canvas)
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, c], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["version_number"] == 2
+    assert body["unchanged_count"] == 0
+    assert len(body["released"]) == 1
+    assert _endpoint_set(body["released"][0]) == frozenset({(str(a), "a0"), (str(b), "b0")})
+    assert len(body["built"]) == 1
+    assert _endpoint_set(body["built"][0]) == frozenset({(str(a), "a1"), (str(c), "c0")})
+
+    conns = await _fork_connections(uuid.UUID(body["fork_id"]))
+    assert len(conns) == 1
+    assert {conns[0].device_a_id, conns[0].device_b_id} == {a, c}
+
+
+@pytest.mark.asyncio
+async def test_save_fork_unchanged_wire_is_not_rewritten(client):
+    """Re-saving an identical canvas leaves the wire untouched but still versions."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    parent_canvas = _canvas([a, b], [(0, 1)])
+    topo_id, _ = await _make_topology_with_version(parent_canvas)
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": parent_canvas},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["released"] == []
+    assert body["built"] == []
+    assert body["unchanged_count"] == 1
+    assert body["version_number"] == 2
+
+
+@pytest.mark.asyncio
+async def test_save_fork_removes_all_wiring(client):
+    """Saving an empty canvas releases every wire and builds nothing."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    parent_canvas = _canvas([a, b], [(0, 1)])
+    topo_id, _ = await _make_topology_with_version(parent_canvas)
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": {"nodes": [], "edges": []}},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["released"]) == 1
+    assert body["built"] == []
+    assert body["unchanged_count"] == 0
+    assert await _fork_connections(uuid.UUID(body["fork_id"])) == []
+
+
+# --- Multi-hop physical path + shared-hop dedup at save (P3 audit gaps) ---
+
+
+@pytest.mark.asyncio
+async def test_save_fork_resolves_multi_hop_path(client):
+    """A canvas edge across an off-canvas patch panel builds one wire per physical hop."""
+    a, p, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", p, "p1")
+    await _make_physical(p, "p2", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    # Canvas edge A-B has no direct cable; it resolves over the two-hop path A-P-B.
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 2
+    got = {_endpoint_set(d) for d in built}
+    assert frozenset({(str(a), "a0"), (str(p), "p1")}) in got
+    assert frozenset({(str(p), "p2"), (str(b), "b0")}) in got
+
+
+@pytest.mark.asyncio
+async def test_save_fork_dedups_shared_hop(client):
+    """Two canvas edges sharing the A-P hop build that cable once, not twice."""
+    a, p, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", p, "p1")  # shared first hop
+    await _make_physical(p, "p2", b, "b0")
+    await _make_physical(p, "p3", c, "c0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    # Edges A-B and A-C both route A-P-* and share the A-P cable.
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b, c], [(0, 1), (0, 2)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 3
+    shared = frozenset({(str(a), "a0"), (str(p), "p1")})
+    assert sum(1 for d in built if _endpoint_set(d) == shared) == 1
+
+
+# --- Transactional rollback: no half-apply, no orphan version ---
+
+
+@pytest.mark.asyncio
+async def test_save_fork_rolls_back_between_release_and_build():
+    """A failure after the release, before the build, leaves the fork byte-for-byte.
+
+    The release-before-build delta and the version append share one transaction: an
+    injected error mid-reconcile must persist nothing (no half-applied wiring, no
+    orphan fork_versions row).
+    """
+    from unittest.mock import patch
+
+    from app.services.fork_save_service import save_fork
+
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    await _make_physical(a, "a1", c, "c0")
+    parent_canvas = _canvas([a, b], [(0, 1)])
+    topo_id, _ = await _make_topology_with_version(parent_canvas)
+    rid = uuid.uuid4()
+
+    # Create the fork with its A-B wiring through an independent session.
+    async with TestSessionLocal() as db:
+        fork = await create_fork(
+            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+        )
+        fork_id = fork.id
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        # The first db.add in a save is the first build insert; the releases are already
+        # deleted-and-flushed by then, so raising here is squarely between the release
+        # and the build.
+        with patch.object(db, "add", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                await save_fork(db, fork, canvas_data=_canvas([a, c], [(0, 1)]))
+        await db.rollback()
+
+    # The original A-B wiring survives and no version 2 was written.
+    conns = await _fork_connections(fork_id)
+    assert len(conns) == 1
+    assert {conns[0].device_a_id, conns[0].device_b_id} == {a, b}
+    async with TestSessionLocal() as db:
+        versions = (
+            (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+        assert [v.version_number for v in versions] == [1]
+
+
+# --- Cross-reservation port-claim enforcement (ADR 0006 Decision 4) ---
+
+
+async def _make_active_fork_claiming(rid: uuid.UUID, da, pa, db_dev, pb, status_=None) -> uuid.UUID:
+    """Persist an ACTIVE (or given-status) fork holding one fork_connection."""
+    async with TestSessionLocal() as db:
+        fork = ReservationFork(reservation_id=rid)
+        if status_ is not None:
+            fork.status = status_
+        db.add(fork)
+        await db.flush()
+        db.add(ForkVersion(fork_id=fork.id, version_number=1))
+        db.add(
+            ForkConnection(
+                fork_id=fork.id,
+                device_a_id=da,
+                port_a=pa,
+                device_b_id=db_dev,
+                port_b=pb,
+                layer="L1",
+                created_by="system",
+            )
+        )
+        await db.commit()
+        return fork.id
+
+
+@pytest.mark.asyncio
+async def test_save_fork_409_on_cross_reservation_port_claim(client):
+    """Building a wire on a port another ACTIVE fork holds fails 409, naming its reservation."""
+    a, b, z = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    # Another ACTIVE reservation's fork already claims (a, a0).
+    other_rid = uuid.uuid4()
+    await _make_active_fork_claiming(other_rid, a, "a0", z, "z0")
+
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["message"] == (
+        "One or more ports are already claimed by another active reservation"
+    )
+    assert detail["conflicts"] == [
+        {"reservation_id": str(other_rid), "device_id": str(a), "port": "a0"}
+    ]
+    # The save was refused wholesale: no wiring, still just version 1.
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        assert await _fork_connections(fork.id) == []
+        versions = (
+            (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        assert [v.version_number for v in versions] == [1]
+
+
+@pytest.mark.asyncio
+async def test_save_fork_archived_other_fork_does_not_block(client):
+    """An ARCHIVED fork's wiring is history, not a claim, so it never blocks a save."""
+    a, b, z = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    other_rid = uuid.uuid4()
+    await _make_active_fork_claiming(other_rid, a, "a0", z, "z0", status_=ForkStatus_ARCHIVED)
+
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["built"]) == 1
+
+
+# --- Concurrent conflicting saves (ADR open risk 2, REQUIRED) ---
+
+
+@pytest.mark.asyncio
+async def test_save_fork_retries_on_version_conflict():
+    """A competing save of the same fork grabs version 2; our save retries onto 3.
+
+    Mirrors test_topology_versions' concurrent-writer pin against the fork save path:
+    the version-allocation retry loop serializes the two saves onto a contiguous,
+    duplicate-free sequence instead of a raw 500, and our wiring still lands.
+    """
+    from unittest.mock import patch
+
+    from app.services.fork_save_service import save_fork
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        fork = await create_fork(
+            db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+        )
+        fork_id = fork.id
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        real_commit = db.commit
+        state = {"raced": False}
+
+        async def racing_commit():
+            if not state["raced"]:
+                state["raced"] = True
+                # Discard our in-flight save (mirrors the winner-race pattern used by
+                # test_create_fork_returns_winner_on_commit_integrity_error), then let a
+                # competing save of the same fork commit version 2 through an independent
+                # session and force our version-allocation IntegrityError. The retry then
+                # re-runs the reconcile and commits our wiring for real.
+                await db.rollback()
+                async with TestSessionLocal() as other:
+                    other.add(ForkVersion(fork_id=fork_id, version_number=2))
+                    await other.commit()
+                raise IntegrityError("INSERT", {}, Exception("uq_fork_versions_fork_version"))
+            return await real_commit()
+
+        with patch.object(db, "commit", side_effect=racing_commit):
+            result = await save_fork(db, fork, canvas_data=_canvas([a, b], [(0, 1)]))
+
+        # Retried onto version 3 after the constraint rejected 2, and our wiring landed.
+        assert result.version_number == 3
+        assert len(result.built) == 1
+
+    # Contiguous, duplicate-free sequence and the wiring persisted.
+    async with TestSessionLocal() as db:
+        numbers = sorted(
+            v.version_number
+            for v in (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+        assert numbers == [1, 2, 3]
+    conns = await _fork_connections(fork_id)
+    assert len(conns) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fork_port_claim_query_reruns_on_retry():
+    """The port-claim query re-runs inside the version-retry loop (ADR open risk 2).
+
+    The conflict does not exist on the first pass; a competing writer both grabs the
+    next version (forcing a retry) and plants a conflicting claim in another ACTIVE
+    fork. The retry's re-executed port-claim query must catch it and fail the save 409,
+    proving the check is inside the retry loop, not evaluated only once.
+    """
+    from unittest.mock import patch
+
+    from app.services.fork_save_service import save_fork
+    from fastapi import HTTPException
+
+    a, b, z = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        fork = await create_fork(
+            db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+        )
+        fork_id = fork.id
+
+    competitor_rid = uuid.uuid4()
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        state = {"raced": False}
+
+        async def racing_commit():
+            if not state["raced"]:
+                state["raced"] = True
+                # Discard our in-flight save, then a competing writer takes version 2
+                # (forcing our IntegrityError retry) AND plants a conflicting claim on
+                # (a, a0) in a second ACTIVE fork. On the retry the reconcile re-runs and
+                # its re-executed port-claim query must now catch that claim.
+                await db.rollback()
+                async with TestSessionLocal() as other:
+                    other.add(ForkVersion(fork_id=fork_id, version_number=2))
+                    competitor = ReservationFork(reservation_id=competitor_rid)
+                    other.add(competitor)
+                    await other.flush()
+                    other.add(ForkVersion(fork_id=competitor.id, version_number=1))
+                    other.add(
+                        ForkConnection(
+                            fork_id=competitor.id,
+                            device_a_id=a,
+                            port_a="a0",
+                            device_b_id=z,
+                            port_b="z0",
+                            layer="L1",
+                            created_by="system",
+                        )
+                    )
+                    await other.commit()
+                raise IntegrityError("INSERT", {}, Exception("uq_fork_versions_fork_version"))
+            return None  # pragma: no cover - the retry raises 409 before committing
+
+        with patch.object(db, "commit", side_effect=racing_commit):
+            with pytest.raises(HTTPException) as excinfo:
+                await save_fork(db, fork, canvas_data=_canvas([a, b], [(0, 1)]))
+        await db.rollback()
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.detail["conflicts"] == [
+        {"reservation_id": str(competitor_rid), "device_id": str(a), "port": "a0"}
+    ]
+    # Our save lost: no wiring for our fork, and no version we authored.
+    assert await _fork_connections(fork_id) == []
+
+
+# --- POST /internal/forks/{reservation_id}/archive (ADR 0006 Decision 5) ---
+
+
+@pytest.mark.asyncio
+async def test_archive_fork_requires_internal_token(client):
+    resp = await client.post(
+        f"/internal/forks/{uuid.uuid4()}/archive", headers={"X-Internal-Token": "wrong"}
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_archive_fork_absent_returns_204(client):
+    """Archiving a nonexistent fork is a no-op 204 (nothing to freeze)."""
+    resp = await client.post(f"/internal/forks/{uuid.uuid4()}/archive", headers=_hdr())
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_archive_fork_freezes_and_is_idempotent(client):
+    """Archive flips status to ARCHIVED; a second call is a no-op 200, same state."""
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    first = await client.post(f"/internal/forks/{rid}/archive", headers=_hdr())
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["status"] == ForkStatus_ARCHIVED
+    assert body["reservation_id"] == str(rid)
+
+    second = await client.post(f"/internal/forks/{rid}/archive", headers=_hdr())
+    assert second.status_code == 200
+    assert second.json()["status"] == ForkStatus_ARCHIVED
+
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        assert fork.status == ForkStatus_ARCHIVED
+
+
+@pytest.mark.asyncio
+async def test_archive_fork_appends_no_version(client):
+    """Archive retains versions read-only and appends no new one (Decision 5)."""
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(f"/internal/forks/{rid}/archive", headers=_hdr())
+
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        versions = (
+            (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        assert [v.version_number for v in versions] == [1]

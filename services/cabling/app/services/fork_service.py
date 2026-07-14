@@ -18,14 +18,13 @@ import copy
 import logging
 import uuid
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.connection import Connection
 from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
 from app.models.topology import Topology, TopologyVersion
-from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
+from app.services.fork_save_service import resolve_canvas_wiring
 
 logger = logging.getLogger(__name__)
 
@@ -74,22 +73,6 @@ async def _resolve_parent_canvas(
     return None, None
 
 
-def _node_to_device_map(canvas: dict) -> dict[str, uuid.UUID]:
-    """Map React Flow node ids to device UUIDs, mirroring _run_topology_validation."""
-    nodes = canvas.get("nodes") or []
-    mapping: dict[str, uuid.UUID] = {}
-    for node in nodes:
-        node_id = node.get("id")
-        device_id_str = ((node.get("data") or {}).get("device") or {}).get("id")
-        if not node_id or not device_id_str:
-            continue
-        try:
-            mapping[node_id] = uuid.UUID(device_id_str)
-        except (ValueError, TypeError):
-            continue
-    return mapping
-
-
 async def _snapshot_connections(
     db: AsyncSession,
     fork_id: uuid.UUID,
@@ -98,100 +81,26 @@ async def _snapshot_connections(
 ) -> None:
     """Seed fork_connections from parent canvas edges resolved to physical paths.
 
-    Open risk #1's recommended rule. For each committed canvas edge, resolve a
-    shortest physical path between its endpoint devices and record every hop as an
-    L1 fork_connection backed by the physical connections row that realizes it.
-    De-duplicates on the fork_connections unique key so two canvas edges sharing a
-    hop do not collide on insert.
+    Open risk #1's recommended rule. Delegates to the shared ``resolve_canvas_wiring``
+    resolver (the same one the save-reconcile uses, issue #25 P3a) to turn committed
+    canvas edges into per-hop L1 WireSpecs, then materializes each as a fork_connection
+    row stamped with ``created_by``. Sharing the resolver keeps fork-on-activation and
+    save-time wiring byte-for-byte identical, including multi-hop paths and shared-hop
+    de-duplication.
     """
-    if not canvas:
-        return
-    edges = canvas.get("edges") or []
-    if not edges:
-        return
-
-    node_to_device = _node_to_device_map(canvas)
-    # Scope to the connected component(s) of the canvas devices (the fork's own
-    # fabric), matching this module's stated rule: snapshot from the parent
-    # canvas edges resolved to physical paths, not the whole global graph.
-    # Component expansion still loads off-canvas intermediates, so every hop on
-    # a chosen path is present.
-    graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
-
-    # Look up the backing physical connection id for an (a, port_a, b, port_b) hop.
-    # The cabling graph is undirected, so match either orientation. Scope the
-    # phys lookup to the same component devices the graph loaded (graph.keys()),
-    # so every connection that can appear on a returned path is indexed while
-    # unrelated fabrics are skipped.
-    component_devices = set(graph.keys())
-    if component_devices:
-        phys_rows = (
-            await db.execute(
-                select(
-                    Connection.id,
-                    Connection.device_a_id,
-                    Connection.port_a,
-                    Connection.device_b_id,
-                    Connection.port_b,
-                ).where(
-                    or_(
-                        Connection.device_a_id.in_(component_devices),
-                        Connection.device_b_id.in_(component_devices),
-                    )
-                )
+    for spec in await resolve_canvas_wiring(db, canvas):
+        db.add(
+            ForkConnection(
+                fork_id=fork_id,
+                device_a_id=spec.device_a_id,
+                port_a=spec.port_a,
+                device_b_id=spec.device_b_id,
+                port_b=spec.port_b,
+                layer=spec.layer,
+                physical_connection_id=spec.physical_connection_id,
+                created_by=created_by,
             )
-        ).all()
-    else:
-        phys_rows = []
-    phys_index: dict[tuple[uuid.UUID, str, uuid.UUID, str], uuid.UUID] = {}
-    for conn_id, da, pa, db_, pb in phys_rows:
-        phys_index[(da, pa, db_, pb)] = conn_id
-        phys_index[(db_, pb, da, pa)] = conn_id
-
-    seen: set[tuple[uuid.UUID, str, uuid.UUID, str, str]] = set()
-
-    for edge in edges:
-        edge_data = edge.get("data") or {}
-        if edge_data.get("isProposal"):
-            continue
-        source_device = node_to_device.get(edge.get("source"))
-        target_device = node_to_device.get(edge.get("target"))
-        if source_device is None or target_device is None:
-            continue
-
-        paths = await find_all_shortest_paths_async(graph, source_device, target_device)
-        if not paths:
-            # Unreachable edge: nothing to wire. Create-time validation already
-            # gates the booking on connectivity, so this is the rare deleted-cable
-            # window, not a normal case.
-            continue
-
-        path = paths[0]
-        # Each adjacent pair of hops is one physical cable: the first hop's
-        # port_out connects to the next hop's port_in.
-        for first, second in zip(path, path[1:]):
-            da = first.device_id
-            pa = first.port_out
-            db_dev = second.device_id
-            pb = second.port_in
-            if pa is None or pb is None:
-                continue
-            key = (da, pa, db_dev, pb, "L1")
-            if key in seen:
-                continue
-            seen.add(key)
-            db.add(
-                ForkConnection(
-                    fork_id=fork_id,
-                    device_a_id=da,
-                    port_a=pa,
-                    device_b_id=db_dev,
-                    port_b=pb,
-                    layer="L1",
-                    physical_connection_id=phys_index.get((da, pa, db_dev, pb)),
-                    created_by=created_by,
-                )
-            )
+        )
 
 
 async def create_fork(

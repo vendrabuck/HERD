@@ -107,3 +107,50 @@ class ForkCanvasUpdateResponse(BaseModel):
     @field_serializer("id")
     def _serialize_uuid(self, value: uuid.UUID) -> str:
         return str(value)
+
+
+class ForkSaveRequest(BaseModel):
+    """Body for POST /internal/forks/{reservation_id}/save (reconcile-on-save)."""
+
+    canvas_data: dict[str, Any]
+    created_by: str | None = None
+
+
+class ForkConnectionDelta(BaseModel):
+    """One released or built wire in a save result (issue #25 P3a, ADR 0006)."""
+
+    device_a_id: uuid.UUID
+    port_a: str
+    device_b_id: uuid.UUID
+    port_b: str
+    layer: str
+
+    @field_serializer("device_a_id", "device_b_id")
+    def _serialize_uuid(self, value: uuid.UUID) -> str:
+        return str(value)
+
+
+class ForkSaveResponse(BaseModel):
+    """POST .../save result: the version appended and the release/build delta."""
+
+    fork_id: uuid.UUID
+    version_number: int
+    released: list[ForkConnectionDelta]
+    built: list[ForkConnectionDelta]
+    unchanged_count: int
+
+    @field_serializer("fork_id")
+    def _serialize_uuid(self, value: uuid.UUID) -> str:
+        return str(value)
+
+
+class ForkArchiveResponse(BaseModel):
+    """POST .../archive result: the frozen fork's identity and ARCHIVED status."""
+
+    fork_id: uuid.UUID
+    reservation_id: uuid.UUID
+    status: str
+
+    @field_serializer("fork_id", "reservation_id")
+    def _serialize_uuid(self, value: uuid.UUID) -> str:
+        return str(value)

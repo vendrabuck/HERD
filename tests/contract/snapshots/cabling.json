@@ -37,8 +37,16 @@
       "/internal/forks/{reservation_id}"
     ],
     [
+      "POST",
+      "/internal/forks/{reservation_id}/archive"
+    ],
+    [
       "PUT",
       "/internal/forks/{reservation_id}/canvas"
+    ],
+    [
+      "POST",
+      "/internal/forks/{reservation_id}/save"
     ],
     [
       "POST",
@@ -243,6 +251,23 @@
       ],
       "type": "object"
     },
+    "ForkConnectionDelta": {
+      "properties": {
+        "device_a_id": "string",
+        "device_b_id": "string",
+        "layer": "string",
+        "port_a": "string",
+        "port_b": "string"
+      },
+      "required": [
+        "device_a_id",
+        "device_b_id",
+        "layer",
+        "port_a",
+        "port_b"
+      ],
+      "type": "object"
+    },
     "ForkConnectionResponse": {
       "properties": {
         "created_at": "string",
@@ -311,6 +336,33 @@
         "status",
         "updated_at",
         "versions"
+      ],
+      "type": "object"
+    },
+    "ForkSaveRequest": {
+      "properties": {
+        "canvas_data": "object",
+        "created_by": "anyOf"
+      },
+      "required": [
+        "canvas_data"
+      ],
+      "type": "object"
+    },
+    "ForkSaveResponse": {
+      "properties": {
+        "built": "array",
+        "fork_id": "string",
+        "released": "array",
+        "unchanged_count": "integer",
+        "version_number": "integer"
+      },
+      "required": [
+        "built",
+        "fork_id",
+        "released",
+        "unchanged_count",
+        "version_number"
       ],
       "type": "object"
     },
