@@ -37,6 +37,15 @@ jobs:
           key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
           restore-keys: ${{ runner.os }}-uv-
 
+      # Dependabot's pip-ecosystem PRs bump pyproject.toml specifiers but never
+      # regenerate uv.lock, so the committed lock drifts silently until something
+      # runs uv (caught by hand in PR #342). Fail loudly instead: --check verifies
+      # the lock is up to date with every pyproject in the workspace without
+      # modifying it. Runs before uv sync so the failure is fast and the check
+      # sees the lockfile exactly as committed.
+      - name: Check uv.lock is in sync
+        run: uv lock --check
+
       - name: Install dependencies
         run: uv sync --all-extras
 
