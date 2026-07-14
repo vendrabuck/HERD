@@ -11,6 +11,7 @@ from app.models.connection import Connection
 from app.models.fork import (
     ForkConnection,
     ForkStatus_ACTIVE,
+    ForkStatus_ARCHIVED,
     ForkVersion,
     ReservationFork,
 )
@@ -582,3 +583,418 @@ async def test_create_fork_reraises_integrity_error_when_no_winner_exists():
             .all()
         )
         assert forks == []
+
+
+@pytest.mark.asyncio
+async def test_create_fork_returns_winner_on_flush_integrity_error():
+    """A flush-time reservation_id collision is caught and returns the winner (issue #304).
+
+    Postgres checks the reservation_id unique constraint at INSERT (flush), not at
+    commit, so on the real concurrent-activation race the loser's IntegrityError
+    surfaces at db.flush(), before commit is ever reached. The guarded region must
+    cover the flush: the handler rolls back and returns the winner, keeping the
+    contract idempotent even when the error never reaches the commit line. Regression
+    for the pre-#304 code that wrapped only db.commit() and let this flush error
+    escape unhandled.
+    """
+    rid = uuid.uuid4()
+    state: dict = {"attempts": 0, "winner_id": None}
+
+    async with TestSessionLocal() as db:
+
+        async def racing_flush():
+            state["attempts"] += 1
+            # The DB aborts the loser's transaction on the constraint violation.
+            await db.rollback()
+            # The concurrent winner commits its fork through an independent session,
+            # after the loser's pre-check already found nothing.
+            async with TestSessionLocal() as other:
+                winner = ReservationFork(reservation_id=rid)
+                other.add(winner)
+                await other.flush()
+                other.add(ForkVersion(fork_id=winner.id, version_number=1))
+                await other.commit()
+                state["winner_id"] = winner.id
+            raise IntegrityError("INSERT", {}, Exception("uq reservation_fork.reservation_id"))
+
+        # No parent topology: create_fork issues no queries before its explicit
+        # db.flush(), so the patched flush intercepts only that INSERT, and internal
+        # autoflush (which runs on the underlying sync session) is untouched.
+        with patch.object(db, "flush", side_effect=racing_flush):
+            fork = await create_fork(
+                db,
+                reservation_id=rid,
+                parent_topology_id=None,
+                parent_version_id=None,
+            )
+
+        # One flush attempt, then the handler re-queries and returns the winner; it
+        # does not retry the insert.
+        assert state["attempts"] == 1
+        assert fork.id == state["winner_id"]
+        assert fork.reservation_id == rid
+
+    async with TestSessionLocal() as db:
+        forks = (
+            (await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid)))
+            .scalars()
+            .all()
+        )
+        assert len(forks) == 1
+        assert forks[0].id == state["winner_id"]
+        # No partial loser rows survived the rollback.
+        versions = (await db.execute(select(ForkVersion))).scalars().all()
+        assert [v.fork_id for v in versions] == [state["winner_id"]]
+
+
+# --- GET /internal/forks/{reservation_id} (issue #25 P3a read) ---
+
+
+@pytest.mark.asyncio
+async def test_get_fork_requires_internal_token(client):
+    resp = await client.get(
+        f"/internal/forks/{uuid.uuid4()}", headers={"X-Internal-Token": "wrong"}
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_get_fork_404_when_absent(client):
+    resp = await client.get(f"/internal/forks/{uuid.uuid4()}", headers=_hdr())
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Fork not found"
+
+
+@pytest.mark.asyncio
+async def test_get_fork_returns_metadata_canvas_connections_versions(client):
+    """GET returns the fork row, its canvas, its wiring, and its version list."""
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    async with TestSessionLocal() as db:
+        physical = Connection(
+            device_a_id=dev_a,
+            port_a="eth0",
+            device_b_id=dev_b,
+            port_b="eth1",
+            created_by="admin",
+        )
+        db.add(physical)
+        await db.commit()
+        physical_id = physical.id
+
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "n2", "data": {"device": {"id": str(dev_b)}}},
+        ],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2"}],
+    }
+    topo_id, version_id = await _make_topology_with_version(canvas)
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        headers=_hdr(),
+    )
+
+    resp = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reservation_id"] == str(rid)
+    assert body["parent_topology_id"] == str(topo_id)
+    assert body["parent_version_id"] == str(version_id)
+    assert body["status"] == ForkStatus_ACTIVE
+    assert body["canvas_data"] == canvas
+    assert len(body["connections"]) == 1
+    conn = body["connections"][0]
+    assert conn["layer"] == "L1"
+    assert {conn["device_a_id"], conn["device_b_id"]} == {str(dev_a), str(dev_b)}
+    assert conn["physical_connection_id"] == str(physical_id)
+    assert len(body["versions"]) == 1
+    assert body["versions"][0]["version_number"] == 1
+    # The version list is a summary: no canvas payload leaks through it.
+    assert "canvas_data" not in body["versions"][0]
+
+
+@pytest.mark.asyncio
+async def test_get_fork_empty_fork_has_no_connections(client):
+    """A fork with no parent topology returns a null canvas and no wiring."""
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    resp = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["canvas_data"] is None
+    assert body["parent_topology_id"] is None
+    assert body["connections"] == []
+    assert len(body["versions"]) == 1
+
+
+# --- PUT /internal/forks/{reservation_id}/canvas (issue #25 P3a loose edit) ---
+
+
+@pytest.mark.asyncio
+async def test_update_fork_canvas_requires_internal_token(client):
+    resp = await client.put(
+        f"/internal/forks/{uuid.uuid4()}/canvas",
+        json={"canvas_data": {"nodes": [], "edges": []}},
+        headers={"X-Internal-Token": "wrong"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_update_fork_canvas_404_when_absent(client):
+    resp = await client.put(
+        f"/internal/forks/{uuid.uuid4()}/canvas",
+        json={"canvas_data": {"nodes": [], "edges": []}},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Fork not found"
+
+
+@pytest.mark.asyncio
+async def test_update_fork_canvas_stores_draft_without_reconcile_or_version(client):
+    """A loose edit stores the canvas, validates it valid, but adds no wiring or version.
+
+    The reachable-edge draft passes route validation (valid True), yet the loose PUT
+    must NOT reconcile fork_connections (still zero) and must NOT append a fork_version
+    (still just create's v1). That is the phase-1 contract: drafts are cheap.
+    """
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    async with TestSessionLocal() as db:
+        db.add(
+            Connection(
+                device_a_id=dev_a,
+                port_a="eth0",
+                device_b_id=dev_b,
+                port_b="eth1",
+                created_by="admin",
+            )
+        )
+        await db.commit()
+
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    draft = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "n2", "data": {"device": {"id": str(dev_b)}}},
+        ],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2"}],
+    }
+    resp = await client.put(
+        f"/internal/forks/{rid}/canvas", json={"canvas_data": draft}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["valid"] is True
+    assert body["invalid_edges"] == []
+
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        assert fork.canvas_data == draft
+        conns = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        assert conns == []  # loose edit does not reconcile wiring
+        versions = (
+            (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        assert len(versions) == 1  # loose edit appends no version
+        assert versions[0].version_number == 1
+
+
+@pytest.mark.asyncio
+async def test_update_fork_canvas_reports_invalid_without_gating(client):
+    """An unreachable edge is reported (valid False, no_path) but the draft still stores."""
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    draft = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": str(dev_a)}}},
+            {"id": "n2", "data": {"device": {"id": str(dev_b)}}},
+        ],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2"}],
+    }
+    resp = await client.put(
+        f"/internal/forks/{rid}/canvas", json={"canvas_data": draft}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["valid"] is False
+    assert len(body["invalid_edges"]) == 1
+    assert body["invalid_edges"][0]["edge_id"] == "e1"
+    assert body["invalid_edges"][0]["reason"] == "no_path"
+
+    # Stored anyway: the loose edit does not gate on route validity.
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        assert fork.canvas_data == draft
+
+
+@pytest.mark.asyncio
+async def test_update_fork_canvas_refuses_archived(client):
+    """A frozen (ARCHIVED) fork refuses the loose edit with 409 and stays unchanged."""
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        fork.status = ForkStatus_ARCHIVED
+        await db.commit()
+
+    draft = {"nodes": [{"id": "n1"}], "edges": []}
+    resp = await client.put(
+        f"/internal/forks/{rid}/canvas", json={"canvas_data": draft}, headers=_hdr()
+    )
+    assert resp.status_code == 409
+    assert "archived" in resp.json()["detail"].lower()
+
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        assert fork.canvas_data is None  # the draft was refused, not applied
+
+
+# --- version_service generalization: commit_fork_with_new_version (issue #25 P3a) ---
+
+
+async def _make_active_fork(reservation_id: uuid.UUID) -> uuid.UUID:
+    """Persist a bare ACTIVE fork with a v1 snapshot; return its fork id."""
+    async with TestSessionLocal() as db:
+        fork = ReservationFork(reservation_id=reservation_id)
+        db.add(fork)
+        await db.flush()
+        db.add(ForkVersion(fork_id=fork.id, version_number=1))
+        await db.commit()
+        return fork.id
+
+
+@pytest.mark.asyncio
+async def test_commit_fork_with_new_version_allocates_next_number():
+    """The fork helper numbers each save max+1 under uq_fork_versions_fork_version."""
+    from app.services.version_service import commit_fork_with_new_version
+
+    fork_id = await _make_active_fork(uuid.uuid4())
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        fork.canvas_data = {"nodes": [{"id": "n2"}], "edges": []}
+        snapshot = ForkVersion(fork_id=fork.id, canvas_data=fork.canvas_data)
+        await commit_fork_with_new_version(db, fork, snapshot)
+        assert snapshot.version_number == 2
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        fork.canvas_data = {"nodes": [{"id": "n3"}], "edges": []}
+        snapshot = ForkVersion(fork_id=fork.id, canvas_data=fork.canvas_data)
+        await commit_fork_with_new_version(db, fork, snapshot)
+        assert snapshot.version_number == 3
+
+    async with TestSessionLocal() as db:
+        numbers = sorted(
+            v.version_number
+            for v in (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+        assert numbers == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_commit_fork_with_new_version_retries_on_conflict():
+    """A concurrent writer grabbing the next number forces a retry onto max+2, not a 500.
+
+    Mirrors test_topology_versions' race pin against the fork version model: the same
+    rollback-recompute-retry loop backs both, so the fork save recovers to a
+    contiguous, duplicate-free sequence instead of surfacing a raw IntegrityError.
+    """
+    from app.services.version_service import commit_fork_with_new_version
+
+    fork_id = await _make_active_fork(uuid.uuid4())
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        fork.canvas_data = {"nodes": [{"id": "n2"}], "edges": []}
+        snapshot = ForkVersion(fork_id=fork.id, canvas_data=fork.canvas_data)
+
+        real_commit = db.commit
+        state = {"raced": False}
+
+        async def racing_commit():
+            if not state["raced"]:
+                state["raced"] = True
+                # A concurrent save grabs version 2 (the number this call allocated)
+                # before our commit lands.
+                async with TestSessionLocal() as other:
+                    other.add(ForkVersion(fork_id=fork_id, version_number=2))
+                    await other.commit()
+            return await real_commit()
+
+        with patch.object(db, "commit", side_effect=racing_commit):
+            await commit_fork_with_new_version(db, fork, snapshot)
+
+        # Retried onto 3 after the constraint rejected 2.
+        assert snapshot.version_number == 3
+
+    async with TestSessionLocal() as db:
+        numbers = sorted(
+            v.version_number
+            for v in (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+        assert numbers == [1, 2, 3]
+        assert len(numbers) == len(set(numbers))
+
+
+@pytest.mark.asyncio
+async def test_commit_fork_with_new_version_exhausts_retries_and_raises():
+    """Persistent contention past the cap re-raises IntegrityError rather than looping.
+
+    The fork analogue of test_commit_with_new_version_exhausts_retries_and_raises: every
+    commit is forced to conflict, so the bounded loop gives up after _MAX_ALLOCATE_RETRIES
+    attempts and the error propagates.
+    """
+    import app.services.version_service as vs
+    from app.services.version_service import commit_fork_with_new_version
+
+    fork_id = await _make_active_fork(uuid.uuid4())
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        fork.canvas_data = {"nodes": [{"id": "n2"}], "edges": []}
+        snapshot = ForkVersion(fork_id=fork.id, canvas_data=fork.canvas_data)
+
+        attempts = {"n": 0}
+
+        async def always_conflict():
+            attempts["n"] += 1
+            raise IntegrityError("INSERT", {}, Exception("uq conflict"))
+
+        async def noop_rollback():
+            return None
+
+        with (
+            patch.object(db, "commit", side_effect=always_conflict),
+            patch.object(db, "rollback", side_effect=noop_rollback),
+        ):
+            with pytest.raises(IntegrityError):
+                await commit_fork_with_new_version(db, fork, snapshot)
+
+        assert attempts["n"] == vs._MAX_ALLOCATE_RETRIES

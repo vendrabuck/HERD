@@ -33,6 +33,14 @@
       "/internal/forks"
     ],
     [
+      "GET",
+      "/internal/forks/{reservation_id}"
+    ],
+    [
+      "PUT",
+      "/internal/forks/{reservation_id}/canvas"
+    ],
+    [
       "POST",
       "/pathfind"
     ],
@@ -213,6 +221,52 @@
       ],
       "type": "object"
     },
+    "ForkCanvasUpdate": {
+      "properties": {
+        "canvas_data": "object"
+      },
+      "required": [
+        "canvas_data"
+      ],
+      "type": "object"
+    },
+    "ForkCanvasUpdateResponse": {
+      "properties": {
+        "id": "string",
+        "invalid_edges": "array",
+        "valid": "boolean"
+      },
+      "required": [
+        "id",
+        "invalid_edges",
+        "valid"
+      ],
+      "type": "object"
+    },
+    "ForkConnectionResponse": {
+      "properties": {
+        "created_at": "string",
+        "created_by": "string",
+        "device_a_id": "string",
+        "device_b_id": "string",
+        "id": "string",
+        "layer": "string",
+        "physical_connection_id": "anyOf",
+        "port_a": "string",
+        "port_b": "string"
+      },
+      "required": [
+        "created_at",
+        "created_by",
+        "device_a_id",
+        "device_b_id",
+        "id",
+        "layer",
+        "port_a",
+        "port_b"
+      ],
+      "type": "object"
+    },
     "ForkCreate": {
       "properties": {
         "created_by": "anyOf",
@@ -232,6 +286,46 @@
       },
       "required": [
         "fork_id",
+        "version_number"
+      ],
+      "type": "object"
+    },
+    "ForkDetailResponse": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "connections": "array",
+        "created_at": "string",
+        "id": "string",
+        "parent_topology_id": "anyOf",
+        "parent_version_id": "anyOf",
+        "reservation_id": "string",
+        "status": "string",
+        "updated_at": "string",
+        "versions": "array"
+      },
+      "required": [
+        "connections",
+        "created_at",
+        "id",
+        "reservation_id",
+        "status",
+        "updated_at",
+        "versions"
+      ],
+      "type": "object"
+    },
+    "ForkVersionSummary": {
+      "properties": {
+        "created_at": "string",
+        "fork_id": "string",
+        "id": "string",
+        "restored_from_id": "anyOf",
+        "version_number": "integer"
+      },
+      "required": [
+        "created_at",
+        "fork_id",
+        "id",
         "version_number"
       ],
       "type": "object"
