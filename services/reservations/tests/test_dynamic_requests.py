@@ -898,12 +898,62 @@ async def test_timeout_backstop_leaves_fresh_dynamic_reservation():
     assert await _outbox_rows("herd.reservations.failed") == []
 
 
-async def test_timeout_backstop_ignores_physical_only_reservation():
-    """A stuck PENDING_PROVISION without dynamic requests is outside the
-    backstop's scope (ADR 0004); it resolves via the claim path's own policy."""
+async def test_restart_backstop_reverts_stranded_physical_reservation():
+    """A physical-only PENDING_PROVISION stranded past the deadline (issue #318)
+    is reverted to PENDING, not failed, so a later claim cycle re-activates it.
+    No reservation.created was emitted yet (it commits with ACTIVE), so nothing
+    was provisioned and there is nothing to tear down: the fix reclaims rather
+    than fails. No reservation.failed is staged and no device is released."""
+    update_mock = AsyncMock()
     rid = await _insert_reservation(
         ReservationStatus.PENDING_PROVISION,
         updated_at=NOW - timedelta(hours=2),
+    )
+    p1, p2, p3, p4 = _patch_expiration_inventory(update_mock=update_mock)
+    with p1, p2, p3, p4:
+        await _run_expiration_cycle()
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.PENDING
+    assert await _outbox_rows("herd.reservations.failed") == []
+    # A revert flips no inventory status; the device release loop is for FAILED
+    # rows only. Re-activation on the next cycle re-flips exclusive devices.
+    update_mock.assert_not_called()
+
+
+async def test_restart_backstop_reclaims_and_reactivates_across_cycles():
+    """End to end: a stranded physical row reverted to PENDING is picked up by
+    the next cycle's claim path and driven to ACTIVE, proving the reclaim is a
+    real recovery, not just a status flip."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        start_time=NOW - timedelta(minutes=5),
+        updated_at=NOW - timedelta(hours=2),
+    )
+    p1, p2, p3, p4 = _patch_expiration_inventory()
+    with (
+        p1,
+        p2,
+        p3,
+        p4,
+        patch("app.tasks.expiration._create_reservation_fork_best_effort", new=AsyncMock()),
+    ):
+        # First cycle: the restart backstop reverts the stranded row to PENDING.
+        await _run_expiration_cycle()
+        assert (await _get_reservation(rid)).status == ReservationStatus.PENDING
+        # Second cycle: the claim path re-activates it exactly like any PENDING
+        # reservation whose start_time has passed.
+        await _run_expiration_cycle()
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.ACTIVE
+    assert len(await _outbox_rows("herd.reservations.created")) == 1
+
+
+async def test_restart_backstop_leaves_fresh_physical_reservation():
+    """A physical-only PENDING_PROVISION within the deadline is untouched: the
+    in-process activation still owns it."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        updated_at=NOW - timedelta(seconds=30),
     )
     p1, p2, p3, p4 = _patch_expiration_inventory()
     with p1, p2, p3, p4:
@@ -911,6 +961,70 @@ async def test_timeout_backstop_ignores_physical_only_reservation():
     res = await _get_reservation(rid)
     assert res.status == ReservationStatus.PENDING_PROVISION
     assert await _outbox_rows("herd.reservations.failed") == []
+    assert await _outbox_rows("herd.reservations.created") == []
+
+
+async def test_restart_backstop_skips_row_activated_concurrently():
+    """CAS race (issue #276 discipline): if an in-process activation commits
+    ACTIVE between the backstop's SELECT and its conditional write, the revert
+    matches zero rows and leaves the row ACTIVE, never dragging it back to
+    PENDING. Simulated by having the conditional UPDATE observe an ACTIVE row."""
+    import app.tasks.expiration as exp
+    from app.services import reservation_service as svc
+
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        updated_at=NOW - timedelta(hours=2),
+    )
+    real_claim = svc._claim_provision_transition
+
+    async def racing_claim(db, reservation_id, new_status):
+        # The competing in-process activation wins the row first: commit ACTIVE,
+        # then run the real CAS, which now matches zero PENDING_PROVISION rows.
+        await db.execute(
+            update(Reservation)
+            .where(Reservation.id == reservation_id)
+            .values(status=ReservationStatus.ACTIVE)
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        return await real_claim(db, reservation_id, new_status)
+
+    p1, p2, p3, p4 = _patch_expiration_inventory()
+    # The cycle calls the name bound into the expiration module at import time,
+    # so patch it there, not in reservation_service.
+    with (
+        p1,
+        p2,
+        p3,
+        p4,
+        patch.object(exp, "_claim_provision_transition", new=racing_claim),
+    ):
+        await _run_expiration_cycle()
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.ACTIVE
+    assert await _outbox_rows("herd.reservations.failed") == []
+
+
+async def test_restart_backstop_disabled_when_timeout_zero():
+    """A provision_timeout_seconds of 0 disables both backstops: a stranded
+    physical row is left in PENDING_PROVISION rather than reclaimed."""
+    from app.config import settings
+
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        updated_at=NOW - timedelta(hours=2),
+    )
+    p1, p2, p3, p4 = _patch_expiration_inventory()
+    original = settings.provision_timeout_seconds
+    settings.provision_timeout_seconds = 0
+    try:
+        with p1, p2, p3, p4:
+            await _run_expiration_cycle()
+    finally:
+        settings.provision_timeout_seconds = original
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.PENDING_PROVISION
 
 
 # --- Same-instant race: backstop vs provision-result callback (#276) ----------

@@ -292,11 +292,10 @@ async def _run_expiration_cycle() -> None:
         # in PENDING_PROVISION past provision_timeout_seconds, so a lost
         # provision-result callback never strands a reservation. updated_at is
         # the transition timestamp: nothing touches a stuck row after it enters
-        # PENDING_PROVISION. Physical-only PENDING_PROVISION reservations are
-        # excluded; they resolve inside the create call or the claim path's
-        # retry-next-tick revert. reservation.failed drives execution-side
-        # instance teardown. A timeout of 0 disables the backstop rather than
-        # instantly failing every in-flight provisioning.
+        # PENDING_PROVISION. reservation.failed drives execution-side instance
+        # teardown. A timeout of 0 disables both backstops rather than instantly
+        # reclaiming every in-flight provisioning. Physical-only rows take the
+        # revert branch below, not this failing one.
         stuck: list[Reservation] = []
         if settings.provision_timeout_seconds > 0:
             deadline = now - timedelta(seconds=settings.provision_timeout_seconds)
@@ -328,6 +327,49 @@ async def _run_expiration_cycle() -> None:
                     res.id,
                     extra={
                         "action": "provision_timeout_failed",
+                        "reservation_id": str(res.id),
+                    },
+                )
+
+            # Restart backstop (issue #318): revert physical-only reservations
+            # stranded in PENDING_PROVISION past the same deadline back to PENDING,
+            # so a later cycle's claim path re-runs the inventory flip and
+            # activation. A physical-only reservation resolves inline (the
+            # immediate create path, or the scheduled claim's
+            # _activate_pending_reservation), never via a callback, so a process
+            # restart between the PENDING_PROVISION commit and that resolving
+            # transition otherwise strands the row forever with nothing to reclaim
+            # it. Unlike the dynamic backstop this reverts rather than fails: no
+            # reservation.created was emitted yet (it commits atomically with the
+            # ACTIVE transition), so no execution provisioning ran and there is
+            # nothing to tear down; re-activation re-flips the exclusive devices
+            # idempotently. PENDING is in the conflict set, so the window stays
+            # held across the revert. The NOT EXISTS mirrors the dynamic branch's
+            # EXISTS, so the two backstops partition PENDING_PROVISION and never
+            # both touch one row.
+            result = await db.execute(
+                select(Reservation).where(
+                    and_(
+                        Reservation.status == ReservationStatus.PENDING_PROVISION,
+                        Reservation.updated_at <= deadline,
+                        ~exists().where(ReservationDynamicRequest.reservation_id == Reservation.id),
+                    )
+                )
+            )
+            for res in result.scalars().all():
+                # Same compare-and-swap discipline (issue #276): an in-process
+                # activation that committed ACTIVE (immediate create path or
+                # _activate_pending_reservation) between the SELECT above and here
+                # wins the row, our conditional UPDATE matches zero rows, and we
+                # skip it. The revert only lands when nothing else resolved the
+                # row, i.e. the genuine restart-strand case.
+                if not await _claim_provision_transition(db, res.id, ReservationStatus.PENDING):
+                    continue
+                logger.warning(
+                    "Reclaiming stranded physical reservation %s; reverting to PENDING",
+                    res.id,
+                    extra={
+                        "action": "provision_restart_reclaim",
                         "reservation_id": str(res.id),
                     },
                 )
