@@ -335,6 +335,48 @@ async def list_reservations_for_topology(
     ]
 
 
+@router.get("/internal/by-device/{device_id}")
+async def list_reservations_for_device(
+    device_id: uuid.UUID,
+    x_internal_token: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """Return reservations containing this device, unfiltered by visibility.
+
+    Internal-token-guarded service-to-service endpoint. Issue #337: inventory's
+    config-version restore needed the device-scoped equivalent of
+    /internal/by-topology, which cabling's reservation lock uses for topology
+    restore. This sees every reservation on the device regardless of who holds
+    it, so the guard cannot be fooled by device-group visibility the way the
+    user-facing /calendar route is. Device membership is an indexed EXISTS over
+    reservation_devices, matching /internal/active and /internal/active-users.
+    Declared before /internal/{reservation_id} so the literal "by-device"
+    segment is not parsed as a reservation id.
+    """
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    result = await db.execute(
+        select(Reservation).where(
+            exists().where(
+                and_(
+                    ReservationDevice.reservation_id == Reservation.id,
+                    ReservationDevice.device_id == device_id,
+                )
+            )
+        )
+    )
+    return [
+        {
+            "id": str(r.id),
+            "user_id": str(r.user_id),
+            "device_id": str(device_id),
+            "status": r.status.value,
+            "end_time": r.end_time.isoformat(),
+        }
+        for r in result.scalars()
+    ]
+
+
 @router.get("/internal/{reservation_id}", response_model=ReservationInternalStatus)
 async def get_reservation_internal_status(
     reservation_id: uuid.UUID,

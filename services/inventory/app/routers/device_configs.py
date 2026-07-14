@@ -30,6 +30,7 @@ from app.schemas.device_config import (
 )
 from app.services.config_diff import render_unified_diff
 from app.services.published_schema import published_schema_for_device
+from app.services.reservation_guard import find_blocking_reservations_for_device
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +329,32 @@ async def restore_config_version(
             )
 
     source = await _load_version(db, device_id, version_id)
+
+    # Issue #337: block a restore that would pull config out from under an
+    # active reservation someone else holds, mirroring topology restore's
+    # active-reservation lock (services/cabling/app/routes/versions.py). A
+    # reservation the caller owns is exempt: `_user_can_manage_device` above
+    # already treats owning an active reservation on this device as
+    # equivalent to `manage`, so a reservation holder restoring their own
+    # device mid-reservation is the self-service case that ACL widening
+    # exists for, not the surprise-rollback case this guard targets.
+    blocking = await find_blocking_reservations_for_device(device_id)
+    blocking_others = [b for b in blocking if str(b.get("user_id") or "") != payload["sub"]]
+    if blocking_others:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Device has active reservations; restore blocked",
+                "reservations": [
+                    {
+                        "id": str(b.get("id")),
+                        "status": b.get("status"),
+                        "end_time": b.get("end_time"),
+                    }
+                    for b in blocking_others
+                ],
+            },
+        )
 
     # Re-validate the source config against the CURRENT schema before restoring.
     # The driver-published schema may have tightened since the source version

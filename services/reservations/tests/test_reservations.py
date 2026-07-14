@@ -436,6 +436,47 @@ async def test_internal_by_topology_bad_token_rejected(internal_client):
 
 
 @pytest.mark.asyncio
+async def test_internal_by_device_returns_matching_reservation(internal_client):
+    """The by-device lookup returns reservations containing that device, unfiltered.
+
+    Issue #337: inventory's config-version restore guard uses this endpoint the
+    same way cabling's topology-restore guard uses /internal/by-topology.
+    """
+    rid = await _insert_reservation_row(status=ReservationStatus.ACTIVE)
+    resp = await internal_client.get(
+        f"/internal/by-device/{DEVICE_A}", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    items = resp.json()
+    assert len(items) == 1
+    assert items[0]["id"] == rid
+    assert items[0]["device_id"] == DEVICE_A
+    assert items[0]["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_internal_by_device_empty_for_unrelated_device(internal_client):
+    """A device with no reservations returns an empty list."""
+    await _insert_reservation_row()
+    other_device = str(uuid.uuid4())
+    resp = await internal_client.get(
+        f"/internal/by-device/{other_device}",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_internal_by_device_bad_token_rejected(internal_client):
+    await _insert_reservation_row()
+    resp = await internal_client.get(
+        f"/internal/by-device/{DEVICE_A}", headers={"X-Internal-Token": "wrong-token"}
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_internal_status_missing_token_rejected(internal_client):
     rid = await _insert_reservation_row()
     resp = await internal_client.get(f"/internal/{rid}")

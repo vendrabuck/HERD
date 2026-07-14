@@ -26,6 +26,10 @@
     ],
     [
       "GET",
+      "/internal/by-device/{device_id}"
+    ],
+    [
+      "GET",
       "/internal/by-topology/{topology_id}"
     ],
     [

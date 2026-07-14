@@ -60,6 +60,20 @@ def _mock_minio():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _noop_reservation_guard():
+    """Default: no active reservations on the device, so restore proceeds.
+
+    Mirrors cabling's test_topology_versions._noop_reservation_guard fixture
+    for the topology-restore lock this guard is patterned after.
+    """
+    with patch(
+        "app.routers.device_configs.find_blocking_reservations_for_device",
+        new=AsyncMock(return_value=[]),
+    ) as m:
+        yield m
+
+
 @pytest.fixture
 async def client():
     app.dependency_overrides[get_db] = override_get_db
