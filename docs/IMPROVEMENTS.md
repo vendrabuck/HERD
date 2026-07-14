@@ -17,18 +17,17 @@ correctness, performance, source-vs-symptom).
 
 ## Security
 
-The three issues previously tracked here (config session-secret forgeability #246,
-cleartext `field_data` password read #247, api-token role clamp #248) have all closed and
-are pruned per this doc's own rule. Remaining security-adjacent work is tracked in the
-issue queue rather than here (at the time of this refresh: the non-constant-time
-internal-token comparison noted below, and the assistant message-retention decision in
+The four issues previously tracked here (config session-secret forgeability #246,
+cleartext `field_data` password read #247, api-token role clamp #248, and the
+non-constant-time internal-token comparison #311) have all closed and are pruned per this
+doc's own rule. Remaining security-adjacent work is tracked in the issue queue rather than
+here (at the time of this refresh: the assistant message-retention decision in
 [#338](https://github.com/vendrabuck/HERD/issues/338)).
 
-Two lower-severity observations were examined and deliberately not filed as bugs, but are
-worth noting for a hardening pass: most services compare the internal token with `!=`
-rather than `hmac.compare_digest` (only `auth` uses constant-time comparison), and
-outbound webhook targets are admin-registered with no SSRF allowlist (within admin
-authority today, but worth an allowlist when multi-tenancy lands).
+One lower-severity observation was examined and deliberately not filed as a bug, but is
+worth noting for a hardening pass: outbound webhook targets are admin-registered with no
+SSRF allowlist (within admin authority today, but worth an allowlist when multi-tenancy
+lands).
 
 ## Performance and scalability
 
@@ -88,9 +87,10 @@ They are the core of the "larger refactor another time" scope.
   `httpx.AsyncClient(...)` calls to peers with an inline timeout and an `X-Internal-Token`
   header, and each re-implements the 5xx-is-transient / 404-is-absent classification
   (`nats_consumer._get_internal` is the most developed version). Promoting that helper
-  into `herd_common` (with the retry-with-backoff helper already there) would give every
-  service one consistent, constant-time-token, correctly-classifying client and remove a
-  class of copy-paste drift.
+  into `herd_common` (with the retry-with-backoff helper already there, and the shared
+  `internal_auth.internal_token_matches` verifier now covering the inbound side) would give
+  every service one consistent, correctly-classifying client and remove a class of
+  copy-paste drift.
 - **Frontend batch-fetch hooks.** The two perf items above are symptoms of the same
   structural gap: `frontend/src/api/` has per-item fetch hooks but no batch primitives.
   Adding `useDevicesByIds` and `usePathfindBatch` (backed by the new endpoints) and making

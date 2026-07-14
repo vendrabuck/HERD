@@ -153,7 +153,7 @@
     <ol class="legend">
       <li><b>Current.</b> The version live on the device right now.</li>
       <li><b>Diff.</b> Opens a unified diff between any version and the current one.</li>
-      <li><b>Restore.</b> Re-applies an older version as a new apply. Unlike topology restore, this has no reservation guard today; it re-applies regardless of any reservation on the device.</li>
+      <li><b>Restore.</b> Re-applies an older version as a new apply. Guarded like topology restore (issue #337): if the device is held by an active reservation (ACTIVE, PENDING_PROVISION, or PENDING) that belongs to someone else, the restore is blocked with a 409. A reservation you own does not block your own restore, and if the reservations service cannot be reached the restore fails closed with a 503 rather than proceeding.</li>
     </ol>
 
     <h2 class="sec" id="diff">What changed</h2>
