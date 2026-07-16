@@ -136,7 +136,7 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-ANTHROPIC_API_KEY_UNUSED_WARNING = (
+LEGACY_ANTHROPIC_ENV_WARNING = (
     "ANTHROPIC_API_KEY is set but is not honored by ai-orchestrator and has no "
     "effect; set AI_API_KEY instead. AI features remain disabled until "
     "AI_API_KEY is set."
@@ -152,4 +152,4 @@ def warn_if_anthropic_api_key_unused() -> None:
     startup; never call this per-request.
     """
     if settings.anthropic_api_key and not settings.ai_api_key:
-        logger.warning(ANTHROPIC_API_KEY_UNUSED_WARNING)
+        logger.warning(LEGACY_ANTHROPIC_ENV_WARNING)

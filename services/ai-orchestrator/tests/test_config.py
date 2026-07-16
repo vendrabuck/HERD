@@ -48,7 +48,7 @@ def test_warns_when_anthropic_key_set_and_ai_api_key_blank(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="app.config"):
         config_module.warn_if_anthropic_api_key_unused()
 
-    assert caplog.messages == [config_module.ANTHROPIC_API_KEY_UNUSED_WARNING]
+    assert caplog.messages == [config_module.LEGACY_ANTHROPIC_ENV_WARNING]
     assert caplog.messages[0] == (
         "ANTHROPIC_API_KEY is set but is not honored by ai-orchestrator and has no "
         "effect; set AI_API_KEY instead. AI features remain disabled until "
