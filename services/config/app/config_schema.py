@@ -298,8 +298,10 @@ CONFIG_SCHEMA = [
         "group": "AI Integration",
         "secret": True,
         "description": (
-            "Deprecated. Use AI_API_KEY instead. Honored as a fallback for one "
-            "release when AI_API_KEY is blank; will be removed in the next release."
+            "Deprecated. Not honored as a fallback for AI_API_KEY; setting this "
+            "alone does not enable AI features. Use AI_API_KEY instead. Leaving "
+            "this set while AI_API_KEY is blank logs a startup warning from "
+            "ai-orchestrator."
         ),
     },
     # Logging
