@@ -16,11 +16,18 @@ import "@xyflow/react/dist/style.css";
 import toast from "react-hot-toast";
 
 import { useTopology, useUpdateTopology, useRestoreVersion } from "@/api/topologies";
-import { useReservations, useUpdateReservation } from "@/api/reservations";
+import {
+  useReservations,
+  useUpdateReservation,
+  useReservationFork,
+  useSaveReservationFork,
+  forkConflictDetail,
+} from "@/api/reservations";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
 import { hydrateCanvasNodes } from "@/api/inventory";
 import { useTopologyStore } from "@/stores/topologyStore";
+import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
 import { FloatingPanel } from "@/components/ui/FloatingPanel";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -30,6 +37,10 @@ import { AIDialog } from "@/components/topology-editor/AIDialog";
 import { AICommitDialog } from "@/components/topology-editor/AICommitDialog";
 import { AIProposalBar } from "@/components/topology-editor/AIProposalBar";
 import { LiveEditBar } from "@/components/topology-editor/LiveEditBar";
+import { AsBuiltBar } from "@/components/topology-editor/AsBuiltBar";
+import { ForkSaveResultToast } from "@/components/topology-editor/ForkSaveResultToast";
+import { ForkConflictDialog } from "@/components/topology-editor/ForkConflictDialog";
+import { ForkHistoryPanel } from "@/components/topology-editor/ForkHistoryPanel";
 import { HistoryPanel } from "@/components/topology-editor/HistoryPanel";
 import { VersionDiffDialog } from "@/components/topology-editor/VersionDiffDialog";
 import { RestoreConfirmDialog } from "@/components/topology-editor/RestoreConfirmDialog";
@@ -40,6 +51,7 @@ import { DeviceNode } from "@/components/topology-editor/nodes/DeviceNode";
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
 import type { Device } from "@/types/device.types";
 import type { AIGenerateResponse } from "@/types/ai.types";
+import type { ForkConflictDetail } from "@/types/reservation.types";
 import type {
   CanvasData,
   DeviceNodeData,
@@ -78,8 +90,10 @@ function TopologyEditorInner() {
 
   // Reservation-bound ("live edit") mode: entered via
   // /topology/:id?reservationId=... from a reservation's detail modal. In this
-  // mode, committing the canvas also PATCHes the reservation's device set, which
-  // the backend turns into incremental provisioning of the running reservation.
+  // mode the canvas is the reservation's editable fork (ADR 0006 Decision 6), NOT
+  // the parent topology: edits autosave as loose fork drafts, committing saves a
+  // fork version (never touching the parent's TopologyVersion history), and the
+  // device-set PATCH still drives incremental provisioning.
   const reservationId = searchParams.get("reservationId");
   const { data: reservations } = useReservations();
   const liveReservation = useMemo(
@@ -88,7 +102,16 @@ function TopologyEditorInner() {
   );
   const isLiveEdit = !!reservationId;
   const updateReservation = useUpdateReservation();
+  const { data: fork } = useReservationFork(isLiveEdit ? reservationId : null);
+  const saveFork = useSaveReservationFork();
   const [isCommitting, setIsCommitting] = useState(false);
+  const [forkLoaded, setForkLoaded] = useState(false);
+  const [saveConflict, setSaveConflict] = useState<ForkConflictDetail | null>(null);
+
+  // An ARCHIVED fork is the frozen as-built record of an ended reservation: the
+  // canvas renders read-only. This is the authoritative signal (the fork is
+  // archived by the teardown paths), so mutations key off it directly.
+  const isReadOnly = isLiveEdit && fork?.status === "ARCHIVED";
 
   const {
     nodes,
@@ -194,13 +217,34 @@ function TopologyEditorInner() {
   const restoreVersion = useRestoreVersion(id);
   const createTemplate = useCreateTemplateFromTopology();
 
-  // Load canvas data from backend when topology loads. Hydrate each node's
+  // Load canvas data from backend when the source loads. Hydrate each node's
   // device from a fresh inventory fetch first, so the editor is resilient to
   // thin or stale persisted nodes (a deleted/missing device degrades to its
   // persisted data and is flagged by validation, never throwing). Loading the
   // persisted canvas first would flash blank/white nodes, so we await hydration
   // before the single loadCanvas call.
+  //
+  // In live-edit mode the source is the reservation's fork, not the parent
+  // topology: the fork carries its own canvas (deep-copied from the parent at
+  // creation, then diverging per save). forkLoaded gates the autosave so loading
+  // the fork never counts as an edit.
   useEffect(() => {
+    if (isLiveEdit) {
+      if (fork && !initializedRef.current) {
+        initializedRef.current = true;
+        const persisted = fork.canvas_data;
+        const applyLoad =
+          persisted && persisted.nodes
+            ? hydrateCanvasNodes(persisted)
+                .then((hydrated) => loadCanvas(hydrated))
+                .catch(() => loadCanvas(persisted))
+            : Promise.resolve().then(() => clearTopology());
+        // Flip forkLoaded off the sync effect body (in a promise callback) so the
+        // autosave baseline is seeded only once the loaded canvas is in the store.
+        applyLoad.finally(() => setForkLoaded(true));
+      }
+      return;
+    }
     if (topology && !initializedRef.current) {
       initializedRef.current = true;
       if (topology.canvas_data) {
@@ -214,14 +258,28 @@ function TopologyEditorInner() {
         clearTopology();
       }
     }
-  }, [topology, loadCanvas, clearTopology]);
+  }, [isLiveEdit, fork, topology, loadCanvas, clearTopology]);
 
-  // Reset initialized ref when navigating to a different topology
+  // Debounced fork-draft autosave: PUTs the loose canvas a couple of seconds
+  // after edits pause and flushes on unmount. Enabled only for an editable
+  // (non-archived) fork that has finished loading.
+  const liveCanvas = useMemo<CanvasData>(
+    () => ({ nodes, edges, selectedEdgeLayer }),
+    [nodes, edges, selectedEdgeLayer],
+  );
+  const autosave = useForkAutosave({
+    reservationId: isLiveEdit ? reservationId : null,
+    canvas: liveCanvas,
+    enabled: isLiveEdit && !isReadOnly && forkLoaded,
+  });
+
+  // Reset initialized ref when navigating to a different topology or reservation
   useEffect(() => {
     return () => {
       initializedRef.current = false;
+      setForkLoaded(false);
     };
-  }, [id]);
+  }, [id, reservationId]);
 
   const allDeviceIds = useMemo(
     () => [...new Set(nodes.map((n) => (n.data as DeviceNodeData).device.id))],
@@ -253,6 +311,7 @@ function TopologyEditorInner() {
   const onDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
+      if (isReadOnly) return;
       const deviceJson = event.dataTransfer.getData("application/herd-device");
       if (!deviceJson) return;
 
@@ -279,7 +338,7 @@ function TopologyEditorInner() {
 
       addDeviceNode(newNode);
     },
-    [addDeviceNode, screenToFlowPosition, allDeviceIds]
+    [isReadOnly, addDeviceNode, screenToFlowPosition, allDeviceIds]
   );
 
   const onDragOver = useCallback((event: React.DragEvent) => {
@@ -289,6 +348,7 @@ function TopologyEditorInner() {
 
   const handleConnect: OnConnect = useCallback(
     (connection) => {
+      if (isReadOnly) return;
       const sourceNode = nodes.find((n) => n.id === connection.source);
       const targetNode = nodes.find((n) => n.id === connection.target);
       if (!sourceNode || !targetNode) return;
@@ -304,7 +364,7 @@ function TopologyEditorInner() {
         targetDeviceName: targetDevice.name,
       });
     },
-    [nodes]
+    [isReadOnly, nodes]
   );
 
   const handleConnectionConfirm = useCallback(
@@ -432,52 +492,72 @@ function TopologyEditorInner() {
     toast.success("Topology saved");
   };
 
-  // Live-edit commit: persist the canvas, then re-point the reservation's device
-  // set at the canvas devices. The device PATCH is what triggers the backend's
-  // incremental provisioning (reservation.updated -> connect/disconnect ports,
-  // add/remove from VLAN). Blocked when any edge is unreachable; the backend
-  // enforces the same rule, this is the fast-fail UX path.
+  // Live-edit commit (ADR 0006 Decision 6): reconcile the reservation's FORK
+  // against the canvas, then re-point the reservation's device set. The fork save
+  // replaces the old parent-topology PUT: it appends a fork version and leaves the
+  // parent's TopologyVersion history byte-for-byte unchanged. The device PATCH is
+  // unchanged and is still what triggers incremental provisioning
+  // (reservation.updated: connect/disconnect ports, add/remove from VLAN).
+  // Blocked when any edge is unreachable; the backend enforces the same rule.
   const handleCommitToReservation = useCallback(async () => {
-    if (!id || !reservationId) return;
+    if (!reservationId) return;
     if (hasInvalidEdges) {
       toast.error("Fix unreachable edges before committing");
       return;
     }
     setIsCommitting(true);
     try {
-      await updateTopology.mutateAsync({
-        id,
-        canvas_data: { nodes, edges, selectedEdgeLayer },
+      const result = await saveFork.mutateAsync({
+        reservationId,
+        canvasData: { nodes, edges, selectedEdgeLayer },
       });
-      await updateReservation.mutateAsync({
-        id: reservationId,
-        data: { device_ids: allDeviceIds },
-      });
-      toast.success("Reservation topology updated");
-      navigate("/reservations");
+      // The reconcile captured this canvas, so cancel any pending draft flush.
+      autosave.markClean();
+      toast.custom((t) => (
+        <ForkSaveResultToast result={result} onDismiss={() => toast.dismiss(t.id)} />
+      ));
+      // The fork version is already committed at this point; a device-set PATCH
+      // failure must not be reported as a failed save, it gets its own message.
+      try {
+        await updateReservation.mutateAsync({
+          id: reservationId,
+          data: { device_ids: allDeviceIds },
+        });
+      } catch {
+        toast.error(
+          "Fork saved, but updating the reservation's device set failed; commit again to retry",
+        );
+      }
     } catch (err) {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-        ?.detail;
-      const message =
-        typeof detail === "string"
-          ? detail
-          : (detail as { message?: string } | undefined)?.message ??
-            "Failed to update the reservation topology";
-      toast.error(message);
+      // A structured 409 (cross-reservation port claim) opens the conflict dialog
+      // and keeps the drawing so the user can rework it. Any other error (a plain
+      // 409 for a non-ACTIVE or ARCHIVED fork, a transport failure) toasts.
+      const conflict = forkConflictDetail(err);
+      if (conflict) {
+        setSaveConflict(conflict);
+      } else {
+        const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
+          ?.detail;
+        const message =
+          typeof detail === "string"
+            ? detail
+            : (detail as { message?: string } | undefined)?.message ??
+              "Failed to save the reservation fork";
+        toast.error(message);
+      }
     } finally {
       setIsCommitting(false);
     }
   }, [
-    id,
     reservationId,
     hasInvalidEdges,
-    updateTopology,
+    saveFork,
+    autosave,
     nodes,
     edges,
     selectedEdgeLayer,
     updateReservation,
     allDeviceIds,
-    navigate,
   ]);
 
   const handleCancelLiveEdit = useCallback(() => {
@@ -585,9 +665,14 @@ function TopologyEditorInner() {
           <span className="text-sm font-medium text-gray-900 truncate">
             {topology?.name ?? "Topology"}
           </span>
-          {isLiveEdit && (
+          {isLiveEdit && !isReadOnly && (
             <span className="text-xs font-medium px-2 py-0.5 rounded bg-blue-100 text-blue-700">
               Editing reservation{liveReservation ? ` (${liveReservation.purpose})` : ""}
+            </span>
+          )}
+          {isReadOnly && (
+            <span className="text-xs font-medium px-2 py-0.5 rounded bg-gray-200 text-gray-700">
+              As-built (read-only){liveReservation ? ` (${liveReservation.purpose})` : ""}
             </span>
           )}
           <div className="w-px h-5 bg-gray-300" />
@@ -659,13 +744,15 @@ function TopologyEditorInner() {
             >
               History
             </button>
-            <button
-              onClick={() => setShowSaveAsTemplate(true)}
-              disabled={!!previewVersion}
-              className="text-sm text-gray-700 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-50"
-            >
-              Save as Template
-            </button>
+            {!isLiveEdit && (
+              <button
+                onClick={() => setShowSaveAsTemplate(true)}
+                disabled={!!previewVersion}
+                className="text-sm text-gray-700 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-50"
+              >
+                Save as Template
+              </button>
+            )}
             {previewVersion && (
               <button
                 onClick={handleExitPreview}
@@ -676,7 +763,7 @@ function TopologyEditorInner() {
             )}
             <button
               onClick={() => setShowClearConfirm(true)}
-              disabled={!!previewVersion}
+              disabled={!!previewVersion || isReadOnly}
               className="text-sm text-red-600 hover:text-red-800 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Clear canvas
@@ -703,14 +790,19 @@ function TopologyEditorInner() {
             />
           )}
 
-          {isLiveEdit && !pendingProposal && (
+          {isLiveEdit && !isReadOnly && !pendingProposal && (
             <LiveEditBar
               deviceCount={allDeviceIds.length}
               invalidEdgeCount={invalidEdges.length}
               isCommitting={isCommitting}
+              autosaveStatus={autosave.status}
               onCommit={handleCommitToReservation}
               onCancel={handleCancelLiveEdit}
             />
+          )}
+
+          {isReadOnly && !pendingProposal && (
+            <AsBuiltBar deviceCount={allDeviceIds.length} onClose={handleCancelLiveEdit} />
           )}
 
           <ReactFlow
@@ -725,8 +817,11 @@ function TopologyEditorInner() {
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             connectionMode={ConnectionMode.Loose}
+            nodesDraggable={!isReadOnly}
+            nodesConnectable={!isReadOnly}
+            elementsSelectable={!isReadOnly}
             fitView
-            deleteKeyCode="Delete"
+            deleteKeyCode={isReadOnly ? null : "Delete"}
           >
             <Background gap={16} size={1} color="#e5e7eb" />
             <Controls />
@@ -791,7 +886,17 @@ function TopologyEditorInner() {
           />
         )}
 
-        {showHistory && id && (
+        {/* In live-edit mode History lists the FORK's versions (ADR 0006), not the
+            parent topology's, so an owner's edits never appear in the master's
+            history. Read-only: P3a ships no fork version preview/diff/restore. */}
+        {showHistory && isLiveEdit && (
+          <ForkHistoryPanel
+            versions={fork?.versions ?? []}
+            onClose={() => setShowHistory(false)}
+          />
+        )}
+
+        {showHistory && !isLiveEdit && id && (
           <HistoryPanel
             topologyId={id}
             onClose={() => setShowHistory(false)}
@@ -804,6 +909,12 @@ function TopologyEditorInner() {
             previewVersionId={previewVersion?.id ?? null}
           />
         )}
+
+        <ForkConflictDialog
+          open={!!saveConflict}
+          detail={saveConflict}
+          onClose={() => setSaveConflict(null)}
+        />
 
         {diffPair && id && (
           <VersionDiffDialog

@@ -51,6 +51,25 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
   const isOwner = user?.id === reservation.user_id;
   const canAct = isOwner && reservation.status === "ACTIVE";
   const canEdit = isOwner && (reservation.status === "ACTIVE" || reservation.status === "PENDING");
+  // The fork is editable only while the reservation is ACTIVE (ADR 0006); after
+  // it ends the fork is the frozen, read-only as-built record. A fork exists only
+  // once the reservation has activated, so a still-PENDING reservation has no fork
+  // view to open yet.
+  const isEnded =
+    reservation.status === "COMPLETED" ||
+    reservation.status === "CANCELLED" ||
+    reservation.status === "FAILED";
+  const canEditFork = isOwner && reservation.status === "ACTIVE" && !!reservation.topology_id;
+  const canViewAsBuilt = isOwner && isEnded && !!reservation.topology_id;
+
+  // Both open the reservation's fork view (ADR 0006 Decision 6): the editor loads
+  // the fork through GET /reservations/{id}/fork, not the parent topology_id, so
+  // the parent's history stays clean. The editor renders read-only for an ended
+  // (archived) fork.
+  const openForkView = () => {
+    onClose();
+    navigate(`/topology/${reservation.topology_id}?reservationId=${reservation.id}`);
+  };
 
   const start = new Date(reservation.start_time).toLocaleString();
   const end = new Date(reservation.end_time).toLocaleString();
@@ -81,27 +100,32 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
               {t.label}
             </button>
           ))}
-          {canEdit && activeTab !== "assistant" && (
+          {(canEdit || canViewAsBuilt) && activeTab !== "assistant" && (
             <div className="ml-auto flex items-center gap-2">
-              {reservation.topology_id && (
+              {canEditFork && (
                 <button
-                  onClick={() => {
-                    onClose();
-                    navigate(
-                      `/topology/${reservation.topology_id}?reservationId=${reservation.id}`,
-                    );
-                  }}
+                  onClick={openForkView}
                   className="text-xs px-2.5 py-1.5 rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
                 >
                   Edit topology
                 </button>
               )}
-              <button
-                onClick={() => setEditDevicesOpen(true)}
-                className="text-xs px-2.5 py-1.5 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
-              >
-                Edit Resources
-              </button>
+              {canViewAsBuilt && (
+                <button
+                  onClick={openForkView}
+                  className="text-xs px-2.5 py-1.5 rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+                >
+                  View as-built
+                </button>
+              )}
+              {canEdit && (
+                <button
+                  onClick={() => setEditDevicesOpen(true)}
+                  className="text-xs px-2.5 py-1.5 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+                >
+                  Edit Resources
+                </button>
+              )}
             </div>
           )}
         </div>

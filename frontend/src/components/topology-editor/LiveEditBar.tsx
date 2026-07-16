@@ -1,20 +1,33 @@
+import type { ForkAutosaveStatus } from "@/hooks/useForkAutosave";
+
 interface LiveEditBarProps {
   deviceCount: number;
   invalidEdgeCount: number;
   isCommitting: boolean;
+  autosaveStatus?: ForkAutosaveStatus;
   onCommit: () => void;
   onCancel: () => void;
 }
 
-// Shown when the topology editor is opened bound to a live reservation
-// (/topology/:id?reservationId=...). Editing the canvas here re-wires a running
-// reservation: committing PUTs the canvas and PATCHes the reservation's device
-// set, which the backend turns into incremental provisioning. Commit is blocked
-// while any edge has no physical path, matching the server-side validation.
+const AUTOSAVE_LABEL: Record<ForkAutosaveStatus, string> = {
+  idle: "Draft up to date",
+  saving: "Saving draft...",
+  saved: "Draft saved",
+  error: "Draft save failed",
+};
+
+// Shown when the topology editor is opened bound to a live (ACTIVE) reservation
+// (/topology/:id?reservationId=...). Editing the canvas here re-wires the
+// reservation's fork: edits autosave as loose drafts, and committing reconciles
+// the fork (POST /reservations/{id}/fork/save, which appends a fork version and
+// leaves the parent topology's history untouched) and PATCHes the reservation's
+// device set to drive incremental provisioning. Commit is blocked while any edge
+// has no physical path, matching the server-side validation.
 export function LiveEditBar({
   deviceCount,
   invalidEdgeCount,
   isCommitting,
+  autosaveStatus,
   onCommit,
   onCancel,
 }: LiveEditBarProps) {
@@ -30,10 +43,21 @@ export function LiveEditBar({
             <span className="text-sm font-medium text-gray-900">
               {deviceCount} device{deviceCount !== 1 ? "s" : ""}
             </span>
+            {autosaveStatus && (
+              <span
+                className={`text-xs ${
+                  autosaveStatus === "error" ? "text-red-600" : "text-gray-400"
+                }`}
+                aria-live="polite"
+              >
+                {AUTOSAVE_LABEL[autosaveStatus]}
+              </span>
+            )}
           </div>
           <p className="text-xs text-gray-600 mt-1">
             Changes commit to the running reservation and re-provision the
-            affected devices.
+            affected devices. Edits autosave as drafts; committing saves a fork
+            version and leaves the master topology untouched.
           </p>
           {blocked && (
             <p className="text-xs text-red-600 mt-1">
