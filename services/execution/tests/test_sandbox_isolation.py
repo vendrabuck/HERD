@@ -6,10 +6,14 @@ driver child process:
 1. Device credentials (password-typed context keys) are not copied into the
    child environment, so they cannot be read out of /proc/<pid>/environ. The
    driver still receives them via the context temp file.
-2. POSIX resource limits (RLIMIT_AS, RLIMIT_CPU) are applied via preexec_fn, so
-   a driver that exhausts memory or CPU is killed rather than taking down the
-   host. These limits are POSIX-only; the rlimit cases skip where os.fork is
-   unavailable.
+2. POSIX resource limits (RLIMIT_AS, RLIMIT_CPU) are applied by the child
+   wrapper (_runner.py) before it imports any driver code, so a driver that
+   exhausts memory or CPU is killed rather than taking down the host. These
+   limits are POSIX-only; the rlimit cases skip where os.fork is unavailable.
+   The caps are applied in the child rather than via subprocess preexec_fn
+   because preexec_fn is not thread-safe and driver execution runs under
+   asyncio.to_thread (issue #307). These cases still spawn the real wrapper via
+   execute_driver_method, so they prove the child actually enforces the limits.
 """
 
 import os
@@ -24,7 +28,7 @@ from app.services.driver_sandbox import execute_driver_method
 # memory-kill assertion is only reliable on a forking, non-Darwin platform.
 _POSIX_FORK = hasattr(os, "fork") and sys.platform != "win32"
 _skip_no_rlimit = pytest.mark.skipif(
-    not _POSIX_FORK, reason="rlimit/preexec_fn requires POSIX os.fork"
+    not _POSIX_FORK, reason="rlimit enforcement requires POSIX os.fork"
 )
 
 

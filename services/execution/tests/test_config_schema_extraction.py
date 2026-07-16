@@ -118,7 +118,7 @@ def test_extract_does_not_instantiate_credential_dependent_init():
 
 @pytest.mark.skipif(
     not hasattr(__import__("os"), "fork"),
-    reason="rlimit/preexec_fn only applies on POSIX",
+    reason="rlimits only apply on POSIX",
 )
 def test_extract_schema_timeout_surfaces_as_failed_run():
     """A config_schema() that sleeps past the timeout is killed; the wrapper
