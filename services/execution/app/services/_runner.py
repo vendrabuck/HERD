@@ -35,6 +35,20 @@ def main():
         )
         sys.exit(1)
 
+    # Apply the POSIX resource caps the parent handed down BEFORE importing or
+    # running any driver code, so a memory- or CPU-abusing driver is still bound
+    # by RLIMIT_AS/RLIMIT_CPU/RLIMIT_NOFILE/RLIMIT_NPROC. These were historically
+    # applied via subprocess preexec_fn, but CPython documents preexec_fn as not
+    # thread-safe (the child runs Python between fork and exec and can deadlock
+    # on a lock held by another thread at fork time). Driver execution now runs
+    # under asyncio.to_thread, so multiple threads fork concurrently; applying
+    # the identical caps here in the child sidesteps the fork-safety hazard (#307).
+    _rlimits_json = os.environ.get("HERD_SANDBOX_RLIMITS")
+    if _rlimits_json:
+        import _rlimits
+
+        _rlimits.apply_rlimits(json.loads(_rlimits_json))
+
     driver_path = sys.argv[1]
     action = sys.argv[2]
     context_file = sys.argv[3]

@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -48,41 +47,37 @@ def context_to_env_vars(context: dict, exclude: set[str] | None = None) -> dict[
     return env_vars
 
 
-def _build_preexec_fn():
-    """Return a preexec_fn that applies POSIX resource limits to the driver child.
+# Env var carrying the rlimit policy from the parent to the child wrapper. The
+# child (_runner.py) reads it and applies the caps BEFORE importing any driver
+# code. See _rlimit_pairs and _rlimits.apply_rlimits.
+_RLIMITS_ENV_KEY = "HERD_SANDBOX_RLIMITS"
 
-    Runs in the child after fork, before exec. Returns None on non-POSIX
-    platforms (Windows, no os.fork), in which case the subprocess launches
-    without rlimits (backward compatible; no regression). Each limit reads
-    settings live so tests can monkeypatch them; a limit of 0 leaves that
-    resource unlimited. Limits applied: RLIMIT_AS (address space, prevents
+
+def _rlimit_pairs() -> list[tuple[str, int]]:
+    """Build the (RLIMIT_* name, value) pairs the child applies from live settings.
+
+    Each pair maps a resource.RLIMIT_* attribute name to its configured cap;
+    the child applies the value as both soft and hard limit. Read from settings
+    live so tests can monkeypatch them; a value of 0 leaves that resource
+    unlimited (the child skips it). This is the single source of which limits
+    the sandbox enforces and their values: RLIMIT_AS (address space, prevents
     OOM-bomb drivers), RLIMIT_CPU (seconds, prevents infinite loops),
-    RLIMIT_NOFILE (open files), RLIMIT_NPROC (child processes, prevents
-    fork-bombs). setrlimit failures are swallowed: no safe logger exists
-    inside the forked child after fork and before exec; a setrlimit error
-    (e.g. insufficient permissions) must not break the spawn.
+    RLIMIT_NOFILE (open files), RLIMIT_NPROC (processes, prevents fork-bombs).
+    The child applies them generically, so the policy is not duplicated there.
+
+    The caps are applied inside the child rather than via subprocess preexec_fn:
+    CPython documents preexec_fn as not thread-safe (the child runs Python
+    between fork and exec and can deadlock on a lock, e.g. the allocator or
+    import lock, held by another thread at fork time). Since driver execution
+    runs under asyncio.to_thread, multiple worker threads fork concurrently, so
+    a preexec_fn hook is unsafe; the child applies the identical caps itself (#307).
     """
-    if sys.platform == "win32" or not hasattr(os, "fork"):
-        return None
-
-    import resource
-
-    limits = [
-        (resource.RLIMIT_AS, settings.driver_rlimit_as_bytes),
-        (resource.RLIMIT_CPU, settings.driver_rlimit_cpu_seconds),
-        (resource.RLIMIT_NOFILE, settings.driver_rlimit_nofile),
-        (resource.RLIMIT_NPROC, settings.driver_rlimit_nproc),
+    return [
+        ("RLIMIT_AS", settings.driver_rlimit_as_bytes),
+        ("RLIMIT_CPU", settings.driver_rlimit_cpu_seconds),
+        ("RLIMIT_NOFILE", settings.driver_rlimit_nofile),
+        ("RLIMIT_NPROC", settings.driver_rlimit_nproc),
     ]
-
-    def _apply():
-        for res, val in limits:
-            if val and val > 0:
-                try:
-                    resource.setrlimit(res, (val, val))
-                except (ValueError, OSError):
-                    pass
-
-    return _apply
 
 
 class DryRunRefused(RuntimeError):
@@ -200,12 +195,18 @@ def execute_driver_method(
         # temp file written above.
         env.update(context_to_env_vars(context, exclude=password_keys or set()))
 
+        # Hand the rlimit policy to the child wrapper, which applies it before
+        # importing any driver code. Set after the context env update so a
+        # context key can never clobber it.
+        env[_RLIMITS_ENV_KEY] = json.dumps(_rlimit_pairs())
+
         # Install a driver's requirements.txt only when explicitly enabled. A
         # runtime `pip install` fetches arbitrary code from the network as the
         # service uid, so it is gated behind allow_driver_pip_install (default
         # off). When off, drivers must vendor their deps into _deps/. The
-        # install subprocess deliberately does NOT get the rlimit preexec_fn
-        # (the 256MB RLIMIT_AS would OOM pip).
+        # install subprocess deliberately does NOT apply the driver rlimits: it
+        # does not run the _runner.py wrapper (which reads _RLIMITS_ENV_KEY), so
+        # the 256MB RLIMIT_AS never bites pip.
         deps_dir = os.path.join(driver_path, "_deps")
         reqs_file = os.path.join(driver_path, "requirements.txt")
         if os.path.exists(reqs_file) and not os.path.exists(deps_dir):
@@ -236,7 +237,6 @@ def execute_driver_method(
                 text=True,
                 timeout=timeout,
                 env=env,
-                preexec_fn=_build_preexec_fn(),
             )
             elapsed_ms = int((time.monotonic() - start) * 1000)
 

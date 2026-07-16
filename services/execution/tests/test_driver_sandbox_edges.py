@@ -1,9 +1,10 @@
 """Edge-branch coverage for driver_sandbox.py.
 
-Covers the resource-limit preexec_fn (POSIX apply + setrlimit failure swallow,
-and the non-POSIX None return), the pip-install exception branch, the
-non-JSON-stdout-on-success fallback, and _read_transcript (missing file,
-malformed line skip, OSError on read).
+Covers the resource-limit policy (parent-side pair building from settings, the
+child-side apply with its 0-means-unlimited skip and setrlimit failure swallow,
+and the env var that carries the policy to the child), the pip-install exception
+branch, the non-JSON-stdout-on-success fallback, and _read_transcript (missing
+file, malformed line skip, OSError on read).
 """
 
 import json
@@ -11,10 +12,11 @@ import os
 import tempfile
 
 import pytest
-from app.services import driver_sandbox
+from app.services import _rlimits, driver_sandbox
 from app.services.driver_sandbox import (
-    _build_preexec_fn,
+    _RLIMITS_ENV_KEY,
     _read_transcript,
+    _rlimit_pairs,
     execute_driver_method,
 )
 
@@ -35,42 +37,61 @@ class Driver:
 """
 
 
-# --- _build_preexec_fn ---
+# --- rlimit policy: parent pair-building, child apply, env transport ---
 
 
-def test_build_preexec_fn_returns_none_on_win32(monkeypatch):
-    monkeypatch.setattr(driver_sandbox.sys, "platform", "win32")
-    assert _build_preexec_fn() is None
+def test_rlimit_pairs_reads_settings_live(monkeypatch):
+    """_rlimit_pairs maps each RLIMIT_* name to its live setting value."""
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_as_bytes", 111)
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_cpu_seconds", 222)
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_nofile", 333)
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_nproc", 444)
+    assert _rlimit_pairs() == [
+        ("RLIMIT_AS", 111),
+        ("RLIMIT_CPU", 222),
+        ("RLIMIT_NOFILE", 333),
+        ("RLIMIT_NPROC", 444),
+    ]
 
 
-def test_build_preexec_fn_applies_rlimits(monkeypatch):
-    """On POSIX, the returned callable calls setrlimit for each positive limit."""
-    if not hasattr(os, "fork"):
+def test_apply_rlimits_applies_each_positive_limit(monkeypatch):
+    """apply_rlimits calls setrlimit for each positive pair, resolving the name,
+    and skips a 0 (unlimited) pair."""
+    if not _rlimits.rlimits_supported():
         pytest.skip("non-POSIX platform")
 
-    calls = []
     import resource
+
+    calls = []
 
     def _fake_setrlimit(res, limits):
         calls.append((res, limits))
 
     monkeypatch.setattr(resource, "setrlimit", _fake_setrlimit)
-    # Ensure at least one positive limit is configured.
-    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_cpu_seconds", 5)
-    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_as_bytes", 0)
-    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_nofile", 0)
-    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_nproc", 0)
-
-    apply_fn = _build_preexec_fn()
-    assert apply_fn is not None
-    apply_fn()
-    # Only the one positive limit (CPU) was applied.
-    assert calls == [(resource.RLIMIT_CPU, (5, 5))]
+    _rlimits.apply_rlimits([("RLIMIT_CPU", 5), ("RLIMIT_AS", 0), ("RLIMIT_NOFILE", 128)])
+    # The 0 pair is skipped; the two positive limits are applied as soft==hard.
+    assert calls == [
+        (resource.RLIMIT_CPU, (5, 5)),
+        (resource.RLIMIT_NOFILE, (128, 128)),
+    ]
 
 
-def test_build_preexec_fn_swallows_setrlimit_error(monkeypatch):
-    """A setrlimit ValueError/OSError inside the child is swallowed, not raised."""
-    if not hasattr(os, "fork"):
+def test_apply_rlimits_skips_unknown_limit_name(monkeypatch):
+    """An unrecognized RLIMIT name is skipped, not fatal."""
+    if not _rlimits.rlimits_supported():
+        pytest.skip("non-POSIX platform")
+
+    import resource
+
+    calls = []
+    monkeypatch.setattr(resource, "setrlimit", lambda res, limits: calls.append(res))
+    _rlimits.apply_rlimits([("RLIMIT_NOT_A_REAL_LIMIT", 5)])
+    assert calls == []
+
+
+def test_apply_rlimits_swallows_setrlimit_error(monkeypatch):
+    """A setrlimit ValueError/OSError is swallowed, not raised (preexec parity)."""
+    if not _rlimits.rlimits_supported():
         pytest.skip("non-POSIX platform")
 
     import resource
@@ -79,11 +100,41 @@ def test_build_preexec_fn_swallows_setrlimit_error(monkeypatch):
         raise OSError("cannot raise limit")
 
     monkeypatch.setattr(resource, "setrlimit", _boom)
-    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_cpu_seconds", 5)
-
-    apply_fn = _build_preexec_fn()
     # Must not raise despite setrlimit failing for every limit.
-    apply_fn()
+    _rlimits.apply_rlimits([("RLIMIT_CPU", 5)])
+
+
+def test_execute_passes_rlimit_policy_to_child_env(monkeypatch):
+    """execute_driver_method hands the child the exact _rlimit_pairs policy via
+    the env var, and a context key cannot clobber it."""
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_as_bytes", 777)
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_cpu_seconds", 0)
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_nofile", 0)
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_nproc", 0)
+
+    driver_dir = _make_driver_dir(VALID_DRIVER)
+    seen = {}
+
+    class _Done:
+        returncode = 0
+        stdout = json.dumps({"ok": True})
+        stderr = ""
+
+    def _capture_run(cmd, *a, **kw):
+        seen["env"] = kw["env"]
+        # preexec_fn must no longer be used (thread-unsafe under to_thread).
+        assert "preexec_fn" not in kw or kw["preexec_fn"] is None
+        return _Done()
+
+    monkeypatch.setattr(driver_sandbox.subprocess, "run", _capture_run)
+    # A context key that uppercases onto the rlimits env key must not win.
+    result = execute_driver_method(
+        driver_dir, "login", {"HERD_sandbox_rlimits": "attacker"}, timeout=10
+    )
+    assert result["success"] is True
+    assert seen["env"][_RLIMITS_ENV_KEY] == json.dumps(
+        [["RLIMIT_AS", 777], ["RLIMIT_CPU", 0], ["RLIMIT_NOFILE", 0], ["RLIMIT_NPROC", 0]]
+    )
 
 
 # --- pip-install exception branch (lines 216-217) ---

@@ -38,7 +38,8 @@ class Settings(BaseSettings):
     validate_package_max_bytes: int = 10_485_760
     validate_dry_run_timeout_seconds: int = 10
 
-    # Driver-subprocess resource limits (POSIX rlimits applied via preexec_fn).
+    # Driver-subprocess resource limits (POSIX rlimits applied inside the child
+    # wrapper before any driver code is imported; see driver_sandbox._rlimit_pairs).
     # Each limit is applied to the driver child only; 0 leaves that limit
     # unlimited. RLIMIT_AS bounds virtual address space, so library-heavy
     # drivers (numpy/pandas/BLAS) may need it raised or set to 0 per deployment.
