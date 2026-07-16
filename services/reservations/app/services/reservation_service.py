@@ -281,6 +281,148 @@ async def _create_reservation_fork_best_effort(
         )
 
 
+async def _cabling_fork_call(
+    method: str,
+    path: str,
+    json_body: dict | None = None,
+) -> httpx.Response:
+    """Issue one X-Internal-Token call to a cabling fork endpoint (issue #25 P3a).
+
+    The single transport used by every reservations-side fork interaction: the
+    user-facing GET/PUT/save forwarders, the lazy-create on GET-miss, the teardown
+    archive, and the reconciler's active-fork listing. Raises RuntimeError on a
+    transport failure (the router/caller maps that to 503, the issue #131
+    upstream-unreachable convention); a returned Response carries cabling's own
+    status and body so a 4xx (409 port conflict, ARCHIVED refusal, 404) can be
+    relayed to the user verbatim.
+
+    Authenticated service-to-service, exactly like _create_reservation_fork: the
+    booking owner does not necessarily own the parent topology, so a JWT-forward
+    would 403 against cabling's fork routes.
+    """
+    if not settings.internal_api_token:
+        raise RuntimeError("internal_api_token not configured; cannot reach cabling forks")
+    try:
+        async with httpx.AsyncClient() as client:
+            return await client.request(
+                method,
+                f"{settings.cabling_service_url}{path}",
+                headers={"X-Internal-Token": settings.internal_api_token},
+                json=json_body,
+                timeout=10.0,
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
+
+
+async def _lazy_create_reservation_fork(
+    reservation_id: uuid.UUID,
+    topology_id: uuid.UUID | None,
+    created_by: str,
+) -> None:
+    """Create the fork on a GET-miss for an ACTIVE reservation (ADR 0006 Decision 2).
+
+    Distinct from _create_reservation_fork_best_effort, which SKIPS a null parent
+    topology at activation (Case A deferral). This lazy path DOES create a fork even
+    with no parent topology: a read/edit of the bench is exactly ADR 0001 Decision 3
+    Case A's "start wiring this reservation" trigger. Same idempotent
+    POST /internal/forks; cabling builds a null-canvas fork when parent_topology_id
+    is null. Raises RuntimeError on a transport failure or a cabling error so the
+    caller maps it to 503. Not best-effort: the user asked to see the fork, so a
+    creation failure must surface, not silently yield a 404.
+    """
+    resp = await _cabling_fork_call(
+        "POST",
+        "/internal/forks",
+        json_body={
+            "reservation_id": str(reservation_id),
+            "parent_topology_id": str(topology_id) if topology_id else None,
+            "parent_version_id": None,
+            "created_by": created_by,
+        },
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
+
+
+async def _archive_reservation_fork(reservation_id: uuid.UUID) -> None:
+    """Freeze a reservation's fork as its as-built record (ADR 0006 Decision 5).
+
+    POSTs cabling's idempotent archive: 200 on an already-ARCHIVED fork, 204 on a
+    reservation that never had a fork, so a retried call is safe. Raises RuntimeError
+    on a transport failure or a cabling error status so the best-effort wrapper's
+    retry loop can see it.
+    """
+    resp = await _cabling_fork_call("POST", f"/internal/forks/{reservation_id}/archive")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cabling fork-archive returned {resp.status_code}: {resp.text}")
+
+
+async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> None:
+    """Archive the fork with bounded retry and log-and-continue (ADR 0006 Decision 5).
+
+    Mirrors _create_reservation_fork_best_effort's fail-open posture: an archive
+    failure must NEVER strand a teardown. Called AFTER the status-transition
+    transaction commits, from every teardown path (release, cancel, auto-complete,
+    the provision-result FAILED branch, and the timeout-backstop FAILED transition).
+    A FAILED reservation still archives: the fork records intended wiring even when
+    provisioning failed. Exhausted retries are structured-logged and swallowed; the
+    standing reconciler picks up any fork left ACTIVE.
+    """
+    if not settings.internal_api_token:
+        return
+    try:
+        await retry_with_backoff(
+            lambda: _archive_reservation_fork(reservation_id),
+            attempts=3,
+            initial_delay=0.5,
+            factor=2.0,
+            max_delay=5.0,
+        )
+    except Exception:
+        logger.error(
+            "Fork archive failed for reservation %s; as-built record not frozen",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_archive_failed",
+                "reservation_id": str(reservation_id),
+            },
+            exc_info=True,
+        )
+
+
+async def _fetch_active_fork_reservation_ids() -> list[uuid.UUID]:
+    """Return reservation_ids of every ACTIVE fork from cabling, paging fully.
+
+    The read half of the standing archive reconciler (ADR 0006 Decision 5). Walks
+    cabling's paginated GET /internal/forks until the whole ACTIVE set is drained.
+    Raises on a transport or error status; the caller treats a fetch failure as
+    non-fatal to the rest of the sweep.
+    """
+    if not settings.internal_api_token:
+        return []
+    ids: list[uuid.UUID] = []
+    skip = 0
+    limit = 200
+    async with httpx.AsyncClient() as client:
+        while True:
+            resp = await client.get(
+                f"{settings.cabling_service_url}/internal/forks",
+                params={"skip": skip, "limit": limit},
+                headers={"X-Internal-Token": settings.internal_api_token},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            page = [uuid.UUID(str(x)) for x in body.get("reservation_ids", [])]
+            ids.extend(page)
+            total = body.get("total", len(ids))
+            skip += limit
+            if not page or skip >= total:
+                break
+    return ids
+
+
 async def _check_conflicts(
     db: AsyncSession,
     device_ids: list[uuid.UUID],
@@ -926,6 +1068,11 @@ async def apply_provision_result(
     await _release_exclusive_devices_best_effort(
         reservation.id, list(reservation.device_ids), "reservation_provision_failed_release"
     )
+    # Archive the fork as the as-built record even on failure (ADR 0006 Decision 5):
+    # the fork captures intended wiring regardless of the provisioning outcome. The
+    # FAILED transition already committed above; this best-effort call never strands
+    # it. The success branch does NOT archive: it activates and (re)creates the fork.
+    await _archive_reservation_fork_best_effort(reservation.id)
     return reservation, True
 
 
@@ -1358,6 +1505,11 @@ async def cancel_reservation(
                 exc_info=exc,
             )
 
+    # Freeze the fork as the as-built record now that the reservation is CANCELLED
+    # (ADR 0006 Decision 5). Best-effort: the cancel already committed and its
+    # devices are being released; an archive failure must not strand the teardown.
+    await _archive_reservation_fork_best_effort(reservation.id)
+
     return reservation
 
 
@@ -1441,5 +1593,10 @@ async def release_reservation(
                 },
                 exc_info=exc,
             )
+
+    # Freeze the fork as the as-built record now that the reservation is COMPLETED
+    # (ADR 0006 Decision 5). Best-effort, mirroring cancel: COMPLETED already
+    # committed; an archive failure must not strand the teardown.
+    await _archive_reservation_fork_best_effort(reservation.id)
 
     return reservation

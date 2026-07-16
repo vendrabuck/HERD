@@ -61,6 +61,18 @@
       "/{reservation_id}"
     ],
     [
+      "GET",
+      "/{reservation_id}/fork"
+    ],
+    [
+      "PUT",
+      "/{reservation_id}/fork/canvas"
+    ],
+    [
+      "POST",
+      "/{reservation_id}/fork/save"
+    ],
+    [
       "PUT",
       "/{reservation_id}/release"
     ]
@@ -147,6 +159,24 @@
         "total_reserved_hours",
         "utilization_pct",
         "window_hours"
+      ],
+      "type": "object"
+    },
+    "ForkCanvasBody": {
+      "properties": {
+        "canvas_data": "object"
+      },
+      "required": [
+        "canvas_data"
+      ],
+      "type": "object"
+    },
+    "ForkSaveBody": {
+      "properties": {
+        "canvas_data": "object"
+      },
+      "required": [
+        "canvas_data"
       ],
       "type": "object"
     },

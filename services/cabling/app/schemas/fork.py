@@ -154,3 +154,23 @@ class ForkArchiveResponse(BaseModel):
     @field_serializer("fork_id", "reservation_id")
     def _serialize_uuid(self, value: uuid.UUID) -> str:
         return str(value)
+
+
+class ActiveForkListResponse(BaseModel):
+    """GET /internal/forks: reservation_ids of ACTIVE forks, paginated.
+
+    Minimal by design (issue #25 P3a, ADR 0006 Decision 5): the standing archive
+    reconciler in reservations only needs the reservation_ids of forks still ACTIVE
+    to decide which to archive, so the body carries those plus the page bounds and
+    the unpaginated total. reservation_ids is the ORDER-stable page, not the whole
+    set.
+    """
+
+    reservation_ids: list[uuid.UUID]
+    total: int
+    skip: int
+    limit: int
+
+    @field_serializer("reservation_ids")
+    def _serialize_ids(self, value: list[uuid.UUID]) -> list[str]:
+        return [str(v) for v in value]

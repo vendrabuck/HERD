@@ -1,12 +1,14 @@
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.internal_auth import internal_token_matches
+from pydantic import BaseModel
 from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +36,8 @@ from app.services.reporting_service import (
     rollup_by_group,
 )
 from app.services.reservation_service import (
+    _cabling_fork_call,
+    _lazy_create_reservation_fork,
     apply_provision_result,
     cancel_reservation,
     create_reservation,
@@ -554,6 +558,176 @@ async def release_reservation_early(
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
     return reservation
+
+
+# Pinned 409 wordings when a fork mutation targets a non-ACTIVE reservation. A fork
+# is editable only while its reservation is live; after it ends the fork is the frozen
+# as-built record (ADR 0006 Decision 5).
+FORK_EDIT_REQUIRES_ACTIVE = "Fork editing requires an ACTIVE reservation"
+FORK_SAVE_REQUIRES_ACTIVE = "Fork save requires an ACTIVE reservation"
+
+
+class ForkCanvasBody(BaseModel):
+    """Body for PUT /{id}/fork/canvas: the loose draft canvas (matches cabling)."""
+
+    canvas_data: dict[str, Any]
+
+
+class ForkSaveBody(BaseModel):
+    """Body for POST /{id}/fork/save: the canvas to reconcile (matches cabling).
+
+    created_by is not accepted from the client; reservations stamps it with the
+    authenticated user before forwarding, so save provenance cannot be spoofed.
+    """
+
+    canvas_data: dict[str, Any]
+
+
+async def _load_owned_or_admin(
+    db: AsyncSession, reservation_id: uuid.UUID, user_id: uuid.UUID, role: str
+) -> Reservation | None:
+    """Load a reservation for its owner, or for an admin over any owner.
+
+    The same owner-first, admin-fallback idiom cancel_reservation uses for the
+    admin-cancel-any override (issue #340): a non-admin who is not the owner misses
+    the owner-filtered load and gets None (the router maps that to 404, never a 403
+    that would leak the reservation's existence).
+    """
+    reservation = await get_reservation(db, reservation_id, user_id)
+    if reservation is None and role in ("admin", "superadmin"):
+        result = await db.execute(select(Reservation).where(Reservation.id == reservation_id))
+        reservation = result.scalar_one_or_none()
+    return reservation
+
+
+def _relay_cabling_fork_response(resp: httpx.Response) -> Any:
+    """Return a cabling fork response's JSON, or raise the mapped user-facing error.
+
+    5xx maps to 503 (the issue #131 upstream-error convention; a transport failure
+    is raised as RuntimeError upstream and mapped to 503 by the same rule). A 4xx is
+    relayed verbatim, so cabling's structured 409 detail (port conflicts, ARCHIVED
+    refusal) reaches the user unchanged.
+    """
+    if resp.status_code >= 500:
+        raise HTTPException(status_code=503, detail="Cabling service is unavailable")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=_cabling_detail(resp))
+    if resp.status_code == 204 or not resp.content:
+        return None
+    return resp.json()
+
+
+def _cabling_detail(resp: httpx.Response) -> Any:
+    """Extract cabling's error detail, unwrapping the FastAPI {"detail": ...} envelope."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return resp.text or "Cabling request failed"
+    if isinstance(body, dict) and "detail" in body:
+        return body["detail"]
+    return body
+
+
+@router.get("/{reservation_id}/fork")
+async def get_reservation_fork(
+    reservation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Return the reservation's editable/as-built fork (ADR 0006 Decision 2).
+
+    Owner-or-admin gated. Allowed for ANY reservation status: reading the as-built
+    record after the reservation ends is the point. Forwards to cabling's internal
+    fork GET. On a cabling 404 the behavior forks on status: an ACTIVE reservation
+    lazy-creates the fork through the idempotent POST /internal/forks (ADR 0001
+    Decision 3 Case A, including a reservation with no parent topology) and re-reads;
+    a non-ACTIVE reservation with no fork returns 404.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    try:
+        resp = await _cabling_fork_call("GET", f"/internal/forks/{reservation_id}")
+        if resp.status_code == 404:
+            if reservation.status != ReservationStatus.ACTIVE:
+                raise HTTPException(status_code=404, detail="Fork not found")
+            # Case A lazy-create: build the bench on first read of a live reservation,
+            # even with no parent topology, then re-read.
+            await _lazy_create_reservation_fork(
+                reservation_id, reservation.topology_id, str(reservation.user_id)
+            )
+            resp = await _cabling_fork_call("GET", f"/internal/forks/{reservation_id}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return _relay_cabling_fork_response(resp)
+
+
+@router.put("/{reservation_id}/fork/canvas")
+async def update_reservation_fork_canvas(
+    reservation_id: uuid.UUID,
+    body: ForkCanvasBody,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Loose-draft edit of the reservation's fork canvas (ADR 0006 Decision 2).
+
+    Owner-or-admin gated and ACTIVE-only: a fork is editable only while its
+    reservation is live (409 otherwise). Forwards the canvas to cabling's loose PUT,
+    which stores without reconcile. A cabling 409 (ARCHIVED fork) relays verbatim.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if reservation.status != ReservationStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail=FORK_EDIT_REQUIRES_ACTIVE)
+
+    try:
+        resp = await _cabling_fork_call(
+            "PUT",
+            f"/internal/forks/{reservation_id}/canvas",
+            json_body={"canvas_data": body.canvas_data},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return _relay_cabling_fork_response(resp)
+
+
+@router.post("/{reservation_id}/fork/save")
+async def save_reservation_fork(
+    reservation_id: uuid.UUID,
+    body: ForkSaveBody,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Reconcile the reservation's fork against the submitted canvas (ADR 0006).
+
+    Owner-or-admin gated and ACTIVE-only (409 otherwise). Forwards to cabling's
+    save-reconcile, stamping created_by with the authenticated user. Cabling's
+    structured 409 (cross-reservation port conflict naming the blocking reservation,
+    or an ARCHIVED fork) relays to the user verbatim.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if reservation.status != ReservationStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail=FORK_SAVE_REQUIRES_ACTIVE)
+
+    try:
+        resp = await _cabling_fork_call(
+            "POST",
+            f"/internal/forks/{reservation_id}/save",
+            json_body={"canvas_data": body.canvas_data, "created_by": str(user_id)},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return _relay_cabling_fork_response(resp)
 
 
 async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] | None:
