@@ -1,6 +1,7 @@
 from typing import Literal
 
 from herd_common.config_loader import HerdJsonConfigSource
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 
@@ -16,6 +17,13 @@ class Settings(BaseSettings):
     db_schema: str = "ai_orchestrator"
 
     # Multi-turn assistant: bounds applied on every turn before the call.
+    # Idle-conversation retention (issue #338): conversations, including the
+    # persisted question text in assistant_messages.content_blocks, live
+    # until this many hours pass with no activity, then the sweeper
+    # (app/tasks/conversation_sweeper.py) deletes them. Must stay positive;
+    # 0 or negative does not mean "never retain", it would mean every
+    # conversation is eligible for deletion the instant it is created, which
+    # is rejected below rather than silently honored.
     assistant_conversation_ttl_hours: int = 24
     assistant_max_turns: int = 40
     assistant_history_token_budget: int = 60000
@@ -86,6 +94,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "case_sensitive": False}
+
+    @field_validator("assistant_conversation_ttl_hours")
+    @classmethod
+    def _validate_assistant_conversation_ttl_hours(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                "assistant_conversation_ttl_hours must be a positive integer "
+                f"(got {v}); 0 or negative would expire every conversation instantly"
+            )
+        return v
 
     @classmethod
     def settings_customise_sources(

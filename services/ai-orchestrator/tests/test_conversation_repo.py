@@ -316,3 +316,58 @@ async def test_expire_idle_returns_zero_when_all_fresh():
         await conversation_repo.create(db, user_id=USER_A, reservation_id=RES_X, seed_block="fresh")
         deleted = await conversation_repo.expire_idle(db, ttl_hours=24)
     assert deleted == 0
+
+
+@pytest.mark.asyncio
+async def test_expire_idle_default_ttl_matches_24h_default_setting():
+    """No explicit ttl_hours falls back to settings.assistant_conversation_ttl_hours,
+    whose in-code default is 24 (issue #338): preserves today's behavior for a
+    deployment that sets no override."""
+    from app.config import settings
+
+    assert settings.assistant_conversation_ttl_hours == 24
+    async with TestSessionLocal() as db:
+        old = await conversation_repo.create(
+            db, user_id=USER_A, reservation_id=RES_X, seed_block="old"
+        )
+        new = await conversation_repo.create(
+            db, user_id=USER_A, reservation_id=RES_Y, seed_block="new"
+        )
+        old.last_used_at = datetime.now(UTC) - timedelta(hours=25)
+        new.last_used_at = datetime.now(UTC) - timedelta(hours=23)
+        await db.commit()
+
+        deleted = await conversation_repo.expire_idle(db)  # no override passed
+    assert deleted == 1
+    async with TestSessionLocal() as db:
+        remaining = (await db.execute(select(AssistantConversation))).scalars().all()
+    assert {r.id for r in remaining} == {new.id}
+
+
+@pytest.mark.asyncio
+async def test_expire_idle_custom_ttl_setting_moves_the_cutoff(monkeypatch):
+    """A deployment-configured TTL (env var ASSISTANT_CONVERSATION_TTL_HOURS,
+    surfaced here as settings.assistant_conversation_ttl_hours) changes which
+    conversations the sweeper considers idle, independent of the 24h default."""
+    from app import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "assistant_conversation_ttl_hours", 2)
+
+    async with TestSessionLocal() as db:
+        old = await conversation_repo.create(
+            db, user_id=USER_A, reservation_id=RES_X, seed_block="old"
+        )
+        new = await conversation_repo.create(
+            db, user_id=USER_A, reservation_id=RES_Y, seed_block="new"
+        )
+        # Idle 3h: expired under the 2h custom TTL, would survive the 24h default.
+        old.last_used_at = datetime.now(UTC) - timedelta(hours=3)
+        # Idle 1h: survives the 2h custom TTL.
+        new.last_used_at = datetime.now(UTC) - timedelta(hours=1)
+        await db.commit()
+
+        deleted = await conversation_repo.expire_idle(db)  # no override: reads settings
+    assert deleted == 1
+    async with TestSessionLocal() as db:
+        remaining = (await db.execute(select(AssistantConversation))).scalars().all()
+    assert {r.id for r in remaining} == {new.id}
