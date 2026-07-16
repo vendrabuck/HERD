@@ -75,6 +75,31 @@ def _create_reserved_topology(browser):
         "end_time": (now + timedelta(minutes=30)).isoformat(),
         "topology_id": topology["id"],
     }
+    # Put the reserved device on the topology canvas (a thin deviceNode ref the
+    # editor hydrates by id) so the commit-time device-set PATCH carries the same
+    # single device instead of an empty list the backend would reject.
+    canvas = {
+        "nodes": [
+            {
+                "id": "n0",
+                "type": "deviceNode",
+                "position": {"x": 100, "y": 100},
+                "data": {"device": {"id": available[0]["id"]}},
+            }
+        ],
+        "edges": [],
+    }
+    canvas_resp = api_request(
+        browser,
+        "PUT",
+        f"/cabling/topologies/{topology['id']}",
+        json={"canvas_data": canvas},
+        allow_errors=True,
+    )
+    if canvas_resp.status_code != 200:
+        api_request(browser, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)
+        return None
+
     res_resp = api_request(browser, "POST", "/reservations/", json=body, allow_errors=True)
     if res_resp.status_code != 201:
         api_request(browser, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)
@@ -153,14 +178,16 @@ def test_commit_shows_released_built_save_toast(admin_browser, base_url, fork_re
         admin_browser.execute_script("arguments[0].click();", commit)
 
     # The ForkSaveResultToast renders "Fork saved as v{n}" and the released/built
-    # counts. Match the literal (non-CSS-transformed) text.
+    # counts. Anchor on the toast's <p> elements: a bare //*[contains(., ...)] also
+    # matches every ancestor (html first in document order), and the visibility
+    # check then runs against <html>, never the toast.
     wait.until(
         EC.visibility_of_element_located(
-            (By.XPATH, "//*[contains(., 'Fork saved as v')]")
+            (By.XPATH, "//p[contains(normalize-space(.), 'Fork saved as v')]")
         )
     )
     assert admin_browser.find_elements(
-        By.XPATH, "//*[contains(., 'Released') and contains(., 'built')]"
+        By.XPATH, "//p[contains(., 'Released') and contains(., 'built')]"
     )
 
 
@@ -195,8 +222,11 @@ def test_parent_topology_history_unchanged_after_commit(
         commit.click()
     except Exception:
         admin_browser.execute_script("arguments[0].click();", commit)
+    # Anchored on the toast <p>: see the locator note in the toast test above.
     wait.until(
-        EC.visibility_of_element_located((By.XPATH, "//*[contains(., 'Fork saved as v')]"))
+        EC.visibility_of_element_located(
+            (By.XPATH, "//p[contains(normalize-space(.), 'Fork saved as v')]")
+        )
     )
 
     after = parent_versions()

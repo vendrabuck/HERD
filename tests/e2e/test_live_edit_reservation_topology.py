@@ -242,7 +242,16 @@ def test_live_edit_hides_save_and_reserve_shows_commit_and_cancel(
         )
         == []
     )
-    assert admin_browser.find_elements(By.XPATH, "//button[normalize-space()='Save']") == []
+    # Visibility, not DOM presence: the closed save-as-template <dialog> keeps its
+    # own submit button (labeled "Save") in the DOM at all times, invisible and
+    # inert. The toolbar Save is what live-edit must hide. This assertion was
+    # latent until run against a fully seeded stack; the fixture skips in CI.
+    visible_saves = [
+        el
+        for el in admin_browser.find_elements(By.XPATH, "//button[normalize-space()='Save']")
+        if el.is_displayed()
+    ]
+    assert visible_saves == []
 
 
 def test_live_edit_cancel_returns_to_reservations(admin_browser, base_url, reserved_topology):

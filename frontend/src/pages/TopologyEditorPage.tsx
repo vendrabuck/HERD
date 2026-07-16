@@ -513,13 +513,21 @@ function TopologyEditorInner() {
       });
       // The reconcile captured this canvas, so cancel any pending draft flush.
       autosave.markClean();
-      await updateReservation.mutateAsync({
-        id: reservationId,
-        data: { device_ids: allDeviceIds },
-      });
       toast.custom((t) => (
         <ForkSaveResultToast result={result} onDismiss={() => toast.dismiss(t.id)} />
       ));
+      // The fork version is already committed at this point; a device-set PATCH
+      // failure must not be reported as a failed save, it gets its own message.
+      try {
+        await updateReservation.mutateAsync({
+          id: reservationId,
+          data: { device_ids: allDeviceIds },
+        });
+      } catch {
+        toast.error(
+          "Fork saved, but updating the reservation's device set failed; commit again to retry",
+        );
+      }
     } catch (err) {
       // A structured 409 (cross-reservation port claim) opens the conflict dialog
       // and keeps the drawing so the user can rework it. Any other error (a plain
