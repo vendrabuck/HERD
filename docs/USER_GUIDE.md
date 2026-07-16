@@ -82,6 +82,22 @@ Click any reservation in the list to open the detail modal. Four tabs:
 
 The reservation owner can also click **Edit Resources** to add or remove devices while the reservation is active or pending. Added exclusive devices are checked for conflicts and flipped to `RESERVED`; removed devices are released back to `AVAILABLE`.
 
+### Editing the topology during a reservation
+
+When a reservation goes `ACTIVE`, HERD gives it an editable **fork** of its parent topology: a private working copy you can re-wire during the reservation without touching the shared master template. From the reservation detail modal, the owner (or an admin) clicks **Edit topology** to open the fork in the topology editor's live-edit mode. The editor loads the fork, not the parent topology, so the parent's version history stays clean.
+
+- **Load and edit.** The canvas opens on the fork with an "Editing live reservation" banner. Re-wire it exactly like any topology: drag devices, draw or remove L1/L2/L3 links. Each edge is still checked against the physical cabling graph, and a red (unroutable) edge blocks committing.
+- **Autosave drafts.** Your changes autosave as loose drafts as you work (the banner shows "Draft saved" / "Saving draft..."). A draft is stored without reconciling, so you can leave and come back to an in-progress edit.
+- **Commit.** Click **Commit to reservation** to reconcile the fork. The save runs release-before-build set arithmetic: connections you removed are released and connections you added are built, in one transaction, and a new fork version is appended. A toast reports the result ("Fork saved as vN", released X, built Y, unchanged Z) and expands to list the exact released and built connections. Committing also updates the reservation's device set so provisioning re-runs for the affected devices.
+- **Port conflicts.** If your wiring would claim a port already held by another active reservation, the save is refused with a "Ports already claimed" dialog that names each blocking reservation, device, and port. Your drawing is kept on the canvas so you can re-wire the conflicting ports and save again.
+- **Fork version history.** The editor's fork history panel lists every commit (newest first) with author and timestamp. In this release the fork history is view-only: there is no per-version preview, diff, or restore for fork versions (those exist for standalone topologies, not forks).
+- **After the reservation ends.** Once the reservation is `COMPLETED`, `CANCELLED`, or `FAILED`, the fork is frozen as the immutable **as-built record**: the last wiring the reservation was reconciled to. The detail modal's button becomes **View as-built**, and the editor opens the fork read-only ("As-built record (read-only)"). Nothing can edit it after this point.
+
+Two changes from HERD's earlier behavior are worth calling out:
+
+- **Live edits no longer touch the shared parent topology.** Editing during a reservation now edits the fork and appends fork versions only; it does not modify the parent topology or add entries to the parent's version history. The master template stays exactly as saved.
+- **`PENDING` reservations no longer offer topology editing.** The fork exists only from activation onward, so there is nothing to edit before a reservation is `ACTIVE`. (Previously, editing a not-yet-active reservation mutated the shared parent topology; that path is gone.)
+
 ### Reservation calendar
 
 **Reservations > Calendar** shows a Gantt-style timeline:

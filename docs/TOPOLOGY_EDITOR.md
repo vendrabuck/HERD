@@ -94,6 +94,19 @@ Every save writes a new version unless the canvas is byte-identical to the previ
 
 Permissions: restoring requires admin or the topology's original creator; any authenticated user with read access to the topology can view the version list and run a diff.
 
+The History sidebar above is for standalone topologies. A reservation's topology fork (see the next section) has its own version list with the same visual pattern, but it is view-only: forks have no preview, diff, or restore.
+
+## Live-edit mode (editing a reservation's topology)
+
+When you open the editor bound to a reservation (from the reservation detail modal's **Edit topology** button, which navigates to `/topology/<id>?reservationId=<id>`), you are not editing the shared master topology. You are editing the reservation's **fork**: a private working copy created when the reservation activated. Your edits never touch the parent topology or its version history.
+
+- **Editing live reservation banner.** A blue banner marks the mode and shows the current device count and autosave status. Edits autosave as loose drafts ("Draft saved" / "Saving draft..."), so an in-progress change survives leaving and returning.
+- **Commit to reservation.** Committing reconciles the fork: release-before-build set arithmetic in one transaction, appending a new fork version. A result toast reports "Fork saved as vN" with released, built, and unchanged counts, expandable to the exact connections. The commit is blocked while any edge has no physical path, matching the server-side check. Committing also updates the reservation's device set so provisioning re-runs for the affected devices.
+- **Port-conflict dialog.** If a commit would claim a port already held by another active reservation, a "Ports already claimed" dialog lists each blocking reservation, device, and port. Your drawing stays on the canvas; re-wire the conflicting ports and commit again.
+- **As-built (read-only).** After the reservation ends the fork is archived. The button becomes **View as-built** and the editor opens the fork read-only, showing the immutable as-built record of the last wiring the reservation was reconciled to.
+
+Only the reservation owner or an admin can open the fork, and the fork is editable only while the reservation is `ACTIVE`. A `PENDING` reservation has no fork yet, so it offers no topology editing.
+
 ## AI generation (optional)
 
 If the AI orchestrator is configured, the toolbar includes a **Use AI** button. See [AI_GENERATE.md](AI_GENERATE.md) for the full flow (prompt entry, ghost-node preview, Accept / Modify / Reject, commit dialog that creates both the topology and a reservation).
