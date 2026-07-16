@@ -1,8 +1,11 @@
+import logging
 from typing import Literal
 
 from herd_common.config_loader import HerdJsonConfigSource
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -57,6 +60,13 @@ class Settings(BaseSettings):
     # ai_tls_verify: when set, verification stays on and fails closed, which is
     # preferable to ai_tls_verify=false for a known on-prem endpoint.
     ai_ca_cert: str = ""
+
+    # Deprecated legacy env var. Not read as a fallback for ai_api_key anywhere
+    # in the code (issue #339); kept as a field only so
+    # warn_if_anthropic_api_key_unused() below can detect an operator who set
+    # it expecting the old, never-implemented fallback and warn loudly instead
+    # of AI features silently staying disabled.
+    anthropic_api_key: str = ""
 
     upload_max_file_bytes: int = 5 * 1024 * 1024
     upload_max_files: int = 5
@@ -124,3 +134,22 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+LEGACY_ANTHROPIC_ENV_WARNING = (
+    "ANTHROPIC_API_KEY is set but is not honored by ai-orchestrator and has no "
+    "effect; set AI_API_KEY instead. AI features remain disabled until "
+    "AI_API_KEY is set."
+)
+
+
+def warn_if_anthropic_api_key_unused() -> None:
+    """Log once if ANTHROPIC_API_KEY is set while AI_API_KEY is blank.
+
+    ANTHROPIC_API_KEY was documented as a one-release fallback for AI_API_KEY,
+    but no code ever read it (issue #339), so an operator relying on it got no
+    AI features with no signal why. Call once from app.main at process
+    startup; never call this per-request.
+    """
+    if settings.anthropic_api_key and not settings.ai_api_key:
+        logger.warning(LEGACY_ANTHROPIC_ENV_WARNING)

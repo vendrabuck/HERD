@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
 
-from app.config import settings
+from app.config import settings, warn_if_anthropic_api_key_unused
 from app.database import Base, engine
 from app.routes.commit import router as commit_router
 from app.routes.generate import router as generate_router
@@ -40,6 +40,9 @@ from app.tasks.conversation_sweeper import conversation_sweeper_loop
 setup_logging("ai-orchestrator", level=settings.log_level)
 
 logger = logging.getLogger(__name__)
+
+# Fires once at process startup, not per-request; see app/config.py.
+warn_if_anthropic_api_key_unused()
 
 
 @asynccontextmanager
