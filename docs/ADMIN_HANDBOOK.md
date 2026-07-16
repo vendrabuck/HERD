@@ -9,6 +9,8 @@ Operational playbook for administrators. For the permission matrix, see [ROLES.m
 | Register, log in, change own password | yes | yes | yes |
 | Browse inventory (within visibility) | yes | yes | yes |
 | Create/cancel own reservations | yes | yes | yes |
+| List every user's reservations (`GET /reservations/?all=true`) | - | yes | yes |
+| Cancel any user's reservation | - | yes | yes |
 | Upload drivers, create templates | - | yes | yes |
 | Create/delete devices and ports | - | yes | yes |
 | Create/delete device groups and assign permissions | - | yes | yes |
@@ -121,15 +123,23 @@ Only superadmins. From the Users admin page, pick a user, use the role picker. U
 ### Viewing anyone's reservations
 
 The calendar is cross-user for every role, filtered to device visibility. The
-reservations list (`/reservations`) is always scoped to your own reservations today,
-for every role including admin and superadmin; there is no admin view-all toggle.
+reservations list (`/reservations`) is scoped to your own reservations by default for
+every role. Admins and superadmins get an "All reservations" toggle on that page that
+switches the list to every user's reservations; it is wired to the admin-only
+`GET /reservations/?all=true` query param (issue #340). A non-admin who passes
+`all=true` is rejected with 403 `Only admins can list all reservations`.
 
 ### Cancelling someone else's reservation
 
-Listing and cancelling are both owner-scoped today: an admin cannot cancel a
-reservation they do not own, even though they can see it on the cross-user calendar.
-To help a user with a stuck reservation, walk them through cancelling it themselves, or
-use direct database access as a last resort.
+Admins and superadmins can cancel any reservation, not just their own: turn on the
+"All reservations" toggle, then use the Cancel action on the target row (or call
+`DELETE /reservations/{id}` directly). This frees a stuck or abandoned lab without
+database surgery. The cancel is audited: when an admin cancels a reservation they do
+not own, the reservation's `cancelled_by` field records the acting admin's user id; an
+owner cancelling their own reservation leaves `cancelled_by` null. The cancel emits the
+same `reservation.cancelled` event as an owner self-cancel, so the owner is still
+notified and the devices are released. A non-admin cancelling a reservation they do not
+own still gets 404, unchanged.
 
 ### Recovering a FAILED reservation
 

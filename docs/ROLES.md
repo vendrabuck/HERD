@@ -14,6 +14,8 @@ in their JWT access token and enforced independently by each service.
 | Browse templates and drivers | yes | yes | yes |
 | Build topology diagrams | yes | yes | yes |
 | Create and cancel reservations | yes | yes | yes |
+| List every user's reservations (`GET /reservations/?all=true`) | | yes | yes |
+| Cancel any user's reservation | | yes | yes |
 | View reservation calendar | yes | yes | yes |
 | View backend connections | yes | yes | yes |
 | Create, update, delete templates | | yes | yes |
@@ -1265,11 +1267,11 @@ Authorization: Bearer <admin-token>
 | `/api/inventory/device-groups/{id}/permissions/bulk-remove` | POST | | yes | yes |
 | `/api/inventory/device-groups/visible-devices` | GET | yes | yes | yes |
 | `/api/reservations/` | POST | yes | yes | yes |
-| `/api/reservations/` | GET | yes | yes | yes |
+| `/api/reservations/` | GET | yes (own only) | own, or all with `all=true` | own, or all with `all=true` |
 | `/api/reservations/calendar` | GET | yes | yes | yes |
-| `/api/reservations/{id}` | GET | yes | yes | yes |
+| `/api/reservations/{id}` | GET | yes (owner only) | yes (owner only) | yes (owner only) |
 | `/api/reservations/{id}` | PATCH | yes (owner only) | yes (owner only) | yes (owner only) |
-| `/api/reservations/{id}` | DELETE | yes | yes | yes |
+| `/api/reservations/{id}` | DELETE | yes (owner only) | any reservation | any reservation |
 | `/api/reservations/{id}/release` | PUT | yes | yes | yes |
 | `/api/reservations/internal/{id}/provision-result` | POST | internal | internal | internal |
 | `/api/reservations/reports/utilization` | GET | | yes | yes |
@@ -1308,6 +1310,15 @@ Authorization: Bearer <admin-token>
 in the request body, mirroring `/login` and `/refresh`. `PATCH /api/reservations/{id}`
 is owner-scoped: any authenticated user may call it, but the update only ever applies to
 a reservation the caller owns (404 otherwise), with no admin bypass.
+
+`GET /api/reservations/` defaults to the caller's own reservations. Admins and
+superadmins may pass `all=true` to list every user's reservations; a non-admin who
+passes `all=true` is rejected with 403 `Only admins can list all reservations` (issue
+#340). `DELETE /api/reservations/{id}` lets an admin or superadmin cancel any
+reservation, not just their own; a non-admin cancelling a reservation they do not own
+still gets 404. An admin cancelling a reservation they do not own is recorded in the
+reservation's `cancelled_by` field (an owner self-cancel leaves it null), and emits the
+same `reservation.cancelled` event as an owner self-cancel.
 
 ---
 

@@ -38,6 +38,7 @@ from app.services.reservation_service import (
     cancel_reservation,
     create_reservation,
     get_reservation,
+    list_all_reservations,
     list_calendar_reservations,
     list_user_reservations,
     release_reservation,
@@ -95,11 +96,24 @@ async def create_new_reservation(
 async def get_my_reservations(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
+    all: bool = Query(
+        False,
+        description="Admin only: list every user's reservations instead of just your own.",
+    ),
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
 ):
     user_id = uuid.UUID(payload["sub"])
-    reservations, total = await list_user_reservations(db, user_id, skip=skip, limit=limit)
+    role = payload.get("role", "user")
+    if all:
+        if role not in ("admin", "superadmin"):
+            raise HTTPException(
+                status_code=403,
+                detail="Only admins can list all reservations",
+            )
+        reservations, total = await list_all_reservations(db, skip=skip, limit=limit)
+    else:
+        reservations, total = await list_user_reservations(db, user_id, skip=skip, limit=limit)
     return PaginatedReservationResponse(
         items=reservations,
         total=total,
@@ -510,8 +524,16 @@ async def cancel_reservation_by_id(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    # Admins may cancel any reservation (issue #340); the service records the
+    # acting admin in cancelled_by when this is a cross-owner override. A
+    # non-admin still only reaches their own reservations (404 otherwise).
     reservation = await cancel_reservation(
-        db, reservation_id, user_id, token=credentials.credentials
+        db,
+        reservation_id,
+        user_id,
+        token=credentials.credentials,
+        is_admin=role in ("admin", "superadmin"),
     )
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")

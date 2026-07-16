@@ -73,6 +73,11 @@ class Reservation(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     modified_by: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    # Set only when an admin cancels a reservation they do not own (issue #340).
+    # Owner self-cancel leaves this NULL, so a non-null value is the audit record
+    # that an admin force-cancelled on the owner's behalf. modified_by stays the
+    # generic last-writer field; this is the dedicated cancel-attribution field.
+    cancelled_by: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     # ROADMAP #40: timestamp the expiration task stamps when it has emitted the
     # upcoming-expiry reminder for this reservation. Null means "not yet sent".
     # Dedupes the reminder per reservation across expiration ticks so a
