@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useCancelReservation, useReleaseReservation, usePaginatedReservations } from "@/api/reservations";
 import { useAllDeviceNames } from "@/api/inventory";
+import { useAuthStore } from "@/stores/authStore";
 import { Pagination } from "@/components/ui/Pagination";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
@@ -88,8 +89,14 @@ export function ReservationsPage() {
   const [skip, setSkip] = useState(0);
   const [selectedReservation, setSelectedReservation] = useState<Reservation | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const user = useAuthStore((s) => s.user);
+  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
   const limit = 50;
-  const { data, isLoading, isError } = usePaginatedReservations(skip, limit);
+  // `showAll` is admin-only; a non-admin never sets it, so the query stays
+  // scoped to the caller's own reservations (issue #340).
+  const allReservations = isAdmin && showAll;
+  const { data, isLoading, isError } = usePaginatedReservations(skip, limit, allReservations);
   const { data: deviceNames } = useAllDeviceNames();
   const reservations = data?.items;
   const total = data?.total ?? 0;
@@ -100,7 +107,7 @@ export function ReservationsPage() {
         {/* Tab toggle */}
         <div className="flex items-center gap-4 mb-4">
           <span className="text-sm px-3 py-1.5 rounded bg-gray-900 text-white">
-            My Reservations
+            {allReservations ? "All Reservations" : "My Reservations"}
           </span>
           <Link
             to="/reservations/calendar"
@@ -110,6 +117,20 @@ export function ReservationsPage() {
           </Link>
           {data && (
             <span className="text-sm text-gray-400">({total})</span>
+          )}
+          {isAdmin && (
+            <label className="flex items-center gap-1.5 text-sm text-gray-600 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={showAll}
+                onChange={(e) => {
+                  setShowAll(e.target.checked);
+                  setSkip(0);
+                }}
+                className="h-4 w-4 rounded border-gray-300"
+              />
+              All reservations
+            </label>
           )}
           <button
             onClick={() => setCreateOpen(true)}

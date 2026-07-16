@@ -248,6 +248,7 @@
     },
     "ReservationResponse": {
       "properties": {
+        "cancelled_by": "anyOf",
         "created_at": "string",
         "device_ids": "array",
         "dynamic_requests": "array",

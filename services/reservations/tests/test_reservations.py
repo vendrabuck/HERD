@@ -280,6 +280,82 @@ async def test_cancel_reservation(client):
     assert del_resp.status_code == 204
 
 
+# --- Admin list-all and cancel-any (issue #340) ---
+
+
+async def _seed_owned_reservation(owner_id: str, device_ids=None) -> str:
+    """Insert an ACTIVE reservation owned by owner_id directly (bypasses auth)."""
+    if device_ids is None:
+        device_ids = [str(uuid.uuid4())]
+    async with TestSessionLocal() as db:
+        res = Reservation(
+            user_id=uuid.UUID(owner_id),
+            device_ids=device_ids,
+            topology_type=TopologyType.PHYSICAL,
+            purpose="seeded",
+            start_time=NOW + timedelta(hours=1),
+            end_time=NOW + timedelta(hours=3),
+            status=ReservationStatus.ACTIVE,
+        )
+        db.add(res)
+        await db.commit()
+        await db.refresh(res)
+        return str(res.id)
+
+
+@pytest.mark.asyncio
+async def test_list_all_true_forbidden_for_non_admin(client):
+    resp = await client.get("/?all=true")
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Only admins can list all reservations"
+
+
+# The shared admin_client fixture authenticates as USER_ID with role "admin".
+ADMIN_ID = USER_ID
+
+
+@pytest.mark.asyncio
+async def test_list_all_true_admin_sees_every_user(admin_client):
+    await _seed_owned_reservation(ADMIN_ID)
+    await _seed_owned_reservation(OTHER_USER_ID)
+    # all=true: the admin sees both users' reservations.
+    resp = await admin_client.get("/?all=true")
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 2
+    # Default (no all): the admin's own scoped view sees only its own row.
+    own = await admin_client.get("/")
+    assert own.status_code == 200
+    assert own.json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_any_records_cancelled_by(admin_client):
+    res_id = await _seed_owned_reservation(OTHER_USER_ID)
+    with patch(
+        "app.services.reservation_service._update_device_statuses",
+        new=AsyncMock(),
+    ):
+        resp = await admin_client.delete(f"/{res_id}")
+    assert resp.status_code == 204
+    async with TestSessionLocal() as db:
+        row = await db.get(Reservation, uuid.UUID(res_id))
+        assert row.status == ReservationStatus.CANCELLED
+        # The acting admin (USER_ID) is recorded; the owner is unchanged.
+        assert str(row.cancelled_by) == ADMIN_ID
+        assert str(row.user_id) == OTHER_USER_ID
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_cancel_other_users_reservation(other_client):
+    res_id = await _seed_owned_reservation(USER_ID)
+    resp = await other_client.delete(f"/{res_id}")
+    assert resp.status_code == 404
+    async with TestSessionLocal() as db:
+        row = await db.get(Reservation, uuid.UUID(res_id))
+        assert row.status == ReservationStatus.ACTIVE
+        assert row.cancelled_by is None
+
+
 # --- GET single reservation ---
 
 

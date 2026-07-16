@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, exists, false, select, text, update
+from sqlalchemy import and_, exists, false, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -934,7 +934,26 @@ async def list_user_reservations(
 ) -> tuple[list[Reservation], int]:
     base = select(Reservation).where(Reservation.user_id == user_id)
 
-    from sqlalchemy import func
+    count_query = select(func.count()).select_from(base.subquery())
+    total = (await db.execute(count_query)).scalar() or 0
+
+    result = await db.execute(
+        base.order_by(Reservation.created_at.desc()).offset(skip).limit(limit)
+    )
+    return list(result.scalars().all()), total
+
+
+async def list_all_reservations(
+    db: AsyncSession, skip: int = 0, limit: int = 50
+) -> tuple[list[Reservation], int]:
+    """Return every reservation across all users, paginated (issue #340).
+
+    Admin-only: the router gates the caller's role before invoking this, so the
+    owner filter that list_user_reservations applies is deliberately absent here.
+    Ordering mirrors list_user_reservations (newest created first) so the admin
+    and self views paginate identically.
+    """
+    base = select(Reservation)
 
     count_query = select(func.count()).select_from(base.subquery())
     total = (await db.execute(count_query)).scalar() or 0
@@ -1232,8 +1251,20 @@ async def cancel_reservation(
     reservation_id: uuid.UUID,
     user_id: uuid.UUID,
     token: str = "",
+    *,
+    is_admin: bool = False,
 ) -> Reservation | None:
+    # Owner path first: the owner-filtered load keeps self-cancel byte-for-byte
+    # unchanged (including cancelled_by staying NULL). Only when the owner lookup
+    # misses AND the caller is an admin do we fall back to an id-only load, which
+    # is the admin-cancel-any override (issue #340). A non-admin cancelling a
+    # reservation they do not own still misses here and returns None -> 404.
     reservation = await get_reservation(db, reservation_id, user_id)
+    admin_override = False
+    if reservation is None and is_admin:
+        result = await db.execute(select(Reservation).where(Reservation.id == reservation_id))
+        reservation = result.scalar_one_or_none()
+        admin_override = reservation is not None
     if not reservation:
         return None
     # FAILED is terminal here too: a FAILED reservation already released its
@@ -1250,9 +1281,17 @@ async def cancel_reservation(
         return reservation
     reservation.status = ReservationStatus.CANCELLED
     reservation.modified_by = user_id
+    # Record the acting admin only when this is a cross-owner override; an owner
+    # self-cancel leaves cancelled_by NULL (issue #340 audit invariant).
+    if admin_override:
+        reservation.cancelled_by = user_id
     # Stage reservation.cancelled in the same transaction that lands CANCELLED
     # (issue #21). The inventory device release below is best-effort and runs
     # after the commit; the event is durable regardless of NATS availability.
+    # The payload's user_id is the reservation OWNER (not the acting caller) so
+    # notification fan-out reaches the owner even on an admin override. On the
+    # owner path reservation.user_id == user_id, so this is byte-for-byte
+    # identical to the prior behavior.
     enqueue_event(
         db,
         OutboxEvent,
@@ -1260,7 +1299,7 @@ async def cancel_reservation(
         {
             "event": "reservation.cancelled",
             "reservation_id": str(reservation.id),
-            "user_id": str(user_id),
+            "user_id": str(reservation.user_id),
             "device_ids": [str(d) for d in reservation.device_ids],
             "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
             "topology_type": reservation.topology_type.value,

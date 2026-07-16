@@ -9,9 +9,15 @@ function errorDetail(err: unknown, fallback: string): string {
   return typeof detail === "string" ? detail : fallback;
 }
 
-async function fetchPaginatedReservations(skip = 0, limit = 50): Promise<PaginatedResponse<Reservation>> {
+async function fetchPaginatedReservations(
+  skip = 0,
+  limit = 50,
+  all = false,
+): Promise<PaginatedResponse<Reservation>> {
+  // `all=true` is admin-only (the backend returns 403 for non-admins); it lists
+  // every user's reservations instead of just the caller's own (issue #340).
   const resp = await apiClient.get<PaginatedResponse<Reservation>>("/reservations/", {
-    params: { skip, limit },
+    params: all ? { skip, limit, all: true } : { skip, limit },
   });
   return resp.data;
 }
@@ -65,10 +71,10 @@ export function useReservations() {
   });
 }
 
-export function usePaginatedReservations(skip = 0, limit = 50) {
+export function usePaginatedReservations(skip = 0, limit = 50, all = false) {
   return useQuery({
-    queryKey: ["reservations", "paginated", skip, limit],
-    queryFn: () => fetchPaginatedReservations(skip, limit),
+    queryKey: ["reservations", "paginated", skip, limit, all],
+    queryFn: () => fetchPaginatedReservations(skip, limit, all),
     placeholderData: keepPreviousData,
   });
 }

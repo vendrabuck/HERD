@@ -151,6 +151,8 @@ class ReservationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     modified_by: uuid.UUID | None = None
+    # Non-null only when an admin cancelled a reservation they do not own (#340).
+    cancelled_by: uuid.UUID | None = None
     dynamic_requests: list[DynamicRequestResponse] = []
 
     model_config = {"from_attributes": True}

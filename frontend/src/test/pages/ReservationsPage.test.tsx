@@ -32,6 +32,22 @@ vi.mock("@/components/reservations/ReservationDetailModal", () => ({
 
 import { server } from "../mocks/server";
 import { ReservationsPage } from "@/pages/ReservationsPage";
+import { useAuthStore } from "@/stores/authStore";
+
+function setRole(role: string | null) {
+  useAuthStore.setState({
+    user: role
+      ? {
+          id: "1",
+          email: "a@b.c",
+          username: "u",
+          is_active: true,
+          role,
+          created_at: "2026-01-01T00:00:00Z",
+        }
+      : null,
+  });
+}
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -58,6 +74,7 @@ const RESERVATION = {
 };
 
 beforeEach(() => {
+  setRole(null);
   server.use(
     http.get("/api/inventory/devices", () =>
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
@@ -128,6 +145,47 @@ describe("ReservationsPage", () => {
     expect(screen.getByTestId("reservation-detail-modal")).toHaveTextContent(
       RESERVATION.id,
     );
+  });
+
+  it("hides the all-reservations toggle from non-admins", async () => {
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 }),
+      ),
+    );
+    setRole("user");
+    renderWithProviders(<ReservationsPage />);
+    await waitFor(() =>
+      expect(screen.getByText("No reservations yet")).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByLabelText("All reservations"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("My Reservations")).toBeInTheDocument();
+  });
+
+  it("admin toggle switches the list query to all=true", async () => {
+    const seenAllParams: string[] = [];
+    server.use(
+      http.get("/api/reservations/", ({ request }) => {
+        seenAllParams.push(new URL(request.url).searchParams.get("all") ?? "");
+        return HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 });
+      }),
+    );
+    setRole("admin");
+    renderWithProviders(<ReservationsPage />);
+
+    const toggle = await screen.findByLabelText("All reservations");
+    // Default view is the caller's own reservations: no all param sent.
+    await waitFor(() => expect(seenAllParams.length).toBeGreaterThan(0));
+    expect(seenAllParams.every((v) => v === "")).toBe(true);
+
+    fireEvent.click(toggle);
+    // After toggling, the refetch carries all=true and the header relabels.
+    await waitFor(() =>
+      expect(seenAllParams.some((v) => v === "true")).toBe(true),
+    );
+    expect(screen.getByText("All Reservations")).toBeInTheDocument();
   });
 
   it("renders an error state when the fetch fails", async () => {

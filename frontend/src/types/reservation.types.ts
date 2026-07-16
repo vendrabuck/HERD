@@ -34,6 +34,9 @@ export interface Reservation {
   end_time: string;
   status: ReservationStatus;
   created_at: string;
+  // Non-null only when an admin cancelled a reservation they do not own (#340).
+  // Optional here so fixtures and pre-#340 cached responses stay valid.
+  cancelled_by?: string | null;
   // Always present in backend responses (defaults to []); optional here so
   // fixtures and cached responses that predate dynamic requests stay valid.
   dynamic_requests?: DynamicRequestResponse[];

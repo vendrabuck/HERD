@@ -25,6 +25,7 @@ from app.services.reservation_service import (
     cancel_reservation,
     create_reservation,
     get_reservation,
+    list_all_reservations,
     list_calendar_reservations,
     list_user_reservations,
     release_reservation,
@@ -834,6 +835,36 @@ async def test_list_user_reservations_pagination():
         assert total == 3
 
 
+# --- list_all_reservations (issue #340 admin view) ---
+
+
+@pytest.mark.asyncio
+async def test_list_all_reservations_spans_every_user():
+    other_user = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        await _insert_reservation(db, user_id=USER_ID)
+        await _insert_reservation(db, user_id=other_user, device_ids=[DEVICE_B])
+        items, total = await list_all_reservations(db)
+        assert total == 2
+        owners = {r.user_id for r in items}
+        assert owners == {USER_ID, other_user}
+        # The owner-scoped view still sees only its own row.
+        _, own_total = await list_user_reservations(db, USER_ID)
+        assert own_total == 1
+
+
+@pytest.mark.asyncio
+async def test_list_all_reservations_pagination():
+    other_user = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        await _insert_reservation(db, user_id=USER_ID)
+        await _insert_reservation(db, user_id=other_user, device_ids=[DEVICE_B])
+        await _insert_reservation(db, user_id=other_user, device_ids=[DEVICE_B])
+        items, total = await list_all_reservations(db, skip=1, limit=1)
+        assert len(items) == 1
+        assert total == 3
+
+
 # --- list_calendar_reservations ---
 
 
@@ -971,6 +1002,69 @@ async def test_cancel_reservation_success():
         assert len(rows) == 1
         assert rows[0].published_at is None
         assert rows[0].payload["reservation_id"] == str(res.id)
+
+
+@pytest.mark.asyncio
+async def test_cancel_reservation_self_cancel_leaves_cancelled_by_null():
+    """Owner self-cancel must not populate the admin-attribution field (#340)."""
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db)
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices_best_effort",
+                new=AsyncMock(return_value=[_make_device(DEVICE_A)]),
+            ),
+            patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
+        ):
+            cancelled = await cancel_reservation(db, res.id, USER_ID, "token", is_admin=True)
+        assert cancelled.status == ReservationStatus.CANCELLED
+        # Admin cancelling their OWN reservation is still a self-cancel: no override.
+        assert cancelled.cancelled_by is None
+        assert cancelled.modified_by == USER_ID
+        # The event carries the owner's id (owner == caller here).
+        rows = await _outbox(db, "herd.reservations.cancelled")
+        assert rows[0].payload["user_id"] == str(USER_ID)
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_any_records_canceller():
+    """An admin cancelling another user's reservation records cancelled_by (#340)."""
+    owner = uuid.uuid4()
+    admin_id = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, user_id=owner)
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices_best_effort",
+                new=AsyncMock(return_value=[_make_device(DEVICE_A)]),
+            ),
+            patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
+        ):
+            cancelled = await cancel_reservation(db, res.id, admin_id, "token", is_admin=True)
+        assert cancelled.status == ReservationStatus.CANCELLED
+        # The acting admin is recorded; the owner is untouched.
+        assert cancelled.cancelled_by == admin_id
+        assert cancelled.user_id == owner
+        # Same cancelled event as the owner path, and it notifies the OWNER.
+        rows = await _outbox(db, "herd.reservations.cancelled")
+        assert len(rows) == 1
+        assert rows[0].payload["user_id"] == str(owner)
+        assert rows[0].payload["reservation_id"] == str(res.id)
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_cancel_other_users_reservation():
+    """Without the admin flag, a non-owner cancel still misses (router -> 404)."""
+    owner = uuid.uuid4()
+    stranger = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, user_id=owner)
+        result = await cancel_reservation(db, res.id, stranger, "token", is_admin=False)
+        assert result is None
+        # The reservation is untouched: still ACTIVE, no event staged.
+        await db.refresh(res)
+        assert res.status == ReservationStatus.ACTIVE
+        assert await _outbox(db, "herd.reservations.cancelled") == []
 
 
 @pytest.mark.asyncio
