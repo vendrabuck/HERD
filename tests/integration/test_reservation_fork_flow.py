@@ -190,9 +190,12 @@ async def test_standing_reconciler_archives_zombie_fork(admin_client, base_url, 
         )
         assert created.status_code == 201, created.text
 
-        # The reconciler runs on the expiration sweep; poll for ARCHIVED.
+        # The reconciler runs on the expiration sweep. The dev/test stack pins
+        # EXPIRATION_INTERVAL_SECONDS to 5 in docker-compose.override.yml so this
+        # poll fits inside the suite's --timeout=30 cap; against a stack running
+        # the 60s production default this test would time out by design.
         archived = False
-        for _ in range(30):
+        for _ in range(8):
             got = await raw.get(f"/cabling/internal/forks/{reservation_id}", headers=headers)
             if got.status_code == 200 and got.json()["status"] == "ARCHIVED":
                 archived = True

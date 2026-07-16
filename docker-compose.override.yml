@@ -35,6 +35,13 @@ services:
 
   reservations:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      # Dev/test-only fast sweep (production default is 60s): lets integration
+      # tests that wait on sweep-driven behavior (the fork archive reconciler,
+      # issue #25 P3a phase 3) complete inside the suite's --timeout=30 cap.
+      # Mirrors the WEBHOOK_TEST_SINK_ENABLED test-knob pattern below; make prod
+      # excludes this override.
+      EXPIRATION_INTERVAL_SECONDS: "5"
     volumes:
       - ./services/reservations/app:/app/app
       - ./services/common/herd_common:/app/common/herd_common
