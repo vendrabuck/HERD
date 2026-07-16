@@ -1,9 +1,11 @@
 # Decision: Editable Reservation Topologies (Fork-on-Reserve), Issue #25
 
-Status: Accepted; P1-P2 shipped (fork models, tables, and creation in the
-cabling service). P3 reconcile-on-save is designed in ADR 0006
-(`0006-fork-reconcile-and-as-built.md`), which resolves this doc's open risks.
-No code in this doc.
+Status: Accepted, superseded for P3 by ADR 0006
+(`0006-fork-reconcile-and-as-built.md`), the successor design that resolves this
+doc's open risks. P1-P2 shipped (fork models, tables, and creation in the cabling
+service); ADR 0006's P3a (fork reconcile-on-save and the as-built archive)
+delivered in phases 1 to 5 (PRs #349, #353, #359, #360), with P3b (execution
+consumes fork wiring deltas, issue #345) remaining. No code in this doc.
 Context verified against the live HERD-public tree on 2026-06-09.
 
 ## Context

@@ -254,6 +254,7 @@ make frontend-dev    # Run frontend dev server
 - Schedule tab: inline editing of end time and purpose
 - Edit Resources: search, add, and remove devices with availability filtering
 - Backend PATCH endpoint validates topology uniformity, checks conflicts for added devices, and publishes NATS events for driver execution
+- Edit topology (live-edit mode): while a reservation is ACTIVE its owner (or an admin) re-wires the reservation's editable topology fork; edits autosave as drafts and committing reconciles the fork (release-before-build) and leaves the master topology's history untouched. A commit that would claim a port held by another active reservation is refused with a conflict naming the blocker. After the reservation ends the fork is a read-only as-built record (ADR 0006)
 
 ### Reservation calendar
 - Gantt-style timeline with day, week, and month views
@@ -335,7 +336,9 @@ users filtered by device group visibility); writes require admin or superadmin r
 Time-window reservations with topology-type enforcement (physical and cloud devices
 cannot be mixed), conflict detection for exclusive devices, automatic expiration of
 pending and active reservations, and inter-service device status sync. Live editing
-of active reservations: modify device lists, extend end times, and update purpose.
+of active reservations: modify device lists, extend end times, update purpose, and
+re-wire the reservation's editable topology fork (reconciled on save, frozen to an
+as-built record at teardown; ADR 0006).
 Publishes lifecycle events to NATS JetStream (`herd.reservations.*`) for created,
 cancelled, completed, and updated events.
 

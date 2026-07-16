@@ -884,6 +884,40 @@ Authorization: Bearer <token>   # creator or admin
 
 ---
 
+## Reservation Topology Fork (ADR 0006 P3a)
+
+Each reservation gets an editable fork of its parent topology on activation, so
+live edits stay off the shared master template. The reservations service exposes
+three user-facing fork endpoints (they forward to the cabling service's internal
+fork surface). All three are owner-or-admin gated: the reservation owner, an
+admin, or a superadmin.
+
+Read the fork (allowed for any reservation status, so the as-built record stays
+readable after the reservation ends; on an ACTIVE reservation with no fork yet it
+lazy-creates one):
+
+```
+GET /api/reservations/{reservation_id}/fork
+Authorization: Bearer <token>   # owner or admin
+```
+
+Loosely edit the fork canvas (stored as a draft with no reconcile) and commit a
+reconcile that appends a fork version. Both mutations require the reservation to
+be `ACTIVE`; a fork is editable only while its reservation is live, and either
+returns `409` otherwise. A save whose wiring would claim a port already held by
+another active reservation returns `409` naming the blocking reservation:
+
+```
+PUT  /api/reservations/{reservation_id}/fork/canvas    # owner or admin, ACTIVE only
+POST /api/reservations/{reservation_id}/fork/save       # owner or admin, ACTIVE only
+Authorization: Bearer <token>
+```
+
+When the reservation ends the fork is archived to an immutable as-built record:
+the read endpoint still returns it, but the two mutations are refused.
+
+---
+
 ## Reservation Calendar
 
 The calendar provides a cross-user view of reservations within a time range.
@@ -1273,6 +1307,9 @@ Authorization: Bearer <admin-token>
 | `/api/reservations/{id}` | PATCH | yes (owner only) | yes (owner only) | yes (owner only) |
 | `/api/reservations/{id}` | DELETE | yes (owner only) | any reservation | any reservation |
 | `/api/reservations/{id}/release` | PUT | yes | yes | yes |
+| `/api/reservations/{id}/fork` | GET | owner only | owner or admin | owner or admin |
+| `/api/reservations/{id}/fork/canvas` | PUT | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
+| `/api/reservations/{id}/fork/save` | POST | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
 | `/api/reservations/internal/{id}/provision-result` | POST | internal | internal | internal |
 | `/api/reservations/reports/utilization` | GET | | yes | yes |
 | `/api/reservations/reports/utilization.csv` | GET | | yes | yes |

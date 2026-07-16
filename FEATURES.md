@@ -62,6 +62,18 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   references the topology.
 - **Topology cloning and reusable templates** (Shipped): clone an existing topology
   as a starting point; promote a topology to a reusable template.
+- **Editable reservation topologies (fork, reconcile-on-save, as-built)** (Shipped):
+  each reservation gets an editable fork of its parent topology, created on
+  activation. While the reservation is ACTIVE the owner (or an admin) edits the fork
+  in the topology editor's live-edit mode: edits autosave as loose drafts, and
+  committing runs a set-arithmetic reconcile (release-before-build) that appends a
+  fork version and leaves the parent topology's history untouched. A commit whose
+  wiring would claim a port already held by another active reservation is refused
+  with a conflict that names the blocking reservation. When the reservation ends the
+  fork is frozen to an immutable as-built record, viewable read-only. Two behavior
+  changes from the previous design: live edits no longer mutate the shared parent
+  topology or append parent versions, and PENDING reservations no longer offer
+  topology editing (the fork exists only from activation). See ADR 0006.
 - **Shortest-path cable routing** (Shipped): on-demand BFS (minimum-hop) pathfinding through
   Layer 1 switch infrastructure, with visual feedback on the canvas (green stroke
   and hop-count badge when a path exists, red stroke when not).

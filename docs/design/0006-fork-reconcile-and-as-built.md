@@ -1,11 +1,15 @@
 # Decision: Fork Reconcile-on-Save and As-Built Archive, Issue #25 P3
 
-Status: Proposed. Extends ADR 0001 (accepted), whose P1-P2 (fork schema and
-fork-on-activation) shipped in migration `0007_reservation_forks.py`. Resolves
-ADR 0001's open risks 1, 2, 4, and 5, and phases risk 3. No code in this doc.
-Context verified against the live HERD-public tree on 2026-07-09; ADR 0001's
-`reservation_service.py` line references predate the file's growth and are
-stale, so this doc re-cites current lines.
+Status: Accepted; P3a delivered. Extends ADR 0001 (accepted), whose P1-P2 (fork
+schema and fork-on-activation) shipped in migration `0007_reservation_forks.py`.
+Resolves ADR 0001's open risks 1, 2, 4, and 5, and phases risk 3. P3a shipped in
+phases 1 to 5 (PRs #349, #353, #359, #360, and this docs sweep): the cabling
+internal fork surface, the reservations user-facing fork endpoints with teardown
+archive and the standing reconciler, and the frontend fork-editing switch. P3b
+(execution consumes fork wiring deltas, Decision 7) remains, tracked as issue
+#345. No code in this doc. Context verified against the live HERD-public tree on
+2026-07-09; ADR 0001's `reservation_service.py` line references predate the
+file's growth and are stale, so this doc re-cites current lines.
 
 ## Context
 
