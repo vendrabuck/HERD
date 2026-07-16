@@ -10,17 +10,24 @@ See docs/design/0001-editable-reservation-topologies.md (Decision 2).
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.models.fork import ForkConnection, ForkStatus_ARCHIVED, ForkVersion, ReservationFork
+from app.models.fork import (
+    ForkConnection,
+    ForkStatus_ACTIVE,
+    ForkStatus_ARCHIVED,
+    ForkVersion,
+    ReservationFork,
+)
 from app.models.topology import Topology
 from app.routes.topologies import _run_topology_validation
 from app.schemas.fork import (
+    ActiveForkListResponse,
     ForkArchiveResponse,
     ForkCanvasUpdate,
     ForkCanvasUpdateResponse,
@@ -84,6 +91,56 @@ async def create_fork_internal(
     ).scalar() or 1
 
     return ForkCreateResponse(fork_id=fork.id, version_number=version_number)
+
+
+@router.get("", response_model=ActiveForkListResponse)
+async def list_active_forks_internal(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=1000),
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """List reservation_ids of every fork still in status ACTIVE (issue #25 P3a).
+
+    Feeds reservations' standing archive reconciler (ADR 0006 Decision 5): cabling
+    keeps a fork ACTIVE until reservations archives it on teardown, so an ACTIVE
+    fork whose reservation has ended (a crash between the terminal transition and
+    the best-effort archive, or any pre-phase-3 fork that predates the teardown
+    wiring) is a zombie that false-contends for port claims. This is the read side;
+    reservations decides which of these to freeze. ARCHIVED forks are never listed,
+    so an already-frozen fork drops out naturally. Ordered by created_at for stable
+    pagination.
+    """
+    _check_internal_token(x_internal_token)
+
+    total = (
+        await db.execute(
+            select(func.count())
+            .select_from(ReservationFork)
+            .where(ReservationFork.status == ForkStatus_ACTIVE)
+        )
+    ).scalar() or 0
+
+    rows = (
+        (
+            await db.execute(
+                select(ReservationFork.reservation_id)
+                .where(ReservationFork.status == ForkStatus_ACTIVE)
+                .order_by(ReservationFork.created_at)
+                .offset(skip)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return ActiveForkListResponse(
+        reservation_ids=list(rows),
+        total=total,
+        skip=skip,
+        limit=limit,
+    )
 
 
 @router.get("/{reservation_id}", response_model=ForkDetailResponse)

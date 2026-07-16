@@ -29,6 +29,10 @@
       "/health"
     ],
     [
+      "GET",
+      "/internal/forks"
+    ],
+    [
       "POST",
       "/internal/forks"
     ],
@@ -142,6 +146,21 @@
     ]
   ],
   "schemas": {
+    "ActiveForkListResponse": {
+      "properties": {
+        "limit": "integer",
+        "reservation_ids": "array",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "limit",
+        "reservation_ids",
+        "skip",
+        "total"
+      ],
+      "type": "object"
+    },
     "Body_import_topologies_endpoint_topologies_import_post": {
       "properties": {
         "file": "string"

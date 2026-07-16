@@ -18,14 +18,23 @@ from app.models.reservation import (
     ReservationStatus,
 )
 from app.services.reservation_service import (
+    _archive_reservation_fork_best_effort,
     _claim_provision_transition,
     _create_reservation_fork_best_effort,
+    _fetch_active_fork_reservation_ids,
     _fetch_devices_best_effort,
     _provision_requested_event,
     _release_exclusive_devices_best_effort,
     _reservation_created_event,
     _reservation_failed_event,
     _update_device_statuses,
+)
+
+# Terminal reservation statuses whose fork the standing reconciler may archive.
+TERMINAL_STATUSES = (
+    ReservationStatus.COMPLETED,
+    ReservationStatus.CANCELLED,
+    ReservationStatus.FAILED,
 )
 
 logger = logging.getLogger(__name__)
@@ -402,6 +411,9 @@ async def _run_expiration_cycle() -> None:
                 exclusive_ids.append(did)
         if exclusive_ids:
             await _update_device_statuses(exclusive_ids, "AVAILABLE")
+        # Freeze the fork as the as-built record now the reservation is COMPLETED
+        # (ADR 0006 Decision 5). Best-effort, mirroring the manual release path.
+        await _archive_reservation_fork_best_effort(res.id)
 
     # Release the timed-out reservations' exclusive devices back to AVAILABLE
     # (the create path's orphaned-RESERVED discipline: FAILED is outside the
@@ -410,6 +422,77 @@ async def _run_expiration_cycle() -> None:
         await _release_exclusive_devices_best_effort(
             res.id, list(res.device_ids), "provision_timeout_release"
         )
+        # A timed-out reservation is now FAILED; archive its fork as the as-built
+        # record (ADR 0006 Decision 5). A FAILED reservation still archives: the
+        # fork records intended wiring even though provisioning never completed.
+        await _archive_reservation_fork_best_effort(res.id)
+
+
+async def _run_fork_archive_reconcile() -> None:
+    """Archive forks whose reservation reached a terminal status (ADR 0006 Decision 5).
+
+    Standing reconciler AND the required one-time backfill (PR #353 notes). Cabling
+    keeps a fork ACTIVE until reservations archives it on teardown, so two things
+    leave an ACTIVE fork whose reservation is over: a crash between the terminal
+    transition and the best-effort archive, and any pre-phase-3 fork created before
+    the teardown-archive wiring existed. Such a fork is a zombie that false-contends
+    for cross-reservation port claims. Each tick this fetches cabling's ACTIVE-fork
+    reservation_ids, keeps those whose reservation is terminal
+    (COMPLETED/CANCELLED/FAILED), and archives each best-effort. The first run
+    archives every pre-phase-3 zombie, which is the backfill.
+
+    A reservation_id cabling reports that this DB does not know is logged and
+    skipped, never archived blind: reservations is the lifecycle authority, and only
+    a reservation it can read attests that its fork should be frozen. A reservation
+    still non-terminal (ACTIVE and legitimately in use) is left alone. The cabling
+    fetch is non-fatal to the rest of the sweep: a failure returns early here and the
+    loop also guards the call.
+    """
+    try:
+        reservation_ids = await _fetch_active_fork_reservation_ids()
+    except Exception:
+        logger.error(
+            "Fork archive reconcile: could not fetch active forks from cabling",
+            exc_info=True,
+            extra={"action": "fork_reconcile_fetch_failed"},
+        )
+        return
+
+    if not reservation_ids:
+        return
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Reservation.id, Reservation.status).where(Reservation.id.in_(reservation_ids))
+        )
+        status_by_id = {row.id: row.status for row in result}
+
+    for reservation_id in reservation_ids:
+        status = status_by_id.get(reservation_id)
+        if status is None:
+            # Cabling holds an ACTIVE fork for a reservation this service does not
+            # know. Do not archive blind: log it for investigation and skip.
+            logger.warning(
+                "Fork archive reconcile: ACTIVE fork for unknown reservation %s; skipping",
+                reservation_id,
+                extra={
+                    "action": "fork_reconcile_unknown_reservation",
+                    "reservation_id": str(reservation_id),
+                },
+            )
+            continue
+        if status in TERMINAL_STATUSES:
+            await _archive_reservation_fork_best_effort(reservation_id)
+            logger.info(
+                "Fork archive reconcile: archived fork for terminal reservation %s (%s)",
+                reservation_id,
+                status.value,
+                extra={
+                    "action": "fork_reconcile_archived",
+                    "reservation_id": str(reservation_id),
+                    "reservation_status": status.value,
+                },
+            )
 
 
 async def expiration_loop(interval_seconds: int = 60) -> None:
@@ -431,4 +514,8 @@ async def expiration_loop(interval_seconds: int = 60) -> None:
             await _run_reminder_cycle()
         except Exception:
             logger.error("Expiry reminder cycle failed", exc_info=True)
+        try:
+            await _run_fork_archive_reconcile()
+        except Exception:
+            logger.error("Fork archive reconcile cycle failed", exc_info=True)
         await asyncio.sleep(interval_seconds)

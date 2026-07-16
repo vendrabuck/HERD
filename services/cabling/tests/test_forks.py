@@ -1644,3 +1644,68 @@ async def test_archive_fork_appends_no_version(client):
             .all()
         )
         assert [v.version_number for v in versions] == [1]
+
+
+# --- GET /internal/forks: list ACTIVE forks for the archive reconciler (phase 3) ---
+
+
+@pytest.mark.asyncio
+async def test_list_active_forks_requires_internal_token(client):
+    resp = await client.get("/internal/forks", headers={"X-Internal-Token": "wrong"})
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_list_active_forks_missing_token(client):
+    resp = await client.get("/internal/forks")
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_active_forks_empty(client):
+    resp = await client.get("/internal/forks", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reservation_ids"] == []
+    assert body["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_active_forks_excludes_archived(client):
+    active_a = uuid.uuid4()
+    active_b = uuid.uuid4()
+    archived = uuid.uuid4()
+    for rid in (active_a, active_b, archived):
+        await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    # Freeze one so it drops out of the ACTIVE listing.
+    await client.post(f"/internal/forks/{archived}/archive", headers=_hdr())
+
+    resp = await client.get("/internal/forks", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total"] == 2
+    ids = set(body["reservation_ids"])
+    assert ids == {str(active_a), str(active_b)}
+    assert str(archived) not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_active_forks_pagination(client):
+    rids = [uuid.uuid4() for _ in range(3)]
+    for rid in rids:
+        await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    first = await client.get("/internal/forks", params={"skip": 0, "limit": 2}, headers=_hdr())
+    assert first.status_code == 200, first.text
+    fb = first.json()
+    assert fb["total"] == 3
+    assert len(fb["reservation_ids"]) == 2
+
+    second = await client.get("/internal/forks", params={"skip": 2, "limit": 2}, headers=_hdr())
+    sb = second.json()
+    assert sb["total"] == 3
+    assert len(sb["reservation_ids"]) == 1
+
+    # The two pages together cover every ACTIVE fork with no overlap.
+    combined = set(fb["reservation_ids"]) | set(sb["reservation_ids"])
+    assert combined == {str(r) for r in rids}
