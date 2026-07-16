@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Routes, Route, useLocation } from "react-router-dom";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
 beforeAll(() => {
@@ -208,5 +208,87 @@ describe("ReservationDetailModal", () => {
 
     await waitFor(() => expect(released).toBe(true));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+});
+
+// The fork-view navigation target (ADR 0006 Decision 6 / #7): the modal points at
+// the reservation's fork view, not the parent topology_id directly. The editor
+// loads the fork from GET /reservations/{id}/fork, so the URL still carries the
+// topology id in the path plus the reservationId that selects the fork.
+function LocationEcho() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+}
+
+function renderModalWithLocation(overrides: Partial<Reservation> = {}) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const onClose = vi.fn();
+  const utils = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/reservations"]}>
+        <Routes>
+          <Route
+            path="/reservations"
+            element={
+              <ReservationDetailModal
+                reservation={{ ...RESERVATION, ...overrides }}
+                deviceNames={DEVICE_NAMES}
+                onClose={onClose}
+              />
+            }
+          />
+        </Routes>
+        <LocationEcho />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { ...utils, onClose };
+}
+
+describe("ReservationDetailModal fork navigation", () => {
+  it("Edit topology navigates to the fork view and closes the modal (ACTIVE)", () => {
+    const { onClose } = renderModalWithLocation({ status: "ACTIVE" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit topology", hidden: true }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("loc")).toHaveTextContent(
+      "/topology/topo-1?reservationId=res-1",
+    );
+  });
+
+  it("shows a read-only View as-built button for an ended reservation, not Edit", () => {
+    renderModalWithLocation({ status: "COMPLETED" });
+    expect(
+      screen.queryByRole("button", { name: "Edit topology", hidden: true }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Edit Resources", hidden: true }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "View as-built", hidden: true }),
+    ).toBeInTheDocument();
+  });
+
+  it("View as-built navigates to the same fork view", () => {
+    renderModalWithLocation({ status: "COMPLETED" });
+    fireEvent.click(screen.getByRole("button", { name: "View as-built", hidden: true }));
+    expect(screen.getByTestId("loc")).toHaveTextContent(
+      "/topology/topo-1?reservationId=res-1",
+    );
+  });
+
+  it("does not offer fork editing for a still-PENDING reservation (no fork yet)", () => {
+    renderModalWithLocation({ status: "PENDING" });
+    expect(
+      screen.queryByRole("button", { name: "Edit topology", hidden: true }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "View as-built", hidden: true }),
+    ).not.toBeInTheDocument();
+    // Device-set editing still applies while PENDING.
+    expect(
+      screen.getByRole("button", { name: "Edit Resources", hidden: true }),
+    ).toBeInTheDocument();
   });
 });

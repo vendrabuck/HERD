@@ -98,43 +98,64 @@ beforeEach(() => {
   onClose.mockReset();
 });
 
+// The fork is editable only while the reservation is ACTIVE (ADR 0006
+// Decision 6), and it does not exist until the reservation activates. So the
+// editable "Edit topology" affordance is ACTIVE-only, ended reservations get the
+// read-only "View as-built", and a still-PENDING reservation gets neither (no
+// fork yet). Both open the same fork view URL; the editor decides editable vs
+// read-only from the fork's status.
 describe("ReservationDetailModal Edit topology button", () => {
-  it("shows the button for the owner of an ACTIVE reservation with a topology_id", () => {
+  it("shows Edit topology for the owner of an ACTIVE reservation with a topology_id", () => {
     renderModal(BASE);
     expect(screen.getByRole("button", { name: "Edit topology" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View as-built" })).not.toBeInTheDocument();
   });
 
-  it("shows the button for the owner of a PENDING reservation with a topology_id", () => {
+  it("offers neither fork affordance for a still-PENDING reservation (no fork yet)", () => {
     renderModal({ ...BASE, status: "PENDING" });
-    expect(screen.getByRole("button", { name: "Edit topology" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit topology" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View as-built" })).not.toBeInTheDocument();
   });
 
-  it("hides the button when topology_id is null", () => {
+  it("hides both affordances when topology_id is null", () => {
     renderModal({ ...BASE, topology_id: null });
     expect(screen.queryByRole("button", { name: "Edit topology" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View as-built" })).not.toBeInTheDocument();
   });
 
-  it("hides the button for a non-owner even with a topology_id", () => {
+  it("hides both affordances for a non-owner even with a topology_id", () => {
     currentUserId = "someone-else";
     renderModal(BASE);
     expect(screen.queryByRole("button", { name: "Edit topology" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View as-built" })).not.toBeInTheDocument();
   });
 
-  it("hides the button on a COMPLETED reservation", () => {
+  it("shows read-only View as-built (not Edit topology) on a COMPLETED reservation", () => {
     renderModal({ ...BASE, status: "COMPLETED" });
     expect(screen.queryByRole("button", { name: "Edit topology" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View as-built" })).toBeInTheDocument();
   });
 
-  it("hides the button on a CANCELLED reservation", () => {
+  it("shows read-only View as-built (not Edit topology) on a CANCELLED reservation", () => {
     renderModal({ ...BASE, status: "CANCELLED" });
     expect(screen.queryByRole("button", { name: "Edit topology" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View as-built" })).toBeInTheDocument();
   });
 
-  it("closes the modal and navigates to the topology editor with reservationId on click", () => {
+  it("closes the modal and navigates to the fork view with reservationId on click", () => {
     renderModal(BASE);
     fireEvent.click(screen.getByRole("button", { name: "Edit topology" }));
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(navigateSpy).toHaveBeenCalledTimes(1);
+    expect(navigateSpy).toHaveBeenCalledWith(
+      "/topology/topo-123?reservationId=11111111-2222-3333-4444-555555555555",
+    );
+  });
+
+  it("View as-built opens the same fork view for an ended reservation", () => {
+    renderModal({ ...BASE, status: "COMPLETED" });
+    fireEvent.click(screen.getByRole("button", { name: "View as-built" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
     expect(navigateSpy).toHaveBeenCalledWith(
       "/topology/topo-123?reservationId=11111111-2222-3333-4444-555555555555",
     );
