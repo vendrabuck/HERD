@@ -29,6 +29,14 @@
       "/health"
     ],
     [
+      "GET",
+      "/internal/reservations/{reservation_id}/wiring-status"
+    ],
+    [
+      "POST",
+      "/internal/reservations/{reservation_id}/wiring/retry"
+    ],
+    [
       "POST",
       "/internal/validate-package"
     ],
@@ -268,6 +276,79 @@
         "schema",
         "structural",
         "valid"
+      ],
+      "type": "object"
+    },
+    "WiringConnectionStatus": {
+      "properties": {
+        "attempts": "integer",
+        "created_at": "anyOf",
+        "id": "string",
+        "last_error": "anyOf",
+        "physical_connection_id": "anyOf",
+        "port_a": "string",
+        "port_b": "string",
+        "released_at": "anyOf",
+        "retryable": "boolean",
+        "status": "string",
+        "switch_device_id": "string"
+      },
+      "required": [
+        "attempts",
+        "id",
+        "port_a",
+        "port_b",
+        "retryable",
+        "status",
+        "switch_device_id"
+      ],
+      "type": "object"
+    },
+    "WiringRetryOutcome": {
+      "properties": {
+        "attempts": "integer",
+        "id": "string",
+        "last_error": "anyOf",
+        "outcome": "string",
+        "physical_connection_id": "anyOf",
+        "port_a": "string",
+        "port_b": "string",
+        "status": "string",
+        "switch_device_id": "string"
+      },
+      "required": [
+        "attempts",
+        "id",
+        "outcome",
+        "port_a",
+        "port_b",
+        "status",
+        "switch_device_id"
+      ],
+      "type": "object"
+    },
+    "WiringRetryResponse": {
+      "properties": {
+        "reservation_id": "string",
+        "results": "array"
+      },
+      "required": [
+        "reservation_id",
+        "results"
+      ],
+      "type": "object"
+    },
+    "WiringStatusResponse": {
+      "properties": {
+        "connections": "array",
+        "frozen": "boolean",
+        "last_applied_fork_version": "anyOf",
+        "reservation_id": "string"
+      },
+      "required": [
+        "connections",
+        "frozen",
+        "reservation_id"
       ],
       "type": "object"
     }

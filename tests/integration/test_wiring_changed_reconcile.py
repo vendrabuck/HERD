@@ -13,12 +13,17 @@ End-to-end over a running HERD stack with the checked-in mock L1 driver:
   the wiring state), a directly-injected stale wiring_changed must not reconnect.
 - Replay idempotency (Decision 4): a stale wiring_changed (fork_version at or below
   last-applied) injected after a save is a no-op, driving no additional switch op.
+- The phase-4 per-connection surface (Decision 6): a fork-save build forced to fail via
+  HERD_mock_fail_actions lands a FAILED row observable through the NEW user-facing
+  GET /reservations/{id}/wiring-status; clearing the knob and hitting
+  POST /reservations/{id}/wiring/retry flips that connection ACTIVE. This closes the
+  ADR's integration test-plan item on the manual retry path.
 
-Assignment-row and FAILED-row assertions at the table level are not reachable through
-the API in phase 3 (the wiring-status endpoint lands in phase 4), so these tests assert
-the driver's observable execution runs. They require a running stack and NATS
-reachable from the host; without either they skip or error at connect time, which is
-expected. Live-gated at review.
+The phase-1/3 tests assert the driver's observable execution runs (the wiring-status
+endpoint did not exist before phase 4); the phase-4 test asserts the assignment-row
+flip directly through the new endpoint. They require a running stack and NATS reachable
+from the host; without either they skip or error at connect time, which is expected.
+Live-gated at review.
 """
 
 import asyncio
@@ -85,7 +90,14 @@ async def l1_template(base_url, admin_token, l1_driver):
             "sections": [
                 {
                     "name": "General",
-                    "fields": [{"key": "model", "label": "Model", "type": "string"}],
+                    "fields": [
+                        {"key": "model", "label": "Model", "type": "string"},
+                        {
+                            "key": "mock_fail_actions",
+                            "label": "Mock fail actions",
+                            "type": "string",
+                        },
+                    ],
                 }
             ],
         }
@@ -188,6 +200,132 @@ async def _poll_run_count_at_least(
             return count
         await asyncio.sleep(0.5)
     return count
+
+
+async def _create_switch_fd(client, template_id: str, field_data: dict) -> dict:
+    resp = await client.post(
+        "/inventory/devices",
+        json={
+            "name": f"mock-l1-sw-{uuid.uuid4().hex[:8]}",
+            "template_id": template_id,
+            "topology_type": "PHYSICAL",
+            "status": "AVAILABLE",
+            "field_data": field_data,
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _wiring_status(client, reservation_id: str) -> dict:
+    resp = await client.get(f"/reservations/{reservation_id}/wiring-status")
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _poll_wiring_conn(client, reservation_id: str, predicate, *, timeout: float = 15.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        status = await _wiring_status(client, reservation_id)
+        for conn in status.get("connections", []):
+            if predicate(conn):
+                return conn
+        await asyncio.sleep(0.5)
+    return None
+
+
+async def _poll_active(client, reservation_id: str, *, timeout: float = 12.0) -> bool:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        resp = await client.get(f"/reservations/{reservation_id}")
+        if resp.status_code == 200 and resp.json().get("status") == "ACTIVE":
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def test_failed_build_surfaces_and_manual_retry_recovers(
+    admin_client, l1_template, fresh_devices
+):
+    """A fork-save build forced to fail lands a FAILED row on the phase-4 wiring-status
+    surface; clearing the failure knob and hitting the manual retry endpoint flips that
+    connection ACTIVE (ADR 0007 Decision 6, the manual-retry integration test-plan item).
+
+    The switch starts with HERD_mock_fail_actions=connect_ports and the reservation
+    activates against an EMPTY fork canvas (so activation drives no connect and the knob
+    is inert there). Saving a canvas that wires the two DUTs through the switch makes the
+    reconcile BUILD the switch cross-connect, which fails on connect_ports and parks a
+    FAILED row. The knob is then cleared and the retry reattempts the same pair."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(f"NATS not reachable from host: {nats_err}")
+
+    switch = await _create_switch_fd(
+        admin_client,
+        l1_template["id"],
+        {"model": "test", "mock_fail_actions": "connect_ports"},
+    )
+    dut_a, dut_b = await fresh_devices(2)
+    connections = []
+    reservation_id = None
+    topology_id = None
+    try:
+        connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
+        connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
+        # Activate against an empty canvas: no connect fires, so the fail knob is inert
+        # at activation and only bites the later save-driven build.
+        topology_id = await _create_topology(admin_client, {"nodes": [], "edges": []})
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]], topology_id)
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        # Save the wired canvas: the reconcile builds the switch pair, connect_ports fails.
+        saved = await admin_client.post(
+            f"/reservations/{reservation_id}/fork/save",
+            json={"canvas_data": _canvas_edge(dut_a["id"], dut_b["id"])},
+        )
+        assert saved.status_code == 200, saved.text
+
+        # The FAILED build surfaces through the NEW user-facing wiring-status endpoint.
+        failed = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "FAILED"
+        )
+        assert failed is not None, "the failed build never surfaced as a FAILED wiring-status row"
+        assert failed["retryable"] is True, "a driver-failure FAILED row must be retryable"
+
+        # Clear the failure knob so the reattempt can succeed, then manual-retry.
+        upd = await admin_client.put(
+            f"/inventory/devices/{switch['id']}",
+            json={"field_data": {"model": "test", "mock_fail_actions": ""}},
+        )
+        assert upd.status_code == 200, upd.text
+
+        retried = await admin_client.post(f"/reservations/{reservation_id}/wiring/retry")
+        assert retried.status_code == 200, retried.text
+        outcomes = retried.json()["results"]
+        assert any(o["outcome"] == "reconnected" for o in outcomes), (
+            f"manual retry did not reconnect the pair: {outcomes}"
+        )
+
+        # wiring-status now shows the pair ACTIVE with no lingering FAILED row.
+        active = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "ACTIVE"
+        )
+        assert active is not None, "the retried connection never reached ACTIVE"
+        remaining = [
+            c
+            for c in (await _wiring_status(admin_client, reservation_id))["connections"]
+            if c["status"] == "FAILED"
+        ]
+        assert remaining == [], "no FAILED row should remain after a successful retry"
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        for conn in connections:
+            await admin_client.delete(f"/cabling/connections/{conn['id']}")
+        await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
 async def test_fork_save_release_drives_disconnect(admin_client, l1_template, fresh_devices):

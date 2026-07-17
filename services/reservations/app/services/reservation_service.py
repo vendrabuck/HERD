@@ -316,6 +316,36 @@ async def _cabling_fork_call(
         raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
 
 
+async def _execution_wiring_call(
+    method: str,
+    path: str,
+    json_body: dict | None = None,
+) -> httpx.Response:
+    """Issue one X-Internal-Token call to an execution wiring endpoint (ADR 0007 P3b).
+
+    The transport for the reservations-side wiring-status and manual-retry proxies
+    (issue #345 phase 4). Mirrors _cabling_fork_call exactly: authenticated
+    service-to-service (the booking owner does not own execution's internal surface,
+    so a JWT-forward would not authenticate), raises RuntimeError on a transport
+    failure so the router maps it to 503 (the issue #131 upstream-unreachable
+    convention), and returns execution's own Response so a 4xx/409 (frozen refusal) or
+    a structured 200 relays to the user verbatim.
+    """
+    if not settings.internal_api_token:
+        raise RuntimeError("internal_api_token not configured; cannot reach execution")
+    try:
+        async with httpx.AsyncClient() as client:
+            return await client.request(
+                method,
+                f"{settings.execution_service_url}{path}",
+                headers={"X-Internal-Token": settings.internal_api_token},
+                json=json_body,
+                timeout=30.0,
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Failed to contact execution service: {exc}") from exc
+
+
 async def _lazy_create_reservation_fork(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,

@@ -1421,6 +1421,31 @@ L3_EVENT_ACTIONS = {
 }
 
 
+def _l1_op_failed(result: dict) -> tuple[bool, str | None]:
+    """Decide whether one L1 driver op failed, returning (failed, error).
+
+    The sandbox's top-level ``result['success']`` is TRANSPORT-level: it is True
+    whenever the driver subprocess exits 0, i.e. the method ran without raising. A
+    driver method that RETURNS ``{"success": False, ...}`` without raising (the mock
+    drivers' HERD_mock_fail_actions convention, and any real driver that reports a
+    failure in its return value rather than by raising) is therefore a semantic
+    failure the transport flag misses. This mirrors ``_recipe_reported_success`` for
+    the dynamic path; connect_ports/disconnect_ports follow the same
+    ``{"success": bool, ...}`` return shape. An output with no ``success`` key is a
+    bare-data return and counts as success (conservative: only an explicit falsy
+    ``success`` is a failure), so a driver that returns plain data is unaffected.
+
+    Returns (True, error) on a sandbox failure (raise/timeout/signal) or a
+    driver-result failure, else (False, None).
+    """
+    if not result.get("success"):
+        return True, result.get("error") or "driver reported failure"
+    output = result.get("output")
+    if isinstance(output, dict) and output.get("success") is False:
+        return True, output.get("error") or "driver reported failure"
+    return False, None
+
+
 async def _execute_switch_operations(
     device_ids: list[str],
     action: str,
@@ -1469,7 +1494,11 @@ async def _execute_switch_operations(
         redact_context_for_logging,
         update_execution_run,
     )
-    from app.services.l1_assignment_service import record_l1_connect, release_l1_connection
+    from app.services.l1_assignment_service import (
+        record_l1_connect,
+        record_l1_failed,
+        release_l1_connection,
+    )
 
     # Group by switch for batched login/logout
     switch_groups = {}
@@ -1613,7 +1642,12 @@ async def _execute_switch_operations(
                     method_kwargs=port_kwargs,
                     password_keys=password_keys,
                 )
-                if result["success"]:
+                # Inspect the driver RESULT payload, not just the transport-level
+                # sandbox success (#345 phase 4 live-gate): a driver that returns
+                # success=False without raising is a failure the sandbox flag misses,
+                # and previously recorded a false SUCCESS run plus a phantom ACTIVE row.
+                op_failed, op_error = _l1_op_failed(result)
+                if not op_failed:
                     await update_execution_run(
                         db,
                         run,
@@ -1627,8 +1661,6 @@ async def _execute_switch_operations(
                     # issue #345 P3b phase 1). A new projection alongside the
                     # unchanged execution_runs audit log: a successful connect
                     # records an ACTIVE row, a successful disconnect releases it.
-                    # Nothing consumes these rows yet; the driver call, ordering,
-                    # and events above are byte-for-byte unchanged.
                     if res_uuid is not None:
                         if action == "connect_ports":
                             await record_l1_connect(db, res_uuid, switch_uuid, port_a, port_b)
@@ -1639,11 +1671,25 @@ async def _execute_switch_operations(
                         db,
                         run,
                         "FAILED",
-                        error=result.get("error"),
+                        error=op_error,
                         started_at=op_started,
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
                     )
+                    # A failed connect lands a FAILED assignment row so the connection
+                    # is visible and retryable through the phase-4 channel; a failed
+                    # disconnect (teardown) leaves the ACTIVE row intact (the
+                    # cross-connect is still live) rather than falsely releasing it.
+                    if res_uuid is not None and action == "connect_ports":
+                        await record_l1_failed(
+                            db,
+                            res_uuid,
+                            switch_uuid,
+                            port_a,
+                            port_b,
+                            1,
+                            op_error or "driver reported failure",
+                        )
 
             # Logout
             logout_run = await create_execution_run(
@@ -2609,9 +2655,13 @@ async def _run_driver_with_retry(
             last_result = None
         else:
             last_result = result
-            if result.get("success"):
+            # Gate on the driver RESULT payload, not only the transport-level sandbox
+            # success (#345 phase 4 live-gate): a driver returning success=False
+            # without raising is a per-connection failure to retry/park, not a success.
+            op_failed, op_error = _l1_op_failed(result)
+            if not op_failed:
                 return True, attempt, None, result
-            last_error = result.get("error") or "driver reported failure"
+            last_error = op_error
         if attempt < WIRING_DRIVER_ATTEMPTS:
             await asyncio.sleep(min(delay, WIRING_DRIVER_MAX_DELAY))
             delay *= WIRING_DRIVER_BACKOFF_FACTOR
