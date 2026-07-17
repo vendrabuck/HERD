@@ -1412,6 +1412,7 @@ async def _execute_switch_operations(
         redact_context_for_logging,
         update_execution_run,
     )
+    from app.services.l1_assignment_service import record_l1_connect, release_l1_connection
 
     # Group by switch for batched login/logout
     switch_groups = {}
@@ -1565,6 +1566,17 @@ async def _execute_switch_operations(
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
                     )
+                    # Connection-addressable applied state (ADR 0007 Decision 4,
+                    # issue #345 P3b phase 1). A new projection alongside the
+                    # unchanged execution_runs audit log: a successful connect
+                    # records an ACTIVE row, a successful disconnect releases it.
+                    # Nothing consumes these rows yet; the driver call, ordering,
+                    # and events above are byte-for-byte unchanged.
+                    if res_uuid is not None:
+                        if action == "connect_ports":
+                            await record_l1_connect(db, res_uuid, switch_uuid, port_a, port_b)
+                        elif action == "disconnect_ports":
+                            await release_l1_connection(db, res_uuid, switch_uuid, port_a, port_b)
                 else:
                     await update_execution_run(
                         db,
@@ -2498,6 +2510,25 @@ async def handle_reservation_event(
             # on complete/cancel/fail, never on reservation.created.
             if event_type in DYNAMIC_TEARDOWN_EVENTS:
                 await _execute_dynamic_teardown(reservation_id, user_id, get_db_session, client)
+
+            # Freeze the wiring state on terminal events (ADR 0007 Decision 7,
+            # issue #345 P3b phase 1). Once a reservation ends, a later
+            # wiring_changed event must be a no-op; the frozen flag is that guard.
+            # Phase 1 write is inert (nothing reads frozen yet), so it is
+            # best-effort: a failure here must never NAK an otherwise-processed
+            # teardown.
+            if event_type in DYNAMIC_TEARDOWN_EVENTS:
+                from app.services.l1_assignment_service import freeze_reservation_wiring
+
+                try:
+                    async with get_db_session() as db:
+                        await freeze_reservation_wiring(db, reservation_id)
+                except Exception:
+                    logger.warning(
+                        "failed to freeze wiring state for reservation %s",
+                        reservation_id,
+                        exc_info=True,
+                    )
 
     logger.info(
         "Completed processing reservation event",

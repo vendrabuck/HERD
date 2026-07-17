@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -24,6 +25,23 @@ from app.services.nats_consumer import (
     handle_reservation_event,
     process_reservation_message,
 )
+
+
+@asynccontextmanager
+async def _noop_db_session():
+    yield AsyncMock()
+
+
+def _noop_get_db_session():
+    """Protocol-correct get_db_session stand-in yielding a mock session.
+
+    The terminal-event wiring-state freeze (ADR 0007 Decision 7, issue #345)
+    opens a session on reservation.cancelled/completed/failed, so get_db_session
+    must be a real async context manager (mock-backed) rather than a bare
+    AsyncMock, which would leak an un-awaited coroutine. Identity is stable, so
+    dispatch-argument assertions still match.
+    """
+    return _noop_db_session()
 
 
 @pytest.fixture(autouse=True)
@@ -718,7 +736,7 @@ async def test_handle_cancelled_event_calls_l2_deprovision():
         "user_id": uid,
         "device_ids": ["device-1"],
     }
-    mock_session = AsyncMock()
+    mock_session = _noop_get_db_session
     with (
         patch(
             "app.services.nats_consumer._execute_switch_operations",
@@ -728,6 +746,17 @@ async def test_handle_cancelled_event_calls_l2_deprovision():
             "app.services.nats_consumer._execute_l2_switch_operations",
             new_callable=AsyncMock,
         ) as mock_l2,
+        # Best-effort side-effects on the terminal path (tier flip #24, wiring
+        # freeze #345) are not what this dispatch test asserts; patch them out so
+        # they do not run real DB code against the mock session.
+        patch(
+            "app.services.nats_consumer.apply_reservation_event_tiers",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "app.services.l1_assignment_service.freeze_reservation_wiring",
+            new_callable=AsyncMock,
+        ),
     ):
         await handle_reservation_event(event_data, mock_session)
         mock_l1.assert_called_once_with(
