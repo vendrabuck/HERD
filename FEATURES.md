@@ -73,7 +73,14 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   fork is frozen to an immutable as-built record, viewable read-only. Two behavior
   changes from the previous design: live edits no longer mutate the shared parent
   topology or append parent versions, and PENDING reservations no longer offer
-  topology editing (the fork exists only from activation). See ADR 0006.
+  topology editing (the fork exists only from activation). A commit now also
+  reconciles the L1 hardware connection-by-connection: the execution service applies
+  the released/built wire delta against a per-connection `l1_connection_assignments`
+  ledger, and the reservation detail's Wiring tab shows each cross-connect's status
+  (ACTIVE / RELEASED / FAILED, attempts, last error) with a manual retry for the
+  hardware-retryable failures on top of the background auto-retry. L2 and L3
+  provisioning remain device-set-driven. See ADR 0006 and ADR 0007 (issue #345 P3b,
+  L1 delivered).
 - **Shortest-path cable routing** (Shipped): on-demand BFS (minimum-hop) pathfinding through
   Layer 1 switch infrastructure, with visual feedback on the canvas (green stroke
   and hop-count badge when a path exists, red stroke when not).

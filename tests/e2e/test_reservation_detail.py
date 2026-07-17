@@ -25,7 +25,7 @@ def _click_reservation_row(driver):
 
 
 def test_reservation_detail_modal_opens(admin_browser, base_url, transient_reservation):
-    """Clicking a reservation row opens the detail modal with the 4 tabs."""
+    """Clicking a reservation row opens the detail modal with the 5 tabs."""
     _open_reservations(admin_browser, base_url)
     admin_browser.refresh()
     wait = WebDriverWait(admin_browser, WAIT)
@@ -39,15 +39,15 @@ def test_reservation_detail_modal_opens(admin_browser, base_url, transient_reser
             (By.XPATH, "//*[contains(text(), 'Reservation')]")
         )
     )
-    # Four tab buttons: Details, Inventory, Routes, Schedule.
-    for label in ("Details", "Inventory", "Routes", "Schedule"):
+    # Five tab buttons: Details, Inventory, Routes, Wiring, Schedule.
+    for label in ("Details", "Inventory", "Routes", "Wiring", "Schedule"):
         admin_browser.find_element(
             By.XPATH, f"//button[normalize-space()='{label}']"
         )
 
 
 def test_reservation_detail_tabs_switch(admin_browser, base_url, transient_reservation):
-    """Each of the four tabs can be activated."""
+    """Each of the five tabs can be activated."""
     _open_reservations(admin_browser, base_url)
     admin_browser.refresh()
     wait = WebDriverWait(admin_browser, WAIT)
@@ -60,7 +60,7 @@ def test_reservation_detail_tabs_switch(admin_browser, base_url, transient_reser
         )
     )
 
-    for label in ("Inventory", "Routes", "Schedule", "Details"):
+    for label in ("Inventory", "Routes", "Wiring", "Schedule", "Details"):
         admin_browser.find_element(
             By.XPATH, f"//button[normalize-space()='{label}']"
         ).click()

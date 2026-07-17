@@ -1,10 +1,23 @@
 # Decision: Connection-Driven Reconcile for Fork Wiring Deltas, Issue #345 P3b
 
-Status: Proposed. Extends ADR 0006 Decision 7 (the P3b contract sketch), resolves
-ADR 0006 open risk 1 (multi-hop path drift), and tracks issue #345. Blocked on
-P3a, which shipped in ADR 0006 phases 1 to 5: the fork save, the `fork_versions`
-rows, and the released/built set arithmetic are P3b's inputs. No code in this doc.
-Context verified against the live HERD-public tree on 2026-07-17.
+Status: Accepted; P3b L1 delivered. Extends ADR 0006 Decision 7 (the P3b contract
+sketch), resolves ADR 0006 open risk 1 (multi-hop path drift), and tracks issue
+#345. Built on P3a, which shipped in ADR 0006 phases 1 to 5: the fork save, the
+`fork_versions` rows, and the released/built set arithmetic are P3b's inputs. The
+L1 half of this ADR shipped in phases 1 to 5 (PRs #364, #365, #367, #368, #371, and
+the frontend-and-docs closeout): the `l1_connection_assignments` and
+`reservation_wiring_state` tables, the `reservation.wiring_changed` outbox event
+with the `fork_wiring_ledger` and the save-then-stage sweeper, the connection-driven
+consumer with ordered apply and gap-reconcile, the per-connection wiring-status and
+retry endpoints with the background auto-retry channel, and the reservation-detail
+Wiring tab. Phase 2 (L2 VLAN and L3 route connection-driven reconcile, Decision 1)
+remains. Two review-driven refinements landed during delivery without changing the
+decision bodies: the fork save now groups per-hop wiring by a canvas `edge_key` so a
+multi-hop edge round-trips as one logical connection (PR #367); and the L1 apply path
+keys a connection's ACTIVE-versus-FAILED outcome on the driver-result payload the
+sandbox returns rather than inferring success, so a driver-reported failure lands a
+FAILED row instead of a spuriously-ACTIVE one. No code in this doc. Context verified
+against the live HERD-public tree on 2026-07-17.
 
 ## Context
 

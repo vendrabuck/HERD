@@ -153,3 +153,64 @@ export interface ForkConflictDetail {
   message: string;
   conflicts: ForkPortConflict[];
 }
+
+// --- Per-connection L1 wiring status (ADR 0007, issue #345 P3b) -------------
+// After a fork save reconciles the intended wiring, execution applies each L1
+// cross-connect connection-by-connection and records the applied state in its
+// l1_connection_assignments ledger. These types mirror the execution-side
+// WiringStatusResponse / WiringRetryResponse that reservations proxies at
+// GET /reservations/{id}/wiring-status and POST /reservations/{id}/wiring/retry.
+
+export type WiringConnectionState = "ACTIVE" | "RELEASED" | "FAILED";
+
+// One l1_connection_assignments row: a switch port pair and its applied state.
+// `retryable` is true only for a FAILED row whose failure is a transient driver
+// error (hardware-retryable); a FAILED row with retryable=false is an
+// unresolvable/not-a-simple-chain intent whose recovery is a fork re-save
+// (ADR 0007 Decision 5/6), not a hardware retry.
+export interface WiringConnectionStatus {
+  id: string;
+  switch_device_id: string;
+  port_a: string;
+  port_b: string;
+  physical_connection_id: string | null;
+  status: WiringConnectionState;
+  attempts: number;
+  last_error: string | null;
+  retryable: boolean;
+  created_at: string | null;
+  released_at: string | null;
+}
+
+// GET /reservations/{id}/wiring-status: the reservation's per-connection L1
+// applied state plus its wiring-state markers. A reservation with no rows and no
+// state row is the empty/pre-apply case (physical-only pre-P3b, dynamic-only, or
+// no fork edits): an empty connections list, null version, not frozen.
+export interface WiringStatusResponse {
+  reservation_id: string;
+  last_applied_fork_version: number | null;
+  frozen: boolean;
+  connections: WiringConnectionStatus[];
+}
+
+// The outcome of reattempting (or classifying) one FAILED connection on retry.
+export type WiringRetryOutcomeKind = "reconnected" | "still_failed" | "not_retryable";
+
+export interface WiringRetryOutcome {
+  id: string;
+  switch_device_id: string;
+  port_a: string;
+  port_b: string;
+  physical_connection_id: string | null;
+  outcome: WiringRetryOutcomeKind;
+  status: WiringConnectionState;
+  attempts: number;
+  last_error: string | null;
+}
+
+// POST /reservations/{id}/wiring/retry: per-connection outcomes of a manual
+// retry of every hardware-retryable FAILED row of one reservation.
+export interface WiringRetryResponse {
+  reservation_id: string;
+  results: WiringRetryOutcome[];
+}
