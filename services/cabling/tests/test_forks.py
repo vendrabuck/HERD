@@ -1709,3 +1709,61 @@ async def test_list_active_forks_pagination(client):
     # The two pages together cover every ACTIVE fork with no overlap.
     combined = set(fb["reservation_ids"]) | set(sb["reservation_ids"])
     assert combined == {str(r) for r in rids}
+
+
+@pytest.mark.asyncio
+async def test_list_active_forks_reports_latest_fork_version(client):
+    """The additive `forks` array pairs each ACTIVE reservation with its latest version.
+
+    ADR 0007 Decision 2: reservations' wiring-staging heal compares this per-reservation
+    latest fork_version against its ledger. A freshly created fork sits at v1; a save
+    appends v2, and the listing must report the newest, not v1. reservation_ids stays in
+    lockstep as the backward-compatible view the archive reconciler reads.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    saved = uuid.uuid4()  # fork gets a save, advancing to v2
+    fresh = uuid.uuid4()  # fork stays at v1
+    for rid in (saved, fresh):
+        await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    save_resp = await client.post(
+        f"/internal/forks/{saved}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert save_resp.status_code == 200, save_resp.text
+    assert save_resp.json()["version_number"] == 2
+
+    resp = await client.get("/internal/forks", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    version_by_rid = {e["reservation_id"]: e["latest_fork_version"] for e in body["forks"]}
+    assert version_by_rid[str(saved)] == 2
+    assert version_by_rid[str(fresh)] == 1
+    # forks and reservation_ids describe the same page.
+    assert set(version_by_rid) == set(body["reservation_ids"])
+
+
+@pytest.mark.asyncio
+async def test_save_fork_delta_carries_physical_connection_id(client):
+    """A built wire in the save delta carries its backing physical_connection_id.
+
+    ADR 0007 Decision 3: reservations relays this wire shape verbatim into
+    reservation.wiring_changed so execution applies the recorded hop verbatim
+    (Decision 5). The built wire's physical_connection_id must equal the id of the
+    physical Connection backing that hop.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    physical_id = await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 1
+    assert built[0]["physical_connection_id"] == str(physical_id)

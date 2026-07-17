@@ -46,6 +46,7 @@ from app.services.reservation_service import (
     list_calendar_reservations,
     list_user_reservations,
     release_reservation,
+    stage_wiring_changed,
     update_reservation,
 )
 
@@ -727,7 +728,36 @@ async def save_reservation_fork(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
-    return _relay_cabling_fork_response(resp)
+
+    # Relay first: this raises the mapped user-facing error on a cabling 4xx/5xx (the
+    # ARCHIVED 409, a port-conflict 409, or a 503), so nothing is staged when the save
+    # did not commit (ADR 0007 Decision 2; the archive/409 path stages nothing).
+    data = _relay_cabling_fork_response(resp)
+
+    # Save succeeded cabling-side: stage reservation.wiring_changed and advance the
+    # fork_wiring_ledger in one commit (ADR 0007 Decision 2 and 3). released/built are
+    # cabling's per-wire delta arrays, relayed verbatim. Staging is best-effort at the
+    # request boundary: a failure here leaves the ledger behind cabling's committed
+    # version, and the standing sweeper heals it on a later tick, so it must never turn
+    # a durable save into a user-facing error. The user-facing save response (`data`)
+    # is returned unchanged either way.
+    try:
+        await stage_wiring_changed(
+            db,
+            reservation_id,
+            data["version_number"],
+            released=data.get("released") or [],
+            built=data.get("built") or [],
+        )
+    except Exception:
+        await db.rollback()
+        logger.error(
+            "wiring_changed staging failed for reservation %s; sweeper will heal",
+            reservation_id,
+            extra={"action": "wiring_changed_stage_failed", "reservation_id": str(reservation_id)},
+            exc_info=True,
+        )
+    return data
 
 
 async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] | None:

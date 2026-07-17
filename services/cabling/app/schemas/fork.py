@@ -117,17 +117,29 @@ class ForkSaveRequest(BaseModel):
 
 
 class ForkConnectionDelta(BaseModel):
-    """One released or built wire in a save result (issue #25 P3a, ADR 0006)."""
+    """One released or built wire in a save result (issue #25 P3a, ADR 0006).
+
+    Carries the canonical connection identity plus the nullable backing
+    physical_connection_id (ADR 0007 Decision 3): reservations relays this shape
+    verbatim into the reservation.wiring_changed event so execution can apply the
+    recorded hop verbatim (Decision 5). physical_connection_id is additive; a caller
+    that only reads the five identity fields is unaffected.
+    """
 
     device_a_id: uuid.UUID
     port_a: str
     device_b_id: uuid.UUID
     port_b: str
     layer: str
+    physical_connection_id: uuid.UUID | None = None
 
     @field_serializer("device_a_id", "device_b_id")
     def _serialize_uuid(self, value: uuid.UUID) -> str:
         return str(value)
+
+    @field_serializer("physical_connection_id")
+    def _serialize_optional_uuid(self, value: uuid.UUID | None) -> str | None:
+        return str(value) if value else None
 
 
 class ForkSaveResponse(BaseModel):
@@ -156,17 +168,35 @@ class ForkArchiveResponse(BaseModel):
         return str(value)
 
 
-class ActiveForkListResponse(BaseModel):
-    """GET /internal/forks: reservation_ids of ACTIVE forks, paginated.
+class ActiveForkEntry(BaseModel):
+    """One ACTIVE fork's reservation_id and its latest fork_version (ADR 0007).
 
-    Minimal by design (issue #25 P3a, ADR 0006 Decision 5): the standing archive
-    reconciler in reservations only needs the reservation_ids of forks still ACTIVE
-    to decide which to archive, so the body carries those plus the page bounds and
-    the unpaginated total. reservation_ids is the ORDER-stable page, not the whole
-    set.
+    Added for the P3b sweeper heal (ADR 0007 Decision 2): reservations compares each
+    ACTIVE fork's latest fork_version against its wiring ledger to find a save whose
+    reservation.wiring_changed staging was missed. Purely additive alongside the
+    existing reservation_ids list, which the archive reconciler still reads.
+    """
+
+    reservation_id: uuid.UUID
+    latest_fork_version: int
+
+    @field_serializer("reservation_id")
+    def _serialize_uuid(self, value: uuid.UUID) -> str:
+        return str(value)
+
+
+class ActiveForkListResponse(BaseModel):
+    """GET /internal/forks: ACTIVE forks, paginated.
+
+    Two aligned views of the same ORDER-stable page (issue #25 P3a, ADR 0006
+    Decision 5; ADR 0007 Decision 2): reservation_ids feeds the standing archive
+    reconciler, and forks pairs each of those reservation_ids with its latest
+    fork_version for the P3b wiring-staging heal. Both plus the page bounds and the
+    unpaginated total.
     """
 
     reservation_ids: list[uuid.UUID]
+    forks: list[ActiveForkEntry]
     total: int
     skip: int
     limit: int

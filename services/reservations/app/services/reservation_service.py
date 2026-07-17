@@ -22,6 +22,7 @@ from sqlalchemy import and_, exists, false, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.fork_wiring_ledger import ForkWiringLedger
 from app.models.outbox import OutboxEvent
 from app.models.reservation import (
     Reservation,
@@ -391,17 +392,21 @@ async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> No
         )
 
 
-async def _fetch_active_fork_reservation_ids() -> list[uuid.UUID]:
-    """Return reservation_ids of every ACTIVE fork from cabling, paging fully.
+async def _fetch_active_forks() -> list[tuple[uuid.UUID, int]]:
+    """Return (reservation_id, latest_fork_version) for every ACTIVE fork, paging fully.
 
-    The read half of the standing archive reconciler (ADR 0006 Decision 5). Walks
-    cabling's paginated GET /internal/forks until the whole ACTIVE set is drained.
-    Raises on a transport or error status; the caller treats a fetch failure as
-    non-fatal to the rest of the sweep.
+    The single read the standing reconciler makes per tick (ADR 0006 Decision 5 for
+    the archive step, ADR 0007 Decision 2 for the wiring-staging heal). Walks cabling's
+    paginated GET /internal/forks until the whole ACTIVE set is drained, reading the
+    additive `forks` array that pairs each reservation_id with its latest fork_version.
+    One round-trip feeds both concerns: archive terminal-status forks, and heal an
+    ACTIVE fork whose latest version outran its wiring ledger. Raises on a transport or
+    error status; the caller treats a fetch failure as non-fatal to the rest of the
+    sweep.
     """
     if not settings.internal_api_token:
         return []
-    ids: list[uuid.UUID] = []
+    forks: list[tuple[uuid.UUID, int]] = []
     skip = 0
     limit = 200
     async with httpx.AsyncClient() as client:
@@ -414,13 +419,85 @@ async def _fetch_active_fork_reservation_ids() -> list[uuid.UUID]:
             )
             resp.raise_for_status()
             body = resp.json()
-            page = [uuid.UUID(str(x)) for x in body.get("reservation_ids", [])]
-            ids.extend(page)
-            total = body.get("total", len(ids))
+            page = [
+                (uuid.UUID(str(entry["reservation_id"])), int(entry["latest_fork_version"]))
+                for entry in body.get("forks", [])
+            ]
+            forks.extend(page)
+            total = body.get("total", len(forks))
             skip += limit
             if not page or skip >= total:
                 break
-    return ids
+    return forks
+
+
+WIRING_CHANGED_SUBJECT = "herd.reservations.wiring_changed"
+WIRING_CHANGED_EVENT = "reservation.wiring_changed"
+
+
+def _wiring_changed_payload(
+    reservation_id: uuid.UUID,
+    fork_version: int,
+    released: list[dict] | None,
+    built: list[dict] | None,
+) -> dict:
+    """Build the reservation.wiring_changed payload (ADR 0007 Decision 3).
+
+    released/built are the per-wire dicts cabling returned from the save (each carrying
+    device_a_id, port_a, device_b_id, port_b, layer, physical_connection_id), passed
+    through verbatim. A heal event (ADR 0007 Decision 2) carries them as None, NOT empty
+    lists: absent delta is the load-bearing marker that routes the consumer to a full
+    reconcile rather than applying an empty delta and silently advancing the version.
+    enqueue_event stamps event_id.
+    """
+    return {
+        "event": WIRING_CHANGED_EVENT,
+        "reservation_id": str(reservation_id),
+        "fork_version": fork_version,
+        "released": released,
+        "built": built,
+    }
+
+
+async def _upsert_wiring_ledger(
+    db: AsyncSession, reservation_id: uuid.UUID, fork_version: int
+) -> None:
+    """Advance (or create) the fork_wiring_ledger row to fork_version. No commit."""
+    row = await db.get(ForkWiringLedger, reservation_id)
+    if row is None:
+        db.add(
+            ForkWiringLedger(
+                reservation_id=reservation_id,
+                last_staged_fork_version=fork_version,
+            )
+        )
+    else:
+        row.last_staged_fork_version = fork_version
+
+
+async def stage_wiring_changed(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    fork_version: int,
+    *,
+    released: list[dict] | None,
+    built: list[dict] | None,
+) -> None:
+    """Stage the wiring_changed event and advance the ledger in ONE commit (ADR 0007).
+
+    The atomicity anchor (Decision 2): the outbox enqueue and the ledger upsert are one
+    transaction and one commit, so the event exists if and only if the ledger advanced.
+    A failure between the two writes commits neither. Used by both the save handler
+    (released/built are the cabling delta arrays) and the sweeper heal (both None).
+    """
+    enqueue_event(
+        db,
+        OutboxEvent,
+        WIRING_CHANGED_SUBJECT,
+        _wiring_changed_payload(reservation_id, fork_version, released, built),
+    )
+    await _upsert_wiring_ledger(db, reservation_id, fork_version)
+    await db.commit()
 
 
 async def _check_conflicts(

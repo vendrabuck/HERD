@@ -27,6 +27,7 @@ from app.models.fork import (
 from app.models.topology import Topology
 from app.routes.topologies import _run_topology_validation
 from app.schemas.fork import (
+    ActiveForkEntry,
     ActiveForkListResponse,
     ForkArchiveResponse,
     ForkCanvasUpdate,
@@ -122,21 +123,43 @@ async def list_active_forks_internal(
     ).scalar() or 0
 
     rows = (
-        (
-            await db.execute(
-                select(ReservationFork.reservation_id)
-                .where(ReservationFork.status == ForkStatus_ACTIVE)
-                .order_by(ReservationFork.created_at)
-                .offset(skip)
-                .limit(limit)
-            )
+        await db.execute(
+            select(ReservationFork.id, ReservationFork.reservation_id)
+            .where(ReservationFork.status == ForkStatus_ACTIVE)
+            .order_by(ReservationFork.created_at)
+            .offset(skip)
+            .limit(limit)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
+
+    # Latest fork_version per fork on this page, in one grouped query (ADR 0007
+    # Decision 2). A fork always has at least a v1 from create_fork, so a missing
+    # row would be anomalous; default to 0 so the heal treats it as "behind" rather
+    # than crashing.
+    fork_ids = [fork_id for fork_id, _ in rows]
+    latest_by_fork: dict[uuid.UUID, int] = {}
+    if fork_ids:
+        version_rows = (
+            await db.execute(
+                select(
+                    ForkVersion.fork_id,
+                    func.max(ForkVersion.version_number),
+                )
+                .where(ForkVersion.fork_id.in_(fork_ids))
+                .group_by(ForkVersion.fork_id)
+            )
+        ).all()
+        latest_by_fork = {fork_id: version for fork_id, version in version_rows}
 
     return ActiveForkListResponse(
-        reservation_ids=list(rows),
+        reservation_ids=[reservation_id for _, reservation_id in rows],
+        forks=[
+            ActiveForkEntry(
+                reservation_id=reservation_id,
+                latest_fork_version=latest_by_fork.get(fork_id, 0),
+            )
+            for fork_id, reservation_id in rows
+        ],
         total=total,
         skip=skip,
         limit=limit,
@@ -268,6 +291,7 @@ async def save_fork_internal(
                 device_b_id=spec.device_b_id,
                 port_b=spec.port_b,
                 layer=spec.layer,
+                physical_connection_id=spec.physical_connection_id,
             )
             for spec in result.released
         ],
@@ -278,6 +302,7 @@ async def save_fork_internal(
                 device_b_id=spec.device_b_id,
                 port_b=spec.port_b,
                 layer=spec.layer,
+                physical_connection_id=spec.physical_connection_id,
             )
             for spec in result.built
         ],

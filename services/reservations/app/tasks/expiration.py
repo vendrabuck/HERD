@@ -11,6 +11,7 @@ from sqlalchemy import and_, exists, select
 
 from app.config import settings
 from app.database import AsyncSessionLocal
+from app.models.fork_wiring_ledger import ForkWiringLedger
 from app.models.outbox import OutboxEvent
 from app.models.reservation import (
     Reservation,
@@ -21,13 +22,14 @@ from app.services.reservation_service import (
     _archive_reservation_fork_best_effort,
     _claim_provision_transition,
     _create_reservation_fork_best_effort,
-    _fetch_active_fork_reservation_ids,
+    _fetch_active_forks,
     _fetch_devices_best_effort,
     _provision_requested_event,
     _release_exclusive_devices_best_effort,
     _reservation_created_event,
     _reservation_failed_event,
     _update_device_statuses,
+    stage_wiring_changed,
 )
 
 # Terminal reservation statuses whose fork the standing reconciler may archive.
@@ -429,27 +431,33 @@ async def _run_expiration_cycle() -> None:
 
 
 async def _run_fork_archive_reconcile() -> None:
-    """Archive forks whose reservation reached a terminal status (ADR 0006 Decision 5).
+    """Reconcile ACTIVE forks against reservation state each tick (ADR 0006, ADR 0007).
 
-    Standing reconciler AND the required one-time backfill (PR #353 notes). Cabling
-    keeps a fork ACTIVE until reservations archives it on teardown, so two things
-    leave an ACTIVE fork whose reservation is over: a crash between the terminal
-    transition and the best-effort archive, and any pre-phase-3 fork created before
-    the teardown-archive wiring existed. Such a fork is a zombie that false-contends
-    for cross-reservation port claims. Each tick this fetches cabling's ACTIVE-fork
-    reservation_ids, keeps those whose reservation is terminal
-    (COMPLETED/CANCELLED/FAILED), and archives each best-effort. The first run
-    archives every pre-phase-3 zombie, which is the backfill.
+    Two heals off ONE cabling fetch (ADR 0007 Decision 2: reuse the existing fetch, no
+    second round-trip per tick):
 
-    A reservation_id cabling reports that this DB does not know is logged and
-    skipped, never archived blind: reservations is the lifecycle authority, and only
-    a reservation it can read attests that its fork should be frozen. A reservation
-    still non-terminal (ACTIVE and legitimately in use) is left alone. The cabling
-    fetch is non-fatal to the rest of the sweep: a failure returns early here and the
-    loop also guards the call.
+    1. Archive (ADR 0006 Decision 5). Cabling keeps a fork ACTIVE until reservations
+       archives it on teardown, so a crash between the terminal transition and the
+       best-effort archive, or any pre-phase-3 fork, leaves an ACTIVE fork whose
+       reservation is over: a zombie that false-contends for cross-reservation port
+       claims. Forks whose reservation is terminal (COMPLETED/CANCELLED/FAILED) are
+       archived best-effort. The first run archives every pre-phase-3 zombie (the
+       one-time backfill, PR #353 notes).
+    2. Wiring-staging heal (ADR 0007 Decision 2). A save that committed a new
+       fork_version cabling-side but whose reservation.wiring_changed event never
+       staged (reservations crashed in the save-then-stage gap) leaves the
+       fork_wiring_ledger behind cabling's latest version. For each ACTIVE reservation
+       whose cabling latest fork_version strictly exceeds its ledger
+       (a missing ledger row counts as 0), a delta-less heal event is staged and the
+       ledger advanced, atomically, exactly as the save path does.
+
+    A reservation_id cabling reports that this DB does not know is logged and skipped,
+    never touched blind: reservations is the lifecycle authority. The cabling fetch is
+    non-fatal to the rest of the sweep: a failure returns early here and the loop also
+    guards the call.
     """
     try:
-        reservation_ids = await _fetch_active_fork_reservation_ids()
+        forks = await _fetch_active_forks()
     except Exception:
         logger.error(
             "Fork archive reconcile: could not fetch active forks from cabling",
@@ -458,8 +466,11 @@ async def _run_fork_archive_reconcile() -> None:
         )
         return
 
-    if not reservation_ids:
+    if not forks:
         return
+
+    reservation_ids = [reservation_id for reservation_id, _ in forks]
+    version_by_id = {reservation_id: version for reservation_id, version in forks}
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -467,11 +478,12 @@ async def _run_fork_archive_reconcile() -> None:
         )
         status_by_id = {row.id: row.status for row in result}
 
+    active_ids: list[uuid.UUID] = []
     for reservation_id in reservation_ids:
         status = status_by_id.get(reservation_id)
         if status is None:
             # Cabling holds an ACTIVE fork for a reservation this service does not
-            # know. Do not archive blind: log it for investigation and skip.
+            # know. Do not touch it blind: log it for investigation and skip.
             logger.warning(
                 "Fork archive reconcile: ACTIVE fork for unknown reservation %s; skipping",
                 reservation_id,
@@ -491,6 +503,53 @@ async def _run_fork_archive_reconcile() -> None:
                     "action": "fork_reconcile_archived",
                     "reservation_id": str(reservation_id),
                     "reservation_status": status.value,
+                },
+            )
+        elif status == ReservationStatus.ACTIVE:
+            active_ids.append(reservation_id)
+
+    await _heal_wiring_staging(active_ids, version_by_id)
+
+
+async def _heal_wiring_staging(
+    active_ids: list[uuid.UUID], version_by_id: dict[uuid.UUID, int]
+) -> None:
+    """Stage a heal event for each ACTIVE fork whose version outran its ledger (ADR 0007).
+
+    For each ACTIVE reservation, compares cabling's latest fork_version against the
+    fork_wiring_ledger's last_staged_fork_version (a missing row counts as 0). A latest
+    strictly greater than the ledger is a missed staging (the save-then-stage crash
+    gap, Decision 2): stage a delta-less heal event (released/built None, the
+    load-bearing full-reconcile marker) carrying that version and advance the ledger,
+    atomically per reservation, exactly as the save path does. In-sync forks stage
+    nothing.
+    """
+    if not active_ids:
+        return
+    async with AsyncSessionLocal() as db:
+        for reservation_id in active_ids:
+            cabling_version = version_by_id.get(reservation_id, 0)
+            ledger = await db.get(ForkWiringLedger, reservation_id)
+            last_staged = ledger.last_staged_fork_version if ledger is not None else 0
+            if cabling_version <= last_staged:
+                continue
+            await stage_wiring_changed(
+                db,
+                reservation_id,
+                cabling_version,
+                released=None,
+                built=None,
+            )
+            logger.info(
+                "Wiring heal: staged reservation.wiring_changed v%s for reservation %s "
+                "(ledger was %s)",
+                cabling_version,
+                reservation_id,
+                last_staged,
+                extra={
+                    "action": "wiring_heal_staged",
+                    "reservation_id": str(reservation_id),
+                    "fork_version": cabling_version,
                 },
             )
 

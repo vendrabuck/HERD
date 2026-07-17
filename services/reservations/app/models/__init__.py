@@ -5,6 +5,7 @@ and the outbox table on Base.metadata, so create_all in tests and the lifespan,
 plus Alembic autogenerate, pick them up.
 """
 
+from app.models.fork_wiring_ledger import ForkWiringLedger
 from app.models.outbox import OutboxEvent
 from app.models.reservation import (
     Reservation,
@@ -13,6 +14,7 @@ from app.models.reservation import (
 )
 
 __all__ = [
+    "ForkWiringLedger",
     "OutboxEvent",
     "Reservation",
     "ReservationDevice",

@@ -146,14 +146,27 @@
     ]
   ],
   "schemas": {
+    "ActiveForkEntry": {
+      "properties": {
+        "latest_fork_version": "integer",
+        "reservation_id": "string"
+      },
+      "required": [
+        "latest_fork_version",
+        "reservation_id"
+      ],
+      "type": "object"
+    },
     "ActiveForkListResponse": {
       "properties": {
+        "forks": "array",
         "limit": "integer",
         "reservation_ids": "array",
         "skip": "integer",
         "total": "integer"
       },
       "required": [
+        "forks",
         "limit",
         "reservation_ids",
         "skip",
@@ -275,6 +288,7 @@
         "device_a_id": "string",
         "device_b_id": "string",
         "layer": "string",
+        "physical_connection_id": "anyOf",
         "port_a": "string",
         "port_b": "string"
       },
