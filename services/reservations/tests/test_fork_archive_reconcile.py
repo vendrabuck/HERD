@@ -206,10 +206,10 @@ async def test_reconcile_archives_terminal_skips_active_and_unknown():
     unknown = uuid.uuid4()  # cabling reports a fork for a reservation we do not know
 
     archive = AsyncMock()
-    listed = [completed, cancelled, failed, active, unknown]
+    listed = [(completed, 1), (cancelled, 1), (failed, 1), (active, 1), (unknown, 1)]
     with (
         patch(
-            "app.tasks.expiration._fetch_active_fork_reservation_ids",
+            "app.tasks.expiration._fetch_active_forks",
             AsyncMock(return_value=listed),
         ),
         patch("app.tasks.expiration._archive_reservation_fork_best_effort", archive),
@@ -227,7 +227,7 @@ async def test_reconcile_survives_fetch_failure():
     archive = AsyncMock()
     with (
         patch(
-            "app.tasks.expiration._fetch_active_fork_reservation_ids",
+            "app.tasks.expiration._fetch_active_forks",
             AsyncMock(side_effect=RuntimeError("cabling unreachable")),
         ),
         patch("app.tasks.expiration._archive_reservation_fork_best_effort", archive),
@@ -242,7 +242,7 @@ async def test_reconcile_empty_list_noop():
     archive = AsyncMock()
     with (
         patch(
-            "app.tasks.expiration._fetch_active_fork_reservation_ids",
+            "app.tasks.expiration._fetch_active_forks",
             AsyncMock(return_value=[]),
         ),
         patch("app.tasks.expiration._archive_reservation_fork_best_effort", archive),
