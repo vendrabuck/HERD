@@ -292,6 +292,7 @@ async def save_fork_internal(
                 port_b=spec.port_b,
                 layer=spec.layer,
                 physical_connection_id=spec.physical_connection_id,
+                edge_key=spec.edge_key,
             )
             for spec in result.released
         ],
@@ -303,6 +304,7 @@ async def save_fork_internal(
                 port_b=spec.port_b,
                 layer=spec.layer,
                 physical_connection_id=spec.physical_connection_id,
+                edge_key=spec.edge_key,
             )
             for spec in result.built
         ],

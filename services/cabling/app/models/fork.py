@@ -108,6 +108,15 @@ class ForkConnection(Base):
     physical_connection_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), nullable=True
     )
+    # The React Flow canvas edge id this hop was resolved from (issue #345 P3b).
+    # A single canvas edge can resolve to several switch-touching hops; the execution
+    # consumer needs the originating edge to group hops per edge when deriving L1
+    # cross-connects, since two edges through the same switch flatten to hops whose
+    # correct pairing is otherwise unrecoverable. Deliberately NOT part of the
+    # connection identity (ADR 0006 Decision 3). Nullable: rows predating this column,
+    # and any hop resolved without a known edge id, carry NULL and consumers must treat
+    # NULL as ungrouped.
+    edge_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_by: Mapped[str] = mapped_column(String(150), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

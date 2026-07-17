@@ -47,6 +47,11 @@ class WireSpec:
     port_b: str
     layer: str
     physical_connection_id: uuid.UUID | None = None
+    # The React Flow canvas edge id this hop was resolved from (issue #345 P3b).
+    # Carried through resolve to persistence so the execution consumer can group the
+    # hops of one canvas edge. Deliberately absent from the identity helpers below, so
+    # a re-save that changes only the edge id reconciles as unchanged, not release+build.
+    edge_key: str | None = None
 
 
 @dataclass
@@ -134,6 +139,14 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[W
         if source_device is None or target_device is None:
             continue
 
+        # The canvas edge id, carried onto every hop this edge resolves to so the
+        # consumer can group them (issue #345 P3b). Coerced to str for the String(255)
+        # column; a missing id leaves the hops ungrouped (NULL). A hop shared by two
+        # edges de-duplicates on the path-orientation ``seen`` key below, so it keeps
+        # the edge id of whichever edge claimed it first.
+        raw_edge_id = edge.get("id")
+        edge_key = str(raw_edge_id) if raw_edge_id is not None else None
+
         paths = await find_all_shortest_paths_async(graph, source_device, target_device)
         if not paths:
             continue
@@ -158,6 +171,7 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[W
                     port_b=pb,
                     layer="L1",
                     physical_connection_id=phys_index.get((da, pa, db_dev, pb)),
+                    edge_key=edge_key,
                 )
             )
     return specs
@@ -330,6 +344,7 @@ async def save_fork(
                     port_b=spec.port_b,
                     layer=spec.layer,
                     physical_connection_id=spec.physical_connection_id,
+                    edge_key=spec.edge_key,
                     created_by=created_by,
                 )
             )
@@ -344,6 +359,7 @@ async def save_fork(
                 port_b=row.port_b,
                 layer=row.layer,
                 physical_connection_id=row.physical_connection_id,
+                edge_key=row.edge_key,
             )
             for row in to_release
         ]

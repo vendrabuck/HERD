@@ -346,6 +346,25 @@ async def test_save_handler_relays_body_and_stages_event():
 
 
 @pytest.mark.asyncio
+async def test_staging_payload_carries_edge_key_verbatim():
+    """Per-wire edge_key (issue #345 P3b) passes through the payload unchanged, null too.
+
+    reservations relays cabling's delta wires verbatim, so the canvas edge_key each wire
+    carries (or its null when a hop is ungrouped) must survive into the staged
+    reservation.wiring_changed payload for the execution consumer to group hops per edge.
+    """
+    rid = uuid.uuid4()
+    grouped = {**_wire(), "edge_key": "edge-42"}
+    ungrouped = {**_wire(), "edge_key": None}
+    async with TestSessionLocal() as db:
+        await stage_wiring_changed(db, rid, 7, released=[ungrouped], built=[grouped])
+
+    payload = (await _wiring_rows())[0].payload
+    assert payload["built"][0]["edge_key"] == "edge-42"
+    assert payload["released"][0]["edge_key"] is None
+
+
+@pytest.mark.asyncio
 async def test_save_handler_archived_409_stages_nothing():
     """An ARCHIVED-fork 409 from cabling relays the error and stages neither row."""
     rid = await _insert(ReservationStatus.ACTIVE)
