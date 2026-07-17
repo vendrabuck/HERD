@@ -43,6 +43,23 @@ engine = create_async_engine(f"sqlite+aiosqlite:///{_db_path}", echo=False)
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
+@asynccontextmanager
+async def _noop_db_session():
+    yield AsyncMock()
+
+
+def _noop_get_db_session():
+    """Protocol-correct get_db_session stand-in yielding a mock session.
+
+    The terminal-event wiring-state freeze (ADR 0007 Decision 7, issue #345)
+    opens a session on reservation.completed/cancelled/failed; a bare AsyncMock
+    passed as get_db_session is not an async context manager, so it must be a
+    real (mock-backed) one to avoid leaking an un-awaited coroutine. The function
+    identity is stable, so dispatch-argument assertions still match.
+    """
+    return _noop_db_session()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _cleanup_db_file():
     yield
@@ -512,8 +529,12 @@ async def test_handle_reservation_event_applies_tiers():
             "app.services.nats_consumer._execute_dynamic_teardown",
             new_callable=AsyncMock,
         ),
+        patch(
+            "app.services.l1_assignment_service.freeze_reservation_wiring",
+            new_callable=AsyncMock,
+        ),
     ):
-        session_ctx = AsyncMock()
+        session_ctx = _noop_get_db_session
         await handle_reservation_event(event, session_ctx)
         tiers.assert_awaited_once_with(session_ctx, "reservation.completed", event)
 
@@ -552,8 +573,12 @@ async def test_handle_reservation_event_survives_tier_failure():
             "app.services.nats_consumer._execute_dynamic_teardown",
             new_callable=AsyncMock,
         ),
+        patch(
+            "app.services.l1_assignment_service.freeze_reservation_wiring",
+            new_callable=AsyncMock,
+        ),
     ):
-        await handle_reservation_event(event, AsyncMock())
+        await handle_reservation_event(event, _noop_get_db_session)
         l1.assert_awaited_once()
 
 

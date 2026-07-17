@@ -3,7 +3,9 @@ from app.models.driver_cache import DriverCache
 from app.models.dynamic_instance import DynamicInstance
 from app.models.execution_command import ExecutionCommand
 from app.models.execution_run import ExecutionRun
+from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.outbox import OutboxEvent
+from app.models.reservation_wiring_state import ReservationWiringState
 from app.models.route_assignment import RouteAssignment
 from app.models.vlan_assignment import VlanAssignment
 
@@ -13,7 +15,9 @@ __all__ = [
     "DynamicInstance",
     "ExecutionCommand",
     "ExecutionRun",
+    "L1ConnectionAssignment",
     "OutboxEvent",
+    "ReservationWiringState",
     "RouteAssignment",
     "VlanAssignment",
 ]
