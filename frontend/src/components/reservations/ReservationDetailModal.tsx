@@ -8,6 +8,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { ReservationInventoryTab } from "./ReservationInventoryTab";
 import { ReservationRoutesTab } from "./ReservationRoutesTab";
 import { ReservationStatusTab } from "./ReservationStatusTab";
+import { ReservationWiringTab } from "./ReservationWiringTab";
 import { AIApplyConfirmModal } from "./AIApplyConfirmModal";
 import { AIAssistantTab } from "./AIAssistantTab";
 import { EditDevicesModal } from "./EditDevicesModal";
@@ -23,7 +24,7 @@ const STATUS_COLORS: Record<string, string> = {
   FAILED: "bg-red-200 text-red-900",
 };
 
-type Tab = "details" | "inventory" | "routes" | "status" | "assistant";
+type Tab = "details" | "inventory" | "routes" | "wiring" | "status" | "assistant";
 
 interface Props {
   reservation: Reservation | null;
@@ -78,6 +79,7 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
     { key: "details", label: "Details" },
     { key: "inventory", label: "Inventory" },
     { key: "routes", label: "Routes" },
+    { key: "wiring", label: "Wiring" },
     { key: "status", label: "Schedule" },
     ...(aiStatus?.enabled ? [{ key: "assistant" as Tab, label: "AI Assistant" }] : []),
   ];
@@ -200,6 +202,14 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
         {/* Routes tab */}
         {activeTab === "routes" && (
           <ReservationRoutesTab deviceIds={reservation.device_ids} />
+        )}
+
+        {/* Wiring tab: per-connection L1 wiring status + manual retry (ADR 0007) */}
+        {activeTab === "wiring" && (
+          <ReservationWiringTab
+            reservationId={reservation.id}
+            active={reservation.status === "ACTIVE"}
+          />
         )}
 
         {/* Schedule tab */}

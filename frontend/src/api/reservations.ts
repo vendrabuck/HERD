@@ -9,6 +9,8 @@ import type {
   ReservationCreate,
   ReservationFork,
   ReservationUpdate,
+  WiringRetryResponse,
+  WiringStatusResponse,
 } from "@/types/reservation.types";
 import type { CanvasData } from "@/types/topology.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
@@ -192,6 +194,85 @@ export function useSaveReservationFork() {
       // in-progress edit is never stomped by the refetch.
       queryClient.invalidateQueries({ queryKey: forkKey(reservationId) });
     },
+  });
+}
+
+// --- Per-connection L1 wiring status (ADR 0007, issue #345 P3b) ------------
+// After a fork save reconciles the intended wiring, execution applies each L1
+// cross-connect and records per-connection applied state. These owner-or-admin
+// gated endpoints proxy execution's internal wiring-status and retry surface so
+// the reservation detail can show which cross-connects landed, which FAILED, and
+// (for ACTIVE reservations) reattempt the hardware-retryable ones.
+
+export function wiringStatusKey(reservationId: string): (string | undefined)[] {
+  return ["reservations", reservationId, "wiring-status"];
+}
+
+async function fetchReservationWiringStatus(
+  reservationId: string,
+): Promise<WiringStatusResponse> {
+  const resp = await apiClient.get<WiringStatusResponse>(
+    `/reservations/${reservationId}/wiring-status`,
+  );
+  return resp.data;
+}
+
+export async function retryReservationWiring(
+  reservationId: string,
+): Promise<WiringRetryResponse> {
+  const resp = await apiClient.post<WiringRetryResponse>(
+    `/reservations/${reservationId}/wiring/retry`,
+  );
+  return resp.data;
+}
+
+export function useReservationWiringStatus(reservationId: string | null | undefined) {
+  return useQuery({
+    queryKey: wiringStatusKey(reservationId ?? ""),
+    queryFn: () => fetchReservationWiringStatus(reservationId!),
+    enabled: !!reservationId,
+  });
+}
+
+// Summarize a retry response's per-connection outcomes into the three counts the
+// endpoint reports (reconnected / still_failed / not_retryable) for the toast.
+export function summarizeWiringRetry(result: WiringRetryResponse): {
+  reconnected: number;
+  still_failed: number;
+  not_retryable: number;
+} {
+  const counts = { reconnected: 0, still_failed: 0, not_retryable: 0 };
+  for (const r of result.results) {
+    if (r.outcome === "reconnected") counts.reconnected += 1;
+    else if (r.outcome === "still_failed") counts.still_failed += 1;
+    else if (r.outcome === "not_retryable") counts.not_retryable += 1;
+  }
+  return counts;
+}
+
+export function useRetryReservationWiring() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (reservationId: string) => retryReservationWiring(reservationId),
+    onSuccess: (result, reservationId) => {
+      const { reconnected, still_failed, not_retryable } = summarizeWiringRetry(result);
+      const parts = [
+        `${reconnected} reconnected`,
+        `${still_failed} still failed`,
+        `${not_retryable} not retryable`,
+      ];
+      const summary = `Retry complete: ${parts.join(", ")}`;
+      if (still_failed === 0 && not_retryable === 0 && reconnected > 0) {
+        toast.success(summary);
+      } else {
+        // Some rows did not recover; surface it without a hard-error toast so the
+        // panel (refreshed below) shows the per-row detail.
+        toast(summary);
+      }
+      // Refresh the panel so the per-connection rows reflect the new state.
+      queryClient.invalidateQueries({ queryKey: wiringStatusKey(reservationId) });
+    },
+    onError: (err) => toast.error(errorDetail(err, "Failed to retry wiring")),
   });
 }
 

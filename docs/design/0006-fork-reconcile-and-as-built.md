@@ -6,8 +6,10 @@ Resolves ADR 0001's open risks 1, 2, 4, and 5, and phases risk 3. P3a shipped in
 phases 1 to 5 (PRs #349, #353, #359, #360, and this docs sweep): the cabling
 internal fork surface, the reservations user-facing fork endpoints with teardown
 archive and the standing reconciler, and the frontend fork-editing switch. P3b
-(execution consumes fork wiring deltas, Decision 7) remains, tracked as issue
-#345. No code in this doc. Context verified against the live HERD-public tree on
+(execution consumes fork wiring deltas, Decision 7) is delivered for L1 under ADR
+0007 (`0007-connection-driven-reconcile.md`, issue #345 phases 1 to 5); its phase 2
+(L2 VLAN and L3 route connection-driven reconcile) remains. No code in this doc.
+Context verified against the live HERD-public tree on
 2026-07-09; ADR 0001's `reservation_service.py` line references predate the
 file's growth and are stale, so this doc re-cites current lines.
 
