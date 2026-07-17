@@ -75,6 +75,14 @@
     [
       "PUT",
       "/{reservation_id}/release"
+    ],
+    [
+      "GET",
+      "/{reservation_id}/wiring-status"
+    ],
+    [
+      "POST",
+      "/{reservation_id}/wiring/retry"
     ]
   ],
   "schemas": {

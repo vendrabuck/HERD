@@ -107,6 +107,20 @@ class Settings(BaseSettings):
     # replicas (which set health_poll_scheduler_enabled=false).
     execution_poller_only: bool = False
 
+    # Per-connection wiring auto-retry channel (ADR 0007 Decision 6 item 2, issue
+    # #345 P3b phase 4). A background sweep reattempts hardware-retryable FAILED
+    # l1_connection_assignments rows with the same in-line bounded backoff the apply
+    # uses, up to a total-attempts cap; past the cap a row is parked FAILED for manual
+    # retry only. Mirrors the health scheduler's run-mode posture: enabled by default
+    # so a poller-only replica runs it, and set false on API replicas to keep the
+    # background work on the poller fleet. batch_size bounds how many FAILED rows one
+    # tick reattempts; interval is the seconds between ticks; max_attempts is the
+    # cumulative driver-attempt cap a row may reach before it is manual-only.
+    wiring_retry_enabled: bool = True
+    wiring_retry_interval_seconds: int = 60
+    wiring_retry_batch_size: int = 20
+    wiring_retry_max_attempts: int = 10
+
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "case_sensitive": False}

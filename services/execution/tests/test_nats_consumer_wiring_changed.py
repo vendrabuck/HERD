@@ -586,6 +586,32 @@ async def test_driver_failure_acks_and_does_not_raise():
     assert await _last_applied() == 1
 
 
+@pytest.mark.asyncio
+async def test_driver_result_failure_lands_failed_row():
+    """A driver that RETURNS success=False without raising (sandbox transport success is
+    True, the driver's own payload reports failure) is a per-connection failure on the
+    wiring path too: a FAILED row, never a phantom ACTIVE (#345 phase-4 live-gate fix,
+    _run_driver_with_retry gates on the driver result payload, not just transport)."""
+    await _seed_state(last_applied=0)
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "connect_ports":
+            return {
+                "success": True,
+                "output": {"success": False, "error": "mock injected failure on connect_ports"},
+                "error": None,
+                "duration_ms": 1,
+            }
+        return SUCCESS_RESULT
+
+    await _run(_event(1, released=[], built=PAIR_12), execute_fn)
+    assert await _assignments("ACTIVE") == []
+    failed = await _assignments("FAILED")
+    assert len(failed) == 1
+    assert failed[0].last_error == "mock injected failure on connect_ports"
+    assert await _last_applied() == 1
+
+
 # --- Verbatim-hop / unresolvable (Decision 5) -------------------------------
 
 

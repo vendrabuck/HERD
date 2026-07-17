@@ -242,6 +242,15 @@ The execution service also hosts the periodic health-poll scheduler (ROADMAP #13
 | `HEALTH_POLL_NOTIFY_ENABLED` | `true` | Publish a `device.health_transition` NATS event when a device crosses the failure threshold (bad_news) or recovers. Set to `false` to silence alerts without rolling back the publisher code. |
 | `TEMPLATE_CACHE_TTL_SECONDS` | `300` | How long the health-poll path caches a fetched template (keyed by template_id) before re-fetching from inventory (issue #316). A lab sharing a handful of templates across many devices otherwise re-fetches the same template on every poll; a hit within this window skips the inventory call. Scoped to the health scheduler only, not the on-demand executions router or the NATS consumer's own cache, so a just-edited template is still immediately visible there. A failed fetch is never cached. |
 
+The execution service also runs the per-connection wiring auto-retry channel (ADR 0007 Decision 6, issue #345 P3b). A hardware apply failure during a fork-save reconcile lands a `FAILED` `l1_connection_assignments` row rather than rolling back the durable save; a background sweep reattempts the hardware-retryable ones (a driver or login failure), with the pinned unresolvable and not-a-simple-chain rows left for a fork re-save. The channel is batch-capped per tick exactly like the health scheduler, and mirrors its run-mode posture: enabled by default so a poller-only replica runs it, set `false` on API replicas to keep the work on the poller fleet.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WIRING_RETRY_ENABLED` | `true` | Enable the in-process background wiring auto-retry channel. Set to `false` on API replicas (paired with `EXECUTION_POLLER_ONLY=false`) so the sweep runs only on the poller fleet, the same split `HEALTH_POLL_SCHEDULER_ENABLED` provides for the health scheduler. Disabling it leaves FAILED rows for manual retry only (the owner-gated `POST /reservations/{id}/wiring/retry` proxy). |
+| `WIRING_RETRY_INTERVAL_SECONDS` | `60` | Seconds between auto-retry ticks. A tick that raises backs off exponentially up to a cap, then resets on the next healthy tick, exactly like the health scheduler loop. |
+| `WIRING_RETRY_BATCH_SIZE` | `20` | Maximum FAILED rows one tick reattempts (issue #345). Rows past the batch stay `FAILED` and are swept on later ticks. Bounds the driver subprocesses one tick can spawn, the same role `HEALTH_POLL_BATCH_SIZE` plays for polls. |
+| `WIRING_RETRY_MAX_ATTEMPTS` | `10` | Cumulative driver-attempt cap for the auto-retry channel. `attempts` accumulates every driver call ever spent on a connection (the in-line apply plus each reattempt), so a row whose `attempts` reaches this cap is no longer auto-swept and is parked `FAILED` for manual retry only. The manual retry proxy ignores this cap by design, since it is the fallback for a parked row. |
+
 ## Inventory service (optional storage overrides)
 
 Driver packages are stored locally by default. To use MinIO (or any S3-compatible store):

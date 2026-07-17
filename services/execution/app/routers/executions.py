@@ -8,6 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.auth import make_auth_dependencies
 from herd_common.internal_auth import internal_token_matches
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -33,6 +34,17 @@ from app.services.execution_service import (
     list_command_log,
     list_execution_runs,
     run_driver_action,
+)
+from app.services.l1_assignment_service import (
+    all_assignments_for_reservation,
+    get_wiring_state,
+)
+from app.services.nats_consumer import TransientUpstreamError
+from app.services.wiring_retry_service import (
+    WiringReservationFrozen,
+    is_retryable_failure,
+    make_session_ctx_factory,
+    reattempt_reservation,
 )
 
 logger = logging.getLogger(__name__)
@@ -405,3 +417,130 @@ async def retry_run(
         method_kwargs=original_kwargs,
     )
     return run
+
+
+# --- Per-connection wiring status and retry (ADR 0007 Decision 6, #345 P3b phase 4) ---
+
+
+class WiringConnectionStatus(BaseModel):
+    """One l1_connection_assignments row projected for the wiring-status surface."""
+
+    id: uuid.UUID
+    switch_device_id: uuid.UUID
+    port_a: str
+    port_b: str
+    physical_connection_id: uuid.UUID | None = None
+    status: str
+    attempts: int
+    last_error: str | None = None
+    retryable: bool
+    created_at: datetime | None = None
+    released_at: datetime | None = None
+
+
+class WiringStatusResponse(BaseModel):
+    """The reservation's per-connection L1 applied state plus its wiring-state markers."""
+
+    reservation_id: uuid.UUID
+    last_applied_fork_version: int | None = None
+    frozen: bool
+    connections: list[WiringConnectionStatus]
+
+
+class WiringRetryOutcome(BaseModel):
+    """The result of reattempting (or classifying) one FAILED connection."""
+
+    id: uuid.UUID
+    switch_device_id: uuid.UUID
+    port_a: str
+    port_b: str
+    physical_connection_id: uuid.UUID | None = None
+    outcome: str
+    status: str
+    attempts: int
+    last_error: str | None = None
+
+
+class WiringRetryResponse(BaseModel):
+    """Per-connection outcomes of a manual wiring retry."""
+
+    reservation_id: uuid.UUID
+    results: list[WiringRetryOutcome]
+
+
+@router.get(
+    "/internal/reservations/{reservation_id}/wiring-status",
+    response_model=WiringStatusResponse,
+)
+async def internal_wiring_status(
+    reservation_id: uuid.UUID,
+    _: None = Depends(_require_internal_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Per-connection L1 wiring status for a reservation (ADR 0007 Decision 6).
+
+    Service-to-service (X-Internal-Token); reservations proxies it as an owner-gated
+    user endpoint. Returns every l1_connection_assignments row (ACTIVE cross-connects,
+    RELEASED history, and FAILED rows) plus last_applied_fork_version and frozen from
+    reservation_wiring_state. A reservation with no rows and no state row is the
+    empty/pre-apply case: an empty connection list, null version, not frozen. Each row
+    carries `retryable` so a caller can distinguish a driver failure (hardware-retryable)
+    from a pinned unresolvable/not-a-simple-chain intent (recovery is a re-save).
+    """
+    rows = await all_assignments_for_reservation(db, reservation_id)
+    state = await get_wiring_state(db, reservation_id)
+    connections = [
+        WiringConnectionStatus(
+            id=row.id,
+            switch_device_id=row.switch_device_id,
+            port_a=row.port_a,
+            port_b=row.port_b,
+            physical_connection_id=row.physical_connection_id,
+            status=row.status,
+            attempts=row.attempts,
+            last_error=row.last_error,
+            retryable=(row.status == "FAILED" and is_retryable_failure(row.last_error)),
+            created_at=row.created_at,
+            released_at=row.released_at,
+        )
+        for row in rows
+    ]
+    return WiringStatusResponse(
+        reservation_id=reservation_id,
+        last_applied_fork_version=(state.last_applied_fork_version if state else None),
+        frozen=bool(state.frozen) if state else False,
+        connections=connections,
+    )
+
+
+@router.post(
+    "/internal/reservations/{reservation_id}/wiring/retry",
+    response_model=WiringRetryResponse,
+)
+async def internal_wiring_retry(
+    reservation_id: uuid.UUID,
+    _: None = Depends(_require_internal_token),
+):
+    """Reattempt a reservation's hardware-retryable FAILED cross-connects now.
+
+    Service-to-service (X-Internal-Token); reservations proxies it as an owner-gated,
+    ACTIVE-only user endpoint. Reattempts every retryable FAILED row through the same
+    driver machinery the consumer uses, flipping a row ACTIVE on success and
+    accumulating attempts/last_error on a repeat failure. A row whose reason is a pinned
+    unresolvable/not-a-simple-chain intent is reported "not_retryable" without a driver
+    call (Decision 5). A frozen reservation refuses retry (409). An upstream resolve
+    failure (inventory/cabling 5xx) maps to 503.
+
+    Runs against fresh sessions (the driver apply opens its own), so it does not use the
+    request-scoped db handle.
+    """
+    get_db_session = make_session_ctx_factory()
+    try:
+        return await reattempt_reservation(reservation_id, get_db_session)
+    except WiringReservationFrozen:
+        raise HTTPException(
+            status_code=409,
+            detail="Reservation wiring is frozen; retry is not allowed",
+        )
+    except TransientUpstreamError as exc:
+        raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {exc}")

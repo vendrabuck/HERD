@@ -37,6 +37,7 @@ from app.services.reporting_service import (
 )
 from app.services.reservation_service import (
     _cabling_fork_call,
+    _execution_wiring_call,
     _lazy_create_reservation_fork,
     apply_provision_result,
     cancel_reservation,
@@ -567,6 +568,11 @@ async def release_reservation_early(
 FORK_EDIT_REQUIRES_ACTIVE = "Fork editing requires an ACTIVE reservation"
 FORK_SAVE_REQUIRES_ACTIVE = "Fork save requires an ACTIVE reservation"
 
+# Pinned 409 wording when a wiring retry targets a non-ACTIVE reservation (ADR 0007
+# Decision 6): reattempting a cross-connect only makes sense while the reservation is
+# live; a completed/cancelled reservation's wiring is the frozen as-built record.
+WIRING_RETRY_REQUIRES_ACTIVE = "Wiring retry requires an ACTIVE reservation"
+
 
 class ForkCanvasBody(BaseModel):
     """Body for PUT /{id}/fork/canvas: the loose draft canvas (matches cabling)."""
@@ -611,6 +617,22 @@ def _relay_cabling_fork_response(resp: httpx.Response) -> Any:
     """
     if resp.status_code >= 500:
         raise HTTPException(status_code=503, detail="Cabling service is unavailable")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=_cabling_detail(resp))
+    if resp.status_code == 204 or not resp.content:
+        return None
+    return resp.json()
+
+
+def _relay_execution_response(resp: httpx.Response) -> Any:
+    """Return an execution wiring response's JSON, or raise the mapped user error.
+
+    Same discipline as _relay_cabling_fork_response (ADR 0007 Decision 6): 5xx maps to
+    503; a 4xx (execution's 409 frozen refusal, its 503-mapped upstream) relays verbatim
+    so the structured detail reaches the user unchanged.
+    """
+    if resp.status_code >= 500:
+        raise HTTPException(status_code=503, detail="Execution service is unavailable")
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=_cabling_detail(resp))
     if resp.status_code == 204 or not resp.content:
@@ -758,6 +780,66 @@ async def save_reservation_fork(
             exc_info=True,
         )
     return data
+
+
+@router.get("/{reservation_id}/wiring-status")
+async def get_reservation_wiring_status(
+    reservation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Return the reservation's per-connection L1 wiring status (ADR 0007 Decision 6).
+
+    Owner-or-admin gated, allowed for ANY reservation status: reading the per-connection
+    applied state (including FAILED rows needing retry, and the RELEASED/ACTIVE as-built
+    record after the reservation ends) is the point, exactly like GET /{id}/fork. Proxies
+    execution's internal wiring-status endpoint and relays its structured response
+    verbatim; an unreachable execution service maps to 503.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    try:
+        resp = await _execution_wiring_call(
+            "GET", f"/internal/reservations/{reservation_id}/wiring-status"
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return _relay_execution_response(resp)
+
+
+@router.post("/{reservation_id}/wiring/retry")
+async def retry_reservation_wiring(
+    reservation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Reattempt the reservation's FAILED cross-connects now (ADR 0007 Decision 6).
+
+    Owner-or-admin gated and ACTIVE-only: retry mutates live hardware, so it is refused
+    for a non-ACTIVE reservation with a pinned 409 (the fork-mutation discipline).
+    Proxies execution's internal retry endpoint and relays its structured per-connection
+    outcomes verbatim, including execution's own 409 (wiring frozen) and its 503 (upstream
+    unavailable); an unreachable execution service maps to 503.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if reservation.status != ReservationStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail=WIRING_RETRY_REQUIRES_ACTIVE)
+
+    try:
+        resp = await _execution_wiring_call(
+            "POST", f"/internal/reservations/{reservation_id}/wiring/retry"
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return _relay_execution_response(resp)
 
 
 async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] | None:

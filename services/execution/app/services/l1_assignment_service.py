@@ -61,6 +61,29 @@ async def record_l1_connect(
     if existing is not None:
         return existing
 
+    # Reuse this reservation's own prior FAILED row for the same pair (a build that
+    # failed, then succeeded on a later apply or a retry): flip it ACTIVE in place
+    # rather than inserting a parallel row that would leave a stale FAILED sibling
+    # (ADR 0007 Decision 6, phase 4). Index-safe because no ACTIVE row exists (checked
+    # above), and reservation-scoped so it never adopts another reservation's failure.
+    reusable = await _find_reusable_failed(db, res_uuid, switch_uuid, ca, cb)
+    if reusable is not None:
+        reusable.status = "ACTIVE"
+        reusable.last_error = None
+        reusable.released_at = None
+        if physical_connection_id and reusable.physical_connection_id is None:
+            reusable.physical_connection_id = _as_uuid(physical_connection_id)
+        await db.commit()
+        await db.refresh(reusable)
+        logger.info(
+            "Reattempt flipped FAILED to ACTIVE for switch %s pair (%s, %s), reservation %s",
+            switch_uuid,
+            ca,
+            cb,
+            res_uuid,
+        )
+        return reusable
+
     assignment = L1ConnectionAssignment(
         reservation_id=res_uuid,
         switch_device_id=switch_uuid,
@@ -142,6 +165,30 @@ async def _find_active(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def _find_reusable_failed(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    switch_uuid: uuid.UUID,
+    port_a: str,
+    port_b: str,
+) -> L1ConnectionAssignment | None:
+    """This reservation's non-RELEASED (FAILED) row for a pair, if any.
+
+    The candidate a successful (re)connect flips to ACTIVE in place. RELEASED rows
+    are excluded so a torn-down cross-connect is never resurrected.
+    """
+    result = await db.execute(
+        select(L1ConnectionAssignment).where(
+            L1ConnectionAssignment.reservation_id == reservation_id,
+            L1ConnectionAssignment.switch_device_id == switch_uuid,
+            L1ConnectionAssignment.port_a == port_a,
+            L1ConnectionAssignment.port_b == port_b,
+            L1ConnectionAssignment.status == "FAILED",
+        )
+    )
+    return result.scalars().first()
 
 
 async def freeze_reservation_wiring(
@@ -256,6 +303,68 @@ async def active_assignments_for_reservation(
     return list(result.scalars().all())
 
 
+async def all_assignments_for_reservation(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+) -> list[L1ConnectionAssignment]:
+    """Return every assignment row for a reservation (all statuses), oldest first.
+
+    Backs the phase-4 wiring-status surface: the caller wants the full per-connection
+    picture (ACTIVE cross-connects, RELEASED history, and FAILED rows needing retry),
+    so no status filter is applied. Ordered by created_at for a stable read.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    result = await db.execute(
+        select(L1ConnectionAssignment)
+        .where(L1ConnectionAssignment.reservation_id == res_uuid)
+        .order_by(L1ConnectionAssignment.created_at.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def failed_assignments_for_reservation(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+) -> list[L1ConnectionAssignment]:
+    """Return this reservation's FAILED rows, oldest first (the retry candidates)."""
+    res_uuid = _as_uuid(reservation_id)
+    result = await db.execute(
+        select(L1ConnectionAssignment)
+        .where(
+            L1ConnectionAssignment.reservation_id == res_uuid,
+            L1ConnectionAssignment.status == "FAILED",
+        )
+        .order_by(L1ConnectionAssignment.created_at.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def due_failed_rows(
+    db: AsyncSession,
+    limit: int,
+    max_attempts: int,
+) -> list[L1ConnectionAssignment]:
+    """FAILED rows still under the total-attempts cap, oldest first, batch-capped.
+
+    The background auto-retry channel's per-tick candidate set (ADR 0007 Decision 6
+    item 2): FAILED rows whose accumulated `attempts` is below `max_attempts`, so a
+    row parked past the cap is never re-swept (manual retry only). The LIMIT bounds
+    one tick exactly as the health scheduler's batch cap does. Retryability by reason
+    and the frozen-reservation guard are applied by the caller, since neither is a
+    clean SQL predicate here.
+    """
+    result = await db.execute(
+        select(L1ConnectionAssignment)
+        .where(
+            L1ConnectionAssignment.status == "FAILED",
+            L1ConnectionAssignment.attempts < max_attempts,
+        )
+        .order_by(L1ConnectionAssignment.created_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
 async def is_pair_active(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,
@@ -298,9 +407,12 @@ async def record_l1_failed(
     A FAILED status is exempt from the ACTIVE-only partial-unique index, so a FAILED
     row never blocks a later ACTIVE claim on the same pair and cannot collide with the
     live cross-connect. Upserts on (reservation, switch, canonical pair) for any
-    non-RELEASED row so a redelivery before the version is stamped updates attempts
-    rather than duplicating. Feeds the Decision 6 per-connection retry/manual channel
-    (phase 4).
+    non-RELEASED row so a redelivery before the version is stamped, or a phase-4
+    reattempt, updates the existing row rather than duplicating. `attempts` ACCUMULATES
+    onto the existing row (the driver attempts made in THIS pass are added to the
+    running total), so the phase-4 total-attempts cap counts every driver call ever
+    spent on the connection, across the in-line apply and every reattempt. Feeds the
+    Decision 6 per-connection retry/manual channel (phase 4).
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -318,7 +430,7 @@ async def record_l1_failed(
     row = result.scalars().first()
     if row is not None:
         row.status = "FAILED"
-        row.attempts = attempts
+        row.attempts = (row.attempts or 0) + attempts
         row.last_error = last_error
         if physical_connection_id and row.physical_connection_id is None:
             row.physical_connection_id = _as_uuid(physical_connection_id)

@@ -18,6 +18,10 @@ from app.routers.health import router as health_router
 from app.routers.validation import router as validation_router
 from app.services.health_scheduler import start_health_scheduler, stop_health_scheduler
 from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
+from app.services.wiring_retry_service import (
+    start_wiring_retry_scheduler,
+    stop_wiring_retry_scheduler,
+)
 
 setup_logging("execution", level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -123,7 +127,9 @@ async def lifespan(app: FastAPI):
     await _ensure_dlq_stream(app)
     await start_health_scheduler(app)
     await start_outbox_relay(app)
+    await start_wiring_retry_scheduler(app)
     yield
+    await stop_wiring_retry_scheduler(app)
     await stop_outbox_relay(app)
     await stop_health_scheduler(app)
     await stop_nats_consumer(app)

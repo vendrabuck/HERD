@@ -149,15 +149,45 @@ async def test_created_records_active_assignment():
 
 
 @pytest.mark.asyncio
-async def test_failed_connect_records_no_assignment():
-    """No ACTIVE row is written when the connect_ports driver call fails."""
+async def test_sandbox_failed_connect_records_failed_row():
+    """A sandbox-level connect failure (raise/timeout: result success falsy) writes no
+    ACTIVE row and lands a visible FAILED row (issue #345 phase-4 live-gate fix)."""
     fail = {"success": False, "output": None, "error": "boom", "duration_ms": 1}
 
     def execute_fn(driver_path, action, context, **kwargs):
         return SUCCESS_RESULT if action in ("login", "logout") else fail
 
     await _run_event("reservation.created", execute_fn=execute_fn)
-    assert await _assignments() == []
+    rows = await _assignments()
+    assert [r for r in rows if r.status == "ACTIVE"] == []
+    failed = [r for r in rows if r.status == "FAILED"]
+    assert len(failed) == 1
+    assert (failed[0].port_a, failed[0].port_b) == ("0/0/1", "0/0/2")
+    assert failed[0].last_error == "boom"
+
+
+@pytest.mark.asyncio
+async def test_driver_result_failure_on_connect_records_failed_row():
+    """The live-gate bug: a driver that RETURNS success=False without raising (sandbox
+    transport success is True, the driver's own payload reports failure) must land a
+    FAILED run and a FAILED assignment row, never a false SUCCESS + phantom ACTIVE row.
+    """
+    driver_result_fail = {
+        "success": True,
+        "output": {"success": False, "error": "mock injected failure on connect_ports"},
+        "error": None,
+        "duration_ms": 1,
+    }
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        return SUCCESS_RESULT if action in ("login", "logout") else driver_result_fail
+
+    await _run_event("reservation.created", execute_fn=execute_fn)
+    rows = await _assignments()
+    assert [r for r in rows if r.status == "ACTIVE"] == [], "no phantom ACTIVE on a failed connect"
+    failed = [r for r in rows if r.status == "FAILED"]
+    assert len(failed) == 1
+    assert failed[0].last_error == "mock injected failure on connect_ports"
 
 
 @pytest.mark.asyncio
