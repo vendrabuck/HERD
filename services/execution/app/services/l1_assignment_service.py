@@ -180,6 +180,167 @@ async def freeze_reservation_wiring(
     return row
 
 
+async def get_wiring_state(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+) -> ReservationWiringState | None:
+    """Read a reservation's wiring-state row, or None when it does not exist.
+
+    A missing row is the pre-P3b / phase-1-deferred case: phase 1 only ever
+    creates the row via freeze_reservation_wiring on a terminal event, so an
+    absent row means no terminal event fired and no version was applied. The
+    phase 3 consumer treats a missing row as a gap (ADR 0007 Decision 4).
+    """
+    res_uuid = _as_uuid(reservation_id)
+    result = await db.execute(
+        select(ReservationWiringState).where(ReservationWiringState.reservation_id == res_uuid)
+    )
+    return result.scalar_one_or_none()
+
+
+async def stamp_last_applied(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    fork_version: int,
+) -> ReservationWiringState:
+    """Advance reservation_wiring_state.last_applied_fork_version, upserting the row.
+
+    The monotonic ordering marker (ADR 0007 Decision 4). Called after a version is
+    processed, even when the pass left FAILED rows: the version was processed, so a
+    replay of the same version is a no-op skip. Never lowers the marker (a stale
+    stamp cannot regress it) and never clears frozen. Upsert is read-then-insert with
+    an IntegrityError fallback so a concurrent first-write cannot double-insert.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    result = await db.execute(
+        select(ReservationWiringState).where(ReservationWiringState.reservation_id == res_uuid)
+    )
+    row = result.scalar_one_or_none()
+    if row is not None:
+        if row.last_applied_fork_version is None or fork_version > row.last_applied_fork_version:
+            row.last_applied_fork_version = fork_version
+            await db.commit()
+        return row
+
+    row = ReservationWiringState(
+        reservation_id=res_uuid,
+        last_applied_fork_version=fork_version,
+    )
+    db.add(row)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        result = await db.execute(
+            select(ReservationWiringState).where(ReservationWiringState.reservation_id == res_uuid)
+        )
+        row = result.scalar_one()
+        if row.last_applied_fork_version is None or fork_version > row.last_applied_fork_version:
+            row.last_applied_fork_version = fork_version
+            await db.commit()
+    return row
+
+
+async def active_assignments_for_reservation(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+) -> list[L1ConnectionAssignment]:
+    """Return this reservation's ACTIVE cross-connect rows (the applied L1 set)."""
+    res_uuid = _as_uuid(reservation_id)
+    result = await db.execute(
+        select(L1ConnectionAssignment).where(
+            L1ConnectionAssignment.reservation_id == res_uuid,
+            L1ConnectionAssignment.status == "ACTIVE",
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def is_pair_active(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    switch_device_id: uuid.UUID | str,
+    port_a: str,
+    port_b: str,
+) -> bool:
+    """True when this reservation already holds an ACTIVE row for the pair.
+
+    The idempotency gate for a build (ADR 0007 Decision 4/5): a build whose pair is
+    already ACTIVE for this reservation is a convergent no-op, not a driver call.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    switch_uuid = _as_uuid(switch_device_id)
+    ca, cb = canonical_port_pair(port_a, port_b)
+    result = await db.execute(
+        select(L1ConnectionAssignment.id).where(
+            L1ConnectionAssignment.reservation_id == res_uuid,
+            L1ConnectionAssignment.switch_device_id == switch_uuid,
+            L1ConnectionAssignment.port_a == ca,
+            L1ConnectionAssignment.port_b == cb,
+            L1ConnectionAssignment.status == "ACTIVE",
+        )
+    )
+    return result.first() is not None
+
+
+async def record_l1_failed(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    switch_device_id: uuid.UUID | str,
+    port_a: str,
+    port_b: str,
+    attempts: int,
+    last_error: str,
+    physical_connection_id: uuid.UUID | str | None = None,
+) -> L1ConnectionAssignment:
+    """Write (or update) a FAILED row for a cross-connect that could not be applied.
+
+    A FAILED status is exempt from the ACTIVE-only partial-unique index, so a FAILED
+    row never blocks a later ACTIVE claim on the same pair and cannot collide with the
+    live cross-connect. Upserts on (reservation, switch, canonical pair) for any
+    non-RELEASED row so a redelivery before the version is stamped updates attempts
+    rather than duplicating. Feeds the Decision 6 per-connection retry/manual channel
+    (phase 4).
+    """
+    res_uuid = _as_uuid(reservation_id)
+    switch_uuid = _as_uuid(switch_device_id)
+    ca, cb = canonical_port_pair(port_a, port_b)
+
+    result = await db.execute(
+        select(L1ConnectionAssignment).where(
+            L1ConnectionAssignment.reservation_id == res_uuid,
+            L1ConnectionAssignment.switch_device_id == switch_uuid,
+            L1ConnectionAssignment.port_a == ca,
+            L1ConnectionAssignment.port_b == cb,
+            L1ConnectionAssignment.status != "RELEASED",
+        )
+    )
+    row = result.scalars().first()
+    if row is not None:
+        row.status = "FAILED"
+        row.attempts = attempts
+        row.last_error = last_error
+        if physical_connection_id and row.physical_connection_id is None:
+            row.physical_connection_id = _as_uuid(physical_connection_id)
+        await db.commit()
+        return row
+
+    row = L1ConnectionAssignment(
+        reservation_id=res_uuid,
+        switch_device_id=switch_uuid,
+        port_a=ca,
+        port_b=cb,
+        physical_connection_id=_as_uuid(physical_connection_id) if physical_connection_id else None,
+        status="FAILED",
+        attempts=attempts,
+        last_error=last_error,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
 def _row_get(row, name: str):
     if isinstance(row, dict):
         return row.get(name)

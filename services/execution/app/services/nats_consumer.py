@@ -59,6 +59,30 @@ NATS_FETCH_TIMEOUT_SECONDS = 5
 # best-effort and swallows errors so a DLQ outage cannot wedge the consumer.
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.execution"
 
+# Event name for the connection-driven L1 reconcile (ADR 0007, issue #345 P3b).
+WIRING_CHANGED_EVENT = "reservation.wiring_changed"
+# Per-connection in-line retry for a transient driver failure while applying one
+# cross-connect (ADR 0007 Decision 6 item 1). Mirrors run_driver_action's discipline
+# (herd_common.retry.retry_with_backoff): a bounded number of attempts with
+# exponential backoff, then the connection is parked FAILED and the pass continues.
+# A per-connection DRIVER failure never NAKs the message (Decision 7); only an
+# UPSTREAM cabling/inventory failure does. Delays are small so a failing connection
+# does not blow the integration suite's per-test timeout budget.
+WIRING_DRIVER_ATTEMPTS = 3
+WIRING_DRIVER_INITIAL_DELAY = 0.2
+WIRING_DRIVER_BACKOFF_FACTOR = 2.0
+WIRING_DRIVER_MAX_DELAY = 2.0
+# Reason pinned on a FAILED row when a recorded hop no longer resolves to a live
+# switch/port (ADR 0007 Decision 5): execution applies recorded hops verbatim and
+# never re-routes, so a graph change between save and apply strands the connection.
+WIRING_UNRESOLVABLE_REASON = "recorded hop unresolvable"
+# Reason pinned when a set of recorded hops does not form a simple chain (a switch
+# touched by more than two hops in one apply, or a cycle). The switch cross-connect
+# pairing is then not recoverable from the flattened wire delta (the pairing lived in
+# the canvas edge, which the delta discards), so the reconcile refuses to guess and
+# fails those hops rather than risk a physical mis-cross-connect (ADR 0007 review).
+WIRING_NOT_SIMPLE_CHAIN_REASON = "hop set is not a simple chain"
+
 
 async def _run_sandbox(*args, **kwargs):
     """Run the synchronous driver sandbox off the event loop (issue #317).
@@ -313,6 +337,39 @@ async def _fetch_secret_value(secret_id: str, client=None) -> dict | None:
             return None
         data = resp.json()
         return data.get("data", {}) if isinstance(data, dict) else {}
+
+
+async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> list[dict]:
+    """Fetch a reservation fork's full intended L1 wiring from cabling (ADR 0007).
+
+    The desired set for the gap/heal full-reconcile path (Decision 4): cabling's
+    internal fork GET returns every fork_connections row, the intended wiring as the
+    human reviewed and saved it. Raises TransientUpstreamError on a 5xx or transport
+    error so the message NAKs (an UPSTREAM failure, Decision 7); a 404 (no fork yet)
+    returns [] so the reconcile converges the applied set to empty. Only L1 rows are
+    returned; phase 1 wiring is L1 by construction, and a stray non-L1 row is ignored.
+    """
+    url = f"{settings.cabling_service_url}/internal/forks/{reservation_id}"
+    async with _client_ctx(client) as c:
+        resp = await _get_internal(
+            c,
+            url,
+            what=f"fetch fork wiring for reservation {reservation_id}",
+            headers={"X-Internal-Token": settings.internal_api_token},
+            timeout=10.0,
+        )
+        if resp.status_code == 404:
+            return []
+        if resp.status_code != 200:
+            logger.warning(
+                "Unexpected status fetching fork wiring for reservation %s: %s",
+                reservation_id,
+                resp.status_code,
+            )
+            return []
+        data = resp.json()
+        connections = data.get("connections", []) if isinstance(data, dict) else []
+        return [c for c in connections if (c.get("layer") or "L1") == "L1"]
 
 
 class _FetchContext:
@@ -2337,6 +2394,677 @@ async def _execute_dynamic_teardown(
         await _teardown_one_instance(row, reservation_id, user_id, get_db_session, client)
 
 
+# --- Connection-driven L1 reconcile (ADR 0007, issue #345 P3b phase 3) --------
+#
+# A reservation.wiring_changed event carries a fork-save's released/built L1 hop
+# delta (or, for a sweeper heal, no delta at all). The consumer applies it to
+# hardware connection-by-connection: disconnect the released switch cross-connects,
+# then connect the built ones, keyed by the l1_connection_assignments table (phase 1).
+# Ordering, gap-reconcile, verbatim-hop apply, per-connection failure, and the frozen
+# no-op guard are all Decision 4 to 7 of ADR 0007.
+
+# System actor for consumer-driven execution runs: wiring_changed carries no acting
+# user (it is a reconcile, not a user action), so runs are attributed to the nil UUID.
+WIRING_SYSTEM_USER = uuid.UUID(int=0)
+
+
+def _chain_walk_group(
+    group: list[dict],
+    device_is_switch: dict[str, bool],
+) -> tuple[dict[str, list[tuple[str, str, str | None]]], list[tuple[dict, str]]]:
+    """Chain-walk one hop set into switch cross-connect pairs, order-independently.
+
+    `group` is a list of resolved hop dicts (ep_a, ep_b, phys, wire). It is either the
+    hops of one canvas edge (grouped by edge_key, a single path by construction) or the
+    ungrouped NULL-edge_key remainder. Each (device, port) endpoint appears in at most
+    one hop, so the set is disjoint simple chains. Build a device-level adjacency, split
+    into connected components, and walk each from a degree-1 end: every interior L1
+    switch was entered on one port and left on another, and those two ports are exactly
+    its cross-connect for that path. A component that is not a simple chain (a switch
+    touched by more than two hops, or a cycle) is ambiguous once flattened, so every hop
+    in it lands unresolvable rather than a guessed pairing. Within an edge_key group this
+    never happens (one edge is one simple path); it is the fail-safe for the NULL set.
+
+    Returns (pairs_by_switch, unresolvable) for this group.
+    """
+    touches: dict[str, list[tuple[str, int]]] = {}
+    for idx, rw in enumerate(group):
+        da, pa = rw["ep_a"]
+        db_dev, pb = rw["ep_b"]
+        touches.setdefault(da, []).append((pa, idx))
+        touches.setdefault(db_dev, []).append((pb, idx))
+
+    def _other(idx: int, dev: str, port: str) -> tuple[str, str]:
+        rw = group[idx]
+        return rw["ep_b"] if rw["ep_a"] == (dev, port) else rw["ep_a"]
+
+    pairs_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
+    unresolvable: list[tuple[dict, str]] = []
+    seen_dev: set[str] = set()
+    for start_dev in list(touches.keys()):
+        if start_dev in seen_dev:
+            continue
+        # BFS the connected component and collect its hop indices.
+        comp_devices: list[str] = []
+        comp_hops: set[int] = set()
+        stack = [start_dev]
+        seen_dev.add(start_dev)
+        while stack:
+            d = stack.pop()
+            comp_devices.append(d)
+            for port, idx in touches[d]:
+                comp_hops.add(idx)
+                nd, _np = _other(idx, d, port)
+                if nd not in seen_dev:
+                    seen_dev.add(nd)
+                    stack.append(nd)
+
+        degrees = {d: len(touches[d]) for d in comp_devices}
+        endpoints = [d for d in comp_devices if degrees[d] == 1]
+        # A simple chain: no node above degree 2, and two degree-1 ends (a lone hop is
+        # two ends). Zero ends is a cycle; a degree above 2 is a branch. Either is
+        # ambiguous, so fail every hop in the component rather than mis-pair.
+        if max(degrees.values()) > 2 or len(endpoints) != 2:
+            for idx in comp_hops:
+                unresolvable.append((group[idx]["wire"], WIRING_NOT_SIMPLE_CHAIN_REASON))
+            continue
+
+        # Walk the path from one end. Track the port the walk arrived on; an interior
+        # switch's (arrival_port, departure_port) is its cross-connect for this path.
+        current = endpoints[0]
+        prev_hop = -1
+        in_port: str | None = None
+        while True:
+            out_entry = next(((p, i) for p, i in touches[current] if i != prev_hop), None)
+            if out_entry is None:
+                break  # reached the far end of the chain
+            out_port, idx = out_entry
+            if in_port is not None and device_is_switch.get(current):
+                pairs_by_switch.setdefault(current, []).append(
+                    (in_port, out_port, group[idx]["phys"])
+                )
+            nd, np_ = _other(idx, current, out_port)
+            prev_hop = idx
+            in_port = np_
+            current = nd
+    return pairs_by_switch, unresolvable
+
+
+async def _wires_to_switch_pairs(
+    wires: list[dict],
+    ctx: "_FetchContext",
+) -> tuple[dict[str, list[tuple[str, str, str | None]]], list[tuple[dict, str]]]:
+    """Derive L1 switch cross-connect pairs from recorded wires, grouped by edge_key.
+
+    Each recorded wire is one physical hop between the port-endpoints (device_a, port_a)
+    and (device_b, port_b), applied verbatim (ADR 0007 Decision 5). A canvas edge that
+    routes through one or more L1 matrix switches is recorded as a run of such hops:
+    A to SW1 to SW2 to B is three hops. The cross-connect a switch must apply is the
+    pair of ports by which its path enters and leaves it, and that pairing lives in the
+    edge, NOT in any single hop: SW1's two ports sit in two different hop rows.
+
+    Pairing is BY edge_key FIRST (issue #345, PR #367 propagates the canvas edge id each
+    hop was resolved from through cabling's fork GET, the save-delta, and this event).
+    Grouping by edge_key makes the pairing exact: within one group the hops are one path
+    by construction, so the chain-walk is unambiguous even when two groups traverse the
+    SAME switch (each group's chain yields that switch's own cross-connect). A NULL/absent
+    edge_key is a pre-migration (legacy) row with no grouping; the whole NULL remainder is
+    chain-walked as one set with the not-a-simple-chain fail-safe, so a genuinely
+    ambiguous legacy delta (two edges on one switch, no keys) fails rather than mis-pairs.
+    A mixed delta processes keyed groups exactly and the NULL remainder via the fallback.
+
+    Positional pairing (group a switch's hop ports, pair them by array order) is UNSOUND
+    and NOT used: the delta arrays carry no reliable order. cabling builds released/built
+    from set differences (fork_save_service reconcile_connection_sets), and the
+    full-reconcile source orders fork_connections by a shared-timestamp created_at, so
+    equal-time ties are unstable. Array-order pairing can physically mis-cross-connect.
+
+    Returns (pairs_by_switch, unresolvable):
+      pairs_by_switch: switch_id -> list of (port_a, port_b, physical_connection_id).
+                       A switch may carry several pairs from several edge_key groups.
+      unresolvable:    list of (wire, reason). A hop whose endpoint device no longer
+                       resolves is WIRING_UNRESOLVABLE_REASON (Decision 5); an ambiguous
+                       (non-simple-chain) group is WIRING_NOT_SIMPLE_CHAIN_REASON.
+
+    Raises TransientUpstreamError (through ctx.get_device) on a 5xx or transport error
+    while classifying an endpoint, so an UPSTREAM outage NAKs the whole message rather
+    than mis-classifying a live switch as gone (Decision 7 error split).
+    """
+    device_is_switch: dict[str, bool] = {}
+    keyed_groups: dict[str, list[dict]] = {}
+    null_group: list[dict] = []
+    unresolvable: list[tuple[dict, str]] = []
+    for wire in wires:
+        da = str(wire.get("device_a_id"))
+        pa = wire.get("port_a")
+        db_dev = str(wire.get("device_b_id"))
+        pb = wire.get("port_b")
+        dev_a = await ctx.get_device(da)
+        dev_b = await ctx.get_device(db_dev)
+        if dev_a is None or dev_b is None:
+            # A recorded hop endpoint is gone: verbatim apply cannot proceed and a
+            # re-route is forbidden (Decision 5).
+            unresolvable.append((wire, WIRING_UNRESOLVABLE_REASON))
+            continue
+        if da == db_dev:
+            # A self-loop hop is not a simple chain link; refuse to guess.
+            unresolvable.append((wire, WIRING_NOT_SIMPLE_CHAIN_REASON))
+            continue
+        device_is_switch[da] = dev_a.get("connection_type") == "Layer 1 Switch"
+        device_is_switch[db_dev] = dev_b.get("connection_type") == "Layer 1 Switch"
+        rw = {
+            "ep_a": (da, pa),
+            "ep_b": (db_dev, pb),
+            "phys": wire.get("physical_connection_id"),
+            "wire": wire,
+        }
+        edge_key = wire.get("edge_key")
+        if edge_key is None:
+            null_group.append(rw)
+        else:
+            keyed_groups.setdefault(str(edge_key), []).append(rw)
+
+    pairs_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
+    groups = list(keyed_groups.values())
+    if null_group:
+        groups.append(null_group)
+    for group in groups:
+        group_pairs, group_unresolvable = _chain_walk_group(group, device_is_switch)
+        for switch_id, pairs in group_pairs.items():
+            pairs_by_switch.setdefault(switch_id, []).extend(pairs)
+        unresolvable.extend(group_unresolvable)
+    return pairs_by_switch, unresolvable
+
+
+async def _run_driver_with_retry(
+    driver_path: str,
+    action: str,
+    context: dict,
+    password_keys: set,
+    method_kwargs: dict | None = None,
+) -> tuple[bool, int, str | None, dict | None]:
+    """Run one driver action in the sandbox with bounded in-line retry/backoff.
+
+    Mirrors run_driver_action's discipline (ADR 0007 Decision 6 item 1): a transient
+    driver failure (a sandbox result with success false, or a raised exception) is
+    retried up to WIRING_DRIVER_ATTEMPTS with exponential backoff. Returns
+    (success, attempts, last_error, last_result). A driver failure is compensated
+    per connection and never NAKs the message (Decision 7).
+    """
+    delay = WIRING_DRIVER_INITIAL_DELAY
+    last_error: str | None = None
+    last_result: dict | None = None
+    attempt = 0
+    for attempt in range(1, WIRING_DRIVER_ATTEMPTS + 1):
+        try:
+            result = await _run_sandbox(
+                driver_path,
+                action,
+                context,
+                method_kwargs=method_kwargs,
+                password_keys=password_keys,
+            )
+        except Exception as exc:  # noqa: BLE001 - sandbox failures are per-connection
+            last_error = f"driver raised: {exc}"
+            last_result = None
+        else:
+            last_result = result
+            if result.get("success"):
+                return True, attempt, None, result
+            last_error = result.get("error") or "driver reported failure"
+        if attempt < WIRING_DRIVER_ATTEMPTS:
+            await asyncio.sleep(min(delay, WIRING_DRIVER_MAX_DELAY))
+            delay *= WIRING_DRIVER_BACKOFF_FACTOR
+    return False, attempt, last_error, last_result
+
+
+async def _apply_wiring_pairs(
+    reservation_id: str,
+    release_by_switch: dict[str, list[tuple[str, str, str | None]]],
+    build_by_switch: dict[str, list[tuple[str, str, str | None]]],
+    unresolvable: list[tuple[dict, str]],
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Apply an L1 reconcile: release the released pairs, then build the built ones.
+
+    Release-before-build in one pass, per switch (ADR 0007 Decision 4): a moved cable
+    frees its old port before the new claim, so the ACTIVE-only partial-unique index is
+    never tripped. Each connection is independent (Decision 6): a driver failure after
+    the in-line retry cap lands a FAILED row and the pass continues; it never aborts the
+    surviving connections and never NAKs. Assignment rows flip exactly as phase 1's
+    projection does: record_l1_connect on a successful connect, release_l1_connection on
+    a successful disconnect. A recorded hop that no longer resolves to a live
+    switch/port is a FAILED row with the pinned unresolvable reason (Decision 5).
+    """
+    from datetime import datetime, timezone
+
+    from app.services.driver_loader import load_driver
+    from app.services.execution_service import (
+        build_context,
+        create_execution_run,
+        extract_password_keys,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+    from app.services.l1_assignment_service import (
+        is_pair_active,
+        record_l1_failed,
+    )
+
+    res_uuid = uuid.UUID(reservation_id)
+
+    # Unresolvable hops (Decision 5): a recorded endpoint is gone, or the hop set is
+    # not a simple chain so its pairing is unrecoverable. A verbatim apply cannot
+    # proceed and re-routing/guessing is forbidden. Park each hop FAILED with its
+    # pinned reason, keyed on the hop's own recorded endpoints.
+    for wire, reason in unresolvable:
+        async with get_db_session() as db:
+            await record_l1_failed(
+                db,
+                res_uuid,
+                str(wire.get("device_a_id")),
+                str(wire.get("port_a")),
+                str(wire.get("port_b")),
+                attempts=0,
+                last_error=reason,
+                physical_connection_id=wire.get("physical_connection_id"),
+            )
+
+    switch_ids = list({*release_by_switch.keys(), *build_by_switch.keys()})
+    for switch_id in switch_ids:
+        release_pairs = release_by_switch.get(switch_id, [])
+        build_pairs = build_by_switch.get(switch_id, [])
+        switch_uuid = uuid.UUID(switch_id)
+
+        switch_data = await ctx.get_device(switch_id)
+        template_data = (
+            await _fetch_template(switch_data.get("template_id", ""), ctx.client)
+            if switch_data
+            else None
+        )
+        driver_path = None
+        load_error: str | None = None
+        if switch_data is None:
+            load_error = f"{WIRING_UNRESOLVABLE_REASON}: switch {switch_id} not found"
+        elif template_data is None:
+            load_error = f"{WIRING_UNRESOLVABLE_REASON}: template for switch {switch_id} not found"
+
+        context: dict = {}
+        password_keys: set = set()
+        driver_id = None
+        driver_sha256 = "unknown"
+        if load_error is None:
+            driver_id = uuid.UUID(switch_data["driver_id"])
+            driver_sha256 = switch_data.get("driver_sha256", "unknown")
+            driver_filename = switch_data.get("driver_filename", "driver.zip")
+            connection_type = switch_data.get("connection_type", "Layer 1 Switch")
+            context = build_context(switch_data, switch_uuid, WIRING_SYSTEM_USER, res_uuid)
+            password_keys = extract_password_keys(template_data)
+            async with get_db_session() as db:
+                try:
+                    driver_path = await load_driver(
+                        db, driver_id, driver_sha256, driver_filename, connection_type
+                    )
+                except Exception as exc:  # noqa: BLE001 - a load failure strands the hops
+                    load_error = f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: {exc}"
+
+        # A switch we cannot drive: every pair on it (release and build) is a FAILED
+        # unresolvable row. A release with no ACTIVE row is still a no-op (nothing to
+        # tear down), so only build/held pairs are surfaced as failures.
+        if load_error is not None or driver_path is None:
+            async with get_db_session() as db:
+                for port_a, port_b, phys in build_pairs:
+                    await record_l1_failed(
+                        db, res_uuid, switch_uuid, port_a, port_b, 0, load_error, phys
+                    )
+                for port_a, port_b, phys in release_pairs:
+                    if await is_pair_active(db, res_uuid, switch_uuid, port_a, port_b):
+                        await record_l1_failed(
+                            db, res_uuid, switch_uuid, port_a, port_b, 0, load_error, phys
+                        )
+            continue
+
+        redacted = redact_context_for_logging(context, password_keys)
+
+        async with get_db_session() as db:
+            # Login once per switch.
+            login_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "login",
+                WIRING_SYSTEM_USER,
+                redacted,
+                res_uuid,
+            )
+            login_started = datetime.now(timezone.utc)
+            login_ok, login_attempts, login_err, login_result = await _run_driver_with_retry(
+                driver_path, "login", context, password_keys
+            )
+            await update_execution_run(
+                db,
+                login_run,
+                "SUCCESS" if login_ok else "FAILED",
+                output=(
+                    json.dumps(login_result["output"], default=str)
+                    if login_ok and login_result
+                    else None
+                ),
+                error=None if login_ok else login_err,
+                started_at=login_started,
+                completed_at=datetime.now(timezone.utc),
+            )
+            if not login_ok:
+                # A driver-level login failure (Decision 7: never NAKs). Every pair we
+                # would have applied on this switch is parked FAILED with the attempts.
+                for port_a, port_b, phys in build_pairs:
+                    await record_l1_failed(
+                        db,
+                        res_uuid,
+                        switch_uuid,
+                        port_a,
+                        port_b,
+                        login_attempts,
+                        f"driver login failed: {login_err}",
+                        phys,
+                    )
+                for port_a, port_b, phys in release_pairs:
+                    if await is_pair_active(db, res_uuid, switch_uuid, port_a, port_b):
+                        await record_l1_failed(
+                            db,
+                            res_uuid,
+                            switch_uuid,
+                            port_a,
+                            port_b,
+                            login_attempts,
+                            f"driver login failed: {login_err}",
+                            phys,
+                        )
+                continue
+
+            # Release-before-build. Disconnect the released pairs first so a moved
+            # cable frees its port before the rebuild claims it.
+            for port_a, port_b, phys in release_pairs:
+                if not await is_pair_active(db, res_uuid, switch_uuid, port_a, port_b):
+                    # Already released or never applied: an idempotent no-op, no
+                    # driver call and no hardware touch.
+                    continue
+                await _apply_one_port_action(
+                    db,
+                    "disconnect_ports",
+                    driver_path,
+                    context,
+                    password_keys,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    res_uuid,
+                    port_a,
+                    port_b,
+                    phys,
+                )
+
+            # Build the built pairs.
+            for port_a, port_b, phys in build_pairs:
+                if await is_pair_active(db, res_uuid, switch_uuid, port_a, port_b):
+                    # Convergent replay: the pair is already ACTIVE for this
+                    # reservation, so the build is a no-op success, not a driver call.
+                    continue
+                await _apply_one_port_action(
+                    db,
+                    "connect_ports",
+                    driver_path,
+                    context,
+                    password_keys,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    res_uuid,
+                    port_a,
+                    port_b,
+                    phys,
+                )
+
+            # Logout once per switch.
+            logout_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "logout",
+                WIRING_SYSTEM_USER,
+                redacted,
+                res_uuid,
+            )
+            logout_started = datetime.now(timezone.utc)
+            logout_ok, _la, logout_err, logout_result = await _run_driver_with_retry(
+                driver_path, "logout", context, password_keys
+            )
+            await update_execution_run(
+                db,
+                logout_run,
+                "SUCCESS" if logout_ok else "FAILED",
+                output=(
+                    json.dumps(logout_result["output"], default=str)
+                    if logout_ok and logout_result and logout_result.get("output")
+                    else None
+                ),
+                error=None if logout_ok else logout_err,
+                started_at=logout_started,
+                completed_at=datetime.now(timezone.utc),
+            )
+
+
+async def _apply_one_port_action(
+    db,
+    action: str,
+    driver_path: str,
+    context: dict,
+    password_keys: set,
+    switch_uuid: uuid.UUID,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    res_uuid: uuid.UUID,
+    port_a: str,
+    port_b: str,
+    phys: str | None,
+) -> None:
+    """Apply one connect/disconnect cross-connect, flipping its assignment row.
+
+    Writes an execution_run audit row, runs the driver with bounded retry, and on
+    success flips the l1_connection_assignments projection (ACTIVE on connect,
+    RELEASED on disconnect); on exhausting the retry cap it lands a FAILED row with the
+    attempts and last_error, leaving siblings untouched (ADR 0007 Decision 6).
+    """
+    from datetime import datetime, timezone
+
+    from app.services.execution_service import (
+        create_execution_run,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+    from app.services.l1_assignment_service import (
+        record_l1_connect,
+        record_l1_failed,
+        release_l1_connection,
+    )
+
+    redacted = redact_context_for_logging(context, password_keys)
+    port_kwargs = {"port_a": port_a, "port_b": port_b}
+    run = await create_execution_run(
+        db,
+        switch_uuid,
+        driver_id,
+        driver_sha256,
+        action,
+        WIRING_SYSTEM_USER,
+        redacted,
+        res_uuid,
+        port_a,
+        port_b,
+        method_kwargs=port_kwargs,
+    )
+    started = datetime.now(timezone.utc)
+    ok, attempts, err, result = await _run_driver_with_retry(
+        driver_path, action, context, password_keys, method_kwargs=port_kwargs
+    )
+    if ok:
+        await update_execution_run(
+            db,
+            run,
+            "SUCCESS",
+            output=json.dumps(result["output"], default=str) if result else None,
+            started_at=started,
+            completed_at=datetime.now(timezone.utc),
+        )
+        if action == "connect_ports":
+            await record_l1_connect(db, res_uuid, switch_uuid, port_a, port_b, phys)
+        else:
+            await release_l1_connection(db, res_uuid, switch_uuid, port_a, port_b)
+    else:
+        await update_execution_run(
+            db,
+            run,
+            "FAILED",
+            error=err,
+            started_at=started,
+            completed_at=datetime.now(timezone.utc),
+        )
+        await record_l1_failed(db, res_uuid, switch_uuid, port_a, port_b, attempts, err, phys)
+
+
+async def handle_wiring_changed(
+    event_data: dict, get_db_session, dedupe_key: str | None = None
+) -> None:
+    """Consume reservation.wiring_changed: ordered, connection-driven L1 reconcile.
+
+    The ordering decision (ADR 0007 Decision 4), against
+    reservation_wiring_state.last_applied_fork_version (LA):
+
+      - frozen reservation:            no-op ack before any driver call (Decision 7).
+      - fork_version <= LA:            stale/duplicate delivery, no-op ack.
+      - delta-less event (heal), any:  full reconcile from cabling's intended set.
+      - missing wiring_state row:      gap by definition, full reconcile, then stamp.
+      - fork_version == LA + 1, delta: contiguous, apply the carried released/built.
+      - fork_version >  LA + 1:        gap, full reconcile from cabling's intended set.
+
+    The version is stamped after the pass even when it left FAILED rows (the version
+    was processed). An UPSTREAM cabling/inventory failure raises TransientUpstreamError
+    and NAKs; a per-connection DRIVER failure lands a FAILED row and acks (Decision 7).
+    """
+    from app.services.l1_assignment_service import get_wiring_state, stamp_last_applied
+
+    reservation_id = event_data.get("reservation_id")
+    fork_version = event_data.get("fork_version")
+    released = event_data.get("released")
+    built = event_data.get("built")
+
+    if reservation_id is None or fork_version is None:
+        logger.warning("wiring_changed event missing reservation_id or fork_version; ignoring")
+        return
+
+    # Frozen guard (Decision 7): a wiring_changed for an ended reservation is a no-op
+    # before any driver call. Read once, up front.
+    async with get_db_session() as db:
+        state = await get_wiring_state(db, reservation_id)
+        if state is not None and state.frozen:
+            logger.info(
+                "wiring_changed for frozen reservation %s (version %s); no-op",
+                reservation_id,
+                fork_version,
+            )
+            return
+        last_applied = state.last_applied_fork_version if state is not None else None
+
+    # Stale or duplicate: the version was already applied. No-op.
+    if last_applied is not None and fork_version <= last_applied:
+        logger.info(
+            "wiring_changed version %s <= last_applied %s for reservation %s; stale no-op",
+            fork_version,
+            last_applied,
+            reservation_id,
+        )
+        return
+
+    delta_less = released is None or built is None
+    # Full reconcile when: heal (no delta) at any version; a missing state row; a
+    # version gap. Otherwise the contiguous carried-delta apply. The delta_less check
+    # comes first so a heal at exactly last_applied + 1 takes the full-reconcile path
+    # and applies the missed save, never the empty carried delta (ADR 0007 Decision 2).
+    full_reconcile = delta_less or last_applied is None or fork_version != last_applied + 1
+
+    async with httpx.AsyncClient() as client:
+        ctx = _FetchContext(client)
+
+        if full_reconcile:
+            desired_wires = await _fetch_fork_intended_wires(str(reservation_id), client)
+            desired_by_switch, unresolvable = await _wires_to_switch_pairs(desired_wires, ctx)
+
+            # Convergent reconcile against the current ACTIVE rows: release ACTIVE pairs
+            # not desired, build desired pairs not yet ACTIVE.
+            async with get_db_session() as db:
+                from app.services.l1_assignment_service import (
+                    active_assignments_for_reservation,
+                )
+                from app.services.l1_assignment_service import (
+                    canonical_port_pair as _canon,
+                )
+
+                active_rows = await active_assignments_for_reservation(db, reservation_id)
+            current: dict[tuple[str, str, str], None] = {}
+            for row in active_rows:
+                ca, cb = _canon(row.port_a, row.port_b)
+                current[(str(row.switch_device_id), ca, cb)] = None
+            desired: dict[tuple[str, str, str], tuple[str, str, str | None]] = {}
+            for switch_id, pairs in desired_by_switch.items():
+                for port_a, port_b, phys in pairs:
+                    ca, cb = _canon(port_a, port_b)
+                    desired[(switch_id, ca, cb)] = (port_a, port_b, phys)
+
+            release_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
+            build_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
+            for key in current.keys() - desired.keys():
+                switch_id, ca, cb = key
+                release_by_switch.setdefault(switch_id, []).append((ca, cb, None))
+            for key in desired.keys() - current.keys():
+                switch_id, ca, cb = key
+                build_by_switch.setdefault(switch_id, []).append(desired[key])
+
+            await _apply_wiring_pairs(
+                str(reservation_id),
+                release_by_switch,
+                build_by_switch,
+                unresolvable,
+                ctx,
+                get_db_session,
+            )
+        else:
+            release_by_switch, unresolvable_r = await _wires_to_switch_pairs(released, ctx)
+            build_by_switch, unresolvable_b = await _wires_to_switch_pairs(built, ctx)
+            await _apply_wiring_pairs(
+                str(reservation_id),
+                release_by_switch,
+                build_by_switch,
+                unresolvable_r + unresolvable_b,
+                ctx,
+                get_db_session,
+            )
+
+    # Advance the monotonic marker: the version was processed (Decision 4/6), even if
+    # the pass left FAILED rows for the Decision 6 retry channel.
+    async with get_db_session() as db:
+        await stamp_last_applied(db, reservation_id, fork_version)
+
+    logger.info(
+        "Applied wiring_changed version %s for reservation %s (%s)",
+        fork_version,
+        reservation_id,
+        "full-reconcile" if full_reconcile else "carried-delta",
+    )
+
+
 async def handle_reservation_event(
     event_data: dict, get_db_session, dedupe_key: str | None = None
 ) -> None:
@@ -2356,6 +3084,13 @@ async def handle_reservation_event(
     # provision_requested.
     if event_type == "reservation.provision_requested":
         await _handle_provision_requested(event_data, get_db_session, dedupe_key)
+        return
+
+    # Connection-driven L1 reconcile (ADR 0007, issue #345 P3b phase 3). A fork-save's
+    # released/built delta (or a sweeper heal with no delta) applied hop-by-hop,
+    # ordered by fork_version. Separate from device-set-driven L1/L2/L3 provisioning.
+    if event_type == WIRING_CHANGED_EVENT:
+        await handle_wiring_changed(event_data, get_db_session, dedupe_key)
         return
 
     action = EVENT_ACTIONS.get(event_type)
