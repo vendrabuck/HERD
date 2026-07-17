@@ -34,6 +34,9 @@ class ForkConnectionResponse(BaseModel):
     port_b: str
     layer: str
     physical_connection_id: uuid.UUID | None = None
+    # The canvas edge id this hop was resolved from (issue #345 P3b); NULL when unknown
+    # (rows predating the column, or a hop resolved without a known edge id). Additive.
+    edge_key: str | None = None
     created_by: str
     created_at: datetime
 
@@ -132,6 +135,9 @@ class ForkConnectionDelta(BaseModel):
     port_b: str
     layer: str
     physical_connection_id: uuid.UUID | None = None
+    # The canvas edge id this hop was resolved from (issue #345 P3b); NULL means
+    # ungrouped. Relayed verbatim so the consumer can group the hops of one edge.
+    edge_key: str | None = None
 
     @field_serializer("device_a_id", "device_b_id")
     def _serialize_uuid(self, value: uuid.UUID) -> str:

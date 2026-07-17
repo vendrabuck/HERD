@@ -444,8 +444,9 @@ def _wiring_changed_payload(
     """Build the reservation.wiring_changed payload (ADR 0007 Decision 3).
 
     released/built are the per-wire dicts cabling returned from the save (each carrying
-    device_a_id, port_a, device_b_id, port_b, layer, physical_connection_id), passed
-    through verbatim. A heal event (ADR 0007 Decision 2) carries them as None, NOT empty
+    device_a_id, port_a, device_b_id, port_b, layer, physical_connection_id, and the
+    nullable edge_key added for per-edge hop grouping, issue #345 P3b), passed through
+    verbatim. A heal event (ADR 0007 Decision 2) carries them as None, NOT empty
     lists: absent delta is the load-bearing marker that routes the consumer to a full
     reconcile rather than applying an empty delta and silently advancing the version.
     enqueue_event stamps event_id.

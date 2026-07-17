@@ -1767,3 +1767,185 @@ async def test_save_fork_delta_carries_physical_connection_id(client):
     built = resp.json()["built"]
     assert len(built) == 1
     assert built[0]["physical_connection_id"] == str(physical_id)
+
+
+# --- edge_key: per-edge hop grouping (issue #345 P3b) ---
+
+
+@pytest.mark.asyncio
+async def test_create_fork_snapshot_persists_edge_key(client):
+    """The activation snapshot stamps each hop with its originating canvas edge id."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+        ],
+        "edges": [{"id": "edge-xyz", "source": "n0", "target": "n1"}],
+    }
+    topo_id, _ = await _make_topology_with_version(canvas)
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+    conns = await _fork_connections(uuid.UUID(resp.json()["fork_id"]))
+    assert len(conns) == 1
+    assert conns[0].edge_key == "edge-xyz"
+
+
+@pytest.mark.asyncio
+async def test_save_persists_edge_key_on_built_wire(client):
+    """The save insert path stamps the built row and its delta with the canvas edge id."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},  # _canvas numbers edges "e0"
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 1
+    assert built[0]["edge_key"] == "e0"
+
+    conns = await _fork_connections(uuid.UUID(resp.json()["fork_id"]))
+    assert len(conns) == 1
+    assert conns[0].edge_key == "e0"
+
+
+@pytest.mark.asyncio
+async def test_save_groups_hops_per_edge(client):
+    """A multi-hop edge's hops share one edge_key; a second edge's hop carries another.
+
+    The core P3b need (issue #345): the execution consumer groups switch-touching hops
+    by the canvas edge they came from. Edge e0 (A-B) resolves over an off-canvas patch
+    panel into two hops; edge e1 (C-D) resolves to one. Both e0 hops carry "e0", the e1
+    hop carries "e1", so the flattened hop list stays regroupable per edge.
+    """
+    a, p, b, c, d = (uuid.uuid4() for _ in range(5))
+    await _make_physical(a, "a0", p, "p1")
+    await _make_physical(p, "p2", b, "b0")
+    await _make_physical(c, "c0", d, "d0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    # nodes n0..n3 -> a,b,c,d; edges e0 = A-B (multi-hop via P), e1 = C-D (single hop).
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b, c, d], [(0, 1), (2, 3)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    by_key: dict = {}
+    for wire in built:
+        by_key.setdefault(wire["edge_key"], []).append(wire)
+    assert set(by_key) == {"e0", "e1"}
+    assert len(by_key["e0"]) == 2  # both hops of the A-B edge share its id
+    assert len(by_key["e1"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_edge_id_only_change_reconciles_as_unchanged(client):
+    """CRITICAL invariant: edge_key is NOT part of connection identity (ADR 0006 D3).
+
+    A re-save that changes ONLY the canvas edge id, over the same physical hop, must
+    reconcile as unchanged (no release, no build); the stored row keeps its original
+    edge_key. If edge_key joined the identity this would churn as a release plus build.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    parent_canvas = _canvas([a, b], [(0, 1)])  # snapshotted with edge id "e0"
+    topo_id, _ = await _make_topology_with_version(parent_canvas)
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        headers=_hdr(),
+    )
+
+    # Same devices and ports, DIFFERENT edge id.
+    renamed = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+        ],
+        "edges": [{"id": "renamed-edge", "source": "n0", "target": "n1"}],
+    }
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": renamed},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["unchanged_count"] == 1
+    assert body["released"] == []
+    assert body["built"] == []
+
+    # The untouched row keeps the edge_key it was first built with; the identity-only
+    # reconcile never rewrote it.
+    conns = await _fork_connections(uuid.UUID(body["fork_id"]))
+    assert len(conns) == 1
+    assert conns[0].edge_key == "e0"
+
+
+@pytest.mark.asyncio
+async def test_save_tolerates_edge_without_id(client):
+    """A canvas edge carrying no id leaves the hop ungrouped (edge_key NULL) end to end."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    no_id_canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+        ],
+        "edges": [{"source": "n0", "target": "n1"}],  # no "id" key
+    }
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": no_id_canvas},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 1
+    assert built[0]["edge_key"] is None
+
+    conns = await _fork_connections(uuid.UUID(resp.json()["fork_id"]))
+    assert conns[0].edge_key is None
+
+    # The GET surface reports it as null too.
+    get = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert get.status_code == 200
+    assert get.json()["connections"][0]["edge_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_fork_connections_carry_edge_key(client):
+    """The internal fork GET exposes edge_key on each fork_connections entry."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1)])},  # edge id "e0"
+        headers=_hdr(),
+    )
+
+    get = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert get.status_code == 200, get.text
+    conns = get.json()["connections"]
+    assert len(conns) == 1
+    assert conns[0]["edge_key"] == "e0"

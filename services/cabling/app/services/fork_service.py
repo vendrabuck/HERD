@@ -98,6 +98,7 @@ async def _snapshot_connections(
                 port_b=spec.port_b,
                 layer=spec.layer,
                 physical_connection_id=spec.physical_connection_id,
+                edge_key=spec.edge_key,
                 created_by=created_by,
             )
         )
