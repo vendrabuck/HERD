@@ -77,11 +77,18 @@ class HerdJsonConfigSource(PydanticBaseSettingsSource):
         # Build mapped dict: apply key mapping and compute derived values
         self._data: dict[str, Any] = {}
         for key, value in raw.items():
+            if isinstance(value, str) and value.strip() == "":
+                # An empty string in config.json means "unset": the key falls
+                # through to the environment instead of shadowing it.
+                continue
             mapped_key = _KEY_MAP.get(key, key)
             self._data[mapped_key.lower()] = value
-        # Compute DATABASE_URL from POSTGRES_* fields
+        # Compute DATABASE_URL from POSTGRES_* fields. The derived URL
+        # hardcodes the in-compose postgres:5432 host, so it is a fallback
+        # only: an explicitly set DATABASE_URL env var (external DB, pooler,
+        # TLS params) must outrank it in both source orders below.
         db_url = _build_database_url(raw)
-        if db_url:
+        if db_url and not os.environ.get("DATABASE_URL"):
             self._data["database_url"] = db_url
 
     def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
@@ -95,3 +102,55 @@ class HerdJsonConfigSource(PydanticBaseSettingsSource):
             if is_set:
                 d[field_name] = val
         return d
+
+
+BOOTSTRAP_MARKER = "config.bootstrapped"
+
+
+def _bootstrap_marker_file() -> str:
+    # Derived at call time from CONFIG_FILE so test reloads with a patched
+    # HERD_CONFIG_FILE resolve the marker beside the patched config path.
+    return os.path.join(os.path.dirname(CONFIG_FILE), BOOTSTRAP_MARKER)
+
+
+def herd_settings_sources(
+    settings_cls: type[BaseSettings],
+    init_settings: PydanticBaseSettingsSource,
+    env_settings: PydanticBaseSettingsSource,
+    dotenv_settings: PydanticBaseSettingsSource,
+    file_secret_settings: PydanticBaseSettingsSource,
+) -> tuple[PydanticBaseSettingsSource, ...]:
+    """Canonical settings-source order for every HERD service.
+
+    Earlier sources win. The config file outranks the environment only once an
+    operator has actually saved through the config UI: compose injects the
+    same keys as container env vars, and a container's env is fixed at
+    creation, so with env-first ordering a config-UI save could never change a
+    running deployment.
+
+    A config.json created solely by first-boot auto-bootstrap is a copy of the
+    environment, not an operator decision; the config service marks it with a
+    sibling config.bootstrapped file and deletes that marker on the first real
+    UI save. While the marker exists the file ranks below the environment, so
+    a stack driven purely by .env behaves exactly as it did before the file
+    existed. Keys absent from the file always resolve from env and dotenv, a
+    host with no config.json (unit tests, bare processes) behaves as pure env,
+    and init_settings stays first so explicit constructor arguments override
+    everything.
+    """
+    file_source = HerdJsonConfigSource(settings_cls)
+    if os.path.exists(_bootstrap_marker_file()):
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_source,
+            file_secret_settings,
+        )
+    return (
+        init_settings,
+        file_source,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    )

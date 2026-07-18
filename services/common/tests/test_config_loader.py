@@ -65,6 +65,7 @@ def test_source_maps_auth_keys(tmp_path, monkeypatch):
 
 
 def test_source_builds_database_url_when_postgres_fields_present(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     config_file = tmp_path / "config.json"
     config_file.write_text(
         json.dumps(
@@ -85,6 +86,7 @@ def test_source_builds_database_url_when_postgres_fields_present(tmp_path, monke
 
 
 def test_source_url_encodes_special_chars_in_password(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     config_file = tmp_path / "config.json"
     config_file.write_text(
         json.dumps(
@@ -168,3 +170,116 @@ def test_source_falls_back_when_config_json_is_corrupt(tmp_path, monkeypatch):
     # import/construction time; it falls back to {} so env/defaults apply.
     source = loader.HerdJsonConfigSource(S)
     assert source() == {}
+
+
+def _herd_ordered_settings(loader):
+    """Settings class wired through herd_settings_sources, as every service is."""
+
+    class S(BaseSettings):
+        cors_origins: str = "default-origins"
+        log_level: str = "INFO"
+
+        @classmethod
+        def settings_customise_sources(
+            cls,
+            settings_cls,
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        ):
+            return loader.herd_settings_sources(
+                settings_cls,
+                init_settings,
+                env_settings,
+                dotenv_settings,
+                file_secret_settings,
+            )
+
+    return S
+
+
+def test_herd_sources_file_beats_env(tmp_path, monkeypatch):
+    # The config-UI invariant: a key saved to config.json takes effect even
+    # though compose injects the same key as a container env var.
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"CORS_ORIGINS": "https://from-file"}))
+    loader = _reload_loader(monkeypatch, str(config_file))
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    settings = _herd_ordered_settings(loader)()
+    assert settings.cors_origins == "https://from-file"
+
+
+def test_herd_sources_env_applies_for_keys_absent_from_file(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"CORS_ORIGINS": "https://from-file"}))
+    loader = _reload_loader(monkeypatch, str(config_file))
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+
+    settings = _herd_ordered_settings(loader)()
+    assert settings.log_level == "DEBUG"
+
+
+def test_herd_sources_init_kwargs_beat_file(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"CORS_ORIGINS": "https://from-file"}))
+    loader = _reload_loader(monkeypatch, str(config_file))
+
+    settings = _herd_ordered_settings(loader)(cors_origins="https://explicit")
+    assert settings.cors_origins == "https://explicit"
+
+
+def test_herd_sources_pure_env_when_file_missing(tmp_path, monkeypatch):
+    # Unit tests and bare processes have no /etc/herd/config.json; the reorder
+    # must be a no-op there.
+    loader = _reload_loader(monkeypatch, str(tmp_path / "missing.json"))
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    settings = _herd_ordered_settings(loader)()
+    assert settings.cors_origins == "https://from-env"
+
+
+def test_herd_sources_env_first_while_bootstrap_marker_present(tmp_path, monkeypatch):
+    # An auto-bootstrapped config.json is a copy of the environment, not an
+    # operator decision: while the marker exists the env stays authoritative
+    # and the file only fills keys the env lacks (its original fallback role).
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps({"CORS_ORIGINS": "https://from-file", "LOG_LEVEL": "WARNING"})
+    )
+    (tmp_path / "config.bootstrapped").write_text("marker")
+    loader = _reload_loader(monkeypatch, str(config_file))
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    settings = _herd_ordered_settings(loader)()
+    assert settings.cors_origins == "https://from-env"
+    assert settings.log_level == "WARNING"
+
+
+def test_source_skips_empty_string_values(tmp_path, monkeypatch):
+    # An empty string in config.json means "unset": the key must fall through
+    # to the environment instead of shadowing it, even in file-first mode.
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"CORS_ORIGINS": "", "LOG_LEVEL": "WARNING"}))
+    loader = _reload_loader(monkeypatch, str(config_file))
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    settings = _herd_ordered_settings(loader)()
+    assert settings.cors_origins == "https://from-env"
+    assert settings.log_level == "WARNING"
+
+
+def test_source_database_url_yields_to_env_database_url(tmp_path, monkeypatch):
+    # The derived URL hardcodes the in-compose postgres:5432 host; a deployer
+    # pointing at an external DB via DATABASE_URL must keep winning even in
+    # file-first mode.
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps({"POSTGRES_USER": "herd", "POSTGRES_PASSWORD": "pw", "POSTGRES_DB": "herd"})
+    )
+    loader = _reload_loader(monkeypatch, str(config_file))
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@db.example.com:6432/herd")
+
+    values = loader.HerdJsonConfigSource(BaseSettings)()
+    assert "database_url" not in values

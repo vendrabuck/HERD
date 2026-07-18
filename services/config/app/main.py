@@ -125,6 +125,8 @@ async def get_schema():
 async def get_settings(_session: dict = Depends(require_config_session)):
     # Layer env values under file values so deployer-supplied env vars show up
     # in the editor when config.json is missing the key; file wins on conflict.
+    # This mirrors the runtime source order for a UI-saved file in
+    # herd_common.config_loader.herd_settings_sources; keep the two in sync.
     merged = {**load_env_values(), **load_config()}
     secret_keys = {f["key"] for f in CONFIG_SCHEMA if f.get("secret")}
     redacted = {}
@@ -141,13 +143,23 @@ async def update_settings(
     req: SaveSettingsRequest,
     _rotated: None = Depends(require_password_rotated),
 ):
-    # Merge: if a secret field is "********", keep the existing value
+    # Merge: a "********" value means "unchanged". Resolve it to the existing
+    # file value, else the env value the editor rendered it from, and never
+    # write the placeholder itself: once saved, config.json outranks the
+    # environment at runtime (herd_common.config_loader.herd_settings_sources),
+    # so a literal "********" would become the live credential.
     existing = load_config()
+    env_values = load_env_values()
     secret_keys = {f["key"] for f in CONFIG_SCHEMA if f.get("secret")}
     merged = dict(req.values)
     for key in secret_keys:
-        if merged.get(key) == "********" and key in existing:
-            merged[key] = existing[key]
+        if merged.get(key) == "********":
+            if key in existing:
+                merged[key] = existing[key]
+            elif key in env_values:
+                merged[key] = env_values[key]
+            else:
+                merged.pop(key, None)
 
     errors = save_config(merged)
     if errors:

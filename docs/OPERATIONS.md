@@ -50,7 +50,7 @@ If any required var is missing, the config service logs a warning listing them a
 6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts every other container via the Docker socket.
 7. Once containers come back healthy (`docker compose ps`), the login form re-enables and you can sign in as the superadmin.
 
-`.env` values take precedence over config-page values. A mixed approach is fine: put secrets in `.env`, let the UI manage everything else. The config UI's own password is independent of the app config: set `CONFIG_ADMIN_PASSWORD` to pin it, otherwise the wrench icon accepts the random one-time password logged on first boot.
+Config-page values take precedence over `.env` for every key that has been saved through the config UI; a `config.json` that exists only from the first-run auto-bootstrap stays subordinate to `.env`, so pure-`.env` operation is unchanged until the first UI save (see the precedence section in `ENV_VARS.md` for the marker mechanics and the escape hatches). The config UI's own password is independent of the app config: set `CONFIG_ADMIN_PASSWORD` to pin it, otherwise the wrench icon accepts the random one-time password logged on first boot.
 
 ## Upgrade path
 

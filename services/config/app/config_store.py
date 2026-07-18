@@ -22,6 +22,11 @@ def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+def _bootstrap_marker_file() -> str:
+    # Derived at call time so the test fixture's DATA_DIR monkeypatch applies.
+    return os.path.join(DATA_DIR, "config.bootstrapped")
+
+
 def _hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -146,6 +151,13 @@ def save_config(values: dict) -> list[str]:
     _ensure_data_dir()
     with open(CONFIG_FILE, "w") as f:
         json.dump(values, f, indent=2)
+    # A save is a deliberate operator decision: dropping the bootstrap marker
+    # promotes config.json above the environment in every service from its
+    # next start (see herd_common.config_loader.herd_settings_sources).
+    try:
+        os.remove(_bootstrap_marker_file())
+    except FileNotFoundError:
+        pass
     return []
 
 
@@ -186,5 +198,10 @@ def bootstrap_from_env() -> bool:
     _ensure_data_dir()
     with open(CONFIG_FILE, "w") as f:
         json.dump(values, f, indent=2)
+    # Mark the file as env-bootstrapped: it is a copy of the environment, not
+    # an operator decision, so services keep treating the environment as
+    # authoritative until the first real config-UI save deletes this marker.
+    with open(_bootstrap_marker_file(), "w") as f:
+        f.write("created by first-boot auto-bootstrap; deleted on first config-UI save\n")
     logger.info("Config bootstrapped from environment into %s", CONFIG_FILE)
     return True
