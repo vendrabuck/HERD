@@ -1,4 +1,5 @@
 import logging
+import socket
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +26,34 @@ def restart_services() -> dict:
         return result
 
     try:
-        containers = client.containers.list(filters={"label": "com.docker.compose.service"})
+        # Get the current container ID from hostname
+        hostname = socket.gethostname()
+        # In Docker, the hostname is the container ID by default
+        self_container = client.containers.get(hostname)
+        # Get the project label from the container's labels
+        project = self_container.labels.get("com.docker.compose.project")
+        if project is None:
+            raise ValueError("Cannot determine project label from container")
     except Exception as exc:
-        result["errors"].append(f"Cannot list containers: {exc}")
+        msg = f"Failed to determine current project: {exc}"
+        result["errors"].append(msg)
+        logger.error(msg)
+        return result
+
+    try:
+        # Filter containers by both project and service label
+        containers = client.containers.list(
+            filters={
+                "label": [
+                    f"com.docker.compose.project={project}",
+                    "com.docker.compose.service"
+                ]
+            }
+            )
+    except Exception as exc:
+        msg = f"Cannot list containers: {exc}"
+        result["errors"].append(msg)
+        logger.error(msg)
         return result
 
     for container in containers:
