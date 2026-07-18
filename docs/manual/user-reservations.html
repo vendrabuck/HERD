@@ -39,9 +39,10 @@
       <li><a href="quickstart.html">1 · First boot</a></li>
       <li><a href="user-reservations.html" class="active">2 · Reservations</a></li>
       <li><a href="user-topology.html">3 · Topology</a></li>
-      <li><a href="user-ai.html">4 · Generate with AI</a></li>
-      <li><a href="user-assistant.html">5 · AI assistant</a></li>
-      <li><a href="user-notifications.html">6 · Notifications</a></li>
+      <li><a href="user-live-editing.html">4 · Live editing</a></li>
+      <li><a href="user-ai.html">5 · Generate with AI</a></li>
+      <li><a href="user-assistant.html">6 · AI assistant</a></li>
+      <li><a href="user-notifications.html">7 · Notifications</a></li>
     </ul>
   </aside>
 
@@ -181,7 +182,7 @@
 
     <h2 class="sec" id="detail">Drilling in</h2>
     <p class="sectitle">The reservation detail modal</p>
-    <p>Click any row to open its detail view. Four tabs:</p>
+    <p>Click any row to open its detail view. Five tabs:</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -194,7 +195,8 @@
                   <span class="hd-mtab active" data-anno="1" data-anno-pin="b" data-anno-arrow>Details</span>
                   <span class="hd-mtab" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">Inventory</span>
                   <span class="hd-mtab" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Routes</span>
-                  <span class="hd-mtab" data-anno="4" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Schedule</span>
+                  <span class="hd-mtab" data-anno="4" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Wiring</span>
+                  <span class="hd-mtab" data-anno="5" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Schedule</span>
                 </div>
                 <dl class="hd-dl">
                   <dt>Status</dt><dd><span class="hd-badge active">ACTIVE</span></dd>
@@ -216,12 +218,18 @@
       <li><b>Details</b> &mdash; the basics: id, purpose, dates, status. The default tab.</li>
       <li><b>Inventory</b> &mdash; the devices in this reservation. Expand a device to see its ports and what each is cabled to.</li>
       <li><b>Routes</b> &mdash; for DUT-to-DUT pairs, the hop-by-hop path through the L1 switches. Green = reachable, red = not.</li>
+      <li><b>Wiring</b> &mdash; the per-connection status of the L1 wiring HERD applied to the hardware, with a <b>Retry failed</b> action while the reservation is active. Full walkthrough in <a href="user-live-editing.html#wiring">Live editing</a>.</li>
       <li><b>Schedule</b> &mdash; inline-edit the end time and purpose without rebooking.</li>
     </ol>
 
     <div class="callout tip">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4z"/></svg></span>
       <div><span class="ttl">Need to add a device mid-run?</span><p>You (the owner) or an admin can hit <b>Edit Resources</b> on an active reservation to add or remove devices on the fly. Added exclusive devices get a conflict check; removed ones are released back to <span class="badge available">AVAILABLE</span>.</p></div>
+    </div>
+
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
+      <div><span class="ttl">Re-wiring a live reservation</span><p>On an <span class="badge active">ACTIVE</span> reservation you own, the tab bar also shows <b>Edit topology</b>. It opens the reservation's private <strong>fork</strong> in the editor's live-edit mode &mdash; your changes never touch the shared master topology, and a <span class="badge pending">PENDING</span> reservation offers no topology editing at all (its fork doesn't exist until activation). After the reservation ends, the button becomes <b>View as-built</b>. The whole flow is <a href="user-live-editing.html">step 4, Live editing</a>.</p></div>
     </div>
 
     <h2 class="sec" id="calendar">Finding a free window</h2>
