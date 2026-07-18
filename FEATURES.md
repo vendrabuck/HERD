@@ -225,7 +225,8 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Structured JSON logging** (Shipped): every service emits JSON logs with request
   middleware and business-event logging; per-service log level configurable.
 - **Config service** (Shipped): zero-database web UI for configuring HERD on first
-  start. Environment variables in `.env` continue to take precedence.
+  start. Values saved through the UI take precedence over `.env`; an auto-bootstrapped
+  config file stays subordinate, so pure-`.env` setups behave unchanged.
 
 ## Integration
 

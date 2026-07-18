@@ -47,7 +47,7 @@ If any required var is missing, the config service logs a warning listing them a
 3. Log in with the config-page password: set `CONFIG_ADMIN_PASSWORD` to choose it, or read the random one-time password the config service logs on first boot (`docker compose logs config`).
 4. If you used the random one-time password, you must change it (min 8, max 32 chars) before the config write and apply actions unlock.
 5. Fill in the required database, auth, and API-token fields (same required list as above). The superadmin fields are optional; if you skip them, create the first admin account through the UI afterward.
-6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts every other container via the Docker socket.
+6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts this compose project's app services via the Docker socket (config, traefik, postgres, nats, and the frontend are skipped; other compose projects on the host are never touched).
 7. Once containers come back healthy (`docker compose ps`), the login form re-enables and you can sign in as the superadmin.
 
 Config-page values take precedence over `.env` for every key that has been saved through the config UI; a `config.json` that exists only from the first-run auto-bootstrap stays subordinate to `.env`, so pure-`.env` operation is unchanged until the first UI save (see the precedence section in `ENV_VARS.md` for the marker mechanics and the escape hatches). The config UI's own password is independent of the app config: set `CONFIG_ADMIN_PASSWORD` to pin it, otherwise the wrench icon accepts the random one-time password logged on first boot.

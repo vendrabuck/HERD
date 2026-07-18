@@ -139,8 +139,9 @@ cp .env.example .env
 #   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
 #   AUTH_SECRET_KEY, INTERNAL_API_TOKEN  (generate each with: openssl rand -hex 32)
 # docker-compose injects them into the containers at creation time. The config
-# UI shows these fields, but editing them there only takes effect on a full
-# recreate, not the UI's "Save and Restart", and postgres is never restarted by it.
+# UI shows these fields; a UI save outranks the env for the app services that
+# "Save and Restart" restarts, but postgres itself is never restarted by it,
+# so change the POSTGRES_* values only via .env plus a full recreate.
 
 make up        # dev mode: hot-reload + volume mounts
 
@@ -170,7 +171,8 @@ make logs
 ```
 
 The app is available at `https://localhost` (HTTP redirects to HTTPS).
-Environment variables from `.env` take precedence over config page values.
+Values saved through the config UI take precedence over `.env`; a `config.json`
+that exists only from first-run auto-bootstrap does not (see `docs/ENV_VARS.md`).
 
 ### API Endpoints
 
@@ -313,9 +315,12 @@ on a shared Docker volume. Password-protected with its own authentication (set
 boot and must be changed before the write surface unlocks). All environment variables from `.env.example`
 are exposed as configurable fields. On first startup with no config, login is blocked
 until the admin completes setup via the wrench icon on the login page. After saving,
-the service restarts all HERD containers via Docker API. All other services read
-the config file via a shared Pydantic settings source in herd-common, with env vars
-taking precedence (backward compatible with the .env workflow).
+the service restarts this compose project's HERD services via the Docker API
+(config, traefik, postgres, nats, and the frontend are skipped, and other compose
+projects on the host are never touched). All other services read the config file via
+a shared Pydantic settings source in herd-common; values saved through the UI take
+precedence over env vars, while an auto-bootstrapped config file stays subordinate
+to them, so pure-.env operation is unchanged until the first UI save.
 
 ### Auth Service
 Registration, login, JWT issuance, refresh token rotation, logout, superadmin
