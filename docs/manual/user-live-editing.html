@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Live-editing a reservation</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#fork">What a fork is</a></li>
+      <li><a href="#changes">What changed</a></li>
+      <li><a href="#open">Opening live-edit mode</a></li>
+      <li><a href="#editing">Drafts &amp; autosave</a></li>
+      <li><a href="#commit">Committing your wiring</a></li>
+      <li><a href="#conflicts">Port conflicts</a></li>
+      <li><a href="#wiring">The Wiring tab</a></li>
+      <li><a href="#asbuilt">After it ends</a></li>
+    </ul>
+    <p class="eyebrow">User track</p>
+    <ul>
+      <li><a href="quickstart.html">1 · First boot</a></li>
+      <li><a href="user-reservations.html">2 · Reservations</a></li>
+      <li><a href="user-topology.html">3 · Topology</a></li>
+      <li><a href="user-live-editing.html" class="active">4 · Live editing</a></li>
+      <li><a href="user-ai.html">5 · Generate with AI</a></li>
+      <li><a href="user-assistant.html">6 · AI assistant</a></li>
+      <li><a href="user-notifications.html">7 · Notifications</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker user">User track · Step 4</span>
+    <h1 class="title">Live-editing a reservation</h1>
+    <p class="dek">Once a reservation is <span class="badge active">ACTIVE</span>, you can re-wire its topology while it runs. You're not editing the shared master diagram &mdash; you're editing the reservation's own private <strong>fork</strong>, and HERD applies your changes to the real hardware.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The one-sentence version</div>
+      <p>Open an active reservation, click <b>Edit topology</b>, re-wire the canvas, and hit <b>Commit to reservation</b> &mdash; your edits land on a private copy, never on the master topology, and the <b>Wiring</b> tab shows you whether each cross-connect actually took.</p>
+    </div>
+
+    <h2 class="sec" id="fork">The mental model</h2>
+    <p class="sectitle">What a fork is</p>
+    <p>The moment your reservation activates, HERD gives it a <strong>fork</strong>: a private working copy of the topology it was created from. Everything you do in live-edit mode happens on that fork:</p>
+    <ul class="list">
+      <li><b>It exists from activation onward.</b> A <span class="badge pending">PENDING</span> reservation has no fork yet, so there is nothing to edit before it goes active.</li>
+      <li><b>It's yours.</b> Only the reservation owner (or an admin) can open it, and it's editable only while the reservation is <span class="badge active">ACTIVE</span>.</li>
+      <li><b>It has its own version history.</b> Every commit appends a fork version. The fork history panel lists them (newest first, with author and timestamp) but is view-only &mdash; no preview, diff, or restore, unlike a standalone topology's history.</li>
+      <li><b>It outlives the reservation</b> &mdash; as a frozen, read-only <a href="#asbuilt">as-built record</a>.</li>
+    </ul>
+
+    <h2 class="sec" id="changes">Read this if you used the old behavior</h2>
+    <p class="sectitle">Two changes that will surprise you</p>
+
+    <div class="callout danger">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">Live edits no longer touch the parent topology</span><p>Editing during a reservation used to modify the shared master topology and clutter its version history. It doesn't anymore. Live edits go to the reservation's fork and append <em>fork</em> versions only &mdash; the master template stays exactly as saved, for everyone. If you relied on live edits to update the master, save the master separately from the <a href="user-topology.html">topology editor</a>.</p></div>
+    </div>
+
+    <div class="callout danger">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">PENDING reservations no longer offer topology editing</span><p>The fork exists only from activation onward, so a <span class="badge pending">PENDING</span> reservation's detail modal shows no <b>Edit topology</b> button at all. Previously, editing a not-yet-active reservation mutated the shared parent topology; that path is gone. Wait for the reservation to activate, then edit its fork.</p></div>
+    </div>
+
+    <h2 class="sec" id="open">Getting in</h2>
+    <p class="sectitle">Opening live-edit mode</p>
+    <div class="steps">
+      <div class="stepblock"><div class="stepbody"><h3 class="step">Open your <span class="badge active">ACTIVE</span> reservation</h3><p>Click its row on the <a href="user-reservations.html">Reservations</a> page to open the detail modal.</p></div></div>
+      <div class="stepblock"><div class="stepbody"><h3 class="step">Click <b>Edit topology</b></h3><p>The blue-outlined button in the tab bar. It's there only if you own the reservation (admins can open the fork too) and the reservation is active.</p></div></div>
+      <div class="stepblock"><div class="stepbody"><h3 class="step">You land on the canvas, in live-edit mode</h3><p>The editor loads the reservation's <strong>fork</strong>, not the parent topology, and a blue banner marks the mode.</p></div></div>
+    </div>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/topology/9a81c0d2?reservationId=f1a2b3c4</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a class="active">Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><span class="u">sara.k</span></span></div>
+            <div class="hd-canvas" style="height:340px;">
+              <script type="application/json" class="hd-edges">
+                [{"from":"#ln1","to":"#ln2","layer":"l1"},
+                 {"from":"#ln2","to":"#ln3","layer":"l2"}]
+              </script>
+              <div style="position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:5;background:#fff;border:2px solid var(--blue-400);border-radius:var(--radius-lg);box-shadow:var(--shadow-md);padding:12px 16px;max-width:560px;" data-anno="1" data-anno-pin="l" data-anno-arrow data-anno-pad="4">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span style="font-size:11px;font-weight:700;padding:2px 6px;border-radius:4px;background:var(--blue-600);color:#fff;white-space:nowrap;">EDITING LIVE RESERVATION</span>
+                  <span style="font-size:13px;font-weight:500;white-space:nowrap;">4 devices</span>
+                  <span style="font-size:11px;color:var(--gray-400);white-space:nowrap;" data-anno="2" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Draft saved</span>
+                  <span style="flex:1"></span>
+                  <span class="hd-btn secondary sm" style="white-space:nowrap;">Cancel</span>
+                  <span class="hd-btn primary sm" style="white-space:nowrap;" data-anno="3" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Commit to reservation</span>
+                </div>
+                <p style="font-size:11.5px;color:var(--gray-600);margin:6px 0 0;">Changes commit to the running reservation and re-provision the affected devices. Edits autosave as drafts; committing saves a fork version and leaves the master topology untouched.</p>
+              </div>
+              <div class="hd-node" id="ln1" style="left:130px;top:150px;">
+                <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-01</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Palo PA-460</div>
+              </div>
+              <div class="hd-node" id="ln2" style="left:400px;top:210px;">
+                <span class="handle l"></span><span class="handle r"></span><div class="gl"></div><div class="nm">l1-patch-mux</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">MRV L1 Switch</div>
+              </div>
+              <div class="hd-node" id="ln3" style="left:620px;top:140px;">
+                <span class="handle l"></span><div class="gl"></div><div class="nm">dut-server-14</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Dell R760</div>
+              </div>
+              <span class="hd-elabel" style="left:300px;top:200px;white-space:nowrap;"><span class="layer l1">L1</span><span class="hops">1 hop</span></span>
+              <span class="hd-elabel" style="left:545px;top:195px;white-space:nowrap;"><span class="layer l2">L2</span><span class="port">ge-4 - eth1/2</span></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>Live-edit mode.</b> The blue banner is the tell: you're on the reservation's fork, not the master topology.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The live-edit banner.</b> Shows the device count and the autosave status. Everything else on the canvas works exactly like the normal <a href="user-topology.html">editor</a>: drag devices, draw or remove L1/L2/L3 links, same red-edge checks.</li>
+      <li><b>Autosave status.</b> Cycles through "Saving draft&hellip;" and "Draft saved" as you work. See <a href="#editing">below</a>.</li>
+      <li><b>Commit to reservation.</b> The explicit save. Disabled while any edge is red &mdash; same rule as reserving. See <a href="#commit">Committing</a>.</li>
+    </ol>
+
+    <h2 class="sec" id="editing">Work in progress is safe</h2>
+    <p class="sectitle">Drafts &amp; autosave</p>
+    <p>As you edit, your changes autosave as a <strong>loose draft</strong> a moment after you stop making them &mdash; the banner flips from "Saving draft&hellip;" to "Draft saved". A draft is stored without touching the hardware or the fork's version history, so you can close the tab mid-thought and pick the edit back up later.</p>
+    <ul class="list">
+      <li><b>"Draft saved" does not mean applied.</b> Nothing reaches the reservation or the hardware until you <a href="#commit">commit</a>.</li>
+      <li><b>"Draft save failed"</b> in red means the autosave didn't land (usually a network blip). Your canvas is still intact; keep the tab open and commit, or check your connection.</li>
+    </ul>
+
+    <h2 class="sec" id="commit">Making it real</h2>
+    <p class="sectitle">Committing your wiring</p>
+    <p>Click <b>Commit to reservation</b>. HERD reconciles the fork in one transaction: connections you removed are <strong>released</strong>, connections you added are <strong>built</strong> (release before build), and a new fork version is appended. Committing also updates the reservation's device set, so provisioning re-runs for the affected devices.</p>
+    <p>A toast reports the result &mdash; <strong>"Fork saved as vN"</strong> with released, built, and unchanged counts &mdash; and expands to list the exact connections released and built.</p>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><span class="ttl">Red edges block the commit</span><p>Same as reserving: if any edge has no physical path, the commit button is disabled and the banner tells you how many edges to fix or remove. The server applies the same check, so there's no way around it.</p></div>
+    </div>
+
+    <h2 class="sec" id="conflicts">When someone got there first</h2>
+    <p class="sectitle">Port conflicts</p>
+    <p>Switch ports are a shared resource. If your wiring would claim a port that another <em>active</em> reservation already holds, the save is refused and this dialog appears:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>Ports already claimed</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <p style="font-size:13.5px;color:var(--gray-700);margin:0 0 4px;">One or more ports are already claimed by another active reservation.</p>
+                <p style="font-size:12px;color:var(--gray-500);margin:0 0 12px;" data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue">Your drawing is kept on the canvas. Re-wire the conflicting ports and save again.</p>
+                <div style="border:1px solid var(--gray-200);border-radius:6px;" data-anno="1" data-anno-pin="r" data-anno-arrow>
+                  <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;font-size:13px;border-bottom:1px solid var(--gray-100);flex-wrap:wrap;">
+                    <span style="font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;background:#fee2e2;color:#b91c1c;">port ge-7</span>
+                    <span style="color:var(--gray-700);white-space:nowrap;">device <code>a3f9c2e1</code></span>
+                    <span style="color:var(--gray-500);font-size:12px;white-space:nowrap;">held by reservation <code>77e0b4d9</code></span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;font-size:13px;flex-wrap:wrap;">
+                    <span style="font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;background:#fee2e2;color:#b91c1c;">port ge-8</span>
+                    <span style="color:var(--gray-700);white-space:nowrap;">device <code>a3f9c2e1</code></span>
+                    <span style="color:var(--gray-500);font-size:12px;white-space:nowrap;">held by reservation <code>77e0b4d9</code></span>
+                  </div>
+                </div>
+              </div>
+              <div class="mfoot"><span class="hd-btn primary" style="white-space:nowrap;">Back to editing</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The port-conflict dialog.</b> Nothing was saved; the dialog names exactly what's in the way.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Each blocking claim, spelled out.</b> One row per conflict: the port, the device it's on, and the reservation currently holding it. Use the reservation id with the <a href="user-reservations.html#calendar">calendar</a> to find out whose it is and when it frees up.</li>
+      <li><b>Nothing is lost.</b> Your drawing stays on the canvas exactly as you left it. Re-wire the conflicting connections onto free ports (or wait the other reservation out) and commit again.</li>
+    </ol>
+
+    <h2 class="sec" id="wiring">Did the hardware take it?</h2>
+    <p class="sectitle">The Wiring tab</p>
+    <p>Committing records your <em>intent</em>. HERD then applies the L1 wiring to the actual switches one cross-connect at a time &mdash; and the reservation detail modal's <b>Wiring</b> tab shows how each one went.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal wide">
+              <div class="mhead"><h2>Reservation f1a2b3c4</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-mtabs">
+                  <span class="hd-mtab">Details</span>
+                  <span class="hd-mtab">Inventory</span>
+                  <span class="hd-mtab">Routes</span>
+                  <span class="hd-mtab active">Wiring</span>
+                  <span class="hd-mtab">Schedule</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;font-size:12px;color:var(--gray-500);margin-bottom:10px;">
+                  <span>Applied fork version: <b style="color:var(--gray-700);">v3</b></span>
+                  <span style="padding:2px 6px;border-radius:4px;background:#fee2e2;color:#b91c1c;font-weight:500;">1 failed</span>
+                  <span style="flex:1"></span>
+                  <span class="hd-btn primary sm" style="white-space:nowrap;" data-anno="3" data-anno-pin="l" data-anno-arrow data-anno-color="blue">Retry failed</span>
+                </div>
+                <div style="border:1px solid var(--gray-200);border-radius:6px;overflow:hidden;margin-bottom:8px;" data-anno="1" data-anno-pin="r" data-anno-arrow>
+                  <div style="display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--gray-50);border-bottom:1px solid var(--gray-100);font-size:13px;">
+                    <span style="font-weight:500;">l1-patch-mux</span>
+                    <span style="font-family:var(--font-mono);font-size:11.5px;color:var(--gray-500);white-space:nowrap;">ge-4 to ge-11</span>
+                    <span style="margin-left:auto;font-size:11px;font-weight:500;padding:2px 6px;border-radius:4px;background:var(--res-active-bg);color:var(--res-active-fg);">ACTIVE</span>
+                  </div>
+                  <div style="padding:5px 12px;font-size:11.5px;color:var(--gray-500);">Attempts: <b style="color:var(--gray-700);">1</b> <span style="font-family:var(--font-mono);margin-left:10px;">cable 4be91f02</span></div>
+                </div>
+                <div style="border:1px solid var(--gray-200);border-radius:6px;overflow:hidden;" data-anno="2" data-anno-pin="r" data-anno-arrow>
+                  <div style="display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--gray-50);border-bottom:1px solid var(--gray-100);font-size:13px;">
+                    <span style="font-weight:500;">l1-patch-mux</span>
+                    <span style="font-family:var(--font-mono);font-size:11.5px;color:var(--gray-500);white-space:nowrap;">ge-7 to ge-12</span>
+                    <span style="margin-left:auto;font-size:11px;font-weight:500;padding:2px 6px;border-radius:4px;background:var(--res-failed-bg);color:var(--res-failed-fg);">FAILED</span>
+                  </div>
+                  <div style="padding:5px 12px 2px;font-size:11.5px;color:var(--gray-500);">Attempts: <b style="color:var(--gray-700);">3</b></div>
+                  <p style="padding:0 12px 8px;font-size:11.5px;color:#dc2626;margin:0;">Driver timeout: no response from switch after 30s</p>
+                </div>
+              </div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The Wiring tab.</b> One card per switch cross-connect, with the honest per-connection verdict.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>A healthy connection.</b> The switch, the port pair, an <span class="badge active">ACTIVE</span> status, and the attempt count. Released connections show a gray RELEASED instead.</li>
+      <li><b>A failed connection.</b> The status goes red and the driver's actual error is printed underneath. <strong>Your saved wiring is not rolled back</strong> &mdash; the intent stays durable, only the hardware apply failed.</li>
+      <li><b>Retry failed.</b> Reattempts every retryable failed connection at once; a toast summarizes how many reconnected, are still failing, or are not retryable. The button appears only while the reservation is <span class="badge active">ACTIVE</span> and something is actually retryable.</li>
+    </ol>
+
+    <div class="callout tip">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
+      <div><span class="ttl">Most failures fix themselves</span><p>A driver timeout or a switch login blip is transient: HERD auto-retries failed connections in the background with backoff. Reach for <b>Retry failed</b> when you don't want to wait.</p></div>
+    </div>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><span class="ttl">When retrying won't help</span><p>A failed connection marked <em>not retryable</em> can't be reapplied as recorded &mdash; its cabling path changed under the reservation, so the row explains that retrying is pointless. The fix is to <strong>re-save the fork wiring</strong> (open live-edit mode and commit again), which re-resolves the path against current inventory. Then retry.</p></div>
+    </div>
+
+    <h2 class="sec" id="asbuilt">The paper trail</h2>
+    <p class="sectitle">After the reservation ends</p>
+    <p>Once the reservation is <span class="badge" style="background:var(--res-completed-bg);color:var(--res-completed-fg)">COMPLETED</span>, <span class="badge" style="background:var(--res-cancelled-bg);color:var(--res-cancelled-fg)">CANCELLED</span>, or <span class="badge failed">FAILED</span>, the fork freezes into the immutable <strong>as-built record</strong>: the last wiring the reservation was actually reconciled to.</p>
+    <ul class="list">
+      <li><b>The detail modal's button becomes View as-built.</b> It opens the same fork in the editor, read-only, under a gray "As-built record (read-only)" banner. Nothing can edit it after this point.</li>
+      <li><b>The Wiring tab stays readable</b> as part of the record &mdash; but the <b>Retry failed</b> action is gone, since it's offered only while the reservation is active.</li>
+    </ul>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-canvas" style="height:150px;">
+              <div style="position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:5;background:#fff;border:2px solid var(--gray-400);border-radius:var(--radius-lg);box-shadow:var(--shadow-md);padding:12px 16px;max-width:560px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span style="font-size:11px;font-weight:700;padding:2px 6px;border-radius:4px;background:var(--gray-700);color:#fff;white-space:nowrap;">AS-BUILT RECORD (READ-ONLY)</span>
+                  <span style="font-size:13px;font-weight:500;white-space:nowrap;">4 devices</span>
+                  <span style="flex:1"></span>
+                  <span class="hd-btn secondary sm" style="white-space:nowrap;">Back to reservations</span>
+                </div>
+                <p style="font-size:11.5px;color:var(--gray-600);margin:6px 0 0;">This reservation has ended. The wiring below is the archived as-built record and cannot be edited.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The as-built banner.</b> Gray instead of blue: look, don't touch.</p>
+    </figure>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><span class="ttl">Why keep it?</span><p>The as-built record answers "what was this lab actually wired as when the test ran" &mdash; months later, without archaeology. It's the reservation's audit trail, not a template; clone the master topology if you want to run the same lab again.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Live-editing a reservation</p>
+      <div class="pagenav">
+        <a href="user-topology.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Topology</a>
+        <a href="user-ai.html" style="white-space:nowrap;">Generate with AI <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>
