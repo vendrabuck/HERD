@@ -35,6 +35,24 @@ def test_bootstrap_writes_config_when_required_env_set(monkeypatch):
     assert written["CORS_ORIGINS"] == "https://localhost"
 
 
+def test_bootstrap_writes_marker(monkeypatch):
+    # The marker keeps the env authoritative until a real config-UI save
+    # (herd_common.config_loader.herd_settings_sources checks for it).
+    _set_required_env(monkeypatch)
+
+    assert config_store.bootstrap_from_env() is True
+    assert os.path.exists(config_store._bootstrap_marker_file())
+
+
+def test_save_config_clears_bootstrap_marker(monkeypatch):
+    seed = _set_required_env(monkeypatch)
+    assert config_store.bootstrap_from_env() is True
+    assert os.path.exists(config_store._bootstrap_marker_file())
+
+    assert config_store.save_config(seed) == []
+    assert not os.path.exists(config_store._bootstrap_marker_file())
+
+
 def test_bootstrap_skips_when_required_missing(monkeypatch):
     for key in REQUIRED_KEYS:
         monkeypatch.delenv(key, raising=False)

@@ -1,14 +1,26 @@
 # Environment Variables Reference
 
-Every environment variable HERD reads, where it's consumed, and what it does. `.env` values take precedence over the config service's `config.json`.
+Every environment variable HERD reads, where it's consumed, and what it does. Values saved through the config UI take precedence over `.env`; a `config.json` that exists only from first-run auto-bootstrap does not (details below).
 
 ## Precedence (highest to lowest)
 
-1. `os.environ` (shell / `.env` / docker compose environment block)
-2. `config.json` written by the config service at `/data/herd-config/config.json` (the directory is overridable via `HERD_CONFIG_DATA_DIR`)
-3. In-code defaults (usually dev-friendly values)
+1. `config.json` once saved through the config UI, at `/data/herd-config/config.json` (the directory is overridable via `HERD_CONFIG_DATA_DIR`)
+2. `os.environ` (shell / `.env` / docker compose environment block)
+3. Auto-bootstrapped `config.json` (marked by a sibling `config.bootstrapped` file; a copy of the environment serving as fallback)
+4. In-code defaults (usually dev-friendly values)
 
-This means you can override a config-service setting temporarily via the shell, and the override wins until you remove it.
+Which rung the file occupies depends on how it came to exist:
+
+- A `config.json` created solely by the first-run auto-bootstrap (below) is a copy of the environment, not an operator decision. The config service writes a `config.bootstrapped` marker beside it and the file ranks below the environment, so a stack driven purely by `.env` behaves exactly as it always has: edit `.env`, recreate containers, done.
+- The first real save through the config UI deletes the marker. From then on the file outranks the environment for every key it carries, which is what makes Save and Restart actually take effect: container env vars are fixed at container creation, so with env-first ordering a config-UI save could never change a running deployment.
+
+Guard rails, in both modes:
+
+- An empty string saved in `config.json` means "unset": the key falls through to the environment, so clearing an optional field in the UI hands it back to `.env`. Required fields cannot be cleared in the UI (the save is rejected); to hand a required key back to the environment, edit or delete `config.json` on the `herd-config` volume (deleting it re-runs the auto-bootstrap on the next config-service start).
+- A `DATABASE_URL` set in the environment always outranks the URL derived from the file's `POSTGRES_*` values; the derived form hardcodes the in-compose `postgres:5432` host and exists only as a fallback.
+- Keys outside the config schema (the dev/test knobs, `SECRETS_KEK`, and so on) never appear in `config.json` and always resolve from the environment.
+
+Upgrading from a version without the marker: an existing `config.json` with no `config.bootstrapped` beside it is treated as UI-saved (file-first). To hand control back to the environment, create an empty `config.bootstrapped` file next to `config.json` on the volume.
 
 ## First-run auto-bootstrap
 
@@ -18,7 +30,7 @@ The config page's own login password is set by `CONFIG_ADMIN_PASSWORD`. When you
 
 ## Config editor populates from env
 
-The wrench-icon config editor shows every schema field that is present in the config container's environment even when `config.json` is missing the key; secrets sourced from env are still rendered as `********`. If a field is set both in `config.json` and in the environment, the file value wins in the editor (it represents an explicit save). Runtime services continue to read `os.environ` directly, so the precedence ladder above still applies to the actual behavior of the stack.
+The wrench-icon config editor shows every schema field that is present in the config container's environment even when `config.json` is missing the key; secrets sourced from env are still rendered as `********`. If a field is set both in `config.json` and in the environment, the file value wins in the editor (it represents an explicit save), and the services resolve it the same way at runtime, so what the editor shows is what the stack runs with.
 
 For the config service to see these env vars, `docker-compose.yml` maps them into the container via the `environment:` block (see the `POSTGRES_*`, `AUTH_*`, `SUPERADMIN_*`, `INTERNAL_API_TOKEN`, `CORS_ORIGINS`, `NATS_URL`, `AI_API_KEY`, `LOG_LEVEL` passthroughs).
 

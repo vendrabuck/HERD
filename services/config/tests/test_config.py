@@ -336,6 +336,61 @@ class TestSettingsEndpoints:
         assert config["AUTH_SECRET_KEY"] == "mysecret"
 
     @pytest.mark.asyncio
+    async def test_save_settings_resolves_masked_secret_from_env(self, async_client, monkeypatch):
+        # No config.json yet, secret supplied via env: the editor shows it
+        # masked and the browser round-trips "********". The save must resolve
+        # the placeholder from env, never write it literally, because a saved
+        # file outranks env at runtime and the placeholder would become the
+        # live credential.
+        monkeypatch.setenv("AUTH_SECRET_KEY", "env-secret")
+        headers = await self._login(async_client)
+        values = {
+            "POSTGRES_USER": "herd",
+            "POSTGRES_PASSWORD": "secret",
+            "POSTGRES_DB": "herddb",
+            "AUTH_SECRET_KEY": "********",
+            "INTERNAL_API_TOKEN": "tok123",
+        }
+        resp = await async_client.put("/settings", json={"values": values}, headers=headers)
+        assert resp.status_code == 200
+        assert load_config()["AUTH_SECRET_KEY"] == "env-secret"
+
+    @pytest.mark.asyncio
+    async def test_save_settings_drops_masked_optional_secret_without_source(self, async_client):
+        # A masked optional secret with no file value and no env value has
+        # nothing to resolve to: the key is dropped, never stored as the
+        # literal placeholder.
+        headers = await self._login(async_client)
+        values = {
+            "POSTGRES_USER": "herd",
+            "POSTGRES_PASSWORD": "secret",
+            "POSTGRES_DB": "herddb",
+            "AUTH_SECRET_KEY": "mysecret",
+            "INTERNAL_API_TOKEN": "tok123",
+            "AI_API_KEY": "********",
+        }
+        resp = await async_client.put("/settings", json={"values": values}, headers=headers)
+        assert resp.status_code == 200
+        config = load_config()
+        assert "AI_API_KEY" not in config
+        assert "********" not in config.values()
+
+    @pytest.mark.asyncio
+    async def test_save_settings_masked_required_secret_without_source_is_422(self, async_client):
+        # A masked REQUIRED secret with no source resolves to missing and must
+        # fail validation rather than persist the placeholder.
+        headers = await self._login(async_client)
+        values = {
+            "POSTGRES_USER": "herd",
+            "POSTGRES_PASSWORD": "********",
+            "POSTGRES_DB": "herddb",
+            "AUTH_SECRET_KEY": "mysecret",
+            "INTERNAL_API_TOKEN": "tok123",
+        }
+        resp = await async_client.put("/settings", json={"values": values}, headers=headers)
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_save_settings_missing_required(self, async_client):
         headers = await self._login(async_client)
         resp = await async_client.put(

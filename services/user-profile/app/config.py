@@ -1,4 +1,4 @@
-from herd_common.config_loader import HerdJsonConfigSource
+from herd_common.config_loader import herd_settings_sources
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 
@@ -24,11 +24,11 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        return (
+        return herd_settings_sources(
+            settings_cls,
             init_settings,
             env_settings,
             dotenv_settings,
-            HerdJsonConfigSource(settings_cls),
             file_secret_settings,
         )
 

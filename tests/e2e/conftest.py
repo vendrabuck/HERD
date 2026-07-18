@@ -171,6 +171,11 @@ def _ensure_config_seeded():
     already drives the backend. We POST directly to the config service's
     /login + /settings endpoints to materialize config.json; no /apply is
     needed since the stack is already running with the right env values.
+
+    The seeded values are read from the test process env (populated from the
+    repo-root .env above) so they match what the stack is running with: a
+    config-UI save outranks the environment at runtime, so seeding hardcoded
+    defaults would poison a stack whose .env differs.
     """
     with httpx.Client(base_url=HOST_BASE_URL, verify=False, timeout=15.0) as client:
         try:
@@ -185,11 +190,15 @@ def _ensure_config_seeded():
             token = login_resp.json()["token"]
             headers = {"Authorization": f"Bearer {token}"}
             values = {
-                "POSTGRES_USER": "herd",
-                "POSTGRES_PASSWORD": "herdpassword",
-                "POSTGRES_DB": "herd",
-                "AUTH_SECRET_KEY": "change-me-in-production-use-a-long-random-string",
-                "INTERNAL_API_TOKEN": "change-me-internal-token",
+                "POSTGRES_USER": os.environ.get("POSTGRES_USER", "herd"),
+                "POSTGRES_PASSWORD": os.environ.get("POSTGRES_PASSWORD", "herdpassword"),
+                "POSTGRES_DB": os.environ.get("POSTGRES_DB", "herd"),
+                "AUTH_SECRET_KEY": os.environ.get(
+                    "AUTH_SECRET_KEY", "change-me-in-production-use-a-long-random-string"
+                ),
+                "INTERNAL_API_TOKEN": os.environ.get(
+                    "INTERNAL_API_TOKEN", "change-me-internal-token"
+                ),
             }
             client.put(
                 "/api/config/settings",

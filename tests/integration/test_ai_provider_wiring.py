@@ -86,7 +86,9 @@ async def test_ai_status_provider_matches_env(base_url):
         body = (await client.get(f"{base_url}/ai/status")).json()
     assert body["provider"] == expected, (
         f"provider drift: .env says {expected!r}, /api/ai/status says {body['provider']!r}. "
-        "Recreate the ai-orchestrator container: docker compose up -d ai-orchestrator"
+        "Recreate the ai-orchestrator container: docker compose up -d ai-orchestrator. "
+        "If config.json was saved via the config UI it outranks env; update or clear "
+        "the AI settings there instead."
     )
 
 
@@ -99,7 +101,9 @@ async def test_ai_status_model_matches_env(base_url):
         body = (await client.get(f"{base_url}/ai/status")).json()
     assert body["model"] == expected_model, (
         f"model drift: .env says {expected_model!r}, /api/ai/status says {body['model']!r}. "
-        "Recreate the ai-orchestrator container: docker compose up -d ai-orchestrator"
+        "Recreate the ai-orchestrator container: docker compose up -d ai-orchestrator. "
+        "If config.json was saved via the config UI it outranks env; update or clear "
+        "the AI settings there instead."
     )
 
 
