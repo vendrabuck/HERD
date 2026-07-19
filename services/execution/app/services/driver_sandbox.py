@@ -249,7 +249,8 @@ def execute_driver_method(
                 return {
                     "success": True,
                     "output": output,
-                    "error": result.stderr if result.stderr else None,
+                    "error": None,
+                    "stderr": result.stderr if result.stderr else None,
                     "duration_ms": elapsed_ms,
                     "transcript": transcript,
                 }
