@@ -7,6 +7,9 @@ Covers:
   recorded as a FAILED run, not propagated.
 - run_driver_action command-log persistence failure (lines 385-388): a failing
   insert_command_log is logged and swallowed; the run still succeeds.
+- run_driver_action driver-result gating (issue #370): a returned
+  {"success": False} records FAILED with the output preserved; a bare-data
+  output without a success key stays SUCCESS.
 """
 
 import uuid
@@ -219,6 +222,111 @@ async def test_run_driver_action_command_log_failure_swallowed(db, monkeypatch):
     run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
     assert run.status == "SUCCESS"
     assert run.duration_ms == 7
+
+
+# --- run_driver_action driver-result gating (issue #370) ---
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_driver_result_failure_records_failed(db, monkeypatch):
+    """A driver that RETURNS {'success': False} is a FAILED run, not SUCCESS.
+
+    The sandbox transport flag only says the subprocess did not raise; before
+    issue #370 this path recorded SUCCESS with the failure buried in output.
+    The full output payload must survive on the FAILED row.
+    """
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(
+            return_value={
+                "success": True,
+                "output": {"success": False, "error": "mock injected failure on connect_ports"},
+                "duration_ms": 5,
+            }
+        ),
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+    assert run.status == "FAILED"
+    assert run.error == "mock injected failure on connect_ports"
+    assert run.output is not None
+    assert "mock injected failure on connect_ports" in run.output
+    assert run.duration_ms == 5
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_driver_result_failure_without_error_message(db, monkeypatch):
+    """A result-level failure with no error string gets the fallback wording."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(return_value={"success": True, "output": {"success": False}, "duration_ms": 3}),
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+    assert run.status == "FAILED"
+    assert run.error == "driver reported failure"
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_bare_data_output_stays_success(db, monkeypatch):
+    """An output dict with no success key is a bare-data return and stays SUCCESS.
+
+    Conservative posture (issue #370): only an explicit success: False fails the
+    run, so drivers returning plain data (frr_mgmt transcripts, status metrics)
+    are unaffected by the gate.
+    """
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(
+            return_value={
+                "success": True,
+                "output": {"uptime_seconds": 4242, "status": "ok"},
+                "duration_ms": 4,
+            }
+        ),
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+    assert run.status == "SUCCESS"
+    assert run.error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("falsy_success", [0, ""])
+async def test_run_driver_action_falsy_success_value_records_failed(db, monkeypatch, falsy_success):
+    """A PRESENT success key is judged falsy, not identity-False.
+
+    The sandbox boundary is JSON, so a driver violating the bool contract with
+    {"success": 0} or {"success": ""} still crosses as a falsy non-False value;
+    the gate must fail these rather than record SUCCESS (review finding on
+    issue #370). The bare-data posture is untouched: only a present key fails.
+    """
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(
+            return_value={
+                "success": True,
+                "output": {"success": falsy_success},
+                "duration_ms": 2,
+            }
+        ),
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+    assert run.status == "FAILED"
+    assert run.error == "driver reported failure"
 
 
 # --- run_driver_action configure validation: published schema vs registry ---
