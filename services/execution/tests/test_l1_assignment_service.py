@@ -19,6 +19,7 @@ from app.services.l1_assignment_service import (
     compute_backfill_assignments,
     freeze_reservation_wiring,
     record_l1_connect,
+    record_l1_failed,
     release_l1_connection,
 )
 from sqlalchemy import select
@@ -175,6 +176,58 @@ async def test_failed_row_does_not_block_new_active_claim(db):
         .all()
     )
     assert len(actives) == 1
+
+
+# --- record_l1_failed vs concurrent winners (issue #412) ---
+
+
+@pytest.mark.asyncio
+async def test_failed_record_never_downgrades_active_row(db):
+    """A stale failure must not clobber a row a concurrent writer flipped ACTIVE.
+
+    The issue #412 race: the in-flight apply's completion records its failure
+    AFTER a manual retry already reconnected the pair. The failure is stale by
+    definition (the winner proved the pair connects), so the row stays ACTIVE
+    and attempts stays untouched (an ACTIVE row is immutable to failure
+    writers; inflating attempts would push a healthy pair toward the retry
+    cap).
+    """
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    winner = await record_l1_connect(db, rid, switch, "p1", "p2")
+    assert winner.status == "ACTIVE"
+    attempts_before = winner.attempts
+
+    row = await record_l1_failed(
+        db, rid, switch, "p1", "p2", attempts=3, last_error="stale apply failure"
+    )
+    assert row.id == winner.id
+    assert row.status == "ACTIVE"
+    assert row.attempts == attempts_before
+    assert row.last_error != "stale apply failure"
+
+
+@pytest.mark.asyncio
+async def test_failed_record_accumulates_attempts_on_failed_row(db):
+    """Repeat failures upsert the same row and ACCUMULATE attempts (phase 4 cap)."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    first = await record_l1_failed(db, rid, switch, "p1", "p2", attempts=3, last_error="boom 1")
+    second = await record_l1_failed(db, rid, switch, "p1", "p2", attempts=1, last_error="boom 2")
+    assert second.id == first.id
+    assert second.status == "FAILED"
+    assert second.attempts == 4
+    assert second.last_error == "boom 2"
+
+
+@pytest.mark.asyncio
+async def test_failed_record_creates_fresh_row_when_none_exists(db):
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    row = await record_l1_failed(db, rid, switch, "p1", "p2", attempts=3, last_error="boom")
+    assert row.status == "FAILED"
+    assert row.attempts == 3
+    assert row.last_error == "boom"
 
 
 # --- release_l1_connection ---

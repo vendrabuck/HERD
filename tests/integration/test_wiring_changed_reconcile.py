@@ -97,6 +97,11 @@ async def l1_template(base_url, admin_token, l1_driver):
                             "label": "Mock fail actions",
                             "type": "string",
                         },
+                        {
+                            "key": "mock_sleep_ms",
+                            "label": "Mock per-call sleep ms",
+                            "type": "string",
+                        },
                     ],
                 }
             ],
@@ -326,6 +331,142 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
+    admin_client, l1_template, fresh_devices
+):
+    """Issue #412: concurrent wiring writers must converge on the winner's ACTIVE row.
+
+    Scope honesty: the write-level race itself (record_l1_failed called with an
+    ACTIVE row) is pinned DETERMINISTICALLY by the unit test
+    test_failed_record_never_downgrades_active_row; forcing the exact clobber
+    interleaving through the black-box API proved unreliable (the system has
+    four concurrent wiring writers and the is_pair_active skip absorbs most
+    orderings). What THIS test pins live is the convergence contract under real
+    overlapping writers:
+
+    1. A fast save with the fail knob armed parks the FAILED row and lets the
+       apply complete (version stamped, nothing in flight).
+    2. The knobs are re-armed as fail plus HERD_mock_sleep_ms, and retry-1 is
+       fired WITHOUT awaiting it: its three in-line connect attempts each
+       sleep, so it is a failing writer in flight for roughly fifteen seconds,
+       holding the device context it fetched at start (knob armed).
+    3. Mid-window the knobs are cleared and retry-2 runs to completion: fresh
+       context, instant success, row ACTIVE (the winner).
+    4. retry-1 finishes; whatever it records, the end state must be the
+       winner's: row ACTIVE, no FAILED residue, attempts not inflated. The
+       issue #412 guard is one of the mechanisms this contract rests on.
+
+    Vacuity canary: retry-2 must complete while retry-1 is still in flight; if
+    retry-1 ever finishes first the interleaving collapsed and the canary
+    fails loudly instead of letting the test pass without exercising the race.
+    """
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(f"NATS not reachable from host: {nats_err}")
+
+    switch = await _create_switch_fd(
+        admin_client,
+        l1_template["id"],
+        {"model": "test", "mock_fail_actions": "connect_ports"},
+    )
+    dut_a, dut_b = await fresh_devices(2)
+    connections = []
+    reservation_id = None
+    topology_id = None
+    try:
+        connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
+        connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
+        topology_id = await _create_topology(admin_client, {"nodes": [], "edges": []})
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]], topology_id)
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        saved = await admin_client.post(
+            f"/reservations/{reservation_id}/fork/save",
+            json={"canvas_data": _canvas_edge(dut_a["id"], dut_b["id"])},
+        )
+        assert saved.status_code == 200, saved.text
+        saved_version = saved.json()["version_number"]
+
+        # Step 1: the fast failing apply completes fully: FAILED row parked,
+        # version stamped, no writer in flight.
+        failed = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "FAILED", timeout=30.0
+        )
+        assert failed is not None, "the failed build never surfaced a FAILED row"
+        stamped = await _poll_wiring_version(admin_client, reservation_id, saved_version)
+        assert stamped, "the save-driven apply never stamped its version"
+
+        # Step 2: re-arm as a SLOW failing writer and launch retry-1 unawaited.
+        upd = await admin_client.put(
+            f"/inventory/devices/{switch['id']}",
+            json={
+                "field_data": {
+                    "model": "test",
+                    "mock_fail_actions": "connect_ports",
+                    "mock_sleep_ms": "4000",
+                }
+            },
+        )
+        assert upd.status_code == 200, upd.text
+        stale_writer = asyncio.create_task(
+            admin_client.post(f"/reservations/{reservation_id}/wiring/retry")
+        )
+        # Let retry-1 fetch its (armed) context and enter its first sleeping
+        # connect attempt before the knobs change under it.
+        await asyncio.sleep(2.0)
+
+        # Step 3: clear the knobs and run the winner to completion mid-window.
+        upd = await admin_client.put(
+            f"/inventory/devices/{switch['id']}",
+            json={"field_data": {"model": "test"}},
+        )
+        assert upd.status_code == 200, upd.text
+        winner_resp = await admin_client.post(f"/reservations/{reservation_id}/wiring/retry")
+        assert winner_resp.status_code == 200, winner_resp.text
+        assert not stale_writer.done(), (
+            "retry-1 finished before the winner ran; the issue #412 interleaving "
+            "collapsed and this test is not exercising the race"
+        )
+        won = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "ACTIVE", timeout=10.0
+        )
+        assert won is not None, "the winning retry never flipped the row ACTIVE"
+        attempts_after_win = won["attempts"]
+
+        # Step 4: the stale writer completes; its failure must be ignored.
+        stale_resp = await stale_writer
+        assert stale_resp.status_code == 200, stale_resp.text
+
+        final = await _wiring_status(admin_client, reservation_id)
+        rows = final["connections"]
+        assert rows and all(c["status"] != "FAILED" for c in rows), (
+            f"stale writer clobbered the winner's ACTIVE row (issue #412): {rows}"
+        )
+        survivor = next(c for c in rows if c["status"] == "ACTIVE")
+        assert survivor["attempts"] == attempts_after_win, (
+            "stale writer inflated attempts on the ACTIVE row"
+        )
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        for conn in connections:
+            await admin_client.delete(f"/cabling/connections/{conn['id']}")
+        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+async def _poll_wiring_version(client, reservation_id: str, version: int, timeout: float = 30.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        status = await _wiring_status(client, reservation_id)
+        if status.get("last_applied_fork_version") == version:
+            return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 async def test_fork_save_release_drives_disconnect(admin_client, l1_template, fresh_devices):
