@@ -1,7 +1,10 @@
 """Integration tests for cabling pathfind + graph cache invalidation.
 
-Connections store raw device UUIDs (no FK into inventory), so we can build a
-minimal synthetic topology for these tests without creating real devices.
+Connections store raw device UUIDs (no cross-schema FK into inventory), but
+since issue #392 creating a connection validates both devices exist in
+inventory, so tests that CREATE connections use the fresh_devices factory.
+Pathfind itself performs no existence check, so pathfind-only tests still use
+synthetic UUIDs for isolated/unreachable endpoints.
 """
 
 import uuid
@@ -37,10 +40,9 @@ async def _pathfind(client, src: str, tgt: str) -> dict:
     return resp.json()
 
 
-async def test_direct_connection_is_reachable(admin_client):
+async def test_direct_connection_is_reachable(admin_client, fresh_devices):
     """Two devices directly cabled together are reachable in 2 hops (A -> B)."""
-    dut_a = str(uuid.uuid4())
-    dut_b = str(uuid.uuid4())
+    dut_a, dut_b = [d["id"] for d in await fresh_devices(2)]
     conn_ids = []
     try:
         conn = await _create_connection(admin_client, dut_a, dut_b)
@@ -54,9 +56,9 @@ async def test_direct_connection_is_reachable(admin_client):
             await admin_client.delete(f"/cabling/connections/{cid}")
 
 
-async def test_three_hop_chain_pathfinds(admin_client):
+async def test_three_hop_chain_pathfinds(admin_client, fresh_devices):
     """A -> B -> C chain is reachable end-to-end."""
-    a, b, c = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    a, b, c = [d["id"] for d in await fresh_devices(3)]
     conn_ids = []
     try:
         conn_ids.append((await _create_connection(admin_client, a, b, "eth1", "eth1"))["id"])
@@ -81,9 +83,9 @@ async def test_unreachable_devices_return_not_reachable(admin_client):
     assert result["paths"] == []
 
 
-async def test_cache_invalidation_on_connection_delete(admin_client):
+async def test_cache_invalidation_on_connection_delete(admin_client, fresh_devices):
     """After deleting an intermediate cable, the end-to-end pathfind flips to unreachable."""
-    a, b, c = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    a, b, c = [d["id"] for d in await fresh_devices(3)]
     conn_ab = None
     conn_bc = None
     try:
@@ -107,14 +109,14 @@ async def test_cache_invalidation_on_connection_delete(admin_client):
             await admin_client.delete(f"/cabling/connections/{conn_ab}")
 
 
-async def test_batch_pathfind_resolves_pairs_in_order(admin_client):
+async def test_batch_pathfind_resolves_pairs_in_order(admin_client, fresh_devices):
     """One batch request resolves reachable and unreachable pairs, preserving order.
 
     Chain a -> b -> c plus an isolated device d: (a, c) is reachable through b,
     (a, d) is not, and each batch entry echoes its requested pair with the same
     shape the single endpoint returns (issue #249).
     """
-    a, b, c, d = (str(uuid.uuid4()) for _ in range(4))
+    a, b, c, d = [dev["id"] for dev in await fresh_devices(4)]
     conn_ids = []
     try:
         conn_ids.append((await _create_connection(admin_client, a, b, "eth1", "eth1"))["id"])
@@ -177,9 +179,9 @@ async def test_batch_pathfind_over_cap_rejected(admin_client):
     assert resp.status_code == 422
 
 
-async def test_cache_invalidation_on_connection_create(admin_client):
+async def test_cache_invalidation_on_connection_create(admin_client, fresh_devices):
     """Creating a new cable makes a previously-unreachable pair reachable."""
-    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    a, b = [d["id"] for d in await fresh_devices(2)]
     conn_id = None
     try:
         before = await _pathfind(admin_client, a, b)
