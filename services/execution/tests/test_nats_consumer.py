@@ -234,6 +234,132 @@ async def test_resolve_switch_is_device_a():
     assert ops[0]["switch_port_b"] == "port-Y"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "device_ids",
+    [
+        ["dut-a", "dut-c", "dut-b", "dut-d"],  # the issue's own [A, C, B, D] example
+        ["dut-c", "dut-a", "dut-d", "dut-b"],
+        ["dut-b", "dut-d", "dut-a", "dut-c"],
+    ],
+)
+async def test_resolve_two_pairs_one_switch_never_mispairs(device_ids):
+    """Issue #366: a reservation wiring TWO cross-connect pairs through the SAME
+    L1 switch (dut-a to switch to dut-b, and dut-c to switch to dut-d) must never
+    silently cross-connect the wrong ports under a device_ids order that would
+    positionally interleave them.
+
+    The raw connections graph carries no edge_key at this layer (that only
+    exists on fork connections, ADR 0007), so this is the same ambiguity the
+    wiring-changed consumer's NULL-edge_key group hits (see
+    test_two_edges_one_switch_null_edge_key_fails_safe in
+    test_nats_consumer_wiring_changed.py): a switch touched by four reserved
+    ports has more than one possible pairing and the resolver refuses to
+    guess. The regression this pins is the SILENCE, not a guessed answer: the
+    resolver must never return dut-a paired with dut-c's port or dut-b paired
+    with dut-d's port (the wrong, positionally-adjacent pairing under this
+    device order); it returns no pairs for this switch at all instead of a
+    50/50 guess.
+    """
+    switch_id = "switch-shared"
+    # dut-a to switch port-1 (intended pair with dut-b's port-2)
+    # dut-c to switch port-3 (intended pair with dut-d's port-4)
+    conns = {
+        "dut-a": [
+            {"device_a_id": "dut-a", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-1"}
+        ],
+        "dut-b": [
+            {"device_a_id": "dut-b", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-2"}
+        ],
+        "dut-c": [
+            {"device_a_id": "dut-c", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-3"}
+        ],
+        "dut-d": [
+            {"device_a_id": "dut-d", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-4"}
+        ],
+    }
+    switch_device = {"id": switch_id, "connection_type": "Layer 1 Switch"}
+
+    async def mock_connections(device_id, client=None):
+        return conns.get(device_id, [])
+
+    with (
+        patch(
+            "app.services.nats_consumer._fetch_connections_for_device",
+            side_effect=mock_connections,
+        ),
+        patch(
+            "app.services.nats_consumer._fetch_device",
+            new_callable=AsyncMock,
+            return_value=switch_device,
+        ),
+    ):
+        ops = await _resolve_l1_switch_operations(device_ids)
+
+    wrong_pairs = {
+        frozenset(("port-1", "port-3")),
+        frozenset(("port-2", "port-4")),
+        frozenset(("port-1", "port-4")),
+        frozenset(("port-3", "port-2")),
+    }
+    got_pairs = {frozenset((op["switch_port_a"], op["switch_port_b"])) for op in ops}
+    assert not got_pairs & wrong_pairs, (
+        f"resolver returned a mis-cross-connected pair under device order {device_ids}: {got_pairs}"
+    )
+    # Fails safe rather than guesses: no pair at all for an ambiguous shared switch.
+    assert ops == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("device_ids", [["dut-a", "dut-b"], ["dut-b", "dut-a"]])
+async def test_resolve_parallel_switches_pair_each_switch(device_ids):
+    """Two DUTs wired through TWO switches in parallel must pair BOTH switches.
+
+    The flattened graph here is a cycle (dut-a, switch-one, dut-b, switch-two,
+    dut-a), but per-switch pairing is unambiguous: each switch has exactly two
+    reserved-adjacent ports, so its only possible cross-connect is that pair.
+    Pins the correction to the first issue #366 fix attempt, whose global
+    chain walk treated the cycle as unresolvable and left a legitimate
+    scenario unwired (caught live by
+    test_l1_failed_event_disconnects_only_applied_pairs).
+    """
+    sw1, sw2 = "switch-one", "switch-two"
+    conns = {
+        "dut-a": [
+            {"device_a_id": "dut-a", "port_a": "eth0", "device_b_id": sw1, "port_b": "s1-p1"},
+            {"device_a_id": "dut-a", "port_a": "eth1", "device_b_id": sw2, "port_b": "s2-p1"},
+        ],
+        "dut-b": [
+            {"device_a_id": "dut-b", "port_a": "eth0", "device_b_id": sw1, "port_b": "s1-p2"},
+            {"device_a_id": "dut-b", "port_a": "eth1", "device_b_id": sw2, "port_b": "s2-p2"},
+        ],
+    }
+    switches = {
+        sw1: {"id": sw1, "connection_type": "Layer 1 Switch"},
+        sw2: {"id": sw2, "connection_type": "Layer 1 Switch"},
+    }
+
+    async def mock_connections(device_id, *args, **kwargs):
+        return conns.get(device_id, [])
+
+    async def mock_device(device_id, *args, **kwargs):
+        return switches.get(device_id)
+
+    with (
+        patch(
+            "app.services.nats_consumer._fetch_connections_for_device",
+            side_effect=mock_connections,
+        ),
+        patch("app.services.nats_consumer._fetch_device", side_effect=mock_device),
+    ):
+        ops = await _resolve_l1_switch_operations(device_ids)
+
+    got = {
+        op["switch_device_id"]: frozenset((op["switch_port_a"], op["switch_port_b"])) for op in ops
+    }
+    assert got == {sw1: frozenset(("s1-p1", "s1-p2")), sw2: frozenset(("s2-p1", "s2-p2"))}
+
+
 # --- handle_reservation_event ---
 
 
@@ -345,9 +471,11 @@ async def test_handle_event_template_not_found():
 
 @pytest.mark.asyncio
 async def test_resolve_odd_port_count():
-    """Odd number of ports for a switch logs warning and skips last port."""
+    """An odd number of DUT touches on one switch is not a simple chain once
+    chain-walked (issue #366 fix): rather than positionally guessing a pair from
+    an ambiguous 3-way share (which could as easily mis-cross-connect as the even
+    case), every touch on that switch is left unresolved and no pair is returned."""
     switch_id = "switch-1"
-    # Three DUTs connected to same switch: 3 ports, only 1 pair formed
     conn1 = {
         "device_a_id": "dut-1",
         "port_a": "eth0",
@@ -385,10 +513,9 @@ async def test_resolve_odd_port_count():
     ):
         ops = await _resolve_l1_switch_operations(["dut-1", "dut-2", "dut-3"])
 
-    # 3 ports, only 1 pair (port-A1, port-A2); port-A3 is unpaired
-    assert len(ops) == 1
-    assert ops[0]["switch_port_a"] == "port-A1"
-    assert ops[0]["switch_port_b"] == "port-A2"
+    # No pair is guessed from the ambiguous 3-way share; the switch is left
+    # entirely unprovisioned rather than risk cross-connecting the wrong two.
+    assert ops == []
 
 
 @pytest.mark.asyncio

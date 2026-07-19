@@ -475,34 +475,43 @@ async def _resolve_l1_switch_operations(
                 }
             )
 
-    # Group operations by switch and pair them up
-    # An L1 switch connects two DUT ports through its own ports
-    switch_ops = {}
-    for op in operations:
-        sid = op["switch_device_id"]
-        if sid not in switch_ops:
-            switch_ops[sid] = []
-        switch_ops[sid].append(op["switch_port"])
+    if not operations:
+        return []
 
-    # Create port pair operations (connect consecutive pairs)
+    # Pair per switch, not by array position (issue #366). The raw connections
+    # graph fetched above carries no edge_key (that exists only on fork
+    # connections, ADR 0007), so the intended grouping of hops into logical
+    # links is unavailable here. What IS sound without it: a switch touched by
+    # exactly two reserved ports has exactly one possible cross-connect, so
+    # that pair is unambiguous under any device_ids order (including parallel
+    # paths where the flattened graph forms a cycle, which a global chain walk
+    # would wrongly refuse). A switch touched by any other number of reserved
+    # ports is ambiguous at this layer and is skipped with a warning instead
+    # of positionally guessed: the silent mis-cross-connect was the defect,
+    # and a fork save wires the ambiguous case correctly via edge_key until
+    # ADR 0009 phase 7 retires this resolver entirely.
+    ops_by_switch: dict[str, list[dict]] = {}
+    for op in operations:
+        ops_by_switch.setdefault(op["switch_device_id"], []).append(op)
+
     paired = []
-    for switch_id, ports in switch_ops.items():
-        if len(ports) % 2 != 0:
-            logger.warning(
-                "Odd number of ports (%d) for switch %s; last port will not be paired",
-                len(ports),
-                switch_id,
-            )
-        # Pair ports sequentially (port 0 to port 1, port 2 to port 3, etc.)
-        for i in range(0, len(ports) - 1, 2):
+    for switch_id, hops in ops_by_switch.items():
+        if len(hops) == 2:
             paired.append(
                 {
                     "switch_device_id": switch_id,
-                    "switch_port_a": ports[i],
-                    "switch_port_b": ports[i + 1],
+                    "switch_port_a": hops[0]["switch_port"],
+                    "switch_port_b": hops[1]["switch_port"],
                 }
             )
-
+        else:
+            logger.warning(
+                "Switch %s has %d reserved-adjacent ports; pairing is ambiguous "
+                "without edge intent (issue #366), skipping its cross-connects. "
+                "A fork save wires them from the canvas edges.",
+                switch_id,
+                len(hops),
+            )
     return paired
 
 
@@ -831,7 +840,12 @@ async def _execute_l2_switch_operations(
                         method_kwargs=vlan_kwargs,
                         password_keys=password_keys,
                     )
-                    status = "SUCCESS" if result["success"] else "FAILED"
+                    # Gate on the driver RESULT payload, not only the transport-level
+                    # sandbox flag (issue #393, the L2 analogue of #370): a driver
+                    # returning success=False without raising is a failure the raw
+                    # transport flag misses.
+                    op_failed, op_error = driver_result_failed(result)
+                    status = "FAILED" if op_failed else "SUCCESS"
                     await update_execution_run(
                         db,
                         run,
@@ -839,7 +853,7 @@ async def _execute_l2_switch_operations(
                         output=json.dumps(result["output"], default=str)
                         if result.get("output")
                         else None,
-                        error=result.get("error"),
+                        error=op_error if op_failed else result.get("error"),
                         started_at=op_started,
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
@@ -880,7 +894,8 @@ async def _execute_l2_switch_operations(
                         method_kwargs=port_kwargs,
                         password_keys=password_keys,
                     )
-                    status = "SUCCESS" if result["success"] else "FAILED"
+                    op_failed, op_error = driver_result_failed(result)
+                    status = "FAILED" if op_failed else "SUCCESS"
                     await update_execution_run(
                         db,
                         run,
@@ -888,7 +903,7 @@ async def _execute_l2_switch_operations(
                         output=json.dumps(result["output"], default=str)
                         if result.get("output")
                         else None,
-                        error=result.get("error"),
+                        error=op_error if op_failed else result.get("error"),
                         started_at=op_started,
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
@@ -930,7 +945,8 @@ async def _execute_l2_switch_operations(
                         method_kwargs=port_kwargs,
                         password_keys=password_keys,
                     )
-                    status = "SUCCESS" if result["success"] else "FAILED"
+                    op_failed, op_error = driver_result_failed(result)
+                    status = "FAILED" if op_failed else "SUCCESS"
                     await update_execution_run(
                         db,
                         run,
@@ -938,7 +954,7 @@ async def _execute_l2_switch_operations(
                         output=json.dumps(result["output"], default=str)
                         if result.get("output")
                         else None,
-                        error=result.get("error"),
+                        error=op_error if op_failed else result.get("error"),
                         started_at=op_started,
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
@@ -974,7 +990,8 @@ async def _execute_l2_switch_operations(
                         method_kwargs=vlan_kwargs,
                         password_keys=password_keys,
                     )
-                    status = "SUCCESS" if result["success"] else "FAILED"
+                    op_failed, op_error = driver_result_failed(result)
+                    status = "FAILED" if op_failed else "SUCCESS"
                     await update_execution_run(
                         db,
                         run,
@@ -982,7 +999,7 @@ async def _execute_l2_switch_operations(
                         output=json.dumps(result["output"], default=str)
                         if result.get("output")
                         else None,
-                        error=result.get("error"),
+                        error=op_error if op_failed else result.get("error"),
                         started_at=op_started,
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
@@ -1349,8 +1366,14 @@ async def _execute_l3_switch_operations(
                     method_kwargs=route_kwargs,
                     password_keys=password_keys,
                 )
-                status = "SUCCESS" if result["success"] else "FAILED"
-                if not result["success"]:
+                # Gate on the driver RESULT payload (issue #393, the L3 analogue of
+                # #370): a configure_route/remove_route that returns success=False
+                # without raising must keep switch_routes_ok False, so a semantically
+                # failed remove_route keeps this switch's route pin ACTIVE below
+                # (same posture as an existing transport failure).
+                op_failed, op_error = driver_result_failed(result)
+                status = "FAILED" if op_failed else "SUCCESS"
+                if op_failed:
                     switch_routes_ok = False
                 await update_execution_run(
                     db,
@@ -1359,7 +1382,7 @@ async def _execute_l3_switch_operations(
                     output=json.dumps(result["output"], default=str)
                     if result.get("output")
                     else None,
-                    error=result.get("error"),
+                    error=op_error if op_failed else result.get("error"),
                     started_at=op_started,
                     completed_at=datetime.now(timezone.utc),
                     duration_ms=result["duration_ms"],
