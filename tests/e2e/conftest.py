@@ -192,6 +192,22 @@ def pw_page(pw_browser):
     context.close()
 
 
+def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> None:
+    """Log in through the main app UI (Playwright), waiting for the post-login redirect.
+
+    Shared by the Playwright test modules under issue #388 (groups, connections,
+    templates, roles). Uses the same #login-email/#login-password/submit ids as
+    the Selenium `_do_login` above so both stacks exercise the identical login
+    form; kept as a plain function (not a fixture) since each test needs to
+    choose its own pw_page and, for the roles test, log in as a specific user.
+    """
+    page.goto(f"{HOST_BASE_URL}/login")
+    page.fill("#login-email", email)
+    page.fill("#login-password", password)
+    page.click("button[type='submit']")
+    page.wait_for_url("**/topology**")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_config_seeded():
     """Seed the config service so LoginPage isn't gated on the setup wizard.
