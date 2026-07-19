@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.connection import Connection
 from app.schemas.connection import ConnectionCreate
-from app.services.device_group_guard import fetch_device_group_ids
+from app.services.device_group_guard import DeviceNotFoundError, fetch_device_group_ids
 
 logger = logging.getLogger(__name__)
 
@@ -18,13 +18,23 @@ async def _enforce_device_group_boundary(body: ConnectionCreate, bearer_token: s
 
     Allows the connection when either device is ungrouped (no boundary to
     enforce) or shares at least one group. Fail-open if inventory cannot be
-    reached, so an inventory hiccup does not block admin cabling. No-op unless
-    enforcement is enabled.
+    reached, so an inventory hiccup does not block admin cabling. A device
+    that inventory confirms does not exist (404) is always a hard reject on
+    this path: existence, unlike group membership, is not an optional boundary.
+    No-op unless enforcement is enabled (matching the pre-existing gate; the
+    existence check only runs where this guard already made an inventory
+    call). See issue #392.
     """
     if not settings.enforce_device_group_boundaries:
         return
-    a_groups = await fetch_device_group_ids(body.device_a_id, bearer_token or "")
-    b_groups = await fetch_device_group_ids(body.device_b_id, bearer_token or "")
+    try:
+        a_groups = await fetch_device_group_ids(body.device_a_id, bearer_token or "")
+        b_groups = await fetch_device_group_ids(body.device_b_id, bearer_token or "")
+    except DeviceNotFoundError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Device {exc.device_id} does not exist",
+        ) from exc
     if a_groups is None or b_groups is None:
         logger.warning(
             "device_group_boundary_unverified",

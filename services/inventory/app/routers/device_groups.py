@@ -160,7 +160,13 @@ async def get_device_groups_for_device_endpoint(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(get_current_user_payload),
 ):
-    """Get all device groups a device belongs to, with user group names resolved."""
+    """Get all device groups a device belongs to, with user group names resolved.
+
+    404s when the device itself does not exist, so callers can distinguish
+    "exists but ungrouped" (200 []) from "no such device" (404). See issue #392.
+    """
+    if await db.get(Device, device_id) is None:
+        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
     groups = await get_device_groups_for_device(db, device_id)
     # Collect all unique user_group_ids to resolve names in a single call
     all_ug_ids: set[uuid.UUID] = set()
