@@ -31,6 +31,7 @@ from app.services.inventory_service import (
     set_device_status,
     update_device,
 )
+from app.services.reservation_guard import find_blocking_reservations_for_device
 
 logger = logging.getLogger(__name__)
 
@@ -474,7 +475,41 @@ async def delete_device_by_id(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    """Remove a device from the inventory. Admin or superadmin only."""
+    """Remove a device from the inventory. Admin or superadmin only.
+
+    Issue #391: an unconditional delete orphans the device UUID in
+    reservations, cabling, and execution (no cross-schema FKs by design), so
+    this reuses the same cross-service guard config-version restore already
+    established (find_blocking_reservations_for_device, issue #337's
+    /internal/by-device call) to refuse deleting a device held by a
+    non-terminal (PENDING/PENDING_PROVISION/ACTIVE) reservation. Unlike the
+    restore guard there is no caller-owned exemption: a delete is
+    irreversible for every holder, not just a surprise for someone else.
+    Fails CLOSED on an unreachable/erroring reservations service (a delete is
+    destructive and rare, so an unverifiable in-use check must block, not
+    silently let the delete through). No force flag: deliberately deferred.
+    """
+    device = await get_device(db, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    try:
+        blocking = await find_blocking_reservations_for_device(device_id)
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503, detail="Could not verify device is not in use"
+            ) from exc
+        raise
+    if blocking:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "device_in_use",
+                "reservation_ids": [str(b.get("id")) for b in blocking],
+            },
+        )
+
     deleted = await delete_device(db, device_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Device not found")

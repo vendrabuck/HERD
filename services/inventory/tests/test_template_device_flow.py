@@ -1,7 +1,7 @@
 """End-to-end functional tests for the template-to-device flow."""
 
 import io
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base, get_db
@@ -69,6 +69,17 @@ def _mock_minio():
     with (
         patch("app.services.driver_service.upload_object", side_effect=mock_upload_object),
         patch("app.services.driver_service.delete_object", side_effect=mock_delete_object),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _mock_reservation_guard():
+    """Default the issue #391 delete guard to "no blocking reservations" so a
+    device delete in this suite never reaches a real reservations service."""
+    with patch(
+        "app.routers.devices.find_blocking_reservations_for_device",
+        new=AsyncMock(return_value=[]),
     ):
         yield
 

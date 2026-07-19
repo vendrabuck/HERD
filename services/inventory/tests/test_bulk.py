@@ -66,6 +66,19 @@ def _mock_minio():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _mock_reservation_guard():
+    """Default the issue #391 delete guard to "no blocking reservations" so a
+    device delete in this suite never reaches a real reservations service."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "app.routers.devices.find_blocking_reservations_for_device",
+        new=AsyncMock(return_value=[]),
+    ):
+        yield
+
+
 @pytest.fixture
 async def client():
     app.dependency_overrides[get_db] = override_get_db
