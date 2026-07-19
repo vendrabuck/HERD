@@ -239,6 +239,31 @@ describe("DevicePage", () => {
     expect(navigate).toHaveBeenCalledWith("/inventory");
   });
 
+  it("toasts a readable message when delete is blocked by an active reservation (409)", async () => {
+    // Issue #391: inventory's delete guard 409s with a structured
+    // {error, reservation_ids} detail, not a plain string; the page must not
+    // toast the raw object and must not navigate away on a blocked delete.
+    server.use(
+      http.delete(`/api/inventory/devices/${DEVICE_ID}`, () =>
+        HttpResponse.json(
+          { detail: { error: "device_in_use", reservation_ids: ["r1"] } },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage();
+    await screen.findByText("Device Details");
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    const confirmButtons = screen.getAllByRole("button", { name: "Delete" });
+    fireEvent.click(confirmButtons[confirmButtons.length - 1]);
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Device is held by an active reservation and cannot be deleted",
+      ),
+    );
+    expect(navigate).not.toHaveBeenCalledWith("/inventory");
+  });
+
   it("surfaces the server detail message when an update fails", async () => {
     server.use(
       http.put(`/api/inventory/devices/${DEVICE_ID}`, () =>

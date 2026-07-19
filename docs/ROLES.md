@@ -1171,7 +1171,15 @@ DELETE /api/inventory/devices/{device_id}
 Authorization: Bearer <admin-token>
 ```
 
-Returns HTTP 204 on success.
+Returns HTTP 204 on success. Issue #391: refused with HTTP 409
+(`{"error": "device_in_use", "reservation_ids": [...]}`) when the device is held by
+a reservation in a non-terminal status (`PENDING`, `PENDING_PROVISION`, `ACTIVE`), so
+the delete cannot orphan the device UUID in reservations, cabling, and execution (no
+cross-schema foreign keys by design). The check calls reservations' internal
+`/internal/by-device/{device_id}` lookup and fails CLOSED: an unreachable or erroring
+reservations service returns HTTP 503 ("Could not verify device is not in use")
+rather than silently letting the delete through. There is no force flag; cancel or
+let the blocking reservation end first.
 
 ### Materialize a dynamic instance (internal, ADR 0004)
 

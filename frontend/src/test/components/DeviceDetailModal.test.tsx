@@ -9,16 +9,23 @@ vi.mock("@/api/templates", () => ({
   useTemplate: (...args: unknown[]) => mockUseTemplate(...args),
 }));
 
-vi.mock("@/api/inventory", () => ({
-  useUpdateDevice: () => ({
-    mutateAsync: mockUpdateMutateAsync,
-    isPending: false,
-  }),
-  useDeleteDevice: () => ({
-    mutateAsync: mockDeleteMutateAsync,
-    isPending: false,
-  }),
-}));
+vi.mock("@/api/inventory", async () => {
+  // Issue #391: keep the real deleteDeviceErrorMessage so the 409
+  // device_in_use shape is exercised through the component's actual error
+  // path, not a re-implementation in the test.
+  const actual = await vi.importActual<typeof import("@/api/inventory")>("@/api/inventory");
+  return {
+    ...actual,
+    useUpdateDevice: () => ({
+      mutateAsync: mockUpdateMutateAsync,
+      isPending: false,
+    }),
+    useDeleteDevice: () => ({
+      mutateAsync: mockDeleteMutateAsync,
+      isPending: false,
+    }),
+  };
+});
 
 // PortsSection has its own data hooks and tests; stub it so this file stays
 // focused on the modal's own render, edit, and delete behavior.
@@ -205,6 +212,34 @@ describe("DeviceDetailModal", () => {
     );
     expect(mockToastSuccess).toHaveBeenCalledWith("Device deleted");
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("toasts a readable message when delete is blocked by an active reservation (409)", async () => {
+    // Issue #391: inventory's delete guard 409s with a structured
+    // {error, reservation_ids} detail, not a plain string; the modal must not
+    // toast the raw object.
+    mockDeleteMutateAsync.mockRejectedValue({
+      response: {
+        data: {
+          detail: { error: "device_in_use", reservation_ids: ["r1", "r2"] },
+        },
+      },
+    });
+    const onClose = vi.fn();
+    render(<DeviceDetailModal device={BASE_DEVICE} onClose={onClose} isAdmin={true} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    const deleteButtons = screen.getAllByRole("button", { name: "Delete" });
+    fireEvent.click(deleteButtons[deleteButtons.length - 1] as HTMLButtonElement);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith(
+        "Device is held by an active reservation and cannot be deleted",
+      ),
+    );
+    // The modal must not close or report success on a blocked delete.
+    expect(onClose).not.toHaveBeenCalled();
+    expect(mockToastSuccess).not.toHaveBeenCalledWith("Device deleted");
   });
 
   it("renders dynamic template fields read-only when the template has sections", () => {

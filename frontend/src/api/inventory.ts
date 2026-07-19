@@ -200,6 +200,20 @@ export function usePaginatedDevices(filters?: DeviceFilters, skip = 0, limit = 5
   });
 }
 
+// Issue #391: inventory's DELETE /devices/{id} 409s with a structured
+// {error: "device_in_use", reservation_ids: [...]} detail (no `message` key,
+// unlike the fork-save conflict shape), so the generic `detail` string
+// extraction elsewhere would toast an unreadable object. Callers pass the
+// caught error's response detail through this to get a plain string instead.
+export function deleteDeviceErrorMessage(err: unknown): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object" && (detail as { error?: string }).error === "device_in_use") {
+    return "Device is held by an active reservation and cannot be deleted";
+  }
+  return "Failed to delete device";
+}
+
 export function useDeleteDevice() {
   const queryClient = useQueryClient();
   return useMutation({

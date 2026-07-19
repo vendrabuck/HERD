@@ -1,7 +1,7 @@
 import { useState } from "react";
 import toast from "react-hot-toast";
 import { useTemplate } from "@/api/templates";
-import { useUpdateDevice, useDeleteDevice } from "@/api/inventory";
+import { useUpdateDevice, useDeleteDevice, deleteDeviceErrorMessage } from "@/api/inventory";
 import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer";
 import { PortsSection } from "@/components/devices/PortsSection";
 import { Modal } from "@/components/ui/Modal";
@@ -77,10 +77,7 @@ export function DeviceDetailModal({ device, onClose, isAdmin }: DeviceDetailModa
       setEditing(false);
       onClose();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete device";
-      toast.error(msg);
+      toast.error(deleteDeviceErrorMessage(err));
     }
   };
 

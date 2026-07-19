@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import toast from "react-hot-toast";
-import { useDevice, useUpdateDevice, useDeleteDevice } from "@/api/inventory";
+import { useDevice, useUpdateDevice, useDeleteDevice, deleteDeviceErrorMessage } from "@/api/inventory";
 import { useTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer";
@@ -80,10 +80,7 @@ export function DevicePage() {
       toast.success("Device deleted");
       navigate("/inventory");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete device";
-      toast.error(msg);
+      toast.error(deleteDeviceErrorMessage(err));
     }
     setShowDeleteConfirm(false);
   };
