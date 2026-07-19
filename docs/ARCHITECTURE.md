@@ -343,7 +343,8 @@ The **notifications** service consumes two NATS streams with distinct durable co
 - Unit tests: per-service pytest suites against SQLite in-memory. Target 85%+ coverage.
 - Integration tests: cross-service via httpx against a running stack. Self-seeding fixtures.
 - Frontend tests: vitest + testing-library + MSW.
-- E2E: Docker Selenium + Chrome against the full running stack.
+- E2E: Docker Selenium + Chrome for the existing suite, plus Playwright's Python sync API for new tests (issue #388), against the full running stack.
+- Manual: docs/MANUAL_TESTING.md covers cases deliberately excluded from automation (real hardware, nondeterministic model output, wall-clock timing, browser matrix), with the exclusion reason per case.
 - CI: three-job GitHub Action (backend, frontend, plus an advisory integration job), runs on push/PR to main.
 
 ## Deployment
