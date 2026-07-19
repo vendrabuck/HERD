@@ -563,6 +563,141 @@ async def test_execute_l3_deprovision_keeps_pin_when_remove_route_result_fails()
     assert assignments[0].status == "ACTIVE"
 
 
+# --- issue #393: result gating (transport success, driver-reported failure) ---
+#
+# The tests above use a top-level success=False (a transport/sandbox failure),
+# which was already gated correctly before #393. These cover the blind spot the
+# raw `result["success"]` check missed: transport succeeds (the subprocess did
+# not raise) but the driver's RETURN VALUE reports success=False. Mirrors
+# test_execution_service_edges.py's #370 coverage for run_driver_action, through
+# the L3 site instead.
+
+
+async def test_execute_l3_provision_configure_route_semantic_result_failure_records_failed():
+    """configure_route returning {"success": True, "output": {"success": False}}
+    (transport ok, driver-reported failure) must record a FAILED run with the
+    driver's error, not SUCCESS."""
+
+    def _semantic_fail(driver_path, action, context, **kwargs):
+        if action == "configure_route":
+            return {
+                "success": True,
+                "output": {"success": False, "error": "route rejected: prefix overlap"},
+                "duration_ms": 8,
+            }
+        return SUCCESS_RESULT
+
+    patches = _l3_patches(_semantic_fail)
+    for p in patches:
+        p.start()
+    try:
+        await _execute_l3_switch_operations(
+            device_ids=["dut-1"],
+            l3_action="provision",
+            reservation_id=RES_ID,
+            user_id=USER_ID,
+            get_db_session=_db_session_factory(),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    async with TestSessionLocal() as db:
+        runs = list(
+            (await db.execute(select(ExecutionRun).where(ExecutionRun.action == "configure_route")))
+            .scalars()
+            .all()
+        )
+    assert runs and all(r.status == "FAILED" for r in runs)
+    assert all(r.error == "route rejected: prefix overlap" for r in runs)
+
+
+async def test_execute_l3_deprovision_keeps_pin_when_remove_route_semantic_result_fails():
+    """The #393 analogue of the transport-failure test above: remove_route
+    returns {"success": True, "output": {"success": False, ...}} (transport ok,
+    driver-reported failure). Before #393 this was gated on the raw transport
+    flag alone, so switch_routes_ok stayed True and the pin was released even
+    though the route may still be installed. It must keep the pin ACTIVE, same
+    as the transport-failure case."""
+    async with TestSessionLocal() as db:
+        await assign_routes(db, RES_ID, SWITCH_ID, ROUTES)
+
+    def _semantic_fail_remove(driver_path, action, context, **kwargs):
+        if action == "remove_route":
+            return {
+                "success": True,
+                "output": {"success": False, "error": "route still in use"},
+                "duration_ms": 5,
+            }
+        return SUCCESS_RESULT
+
+    patches = _l3_patches(_semantic_fail_remove)
+    for p in patches:
+        p.start()
+    try:
+        await _execute_l3_switch_operations(
+            device_ids=["dut-1"],
+            l3_action="deprovision",
+            reservation_id=RES_ID,
+            user_id=USER_ID,
+            get_db_session=_db_session_factory(),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assignments = await _active_assignments()
+    assert len(assignments) == 1
+    assert assignments[0].status == "ACTIVE"
+
+    async with TestSessionLocal() as db:
+        runs = list(
+            (await db.execute(select(ExecutionRun).where(ExecutionRun.action == "remove_route")))
+            .scalars()
+            .all()
+        )
+    assert runs and all(r.status == "FAILED" for r in runs)
+    assert all(r.error == "route still in use" for r in runs)
+
+
+async def test_execute_l3_provision_bare_data_output_stays_success():
+    """An output dict with no `success` key is a bare-data return (e.g. a
+    driver echoing route details) and must stay SUCCESS, matching the
+    conservative #370 posture: only a present, falsy `success` key fails."""
+
+    def _bare_data(driver_path, action, context, **kwargs):
+        if action == "configure_route":
+            return {
+                "success": True,
+                "output": {"applied": True, "route_id": "r-1"},
+                "duration_ms": 6,
+            }
+        return SUCCESS_RESULT
+
+    patches = _l3_patches(_bare_data)
+    for p in patches:
+        p.start()
+    try:
+        await _execute_l3_switch_operations(
+            device_ids=["dut-1"],
+            l3_action="provision",
+            reservation_id=RES_ID,
+            user_id=USER_ID,
+            get_db_session=_db_session_factory(),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    async with TestSessionLocal() as db:
+        runs = list(
+            (await db.execute(select(ExecutionRun).where(ExecutionRun.action == "configure_route")))
+            .scalars()
+            .all()
+        )
+    assert runs and all(r.status == "SUCCESS" for r in runs)
+
+
 # --- reservation.updated removal path ---
 
 
