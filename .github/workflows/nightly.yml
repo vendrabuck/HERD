@@ -67,7 +67,10 @@ jobs:
       - name: Integration tests (full failure set)
         run: uv run pytest tests/integration/ -v --timeout=60
 
-      - name: E2E tests (Selenium)
+      - name: Install Playwright browser deps
+        run: uv run playwright install --with-deps chromium
+
+      - name: E2E tests (Selenium + Playwright)
         run: make test-e2e
 
       - name: Seed stack for load test

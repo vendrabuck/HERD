@@ -351,9 +351,10 @@ test-load:  ## Run headless locust load test (needs a running stack)
 test-load-ui:  ## Run locust with its web UI (needs a running stack)
 	cd tests/load && uv run locust -f locustfile.py --host $${HERD_BASE_URL:-https://localhost}
 
-test-e2e:  ## Run Selenium e2e tests (needs a running stack)
+test-e2e:  ## Run e2e tests, Selenium + Playwright (needs a running stack)
 	-docker compose --profile e2e rm -fsv selenium
 	docker compose --profile e2e up -d --force-recreate selenium
+	uv run playwright install chromium
 	uv run pytest tests/e2e/ -v --tb=short
 
 test-e2e-stop:  ## Stop and remove the e2e Selenium container

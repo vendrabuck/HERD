@@ -162,6 +162,36 @@ def open_admin_menu(driver):
     )
 
 
+@pytest.fixture(scope="session")
+def pw_browser():
+    """Playwright Chromium (headless), shared across the session.
+
+    Plain playwright sync API rather than the pytest-playwright plugin: the
+    plugin's `browser` fixture chain is shadowed by this conftest's Selenium
+    `browser` fixture (a local conftest fixture overrides same-named plugin
+    fixtures for everything under tests/e2e/), so the plugin's page/context
+    fixtures would receive a Selenium WebDriver and crash. The pw_ prefix
+    keeps the two stacks side by side. Playwright runs in the pytest process
+    on the HOST, so its tests target HOST_BASE_URL, not the in-Docker
+    BASE_URL the Selenium container uses.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        yield browser
+        browser.close()
+
+
+@pytest.fixture
+def pw_page(pw_browser):
+    """Fresh Playwright context and page per test, trusting the dev TLS cert."""
+    context = pw_browser.new_context(ignore_https_errors=True)
+    page = context.new_page()
+    yield page
+    context.close()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_config_seeded():
     """Seed the config service so LoginPage isn't gated on the setup wizard.
@@ -182,9 +212,7 @@ def _ensure_config_seeded():
             status_resp = client.get("/api/config/status")
             if status_resp.status_code == 200 and status_resp.json().get("configured"):
                 return
-            login_resp = client.post(
-                "/api/config/login", json={"password": "admin123!"}
-            )
+            login_resp = client.post("/api/config/login", json={"password": "admin123!"})
             if login_resp.status_code != 200:
                 return
             token = login_resp.json()["token"]
@@ -281,9 +309,7 @@ def transient_reservation(admin_browser):
 
     payload = devices_resp.json()
     items = payload.get("items", payload) if isinstance(payload, dict) else payload
-    available = [
-        d for d in items if d.get("status") == "AVAILABLE" and d.get("exclusive", True)
-    ]
+    available = [d for d in items if d.get("status") == "AVAILABLE" and d.get("exclusive", True)]
     if not available:
         pytest.skip("no available exclusive devices to reserve")
 
@@ -294,9 +320,7 @@ def transient_reservation(admin_browser):
         "start_time": now.isoformat(),
         "end_time": (now + timedelta(minutes=30)).isoformat(),
     }
-    create = api_request(
-        admin_browser, "POST", "/reservations/", json=body, allow_errors=True
-    )
+    create = api_request(admin_browser, "POST", "/reservations/", json=body, allow_errors=True)
     if create.status_code != 201:
         pytest.skip(f"reservation create failed: {create.status_code} {create.text}")
     reservation = create.json()
