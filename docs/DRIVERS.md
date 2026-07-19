@@ -362,6 +362,12 @@ line and the driver runs as-is; an import of a missing dependency then fails at 
 All driver methods must return a `dict`. The execution service serializes the return
 value as JSON and stores it in the execution run record for audit purposes.
 
+The `success` key is load-bearing: a method that returns `{"success": False, ...}`
+without raising is recorded as a FAILED execution run (with the returned dict
+preserved as the run output), exactly as if it had raised. A returned dict with no
+`success` key is treated as bare diagnostic data and does not fail the run, so
+methods like `status` that report reachability rather than success are unaffected.
+
 Minimum required keys per method:
 
 | Method | Required keys |

@@ -11,6 +11,7 @@ from herd_common.outbox import event_dedupe_key
 from herd_common.retry import retry_with_backoff
 
 from app.config import settings
+from app.services.execution_service import driver_result_failed
 from app.services.health_scheduler import apply_reservation_event_tiers
 
 logger = logging.getLogger(__name__)
@@ -1421,31 +1422,6 @@ L3_EVENT_ACTIONS = {
 }
 
 
-def _l1_op_failed(result: dict) -> tuple[bool, str | None]:
-    """Decide whether one L1 driver op failed, returning (failed, error).
-
-    The sandbox's top-level ``result['success']`` is TRANSPORT-level: it is True
-    whenever the driver subprocess exits 0, i.e. the method ran without raising. A
-    driver method that RETURNS ``{"success": False, ...}`` without raising (the mock
-    drivers' HERD_mock_fail_actions convention, and any real driver that reports a
-    failure in its return value rather than by raising) is therefore a semantic
-    failure the transport flag misses. This mirrors ``_recipe_reported_success`` for
-    the dynamic path; connect_ports/disconnect_ports follow the same
-    ``{"success": bool, ...}`` return shape. An output with no ``success`` key is a
-    bare-data return and counts as success (conservative: only an explicit falsy
-    ``success`` is a failure), so a driver that returns plain data is unaffected.
-
-    Returns (True, error) on a sandbox failure (raise/timeout/signal) or a
-    driver-result failure, else (False, None).
-    """
-    if not result.get("success"):
-        return True, result.get("error") or "driver reported failure"
-    output = result.get("output")
-    if isinstance(output, dict) and output.get("success") is False:
-        return True, output.get("error") or "driver reported failure"
-    return False, None
-
-
 async def _execute_switch_operations(
     device_ids: list[str],
     action: str,
@@ -1646,7 +1622,7 @@ async def _execute_switch_operations(
                 # sandbox success (#345 phase 4 live-gate): a driver that returns
                 # success=False without raising is a failure the sandbox flag misses,
                 # and previously recorded a false SUCCESS run plus a phantom ACTIVE row.
-                op_failed, op_error = _l1_op_failed(result)
+                op_failed, op_error = driver_result_failed(result)
                 if not op_failed:
                     await update_execution_run(
                         db,
@@ -2658,7 +2634,7 @@ async def _run_driver_with_retry(
             # Gate on the driver RESULT payload, not only the transport-level sandbox
             # success (#345 phase 4 live-gate): a driver returning success=False
             # without raising is a per-connection failure to retry/park, not a success.
-            op_failed, op_error = _l1_op_failed(result)
+            op_failed, op_error = driver_result_failed(result)
             if not op_failed:
                 return True, attempt, None, result
             last_error = op_error
