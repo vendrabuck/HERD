@@ -45,6 +45,13 @@ _MOCK_L1_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l1"
 # in docker-compose.override.yml, so the auto-retry channel ticks every 60s.
 _WIRING_RETRY_MAX_ATTEMPTS_DEFAULT = 10
 
+# nats_consumer.WIRING_DRIVER_ATTEMPTS: the apply path's in-line retry cap.
+# The FAILED row is only stable once the apply has exhausted these (attempts
+# reaches this value AND last_applied_fork_version reaches the saved version);
+# retrying before then races the still-in-flight apply, whose completion
+# clobbers a successful retry back to FAILED (issue #412).
+_WIRING_DRIVER_ATTEMPTS = 3
+
 
 def _token(page) -> str | None:
     return page.evaluate("() => window.localStorage.getItem('access_token')")
@@ -105,17 +112,18 @@ def _canvas_edge(a_id: str, b_id: str) -> dict:
 def _poll(fn, predicate, *, timeout: float = 20.0, interval: float = 0.5):
     """Call fn() until predicate(result) is true or timeout elapses.
 
-    Returns the last fn() result either way, so a timeout still gives the
-    caller something informative to assert against.
+    Returns the predicate-satisfying result, or None on timeout, so an
+    assertion on the return value can never accidentally pass against a
+    last-known-bad snapshot (that ambiguity hid the issue #412 race when
+    this test was first written).
     """
     deadline = time.monotonic() + timeout
-    result = None
     while time.monotonic() < deadline:
         result = fn()
         if predicate(result):
             return result
         time.sleep(interval)
-    return result
+    return None
 
 
 def test_wiring_tab_failed_row_and_retry(pw_page):
@@ -322,13 +330,23 @@ def test_wiring_tab_failed_row_and_retry(pw_page):
             json={"canvas_data": _canvas_edge(dut_a["id"], dut_b["id"])},
         )
         assert saved.status_code == 200, saved.text
+        saved_version = saved.json()["version_number"]
 
+        # Wait for the apply to COMPLETE, not merely for a FAILED row to appear:
+        # the row is recorded progressively while the apply's in-line retries
+        # back off, and acting on it mid-apply reproduces the issue #412 race.
         wiring = _poll(
             lambda: _api(pw_page, "GET", f"/reservations/{reservation_id}/wiring-status").json(),
-            lambda w: any(c["status"] == "FAILED" for c in w.get("connections", [])),
-            timeout=20.0,
+            lambda w: (
+                w.get("last_applied_fork_version") == saved_version
+                and any(
+                    c["status"] == "FAILED" and c["attempts"] >= _WIRING_DRIVER_ATTEMPTS
+                    for c in w.get("connections", [])
+                )
+            ),
+            timeout=25.0,
         )
-        assert wiring is not None, "wiring-status never surfaced a FAILED row"
+        assert wiring is not None, "the wiring apply never completed with a stable FAILED row"
         failed_conn = next(c for c in wiring["connections"] if c["status"] == "FAILED")
         assert failed_conn["retryable"] is True, "a driver-failure row must be retryable"
         assert "connect_ports" in (failed_conn["last_error"] or "")
@@ -368,12 +386,15 @@ def test_wiring_tab_failed_row_and_retry(pw_page):
 
         active_wiring = _poll(
             lambda: _api(pw_page, "GET", f"/reservations/{reservation_id}/wiring-status").json(),
-            lambda w: any(c["status"] == "ACTIVE" for c in w.get("connections", [])),
+            lambda w: (
+                w.get("connections")
+                and all(c["status"] != "FAILED" for c in w["connections"])
+                and any(c["status"] == "ACTIVE" for c in w["connections"])
+            ),
             timeout=15.0,
         )
-        assert active_wiring is not None, "the retried connection never reached ACTIVE"
-        assert all(c["status"] != "FAILED" for c in active_wiring["connections"]), (
-            "a FAILED row remained after the retry succeeded"
+        assert active_wiring is not None, (
+            "the retried connection never reached ACTIVE with no FAILED rows left"
         )
 
         expect(dialog.get_by_text("ACTIVE", exact=True)).to_be_visible(timeout=10000)
