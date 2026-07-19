@@ -23,7 +23,8 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   [docs/ROLES.md](docs/ROLES.md).
 - **User groups** (Shipped): organize users into teams with bulk member management.
 - **Resource-level ACL grants** (Shipped): group-based view and manage grants on
-  topologies, reservations, and secrets.
+  topologies, reservations, and secrets, via the acl service's API. There is no
+  grants-management UI yet; admins drive the API directly (issue #397).
 - **Encrypted-at-rest credential store** (Shipped): a dedicated secrets service
   holding named secrets whose payloads are AES-GCM envelope-encrypted (an
   environment-supplied key-encryption key wraps per-version data-encryption
@@ -107,7 +108,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **Hypervisor-backed dynamic templates** (Shipped): a `dynamic` template type
   materializes an instance from a registered hypervisor when a reservation needs it,
-  rather than referencing a pre-existing device row. Admins register hypervisors
+  rather than referencing a pre-existing device row. Dynamic template authoring is
+  API, seed, or bulk-import only today; the template editor UI offers no dynamic
+  option (deferred per ADR 0004, issue #398). Admins register hypervisors
   (endpoint, a free-string hypervisor type, and a secrets-service credential reference
   validated at registration) and pair a dynamic template with both a hypervisor and a
   recipe driver package: an ordinary driver with a new `Hypervisor` connection type

@@ -199,7 +199,7 @@ make down            # Stop full stack
 make build           # Rebuild all images
 make test            # Run all backend tests (13 services)
 make test-frontend   # Run frontend tests (vitest)
-make test-e2e        # Run E2E browser tests (Docker Selenium, requires running stack)
+make test-e2e        # Run E2E browser tests (Selenium + Playwright, requires running stack)
 make coverage        # Run all backend tests with coverage report
 make lint            # ruff check + eslint
 make format          # ruff format + ruff check --fix
@@ -475,7 +475,7 @@ at the point of use via secrets' internal, `X-Internal-Token`-gated endpoint.
 
 ## Testing
 
-Over 3,300 backend unit tests across the 13 services, around 480 frontend tests via vitest, and 155 cross-service integration tests (a handful self-skip: AI-config-dependent cases when no provider is configured, NATS-dependent cases when JetStream isn't reachable, and LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). 119 E2E browser tests via Selenium (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against a local `osixia/openldap` container (see `docs/ENV_VARS.md` LDAP section).
+Over 3,300 backend unit tests across the 13 services, around 480 frontend tests via vitest, and 164 cross-service integration tests (a handful self-skip: AI-config-dependent cases when no provider is configured, NATS-dependent cases when JetStream isn't reachable, and LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). 125 E2E browser tests, 123 via Selenium and 2 via Playwright (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against a local `osixia/openldap` container (see `docs/ENV_VARS.md` LDAP section).
 
 Coverage targets 85%+ per backend service; run `make coverage` for the current per-service report (or `make coverage-<svc>` for one service with an HTML report). Outstanding test gaps are tracked in [docs/GAPS.md](docs/GAPS.md).
 
@@ -502,8 +502,8 @@ make coverage            # all backend services with terminal report
 make coverage-auth       # single service (terminal + HTML report)
 make coverage-frontend   # vitest with coverage
 
-# E2E browser tests (Docker Selenium, requires running stack)
-make test-e2e            # starts Selenium container + runs tests
+# E2E browser tests (Selenium + Playwright, requires running stack)
+make test-e2e            # starts Selenium container, installs Playwright's Chromium, runs tests
 make test-e2e-stop       # stops the Selenium container
 
 # Integration tests (requires running stack + seed data)
@@ -543,6 +543,7 @@ Three jobs run on push/PR to main, plus a scheduled nightly workflow:
 
 - [docs/DRIVERS.md](docs/DRIVERS.md): Driver developer guide, interface contracts, packaging quickstart, AI-config allowlist.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Public architecture overview: services, inter-service auth contract, event-driven flows, reservation state machine, frontend patterns.
+- [docs/MANUAL_TESTING.md](docs/MANUAL_TESTING.md): Manual test plan for cases deliberately excluded from automation, with the reason, preconditions, steps, and expected results per case.
 
 ### First install
 
