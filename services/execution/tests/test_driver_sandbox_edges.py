@@ -178,6 +178,60 @@ def test_success_with_non_json_stdout_wraps_raw_output(monkeypatch):
     assert result["output"] == {"raw_output": "this is not json"}
 
 
+# --- stderr no longer conflated with error on a clean exit (issue #394) ---
+
+
+def test_success_with_stderr_carries_it_separately_and_leaves_error_none(monkeypatch):
+    """A returncode-0 child with non-empty stderr (e.g. a netmiko deprecation
+    warning) must not populate 'error': the text goes on the new 'stderr' key
+    and 'error' stays None, so a SUCCESS run never carries a non-null error."""
+    driver_dir = _make_driver_dir(VALID_DRIVER)
+
+    class _Done:
+        returncode = 0
+        stdout = json.dumps({"ok": True})
+        stderr = "DeprecationWarning: something benign\n"
+
+    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Done())
+    result = execute_driver_method(driver_dir, "login", {}, timeout=10)
+    assert result["success"] is True
+    assert result["error"] is None
+    assert result["stderr"] == "DeprecationWarning: something benign\n"
+
+
+def test_success_with_empty_stderr_leaves_both_error_and_stderr_none(monkeypatch):
+    """A clean returncode-0 exit with no stderr output at all: 'error' and the
+    new 'stderr' key are both None."""
+    driver_dir = _make_driver_dir(VALID_DRIVER)
+
+    class _Done:
+        returncode = 0
+        stdout = json.dumps({"ok": True})
+        stderr = ""
+
+    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Done())
+    result = execute_driver_method(driver_dir, "login", {}, timeout=10)
+    assert result["success"] is True
+    assert result["error"] is None
+    assert result["stderr"] is None
+
+
+def test_failure_path_still_sources_error_from_stderr(monkeypatch):
+    """Unchanged behavior: on a non-zero, non-signal returncode, 'error' is
+    still populated from stderr (falling back to stdout, then a default)."""
+    driver_dir = _make_driver_dir(VALID_DRIVER)
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "driver raised ValueError: bad config"
+
+    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Failed())
+    result = execute_driver_method(driver_dir, "login", {}, timeout=10)
+    assert result["success"] is False
+    assert result["error"] == "driver raised ValueError: bad config"
+
+
 # --- dry-run gate (lines 147-149, 157-158) ---
 
 
