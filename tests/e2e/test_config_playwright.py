@@ -17,11 +17,20 @@ Scope notes:
   which would break every test after it. It needs a serial, last-in-run
   slot (tracked in issue #388).
 - The round-trip edits LDAP_USER_FILTER, inert while AUTH_METHOD is local,
-  and restores the exact prior settings afterward, so the stack's effective
-  config is unchanged.
+  and restores the exact prior settings afterward. Restoring VALUES is not
+  the whole story: every save_config() deletes the config.bootstrapped
+  marker, which would permanently promote config.json above the environment
+  on a stack still in auto-bootstrapped mode (the PR #374 precedence
+  ladder). The preserve_precedence_marker fixture records the marker's
+  presence via docker compose exec before the test and recreates it after,
+  so a local dev stack keeps its precedence mode. Against a remote stack
+  (no docker access) the restore is skipped and the promotion side effect
+  is accepted; CI's ephemeral stack does not care either way.
 """
 
 import os
+import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
@@ -33,6 +42,38 @@ CONFIG_PASSWORD = os.environ.get("CONFIG_ADMIN_PASSWORD") or "admin123!"
 # Schema label for LDAP_USER_FILTER (services/config/app/config_schema.py).
 FILTER_LABEL = "User Search Filter"
 SENTINEL_FILTER = "(uid={username})(e2e-playwright-sentinel)"
+
+# Container path of the precedence marker (services/config/app/config_store.py).
+BOOTSTRAP_MARKER = "/data/herd-config/config.bootstrapped"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _config_exec(cmd: str) -> "subprocess.CompletedProcess[str]":
+    """Run a shell command inside the config container; rc 125/127 etc. on no docker."""
+    return subprocess.run(
+        ["docker", "compose", "exec", "-T", "config", "sh", "-c", cmd],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        timeout=30,
+    )
+
+
+@pytest.fixture()
+def preserve_precedence_marker():
+    """Keep the stack's config-precedence mode across the save round-trip.
+
+    save_config() deletes the config.bootstrapped marker on every write (a
+    UI save is a deliberate operator decision, PR #374); this test's save is
+    not one, so if the marker existed before the test it is recreated after.
+    Best-effort: when docker compose is unreachable (remote stack), the
+    probe fails and nothing is restored.
+    """
+    probe = _config_exec(f"test -f {BOOTSTRAP_MARKER} && echo PRESENT || echo ABSENT")
+    had_marker = probe.returncode == 0 and "PRESENT" in probe.stdout
+    yield
+    if had_marker:
+        _config_exec(f"touch {BOOTSTRAP_MARKER}")
 
 
 @pytest.fixture(scope="module")
@@ -72,7 +113,9 @@ def test_config_login_success_shows_editor(pw_page, config_api):
     expect(pw_page.get_by_text("Configure all HERD service settings")).to_be_visible()
 
 
-def test_config_save_persists_value_via_api_readback(pw_page, config_api):
+def test_config_save_persists_value_via_api_readback(
+    pw_page, config_api, preserve_precedence_marker
+):
     """Editing a field and clicking Save actually lands in config.json.
 
     UI action, then API read-back (GET /api/config/settings) as the effect

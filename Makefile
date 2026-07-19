@@ -354,7 +354,7 @@ test-load-ui:  ## Run locust with its web UI (needs a running stack)
 test-e2e:  ## Run e2e tests, Selenium + Playwright (needs a running stack)
 	-docker compose --profile e2e rm -fsv selenium
 	docker compose --profile e2e up -d --force-recreate selenium
-	uv run playwright install chromium
+	uv run playwright install chromium  # no-op once cached; on a fresh host, missing OS libs need: uv run playwright install --with-deps chromium (sudo)
 	uv run pytest tests/e2e/ -v --tb=short
 
 test-e2e-stop:  ## Stop and remove the e2e Selenium container
