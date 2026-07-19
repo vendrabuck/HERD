@@ -1,0 +1,57 @@
+# CodeQL advanced setup, replacing GitHub's default setup (2026-07-19).
+#
+# Why advanced: default setup schedules its own analyses and silently skipped
+# PR #414's head entirely (three of seven expected checks materialized), which
+# makes the per-PR check set nondeterministic; the merge policy treats ALL
+# checks including advisory ones as gating, so the set must be predictable.
+# An explicit workflow also lets branch protection require CodeQL later if
+# desired. Default setup MUST be disabled in repo settings before this
+# workflow's first run, or its SARIF uploads are rejected.
+#
+# Languages mirror what default setup analyzed: actions, javascript-typescript
+# (frontend), python (services). The weekly scheduled run keeps main analyzed
+# against newly published queries even in quiet weeks.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 5 * * 1"
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
