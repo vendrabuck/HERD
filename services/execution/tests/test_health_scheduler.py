@@ -8,7 +8,7 @@ loop is integration-shaped and exercised separately.
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from app.config import settings
@@ -16,6 +16,7 @@ from app.database import Base
 from app.models.device_health_status import DeviceHealthStatus
 from app.models.execution_run import ExecutionRun
 from app.models.outbox import OutboxEvent
+from app.services import execution_service as ex_service
 from app.services import health_scheduler
 from app.services.health_scheduler import (
     SYSTEM_POLL_USER_ID,
@@ -619,3 +620,87 @@ def test_decide_transition_threshold_lowered_at_runtime():
     """If threshold lowers past a device already over it, no re-fire."""
     # Old failures (4) and new failures (5) both >= new threshold (3): no bad_news.
     assert health_scheduler._decide_transition(old_failures=4, new_failures=5, threshold=3) is None
+
+
+# --- fire_poll through the REAL run_driver_action gate (issue #370) ---
+
+# Every other fire_poll test stubs run_driver_action wholesale, which proves
+# only the status-string-to-health mapping. These two stub one level down, at
+# the sandbox seam, so the driver-result gate itself decides the run status:
+# a driver whose method RETURNS {"success": False} (transport success) must
+# degrade the device, the semantics issue #370 introduced.
+
+
+def _sandbox_stub(fail_action: str):
+    """execute_driver_method stub: fail_action reports failure in its RETURN
+    value; every other action returns bare data (stays SUCCESS)."""
+
+    def _run(**kwargs):
+        if kwargs["action"] == fail_action:
+            return {
+                "success": True,
+                "output": {"success": False, "error": "driver said no"},
+                "duration_ms": 2,
+            }
+        return {"success": True, "output": {"ok": True}, "duration_ms": 1}
+
+    return _run
+
+
+def _patch_sandbox_seam(monkeypatch, fail_action: str) -> None:
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service, "execute_driver_method", MagicMock(side_effect=_sandbox_stub(fail_action))
+    )
+
+
+@pytest.mark.asyncio
+async def test_fire_poll_driver_result_status_failure_marks_degraded(monkeypatch):
+    device = _device_data()
+    device_id = uuid.UUID(device["id"])
+    now = datetime.now(timezone.utc)
+    await _existing_row(device_id, now)
+
+    monkeypatch.setattr(health_scheduler, "fetch_device", AsyncMock(return_value=device))
+    monkeypatch.setattr(
+        health_scheduler, "fetch_template", AsyncMock(return_value=_template_data())
+    )
+    _patch_sandbox_seam(monkeypatch, fail_action="status")
+
+    await fire_poll(TestSessionLocal, device_id, 60)
+
+    async with TestSessionLocal() as db:
+        row = await db.get(DeviceHealthStatus, device_id)
+        assert row.last_status == "DEGRADED"
+        assert row.consecutive_failures == 1
+        run = (
+            await db.execute(
+                select(ExecutionRun).where(
+                    ExecutionRun.device_id == device_id, ExecutionRun.action == "status"
+                )
+            )
+        ).scalar_one()
+        assert run.status == "FAILED"
+        assert run.error == "driver said no"
+
+
+@pytest.mark.asyncio
+async def test_fire_poll_driver_result_login_failure_marks_unreachable(monkeypatch):
+    device = _device_data()
+    device_id = uuid.UUID(device["id"])
+    now = datetime.now(timezone.utc)
+    await _existing_row(device_id, now)
+
+    monkeypatch.setattr(health_scheduler, "fetch_device", AsyncMock(return_value=device))
+    monkeypatch.setattr(
+        health_scheduler, "fetch_template", AsyncMock(return_value=_template_data())
+    )
+    _patch_sandbox_seam(monkeypatch, fail_action="login")
+
+    await fire_poll(TestSessionLocal, device_id, 60)
+
+    async with TestSessionLocal() as db:
+        row = await db.get(DeviceHealthStatus, device_id)
+        assert row.last_status == "UNREACHABLE"
+        assert row.consecutive_failures == 1

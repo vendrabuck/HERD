@@ -300,6 +300,35 @@ async def test_run_driver_action_bare_data_output_stays_success(db, monkeypatch)
     assert run.error is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("falsy_success", [0, ""])
+async def test_run_driver_action_falsy_success_value_records_failed(db, monkeypatch, falsy_success):
+    """A PRESENT success key is judged falsy, not identity-False.
+
+    The sandbox boundary is JSON, so a driver violating the bool contract with
+    {"success": 0} or {"success": ""} still crosses as a falsy non-False value;
+    the gate must fail these rather than record SUCCESS (review finding on
+    issue #370). The bare-data posture is untouched: only a present key fails.
+    """
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(
+            return_value={
+                "success": True,
+                "output": {"success": falsy_success},
+                "duration_ms": 2,
+            }
+        ),
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+    assert run.status == "FAILED"
+    assert run.error == "driver reported failure"
+
+
 # --- run_driver_action configure validation: published schema vs registry ---
 
 # A driver-published schema shaped like the FRR Management driver's: it accepts

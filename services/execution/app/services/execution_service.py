@@ -361,10 +361,14 @@ def driver_result_failed(result: dict) -> tuple[bool, str | None]:
     mock drivers' HERD_mock_fail_actions convention, and any real driver that
     reports a failure in its return value rather than by raising) is therefore a
     semantic failure the transport flag misses (issue #370). An output with no
-    ``success`` key is a bare-data return and counts as success (conservative:
-    only an explicit ``success: False`` is a failure), so a driver that returns
-    plain data is unaffected. connect_ports/disconnect_ports and the Hypervisor
-    recipe methods all follow the ``{"success": bool, ...}`` return shape.
+    ``success`` key is a bare-data return and counts as success, so a driver
+    that returns plain data is unaffected; a PRESENT ``success`` key is judged
+    falsy (False, 0, empty string all fail), since the sandbox boundary is
+    JSON and a driver is free to violate the ``bool`` contract with a falsy
+    sentinel. connect_ports/disconnect_ports follow the
+    ``{"success": bool, ...}`` return shape. The Hypervisor recipe path does
+    NOT gate through this helper: ``_recipe_reported_success`` layers a
+    stricter missing-key-is-failure rule on top of it.
 
     Returns (True, error) on a sandbox failure (raise/timeout/signal) or a
     driver-result failure, else (False, None).
@@ -372,7 +376,7 @@ def driver_result_failed(result: dict) -> tuple[bool, str | None]:
     if not result.get("success"):
         return True, result.get("error") or "driver reported failure"
     output = result.get("output")
-    if isinstance(output, dict) and output.get("success") is False:
+    if isinstance(output, dict) and "success" in output and not output["success"]:
         return True, output.get("error") or "driver reported failure"
     return False, None
 
@@ -527,26 +531,16 @@ async def run_driver_action(
 
     completed_at = datetime.now(timezone.utc)
     result_failed, result_error = driver_result_failed(result)
-    if not result_failed:
+    if result["success"]:
+        # Transport-level success. Whether the run is SUCCESS or FAILED depends
+        # on the driver's RETURN VALUE (issue #370); the output payload is
+        # persisted either way, on FAILED rows as the debugging evidence.
         run = await update_execution_run(
             db,
             run,
-            status="SUCCESS",
+            status="FAILED" if result_failed else "SUCCESS",
             output=json.dumps(result["output"], default=str) if result["output"] else None,
-            error=result.get("error"),
-            completed_at=completed_at,
-            duration_ms=result["duration_ms"],
-        )
-    elif result["success"]:
-        # Transport-level success with a driver-reported failure in the return
-        # value (issue #370). Keep the full output payload with the FAILED row;
-        # the driver's structured detail is the debugging evidence.
-        run = await update_execution_run(
-            db,
-            run,
-            status="FAILED",
-            output=json.dumps(result["output"], default=str) if result["output"] else None,
-            error=result_error,
+            error=result_error if result_failed else result.get("error"),
             completed_at=completed_at,
             duration_ms=result["duration_ms"],
         )

@@ -1829,15 +1829,20 @@ async def _run_recipe_step(
 def _recipe_reported_success(result: dict) -> bool:
     """True when both the sandbox ran and the recipe's own success flag is set.
 
-    create_instance and destroy_instance return {"success": bool, ...}; a driver
-    that runs cleanly (sandbox success) but reports success=False is a
-    driver-result failure, distinct from a sandbox error. Login/logout carry no
-    such flag, so callers check result["success"] directly for those.
+    Built on the shared ``driver_result_failed`` rule with one STRICTER delta:
+    create_instance and destroy_instance must positively acknowledge with
+    {"success": True, ...}, so a missing ``success`` key counts as failure
+    here, where ``driver_result_failed``'s bare-data posture counts it as
+    success. The delta is deliberate; do not swap one helper for the other
+    (a recipe that never acknowledges an instance create must not be treated
+    as provisioned). Login/logout carry no such flag, so callers check
+    result["success"] directly for those.
     """
-    if not result.get("success"):
+    failed, _ = driver_result_failed(result)
+    if failed:
         return False
-    output = result.get("output") or {}
-    return bool(output.get("success"))
+    output = result.get("output")
+    return isinstance(output, dict) and bool(output.get("success"))
 
 
 async def _create_dynamic_device(
