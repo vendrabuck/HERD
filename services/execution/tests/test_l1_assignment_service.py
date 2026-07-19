@@ -128,6 +128,21 @@ async def test_partial_unique_index_blocks_duplicate_active_insert(db):
     await db.rollback()
 
 
+def test_failed_created_at_index_covers_the_retry_sweep_query():
+    """due_failed_rows filters status='FAILED' and orders by created_at (issue
+
+    #390): the partial index must exist, cover created_at, and restrict itself
+    to FAILED rows on both backends, the same way uq_l1_active_per_switch_pair
+    is exercised for its own partial predicate above.
+    """
+    indexes = {ix.name: ix for ix in L1ConnectionAssignment.__table__.indexes}
+    index = indexes["ix_l1_connection_assignments_failed_created_at"]
+
+    assert [c.name for c in index.columns] == ["created_at"]
+    assert str(index.dialect_options["sqlite"]["where"]) == "status = 'FAILED'"
+    assert str(index.dialect_options["postgresql"]["where"]) == "status = 'FAILED'"
+
+
 @pytest.mark.asyncio
 async def test_failed_row_does_not_block_new_active_claim(db):
     """The unique predicate is ACTIVE-only, so a FAILED row never blocks a claim."""

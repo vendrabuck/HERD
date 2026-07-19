@@ -28,6 +28,23 @@ _active_l1_unique = Index(
     postgresql_where=text("status = 'ACTIVE'"),
 )
 
+# Partial index for the wiring auto-retry sweep's per-tick candidate query
+# (due_failed_rows: WHERE status = 'FAILED' AND attempts < max_attempts ORDER BY
+# created_at). The table is append-only (ADR 0007 Decision 4: RELEASED/FAILED
+# rows are retained as the applied-wiring audit trail), so it grows without
+# bound while the sweep runs every tick. Partial-on-FAILED keeps the index
+# small and matches the hot predicate directly; attempts is left out of the
+# index since it is rarely selective enough on its own append-heavy table to
+# be worth the extra column, and the FAILED-only predicate already discards
+# the bulk of rows. Declared here (not only in the migration) so
+# Base.metadata.create_all builds it for the SQLite unit-test DB.
+_failed_l1_created_at = Index(
+    "ix_l1_connection_assignments_failed_created_at",
+    "created_at",
+    sqlite_where=text("status = 'FAILED'"),
+    postgresql_where=text("status = 'FAILED'"),
+)
+
 
 class L1ConnectionAssignment(Base):
     """The applied L1 cross-connect state for one switch port pair.
@@ -45,7 +62,11 @@ class L1ConnectionAssignment(Base):
     """
 
     __tablename__ = "l1_connection_assignments"
-    __table_args__ = (_active_l1_unique, {"schema": _schema}) if _schema else (_active_l1_unique,)
+    __table_args__ = (
+        (_active_l1_unique, _failed_l1_created_at, {"schema": _schema})
+        if _schema
+        else (_active_l1_unique, _failed_l1_created_at)
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     reservation_id: Mapped[uuid.UUID] = mapped_column(
