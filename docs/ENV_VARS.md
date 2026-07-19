@@ -335,6 +335,7 @@ The notifications service runs two durable NATS consumers: one on `herd.reservat
 | `OUTBOX_BATCH_SIZE` | `100` | Maximum outbox rows the relay publishes per tick. Each row is claimed with `FOR UPDATE SKIP LOCKED` and published with a `Nats-Msg-Id` header for publisher-side dedup. |
 | `OUTBOX_RETENTION_SECONDS` | `604800` | How long published outbox rows are retained before the relay prunes them; default 7 days. |
 | `CALENDAR_MAX_SPAN_DAYS` | `366` | `GET /calendar` has no `LIMIT` and no pagination, so a window (`range_end - range_start`) wider than this is rejected (422) rather than silently loading and holding an unbounded result set in memory (issue #315). `0` disables the cap. |
+| `UTILIZATION_MAX_SPAN_DAYS` | `366` | `GET /reports/utilization` and `/reports/utilization.csv` have no `LIMIT` and no pagination, so a window (`end - start`) wider than this is rejected (422) rather than silently loading and holding an unbounded result set in memory (issue #389, the deferred sibling of #315). `0` disables the cap. |
 
 The execution service runs the same outbox relay for the `device.health_transition` event, but it uses the `herd_common.outbox.run_outbox_relay` defaults (5s tick, 100 batch, 7-day retention) and exposes no environment overrides today.
 

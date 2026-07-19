@@ -201,6 +201,42 @@ async def test_build_report_rejects_inverted_window(db_session):
 
 
 @pytest.mark.asyncio
+async def test_build_report_span_over_max_raises(db_session, monkeypatch):
+    """A window wider than utilization_max_span_days raises ValueError (issue #389)."""
+    from app.services import reporting_service as svc
+
+    monkeypatch.setattr(svc.settings, "utilization_max_span_days", 30)
+    with pytest.raises(ValueError, match="30 days"):
+        await build_utilization_report(
+            db_session, NOW, NOW + timedelta(days=31), [ReservationStatus.COMPLETED]
+        )
+
+
+@pytest.mark.asyncio
+async def test_build_report_span_at_max_succeeds(db_session, monkeypatch):
+    """A window exactly at utilization_max_span_days does not raise."""
+    from app.services import reporting_service as svc
+
+    monkeypatch.setattr(svc.settings, "utilization_max_span_days", 30)
+    report = await build_utilization_report(
+        db_session, NOW, NOW + timedelta(days=30), [ReservationStatus.COMPLETED]
+    )
+    assert report.total_reservations == 0
+
+
+@pytest.mark.asyncio
+async def test_build_report_span_guard_disabled_when_zero(db_session, monkeypatch):
+    """utilization_max_span_days=0 disables the cap entirely."""
+    from app.services import reporting_service as svc
+
+    monkeypatch.setattr(svc.settings, "utilization_max_span_days", 0)
+    report = await build_utilization_report(
+        db_session, NOW, NOW + timedelta(days=3650), [ReservationStatus.COMPLETED]
+    )
+    assert report.total_reservations == 0
+
+
+@pytest.mark.asyncio
 async def test_build_report_returns_empty_when_no_reservations(db_session):
     report = await build_utilization_report(
         db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
