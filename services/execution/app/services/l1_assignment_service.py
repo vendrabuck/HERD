@@ -429,6 +429,23 @@ async def record_l1_failed(
     )
     row = result.scalars().first()
     if row is not None:
+        if row.status == "ACTIVE":
+            # A racing writer (manual retry, phase-4 reattempt, or a concurrent
+            # apply) proved this pair connects AFTER our failed attempt began,
+            # so this failure is stale information: never downgrade the winner
+            # (issue #412, the #276/#318 CAS discipline). attempts stays
+            # untouched: an ACTIVE row is immutable to failure writers, and
+            # inflating it would push a healthy pair toward the retry cap for
+            # no reason.
+            logger.warning(
+                "Ignoring stale L1 failure for switch %s pair (%s, %s), "
+                "reservation %s: row is ACTIVE (a concurrent writer won)",
+                switch_uuid,
+                ca,
+                cb,
+                res_uuid,
+            )
+            return row
         row.status = "FAILED"
         row.attempts = (row.attempts or 0) + attempts
         row.last_error = last_error
