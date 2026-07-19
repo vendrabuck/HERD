@@ -448,10 +448,8 @@ async def _resolve_l1_switch_operations(
             # Determine which side is the reserved device and which might be the L1 switch
             if str(conn.get("device_a_id")) == device_id:
                 other_device_id = str(conn.get("device_b_id"))
-                dut_port = conn.get("port_a")
             elif str(conn.get("device_b_id")) == device_id:
                 other_device_id = str(conn.get("device_a_id"))
-                dut_port = conn.get("port_b")
             else:
                 continue
 
@@ -474,58 +472,47 @@ async def _resolve_l1_switch_operations(
                     "switch_device_id": other_device_id,
                     "switch_port": switch_port,
                     "dut_device_id": device_id,
-                    "dut_port": dut_port,
-                    "connection_id": conn.get("id"),
                 }
             )
 
     if not operations:
         return []
 
-    # Pair switch-adjacent ports with the same order-independent chain walk the
-    # connection-driven wiring path uses (issue #366), instead of pairing array
-    # positions. The raw connections graph fetched above carries no edge_key (that
-    # only exists on fork connections, ADR 0007); every touch of a switch is
-    # therefore chain-walked as one ungrouped set, mirroring
-    # _wires_to_switch_pairs's NULL-edge_key fallback. A switch touched by exactly
-    # two reserved devices is an unambiguous simple chain and pairs correctly under
-    # any device_ids order. A switch touched by more (two or more independent
-    # cross-connects sharing it) is not a simple chain once flattened without a
-    # grouping key, so every hop on it is left unresolved (logged, not returned)
-    # rather than positionally guessed: this is what closes the silent
-    # mis-cross-connect, even though it cannot recover the intended pairing without
-    # more information than this layer carries.
-    device_is_switch = {op["switch_device_id"]: True for op in operations}
-    group = [
-        {
-            "ep_a": (op["dut_device_id"], op["dut_port"]),
-            "ep_b": (op["switch_device_id"], op["switch_port"]),
-            "phys": op["connection_id"],
-            "wire": op,
-        }
-        for op in operations
-    ]
-    pairs_by_switch, unresolvable = _chain_walk_group(group, device_is_switch)
+    # Pair per switch, not by array position (issue #366). The raw connections
+    # graph fetched above carries no edge_key (that exists only on fork
+    # connections, ADR 0007), so the intended grouping of hops into logical
+    # links is unavailable here. What IS sound without it: a switch touched by
+    # exactly two reserved ports has exactly one possible cross-connect, so
+    # that pair is unambiguous under any device_ids order (including parallel
+    # paths where the flattened graph forms a cycle, which a global chain walk
+    # would wrongly refuse). A switch touched by any other number of reserved
+    # ports is ambiguous at this layer and is skipped with a warning instead
+    # of positionally guessed: the silent mis-cross-connect was the defect,
+    # and a fork save wires the ambiguous case correctly via edge_key until
+    # ADR 0009 phase 7 retires this resolver entirely.
+    ops_by_switch: dict[str, list[dict]] = {}
+    for op in operations:
+        ops_by_switch.setdefault(op["switch_device_id"], []).append(op)
 
-    for wire, reason in unresolvable:
-        logger.warning(
-            "L1 switch pairing unresolvable for switch %s port %s (dut %s): %s; "
-            "skipping cross-connect for this hop",
-            wire["switch_device_id"],
-            wire["switch_port"],
-            wire["dut_device_id"],
-            reason,
-        )
-
-    return [
-        {
-            "switch_device_id": switch_id,
-            "switch_port_a": port_a,
-            "switch_port_b": port_b,
-        }
-        for switch_id, pairs in pairs_by_switch.items()
-        for port_a, port_b, _phys in pairs
-    ]
+    paired = []
+    for switch_id, hops in ops_by_switch.items():
+        if len(hops) == 2:
+            paired.append(
+                {
+                    "switch_device_id": switch_id,
+                    "switch_port_a": hops[0]["switch_port"],
+                    "switch_port_b": hops[1]["switch_port"],
+                }
+            )
+        else:
+            logger.warning(
+                "Switch %s has %d reserved-adjacent ports; pairing is ambiguous "
+                "without edge intent (issue #366), skipping its cross-connects. "
+                "A fork save wires them from the canvas edges.",
+                switch_id,
+                len(hops),
+            )
+    return paired
 
 
 def _derive_vlan_id(reservation_id: str) -> int:
