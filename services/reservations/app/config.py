@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # silently loading everything. 0 disables the cap.
     calendar_max_span_days: int = 366
 
+    # Maximum span (window_end - window_start) accepted by GET
+    # /reports/utilization and /reports/utilization.csv (issue #389, the
+    # deferred sibling of #315). The builder has no LIMIT and no pagination,
+    # so an unbounded, client-controlled window can load and hold an
+    # unbounded result set in memory; a window wider than this is rejected
+    # with 422 rather than silently loading everything. 0 disables the cap.
+    utilization_max_span_days: int = 366
+
     log_level: str = "INFO"
 
     model_config = {"env_file": ".env", "case_sensitive": False}

@@ -2773,6 +2773,45 @@ async def test_utilization_report_rejects_inverted_window(admin_client):
 
 
 @pytest.mark.asyncio
+async def test_utilization_report_span_over_max_rejected(admin_client):
+    """A window wider than utilization_max_span_days is rejected with 422
+    (issue #389), instead of silently loading an unbounded result set."""
+    from app.config import settings
+
+    start = NOW.isoformat()
+    end = (NOW + timedelta(days=settings.utilization_max_span_days + 1)).isoformat()
+    resp = await admin_client.get("/reports/utilization", params={"start": start, "end": end})
+    assert resp.status_code == 422
+    assert str(settings.utilization_max_span_days) in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_span_at_max_succeeds(admin_client):
+    """A window exactly at utilization_max_span_days still succeeds."""
+    from app.config import settings
+
+    start = NOW.isoformat()
+    end = (NOW + timedelta(days=settings.utilization_max_span_days)).isoformat()
+    resp = await admin_client.get("/reports/utilization", params={"start": start, "end": end})
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_csv_span_over_max_rejected(admin_client):
+    """The CSV route enforces the same utilization_max_span_days guard (issue #389)."""
+    from app.config import settings
+
+    start = NOW.isoformat()
+    end = (NOW + timedelta(days=settings.utilization_max_span_days + 1)).isoformat()
+    resp = await admin_client.get(
+        "/reports/utilization.csv",
+        params={"start": start, "end": end, "section": "user"},
+    )
+    assert resp.status_code == 422
+    assert str(settings.utilization_max_span_days) in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_utilization_report_csv_user_section(admin_client):
     window_start = NOW - timedelta(days=7)
     window_end = NOW

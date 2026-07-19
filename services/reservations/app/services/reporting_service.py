@@ -3,7 +3,7 @@ import io
 import logging
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from herd_common.enums import TopologyType
@@ -73,9 +73,22 @@ async def build_utilization_report(
     in the same pass. fleet_devices is inventory's device list (id/name/
     status dicts); None means inventory was unreachable or was not asked,
     and the fleet section is omitted (report.fleet stays None).
+
+    Raises ValueError (422 at the router) when the requested window's span
+    exceeds utilization_max_span_days (issue #389): the query below has no
+    LIMIT and no pagination, so an unbounded client-controlled window would
+    otherwise load and hold an unbounded result set in memory. 0 disables
+    the cap.
     """
     if window_end <= window_start:
         raise ValueError("window_end must be after window_start")
+
+    max_span_days = settings.utilization_max_span_days
+    if max_span_days > 0 and (window_end - window_start) > timedelta(days=max_span_days):
+        raise ValueError(
+            f"Utilization window cannot exceed {max_span_days} days "
+            f"(requested {window_start.isoformat()} to {window_end.isoformat()})"
+        )
 
     if fleet_status_filter is None:
         fleet_status_filter = status_filter
