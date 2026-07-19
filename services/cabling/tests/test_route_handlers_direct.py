@@ -188,6 +188,21 @@ async def test_device_group_guard_bad_response_returns_none():
 
 
 @pytest.mark.asyncio
+async def test_device_group_guard_404_raises_device_not_found():
+    """A 404 from inventory means the device is confirmed gone, not merely
+    unverifiable; this must raise rather than fall into the None fail-open
+    branch above (issue #392)."""
+    from app.services import device_group_guard
+
+    device_id = uuid.uuid4()
+    factory, _, _ = _mock_httpx_client(status_code=404, json_data={"detail": "not found"})
+    with patch.object(device_group_guard.httpx, "AsyncClient", factory):
+        with pytest.raises(device_group_guard.DeviceNotFoundError) as exc:
+            await device_group_guard.fetch_device_group_ids(device_id, "tok")
+    assert exc.value.device_id == device_id
+
+
+@pytest.mark.asyncio
 async def test_device_group_guard_unreachable_returns_none():
     from app.services import device_group_guard
 

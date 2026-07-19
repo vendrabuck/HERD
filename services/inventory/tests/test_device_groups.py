@@ -908,3 +908,28 @@ async def test_bulk_remove_permissions_nonexistent_group(client):
         json={"user_group_ids": [str(uuid.uuid4())]},
     )
     assert resp.status_code == 404
+
+
+# --- GET /device-groups/device/{id}: existence vs ungrouped (issue #392) ---
+
+
+@pytest.mark.asyncio
+async def test_device_groups_for_device_nonexistent_device_returns_404(client):
+    """A device that does not exist in inventory 404s rather than returning
+    200 [], so callers (e.g. cabling's group-boundary guard) can distinguish
+    "no such device" from "exists but ungrouped"."""
+    device_id = uuid.uuid4()
+    resp = await client.get(f"/device-groups/device/{device_id}")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == f"Device {device_id} not found"
+
+
+@pytest.mark.asyncio
+async def test_device_groups_for_device_ungrouped_device_returns_empty_list(client):
+    """An existing device that belongs to no device group returns 200 [],
+    distinct from the 404 a nonexistent device now gets."""
+    template = await _create_template(client, "UngroupedTpl")
+    dev = await _create_device(client, template["id"], "ungrouped-dev")
+    resp = await client.get(f"/device-groups/device/{dev['id']}")
+    assert resp.status_code == 200
+    assert resp.json() == []

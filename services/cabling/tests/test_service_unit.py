@@ -161,6 +161,27 @@ async def test_allows_when_inventory_unavailable_fail_open(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rejects_connection_when_device_does_not_exist(monkeypatch):
+    """A 404-confirmed-gone device (DeviceNotFoundError from the guard) is a
+    hard reject, unlike the None fail-open case above for a genuinely
+    unreachable/erroring inventory. See issue #392."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.config import settings
+    from app.services.device_group_guard import DeviceNotFoundError
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(settings, "enforce_device_group_boundaries", True)
+    fetch = AsyncMock(side_effect=DeviceNotFoundError(DEVICE_B))
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        async with TestSession() as db:
+            with pytest.raises(HTTPException) as exc:
+                await create_connection(db, _cross_device_body(), str(USER_ID), bearer_token="t")
+    assert exc.value.status_code == 422
+    assert exc.value.detail == f"Device {DEVICE_B} does not exist"
+
+
+@pytest.mark.asyncio
 async def test_disabled_enforcement_skips_membership_fetch(monkeypatch):
     from unittest.mock import AsyncMock, patch
 
