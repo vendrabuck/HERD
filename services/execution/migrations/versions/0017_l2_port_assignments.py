@@ -16,6 +16,15 @@ pattern): a future retry sweep's per-tick candidate query needs it, and the tabl
 is append-only by the same design (FAILED/RELEASED rows are the applied-wiring
 audit trail).
 
+A new-table migration must tolerate the table already existing: every service
+startup runs herd_common.schema_init.create_all_and_stamp, whose
+metadata.create_all creates any MISSING model table on an existing schema
+without advancing alembic_version. An upgraded-in-place stack that boots the
+new image before running migrate therefore already has this table (with its
+model-declared indexes) when this revision replays, and a bare create_table
+crashes on DuplicateTableError. Discovered live during the phase 3 gate; the
+same latent hazard exists in migration 0014 and is tracked separately.
+
 Revision ID: 0017
 Revises: 0016
 Create Date: 2026-07-19 00:00:00.000000
@@ -35,6 +44,9 @@ _schema = os.environ.get("DB_SCHEMA") or None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    if sa.inspect(bind).has_table("l2_port_assignments", schema=_schema):
+        return
     op.create_table(
         "l2_port_assignments",
         sa.Column("id", sa.Uuid(as_uuid=True), primary_key=True),
