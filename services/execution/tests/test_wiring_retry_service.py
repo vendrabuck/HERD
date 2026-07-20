@@ -115,7 +115,15 @@ def _patches(execute_fn):
     ]
 
 
-async def _seed_failed(port_a, port_b, *, attempts=3, last_error="boom", reservation_id=RES_ID):
+async def _seed_failed(
+    port_a,
+    port_b,
+    *,
+    attempts=3,
+    last_error="boom",
+    reservation_id=RES_ID,
+    intended="ACTIVE",
+):
     async with TestSessionLocal() as s:
         row = L1ConnectionAssignment(
             reservation_id=uuid.UUID(reservation_id),
@@ -123,8 +131,25 @@ async def _seed_failed(port_a, port_b, *, attempts=3, last_error="boom", reserva
             port_a=port_a,
             port_b=port_b,
             status="FAILED",
+            intended=intended,
             attempts=attempts,
             last_error=last_error,
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        return row.id
+
+
+async def _seed_active(port_a, port_b, *, reservation_id=RES_ID):
+    async with TestSessionLocal() as s:
+        row = L1ConnectionAssignment(
+            reservation_id=uuid.UUID(reservation_id),
+            switch_device_id=uuid.UUID(SWITCH_ID),
+            port_a=port_a,
+            port_b=port_b,
+            status="ACTIVE",
+            intended="ACTIVE",
         )
         s.add(row)
         await s.commit()
@@ -211,6 +236,64 @@ async def test_retry_flips_failed_build_to_active_on_success():
 
 
 @pytest.mark.asyncio
+async def test_retry_release_direction_row_drives_disconnect_and_ends_released():
+    """Issue #369: a FAILED row whose intended is RELEASED is reattempted as a
+    disconnect, not the old hard-coded connect, and ends RELEASED on success."""
+    fid = await _seed_failed("0/0/1", "0/0/2", intended="RELEASED")
+    execute_fn, calls = _sandbox_recorder()
+    result = await _run_reattempt(execute_fn)
+
+    assert ("connect_ports", "0/0/1", "0/0/2") not in calls, (
+        "a release-direction row must not be retried as a connect"
+    )
+    assert ("disconnect_ports", "0/0/1", "0/0/2") in calls
+
+    released = await _rows("RELEASED")
+    assert len(released) == 1
+    assert released[0].id == fid, "the same row is flipped, not a parallel row"
+    assert released[0].intended == "RELEASED"
+    assert released[0].last_error is None
+    assert await _rows("FAILED") == []
+    assert result["results"][0]["outcome"] == "released"
+    assert result["results"][0]["status"] == "RELEASED"
+
+
+@pytest.mark.asyncio
+async def test_retry_release_direction_repeat_failure_stays_failed_released():
+    """A release-direction reattempt that fails again stays FAILED, intended
+    RELEASED, with attempts accumulated and last_error updated."""
+    await _seed_failed("0/0/1", "0/0/2", attempts=3, last_error="old boom", intended="RELEASED")
+    execute_fn, calls = _sandbox_recorder(fail_pairs={frozenset({"0/0/1", "0/0/2"})})
+    result = await _run_reattempt(execute_fn)
+
+    failed = await _rows("FAILED")
+    assert len(failed) == 1
+    assert failed[0].intended == "RELEASED"
+    assert failed[0].attempts > 3, "attempts accumulate across the reattempt"
+    assert failed[0].last_error == "boom"
+    assert await _rows("RELEASED") == []
+    assert result["results"][0]["outcome"] == "still_failed"
+    assert ("disconnect_ports", "0/0/1", "0/0/2") in calls
+
+
+@pytest.mark.asyncio
+async def test_retry_mixed_directions_in_one_reservation():
+    """A reservation with both a build-direction and a release-direction FAILED
+    row gets each reattempted in its own direction in the same retry call."""
+    build_id = await _seed_failed("0/0/1", "0/0/2", intended="ACTIVE")
+    release_id = await _seed_failed("0/0/3", "0/0/4", intended="RELEASED")
+    execute_fn, calls = _sandbox_recorder()
+    result = await _run_reattempt(execute_fn)
+
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    assert ("disconnect_ports", "0/0/3", "0/0/4") in calls
+
+    outcomes = {r["id"]: r["outcome"] for r in result["results"]}
+    assert outcomes[str(build_id)] == "reconnected"
+    assert outcomes[str(release_id)] == "released"
+
+
+@pytest.mark.asyncio
 async def test_retry_non_retryable_pinned_reason_makes_no_driver_call():
     """A FAILED row with a pinned reason is reported not_retryable without a driver call."""
     await _seed_failed("0/0/1", "0/0/2", attempts=0, last_error=WIRING_UNRESOLVABLE_REASON)
@@ -289,6 +372,24 @@ async def test_tick_respects_batch_cap(monkeypatch):
     assert len(connects) == 2
     assert len(await _rows("ACTIVE")) == 2
     assert len(await _rows("FAILED")) == 3
+
+
+@pytest.mark.asyncio
+async def test_tick_reports_released_stat_for_release_direction_rows(monkeypatch):
+    """The background tick's stats distinguish reconnected (build) from released
+    (release), not just a combined success count."""
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    await _seed_failed("0/0/1", "0/0/2", attempts=0, intended="ACTIVE")
+    await _seed_failed("0/0/3", "0/0/4", attempts=0, intended="RELEASED")
+    execute_fn, calls = _sandbox_recorder()
+    stats = await _run_tick(execute_fn)
+
+    assert stats["rows_retried"] == 2
+    assert stats["reconnected"] == 1
+    assert stats["released"] == 1
+    assert stats["still_failed"] == 0
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    assert ("disconnect_ports", "0/0/3", "0/0/4") in calls
 
 
 @pytest.mark.asyncio

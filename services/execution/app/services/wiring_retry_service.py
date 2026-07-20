@@ -1,12 +1,16 @@
 """Per-connection wiring retry: the manual and background reattempt of FAILED rows.
 
-ADR 0007 Decision 6 items 2-3 (issue #345 P3b phase 4). A hardware apply failure
-never rolls back the durable fork save; it lands a FAILED l1_connection_assignments
-row (phase 3). This module reattempts those rows through the SAME driver machinery the
-consumer uses (nats_consumer._apply_wiring_pairs), so a reattempt is a plain build of
-the recorded pair: it respects the is_pair_active convergence gate and the active-unique
-index, flips the FAILED row to ACTIVE on success, and accumulates attempts/last_error on
-a repeat failure.
+ADR 0007 Decision 6 items 2-3 (issue #345 P3b phase 4); direction-aware since ADR 0009
+Decision 2 (issue #369). A hardware apply failure never rolls back the durable fork
+save; it lands a FAILED l1_connection_assignments row (phase 3) tagged with the
+direction (`intended`) the failed write was attempting. This module reattempts those
+rows through the SAME driver machinery the consumer uses
+(nats_consumer._apply_wiring_pairs), split by intended: an ACTIVE-intended row is
+reattempted as a build (connect_ports, respecting the is_pair_active convergence gate
+and the active-unique index, flipping the FAILED row to ACTIVE on success); a
+RELEASED-intended row is reattempted as a release (disconnect_ports, respecting the
+pair_needs_release idempotency gate, flipping the FAILED row to RELEASED on success).
+Either way attempts/last_error accumulate on a repeat failure.
 
 Two entry points share one core:
 
@@ -103,15 +107,22 @@ def _outcome(row: L1ConnectionAssignment, outcome: str) -> dict:
 
 
 async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) -> list[dict]:
-    """Reattempt a list of retryable FAILED rows as verbatim builds; return outcomes.
+    """Reattempt a list of retryable FAILED rows in their own direction; return outcomes.
 
-    Groups the rows by (reservation, switch) and drives each reservation through the
-    consumer's release-before-build apply with an empty release set, so a reattempt is
-    a pure build of the recorded pairs. The rows may span reservations (the background
-    batch does), so _apply_wiring_pairs is called once per reservation. On success the
-    build flips the FAILED row to ACTIVE in place (record_l1_connect reuses the row);
-    on repeat failure record_l1_failed accumulates attempts and last_error. Outcomes
-    are read back by row id: ACTIVE is "reconnected", still FAILED is "still_failed".
+    Splits the rows by `intended` (issue #369, ADR 0009 Decision 2) before grouping by
+    (reservation, switch): a row whose intended is ACTIVE is reattempted as a build
+    (connect_ports), a row whose intended is RELEASED is reattempted as a release
+    (disconnect_ports) - the direction fix this module exists for. Both directions are
+    driven through the SAME consumer apply (_apply_wiring_pairs) per reservation, so a
+    release-direction retry gets the same idempotency gate (pair_needs_release), driver
+    machinery, and per-connection failure handling as the normal reconcile path. The
+    rows may span reservations (the background batch does), so _apply_wiring_pairs is
+    called once per reservation with both of that reservation's sets. On success a
+    build flips the FAILED row to ACTIVE in place (record_l1_connect reuses the row); a
+    release flips it to RELEASED in place (release_l1_connection reuses the row); on
+    repeat failure record_l1_failed accumulates attempts and last_error. Outcomes are
+    read back by row id: ACTIVE is "reconnected", RELEASED is "released", anything else
+    is "still_failed".
 
     A TransientUpstreamError from resolving a switch (inventory/cabling 5xx) propagates
     to the caller: the manual endpoint maps it to 503; the background tick logs it and
@@ -122,21 +133,28 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
     if not rows:
         return []
 
-    # reservation -> switch -> [(port_a, port_b, physical_connection_id)]
-    by_res: dict[str, dict[str, list[tuple[str, str, str | None]]]] = {}
+    # reservation -> switch -> [(port_a, port_b, physical_connection_id)], split by
+    # the row's intended direction.
+    by_res_build: dict[str, dict[str, list[tuple[str, str, str | None]]]] = {}
+    by_res_release: dict[str, dict[str, list[tuple[str, str, str | None]]]] = {}
     retry_ids: list[uuid.UUID] = []
     for row in rows:
         phys = str(row.physical_connection_id) if row.physical_connection_id else None
         res_str = str(row.reservation_id)
-        by_res.setdefault(res_str, {}).setdefault(str(row.switch_device_id), []).append(
+        target = by_res_release if row.intended == "RELEASED" else by_res_build
+        target.setdefault(res_str, {}).setdefault(str(row.switch_device_id), []).append(
             (row.port_a, row.port_b, phys)
         )
         retry_ids.append(row.id)
 
     async with httpx.AsyncClient() as client:
         ctx = _FetchContext(client)
-        for res_str, build_by_switch in by_res.items():
-            await _apply_wiring_pairs(res_str, {}, build_by_switch, [], ctx, get_db_session)
+        for res_str in {*by_res_build, *by_res_release}:
+            build_by_switch = by_res_build.get(res_str, {})
+            release_by_switch = by_res_release.get(res_str, {})
+            await _apply_wiring_pairs(
+                res_str, release_by_switch, build_by_switch, [], ctx, get_db_session
+            )
 
     async with get_db_session() as db:
         refreshed = (
@@ -155,7 +173,13 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
         row = by_id.get(rid)
         if row is None:
             continue
-        outcomes.append(_outcome(row, "reconnected" if row.status == "ACTIVE" else "still_failed"))
+        if row.status == "ACTIVE":
+            outcome = "reconnected"
+        elif row.status == "RELEASED":
+            outcome = "released"
+        else:
+            outcome = "still_failed"
+        outcomes.append(_outcome(row, outcome))
     return outcomes
 
 
@@ -168,7 +192,8 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
 
     Returns {"reservation_id", "results": [outcome, ...]} where each outcome carries the
     connection identity, the post-retry status/attempts/last_error, and an `outcome` of
-    "reconnected", "still_failed", or "not_retryable".
+    "reconnected" (a build succeeded), "released" (a release succeeded, issue #369),
+    "still_failed", or "not_retryable".
     """
     res_str = str(reservation_id)
     async with get_db_session() as db:
@@ -212,6 +237,7 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         "rows_due": len(due),
         "rows_retried": 0,
         "reconnected": 0,
+        "released": 0,
         "still_failed": 0,
         "skipped_frozen": 0,
         "skipped_not_retryable": 0,
@@ -248,6 +274,8 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         for o in outcomes:
             if o["outcome"] == "reconnected":
                 stats["reconnected"] += 1
+            elif o["outcome"] == "released":
+                stats["released"] += 1
             elif o["outcome"] == "still_failed":
                 stats["still_failed"] += 1
 

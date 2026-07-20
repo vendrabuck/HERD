@@ -423,7 +423,14 @@ async def retry_run(
 
 
 class WiringConnectionStatus(BaseModel):
-    """One l1_connection_assignments row projected for the wiring-status surface."""
+    """One l1_connection_assignments row projected for the wiring-status surface.
+
+    `intended` (ADR 0009 Decision 2, issue #369; additive field) is the direction
+    the row's last write was attempting: ACTIVE for a connect/build, RELEASED for
+    a disconnect/release. It lets a caller distinguish a FAILED build (still needs
+    to connect) from a FAILED teardown (still needs to disconnect) instead of the
+    row's status alone, which is FAILED either way.
+    """
 
     id: uuid.UUID
     switch_device_id: uuid.UUID
@@ -431,6 +438,7 @@ class WiringConnectionStatus(BaseModel):
     port_b: str
     physical_connection_id: uuid.UUID | None = None
     status: str
+    intended: str
     attempts: int
     last_error: str | None = None
     retryable: bool
@@ -497,6 +505,7 @@ async def internal_wiring_status(
             port_b=row.port_b,
             physical_connection_id=row.physical_connection_id,
             status=row.status,
+            intended=row.intended,
             attempts=row.attempts,
             last_error=row.last_error,
             retryable=(row.status == "FAILED" and is_retryable_failure(row.last_error)),

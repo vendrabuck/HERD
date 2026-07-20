@@ -17,7 +17,9 @@ from app.services import l1_assignment_service as svc
 from app.services.l1_assignment_service import (
     canonical_port_pair,
     compute_backfill_assignments,
+    compute_backfill_intended,
     freeze_reservation_wiring,
+    pair_needs_release,
     record_l1_connect,
     record_l1_failed,
     release_l1_connection,
@@ -69,12 +71,35 @@ async def test_record_connect_inserts_active_row(db):
     row = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
     assert row is not None
     assert row.status == "ACTIVE"
+    assert row.intended == "ACTIVE"
     assert row.reservation_id == rid
     assert row.switch_device_id == switch
     assert (row.port_a, row.port_b) == ("0/0/1", "0/0/2")
     assert row.attempts == 0
     assert row.physical_connection_id is None
     assert row.released_at is None
+
+
+@pytest.mark.asyncio
+async def test_record_connect_reusable_failed_flip_sets_intended_active(db):
+    """Reusing a reservation's own FAILED row (any prior intended) flips intended ACTIVE.
+
+    Covers the case where the row was previously FAILED with intended RELEASED (a
+    stuck teardown) and this reservation now wants the pair connected again: the
+    reuse flip must not leave a stale RELEASED intended on an ACTIVE row.
+    """
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    failed = await record_l1_failed(
+        db, rid, switch, "0/0/1", "0/0/2", attempts=2, last_error="boom", intended="RELEASED"
+    )
+    assert failed.intended == "RELEASED"
+
+    row = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
+    assert row.id == failed.id
+    assert row.status == "ACTIVE"
+    assert row.intended == "ACTIVE"
+    assert row.last_error is None
 
 
 @pytest.mark.asyncio
@@ -199,12 +224,39 @@ async def test_failed_record_never_downgrades_active_row(db):
     attempts_before = winner.attempts
 
     row = await record_l1_failed(
-        db, rid, switch, "p1", "p2", attempts=3, last_error="stale apply failure"
+        db, rid, switch, "p1", "p2", attempts=3, last_error="stale apply failure", intended="ACTIVE"
     )
     assert row.id == winner.id
     assert row.status == "ACTIVE"
     assert row.attempts == attempts_before
     assert row.last_error != "stale apply failure"
+    assert row.intended == "ACTIVE", "intended must not be mutated by the refused write"
+
+
+@pytest.mark.asyncio
+async def test_failed_release_direction_does_flip_an_active_row(db):
+    """The #412 guard is scoped to the BUILD direction; a genuine RELEASE-direction
+    failure against an ACTIVE row is not a race and must flip it FAILED.
+
+    An ACTIVE row is the normal, expected starting state of a disconnect that
+    failed (the pair is still genuinely connected): recording that as a
+    retryable FAILED row with intended RELEASED is the entire point of issue
+    #369, and record_l1_failed must not treat it the same as a stale connect
+    failure racing a winner.
+    """
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    active = await record_l1_connect(db, rid, switch, "p1", "p2")
+    assert active.status == "ACTIVE"
+
+    row = await record_l1_failed(
+        db, rid, switch, "p1", "p2", attempts=1, last_error="disconnect boom", intended="RELEASED"
+    )
+    assert row.id == active.id
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.attempts == 1
+    assert row.last_error == "disconnect boom"
 
 
 @pytest.mark.asyncio
@@ -212,8 +264,12 @@ async def test_failed_record_accumulates_attempts_on_failed_row(db):
     """Repeat failures upsert the same row and ACCUMULATE attempts (phase 4 cap)."""
     rid = uuid.uuid4()
     switch = uuid.uuid4()
-    first = await record_l1_failed(db, rid, switch, "p1", "p2", attempts=3, last_error="boom 1")
-    second = await record_l1_failed(db, rid, switch, "p1", "p2", attempts=1, last_error="boom 2")
+    first = await record_l1_failed(
+        db, rid, switch, "p1", "p2", attempts=3, last_error="boom 1", intended="ACTIVE"
+    )
+    second = await record_l1_failed(
+        db, rid, switch, "p1", "p2", attempts=1, last_error="boom 2", intended="ACTIVE"
+    )
     assert second.id == first.id
     assert second.status == "FAILED"
     assert second.attempts == 4
@@ -224,10 +280,13 @@ async def test_failed_record_accumulates_attempts_on_failed_row(db):
 async def test_failed_record_creates_fresh_row_when_none_exists(db):
     rid = uuid.uuid4()
     switch = uuid.uuid4()
-    row = await record_l1_failed(db, rid, switch, "p1", "p2", attempts=3, last_error="boom")
+    row = await record_l1_failed(
+        db, rid, switch, "p1", "p2", attempts=3, last_error="boom", intended="ACTIVE"
+    )
     assert row.status == "FAILED"
     assert row.attempts == 3
     assert row.last_error == "boom"
+    assert row.intended == "ACTIVE"
 
 
 # --- release_l1_connection ---
@@ -242,7 +301,33 @@ async def test_release_flips_active_to_released(db):
     released = await release_l1_connection(db, rid, switch, "0/0/1", "0/0/2")
     assert released is not None
     assert released.status == "RELEASED"
+    assert released.intended == "RELEASED"
     assert released.released_at is not None
+
+
+@pytest.mark.asyncio
+async def test_release_flips_retried_failed_row_to_released(db):
+    """A retry-driven disconnect success flips a FAILED-intended-RELEASED row in
+    place, the release-side mirror of record_l1_connect's reusable-FAILED flip.
+
+    Without this broadened match, a retry that successfully disconnects a
+    previously-FAILED release would leave the row stuck FAILED forever: the
+    original release_l1_connection only matched status == ACTIVE.
+    """
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    await record_l1_connect(db, rid, switch, "p1", "p2")
+    failed = await record_l1_failed(
+        db, rid, switch, "p1", "p2", attempts=1, last_error="boom", intended="RELEASED"
+    )
+    assert failed.status == "FAILED"
+
+    released = await release_l1_connection(db, rid, switch, "p1", "p2")
+    assert released is not None
+    assert released.id == failed.id
+    assert released.status == "RELEASED"
+    assert released.intended == "RELEASED"
+    assert released.last_error is None, "the resolved failure message must not linger"
 
 
 @pytest.mark.asyncio
@@ -273,6 +358,55 @@ async def test_release_frees_the_pair_for_a_new_claim(db):
 async def test_release_no_matching_active_row_is_noop(db):
     released = await release_l1_connection(db, uuid.uuid4(), uuid.uuid4(), "A", "B")
     assert released is None
+
+
+# --- pair_needs_release (issue #369 release-direction idempotency gate) -----
+
+
+@pytest.mark.asyncio
+async def test_pair_needs_release_true_for_active_row(db):
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    await record_l1_connect(db, rid, switch, "A", "B")
+    assert await pair_needs_release(db, rid, switch, "A", "B") is True
+
+
+@pytest.mark.asyncio
+async def test_pair_needs_release_true_for_failed_intended_released(db):
+    """A FAILED row whose intended is RELEASED is still believed live: a release
+    retry must not skip it as a no-op (the bug this gate exists to prevent)."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    await record_l1_failed(
+        db, rid, switch, "A", "B", attempts=1, last_error="boom", intended="RELEASED"
+    )
+    assert await pair_needs_release(db, rid, switch, "A", "B") is True
+
+
+@pytest.mark.asyncio
+async def test_pair_needs_release_false_for_failed_intended_active(db):
+    """A FAILED row whose intended is ACTIVE (a build that never connected) has
+    nothing live to release."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    await record_l1_failed(
+        db, rid, switch, "A", "B", attempts=1, last_error="boom", intended="ACTIVE"
+    )
+    assert await pair_needs_release(db, rid, switch, "A", "B") is False
+
+
+@pytest.mark.asyncio
+async def test_pair_needs_release_false_when_no_row(db):
+    assert await pair_needs_release(db, uuid.uuid4(), uuid.uuid4(), "A", "B") is False
+
+
+@pytest.mark.asyncio
+async def test_pair_needs_release_false_after_released(db):
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    await record_l1_connect(db, rid, switch, "A", "B")
+    await release_l1_connection(db, rid, switch, "A", "B")
+    assert await pair_needs_release(db, rid, switch, "A", "B") is False
 
 
 # --- active-unique IntegrityError race ---
@@ -462,3 +596,95 @@ def test_backfill_skips_run_without_reservation():
 
 def test_backfill_empty_runs_yields_nothing():
     assert compute_backfill_assignments([]) == []
+
+
+# --- compute_backfill_intended (migration 0016 reconstruction, issue #369) ---
+
+
+def _failed_row(row_id, reservation_id, switch_id, port_a, port_b):
+    return SimpleNamespace(
+        id=row_id,
+        reservation_id=reservation_id,
+        switch_device_id=switch_id,
+        port_a=port_a,
+        port_b=port_b,
+    )
+
+
+def test_backfill_intended_no_matching_run_defaults_active():
+    row_id = uuid.uuid4()
+    row = _failed_row(row_id, uuid.uuid4(), uuid.uuid4(), "A", "B")
+    assert compute_backfill_intended([row], []) == {row_id: "ACTIVE"}
+
+
+def test_backfill_intended_connect_run_yields_active():
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    row_id = uuid.uuid4()
+    row = _failed_row(row_id, rid, switch, "A", "B")
+    runs = [_run(rid, switch, "connect_ports", "FAILED", "A", "B", 1)]
+    assert compute_backfill_intended([row], runs) == {row_id: "ACTIVE"}
+
+
+def test_backfill_intended_disconnect_run_yields_released():
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    row_id = uuid.uuid4()
+    row = _failed_row(row_id, rid, switch, "A", "B")
+    # The run's own status is FAILED (that failed disconnect is WHY the row is
+    # FAILED); compute_backfill_intended considers it regardless, unlike
+    # compute_backfill_assignments which only trusts SUCCESS runs.
+    runs = [_run(rid, switch, "disconnect_ports", "FAILED", "A", "B", 1)]
+    assert compute_backfill_intended([row], runs) == {row_id: "RELEASED"}
+
+
+def test_backfill_intended_uses_most_recent_run():
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    row_id = uuid.uuid4()
+    row = _failed_row(row_id, rid, switch, "A", "B")
+    runs = [
+        _run(rid, switch, "connect_ports", "SUCCESS", "A", "B", 1),
+        _run(rid, switch, "disconnect_ports", "FAILED", "A", "B", 2),
+    ]
+    assert compute_backfill_intended([row], runs) == {row_id: "RELEASED"}
+
+
+def test_backfill_intended_matches_reversed_port_order():
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    row_id = uuid.uuid4()
+    # The row is stored canonical (A, B); the run recorded the reversed order.
+    row = _failed_row(row_id, rid, switch, "A", "B")
+    runs = [_run(rid, switch, "disconnect_ports", "FAILED", "B", "A", 1)]
+    assert compute_backfill_intended([row], runs) == {row_id: "RELEASED"}
+
+
+def test_backfill_intended_scoped_by_reservation():
+    """A run for a DIFFERENT reservation on the same switch/pair must not leak in."""
+    switch = uuid.uuid4()
+    row_id = uuid.uuid4()
+    row = _failed_row(row_id, uuid.uuid4(), switch, "A", "B")
+    other_reservation_run = _run(uuid.uuid4(), switch, "disconnect_ports", "FAILED", "A", "B", 1)
+    assert compute_backfill_intended([row], [other_reservation_run]) == {row_id: "ACTIVE"}
+
+
+def test_backfill_intended_multiple_rows_independent():
+    switch = uuid.uuid4()
+    rid_a, rid_b = uuid.uuid4(), uuid.uuid4()
+    row_a_id, row_b_id = uuid.uuid4(), uuid.uuid4()
+    row_a = _failed_row(row_a_id, rid_a, switch, "A", "B")
+    row_b = _failed_row(row_b_id, rid_b, switch, "C", "D")
+    runs = [
+        _run(rid_a, switch, "connect_ports", "FAILED", "A", "B", 1),
+        _run(rid_b, switch, "disconnect_ports", "FAILED", "C", "D", 1),
+    ]
+    assert compute_backfill_intended([row_a, row_b], runs) == {
+        row_a_id: "ACTIVE",
+        row_b_id: "RELEASED",
+    }
+
+
+def test_backfill_intended_empty_rows_yields_nothing():
+    runs = [_run(uuid.uuid4(), uuid.uuid4(), "connect_ports", "SUCCESS", "A", "B", 1)]
+    assert compute_backfill_intended([], runs) == {}

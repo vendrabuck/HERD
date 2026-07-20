@@ -333,6 +333,91 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
+async def test_cancelled_disconnect_failure_direction_aware_retry(
+    admin_client, l1_template, fresh_devices
+):
+    """Issue #369: a reservation cancelled while its switch fails disconnect_ports
+    parks a FAILED row tagged intended RELEASED (not the old build-direction-only
+    failure surface), and the direction-aware manual retry reattempts it as a
+    disconnect, ending RELEASED.
+
+    Exercises the legacy device-set teardown path (reservation.cancelled ->
+    disconnect_ports, _execute_switch_operations): before this fix, a failed
+    disconnect there recorded no assignment row at all (silently invisible,
+    unretryable, the row left ACTIVE forever). No topology/fork is involved;
+    this is the device-set L1 path, independent of the wiring_changed/fork-save
+    path the rest of this file covers.
+    """
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(f"NATS not reachable from host: {nats_err}")
+
+    switch = await _create_switch_fd(
+        admin_client,
+        l1_template["id"],
+        {"model": "test", "mock_fail_actions": "disconnect_ports"},
+    )
+    dut_a, dut_b = await fresh_devices(2)
+    connections = []
+    reservation_id = None
+    try:
+        connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
+        connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
+        # The knob targets disconnect_ports only, so activation's connect_ports
+        # succeeds regardless.
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]])
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+        assert await _poll_run_count_at_least(admin_client, reservation_id, "connect_ports", 1)
+
+        # Cancel: reservation.cancelled -> disconnect_ports on the switch, which
+        # fails (the knob is armed).
+        cancelled = await admin_client.delete(f"/reservations/{reservation_id}")
+        assert cancelled.status_code == 204, cancelled.text
+
+        failed = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "FAILED", timeout=20.0
+        )
+        assert failed is not None, "the failed teardown never surfaced a FAILED wiring-status row"
+        assert failed["intended"] == "RELEASED", (
+            "a failed disconnect must record intended RELEASED, not the build default"
+        )
+        assert failed["retryable"] is True
+
+        # Clear the knob and manually retry: the row must be retried as a
+        # disconnect (issue #369), not the old hard-coded reconnect.
+        upd = await admin_client.put(
+            f"/inventory/devices/{switch['id']}",
+            json={"field_data": {"model": "test", "mock_fail_actions": ""}},
+        )
+        assert upd.status_code == 200, upd.text
+
+        retried = await admin_client.post(f"/reservations/{reservation_id}/wiring/retry")
+        assert retried.status_code == 200, retried.text
+        outcomes = retried.json()["results"]
+        assert any(o["outcome"] == "released" for o in outcomes), (
+            f"manual retry did not release the pair: {outcomes}"
+        )
+
+        released = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "RELEASED"
+        )
+        assert released is not None, "the retried connection never reached RELEASED"
+        remaining = [
+            c
+            for c in (await _wiring_status(admin_client, reservation_id))["connections"]
+            if c["status"] == "FAILED"
+        ]
+        assert remaining == [], "no FAILED row should remain after a successful retry"
+    finally:
+        if reservation_id:
+            # Already CANCELLED; a second cancel is a terminal-status no-op.
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        for conn in connections:
+            await admin_client.delete(f"/cabling/connections/{conn['id']}")
+        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
 async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
     admin_client, l1_template, fresh_devices
 ):
