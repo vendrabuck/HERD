@@ -86,7 +86,7 @@ Tests live under `frontend/src/test/api/`. Currently covered after this round:
 
 ## E2E
 
-`tests/e2e/` has 38 files and 129 tests (123 Selenium, 6 Playwright). Remaining UI gaps:
+`tests/e2e/` has 39 files and 130 tests (123 Selenium, 7 Playwright). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
