@@ -17,7 +17,7 @@ from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
-from app.routers.reservations import WIRING_RETRY_REQUIRES_ACTIVE, bearer_scheme
+from app.routers.reservations import WIRING_RETRY_NOT_PROVISIONED, bearer_scheme
 from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -207,15 +207,45 @@ async def test_retry_admin_allowed():
     assert resp.status_code == 200
 
 
+@pytest.mark.parametrize(
+    "status",
+    [ReservationStatus.PENDING, ReservationStatus.PENDING_PROVISION],
+)
 @pytest.mark.asyncio
-async def test_retry_non_active_409_pinned_wording():
-    rid = await _insert_reservation(status=ReservationStatus.COMPLETED)
+async def test_retry_pre_provision_409_pinned_wording(status):
+    """PENDING and PENDING_PROVISION have no provisioned wiring, so retry is refused 409."""
+    rid = await _insert_reservation(status=status)
     with patch("app.routers.reservations._execution_wiring_call", new=AsyncMock()) as call:
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.post(f"/{rid}/wiring/retry")
     assert resp.status_code == 409
-    assert resp.json()["detail"] == WIRING_RETRY_REQUIRES_ACTIVE
+    assert resp.json()["detail"] == WIRING_RETRY_NOT_PROVISIONED
     call.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ReservationStatus.COMPLETED,
+        ReservationStatus.CANCELLED,
+        ReservationStatus.FAILED,
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_allowed_for_terminal_statuses(status):
+    """ADR 0009 phase 3 (issue #369): retry is permitted for the terminal statuses so a
+    stuck release-direction disconnect can finish after a reservation ends. The proxy
+    forwards to execution, which scopes the wiring freeze to build-direction rows."""
+    rid = await _insert_reservation(status=status)
+    body = {"reservation_id": str(rid), "results": []}
+    with patch(
+        "app.routers.reservations._execution_wiring_call",
+        new=AsyncMock(return_value=_resp(200, body)),
+    ) as call:
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.post(f"/{rid}/wiring/retry")
+    assert resp.status_code == 200
+    call.assert_awaited_once_with("POST", f"/internal/reservations/{rid}/wiring/retry")
 
 
 @pytest.mark.asyncio

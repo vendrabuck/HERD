@@ -916,19 +916,22 @@ Authorization: Bearer <token>
 When the reservation ends the fork is archived to an immutable as-built record:
 the read endpoint still returns it, but the two mutations are refused.
 
-Read the reservation's per-connection L1 wiring status, and (while ACTIVE)
-reattempt its hardware-retryable FAILED cross-connects. After a fork save
-reconciles the intended wiring, the execution service applies each L1
-cross-connect connection-by-connection and records the applied state; these
-owner-or-admin gated endpoints proxy that per-connection state (ADR 0007). The
-status read is allowed for any reservation status, so the applied and FAILED rows
-stay readable after the reservation ends; the retry mutates live hardware, so it
-requires the reservation to be `ACTIVE` and returns `409` otherwise (execution's
-own `409` for frozen wiring relays through unchanged):
+Read the reservation's per-connection L1 wiring status, and reattempt its
+hardware-retryable FAILED cross-connects. After a fork save reconciles the
+intended wiring, the execution service applies each L1 cross-connect
+connection-by-connection and records the applied state; these owner-or-admin
+gated endpoints proxy that per-connection state (ADR 0007). The status read is
+allowed for any reservation status, so the applied and FAILED rows stay
+readable after the reservation ends. Retry is permitted for `ACTIVE` and the
+terminal statuses `COMPLETED`/`CANCELLED`/`FAILED`, and returns `409` only for
+`PENDING`/`PENDING_PROVISION` (there is no provisioned wiring to reattempt yet).
+On an ended reservation the freeze is direction-scoped (ADR 0009 phase 3): a
+build is still refused (execution reports it `frozen` or relays its own `409`),
+while a stuck release-direction disconnect may finish:
 
 ```
 GET  /api/reservations/{reservation_id}/wiring-status   # owner or admin, any status
-POST /api/reservations/{reservation_id}/wiring/retry    # owner or admin, ACTIVE only
+POST /api/reservations/{reservation_id}/wiring/retry    # owner or admin; not PENDING/PENDING_PROVISION
 Authorization: Bearer <token>
 ```
 
@@ -1335,7 +1338,7 @@ Authorization: Bearer <admin-token>
 | `/api/reservations/{id}/fork/canvas` | PUT | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
 | `/api/reservations/{id}/fork/save` | POST | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
 | `/api/reservations/{id}/wiring-status` | GET | owner only, any status | owner or admin, any status | owner or admin, any status |
-| `/api/reservations/{id}/wiring/retry` | POST | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
+| `/api/reservations/{id}/wiring/retry` | POST | owner only, not PENDING/PENDING_PROVISION | owner or admin, not PENDING/PENDING_PROVISION | owner or admin, not PENDING/PENDING_PROVISION |
 | `/api/reservations/internal/{id}/provision-result` | POST | internal | internal | internal |
 | `/api/reservations/reports/utilization` | GET | | yes | yes |
 | `/api/reservations/reports/utilization.csv` | GET | | yes | yes |

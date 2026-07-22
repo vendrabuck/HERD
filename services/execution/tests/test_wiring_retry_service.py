@@ -71,6 +71,7 @@ def _db_session_factory():
 SWITCH_ID = str(uuid.uuid4())
 DRIVER_ID = str(uuid.uuid4())
 RES_ID = str(uuid.uuid4())
+OTHER_RES_ID = str(uuid.uuid4())
 
 SWITCH_DATA = {
     "id": SWITCH_ID,
@@ -337,6 +338,92 @@ async def test_retry_frozen_reservation_refuses():
 
 
 @pytest.mark.asyncio
+async def test_retry_frozen_reservation_processes_releases_reports_builds_frozen():
+    """Direction-scoped freeze (issue #369): on a frozen reservation a build-direction
+    row is reported "frozen" without a driver call, while a release-direction row is
+    still reattempted as a disconnect and ends RELEASED."""
+    await _seed_state(frozen=True)
+    build_id = await _seed_failed("0/0/1", "0/0/2", attempts=0, intended="ACTIVE")
+    release_id = await _seed_failed("0/0/3", "0/0/4", attempts=0, intended="RELEASED")
+    execute_fn, calls = _sandbox_recorder()
+    result = await _run_reattempt(execute_fn)
+
+    assert ("connect_ports", "0/0/1", "0/0/2") not in calls, (
+        "a build must not be reattempted on a frozen reservation"
+    )
+    assert ("disconnect_ports", "0/0/3", "0/0/4") in calls
+
+    outcomes = {r["id"]: r["outcome"] for r in result["results"]}
+    assert outcomes[str(build_id)] == "frozen"
+    assert outcomes[str(release_id)] == "released"
+
+    # The build row stays FAILED; only the release converged.
+    failed = {(r.port_a, r.port_b) for r in await _rows("FAILED")}
+    assert failed == {("0/0/1", "0/0/2")}
+    released = {(r.port_a, r.port_b) for r in await _rows("RELEASED")}
+    assert released == {("0/0/3", "0/0/4")}
+
+
+@pytest.mark.asyncio
+async def test_retry_frozen_reservation_only_build_rows_still_raises():
+    """A frozen reservation with ONLY build-direction FAILED rows keeps the old refusal
+    contract: WiringReservationFrozen, no driver call."""
+    await _seed_state(frozen=True)
+    await _seed_failed("0/0/1", "0/0/2", intended="ACTIVE")
+    await _seed_failed("0/0/3", "0/0/4", intended="ACTIVE")
+    execute_fn, calls = _sandbox_recorder()
+    ps = _patches(execute_fn)
+    for p in ps:
+        p.start()
+    try:
+        with pytest.raises(WiringReservationFrozen):
+            await reattempt_reservation(RES_ID, _db_session_factory())
+    finally:
+        for p in ps:
+            p.stop()
+    assert calls == []
+    assert len(await _rows("FAILED")) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_supersession_flips_release_row_without_driver_call():
+    """Supersession guard (issue #369): a release-direction FAILED row whose port a
+    newer build on ANOTHER reservation already reclaimed is settled RELEASED with no
+    driver call, reported "superseded"."""
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=0, intended="RELEASED")
+    # A different reservation now holds an ACTIVE cross-connect claiming port 0/0/1 on
+    # the same switch: the old cross-connect had to be torn down for it to succeed.
+    active_id = await _seed_active("0/0/1", "0/0/9", reservation_id=OTHER_RES_ID)
+    execute_fn, calls = _sandbox_recorder()
+    result = await _run_reattempt(execute_fn)
+
+    assert calls == [], "a superseded release needs no driver call"
+    released = await _rows("RELEASED")
+    assert [r.id for r in released] == [fid]
+    assert result["results"][0]["outcome"] == "superseded"
+    assert result["results"][0]["status"] == "RELEASED"
+    # The other reservation's live cross-connect is untouched.
+    active = await _rows("ACTIVE")
+    assert [r.id for r in active] == [active_id]
+
+
+@pytest.mark.asyncio
+async def test_retry_no_supersession_when_active_row_same_reservation_fires_driver():
+    """The supersession guard is cross-reservation: a same-reservation ACTIVE row with
+    an overlapping port does NOT supersede, so the disconnect driver still fires."""
+    await _seed_failed("0/0/1", "0/0/2", attempts=0, intended="RELEASED")
+    # Same reservation holds an ACTIVE row overlapping port 0/0/1: not superseding.
+    await _seed_active("0/0/1", "0/0/9", reservation_id=RES_ID)
+    execute_fn, calls = _sandbox_recorder()
+    result = await _run_reattempt(execute_fn)
+
+    assert ("disconnect_ports", "0/0/1", "0/0/2") in calls, (
+        "a same-reservation ACTIVE row must not suppress the disconnect"
+    )
+    assert result["results"][0]["outcome"] == "released"
+
+
+@pytest.mark.asyncio
 async def test_retry_failed_reattempt_accumulates_attempts_and_updates_error():
     """A reattempt that fails again keeps the row FAILED, grows attempts, updates last_error."""
     await _seed_failed("0/0/1", "0/0/2", attempts=3, last_error="old boom")
@@ -425,6 +512,44 @@ async def test_tick_skips_frozen_reservation(monkeypatch):
     assert stats["rows_retried"] == 0
     assert calls == []
     assert len(await _rows("FAILED")) == 1
+
+
+@pytest.mark.asyncio
+async def test_tick_retries_frozen_release_and_skips_frozen_build(monkeypatch):
+    """Direction-scoped freeze in the auto channel (issue #369): a frozen reservation's
+    build-direction row is skipped, but its release-direction row is still retried."""
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    await _seed_state(frozen=True)
+    await _seed_failed("0/0/1", "0/0/2", attempts=0, intended="ACTIVE")
+    await _seed_failed("0/0/3", "0/0/4", attempts=0, intended="RELEASED")
+    execute_fn, calls = _sandbox_recorder()
+    stats = await _run_tick(execute_fn)
+
+    assert stats["skipped_frozen"] == 1, "the build-direction row is skipped"
+    assert stats["rows_retried"] == 1
+    assert stats["released"] == 1
+    assert ("connect_ports", "0/0/1", "0/0/2") not in calls
+    assert ("disconnect_ports", "0/0/3", "0/0/4") in calls
+    assert {(r.port_a, r.port_b) for r in await _rows("RELEASED")} == {("0/0/3", "0/0/4")}
+    assert {(r.port_a, r.port_b) for r in await _rows("FAILED")} == {("0/0/1", "0/0/2")}
+
+
+@pytest.mark.asyncio
+async def test_tick_reports_superseded_stat(monkeypatch):
+    """The auto channel runs the supersession guard too: a release row a newer build on
+    another reservation reclaimed is counted "superseded", no driver call."""
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=0, intended="RELEASED")
+    await _seed_active("0/0/1", "0/0/9", reservation_id=OTHER_RES_ID)
+    execute_fn, calls = _sandbox_recorder()
+    stats = await _run_tick(execute_fn)
+
+    assert stats["rows_due"] == 1
+    assert stats["rows_retried"] == 1
+    assert stats["superseded"] == 1
+    assert stats["released"] == 0
+    assert calls == []
+    assert [r.id for r in await _rows("RELEASED")] == [fid]
 
 
 # --- Loop backoff schedule --------------------------------------------------

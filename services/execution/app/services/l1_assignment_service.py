@@ -12,7 +12,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -435,6 +435,50 @@ async def pair_needs_release(
         return False
     status, intended = row
     return status == "ACTIVE" or (status == "FAILED" and intended == "RELEASED")
+
+
+async def supersede_release_if_reclaimed(
+    db: AsyncSession,
+    row: L1ConnectionAssignment,
+) -> bool:
+    """Settle a release-direction FAILED row as RELEASED, no driver call, when a newer
+    build already reclaimed its port on the same switch (ADR 0009 phase 3, issue #369).
+
+    A release-direction FAILED row (intended RELEASED) is a disconnect that never
+    confirmed success, so this reservation's own ledger still believes the pair may be
+    live. But an L1 matrix port carries exactly one cross-connect: if ANOTHER
+    reservation now holds an ACTIVE row on the same switch claiming either canonical
+    port of this pair, that newer build could only have succeeded by first destroying
+    the old cross-connect. The disconnect this row wants is therefore already done in
+    hardware; re-firing disconnect_ports would at best no-op and at worst tear down the
+    newer reservation's live cross-connect. So we flip the row RELEASED in place and
+    skip the driver.
+
+    pair_needs_release cannot see this: it is reservation-scoped (it inspects only THIS
+    reservation's row for the pair) and correctly reports the pair as still needing a
+    release, since from this reservation's ledger the disconnect never confirmed. The
+    superseding evidence lives in a DIFFERENT reservation's ACTIVE row, which only a
+    cross-reservation, port-level query reaches. Returns True when the row was
+    superseded (and now RELEASED), False when a driver disconnect is still warranted.
+    """
+    ca, cb = canonical_port_pair(row.port_a, row.port_b)
+    result = await db.execute(
+        select(L1ConnectionAssignment.id).where(
+            L1ConnectionAssignment.switch_device_id == row.switch_device_id,
+            L1ConnectionAssignment.reservation_id != row.reservation_id,
+            L1ConnectionAssignment.status == "ACTIVE",
+            or_(
+                L1ConnectionAssignment.port_a.in_((ca, cb)),
+                L1ConnectionAssignment.port_b.in_((ca, cb)),
+            ),
+        )
+    )
+    if result.first() is None:
+        return False
+    await release_l1_connection(
+        db, row.reservation_id, row.switch_device_id, row.port_a, row.port_b
+    )
+    return True
 
 
 async def record_l1_failed(

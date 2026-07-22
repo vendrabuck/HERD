@@ -126,7 +126,13 @@ teardown drops `action_succeeded_for_reservation` in favor of ledger reads,
 discharging ADR 0007's deferred migration; the helper remains for the
 pre-phase-2 transition fallback and backfill only. The retry channels
 (manual and background) extend to L2 membership and L3 route rows with the
-same retryable classification, honoring `intended` per Decision 2.
+same retryable classification, honoring `intended` per Decision 2. The
+wiring freeze is direction-scoped (phase 3, vendra-approved 2026-07-22): a
+frozen or terminal reservation blocks only BUILD-direction retries;
+RELEASE-direction rows stay retryable so a stuck disconnect can finish
+after the reservation ends. Accordingly the reservations retry proxy
+permits ACTIVE plus the terminal statuses (COMPLETED/CANCELLED/FAILED) and
+refuses only PENDING/PENDING_PROVISION.
 
 ## Decision 6: Initial provisioning unifies through the fork; the legacy resolvers retire
 
@@ -168,8 +174,10 @@ VLAN-number derivation and allocation semantics (find-or-assign, exhaustion
 DLQ, the race-retry); L3 route content semantics (latest config version at
 provision time, pinned, never re-derived: first-class L3, issue #34, builds
 on this later and is out of scope); the device-set PATCH's non-wiring roles;
-frozen-reservation semantics; the #412 invariant (an ACTIVE row is immutable
-to failure writers) which extends to the new ledgers.
+the frozen-reservation consumer no-op (a late `wiring_changed` on a frozen
+reservation is still ignored; the retry-channel freeze becomes
+direction-scoped, see Decision 5); the #412 invariant (an ACTIVE row is
+immutable to failure writers) which extends to the new ledgers.
 
 ## Delivery phases (each independently mergeable)
 
