@@ -12,7 +12,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,6 +69,7 @@ async def record_l1_connect(
     reusable = await _find_reusable_failed(db, res_uuid, switch_uuid, ca, cb)
     if reusable is not None:
         reusable.status = "ACTIVE"
+        reusable.intended = "ACTIVE"
         reusable.last_error = None
         reusable.released_at = None
         if physical_connection_id and reusable.physical_connection_id is None:
@@ -91,6 +92,7 @@ async def record_l1_connect(
         port_b=cb,
         physical_connection_id=_as_uuid(physical_connection_id) if physical_connection_id else None,
         status="ACTIVE",
+        intended="ACTIVE",
     )
     db.add(assignment)
     try:
@@ -118,11 +120,15 @@ async def release_l1_connection(
     port_a: str,
     port_b: str,
 ) -> L1ConnectionAssignment | None:
-    """Flip this reservation's ACTIVE row for a pair to RELEASED after disconnect.
+    """Flip this reservation's ACTIVE (or retried-FAILED) row for a pair to RELEASED.
 
-    Returns the released row, or None if no ACTIVE row matched (already released,
-    or never recorded). Keyed on reservation plus the canonical pair so a
-    teardown only releases what this reservation holds.
+    Returns the released row, or None if no matching row (already released, or
+    never recorded). Keyed on reservation plus the canonical pair so a teardown
+    only releases what this reservation holds. Matches status ACTIVE or FAILED
+    (excludes RELEASED): a FAILED row here is a prior disconnect attempt that did
+    not confirm success (intended RELEASED), reattempted through the retry
+    channel; a successful reattempt flips it RELEASED in place, the release-side
+    mirror of record_l1_connect's reusable-FAILED flip for the build direction.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -134,13 +140,15 @@ async def release_l1_connection(
             L1ConnectionAssignment.switch_device_id == switch_uuid,
             L1ConnectionAssignment.port_a == ca,
             L1ConnectionAssignment.port_b == cb,
-            L1ConnectionAssignment.status == "ACTIVE",
+            L1ConnectionAssignment.status != "RELEASED",
         )
     )
     row = result.scalar_one_or_none()
     if row is None:
         return None
     row.status = "RELEASED"
+    row.intended = "RELEASED"
+    row.last_error = None
     row.released_at = datetime.now(timezone.utc)
     await db.commit()
     logger.info(
@@ -392,6 +400,87 @@ async def is_pair_active(
     return result.first() is not None
 
 
+async def pair_needs_release(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    switch_device_id: uuid.UUID | str,
+    port_a: str,
+    port_b: str,
+) -> bool:
+    """True when this pair is believed to still be live and a disconnect belongs.
+
+    The idempotency gate for a release (issue #369): unlike is_pair_active (build's
+    ACTIVE-only convergence check), this is also true for a FAILED row whose
+    intended is RELEASED. Such a row IS a disconnect attempt that never confirmed
+    success, so the pair may still be physically connected; treating it as "nothing
+    to release" (is_pair_active would say False, since status != ACTIVE) would make
+    a release-direction retry a silent no-op, never reaching the driver. A FAILED
+    row whose intended is ACTIVE (a build that never connected) is correctly
+    excluded: there is nothing live to release.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    switch_uuid = _as_uuid(switch_device_id)
+    ca, cb = canonical_port_pair(port_a, port_b)
+    result = await db.execute(
+        select(L1ConnectionAssignment.status, L1ConnectionAssignment.intended).where(
+            L1ConnectionAssignment.reservation_id == res_uuid,
+            L1ConnectionAssignment.switch_device_id == switch_uuid,
+            L1ConnectionAssignment.port_a == ca,
+            L1ConnectionAssignment.port_b == cb,
+            L1ConnectionAssignment.status != "RELEASED",
+        )
+    )
+    row = result.first()
+    if row is None:
+        return False
+    status, intended = row
+    return status == "ACTIVE" or (status == "FAILED" and intended == "RELEASED")
+
+
+async def supersede_release_if_reclaimed(
+    db: AsyncSession,
+    row: L1ConnectionAssignment,
+) -> bool:
+    """Settle a release-direction FAILED row as RELEASED, no driver call, when a newer
+    build already reclaimed its port on the same switch (ADR 0009 phase 3, issue #369).
+
+    A release-direction FAILED row (intended RELEASED) is a disconnect that never
+    confirmed success, so this reservation's own ledger still believes the pair may be
+    live. But an L1 matrix port carries exactly one cross-connect: if ANOTHER
+    reservation now holds an ACTIVE row on the same switch claiming either canonical
+    port of this pair, that newer build could only have succeeded by first destroying
+    the old cross-connect. The disconnect this row wants is therefore already done in
+    hardware; re-firing disconnect_ports would at best no-op and at worst tear down the
+    newer reservation's live cross-connect. So we flip the row RELEASED in place and
+    skip the driver.
+
+    pair_needs_release cannot see this: it is reservation-scoped (it inspects only THIS
+    reservation's row for the pair) and correctly reports the pair as still needing a
+    release, since from this reservation's ledger the disconnect never confirmed. The
+    superseding evidence lives in a DIFFERENT reservation's ACTIVE row, which only a
+    cross-reservation, port-level query reaches. Returns True when the row was
+    superseded (and now RELEASED), False when a driver disconnect is still warranted.
+    """
+    ca, cb = canonical_port_pair(row.port_a, row.port_b)
+    result = await db.execute(
+        select(L1ConnectionAssignment.id).where(
+            L1ConnectionAssignment.switch_device_id == row.switch_device_id,
+            L1ConnectionAssignment.reservation_id != row.reservation_id,
+            L1ConnectionAssignment.status == "ACTIVE",
+            or_(
+                L1ConnectionAssignment.port_a.in_((ca, cb)),
+                L1ConnectionAssignment.port_b.in_((ca, cb)),
+            ),
+        )
+    )
+    if result.first() is None:
+        return False
+    await release_l1_connection(
+        db, row.reservation_id, row.switch_device_id, row.port_a, row.port_b
+    )
+    return True
+
+
 async def record_l1_failed(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,
@@ -401,8 +490,18 @@ async def record_l1_failed(
     attempts: int,
     last_error: str,
     physical_connection_id: uuid.UUID | str | None = None,
+    *,
+    intended: str,
 ) -> L1ConnectionAssignment:
     """Write (or update) a FAILED row for a cross-connect that could not be applied.
+
+    `intended` (ADR 0009 Decision 2, issue #369) is the direction THIS write was
+    attempting: "ACTIVE" for a failed connect/build, "RELEASED" for a failed
+    disconnect/release. Every caller must pass it explicitly (no default) so a
+    build failure and a release failure are never conflated: the retry channels
+    (wiring_retry_service) split FAILED rows on this field to reattempt each one
+    in its own direction, instead of defaulting every FAILED row to a reconnect
+    (the bug issue #369 describes).
 
     A FAILED status is exempt from the ACTIVE-only partial-unique index, so a FAILED
     row never blocks a later ACTIVE claim on the same pair and cannot collide with the
@@ -429,16 +528,24 @@ async def record_l1_failed(
     )
     row = result.scalars().first()
     if row is not None:
-        if row.status == "ACTIVE":
-            # A racing writer (manual retry, phase-4 reattempt, or a concurrent
-            # apply) proved this pair connects AFTER our failed attempt began,
-            # so this failure is stale information: never downgrade the winner
-            # (issue #412, the #276/#318 CAS discipline). attempts stays
-            # untouched: an ACTIVE row is immutable to failure writers, and
-            # inflating it would push a healthy pair toward the retry cap for
-            # no reason.
+        if row.status == "ACTIVE" and intended == "ACTIVE":
+            # The issue #412 guard, scoped to the direction it actually protects:
+            # a racing writer (manual retry, phase-4 reattempt, or a concurrent
+            # apply) proved this pair connects AFTER our failed BUILD attempt
+            # began, so this failure is stale information: never downgrade the
+            # winner (the #276/#318 CAS discipline). attempts and intended stay
+            # untouched by the refused write: an ACTIVE row is immutable to a
+            # stale connect-direction failure writer, and inflating attempts
+            # would push a healthy pair toward the retry cap for no reason.
+            #
+            # This does NOT extend to a RELEASE-direction failure (intended
+            # RELEASED): an ACTIVE row there is not a race, it is the normal,
+            # expected starting state of a disconnect that failed (the pair is
+            # still genuinely connected), and recording that as a retryable
+            # FAILED row is the entire point of issue #369. See
+            # pair_needs_release for the matching release-side idempotency gate.
             logger.warning(
-                "Ignoring stale L1 failure for switch %s pair (%s, %s), "
+                "Ignoring stale L1 build failure for switch %s pair (%s, %s), "
                 "reservation %s: row is ACTIVE (a concurrent writer won)",
                 switch_uuid,
                 ca,
@@ -447,6 +554,7 @@ async def record_l1_failed(
             )
             return row
         row.status = "FAILED"
+        row.intended = intended
         row.attempts = (row.attempts or 0) + attempts
         row.last_error = last_error
         if physical_connection_id and row.physical_connection_id is None:
@@ -461,6 +569,7 @@ async def record_l1_failed(
         port_b=cb,
         physical_connection_id=_as_uuid(physical_connection_id) if physical_connection_id else None,
         status="FAILED",
+        intended=intended,
         attempts=attempts,
         last_error=last_error,
     )
@@ -552,4 +661,63 @@ def compute_backfill_assignments(runs) -> list[dict]:
                 "port_b": cb,
             }
         )
+    return result
+
+
+def compute_backfill_intended(failed_rows, runs) -> dict:
+    """Reconstruct intended for existing FAILED l1_connection_assignments rows.
+
+    Migration 0016's data step (issue #369, ADR 0009 Decision 2): a FAILED row
+    that predates the `intended` column is reconstructed from the most recent
+    connect_ports/disconnect_ports execution_run for the same (reservation,
+    switch device, canonical port pair), REGARDLESS of that run's own status
+    (unlike compute_backfill_assignments, which only considers SUCCESS runs to
+    infer current live state; here we want the last ATTEMPTED direction, and the
+    row is FAILED precisely because that attempt did not succeed).
+    connect_ports means intended ACTIVE, disconnect_ports means intended
+    RELEASED. A FAILED row with no matching run defaults to ACTIVE, matching the
+    column's server_default.
+
+    `failed_rows` exposes id, reservation_id, switch_device_id, port_a, port_b
+    (already canonical). `runs` exposes reservation_id, device_id (the switch),
+    action, port_a, port_b, created_at. Dicts or attribute objects both work for
+    either iterable. Returns {row_id: "ACTIVE" | "RELEASED"}.
+
+    Kept in sync with the frozen copy embedded in migration 0016: migrations must
+    not import live application code (a later refactor of this module would break
+    `alembic upgrade` for deployments still below that revision), so the two
+    copies are intentionally duplicated, not shared.
+    """
+    latest: dict[tuple, tuple] = {}
+    for r in runs:
+        action = _row_get(r, "action")
+        if action not in ("connect_ports", "disconnect_ports"):
+            continue
+        reservation_id = _row_get(r, "reservation_id")
+        switch_id = _row_get(r, "device_id")
+        port_a = _row_get(r, "port_a")
+        port_b = _row_get(r, "port_b")
+        if reservation_id is None or switch_id is None or port_a is None or port_b is None:
+            continue
+        ca, cb = canonical_port_pair(str(port_a), str(port_b))
+        key = (reservation_id, switch_id, ca, cb)
+        created = _row_get(r, "created_at")
+        prev = latest.get(key)
+        if prev is None or _strictly_after(created, prev[0]):
+            latest[key] = (created, action)
+
+    result: dict = {}
+    for row in failed_rows:
+        row_id = _row_get(row, "id")
+        key = (
+            _row_get(row, "reservation_id"),
+            _row_get(row, "switch_device_id"),
+            _row_get(row, "port_a"),
+            _row_get(row, "port_b"),
+        )
+        match = latest.get(key)
+        if match is None:
+            result[row_id] = "ACTIVE"
+        else:
+            result[row_id] = "ACTIVE" if match[1] == "connect_ports" else "RELEASED"
     return result

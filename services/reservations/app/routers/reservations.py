@@ -568,10 +568,24 @@ async def release_reservation_early(
 FORK_EDIT_REQUIRES_ACTIVE = "Fork editing requires an ACTIVE reservation"
 FORK_SAVE_REQUIRES_ACTIVE = "Fork save requires an ACTIVE reservation"
 
-# Pinned 409 wording when a wiring retry targets a non-ACTIVE reservation (ADR 0007
-# Decision 6): reattempting a cross-connect only makes sense while the reservation is
-# live; a completed/cancelled reservation's wiring is the frozen as-built record.
-WIRING_RETRY_REQUIRES_ACTIVE = "Wiring retry requires an ACTIVE reservation"
+# Pinned 409 wording when a wiring retry targets a not-yet-provisioned reservation.
+# ADR 0009 phase 3 (issue #369) relaxed the old ACTIVE-only rule: retry is permitted for
+# ACTIVE and the terminal statuses (COMPLETED/CANCELLED/FAILED), because a stuck
+# release-direction disconnect must be able to finish after a reservation ends (the
+# execution side scopes the freeze to build-direction rows). Only PENDING and
+# PENDING_PROVISION are refused: there is no provisioned wiring to reattempt yet.
+WIRING_RETRY_NOT_PROVISIONED = "Wiring retry requires a provisioned reservation"
+
+# Reservation statuses whose wiring may be reattempted (everything but the two
+# pre-provision states).
+_WIRING_RETRY_ALLOWED_STATUSES = frozenset(
+    {
+        ReservationStatus.ACTIVE,
+        ReservationStatus.COMPLETED,
+        ReservationStatus.CANCELLED,
+        ReservationStatus.FAILED,
+    }
+)
 
 
 class ForkCanvasBody(BaseModel):
@@ -819,19 +833,23 @@ async def retry_reservation_wiring(
 ):
     """Reattempt the reservation's FAILED cross-connects now (ADR 0007 Decision 6).
 
-    Owner-or-admin gated and ACTIVE-only: retry mutates live hardware, so it is refused
-    for a non-ACTIVE reservation with a pinned 409 (the fork-mutation discipline).
+    Owner-or-admin gated. Permitted for ACTIVE and the terminal statuses
+    (COMPLETED/CANCELLED/FAILED); only PENDING and PENDING_PROVISION are refused with a
+    pinned 409, since a not-yet-provisioned reservation has no wiring to reattempt. The
+    old ACTIVE-only rule was relaxed by ADR 0009 phase 3 (issue #369): a stuck
+    release-direction disconnect must be able to finish after a reservation ends, and
+    the execution side scopes the wiring freeze to build-direction rows accordingly.
     Proxies execution's internal retry endpoint and relays its structured per-connection
-    outcomes verbatim, including execution's own 409 (wiring frozen) and its 503 (upstream
-    unavailable); an unreachable execution service maps to 503.
+    outcomes verbatim, including execution's own 409 (wiring frozen, build-only) and its
+    503 (upstream unavailable); an unreachable execution service maps to 503.
     """
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")
     reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
     if reservation is None:
         raise HTTPException(status_code=404, detail="Reservation not found")
-    if reservation.status != ReservationStatus.ACTIVE:
-        raise HTTPException(status_code=409, detail=WIRING_RETRY_REQUIRES_ACTIVE)
+    if reservation.status not in _WIRING_RETRY_ALLOWED_STATUSES:
+        raise HTTPException(status_code=409, detail=WIRING_RETRY_NOT_PROVISIONED)
 
     try:
         resp = await _execution_wiring_call(

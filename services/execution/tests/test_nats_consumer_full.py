@@ -11,6 +11,7 @@ import pytest
 from app.database import Base
 from app.models.driver_cache import DriverCache  # noqa: F401 (register with Base)
 from app.models.execution_run import ExecutionRun  # noqa: F401 (register with Base)
+from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.services.nats_consumer import (
     TransientUpstreamError,
     _fetch_connections_for_device,
@@ -580,6 +581,39 @@ async def test_handle_event_disconnect_action():
         for p in patches:
             p.stop()
     assert "disconnect_ports" in call_actions
+
+
+@pytest.mark.asyncio
+async def test_cancelled_disconnect_failure_lands_failed_row_intended_released():
+    """Issue #369: the legacy device-set teardown path (reservation.cancelled ->
+    disconnect_ports) now also records a FAILED assignment row, tagged intended
+    RELEASED, on a disconnect failure. Previously a failed teardown left no
+    assignment row at all (silently invisible and unretryable); the connection
+    is still genuinely live (the disconnect did not succeed), so the row is not
+    subject to the issue #412 build-direction guard.
+    """
+    event = _make_event("reservation.cancelled")
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "disconnect_ports":
+            return FAILURE_RESULT
+        return SUCCESS_RESULT
+
+    patches = _event_patches(execute_fn=execute_fn)
+    for p in patches:
+        p.start()
+    try:
+        await handle_reservation_event(event, _db_session_factory())
+    finally:
+        for p in patches:
+            p.stop()
+
+    async with TestSessionLocal() as db:
+        rows = (await db.execute(select(L1ConnectionAssignment))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "RELEASED"
+    assert rows[0].last_error == "Connection refused"
 
 
 # --- start/stop_nats_consumer ---

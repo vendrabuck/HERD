@@ -194,7 +194,18 @@ export interface WiringStatusResponse {
 }
 
 // The outcome of reattempting (or classifying) one FAILED connection on retry.
-export type WiringRetryOutcomeKind = "reconnected" | "still_failed" | "not_retryable";
+// "reconnected" a build succeeded, "released" a release succeeded, "superseded" a
+// release a newer build already made redundant (no driver call), "still_failed" a
+// reattempt failed again, "not_retryable" a pinned unresolvable intent (recovery is a
+// re-save), "frozen" a build refused on an ended reservation (release-direction rows
+// still retry; ADR 0009 phase 3, issue #369).
+export type WiringRetryOutcomeKind =
+  | "reconnected"
+  | "released"
+  | "superseded"
+  | "still_failed"
+  | "not_retryable"
+  | "frozen";
 
 export interface WiringRetryOutcome {
   id: string;

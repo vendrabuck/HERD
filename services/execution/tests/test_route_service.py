@@ -67,6 +67,29 @@ async def test_assign_routes_inserts_active_row(db):
     assert row.status == "ACTIVE"
     assert row.routes == ROUTES
     assert row.released_at is None
+    # ADR 0009 Decision 2 additive columns (issue #369/#416): route_service does
+    # not write these yet (that is the L3 layered reconcile, phase 5), so a
+    # freshly assigned row gets their defaults.
+    assert row.attempts == 0
+    assert row.last_error is None
+    assert row.intended == "ACTIVE"
+
+
+def test_route_assignment_status_accepts_failed_value():
+    """Additive schema change (issue #369/#416): "FAILED" is now a legal status
+    value, even though route_service does not write it this phase."""
+    row = RouteAssignment(
+        reservation_id=uuid.uuid4(),
+        device_id=uuid.uuid4(),
+        routes=[],
+        status="FAILED",
+        attempts=2,
+        last_error="boom",
+        intended="ACTIVE",
+    )
+    assert row.status == "FAILED"
+    assert row.attempts == 2
+    assert row.last_error == "boom"
 
 
 async def test_assign_routes_is_idempotent_for_redelivery(db):

@@ -1675,11 +1675,15 @@ async def _execute_switch_operations(
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
                     )
-                    # A failed connect lands a FAILED assignment row so the connection
-                    # is visible and retryable through the phase-4 channel; a failed
-                    # disconnect (teardown) leaves the ACTIVE row intact (the
-                    # cross-connect is still live) rather than falsely releasing it.
-                    if res_uuid is not None and action == "connect_ports":
+                    # A failed connect or disconnect lands a FAILED assignment row so
+                    # the connection is visible and retryable through the wiring
+                    # retry channel (issue #369): intended records which direction
+                    # this attempt was making, so a failed teardown parks FAILED
+                    # with intended RELEASED rather than silently leaving the row
+                    # ACTIVE with no path to retry the disconnect. The issue #412
+                    # guard (record_l1_failed) still refuses to downgrade a row a
+                    # concurrent BUILD already won; it does not apply here.
+                    if res_uuid is not None:
                         await record_l1_failed(
                             db,
                             res_uuid,
@@ -1688,6 +1692,7 @@ async def _execute_switch_operations(
                             port_b,
                             1,
                             op_error or "driver reported failure",
+                            intended="ACTIVE" if action == "connect_ports" else "RELEASED",
                         )
 
             # Logout
@@ -2676,7 +2681,7 @@ async def _apply_wiring_pairs(
     reservation_id: str,
     release_by_switch: dict[str, list[tuple[str, str, str | None]]],
     build_by_switch: dict[str, list[tuple[str, str, str | None]]],
-    unresolvable: list[tuple[dict, str]],
+    unresolvable: list[tuple[dict, str, str]],
     ctx: "_FetchContext",
     get_db_session,
 ) -> None:
@@ -2690,6 +2695,11 @@ async def _apply_wiring_pairs(
     projection does: record_l1_connect on a successful connect, release_l1_connection on
     a successful disconnect. A recorded hop that no longer resolves to a live
     switch/port is a FAILED row with the pinned unresolvable reason (Decision 5).
+
+    `unresolvable` items carry the direction (ADR 0009 Decision 2, issue #369) the
+    caller resolved them from: (wire, reason, intended), so a hop that fell out of
+    the RELEASE side of a delta parks FAILED with intended RELEASED, not the
+    build-direction default.
     """
     from datetime import datetime, timezone
 
@@ -2703,6 +2713,7 @@ async def _apply_wiring_pairs(
     )
     from app.services.l1_assignment_service import (
         is_pair_active,
+        pair_needs_release,
         record_l1_failed,
     )
 
@@ -2712,7 +2723,7 @@ async def _apply_wiring_pairs(
     # not a simple chain so its pairing is unrecoverable. A verbatim apply cannot
     # proceed and re-routing/guessing is forbidden. Park each hop FAILED with its
     # pinned reason, keyed on the hop's own recorded endpoints.
-    for wire, reason in unresolvable:
+    for wire, reason, wire_intended in unresolvable:
         async with get_db_session() as db:
             await record_l1_failed(
                 db,
@@ -2723,6 +2734,7 @@ async def _apply_wiring_pairs(
                 attempts=0,
                 last_error=reason,
                 physical_connection_id=wire.get("physical_connection_id"),
+                intended=wire_intended,
             )
 
     switch_ids = list({*release_by_switch.keys(), *build_by_switch.keys()})
@@ -2764,18 +2776,35 @@ async def _apply_wiring_pairs(
                     load_error = f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: {exc}"
 
         # A switch we cannot drive: every pair on it (release and build) is a FAILED
-        # unresolvable row. A release with no ACTIVE row is still a no-op (nothing to
-        # tear down), so only build/held pairs are surfaced as failures.
+        # unresolvable row. A release with nothing believed live is still a no-op
+        # (nothing to tear down), so only build/held pairs are unconditionally
+        # surfaced as failures.
         if load_error is not None or driver_path is None:
             async with get_db_session() as db:
                 for port_a, port_b, phys in build_pairs:
                     await record_l1_failed(
-                        db, res_uuid, switch_uuid, port_a, port_b, 0, load_error, phys
+                        db,
+                        res_uuid,
+                        switch_uuid,
+                        port_a,
+                        port_b,
+                        0,
+                        load_error,
+                        phys,
+                        intended="ACTIVE",
                     )
                 for port_a, port_b, phys in release_pairs:
-                    if await is_pair_active(db, res_uuid, switch_uuid, port_a, port_b):
+                    if await pair_needs_release(db, res_uuid, switch_uuid, port_a, port_b):
                         await record_l1_failed(
-                            db, res_uuid, switch_uuid, port_a, port_b, 0, load_error, phys
+                            db,
+                            res_uuid,
+                            switch_uuid,
+                            port_a,
+                            port_b,
+                            0,
+                            load_error,
+                            phys,
+                            intended="RELEASED",
                         )
             continue
 
@@ -2812,7 +2841,8 @@ async def _apply_wiring_pairs(
             )
             if not login_ok:
                 # A driver-level login failure (Decision 7: never NAKs). Every pair we
-                # would have applied on this switch is parked FAILED with the attempts.
+                # would have applied on this switch is parked FAILED with the attempts,
+                # tagged with the direction it was going (issue #369).
                 for port_a, port_b, phys in build_pairs:
                     await record_l1_failed(
                         db,
@@ -2823,9 +2853,10 @@ async def _apply_wiring_pairs(
                         login_attempts,
                         f"driver login failed: {login_err}",
                         phys,
+                        intended="ACTIVE",
                     )
                 for port_a, port_b, phys in release_pairs:
-                    if await is_pair_active(db, res_uuid, switch_uuid, port_a, port_b):
+                    if await pair_needs_release(db, res_uuid, switch_uuid, port_a, port_b):
                         await record_l1_failed(
                             db,
                             res_uuid,
@@ -2835,15 +2866,17 @@ async def _apply_wiring_pairs(
                             login_attempts,
                             f"driver login failed: {login_err}",
                             phys,
+                            intended="RELEASED",
                         )
                 continue
 
             # Release-before-build. Disconnect the released pairs first so a moved
             # cable frees its port before the rebuild claims it.
             for port_a, port_b, phys in release_pairs:
-                if not await is_pair_active(db, res_uuid, switch_uuid, port_a, port_b):
-                    # Already released or never applied: an idempotent no-op, no
-                    # driver call and no hardware touch.
+                if not await pair_needs_release(db, res_uuid, switch_uuid, port_a, port_b):
+                    # Nothing believed live for this pair (already released, never
+                    # applied, or a FAILED row whose intended is ACTIVE): an
+                    # idempotent no-op, no driver call and no hardware touch.
                     continue
                 await _apply_one_port_action(
                     db,
@@ -2986,7 +3019,17 @@ async def _apply_one_port_action(
             started_at=started,
             completed_at=datetime.now(timezone.utc),
         )
-        await record_l1_failed(db, res_uuid, switch_uuid, port_a, port_b, attempts, err, phys)
+        await record_l1_failed(
+            db,
+            res_uuid,
+            switch_uuid,
+            port_a,
+            port_b,
+            attempts,
+            err,
+            phys,
+            intended="ACTIVE" if action == "connect_ports" else "RELEASED",
+        )
 
 
 async def handle_wiring_changed(
@@ -3086,22 +3129,31 @@ async def handle_wiring_changed(
                 switch_id, ca, cb = key
                 build_by_switch.setdefault(switch_id, []).append(desired[key])
 
+            # unresolvable is resolved purely from the DESIRED (build) set, so every
+            # item is build-direction (issue #369): intended ACTIVE.
+            tagged_unresolvable = [(wire, reason, "ACTIVE") for wire, reason in unresolvable]
             await _apply_wiring_pairs(
                 str(reservation_id),
                 release_by_switch,
                 build_by_switch,
-                unresolvable,
+                tagged_unresolvable,
                 ctx,
                 get_db_session,
             )
         else:
             release_by_switch, unresolvable_r = await _wires_to_switch_pairs(released, ctx)
             build_by_switch, unresolvable_b = await _wires_to_switch_pairs(built, ctx)
+            # Tag each side with its direction (issue #369) before merging: a hop
+            # that fell out of the RELEASE delta is intended RELEASED, one from the
+            # BUILD delta is intended ACTIVE.
+            tagged_unresolvable = [
+                (wire, reason, "RELEASED") for wire, reason in unresolvable_r
+            ] + [(wire, reason, "ACTIVE") for wire, reason in unresolvable_b]
             await _apply_wiring_pairs(
                 str(reservation_id),
                 release_by_switch,
                 build_by_switch,
-                unresolvable_r + unresolvable_b,
+                tagged_unresolvable,
                 ctx,
                 get_db_session,
             )

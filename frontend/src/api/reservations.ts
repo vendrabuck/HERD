@@ -234,18 +234,33 @@ export function useReservationWiringStatus(reservationId: string | null | undefi
   });
 }
 
-// Summarize a retry response's per-connection outcomes into the three counts the
-// endpoint reports (reconnected / still_failed / not_retryable) for the toast.
+// Summarize a retry response's per-connection outcomes into the counts the endpoint
+// reports for the toast. Every outcome is counted so the parts always sum to
+// results.length (ADR 0009 phase 3, issue #369: released and superseded were previously
+// dropped, and frozen is new for ended-reservation build rows).
 export function summarizeWiringRetry(result: WiringRetryResponse): {
   reconnected: number;
+  released: number;
+  superseded: number;
   still_failed: number;
   not_retryable: number;
+  frozen: number;
 } {
-  const counts = { reconnected: 0, still_failed: 0, not_retryable: 0 };
+  const counts = {
+    reconnected: 0,
+    released: 0,
+    superseded: 0,
+    still_failed: 0,
+    not_retryable: 0,
+    frozen: 0,
+  };
   for (const r of result.results) {
     if (r.outcome === "reconnected") counts.reconnected += 1;
+    else if (r.outcome === "released") counts.released += 1;
+    else if (r.outcome === "superseded") counts.superseded += 1;
     else if (r.outcome === "still_failed") counts.still_failed += 1;
     else if (r.outcome === "not_retryable") counts.not_retryable += 1;
+    else if (r.outcome === "frozen") counts.frozen += 1;
   }
   return counts;
 }
@@ -255,14 +270,25 @@ export function useRetryReservationWiring() {
   return useMutation({
     mutationFn: (reservationId: string) => retryReservationWiring(reservationId),
     onSuccess: (result, reservationId) => {
-      const { reconnected, still_failed, not_retryable } = summarizeWiringRetry(result);
+      const { reconnected, released, superseded, still_failed, not_retryable, frozen } =
+        summarizeWiringRetry(result);
       const parts = [
         `${reconnected} reconnected`,
+        `${released} released`,
         `${still_failed} still failed`,
         `${not_retryable} not retryable`,
       ];
+      // Superseded is rare and frozen is unreachable from the ACTIVE-only button, so
+      // show each only when it actually happened to keep the common toast short.
+      if (superseded > 0) parts.push(`${superseded} superseded`);
+      if (frozen > 0) parts.push(`${frozen} frozen`);
       const summary = `Retry complete: ${parts.join(", ")}`;
-      if (still_failed === 0 && not_retryable === 0 && reconnected > 0) {
+      if (
+        still_failed === 0 &&
+        not_retryable === 0 &&
+        frozen === 0 &&
+        reconnected + released + superseded > 0
+      ) {
         toast.success(summary);
       } else {
         // Some rows did not recover; surface it without a hard-error toast so the

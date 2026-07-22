@@ -51,7 +51,7 @@ async def client():
     app.dependency_overrides.clear()
 
 
-async def _seed_failed(port_a, port_b, *, attempts=3, last_error="boom"):
+async def _seed_failed(port_a, port_b, *, attempts=3, last_error="boom", intended="ACTIVE"):
     async with TestSessionLocal() as s:
         row = L1ConnectionAssignment(
             reservation_id=uuid.UUID(RES_ID),
@@ -59,6 +59,7 @@ async def _seed_failed(port_a, port_b, *, attempts=3, last_error="boom"):
             port_a=port_a,
             port_b=port_b,
             status="FAILED",
+            intended=intended,
             attempts=attempts,
             last_error=last_error,
         )
@@ -99,7 +100,10 @@ async def test_wiring_retry_requires_internal_token(client):
 @pytest.mark.asyncio
 async def test_wiring_status_shape_includes_state_and_retryable(client):
     await _seed_state(frozen=False, last_applied=7)
-    await _seed_failed("0/0/1", "0/0/2", attempts=3, last_error="boom")
+    await _seed_failed("0/0/1", "0/0/2", attempts=3, last_error="boom", intended="ACTIVE")
+    await _seed_failed(
+        "0/0/3", "0/0/4", attempts=1, last_error="disconnect boom", intended="RELEASED"
+    )
     await _seed_failed("0/0/5", "0/0/6", attempts=0, last_error=WIRING_UNRESOLVABLE_REASON)
 
     resp = await client.get(f"/internal/reservations/{RES_ID}/wiring-status", headers=TOKEN_HEADER)
@@ -108,12 +112,16 @@ async def test_wiring_status_shape_includes_state_and_retryable(client):
     assert body["reservation_id"] == RES_ID
     assert body["last_applied_fork_version"] == 7
     assert body["frozen"] is False
-    assert len(body["connections"]) == 2
+    assert len(body["connections"]) == 3
     by_pair = {(c["port_a"], c["port_b"]): c for c in body["connections"]}
     # A driver-failure FAILED row is retryable; a pinned-reason one is not.
     assert by_pair[("0/0/1", "0/0/2")]["retryable"] is True
     assert by_pair[("0/0/1", "0/0/2")]["status"] == "FAILED"
     assert by_pair[("0/0/1", "0/0/2")]["attempts"] == 3
+    assert by_pair[("0/0/1", "0/0/2")]["intended"] == "ACTIVE"
+    # intended (issue #369, additive) distinguishes a failed build from a failed
+    # release: both are status FAILED, but only intended names the direction.
+    assert by_pair[("0/0/3", "0/0/4")]["intended"] == "RELEASED"
     assert by_pair[("0/0/5", "0/0/6")]["retryable"] is False
     # Every field the surface promises is present.
     for c in body["connections"]:
@@ -124,6 +132,7 @@ async def test_wiring_status_shape_includes_state_and_retryable(client):
             "port_b",
             "physical_connection_id",
             "status",
+            "intended",
             "attempts",
             "last_error",
             "retryable",

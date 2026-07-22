@@ -284,6 +284,7 @@
         "attempts": "integer",
         "created_at": "anyOf",
         "id": "string",
+        "intended": "string",
         "last_error": "anyOf",
         "physical_connection_id": "anyOf",
         "port_a": "string",
@@ -296,6 +297,7 @@
       "required": [
         "attempts",
         "id",
+        "intended",
         "port_a",
         "port_b",
         "retryable",

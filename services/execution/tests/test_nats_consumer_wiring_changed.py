@@ -612,6 +612,29 @@ async def test_driver_result_failure_lands_failed_row():
     assert await _last_applied() == 1
 
 
+@pytest.mark.asyncio
+async def test_release_direction_driver_failure_lands_failed_row_intended_released():
+    """Issue #369: a disconnect that fails on an ACTIVE pair lands a FAILED row
+    tagged intended RELEASED, not the build-direction default, and is not
+    downgraded-refused by the issue #412 guard (which only protects the build
+    direction: an ACTIVE row failing to release is not a race, it is the
+    expected starting state)."""
+    await _seed_state(last_applied=0)
+    await _seed_active("0/0/1", "0/0/2")
+    execute_fn, _calls = _sandbox_recorder(fail_pairs={frozenset({"0/0/1", "0/0/2"})})
+
+    await _run(_event(1, released=PAIR_12, built=[]), execute_fn)
+
+    assert await _assignments("ACTIVE") == []
+    failed = await _assignments("FAILED")
+    assert len(failed) == 1
+    assert failed[0].intended == "RELEASED"
+    assert (failed[0].port_a, failed[0].port_b) == ("0/0/1", "0/0/2")
+    # The version still stamps: a per-connection failure never blocks the
+    # ordering marker (ADR 0007 Decision 6).
+    assert await _last_applied() == 1
+
+
 # --- Verbatim-hop / unresolvable (Decision 5) -------------------------------
 
 

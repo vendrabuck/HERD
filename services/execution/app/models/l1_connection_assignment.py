@@ -59,6 +59,14 @@ class L1ConnectionAssignment(Base):
     `physical_connection_id` is the inventory connection backing the hop; it is
     nullable because phase 1 write sites (and the migration backfill) do not
     carry it, and phase 3's event delta supplies it.
+
+    `intended` (ADR 0009 Decision 2, issue #369) is the direction the row's last
+    write was attempting: ACTIVE for a connect/build, RELEASED for a
+    disconnect/release. It is tracked separately from `status` so a FAILED row
+    records not just "this failed" but "which way it failed", letting the retry
+    channels reattempt a failed disconnect as a disconnect rather than defaulting
+    every FAILED row to a reconnect. Migration 0016 backfills it for rows that
+    predate the column.
     """
 
     __tablename__ = "l1_connection_assignments"
@@ -81,6 +89,9 @@ class L1ConnectionAssignment(Base):
         Uuid(as_uuid=True), nullable=True
     )
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    intended: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="ACTIVE", server_default="ACTIVE"
+    )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
