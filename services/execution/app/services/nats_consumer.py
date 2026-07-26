@@ -1256,15 +1256,18 @@ async def _execute_l3_switch_operations(
         ctx = _FetchContext(None)
 
     from app.services.route_service import (
-        assign_routes,
-        get_pinned_routes,
+        get_effective_pinned_routes,
         get_route_assignments,
+        record_route_active,
+        record_route_failed,
         release_routes_for_device,
     )
 
-    # Build the per-switch route work. For provision the routes come from the
-    # pinned assignment (created here on first delivery); for deprovision they
-    # come exclusively from the stored ACTIVE assignments.
+    # Build the per-switch route work. For provision the pinned set is an existing
+    # non-RELEASED pin reused verbatim if one survives (issue #20), else the switch's
+    # latest config version; the pin's STATUS is now gated on the driver outcome (ADR
+    # 0009 phase 5), so the ACTIVE/FAILED row is written AFTER the routes are driven, not
+    # up front. For deprovision the routes come exclusively from the stored ACTIVE pins.
     switch_routes: dict[str, list[dict]] = {}
 
     if l3_action == "provision":
@@ -1274,11 +1277,11 @@ async def _execute_l3_switch_operations(
             return
         async with get_db_session() as db:
             for sid in switch_ids:
-                pinned = await get_pinned_routes(db, reservation_id, sid)
+                pinned = await get_effective_pinned_routes(db, reservation_id, sid)
                 if pinned is None:
                     detail = await ctx.get_latest_config(sid)
-                    fetched = ((detail or {}).get("config") or {}).get("routes") or []
-                    if not fetched:
+                    pinned = ((detail or {}).get("config") or {}).get("routes") or []
+                    if not pinned:
                         logger.info(
                             "L3 switch %s has no routes in its latest config version; "
                             "skipping for reservation %s",
@@ -1286,7 +1289,6 @@ async def _execute_l3_switch_operations(
                             reservation_id,
                         )
                         continue
-                    pinned = await assign_routes(db, reservation_id, sid, fetched)
                 if pinned:
                     switch_routes[sid] = pinned
     else:
@@ -1405,6 +1407,8 @@ async def _execute_l3_switch_operations(
             # siblings (same prefix + interface, different next hop) stay
             # distinct instead of collapsing into one guarded action.
             switch_routes_ok = True
+            switch_attempts = 0
+            switch_last_error: str | None = None
             for route in routes:
                 destination = route.get("destination")
                 next_hop = route.get("next_hop")
@@ -1458,6 +1462,8 @@ async def _execute_l3_switch_operations(
                 status = "FAILED" if op_failed else "SUCCESS"
                 if op_failed:
                     switch_routes_ok = False
+                    switch_attempts += 1
+                    switch_last_error = op_error
                 await update_execution_run(
                     db,
                     run,
@@ -1473,6 +1479,29 @@ async def _execute_l3_switch_operations(
 
             if l3_action == "deprovision" and switch_routes_ok:
                 cleanly_removed.add(switch_id)
+
+            # Result-gated pin write for the legacy provision path (ADR 0009 phase 5
+            # transition overlap): a clean provision pins the switch ACTIVE (idempotent
+            # under redelivery, and recognized by the fork-driven reconcile so it never
+            # re-provisions a legacy-pinned switch); any route failure lands a FAILED pin
+            # intended ACTIVE so the retry channel reattempts the PINNED set rather than
+            # a bogus ACTIVE row claiming routes the hardware never took. The legacy
+            # DEPROVISION keeps its release-after-clean-removal ledger handling below
+            # unchanged (its failure-keeps-ACTIVE posture and the #244 stranded-teardown
+            # reads are ADR 0009 phase 6 territory).
+            if l3_action == "provision":
+                if switch_routes_ok:
+                    await record_route_active(db, reservation_id, switch_id, routes)
+                else:
+                    await record_route_failed(
+                        db,
+                        reservation_id,
+                        switch_id,
+                        routes,
+                        switch_attempts or 1,
+                        switch_last_error,
+                        intended="ACTIVE",
+                    )
 
             # Logout
             logout_run = await create_execution_run(
@@ -3693,6 +3722,352 @@ async def _reconcile_l2_memberships(
     await _apply_l2_memberships(reservation_id, removes, adds, ctx, get_db_session)
 
 
+# --- L3 layered reconcile (ADR 0009 phase 5, issue #416) ---------------------
+#
+# Adjacency is derived from the SAME recorded hops the L1 reconcile applies and the L2
+# reconcile classifies (option C, layer-agnostic): a hop endpoint landing on a Layer 3
+# Switch makes the reservation L3-adjacent to that switch, UNLESS the hop's other endpoint
+# is ALSO a Layer 3 Switch, in which case the hop is an inter-switch trunk (the same trunk
+# boundary L2 uses: it contributes no adjacency). Unlike the legacy device-set resolver
+# (_resolve_l3_switch_operations), which only saw a RESERVED device's DIRECT adjacency to
+# an L3 switch, this hop walk also credits an L3 switch reached THROUGH intervening L1
+# matrix switches, since it classifies both endpoints of every recorded hop rather than
+# only reserved-device adjacencies. That is the one deliberate divergence, and it is
+# strictly more correct (it never misses an L3 switch a multi-hop path reaches).
+#
+# The pin lifecycle is UNCHANGED (issue #20): routes come from the switch's latest config
+# version at first provision, pinned per reservation in route_assignments, captured once
+# and reused verbatim by every later provision/deprovision/retry (get_effective_pinned_
+# routes), NEVER re-derived. Phase 5 changes only WHEN a switch is provisioned or
+# deprovisioned (it gained or lost adjacency in the intended set), and gates the pin's
+# STATUS on the driver outcome. Adjacency is shared derived state (many hops can imply the
+# same switch), so the L3 pass is ALWAYS a full reconcile against cabling's intended set,
+# exactly like L2: a single released hop cannot prove adjacency ended.
+
+
+async def _derive_l3_adjacency(
+    wires: list[dict],
+    ctx: "_FetchContext",
+) -> set[str]:
+    """Derive the intended L3-adjacent switch set from a set of recorded hops (option C).
+
+    Returns {switch_device_id} for every hop endpoint that lands on a Layer 3 Switch whose
+    opposite endpoint is not itself a Layer 3 Switch. Classifies each endpoint device
+    through ctx.get_device (memoized per event), so a 5xx while classifying raises
+    TransientUpstreamError and NAKs the whole message (Decision 7): an upstream outage must
+    never be mistaken for "this switch is no longer adjacent". The L2 derivation's exact
+    shape, keyed on the switch device id (an L3 pin is per switch, not per port).
+    """
+    switches: set[str] = set()
+    for wire in wires:
+        da = str(wire.get("device_a_id"))
+        db_dev = str(wire.get("device_b_id"))
+        dev_a = await ctx.get_device(da)
+        dev_b = await ctx.get_device(db_dev)
+        if dev_a is None or dev_b is None:
+            # A recorded endpoint is gone: the hop is unresolvable, so it can imply no
+            # adjacency. The L1 reconcile parks it FAILED; L3 simply omits it.
+            continue
+        a_is_l3 = dev_a.get("connection_type") == "Layer 3 Switch"
+        b_is_l3 = dev_b.get("connection_type") == "Layer 3 Switch"
+        if a_is_l3 and b_is_l3:
+            # Inter-switch trunk: assumed provisioned, contributes no adjacency.
+            continue
+        if a_is_l3:
+            switches.add(da)
+        if b_is_l3:
+            switches.add(db_dev)
+    return switches
+
+
+async def _apply_l3_adjacency(
+    reservation_id: str,
+    deprovisions: list[dict],
+    provisions: list[dict],
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Apply an L3 adjacency reconcile: deprovision departed switches, then provision new.
+
+    `deprovisions`/`provisions` are dicts with device_id and routes (the pinned set).
+    Switch sets are disjoint (adjacency is per-switch binary: a switch cannot both gain and
+    lose adjacency in one reconcile), and deprovisions run first (ADR 0009 Decision 4
+    ordering: L3 deprovision before L3 provision). Per switch: login once, drive
+    remove_route (deprovision) or configure_route (provision) for each pinned route, then
+    logout. Every driver call is result-gated through _run_driver_with_retry (Decision 3).
+    A clean provision records the switch ACTIVE (record_route_active); a clean removal
+    releases the pin (release_route_membership). A per-switch failure (any route failed, a
+    login failure, or an undrivable switch) lands a FAILED row tagged with its direction
+    (issue #369) and the pass continues (Decision 6, never NAKs). This one apply is shared
+    by the reconcile and both retry channels, the _apply_l2_memberships analogue.
+    """
+    from datetime import datetime, timezone
+
+    from app.services.driver_loader import load_driver
+    from app.services.execution_service import (
+        build_context,
+        create_execution_run,
+        extract_password_keys,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+    from app.services.route_service import (
+        record_route_active,
+        record_route_failed,
+        release_route_membership,
+        route_needs_remove,
+    )
+
+    res_uuid = uuid.UUID(reservation_id)
+    work = [("deprovision", d) for d in deprovisions] + [("provision", p) for p in provisions]
+
+    for direction, item in work:
+        switch_id = str(item["device_id"])
+        routes = item["routes"] or []
+        switch_uuid = uuid.UUID(switch_id)
+        method = "remove_route" if direction == "deprovision" else "configure_route"
+        intended = "RELEASED" if direction == "deprovision" else "ACTIVE"
+
+        # A deprovision whose pin is no longer believed installed (already released, or a
+        # FAILED-intended-ACTIVE row that never applied) is an idempotent no-op.
+        if direction == "deprovision":
+            async with get_db_session() as db:
+                if not await route_needs_remove(db, res_uuid, switch_id):
+                    continue
+
+        switch_data = await ctx.get_device(switch_id)
+        template_data = (
+            await _fetch_template(switch_data.get("template_id", ""), ctx.client)
+            if switch_data
+            else None
+        )
+        load_error: str | None = None
+        if switch_data is None:
+            load_error = f"{WIRING_UNRESOLVABLE_REASON}: L3 switch {switch_id} not found"
+        elif template_data is None:
+            load_error = (
+                f"{WIRING_UNRESOLVABLE_REASON}: template for L3 switch {switch_id} not found"
+            )
+
+        context: dict = {}
+        password_keys: set = set()
+        driver_id = None
+        driver_sha256 = "unknown"
+        driver_path = None
+        if load_error is None:
+            driver_id = uuid.UUID(switch_data["driver_id"])
+            driver_sha256 = switch_data.get("driver_sha256", "unknown")
+            driver_filename = switch_data.get("driver_filename", "driver.zip")
+            connection_type = switch_data.get("connection_type", "Layer 3 Switch")
+            context = build_context(switch_data, switch_uuid, WIRING_SYSTEM_USER, res_uuid)
+            password_keys = extract_password_keys(template_data)
+            async with get_db_session() as db:
+                try:
+                    driver_path = await load_driver(
+                        db, driver_id, driver_sha256, driver_filename, connection_type
+                    )
+                except Exception as exc:  # noqa: BLE001 - a load failure strands the switch
+                    load_error = f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: {exc}"
+
+        if load_error is not None or driver_path is None:
+            async with get_db_session() as db:
+                await record_route_failed(
+                    db, res_uuid, switch_id, routes, 0, load_error, intended=intended
+                )
+            continue
+
+        redacted = redact_context_for_logging(context, password_keys)
+        async with get_db_session() as db:
+            login_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "login",
+                WIRING_SYSTEM_USER,
+                redacted,
+                res_uuid,
+            )
+            login_started = datetime.now(timezone.utc)
+            login_ok, login_attempts, login_err, login_result = await _run_driver_with_retry(
+                driver_path, "login", context, password_keys
+            )
+            await update_execution_run(
+                db,
+                login_run,
+                "SUCCESS" if login_ok else "FAILED",
+                output=(
+                    json.dumps(login_result["output"], default=str)
+                    if login_ok and login_result
+                    else None
+                ),
+                error=None if login_ok else login_err,
+                started_at=login_started,
+                completed_at=datetime.now(timezone.utc),
+            )
+            if not login_ok:
+                await record_route_failed(
+                    db,
+                    res_uuid,
+                    switch_id,
+                    routes,
+                    login_attempts,
+                    f"driver login failed: {login_err}",
+                    intended=intended,
+                )
+                continue
+
+            switch_ok = True
+            switch_attempts = 0
+            switch_last_error: str | None = None
+            for route in routes:
+                destination = route.get("destination")
+                next_hop = route.get("next_hop")
+                interface = route.get("interface")
+                ident_a, ident_b = _route_run_identity(destination, next_hop, interface)
+                route_kwargs = {
+                    "destination": destination,
+                    "next_hop": next_hop,
+                    "interface": interface,
+                }
+                run = await create_execution_run(
+                    db,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    method,
+                    WIRING_SYSTEM_USER,
+                    redacted,
+                    res_uuid,
+                    ident_a,
+                    ident_b,
+                    method_kwargs=route_kwargs,
+                )
+                op_started = datetime.now(timezone.utc)
+                ok, attempts, err, result = await _run_driver_with_retry(
+                    driver_path, method, context, password_keys, method_kwargs=route_kwargs
+                )
+                if not ok:
+                    switch_ok = False
+                    switch_attempts += attempts
+                    switch_last_error = err
+                await update_execution_run(
+                    db,
+                    run,
+                    "SUCCESS" if ok else "FAILED",
+                    output=json.dumps(result["output"], default=str)
+                    if ok and result and result.get("output")
+                    else None,
+                    error=None if ok else err,
+                    started_at=op_started,
+                    completed_at=datetime.now(timezone.utc),
+                )
+
+            logout_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "logout",
+                WIRING_SYSTEM_USER,
+                redacted,
+                res_uuid,
+            )
+            logout_started = datetime.now(timezone.utc)
+            logout_ok, _la, logout_err, logout_result = await _run_driver_with_retry(
+                driver_path, "logout", context, password_keys
+            )
+            await update_execution_run(
+                db,
+                logout_run,
+                "SUCCESS" if logout_ok else "FAILED",
+                output=(
+                    json.dumps(logout_result["output"], default=str)
+                    if logout_ok and logout_result and logout_result.get("output")
+                    else None
+                ),
+                error=None if logout_ok else logout_err,
+                started_at=logout_started,
+                completed_at=datetime.now(timezone.utc),
+            )
+
+            if switch_ok:
+                if direction == "provision":
+                    await record_route_active(db, res_uuid, switch_id, routes)
+                else:
+                    await release_route_membership(db, res_uuid, switch_id)
+            else:
+                await record_route_failed(
+                    db,
+                    res_uuid,
+                    switch_id,
+                    routes,
+                    switch_attempts or 1,
+                    switch_last_error,
+                    intended=intended,
+                )
+
+
+async def _reconcile_l3_adjacency(
+    reservation_id: str,
+    intended_wires: list[dict],
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Full L3 adjacency reconcile against cabling's intended wires (ADR 0009 phase 5).
+
+    L3 adjacency is ALWAYS a full reconcile (not a per-hop delta), on every apply (delta,
+    heal, or gap): many hops can imply the same switch's adjacency, so a released hop alone
+    cannot prove adjacency ended; only the intended set can. Derives the intended adjacency
+    (option C), diffs against this reservation's ACTIVE route pins, and drives
+    deprovisions-then-provisions through the shared _apply_l3_adjacency. Runs AFTER the L2
+    pass (Decision 4 ordering). The pinned routes for a provision come from an existing
+    non-RELEASED pin if one survives (reused verbatim, issue #20) or the switch's latest
+    config version on a genuinely fresh provision; a switch whose config declares no routes
+    is skipped and nothing is pinned.
+    """
+    from app.services.route_service import get_effective_pinned_routes, get_route_assignments
+
+    intended = await _derive_l3_adjacency(intended_wires, ctx)
+
+    async with get_db_session() as db:
+        active_rows = await get_route_assignments(db, reservation_id)
+    current: dict[str, object] = {str(row.device_id): row for row in active_rows}
+
+    add_switches = intended - set(current.keys())
+    remove_switches = set(current.keys()) - intended
+
+    if not add_switches and not remove_switches:
+        return
+
+    provisions: list[dict] = []
+    for switch_id in add_switches:
+        async with get_db_session() as db:
+            pinned = await get_effective_pinned_routes(db, reservation_id, switch_id)
+        if pinned is None:
+            detail = await ctx.get_latest_config(switch_id)
+            pinned = ((detail or {}).get("config") or {}).get("routes") or []
+        if not pinned:
+            logger.info(
+                "L3 switch %s has no routes in its latest config version; "
+                "skipping adjacency provision for reservation %s",
+                switch_id,
+                reservation_id,
+            )
+            continue
+        provisions.append({"device_id": switch_id, "routes": pinned})
+
+    deprovisions: list[dict] = []
+    for switch_id in remove_switches:
+        row = current[switch_id]
+        deprovisions.append({"device_id": switch_id, "routes": row.routes})
+
+    if not provisions and not deprovisions:
+        return
+
+    await _apply_l3_adjacency(reservation_id, deprovisions, provisions, ctx, get_db_session)
+
+
 async def handle_wiring_changed(
     event_data: dict, get_db_session, dedupe_key: str | None = None
 ) -> None:
@@ -3832,6 +4207,11 @@ async def handle_wiring_changed(
         # L2 membership reconcile runs AFTER the L1 pass (Decision 4 ordering: L2 removes
         # land after L1 builds), always as a full reconcile against the intended wires.
         await _reconcile_l2_memberships(str(reservation_id), l2_intended_wires, ctx, get_db_session)
+
+        # L3 adjacency reconcile runs AFTER the L2 pass (Decision 4 ordering: L3 deprovision
+        # then provision, all after L2), always a full reconcile against the SAME intended
+        # wires fetched once above (derive both layers from one fetch, never fetch twice).
+        await _reconcile_l3_adjacency(str(reservation_id), l2_intended_wires, ctx, get_db_session)
 
     # Advance the monotonic marker: the version was processed (Decision 4/6), even if
     # the pass left FAILED rows for the Decision 6 retry channel.

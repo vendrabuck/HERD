@@ -37,12 +37,16 @@ class RouteAssignment(Base):
     re-derives from the (possibly edited) config, so remove_route always
     targets exactly what configure_route applied.
 
-    `status` gains "FAILED" as a legal value in ADR 0009 (issue #369/#416),
-    additively: this phase adds the column and the value is accepted, but
-    route_service does not yet write it (the L3 layered reconcile that will is
-    phase 5). `attempts`, `last_error`, and `intended` (ACTIVE/RELEASED, mirroring
-    l1_connection_assignments.intended) are added for the same forward-compat
-    reason: no behavior change this phase beyond accepting the columns.
+    `status` gains "FAILED" as a legal value in ADR 0009 (issue #369/#416): the
+    L3 layered reconcile (phase 5) writes it when a fork-adjacency-driven provision
+    or removal fails a driver call. `attempts`, `last_error`, and `intended`
+    (ACTIVE/RELEASED, mirroring l1_connection_assignments.intended) carry the retry
+    bookkeeping the two retry channels split on: a FAILED row intended ACTIVE
+    re-provisions the PINNED set, one intended RELEASED re-removes it, always
+    verbatim, never re-derived from the switch's current config (issue #20). The
+    pin CONTENT (`routes`) is captured once at first provision and reused for the
+    life of the pin; phase 5 changes only the row's STATUS lifecycle (driver-gated)
+    and WHEN a switch is provisioned/deprovisioned (adjacency gained/lost).
     """
 
     __tablename__ = "route_assignments"

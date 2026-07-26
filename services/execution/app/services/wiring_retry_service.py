@@ -59,6 +59,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.l2_port_assignment import L2PortAssignment
+from app.models.route_assignment import RouteAssignment
 from app.services.l1_assignment_service import (
     due_failed_rows,
     failed_assignments_for_reservation,
@@ -73,6 +74,10 @@ from app.services.l2_membership_service import (
 from app.services.nats_consumer import (
     WIRING_NOT_SIMPLE_CHAIN_REASON,
     WIRING_UNRESOLVABLE_REASON,
+)
+from app.services.route_service import (
+    due_failed_route_rows,
+    failed_route_assignments_for_reservation,
 )
 
 logger = logging.getLogger(__name__)
@@ -162,6 +167,31 @@ def _l2_outcome(row: L2PortAssignment, outcome: str, vlan_id: int | None = None)
         "last_error": row.last_error,
         "layer": "l2",
         "vlan": vlan_id,
+    }
+
+
+def _l3_identity(row: RouteAssignment) -> dict:
+    """The per-switch identity fields surfaced in an L3 route-pin retry outcome.
+
+    An L3 row is a per-switch pinned route SET, not a port or a port pair, so it carries
+    only switch_device_id and a route-set summary (route_count). The L1/L2 port fields stay
+    absent (the layered WiringRetryOutcome model makes them optional for L3 rows).
+    """
+    return {
+        "id": str(row.id),
+        "switch_device_id": str(row.device_id),
+        "route_count": len(row.routes or []),
+    }
+
+
+def _l3_outcome(row: RouteAssignment, outcome: str) -> dict:
+    return {
+        **_l3_identity(row),
+        "outcome": outcome,
+        "status": row.status,
+        "attempts": row.attempts,
+        "last_error": row.last_error,
+        "layer": "l3",
     }
 
 
@@ -421,6 +451,70 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
     return outcomes
 
 
+async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> list[dict]:
+    """Reattempt FAILED L3 route pins in their own direction; return outcomes.
+
+    The L3 analogue of _reattempt_rows. Split by intended: an ACTIVE-intended row is a
+    provision (configure_route) reattempt, a RELEASED-intended row is a deprovision
+    (remove_route) reattempt. Both directions drive the PINNED route set verbatim (issue
+    #20: never re-derived from the switch's current config) through the SAME consumer apply
+    (_apply_l3_adjacency) per reservation, so a retry gets the same result gating, adjacency
+    handling, and per-switch failure handling as the reconcile. Outcomes are read back by
+    id: ACTIVE is "reconnected", RELEASED is "released", else "still_failed"; each carries
+    layer "l3".
+
+    There is NO supersession guard for L3 (unlike L1/L2). A route pin is a per-reservation,
+    non-exclusive set: route_assignments keys on (reservation, switch) and holds only THIS
+    reservation's routes, so another reservation gaining routes on the same switch never
+    reconfigures or removes this reservation's pinned routes. A stale release therefore
+    cannot strip a newer reservation's live state the way a re-fired L1/L2 port op could,
+    so there is nothing for a supersession guard to settle. See the module note below.
+    """
+    from app.services.nats_consumer import _apply_l3_adjacency, _FetchContext
+
+    if not rows:
+        return []
+
+    retry_ids: list[uuid.UUID] = [row.id for row in rows]
+
+    # reservation -> {"deprovisions": [...], "provisions": [...]} of {device_id, routes}.
+    by_res: dict[str, dict[str, list[dict]]] = {}
+    for row in rows:
+        res_str = str(row.reservation_id)
+        entry = {"device_id": str(row.device_id), "routes": row.routes or []}
+        bucket = "deprovisions" if row.intended == "RELEASED" else "provisions"
+        by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[bucket].append(entry)
+
+    async with httpx.AsyncClient() as client:
+        ctx = _FetchContext(client)
+        for res_str, sets in by_res.items():
+            await _apply_l3_adjacency(
+                res_str, sets["deprovisions"], sets["provisions"], ctx, get_db_session
+            )
+
+    async with get_db_session() as db:
+        refreshed = (
+            (await db.execute(select(RouteAssignment).where(RouteAssignment.id.in_(retry_ids))))
+            .scalars()
+            .all()
+        )
+    by_id = {r.id: r for r in refreshed}
+
+    outcomes: list[dict] = []
+    for rid in retry_ids:
+        row = by_id.get(rid)
+        if row is None:
+            continue
+        if row.status == "ACTIVE":
+            outcome = "reconnected"
+        elif row.status == "RELEASED":
+            outcome = "released"
+        else:
+            outcome = "still_failed"
+        outcomes.append(_l3_outcome(row, outcome))
+    return outcomes
+
+
 async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session) -> dict:
     """Manual retry: reattempt every hardware-retryable FAILED row of one reservation.
 
@@ -445,9 +539,12 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
         frozen = state is not None and state.frozen
         failed = await failed_assignments_for_reservation(db, reservation_id)
         failed_l2 = await failed_memberships_for_reservation(db, reservation_id)
+        failed_l3 = await failed_route_assignments_for_reservation(db, reservation_id)
 
-    has_release = any(row.intended == "RELEASED" for row in failed) or any(
-        row.intended == "RELEASED" for row in failed_l2
+    has_release = (
+        any(row.intended == "RELEASED" for row in failed)
+        or any(row.intended == "RELEASED" for row in failed_l2)
+        or any(row.intended == "RELEASED" for row in failed_l3)
     )
     if frozen and not has_release:
         # Pure-build (or empty) frozen case: nothing to release in EITHER layer, so retry
@@ -475,8 +572,18 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
         else:
             results.append(_l2_outcome(row, "not_retryable"))
 
+    retryable_l3: list[RouteAssignment] = []
+    for row in failed_l3:
+        if frozen and row.intended != "RELEASED":
+            results.append(_l3_outcome(row, "frozen"))
+        elif is_retryable_failure(row.last_error):
+            retryable_l3.append(row)
+        else:
+            results.append(_l3_outcome(row, "not_retryable"))
+
     results.extend(await _reattempt_rows(retryable, get_db_session))
     results.extend(await _reattempt_l2_rows(retryable_l2, get_db_session))
+    results.extend(await _reattempt_l3_rows(retryable_l3, get_db_session))
     return {"reservation_id": res_str, "results": results}
 
 
@@ -502,12 +609,13 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     async with get_db_session() as db:
         due = await due_failed_rows(db, batch, max_attempts)
         due_l2 = await due_failed_l2_rows(db, batch, max_attempts)
+        due_l3 = await due_failed_route_rows(db, batch, max_attempts)
 
-    # Combined totals across both layers (existing keys, unchanged shape) plus additive
-    # per-layer retried counts (ADR 0009 phase 4): a caller can read the grand totals as
+    # Combined totals across all layers (existing keys, unchanged shape) plus additive
+    # per-layer retried counts (ADR 0009 phases 4-5): a caller can read the grand totals as
     # before or break them down by layer without the old keys shifting meaning.
     stats = {
-        "rows_due": len(due) + len(due_l2),
+        "rows_due": len(due) + len(due_l2) + len(due_l3),
         "rows_retried": 0,
         "reconnected": 0,
         "released": 0,
@@ -517,6 +625,7 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         "skipped_not_retryable": 0,
         "l1_rows_retried": 0,
         "l2_rows_retried": 0,
+        "l3_rows_retried": 0,
     }
 
     frozen_cache: dict[uuid.UUID, bool] = {}
@@ -530,6 +639,7 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
 
     to_retry: list[L1ConnectionAssignment] = []
     to_retry_l2: list[L2PortAssignment] = []
+    to_retry_l3: list[RouteAssignment] = []
     for row in due:
         if not is_retryable_failure(row.last_error):
             stats["skipped_not_retryable"] += 1
@@ -548,6 +658,14 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
             stats["skipped_frozen"] += 1
             continue
         to_retry_l2.append(row)
+    for row in due_l3:
+        if not is_retryable_failure(row.last_error):
+            stats["skipped_not_retryable"] += 1
+            continue
+        if row.intended != "RELEASED" and await _is_frozen(row.reservation_id):
+            stats["skipped_frozen"] += 1
+            continue
+        to_retry_l3.append(row)
 
     def _tally(outcomes: list[dict]) -> None:
         for o in outcomes:
@@ -584,7 +702,20 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         stats["l2_rows_retried"] = len(outcomes_l2)
         _tally(outcomes_l2)
 
-    stats["rows_retried"] = stats["l1_rows_retried"] + stats["l2_rows_retried"]
+    if to_retry_l3:
+        try:
+            outcomes_l3 = await _reattempt_l3_rows(to_retry_l3, get_db_session)
+        except Exception:
+            logger.warning(
+                "wiring retry tick: L3 reattempt failed; rows stay FAILED", exc_info=True
+            )
+            outcomes_l3 = []
+        stats["l3_rows_retried"] = len(outcomes_l3)
+        _tally(outcomes_l3)
+
+    stats["rows_retried"] = (
+        stats["l1_rows_retried"] + stats["l2_rows_retried"] + stats["l3_rows_retried"]
+    )
 
     log = logger.info if stats["rows_due"] else logger.debug
     log("wiring_retry_tick", extra={"action": "wiring_retry_tick", **stats})
