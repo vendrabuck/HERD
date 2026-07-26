@@ -314,6 +314,7 @@ async def test_retry_non_retryable_pinned_reason_makes_no_driver_call():
             "status": "FAILED",
             "attempts": 0,
             "last_error": WIRING_UNRESOLVABLE_REASON,
+            "layer": "l1",
         }
     ]
 

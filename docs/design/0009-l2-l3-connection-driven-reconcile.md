@@ -189,9 +189,23 @@ immutable to failure writers) which extends to the new ledgers.
 3. Ledger schema (#369 included): `intended` on l1_connection_assignments
    with backfill; `l2_port_assignments`; route_assignments FAILED/attempts
    columns; retry channels honor intended. Migrations plus unit pins.
-4. Layered event and reconcile, L2: fork-driven membership reconcile on
-   wiring_changed (per-layer deltas, heal covers), allocation lifecycle
-   coupling, result-gated ledger writes.
+4. Layered event and reconcile, L2 (DELIVERED, issue #416): fork-driven
+   membership reconcile on wiring_changed. Membership is derived
+   layer-agnostically from the recorded hops (option C, the #416 phase 4
+   resolution: a hop terminating on a Layer 2 Switch joins that port, an
+   inter-switch trunk contributes none), so fork_connections stay
+   L1-hop-only. The L2 pass is ALWAYS a full reconcile against cabling's
+   intended set (a released hop cannot prove a membership should leave; only
+   the intended set can), runs after the L1 pass (Decision 4 ordering:
+   removes then adds), and drives add_to_vlan/remove_from_vlan against the
+   l2_port_assignments ledger with result-gated writes, the #412 guard, the
+   cross-reservation supersession guard, allocation lifecycle coupling (first
+   built membership allocates the fabric VLAN, last leave frees it), and both
+   retry channels honoring intended with a `layer` field. The legacy
+   device-set path also records its outcomes into the ledger through the
+   phases 4-6 transition overlap, absorbed by ledger-ACTIVE idempotency.
+   Migration 0019 backfills memberships from historical add_to_vlan runs so
+   the first heal after upgrade re-adds nothing.
 5. Layered reconcile, L3: adjacency from fork L3 rows, pin lifecycle,
    adjacency-aware release.
 6. Ledger-driven teardown: terminal transitions release from ledgers;

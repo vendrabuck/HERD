@@ -16,9 +16,22 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 
+class _FakeResult:
+    def scalar_one_or_none(self):
+        # No allocation row in the fake DB: _assign_vlans_to_operations leaves
+        # vlan_assignment_id None (ADR 0009 phase 4), so the ledger write is skipped
+        # and these VLAN-grouping unit tests stay focused on the vlan_id mapping.
+        return None
+
+
+class _FakeSession:
+    async def execute(self, *args, **kwargs):
+        return _FakeResult()
+
+
 class _FakeSessionCtx:
     async def __aenter__(self):
-        return "fake-session"
+        return _FakeSession()
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
