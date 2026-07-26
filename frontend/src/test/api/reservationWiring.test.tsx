@@ -130,13 +130,13 @@ describe("reservation wiring status api", () => {
     const resp: WiringRetryResponse = {
       reservation_id: RES_ID,
       results: [
-        { id: "a", switch_device_id: SW_ID, port_a: "1", port_b: "2", physical_connection_id: null, outcome: "reconnected", status: "ACTIVE", attempts: 2, last_error: null },
-        { id: "b", switch_device_id: SW_ID, port_a: "3", port_b: "4", physical_connection_id: null, outcome: "still_failed", status: "FAILED", attempts: 3, last_error: "x" },
-        { id: "c", switch_device_id: SW_ID, port_a: "5", port_b: "6", physical_connection_id: null, outcome: "not_retryable", status: "FAILED", attempts: 1, last_error: "recorded hop unresolvable" },
-        { id: "d", switch_device_id: SW_ID, port_a: "7", port_b: "8", physical_connection_id: null, outcome: "reconnected", status: "ACTIVE", attempts: 2, last_error: null },
-        { id: "e", switch_device_id: SW_ID, port_a: "9", port_b: "10", physical_connection_id: null, outcome: "released", status: "RELEASED", attempts: 2, last_error: null },
-        { id: "f", switch_device_id: SW_ID, port_a: "11", port_b: "12", physical_connection_id: null, outcome: "superseded", status: "RELEASED", attempts: 1, last_error: null },
-        { id: "g", switch_device_id: SW_ID, port_a: "13", port_b: "14", physical_connection_id: null, outcome: "frozen", status: "FAILED", attempts: 3, last_error: "boom" },
+        { id: "a", layer: "l1", switch_device_id: SW_ID, port_a: "1", port_b: "2", physical_connection_id: null, outcome: "reconnected", status: "ACTIVE", attempts: 2, last_error: null },
+        { id: "b", layer: "l1", switch_device_id: SW_ID, port_a: "3", port_b: "4", physical_connection_id: null, outcome: "still_failed", status: "FAILED", attempts: 3, last_error: "x" },
+        { id: "c", layer: "l1", switch_device_id: SW_ID, port_a: "5", port_b: "6", physical_connection_id: null, outcome: "not_retryable", status: "FAILED", attempts: 1, last_error: "recorded hop unresolvable" },
+        { id: "d", layer: "l1", switch_device_id: SW_ID, port_a: "7", port_b: "8", physical_connection_id: null, outcome: "reconnected", status: "ACTIVE", attempts: 2, last_error: null },
+        { id: "e", layer: "l2", switch_device_id: SW_ID, port_a: null, port_b: null, port: "9", vlan: 120, vlan_assignment_id: null, physical_connection_id: null, outcome: "released", status: "RELEASED", attempts: 2, last_error: null },
+        { id: "f", layer: "l1", switch_device_id: SW_ID, port_a: "11", port_b: "12", physical_connection_id: null, outcome: "superseded", status: "RELEASED", attempts: 1, last_error: null },
+        { id: "g", layer: "l1", switch_device_id: SW_ID, port_a: "13", port_b: "14", physical_connection_id: null, outcome: "frozen", status: "FAILED", attempts: 3, last_error: "boom" },
       ],
     };
     const counts = summarizeWiringRetry(resp);

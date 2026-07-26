@@ -58,11 +58,17 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.models.l1_connection_assignment import L1ConnectionAssignment
+from app.models.l2_port_assignment import L2PortAssignment
 from app.services.l1_assignment_service import (
     due_failed_rows,
     failed_assignments_for_reservation,
     get_wiring_state,
     supersede_release_if_reclaimed,
+)
+from app.services.l2_membership_service import (
+    due_failed_l2_rows,
+    failed_memberships_for_reservation,
+    supersede_l2_release_if_reclaimed,
 )
 from app.services.nats_consumer import (
     WIRING_NOT_SIMPLE_CHAIN_REASON,
@@ -126,6 +132,36 @@ def _outcome(row: L1ConnectionAssignment, outcome: str) -> dict:
         "status": row.status,
         "attempts": row.attempts,
         "last_error": row.last_error,
+        # `layer` is additive (ADR 0009 phase 4): existing L1 consumers ignore it, and it
+        # lets a caller group L1 cross-connect rows from L2 membership rows in one payload.
+        "layer": "l1",
+    }
+
+
+def _l2_identity(row: L2PortAssignment) -> dict:
+    """The per-membership identity fields surfaced in an L2 retry outcome.
+
+    L2 rows are per (switch, port), not a port pair, so they carry `port` (not port_a/
+    port_b) and their `vlan_assignment_id`. port_a/port_b stay absent (the L1 shape is
+    unchanged; the layered WiringRetryOutcome model makes them optional for L2 rows).
+    """
+    return {
+        "id": str(row.id),
+        "switch_device_id": str(row.switch_device_id),
+        "port": row.port,
+        "vlan_assignment_id": str(row.vlan_assignment_id),
+    }
+
+
+def _l2_outcome(row: L2PortAssignment, outcome: str, vlan_id: int | None = None) -> dict:
+    return {
+        **_l2_identity(row),
+        "outcome": outcome,
+        "status": row.status,
+        "attempts": row.attempts,
+        "last_error": row.last_error,
+        "layer": "l2",
+        "vlan": vlan_id,
     }
 
 
@@ -227,6 +263,164 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
     return outcomes
 
 
+async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> list[dict]:
+    """Reattempt FAILED L2 membership rows in their own direction; return outcomes.
+
+    The L2 analogue of _reattempt_rows. Split by intended: an ACTIVE-intended row is an
+    add_to_vlan (join) reattempt (respecting is_membership_active), a RELEASED-intended
+    row is a remove_from_vlan (leave) reattempt (respecting membership_needs_remove).
+    Both directions drive through the SAME consumer apply (_apply_l2_memberships) per
+    reservation, so a retry gets the same result gating, allocation lifecycle coupling
+    (the last leave frees the allocation), and per-membership failure handling as the
+    reconcile. Before the release set is built, each release-direction row runs through
+    supersede_l2_release_if_reclaimed: a leave whose port another reservation's ACTIVE
+    membership already reclaimed is settled RELEASED with no driver call ("superseded").
+    Outcomes are read back by id: ACTIVE is "reconnected", RELEASED is "released", else
+    "still_failed"; each carries layer "l2" plus its switch/port/vlan.
+
+    A build-direction row whose stored allocation is the nil-UUID placeholder (a row the
+    legacy device-set path parked when its allocation readback failed) or points at a
+    vlan_assignment that no longer exists is re-resolved through _resolve_add_allocations
+    before the op is built, so the retry drives add_to_vlan with the REAL fabric VLAN (not
+    0) and record_l2_membership_active heals the row's allocation on success. If
+    re-resolution fails again, the row is NOT driven: it is re-parked FAILED with the
+    no-allocation reason (attempts accumulate) and reported "still_failed".
+    """
+    from app.models.vlan_assignment import VlanAssignment
+    from app.services.l2_membership_service import record_l2_failed
+    from app.services.nats_consumer import (
+        WIRING_UNRESOLVABLE_REASON,
+        _apply_l2_memberships,
+        _FetchContext,
+        _resolve_add_allocations,
+    )
+
+    if not rows:
+        return []
+
+    _NIL = uuid.UUID(int=0)
+    retry_ids: list[uuid.UUID] = [row.id for row in rows]
+
+    va_ids = {row.vlan_assignment_id for row in rows}
+    async with get_db_session() as db:
+        va_rows = (
+            (await db.execute(select(VlanAssignment).where(VlanAssignment.id.in_(va_ids))))
+            .scalars()
+            .all()
+        )
+    vlan_by_va = {v.id: v.vlan_id for v in va_rows}
+
+    superseded_ids: set[uuid.UUID] = set()
+    async with get_db_session() as db:
+        for row in rows:
+            if row.intended == "RELEASED" and await supersede_l2_release_if_reclaimed(db, row):
+                superseded_ids.add(row.id)
+
+    def _add_needs_resolution(row: L2PortAssignment) -> bool:
+        # A build-direction row whose allocation is unusable: the nil placeholder or a
+        # vlan_assignment that no longer resolves. Re-resolve before driving the driver.
+        return row.intended != "RELEASED" and (
+            row.vlan_assignment_id == _NIL or row.vlan_assignment_id not in vlan_by_va
+        )
+
+    # Re-resolve allocations per reservation for the add rows that need it, so the retry
+    # never drives add_to_vlan against the nil/vlan-0 placeholder.
+    resolve_targets: dict[str, set[tuple[str, str]]] = {}
+    for row in rows:
+        if row.id in superseded_ids:
+            continue
+        if _add_needs_resolution(row):
+            resolve_targets.setdefault(str(row.reservation_id), set()).add(
+                (str(row.switch_device_id), row.port)
+            )
+    resolved: dict[str, dict[str, tuple[uuid.UUID, int]]] = {}
+    for res_str, targets in resolve_targets.items():
+        alloc = await _resolve_add_allocations(res_str, targets, get_db_session)
+        resolved[res_str] = alloc
+        # Fold the freshly-resolved VLAN numbers into the read-back map so a healed row's
+        # outcome reports its real VLAN, not None.
+        for va_id, vlan_id in alloc.values():
+            vlan_by_va[va_id] = vlan_id
+
+    # reservation -> {"removes": [...], "adds": [...]} of membership op dicts.
+    by_res: dict[str, dict[str, list[dict]]] = {}
+    unresolved_ids: set[uuid.UUID] = set()
+    for row in rows:
+        if row.id in superseded_ids:
+            continue
+        res_str = str(row.reservation_id)
+        if row.intended == "RELEASED":
+            entry = {
+                "switch_device_id": str(row.switch_device_id),
+                "port": row.port,
+                "vlan_assignment_id": row.vlan_assignment_id,
+                "vlan_id": vlan_by_va.get(row.vlan_assignment_id, 0),
+            }
+            by_res.setdefault(res_str, {"removes": [], "adds": []})["removes"].append(entry)
+            continue
+
+        if _add_needs_resolution(row):
+            alloc = resolved.get(res_str, {}).get(str(row.switch_device_id))
+            if alloc is None:
+                # Re-resolution failed again: do NOT drive the driver against a bad VLAN.
+                # Re-park FAILED with the (non-retryable) no-allocation reason so recovery
+                # is a re-save, and report still_failed on read-back.
+                unresolved_ids.add(row.id)
+                async with get_db_session() as db:
+                    await record_l2_failed(
+                        db,
+                        row.reservation_id,
+                        None,
+                        row.switch_device_id,
+                        row.port,
+                        1,
+                        f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation for fabric",
+                        intended="ACTIVE",
+                    )
+                continue
+            va_id, vlan_id = alloc
+        else:
+            va_id = row.vlan_assignment_id
+            vlan_id = vlan_by_va[row.vlan_assignment_id]
+
+        entry = {
+            "switch_device_id": str(row.switch_device_id),
+            "port": row.port,
+            "vlan_assignment_id": va_id,
+            "vlan_id": vlan_id,
+        }
+        by_res.setdefault(res_str, {"removes": [], "adds": []})["adds"].append(entry)
+
+    async with httpx.AsyncClient() as client:
+        ctx = _FetchContext(client)
+        for res_str, sets in by_res.items():
+            await _apply_l2_memberships(res_str, sets["removes"], sets["adds"], ctx, get_db_session)
+
+    async with get_db_session() as db:
+        refreshed = (
+            (await db.execute(select(L2PortAssignment).where(L2PortAssignment.id.in_(retry_ids))))
+            .scalars()
+            .all()
+        )
+    by_id = {r.id: r for r in refreshed}
+
+    outcomes: list[dict] = []
+    for rid in retry_ids:
+        row = by_id.get(rid)
+        if row is None:
+            continue
+        if rid in superseded_ids:
+            outcome = "superseded"
+        elif row.status == "ACTIVE":
+            outcome = "reconnected"
+        elif row.status == "RELEASED":
+            outcome = "released"
+        else:
+            outcome = "still_failed"
+        outcomes.append(_l2_outcome(row, outcome, vlan_by_va.get(row.vlan_assignment_id)))
+    return outcomes
+
+
 async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session) -> dict:
     """Manual retry: reattempt every hardware-retryable FAILED row of one reservation.
 
@@ -250,10 +444,14 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
         state = await get_wiring_state(db, reservation_id)
         frozen = state is not None and state.frozen
         failed = await failed_assignments_for_reservation(db, reservation_id)
+        failed_l2 = await failed_memberships_for_reservation(db, reservation_id)
 
-    if frozen and not any(row.intended == "RELEASED" for row in failed):
-        # Pure-build (or empty) frozen case: nothing to release, so retry is refused
-        # exactly as before (the internal endpoint maps this to 409).
+    has_release = any(row.intended == "RELEASED" for row in failed) or any(
+        row.intended == "RELEASED" for row in failed_l2
+    )
+    if frozen and not has_release:
+        # Pure-build (or empty) frozen case: nothing to release in EITHER layer, so retry
+        # is refused exactly as before (the internal endpoint maps this to 409).
         raise WiringReservationFrozen(res_str)
 
     results: list[dict] = []
@@ -268,7 +466,17 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
         else:
             results.append(_outcome(row, "not_retryable"))
 
+    retryable_l2: list[L2PortAssignment] = []
+    for row in failed_l2:
+        if frozen and row.intended != "RELEASED":
+            results.append(_l2_outcome(row, "frozen"))
+        elif is_retryable_failure(row.last_error):
+            retryable_l2.append(row)
+        else:
+            results.append(_l2_outcome(row, "not_retryable"))
+
     results.extend(await _reattempt_rows(retryable, get_db_session))
+    results.extend(await _reattempt_l2_rows(retryable_l2, get_db_session))
     return {"reservation_id": res_str, "results": results}
 
 
@@ -293,9 +501,13 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
 
     async with get_db_session() as db:
         due = await due_failed_rows(db, batch, max_attempts)
+        due_l2 = await due_failed_l2_rows(db, batch, max_attempts)
 
+    # Combined totals across both layers (existing keys, unchanged shape) plus additive
+    # per-layer retried counts (ADR 0009 phase 4): a caller can read the grand totals as
+    # before or break them down by layer without the old keys shifting meaning.
     stats = {
-        "rows_due": len(due),
+        "rows_due": len(due) + len(due_l2),
         "rows_retried": 0,
         "reconnected": 0,
         "released": 0,
@@ -303,6 +515,8 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         "still_failed": 0,
         "skipped_frozen": 0,
         "skipped_not_retryable": 0,
+        "l1_rows_retried": 0,
+        "l2_rows_retried": 0,
     }
 
     frozen_cache: dict[uuid.UUID, bool] = {}
@@ -315,6 +529,7 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         return frozen_cache[res_id]
 
     to_retry: list[L1ConnectionAssignment] = []
+    to_retry_l2: list[L2PortAssignment] = []
     for row in due:
         if not is_retryable_failure(row.last_error):
             stats["skipped_not_retryable"] += 1
@@ -325,16 +540,16 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
             stats["skipped_frozen"] += 1
             continue
         to_retry.append(row)
+    for row in due_l2:
+        if not is_retryable_failure(row.last_error):
+            stats["skipped_not_retryable"] += 1
+            continue
+        if row.intended != "RELEASED" and await _is_frozen(row.reservation_id):
+            stats["skipped_frozen"] += 1
+            continue
+        to_retry_l2.append(row)
 
-    if to_retry:
-        try:
-            outcomes = await _reattempt_rows(to_retry, get_db_session)
-        except Exception:
-            # A TransientUpstreamError (or any resolve failure) must never wedge the
-            # loop: the rows stay FAILED and the next tick re-sweeps them.
-            logger.warning("wiring retry tick: reattempt failed; rows stay FAILED", exc_info=True)
-            outcomes = []
-        stats["rows_retried"] = len(outcomes)
+    def _tally(outcomes: list[dict]) -> None:
         for o in outcomes:
             if o["outcome"] == "reconnected":
                 stats["reconnected"] += 1
@@ -344,6 +559,32 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
                 stats["superseded"] += 1
             elif o["outcome"] == "still_failed":
                 stats["still_failed"] += 1
+
+    if to_retry:
+        try:
+            outcomes = await _reattempt_rows(to_retry, get_db_session)
+        except Exception:
+            # A TransientUpstreamError (or any resolve failure) must never wedge the
+            # loop: the rows stay FAILED and the next tick re-sweeps them.
+            logger.warning(
+                "wiring retry tick: L1 reattempt failed; rows stay FAILED", exc_info=True
+            )
+            outcomes = []
+        stats["l1_rows_retried"] = len(outcomes)
+        _tally(outcomes)
+
+    if to_retry_l2:
+        try:
+            outcomes_l2 = await _reattempt_l2_rows(to_retry_l2, get_db_session)
+        except Exception:
+            logger.warning(
+                "wiring retry tick: L2 reattempt failed; rows stay FAILED", exc_info=True
+            )
+            outcomes_l2 = []
+        stats["l2_rows_retried"] = len(outcomes_l2)
+        _tally(outcomes_l2)
+
+    stats["rows_retried"] = stats["l1_rows_retried"] + stats["l2_rows_retried"]
 
     log = logger.info if stats["rows_due"] else logger.debug
     log("wiring_retry_tick", extra={"action": "wiring_retry_tick", **stats})
