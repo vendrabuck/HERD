@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 import httpx
 from herd_common.outbox import event_dedupe_key
 from herd_common.retry import retry_with_backoff
+from sqlalchemy import select
 
 from app.config import settings
 from app.services.execution_service import driver_result_failed
@@ -583,6 +584,7 @@ async def _assign_vlans_to_operations(
     Groups switches by fabric, assigns a conflict-free VLAN per fabric,
     and sets vlan_id on each operation dict.
     """
+    from app.models.vlan_assignment import VlanAssignment
     from app.services.vlan_service import fetch_fabric_id, find_or_assign_vlan
 
     # Fetch fabric ID for each unique switch
@@ -601,17 +603,31 @@ async def _assign_vlans_to_operations(
     for sid, fid in switch_fabric.items():
         fabric_switches.setdefault(fid, []).append(sid)
 
-    # Assign a VLAN per fabric
+    # Assign a VLAN per fabric, and read back its allocation row id so the legacy path can
+    # record memberships into l2_port_assignments during the phase 4-6 transition overlap.
     fabric_vlan: dict[uuid.UUID, int] = {}
+    fabric_va_id: dict[uuid.UUID, uuid.UUID] = {}
     async with get_db_session() as db:
         for fid, sids in fabric_switches.items():
             vlan_id = await find_or_assign_vlan(db, reservation_id, fid, sids)
             fabric_vlan[fid] = vlan_id
+            row = (
+                await db.execute(
+                    select(VlanAssignment).where(
+                        VlanAssignment.reservation_id == uuid.UUID(reservation_id),
+                        VlanAssignment.fabric_id == fid,
+                        VlanAssignment.status == "ACTIVE",
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                fabric_va_id[fid] = row.id
 
-    # Set vlan_id on each operation
+    # Set vlan_id and the allocation row id on each operation
     for op in operations:
         fid = switch_fabric[op["switch_device_id"]]
         op["vlan_id"] = fabric_vlan[fid]
+        op["vlan_assignment_id"] = fabric_va_id.get(fid)
 
     return operations
 
@@ -675,12 +691,15 @@ async def _execute_l2_switch_operations(
             return
 
         switch_vlan = {}
+        switch_va_id: dict[str, uuid.UUID] = {}
         for a in assignments:
             for sid in a.switch_device_ids:
                 switch_vlan[sid] = a.vlan_id
+                switch_va_id[sid] = getattr(a, "id", None)
         operations = [op for op in operations if op["switch_device_id"] in switch_vlan]
         for op in operations:
             op["vlan_id"] = switch_vlan[op["switch_device_id"]]
+            op["vlan_assignment_id"] = switch_va_id.get(op["switch_device_id"])
     elif l2_action == "deprovision":
         # For deprovisioning, look up stored VLAN assignments first.
         # If assignments exist, use the stored VLAN IDs.
@@ -693,12 +712,15 @@ async def _execute_l2_switch_operations(
         if assignments:
             # Build a map of switch_id to vlan_id from stored assignments
             switch_vlan: dict[str, int] = {}
+            switch_va_id = {}
             for a in assignments:
                 for sid in a.switch_device_ids:
                     switch_vlan[sid] = a.vlan_id
+                    switch_va_id[sid] = getattr(a, "id", None)
             for op in operations:
                 sid = op["switch_device_id"]
                 op["vlan_id"] = switch_vlan.get(sid, _derive_vlan_id(reservation_id))
+                op["vlan_assignment_id"] = switch_va_id.get(sid)
         else:
             # Legacy: no stored assignment, fall back to derived VLAN
             legacy_vlan = _derive_vlan_id(reservation_id)
@@ -725,6 +747,12 @@ async def _execute_l2_switch_operations(
         extract_password_keys,
         redact_context_for_logging,
         update_execution_run,
+    )
+    from app.services.l2_membership_service import (
+        is_membership_active,
+        record_l2_failed,
+        record_l2_membership_active,
+        release_l2_membership,
     )
 
     # Group by switch
@@ -862,6 +890,21 @@ async def _execute_l2_switch_operations(
                 # Add each port to the VLAN
                 for op in ops:
                     port = op["switch_port"]
+                    op_va_id = op.get("vlan_assignment_id")
+                    # Ledger-ACTIVE idempotency (phase 4-6 transition overlap): a membership
+                    # this reservation already holds ACTIVE (applied by the wiring_changed
+                    # reconcile or a prior legacy pass) needs no driver add. Mirrors the L1
+                    # is_pair_active gate; keeps the two provisioning paths idempotent.
+                    if op_va_id is not None and await is_membership_active(
+                        db, res_uuid, switch_uuid, port
+                    ):
+                        logger.info(
+                            "Skipping add_to_vlan on switch %s port %s; membership already "
+                            "ACTIVE in ledger",
+                            switch_id,
+                            port,
+                        )
+                        continue
                     if await action_already_succeeded(
                         db, dedupe_key, switch_uuid, "add_to_vlan", port, None
                     ):
@@ -908,11 +951,33 @@ async def _execute_l2_switch_operations(
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
                     )
+                    # Record the driver-gated outcome into the membership ledger so it stays
+                    # complete whichever path touched hardware (result-gated, same rules as
+                    # the reconcile). A None allocation id means the readback in
+                    # _assign_vlans_to_operations failed; skip the ledger write rather than
+                    # key a membership to nothing.
+                    if op_va_id is not None:
+                        if op_failed:
+                            await record_l2_failed(
+                                db,
+                                res_uuid,
+                                op_va_id,
+                                switch_uuid,
+                                port,
+                                1,
+                                op_error,
+                                intended="ACTIVE",
+                            )
+                        else:
+                            await record_l2_membership_active(
+                                db, res_uuid, op_va_id, switch_uuid, port
+                            )
 
             elif l2_action == "deprovision":
                 # Remove each port from the VLAN first
                 for op in ops:
                     port = op["switch_port"]
+                    op_va_id = op.get("vlan_assignment_id")
                     if await action_already_succeeded(
                         db, dedupe_key, switch_uuid, "remove_from_vlan", port, None
                     ):
@@ -959,6 +1024,24 @@ async def _execute_l2_switch_operations(
                         completed_at=datetime.now(timezone.utc),
                         duration_ms=result["duration_ms"],
                     )
+                    # Record the driver-gated teardown outcome into the membership ledger
+                    # (result-gated): a successful remove releases the membership; a failed
+                    # remove parks it FAILED intended RELEASED so the retry channel can
+                    # finish the teardown (previously silent, issue #369 for L2).
+                    if op_va_id is not None:
+                        if op_failed:
+                            await record_l2_failed(
+                                db,
+                                res_uuid,
+                                op_va_id,
+                                switch_uuid,
+                                port,
+                                1,
+                                op_error,
+                                intended="RELEASED",
+                            )
+                        else:
+                            await release_l2_membership(db, res_uuid, switch_uuid, port)
 
                 # Delete the VLAN (skip if this message already deleted it)
                 if await action_already_succeeded(
@@ -3032,6 +3115,584 @@ async def _apply_one_port_action(
         )
 
 
+# --- L2 layered reconcile (ADR 0009 phase 4, issue #416) ---------------------
+#
+# Membership is derived from the SAME recorded hops the L1 reconcile applies (option C,
+# the #416 phase 4 resolution): a hop endpoint landing on a Layer 2 Switch implies that
+# (switch, port) joins the reservation's VLAN on that switch's fabric, UNLESS the hop's
+# other endpoint is ALSO a Layer 2 Switch, in which case the hop is an inter-switch trunk
+# (assumed provisioned, no membership; membership is path-terminal only). fork_connections
+# stay L1-hop-only; nothing new is recorded at save time. Unlike the legacy device-set
+# resolver (_resolve_l2_switch_operations), which only saw a RESERVED device's DIRECT
+# adjacency to an L2 switch, this hop walk also credits an L2 membership reached THROUGH
+# intervening L1 matrix switches, since it classifies both endpoints of every recorded hop
+# rather than only reserved-device adjacencies. That is the one deliberate divergence, and
+# it is strictly more correct (it never misses a terminal L2 port a multi-hop path reaches).
+
+
+async def _derive_l2_memberships(
+    wires: list[dict],
+    ctx: "_FetchContext",
+) -> set[tuple[str, str]]:
+    """Derive the intended per-port L2 memberships from a set of recorded hops.
+
+    Returns {(switch_device_id, switch_port)} for every hop endpoint that lands on a
+    Layer 2 Switch whose opposite endpoint is not itself a Layer 2 Switch. Classifies
+    each endpoint device through ctx.get_device (memoized per event), so a 5xx while
+    classifying raises TransientUpstreamError and NAKs the whole message (Decision 7):
+    an upstream outage must never be mistaken for "this port is not an L2 member".
+    """
+    memberships: set[tuple[str, str]] = set()
+    for wire in wires:
+        da = str(wire.get("device_a_id"))
+        pa = wire.get("port_a")
+        db_dev = str(wire.get("device_b_id"))
+        pb = wire.get("port_b")
+        dev_a = await ctx.get_device(da)
+        dev_b = await ctx.get_device(db_dev)
+        if dev_a is None or dev_b is None:
+            # A recorded endpoint is gone: the hop is unresolvable, so it can imply no
+            # membership. The L1 reconcile parks it FAILED; L2 simply omits it.
+            continue
+        a_is_l2 = dev_a.get("connection_type") == "Layer 2 Switch"
+        b_is_l2 = dev_b.get("connection_type") == "Layer 2 Switch"
+        if a_is_l2 and b_is_l2:
+            # Inter-switch trunk: assumed provisioned, contributes no membership.
+            continue
+        if a_is_l2 and pa is not None:
+            memberships.add((da, str(pa)))
+        if b_is_l2 and pb is not None:
+            memberships.add((db_dev, str(pb)))
+    return memberships
+
+
+async def _resolve_add_allocations(
+    reservation_id: str,
+    add_switch_ports: set[tuple[str, str]],
+    get_db_session,
+) -> dict[str, tuple[uuid.UUID, int]]:
+    """Resolve (vlan_assignment_id, vlan_id) per switch for the fabrics gaining a member.
+
+    Groups the switches that have at least one ADD by fabric, allocates a conflict-free
+    VLAN number per fabric via the unchanged find_or_assign_vlan (idempotent: an existing
+    ACTIVE allocation for the (reservation, fabric) is returned, so a fabric with a live
+    membership keeps its number), and reads back the vlan_assignments row id. Allocation
+    happens on a fabric's FIRST built membership (ADR 0009 Decision 4): only switches with
+    an add are grouped, so a fabric with no add allocates nothing here.
+    """
+    from app.models.vlan_assignment import VlanAssignment
+    from app.services.vlan_service import fetch_fabric_id, find_or_assign_vlan
+
+    switch_ids = {sid for sid, _port in add_switch_ports}
+    switch_fabric: dict[str, uuid.UUID] = {}
+    for sid in switch_ids:
+        fid = await fetch_fabric_id(sid)
+        if fid is None:
+            fid = uuid.uuid5(uuid.NAMESPACE_DNS, sid)
+            logger.warning("Could not determine fabric for L2 switch %s, using fallback", sid)
+        switch_fabric[sid] = fid
+
+    fabric_switches: dict[uuid.UUID, list[str]] = {}
+    for sid, fid in switch_fabric.items():
+        fabric_switches.setdefault(fid, []).append(sid)
+
+    fabric_alloc: dict[uuid.UUID, tuple[uuid.UUID, int]] = {}
+    async with get_db_session() as db:
+        for fid, sids in fabric_switches.items():
+            vlan_id = await find_or_assign_vlan(db, reservation_id, fid, sids)
+            row = (
+                await db.execute(
+                    select(VlanAssignment).where(
+                        VlanAssignment.reservation_id == uuid.UUID(reservation_id),
+                        VlanAssignment.fabric_id == fid,
+                        VlanAssignment.status == "ACTIVE",
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                # Should not happen (find_or_assign just committed an ACTIVE row), but be
+                # defensive: without the row id we cannot key a membership, so skip.
+                logger.error(
+                    "No ACTIVE vlan_assignment after find_or_assign for fabric %s "
+                    "reservation %s; skipping its adds",
+                    fid,
+                    reservation_id,
+                )
+                continue
+            fabric_alloc[fid] = (row.id, vlan_id)
+
+    return {sid: fabric_alloc[fid] for sid, fid in switch_fabric.items() if fid in fabric_alloc}
+
+
+async def _vlan_ids_for(
+    vlan_assignment_ids: set[uuid.UUID],
+    get_db_session,
+) -> dict[uuid.UUID, int]:
+    """Map vlan_assignment_id -> vlan_id (for driving remove_from_vlan on a leave).
+
+    A leave reads its VLAN number from the allocation its membership row already points
+    at, ACTIVE or RELEASED alike (a RELEASED allocation still carries the number the
+    hardware was configured with), so the driver call names the right VLAN.
+    """
+    from app.models.vlan_assignment import VlanAssignment
+
+    if not vlan_assignment_ids:
+        return {}
+    async with get_db_session() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(VlanAssignment).where(VlanAssignment.id.in_(vlan_assignment_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return {row.id: row.vlan_id for row in rows}
+
+
+async def _release_orphaned_allocations(
+    vlan_assignment_ids: set[uuid.UUID],
+    get_db_session,
+) -> None:
+    """Release each vlan_assignment left with zero ACTIVE memberships (Decision 4).
+
+    Runs AFTER the whole membership pass (removes and adds both applied), so a port moved
+    to a different port on the same fabric leaves the fabric with one member and its
+    allocation intact; only a fabric whose last member truly left is freed.
+    """
+    from datetime import datetime, timezone
+
+    from app.models.vlan_assignment import VlanAssignment
+    from app.services.l2_membership_service import count_active_memberships_for_vlan
+
+    for va_id in vlan_assignment_ids:
+        async with get_db_session() as db:
+            if await count_active_memberships_for_vlan(db, va_id) > 0:
+                continue
+            row = (
+                await db.execute(
+                    select(VlanAssignment).where(
+                        VlanAssignment.id == va_id,
+                        VlanAssignment.status == "ACTIVE",
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                continue
+            row.status = "RELEASED"
+            row.released_at = datetime.now(timezone.utc)
+            await db.commit()
+            logger.info("Released orphaned VLAN allocation %s (last membership left)", va_id)
+
+
+async def _apply_l2_memberships(
+    reservation_id: str,
+    removes: list[dict],
+    adds: list[dict],
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Apply an L2 membership reconcile: leave the removed ports, then join the added ones.
+
+    `removes`/`adds` are dicts with switch_device_id, port, vlan_assignment_id, vlan_id.
+    Per switch: login once, drive remove_from_vlan for each removed membership still
+    believed live (membership_needs_remove gate), then add_to_vlan for each added
+    membership not already ACTIVE (is_membership_active gate), then logout. Every driver
+    call is result-gated through _run_driver_with_retry (Decision 3). A success flips the
+    ledger (release_l2_membership on a leave, record_l2_membership_active on a join); an
+    exhausted retry lands a FAILED row tagged with its direction (issue #369) and the pass
+    continues (Decision 6, never NAKs). A switch that cannot be driven parks its adds and
+    still-live removes FAILED. After the whole pass, an allocation left with no ACTIVE
+    membership is released (allocation lifecycle coupling, Decision 4). This one apply is
+    shared by the reconcile and both retry channels.
+    """
+    from datetime import datetime, timezone
+
+    from app.services.driver_loader import load_driver
+    from app.services.execution_service import (
+        build_context,
+        create_execution_run,
+        extract_password_keys,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+    from app.services.l2_membership_service import (
+        is_membership_active,
+        membership_needs_remove,
+        record_l2_failed,
+    )
+
+    res_uuid = uuid.UUID(reservation_id)
+    touched_allocations: set[uuid.UUID] = {uuid.UUID(str(r["vlan_assignment_id"])) for r in removes}
+
+    removes_by_switch: dict[str, list[dict]] = {}
+    adds_by_switch: dict[str, list[dict]] = {}
+    for r in removes:
+        removes_by_switch.setdefault(str(r["switch_device_id"]), []).append(r)
+    for a in adds:
+        adds_by_switch.setdefault(str(a["switch_device_id"]), []).append(a)
+
+    switch_ids = list({*removes_by_switch.keys(), *adds_by_switch.keys()})
+    for switch_id in switch_ids:
+        switch_uuid = uuid.UUID(switch_id)
+        switch_removes = removes_by_switch.get(switch_id, [])
+        switch_adds = adds_by_switch.get(switch_id, [])
+
+        switch_data = await ctx.get_device(switch_id)
+        template_data = (
+            await _fetch_template(switch_data.get("template_id", ""), ctx.client)
+            if switch_data
+            else None
+        )
+        load_error: str | None = None
+        if switch_data is None:
+            load_error = f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
+        elif template_data is None:
+            load_error = (
+                f"{WIRING_UNRESOLVABLE_REASON}: template for L2 switch {switch_id} not found"
+            )
+
+        context: dict = {}
+        password_keys: set = set()
+        driver_id = None
+        driver_sha256 = "unknown"
+        driver_path = None
+        if load_error is None:
+            driver_id = uuid.UUID(switch_data["driver_id"])
+            driver_sha256 = switch_data.get("driver_sha256", "unknown")
+            driver_filename = switch_data.get("driver_filename", "driver.zip")
+            connection_type = switch_data.get("connection_type", "Layer 2 Switch")
+            context = build_context(switch_data, switch_uuid, WIRING_SYSTEM_USER, res_uuid)
+            password_keys = extract_password_keys(template_data)
+            async with get_db_session() as db:
+                try:
+                    driver_path = await load_driver(
+                        db, driver_id, driver_sha256, driver_filename, connection_type
+                    )
+                except Exception as exc:  # noqa: BLE001 - a load failure strands the ops
+                    load_error = f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: {exc}"
+
+        if load_error is not None or driver_path is None:
+            async with get_db_session() as db:
+                for a in switch_adds:
+                    await record_l2_failed(
+                        db,
+                        res_uuid,
+                        a["vlan_assignment_id"],
+                        switch_uuid,
+                        a["port"],
+                        0,
+                        load_error,
+                        intended="ACTIVE",
+                    )
+                for r in switch_removes:
+                    if await membership_needs_remove(db, res_uuid, switch_uuid, r["port"]):
+                        await record_l2_failed(
+                            db,
+                            res_uuid,
+                            r["vlan_assignment_id"],
+                            switch_uuid,
+                            r["port"],
+                            0,
+                            load_error,
+                            intended="RELEASED",
+                        )
+            continue
+
+        redacted = redact_context_for_logging(context, password_keys)
+        async with get_db_session() as db:
+            login_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "login",
+                WIRING_SYSTEM_USER,
+                redacted,
+                res_uuid,
+            )
+            login_started = datetime.now(timezone.utc)
+            login_ok, login_attempts, login_err, login_result = await _run_driver_with_retry(
+                driver_path, "login", context, password_keys
+            )
+            await update_execution_run(
+                db,
+                login_run,
+                "SUCCESS" if login_ok else "FAILED",
+                output=(
+                    json.dumps(login_result["output"], default=str)
+                    if login_ok and login_result
+                    else None
+                ),
+                error=None if login_ok else login_err,
+                started_at=login_started,
+                completed_at=datetime.now(timezone.utc),
+            )
+            if not login_ok:
+                for a in switch_adds:
+                    await record_l2_failed(
+                        db,
+                        res_uuid,
+                        a["vlan_assignment_id"],
+                        switch_uuid,
+                        a["port"],
+                        login_attempts,
+                        f"driver login failed: {login_err}",
+                        intended="ACTIVE",
+                    )
+                for r in switch_removes:
+                    if await membership_needs_remove(db, res_uuid, switch_uuid, r["port"]):
+                        await record_l2_failed(
+                            db,
+                            res_uuid,
+                            r["vlan_assignment_id"],
+                            switch_uuid,
+                            r["port"],
+                            login_attempts,
+                            f"driver login failed: {login_err}",
+                            intended="RELEASED",
+                        )
+                continue
+
+            # Leave-before-join: remove departed memberships before adding new ones.
+            for r in switch_removes:
+                if not await membership_needs_remove(db, res_uuid, switch_uuid, r["port"]):
+                    continue
+                await _apply_one_vlan_action(
+                    db,
+                    "remove_from_vlan",
+                    driver_path,
+                    context,
+                    password_keys,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    res_uuid,
+                    r["port"],
+                    r["vlan_id"],
+                    r["vlan_assignment_id"],
+                )
+            for a in switch_adds:
+                if await is_membership_active(db, res_uuid, switch_uuid, a["port"]):
+                    continue
+                await _apply_one_vlan_action(
+                    db,
+                    "add_to_vlan",
+                    driver_path,
+                    context,
+                    password_keys,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    res_uuid,
+                    a["port"],
+                    a["vlan_id"],
+                    a["vlan_assignment_id"],
+                )
+
+            logout_run = await create_execution_run(
+                db,
+                switch_uuid,
+                driver_id,
+                driver_sha256,
+                "logout",
+                WIRING_SYSTEM_USER,
+                redacted,
+                res_uuid,
+            )
+            logout_started = datetime.now(timezone.utc)
+            logout_ok, _la, logout_err, logout_result = await _run_driver_with_retry(
+                driver_path, "logout", context, password_keys
+            )
+            await update_execution_run(
+                db,
+                logout_run,
+                "SUCCESS" if logout_ok else "FAILED",
+                output=(
+                    json.dumps(logout_result["output"], default=str)
+                    if logout_ok and logout_result and logout_result.get("output")
+                    else None
+                ),
+                error=None if logout_ok else logout_err,
+                started_at=logout_started,
+                completed_at=datetime.now(timezone.utc),
+            )
+
+    await _release_orphaned_allocations(touched_allocations, get_db_session)
+
+
+async def _apply_one_vlan_action(
+    db,
+    action: str,
+    driver_path: str,
+    context: dict,
+    password_keys: set,
+    switch_uuid: uuid.UUID,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    res_uuid: uuid.UUID,
+    port: str,
+    vlan_id: int,
+    vlan_assignment_id,
+) -> None:
+    """Apply one add_to_vlan/remove_from_vlan membership op, flipping its ledger row.
+
+    Writes an execution_run audit row, runs the driver with bounded retry gated on the
+    driver RESULT (Decision 3), and on success flips the l2_port_assignments projection
+    (ACTIVE on add, RELEASED on remove); on exhausting the retry cap it lands a FAILED
+    row tagged with the op's direction, leaving siblings untouched (Decision 6).
+    """
+    from datetime import datetime, timezone
+
+    from app.services.execution_service import (
+        create_execution_run,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+    from app.services.l2_membership_service import (
+        record_l2_failed,
+        record_l2_membership_active,
+        release_l2_membership,
+    )
+
+    redacted = redact_context_for_logging(context, password_keys)
+    method_kwargs = (
+        {"port": port, "vlan_id": vlan_id, "tag": "tagged"}
+        if action == "add_to_vlan"
+        else {"port": port, "vlan_id": vlan_id}
+    )
+    run = await create_execution_run(
+        db,
+        switch_uuid,
+        driver_id,
+        driver_sha256,
+        action,
+        WIRING_SYSTEM_USER,
+        redacted,
+        res_uuid,
+        port,
+        method_kwargs=method_kwargs,
+    )
+    started = datetime.now(timezone.utc)
+    ok, attempts, err, result = await _run_driver_with_retry(
+        driver_path, action, context, password_keys, method_kwargs=method_kwargs
+    )
+    if ok:
+        await update_execution_run(
+            db,
+            run,
+            "SUCCESS",
+            output=json.dumps(result["output"], default=str) if result else None,
+            started_at=started,
+            completed_at=datetime.now(timezone.utc),
+        )
+        if action == "add_to_vlan":
+            await record_l2_membership_active(db, res_uuid, vlan_assignment_id, switch_uuid, port)
+        else:
+            await release_l2_membership(db, res_uuid, switch_uuid, port)
+    else:
+        await update_execution_run(
+            db,
+            run,
+            "FAILED",
+            error=err,
+            started_at=started,
+            completed_at=datetime.now(timezone.utc),
+        )
+        await record_l2_failed(
+            db,
+            res_uuid,
+            vlan_assignment_id,
+            switch_uuid,
+            port,
+            attempts,
+            err,
+            intended="ACTIVE" if action == "add_to_vlan" else "RELEASED",
+        )
+
+
+async def _reconcile_l2_memberships(
+    reservation_id: str,
+    intended_wires: list[dict],
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Full L2 membership reconcile against cabling's intended wires (ADR 0009 phase 4).
+
+    L2 membership is ALWAYS a full reconcile (not a per-hop delta), on every apply (delta,
+    heal, or gap): two hops can imply the same (switch, port) membership, so a released
+    hop alone cannot prove a membership should leave; only the intended set can. Derives
+    the intended memberships (option C), diffs against this reservation's ACTIVE
+    memberships, and drives removes-then-adds through the shared _apply_l2_memberships. The
+    L1 reconcile keeps its verbatim delta semantics untouched; this runs after it so L2
+    removes land after L1 builds (Decision 4 ordering).
+    """
+    from app.services.l2_membership_service import active_memberships_for_reservation
+
+    intended = await _derive_l2_memberships(intended_wires, ctx)
+
+    async with get_db_session() as db:
+        active_rows = await active_memberships_for_reservation(db, reservation_id)
+    current: dict[tuple[str, str], object] = {
+        (str(row.switch_device_id), row.port): row for row in active_rows
+    }
+
+    add_keys = intended - set(current.keys())
+    remove_keys = set(current.keys()) - intended
+
+    if not add_keys and not remove_keys:
+        return
+
+    alloc_by_switch = await _resolve_add_allocations(reservation_id, add_keys, get_db_session)
+
+    adds: list[dict] = []
+    for switch_id, port in add_keys:
+        alloc = alloc_by_switch.get(switch_id)
+        if alloc is None:
+            # No allocation resolved for this switch's fabric (upstream fabric lookup or
+            # allocation failed); park the join FAILED so the retry channel revisits it.
+            async with get_db_session() as db:
+                from app.services.l2_membership_service import record_l2_failed
+
+                await record_l2_failed(
+                    db,
+                    uuid.UUID(reservation_id),
+                    None,
+                    uuid.UUID(switch_id),
+                    port,
+                    0,
+                    f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation for fabric",
+                    intended="ACTIVE",
+                )
+            continue
+        va_id, vlan_id = alloc
+        adds.append(
+            {
+                "switch_device_id": switch_id,
+                "port": port,
+                "vlan_assignment_id": va_id,
+                "vlan_id": vlan_id,
+            }
+        )
+
+    remove_alloc_ids = {current[key].vlan_assignment_id for key in remove_keys}
+    vlan_by_alloc = await _vlan_ids_for(remove_alloc_ids, get_db_session)
+    removes: list[dict] = []
+    for switch_id, port in remove_keys:
+        row = current[(switch_id, port)]
+        removes.append(
+            {
+                "switch_device_id": switch_id,
+                "port": port,
+                "vlan_assignment_id": row.vlan_assignment_id,
+                "vlan_id": vlan_by_alloc.get(row.vlan_assignment_id, 0),
+            }
+        )
+
+    await _apply_l2_memberships(reservation_id, removes, adds, ctx, get_db_session)
+
+
 async def handle_wiring_changed(
     event_data: dict, get_db_session, dedupe_key: str | None = None
 ) -> None:
@@ -3095,8 +3756,17 @@ async def handle_wiring_changed(
     async with httpx.AsyncClient() as client:
         ctx = _FetchContext(client)
 
+        # L2 membership is ALWAYS a full reconcile against cabling's intended set (the
+        # session lead's settled call, ADR 0009 phase 4): a released hop cannot prove a
+        # membership should leave, only the intended set can. In the full_reconcile branch
+        # the intended wires are fetched anyway (reused); the carried-delta branch fetches
+        # them once here for the L2 pass. The fork stores L1-hop-only rows, so this is the
+        # complete recorded-hop set L2 membership is derived from (option C).
+        l2_intended_wires: list[dict]
+
         if full_reconcile:
             desired_wires = await _fetch_fork_intended_wires(str(reservation_id), client)
+            l2_intended_wires = desired_wires
             desired_by_switch, unresolvable = await _wires_to_switch_pairs(desired_wires, ctx)
 
             # Convergent reconcile against the current ACTIVE rows: release ACTIVE pairs
@@ -3141,6 +3811,7 @@ async def handle_wiring_changed(
                 get_db_session,
             )
         else:
+            l2_intended_wires = await _fetch_fork_intended_wires(str(reservation_id), client)
             release_by_switch, unresolvable_r = await _wires_to_switch_pairs(released, ctx)
             build_by_switch, unresolvable_b = await _wires_to_switch_pairs(built, ctx)
             # Tag each side with its direction (issue #369) before merging: a hop
@@ -3157,6 +3828,10 @@ async def handle_wiring_changed(
                 ctx,
                 get_db_session,
             )
+
+        # L2 membership reconcile runs AFTER the L1 pass (Decision 4 ordering: L2 removes
+        # land after L1 builds), always as a full reconcile against the intended wires.
+        await _reconcile_l2_memberships(str(reservation_id), l2_intended_wires, ctx, get_db_session)
 
     # Advance the monotonic marker: the version was processed (Decision 4/6), even if
     # the pass left FAILED rows for the Decision 6 retry channel.

@@ -456,13 +456,26 @@ class WiringStatusResponse(BaseModel):
 
 
 class WiringRetryOutcome(BaseModel):
-    """The result of reattempting (or classifying) one FAILED connection."""
+    """The result of reattempting (or classifying) one FAILED connection or membership.
+
+    Layered since ADR 0009 phase 4 (issue #416): `layer` is "l1" for a cross-connect row
+    (the unchanged shape, port_a/port_b/physical_connection_id populated) or "l2" for a
+    VLAN membership row (port/vlan_assignment_id/vlan populated, port_a/port_b absent).
+    The L1-only fields are optional so an L2 row omits them; existing L1 consumers read
+    the same fields they always did.
+    """
 
     id: uuid.UUID
     switch_device_id: uuid.UUID
-    port_a: str
-    port_b: str
+    layer: str = "l1"
+    # L1 cross-connect fields (present for layer "l1").
+    port_a: str | None = None
+    port_b: str | None = None
     physical_connection_id: uuid.UUID | None = None
+    # L2 membership fields (present for layer "l2").
+    port: str | None = None
+    vlan_assignment_id: uuid.UUID | None = None
+    vlan: int | None = None
     outcome: str
     status: str
     attempts: int
