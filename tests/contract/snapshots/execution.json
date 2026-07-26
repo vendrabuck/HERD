@@ -317,6 +317,7 @@
         "port": "anyOf",
         "port_a": "anyOf",
         "port_b": "anyOf",
+        "route_count": "anyOf",
         "status": "string",
         "switch_device_id": "string",
         "vlan": "anyOf",

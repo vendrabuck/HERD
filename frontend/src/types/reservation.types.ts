@@ -207,14 +207,15 @@ export type WiringRetryOutcomeKind =
   | "not_retryable"
   | "frozen";
 
-// Layered since ADR 0009 phase 4 (issue #416): `layer` is "l1" for a cross-connect row
-// (port_a/port_b/physical_connection_id populated) or "l2" for a VLAN membership row
-// (port/vlan_assignment_id/vlan populated, port_a/port_b null). The L1-only fields are
-// nullable so an L2 row omits them; the outcome vocabulary is unchanged in this phase.
+// Layered since ADR 0009 phases 4-5 (issue #416): `layer` is "l1" for a cross-connect row
+// (port_a/port_b/physical_connection_id populated), "l2" for a VLAN membership row
+// (port/vlan_assignment_id/vlan populated, port_a/port_b null), or "l3" for a per-switch
+// route pin (route_count populated, no port fields). The layer-specific fields are nullable
+// so a row omits the ones that do not apply; the outcome vocabulary is unchanged.
 export interface WiringRetryOutcome {
   id: string;
   switch_device_id: string;
-  layer: "l1" | "l2";
+  layer: "l1" | "l2" | "l3";
   // L1 cross-connect fields (present for layer "l1").
   port_a: string | null;
   port_b: string | null;
@@ -223,6 +224,8 @@ export interface WiringRetryOutcome {
   port?: string | null;
   vlan_assignment_id?: string | null;
   vlan?: number | null;
+  // L3 route-pin summary field (present for layer "l3").
+  route_count?: number | null;
   outcome: WiringRetryOutcomeKind;
   status: WiringConnectionState;
   attempts: number;
