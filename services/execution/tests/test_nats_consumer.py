@@ -853,8 +853,10 @@ async def test_handle_created_event_calls_l2_provision():
 
 
 @pytest.mark.asyncio
-async def test_handle_cancelled_event_calls_l2_deprovision():
-    """reservation.cancelled triggers both L1 disconnect and L2 deprovision."""
+async def test_handle_cancelled_event_dispatches_ledger_teardown():
+    """ADR 0009 phase 6: reservation.cancelled dispatches the ledger-driven teardown, not
+    the legacy device-set L1/L2 executors (which retire in phase 7). Teardown work is read
+    from the three wiring ledgers by _teardown_from_ledgers."""
     rid = str(uuid.uuid4())
     uid = str(uuid.uuid4())
     event_data = {
@@ -865,6 +867,10 @@ async def test_handle_cancelled_event_calls_l2_deprovision():
     }
     mock_session = _noop_get_db_session
     with (
+        patch(
+            "app.services.nats_consumer._teardown_from_ledgers",
+            new_callable=AsyncMock,
+        ) as mock_teardown,
         patch(
             "app.services.nats_consumer._execute_switch_operations",
             new_callable=AsyncMock,
@@ -886,19 +892,10 @@ async def test_handle_cancelled_event_calls_l2_deprovision():
         ),
     ):
         await handle_reservation_event(event_data, mock_session)
-        mock_l1.assert_called_once_with(
-            ["device-1"],
-            "disconnect_ports",
-            rid,
-            uid,
-            mock_session,
-            None,
-            ANY,
-            only_applied_pairs=False,
-        )
-        mock_l2.assert_called_once_with(
-            ["device-1"], "deprovision", rid, uid, mock_session, None, ANY, failed_cleanup=False
-        )
+        mock_teardown.assert_awaited_once()
+        assert str(mock_teardown.await_args.args[0]) == rid
+        mock_l1.assert_not_awaited()
+        mock_l2.assert_not_awaited()
 
 
 # --- process_reservation_message: DLQ / retry semantics ---

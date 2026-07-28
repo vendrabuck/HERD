@@ -564,7 +564,23 @@ async def test_handle_event_multiple_switches():
 
 @pytest.mark.asyncio
 async def test_handle_event_disconnect_action():
-    """Cancelled event maps to disconnect_ports action."""
+    """Cancelled event tears down the L1 ledger's ACTIVE pair with disconnect_ports.
+
+    ADR 0009 phase 6: terminal teardown drives from the l1_connection_assignments ledger,
+    not the device set, so an ACTIVE row is what gets disconnected.
+    """
+    async with TestSessionLocal() as s:
+        s.add(
+            L1ConnectionAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                switch_device_id=uuid.UUID(SWITCH_ID),
+                port_a="0/0/1",
+                port_b="0/0/2",
+                status="ACTIVE",
+            )
+        )
+        await s.commit()
+
     event = _make_event("reservation.cancelled")
     call_actions = []
 
@@ -585,13 +601,25 @@ async def test_handle_event_disconnect_action():
 
 @pytest.mark.asyncio
 async def test_cancelled_disconnect_failure_lands_failed_row_intended_released():
-    """Issue #369: the legacy device-set teardown path (reservation.cancelled ->
-    disconnect_ports) now also records a FAILED assignment row, tagged intended
-    RELEASED, on a disconnect failure. Previously a failed teardown left no
-    assignment row at all (silently invisible and unretryable); the connection
-    is still genuinely live (the disconnect did not succeed), so the row is not
-    subject to the issue #412 build-direction guard.
+    """Issue #369 / ADR 0009 phase 6: the ledger-driven terminal teardown records a FAILED
+    assignment row, tagged intended RELEASED, when the disconnect of an ACTIVE ledger pair
+    fails. The row stays visible and retryable through the direction-scoped retry channels
+    (discharging the issue #244 posture), and because the connection is still genuinely live
+    (the disconnect did not succeed) it is not subject to the issue #412 build-direction
+    guard.
     """
+    async with TestSessionLocal() as s:
+        s.add(
+            L1ConnectionAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                switch_device_id=uuid.UUID(SWITCH_ID),
+                port_a="0/0/1",
+                port_b="0/0/2",
+                status="ACTIVE",
+            )
+        )
+        await s.commit()
+
     event = _make_event("reservation.cancelled")
 
     def execute_fn(driver_path, action, context, **kwargs):

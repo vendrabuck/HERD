@@ -341,12 +341,15 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
     failure surface), and the direction-aware manual retry reattempts it as a
     disconnect, ending RELEASED.
 
-    Exercises the legacy device-set teardown path (reservation.cancelled ->
-    disconnect_ports, _execute_switch_operations): before this fix, a failed
-    disconnect there recorded no assignment row at all (silently invisible,
-    unretryable, the row left ACTIVE forever). No topology/fork is involved;
-    this is the device-set L1 path, independent of the wiring_changed/fork-save
-    path the rest of this file covers.
+    As of ADR 0009 phase 6 the terminal teardown is ledger-driven
+    (reservation.cancelled -> _teardown_from_ledgers reads the ACTIVE
+    l1_connection_assignments rows and drives disconnect_ports), and the observable
+    contract is unchanged: a failed disconnect still lands a FAILED intended-RELEASED
+    row, still surfaced and retryable, converging RELEASED on retry. The reservation is
+    created with no topology/fork; the ACTIVE L1 ledger rows come from the device-set
+    activation path (record_l1_connect on the successful connect), so the ledger-driven
+    teardown has exactly those rows to release. This is the phase-6 analogue of the
+    prior device-set disconnect path.
     """
     nats_err = await probe_nats()
     if nats_err:

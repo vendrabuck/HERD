@@ -513,16 +513,10 @@ async def test_handle_reservation_event_applies_tiers():
             "app.services.nats_consumer.apply_reservation_event_tiers",
             new_callable=AsyncMock,
         ) as tiers,
+        # reservation.completed is terminal: phase 6 routes teardown through the
+        # ledger-driven pass, not the device-set executors.
         patch(
-            "app.services.nats_consumer._execute_switch_operations",
-            new_callable=AsyncMock,
-        ),
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ),
-        patch(
-            "app.services.nats_consumer._execute_l3_switch_operations",
+            "app.services.nats_consumer._teardown_from_ledgers",
             new_callable=AsyncMock,
         ),
         patch(
@@ -557,18 +551,12 @@ async def test_handle_reservation_event_survives_tier_failure():
             new_callable=AsyncMock,
             side_effect=RuntimeError("tier update broke"),
         ),
+        # reservation.completed is terminal: the main work after the tier hint is the
+        # ledger-driven teardown (phase 6); assert it still runs despite the tier failure.
         patch(
-            "app.services.nats_consumer._execute_switch_operations",
+            "app.services.nats_consumer._teardown_from_ledgers",
             new_callable=AsyncMock,
-        ) as l1,
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ),
-        patch(
-            "app.services.nats_consumer._execute_l3_switch_operations",
-            new_callable=AsyncMock,
-        ),
+        ) as teardown,
         patch(
             "app.services.nats_consumer._execute_dynamic_teardown",
             new_callable=AsyncMock,
@@ -579,7 +567,7 @@ async def test_handle_reservation_event_survives_tier_failure():
         ),
     ):
         await handle_reservation_event(event, _noop_get_db_session)
-        l1.assert_awaited_once()
+        teardown.assert_awaited_once()
 
 
 # --- Per-tick structured log ---
