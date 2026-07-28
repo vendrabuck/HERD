@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Release 0.1.0</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+<style>
+  /* release-page only: the version identity strip */
+  .relmeta{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--gray-200);border:1px solid var(--gray-200);border-radius:var(--radius-lg);overflow:hidden;margin:26px 0 8px;}
+  .relmeta div{background:#fff;padding:14px 16px;}
+  .relmeta .k{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--gray-500);margin:0 0 4px;}
+  .relmeta .v{font-family:var(--font-mono);font-size:15px;color:var(--gray-900);margin:0;font-variant-numeric:tabular-nums;}
+  @media(max-width:680px){.relmeta{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="release-0-1-0.html" class="active">Release 0.1.0</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#what">What 0.1.0 is</a></li>
+      <li><a href="#highlights">What shipped</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#quality">Quality bar</a></li>
+      <li><a href="#boundaries">Known boundaries</a></li>
+      <li><a href="#manual">Reading the manual against this release</a></li>
+    </ul>
+    <p class="eyebrow">Shared reference</p>
+    <ul>
+      <li><a href="troubleshooting.html">Troubleshooting</a></li>
+      <li><a href="glossary.html">Glossary</a></li>
+      <li><a href="release-0-1-0.html" class="active">Release 0.1.0</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker shared">Shared reference</span>
+    <h1 class="title">Release 0.1.0</h1>
+    <p class="dek">The first tagged release of HERD, and the version this manual documents. What shipped, what the platform does not do yet, and how to tell which of the two you are looking at.</p>
+
+    <div class="relmeta">
+      <div><p class="k">Version</p><p class="v">v0.1.0</p></div>
+      <div><p class="k">Released</p><p class="v">2026-07-27</p></div>
+      <div><p class="k">Tagged commit</p><p class="v">c4cfd61</p></div>
+    </div>
+    <p class="shotcap">Source of record: the <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.1.0">v0.1.0 release notes</a> and <a href="https://github.com/vendrabuck/HERD/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg> Read this before you file a bug</div>
+      <p>Some of the things you might expect to find are not missing by accident. The <a href="#boundaries">Known boundaries</a> section below lists what 0.1.0 deliberately does not do yet. Check it first.</p>
+    </div>
+
+    <h2 class="sec" id="what">The short version</h2>
+    <p class="sectitle">What 0.1.0 is</p>
+    <p>HERD is a lab reservation and topology-management platform built lab-first, for organizations that run a hardware lab and cannot answer two questions: "do we have a lab, and how do I use it?" and "what was done in the lab, by whom, on what, for how long?" Any engineer can browse live inventory, build a topology, and reserve equipment without tribal knowledge; leadership gets utilization reporting with CSV export to defend lab budget.</p>
+    <p>The differentiator is the AI topology pipeline: you describe a need in plain language, an LLM proposes a wiring plan against live inventory, you review it as ghost nodes on the canvas, and committing transactionally creates the topology, books the reservation, and can push per-device configuration.</p>
+    <p>0.1.0 is the first tagged release. It consolidates 296 merged pull requests into a coherent platform.</p>
+
+    <h2 class="sec" id="highlights">The contents</h2>
+    <p class="sectitle">What shipped</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <div class="gcard" style="cursor:default;"><span class="num">01</span><h3>AI topology generation with human review</h3><p>Natural-language prompts plus optional PDFs, tech-support tarballs, or text files produce role-based device proposals rendered as <span class="badge" style="background:#faf5ff;color:var(--proposal)">PROPOSED</span> ghost nodes. Accept transactionally creates the topology and books the reservation, with an optional per-device config push. Feature-gated by a configured LLM provider: an Anthropic backend and an OpenAI-compatible backend covering vLLM, Ollama, LM Studio, OpenAI, and Azure OpenAI. <a href="user-ai.html">Generate with AI &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">02</span><h3>Reservation lifecycle and editable forks</h3><p><span class="badge pending">PENDING</span> to <span class="badge" style="background:var(--res-provision-bg);color:var(--res-provision-fg)">PENDING_PROVISION</span> to <span class="badge active">ACTIVE</span> to <span class="badge" style="background:var(--res-completed-bg);color:var(--res-completed-fg)">COMPLETED</span>, with cancelled and failed branches, automatic activation and expiration, and conflict detection for exclusive devices. On activation a reservation gets an editable fork of its parent topology; edits autosave as drafts and a commit reconciles release-before-build. A port claim colliding with another active reservation is refused with a conflict naming the blocker, and at teardown the fork freezes to an immutable as-built record. <a href="user-live-editing.html">Live editing &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">03</span><h3>Automatic L1/L2/L3 provisioning</h3><p>Reservation lifecycle events drive Layer 1 port cross-connects, Layer 2 VLAN creation and membership with fabric-aware VLAN ids, and Layer 3 static routes pinned from the switch's latest config version, so teardown removes exactly what was applied. After a fork save, wiring is reconciled connection-driven at all three layers against per-connection ledgers, with background auto-retry and manual retry that is direction-aware, so a stuck disconnect can finish even after a reservation ends.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">04</span><h3>Driver sandbox</h3><p>Admin-uploaded packages (.zip or .tar.gz, SHA256-cached) run as a subprocess under POSIX rlimit caps and are validated for required methods before execution. Drivers may publish their own JSON Schema config vocabulary, preferred over the connection-type registry at the configure boundary. Per-command execution transcripts back the config-apply and AI-confirmation surfaces.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">05</span><h3>Encrypted credential store</h3><p>Named secrets under AES-GCM envelope encryption, with a key-encryption key supplied by environment; the service refuses to boot without a valid one, so there is no source-visible default. Online key rotation with a two-key window, ACL-gated reveal, and an internal retrieval surface for automated provisioning.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">06</span><h3>Dynamic hypervisor-backed resources</h3><p>A <code>dynamic</code> template type materializes an instance from a registered hypervisor at reservation time through a recipe driver, records it in an idempotent instance ledger, and surfaces it as a real inventory device. A reservation carrying a dynamic request activates only once every instance exists, and a provisioning timeout prevents a lost callback from stranding a booking.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">07</span><h3>Authentication and access control</h3><p>Local or LDAP/Active Directory sign-in with three roles: <span class="badge" style="background:var(--gray-100);color:var(--gray-600)">user</span>, <span class="badge admin-only">admin</span>, <span class="badge" style="background:#faf5ff;color:var(--proposal)">superadmin</span>. LDAP users JIT-provision on first bind while superadmin rows stay local. Device-group membership gates non-admin visibility; resource-level ACL grants layer narrower carve-outs on top.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">08</span><h3>External API and webhooks</h3><p>A stable, versioned <code>/api/v1</code> facade for CI/CD and test automation to reserve and release devices, authenticated with admin-minted API tokens whose role can never exceed their principal's, forwarding caller identity so RBAC and visibility rules apply as they do interactively. Lifecycle webhooks are HMAC-SHA256 signed, at-least-once with retry and backoff, idempotent on <code>event_id</code>, and dead-lettered on exhaustion.</p></div>
+    </div>
+
+    <p class="sectitle" style="margin-top:34px;">Also in this release</p>
+    <ul class="list">
+      <li>Zero-database first-startup config UI, whose saved values outrank env vars. <a href="admin-setup.html">First-day setup &rarr;</a></li>
+      <li>Utilization reporting by user, device, topology type, day, and group, with CSV export and a fleet-utilization view. <a href="admin-reporting.html">Reporting &rarr;</a></li>
+      <li>Multi-channel notifications, in-app bell plus email, Slack-style chat, and HMAC-signed webhook, driven by durable consumers. <a href="user-notifications.html">Notifications &rarr;</a></li>
+      <li>Bulk CSV and JSON import and export of devices, templates, and topologies.</li>
+      <li>Topology versioning with diff and restore. <a href="user-topology.html#reuse">Cloning and templates &rarr;</a></li>
+      <li>BFS shortest-path cable routing, and fleet-scale device health polling with idle and in-use poll tiers. <a href="admin-health-config.html#health">Health monitoring &rarr;</a></li>
+    </ul>
+
+    <h2 class="sec" id="architecture">Under the floor</h2>
+    <p class="sectitle">Architecture</p>
+    <p>HERD is a <code>uv</code> workspace of twelve FastAPI microservices behind a Traefik v3 gateway that terminates TLS and routes each <code>/api/&lt;service&gt;</code> path prefix. Every service owns its own PostgreSQL 16 schema, its own Alembic migration chain, and its own test suite; there are no cross-schema foreign keys or joins, so services reference each other only by UUID validated over HTTP at the boundary.</p>
+    <p>Asynchronous work flows over NATS JetStream. Every state-change event is written to a per-service transactional outbox in the same database transaction as the state change, then drained to NATS by a background relay with broker-side and consumer-side dedup. Consumers are durable pull consumers with service-scoped dead-letter subjects on a dedicated DLQ stream, so a messaging outage delays delivery rather than dropping a provisioning or notification event.</p>
+    <p>The frontend is React 19 with TypeScript and Vite, using Zustand and TanStack Query for state and a React Flow canvas for topology editing.</p>
+
+    <h2 class="sec" id="quality">What it was tested against</h2>
+    <p class="sectitle">Quality bar</p>
+    <ul class="list">
+      <li>Over 3,300 backend unit tests across the thirteen suites, on in-memory SQLite.</li>
+      <li>OpenAPI contract snapshot tests that fail on any public-API shape change.</li>
+      <li>173 cross-service integration tests against a live stack.</li>
+      <li>130 end-to-end browser tests: 123 Selenium, 7 Playwright.</li>
+      <li>Around 480 frontend tests via vitest, plus Locust load tests. Coverage targets 85% or higher per backend service.</li>
+    </ul>
+    <p>CI gates <code>main</code> with a branch-protection ruleset: the backend and frontend jobs (lockfile-drift check, lint, format check, tests, coverage, frontend build) must pass before merge. An advisory integration job boots the full ephemeral stack for the contract and integration suites, and a scheduled nightly workflow runs the heavier suites PR CI skips. CodeQL runs on pull requests, pushes to <code>main</code>, and a weekly cron.</p>
+
+    <h2 class="sec" id="boundaries">The honest part</h2>
+    <p class="sectitle">Known boundaries</p>
+    <p>These are limits of 0.1.0, not bugs. If you hit one, the answer is "not yet", not "file a ticket".</p>
+    <ul class="list">
+      <li><b>Initial provisioning and teardown are still device-set-driven, not connection-driven.</b> The connection-driven reconcile at all three layers ships for the fork-save path; unifying initial provisioning and teardown through it is in progress under ADR 0009 (phases 6 and 7).</li>
+      <li><b>The per-connection wiring-status surface is Layer 1 only.</b> The Layer 2 and Layer 3 wiring-status view lands with ADR 0009 phase 8.</li>
+      <li><b>Dynamic resources and AI recipe authoring are feature-gated.</b> Recipe authoring is dark by default behind <code>AI_RECIPE_AUTHORING_ENABLED</code>. Dynamic template authoring is API, seed, or bulk-import only; the template editor UI has no dynamic option yet.</li>
+      <li><b>Resource-level ACL grants have no management UI.</b> Admins drive the ACL API directly.</li>
+      <li><b>Driver packages are trusted code.</b> The execution sandbox applies POSIX <code>setrlimit</code> caps (address space, CPU) and runs each package as a subprocess, but this is resource bounding, not OS-level isolation.</li>
+    </ul>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><p>Some manual pages describe screens that only appear when a feature is configured, for example the <b>AI Assistant</b> tab and the <b>Use AI</b> button. On an install with no LLM provider configured, those surfaces are hidden and the AI endpoints return <code>503</code>. That is the feature gate, not a broken deployment.</p></div>
+    </div>
+
+    <h2 class="sec" id="manual">Version and docs</h2>
+    <p class="sectitle">Reading the manual against this release</p>
+    <p>This manual is published from the repository and describes <b>0.1.0</b>. When a later release changes behaviour, the manual changes with it, and a new release page is added here. If a screen in front of you does not match a page here, check your deployed version before assuming the page is wrong.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Full release notes, the tag, and the changelog live in the repository: <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.1.0">github.com/vendrabuck/HERD releases/tag/v0.1.0</a>.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Release 0.1.0</p>
+      <div class="pagenav">
+        <a href="glossary.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Glossary</a>
+        <a href="index.html">Home <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+</body>
+</html>
