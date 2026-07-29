@@ -12,13 +12,26 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # format-checked locally and in CI. Today this is just the seed script.
 ROOT_PY := seed_devices_public.py
 
+# The ephemeral master/everything gate stack runs in its OWN compose project so
+# its volumes never collide with the dev stack's: the gate is always born fresh
+# (gate-clean purges only the gate project) and `make up` after a gate run
+# restores the dev stack WITH its data, no reseed needed. Lowercased because
+# compose project names reject uppercase; derived from the directory so
+# worktree gates are isolated per-worktree too.
+GATE_PROJECT := $(shell basename "$$PWD" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-')-gate
+GATE_COMPOSE := docker compose -p $(GATE_PROJECT)
+# Overridable compose entry for targets that must run against either stack:
+# standalone `make test-e2e` targets the dev stack; master/everything pass
+# COMPOSE="$(GATE_COMPOSE)" so selenium joins the gate project's network.
+COMPOSE ?= docker compose
+
 # Coverage package name per service. Most are app/; common ships herd_common/.
 cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 
 # Self-documenting help is the default goal: a bare `make` prints the target list.
 .DEFAULT_GOAL := help
 
-.PHONY: help audit master master-quick master-clean clean-images everything \
+.PHONY: help audit master master-quick master-clean clean-images everything everything-noload \
 	up dev prod down build logs restart \
 	migrate test coverage \
 	$(addprefix test-,$(SERVICES)) \
@@ -27,7 +40,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix shell-,$(DB_SERVICES)) \
 	test-frontend test-integration test-contract test-load test-load-ui test-e2e test-e2e-stop test-auth-ldap \
 	test-root coverage-parallel coverage-frontend \
-	install frontend-install frontend-dev lint format clean seed \
+	install frontend-install frontend-dev lint format clean clean-data gate-clean seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed
 
@@ -120,7 +133,7 @@ master-quick:  ## Fast gate: format + lint + unit + frontend + build
 	@echo ""
 	@echo "=== master-quick complete ==="
 
-master: clean master-quick  ## Full gate: master-quick + ephemeral stack contract/integration/e2e
+master: gate-clean master-quick  ## Full gate: master-quick + ephemeral stack contract/integration/e2e
 	@echo ""
 	@echo "=== Starting ephemeral stack for integration + e2e ==="
 	@# Always tear the stack down, even if integration or e2e fails.
@@ -132,7 +145,7 @@ master: clean master-quick  ## Full gate: master-quick + ephemeral stack contrac
 		echo "" && echo "=== Integration tests ===" && \
 		$(MAKE) test-integration && \
 		echo "" && echo "=== E2E tests ===" && \
-		$(MAKE) test-e2e
+		$(MAKE) test-e2e COMPOSE="$(GATE_COMPOSE)"
 	@echo ""
 	@echo "=== master complete ==="
 
@@ -146,7 +159,8 @@ master: clean master-quick  ## Full gate: master-quick + ephemeral stack contrac
 clean-images:
 	@echo ""
 	@echo "=== Removing HERD compose images ==="
-	-docker compose down -v --remove-orphans
+	-docker compose down --remove-orphans
+	-$(GATE_COMPOSE) down -v --remove-orphans
 	@ids=$$(docker images --filter "reference=herd-*" -q | sort -u); \
 		if [ -n "$$ids" ]; then \
 			echo "$$ids" | xargs -r docker rmi -f; \
@@ -168,7 +182,11 @@ master-clean: clean-images  ## master with all HERD compose images rebuilt --no-
 #   - Adds headless locust stress test after e2e.
 # Everything stops on first failure; teardown is trapped.
 
-everything: clean  ## Closest-to-CI gate: master + coverage + format-check + load tests
+# Set EVERYTHING_LOAD=0 (or use everything-noload) to stop after e2e: no seed,
+# no locust. Everything else is identical, including the gate-project stack.
+EVERYTHING_LOAD ?= 1
+
+everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check + load tests
 	@echo ""
 	@echo "=== Installing Python dependencies ==="
 	uv sync --all-extras
@@ -206,13 +224,20 @@ everything: clean  ## Closest-to-CI gate: master + coverage + format-check + loa
 		echo "" && echo "=== Integration tests ===" && \
 		$(MAKE) test-integration && \
 		echo "" && echo "=== E2E tests ===" && \
-		$(MAKE) test-e2e && \
-		echo "" && echo "=== Seeding stack for load tests ===" && \
-		$(MAKE) _everything-seed && \
-		echo "" && echo "=== Load / stress tests ===" && \
-		HERD_BASE_URL=https://localhost $(MAKE) test-load
+		$(MAKE) test-e2e COMPOSE="$(GATE_COMPOSE)" && \
+		if [ "$(EVERYTHING_LOAD)" = "1" ]; then \
+			echo "" && echo "=== Seeding gate stack for load tests ===" && \
+			$(MAKE) _everything-seed && \
+			echo "" && echo "=== Load / stress tests ===" && \
+			HERD_BASE_URL=https://localhost $(MAKE) test-load; \
+		else \
+			echo "" && echo "=== Skipping seed + load tests (EVERYTHING_LOAD=0) ==="; \
+		fi
 	@echo ""
 	@echo "=== everything complete ==="
+
+everything-noload:  ## everything minus the seed + load-test tail
+	$(MAKE) everything EVERYTHING_LOAD=0
 
 # Seeds the running stack via seed_devices_public.py: users, drivers, templates,
 # devices, ports, L1/L2 switches, cabling, device/user groups, 6 isolated demo
@@ -248,7 +273,7 @@ _everything-seed:
 seed: _everything-seed  ## Seed a running stack with demo users, devices, cabling, and topologies
 
 _master-stack-up:
-	docker compose up -d --build
+	$(GATE_COMPOSE) up -d --build
 
 _master-wait-healthy:
 	@echo "Waiting for stack to report healthy..."
@@ -264,9 +289,9 @@ _master-wait-healthy:
 
 _master-stack-down:
 	@echo ""
-	@echo "=== Tearing down ephemeral stack ==="
-	-$(MAKE) test-e2e-stop
-	-docker compose down -v
+	@echo "=== Tearing down ephemeral gate stack ==="
+	-$(MAKE) test-e2e-stop COMPOSE="$(GATE_COMPOSE)"
+	-$(GATE_COMPOSE) down -v
 
 ## --- Docker Compose ---
 
@@ -352,13 +377,13 @@ test-load-ui:  ## Run locust with its web UI (needs a running stack)
 	cd tests/load && uv run locust -f locustfile.py --host $${HERD_BASE_URL:-https://localhost}
 
 test-e2e:  ## Run e2e tests, Selenium + Playwright (needs a running stack)
-	-docker compose --profile e2e rm -fsv selenium
-	docker compose --profile e2e up -d --force-recreate selenium
+	-$(COMPOSE) --profile e2e rm -fsv selenium
+	$(COMPOSE) --profile e2e up -d --force-recreate selenium
 	uv run playwright install chromium  # no-op once cached; on a fresh host, missing OS libs need: uv run playwright install --with-deps chromium (sudo)
 	uv run pytest tests/e2e/ -v --tb=short
 
 test-e2e-stop:  ## Stop and remove the e2e Selenium container
-	-docker compose --profile e2e rm -fsv selenium
+	-$(COMPOSE) --profile e2e rm -fsv selenium
 
 # -- Local LDAP test server ---------------------------------------------------
 #
@@ -479,11 +504,22 @@ format:  ## Format and autofix backend Python (services/ + root scripts)
 
 # -- Cleanup ------------------------------------------------------------------
 
-clean:  ## Tear down stack and remove caches/coverage artifacts
-	docker compose down -v --remove-orphans
+clean:  ## Stop the stack (KEEPING volumes/data) and remove caches/coverage artifacts
+	docker compose down --remove-orphans
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name htmlcov -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name coverage.xml -delete 2>/dev/null || true
 	find . -type f -name .coverage -delete 2>/dev/null || true
+
+# Pre-gate cleanup for master/everything. Both compose projects publish the same
+# host ports, so the dev stack must be STOPPED before the gate stack can boot;
+# stopping without -v is what preserves the dev volumes (data and seed) across a
+# gate run. The gate project itself is purged WITH volumes so every gate is born
+# on a fresh database.
+gate-clean: clean  ## Stop the dev stack (data kept), purge any stale gate-project stack
+	-$(GATE_COMPOSE) down -v --remove-orphans
+
+clean-data:  ## DESTRUCTIVE: tear down the dev stack INCLUDING volumes (the pre-gate-isolation `make clean`)
+	docker compose down -v --remove-orphans
