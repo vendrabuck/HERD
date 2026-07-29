@@ -4226,6 +4226,95 @@ async def handle_wiring_changed(
     )
 
 
+async def _teardown_from_ledgers(
+    reservation_id: str,
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Release a reservation's applied wiring from the three ledgers (ADR 0009 phase 6).
+
+    The terminal-transition teardown (cancelled/completed/failed). Instead of resolving
+    teardown work from the device set (the legacy _resolve_l{1,2,3}_switch_operations
+    resolvers, which keep serving provisioning until phase 7), release exactly what the
+    ledgers record as applied. The reservation is ending, so every ACTIVE row is due for
+    removal; the pass drives the SAME shared apply functions the wiring_changed reconcile
+    and both retry channels use, so result gating, the issue #412 guard, FAILED
+    intended-RELEASED rows on a driver failure (retryable through the phase-3
+    direction-scoped channels, which discharges the issue #244 posture: a teardown driver
+    failure is now visible and retryable instead of a silently stranded ACTIVE row),
+    attempts accumulation, the L2 allocation lifecycle coupling, and the issue #20 pin
+    semantics all come for free. `action_succeeded_for_reservation` is no longer consulted:
+    an ACTIVE l1_connection_assignments row IS an applied pair (a connect only flips ACTIVE
+    on a gated driver success), so reading the ACTIVE set gives the issue #244
+    applied-state-only guarantee directly.
+
+    Ordering mirrors ADR 0009 Decision 4 in release form: L1 disconnects, then L2
+    membership removes plus allocation frees, then L3 pin removals. Empty ledgers no-op
+    with no driver call. The wiring freeze is deliberately NOT consulted here: the freeze
+    gates a LATE wiring_changed event and build-direction retries, never the terminal
+    teardown pass itself. The caller sets frozen AFTER this pass, preserving the
+    pre-phase-6 ordering (teardown, then dynamic teardown, then freeze).
+    """
+    from app.services.l1_assignment_service import active_assignments_for_reservation
+    from app.services.l2_membership_service import active_memberships_for_reservation
+    from app.services.route_service import (
+        get_effective_pinned_routes,
+        get_route_assignments,
+    )
+
+    res_str = str(reservation_id)
+
+    # L1: disconnect every ACTIVE cross-connect pair, verbatim from the ledger. A driver
+    # failure lands a FAILED intended-RELEASED row (release-side of _apply_one_port_action);
+    # a moved-then-stranded pair is idempotently skipped by the pair_needs_release gate.
+    async with get_db_session() as db:
+        l1_rows = await active_assignments_for_reservation(db, res_str)
+    release_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
+    for row in l1_rows:
+        phys = str(row.physical_connection_id) if row.physical_connection_id else None
+        release_by_switch.setdefault(str(row.switch_device_id), []).append(
+            (row.port_a, row.port_b, phys)
+        )
+    if release_by_switch:
+        await _apply_wiring_pairs(res_str, release_by_switch, {}, [], ctx, get_db_session)
+
+    # L2: remove every ACTIVE membership, then release each now-orphaned allocation. The
+    # allocation coupling runs inside _apply_l2_memberships after the whole membership pass,
+    # so a fabric whose last member left is freed (Decision 4).
+    async with get_db_session() as db:
+        l2_rows = await active_memberships_for_reservation(db, res_str)
+    if l2_rows:
+        remove_alloc_ids = {row.vlan_assignment_id for row in l2_rows}
+        vlan_by_alloc = await _vlan_ids_for(remove_alloc_ids, get_db_session)
+        removes = [
+            {
+                "switch_device_id": str(row.switch_device_id),
+                "port": row.port,
+                "vlan_assignment_id": row.vlan_assignment_id,
+                "vlan_id": vlan_by_alloc.get(row.vlan_assignment_id, 0),
+            }
+            for row in l2_rows
+        ]
+        await _apply_l2_memberships(res_str, removes, [], ctx, get_db_session)
+
+    # L3: remove every ACTIVE pin using the PINNED route set verbatim (issue #20:
+    # get_effective_pinned_routes, never a re-derived config). The adjacency-aware nuance
+    # (a switch still serving another intended edge keeps its routes) is moot at terminal
+    # time: the whole reservation ends, so every pinned switch is due for removal.
+    async with get_db_session() as db:
+        l3_rows = await get_route_assignments(db, res_str)
+    deprovisions: list[dict] = []
+    for row in l3_rows:
+        switch_id = str(row.device_id)
+        async with get_db_session() as db:
+            pinned = await get_effective_pinned_routes(db, res_str, switch_id)
+        deprovisions.append(
+            {"device_id": switch_id, "routes": pinned if pinned is not None else row.routes}
+        )
+    if deprovisions:
+        await _apply_l3_adjacency(res_str, deprovisions, [], ctx, get_db_session)
+
+
 async def handle_reservation_event(
     event_data: dict, get_db_session, dedupe_key: str | None = None
 ) -> None:
@@ -4365,14 +4454,43 @@ async def handle_reservation_event(
                     client,
                     removed_device_ids=removed_ids,
                 )
+        elif event_type in DYNAMIC_TEARDOWN_EVENTS:
+            # ADR 0009 phase 6: terminal teardown (cancelled/completed/failed) releases
+            # from the three wiring ledgers, not the device set. The legacy device-set
+            # resolvers still serve provisioning (reservation.created) until phase 7; only
+            # teardown is rerouted here. Reading the ACTIVE ledger set gives the issue #244
+            # applied-state-only guarantee directly (an ACTIVE row IS an applied op), so no
+            # only_applied_pairs / failed_cleanup / action_succeeded_for_reservation flag is
+            # needed: the failed and cancelled/completed paths are one and the same.
+            await _teardown_from_ledgers(reservation_id, ctx, get_db_session)
+
+            # Dynamic-instance teardown (issue #32) runs after physical teardown
+            # on complete/cancel/fail, never on reservation.created.
+            await _execute_dynamic_teardown(reservation_id, user_id, get_db_session, client)
+
+            # Freeze the wiring state on terminal events (ADR 0007 Decision 7,
+            # issue #345 P3b phase 1). Once a reservation ends, a later wiring_changed
+            # event must be a no-op; the frozen flag is that guard. Set AFTER the teardown
+            # pass (unchanged ordering): the ledger teardown above is deliberately NOT gated
+            # by frozen (the freeze gates late wiring_changed events and build-direction
+            # retries, never the terminal teardown itself). Best-effort: a failure here must
+            # never NAK an otherwise-processed teardown.
+            from app.services.l1_assignment_service import freeze_reservation_wiring
+
+            try:
+                async with get_db_session() as db:
+                    await freeze_reservation_wiring(db, reservation_id)
+            except Exception:
+                logger.warning(
+                    "failed to freeze wiring state for reservation %s",
+                    reservation_id,
+                    exc_info=True,
+                )
         else:
+            # reservation.created: device-set-driven L1/L2/L3 provisioning. This legacy
+            # build path (the _resolve_l{1,2,3}_switch_operations resolvers) is unchanged;
+            # ADR 0009 phase 7 retires it in favor of an activation-staged wiring_changed.
             device_ids = event_data.get("device_ids", [])
-            # reservation.failed teardown (issue #244) is applied-state-only:
-            # the reservation may have half-provisioned (or never provisioned),
-            # so L1 tears down only pairs whose connect_ports succeeded and L2
-            # only what the stored vlan_assignments record. L3's deprovision is
-            # already pinned-set-driven, so it needs no flag.
-            failed_cleanup = event_type == "reservation.failed"
             await _execute_switch_operations(
                 device_ids,
                 action,
@@ -4381,9 +4499,8 @@ async def handle_reservation_event(
                 get_db_session,
                 dedupe_key,
                 ctx,
-                only_applied_pairs=failed_cleanup,
+                only_applied_pairs=False,
             )
-            # L2 switch operations
             l2_action = L2_EVENT_ACTIONS.get(event_type)
             if l2_action:
                 await _execute_l2_switch_operations(
@@ -4394,37 +4511,13 @@ async def handle_reservation_event(
                     get_db_session,
                     dedupe_key,
                     ctx,
-                    failed_cleanup=failed_cleanup,
+                    failed_cleanup=False,
                 )
-            # L3 switch operations
             l3_action = L3_EVENT_ACTIONS.get(event_type)
             if l3_action:
                 await _execute_l3_switch_operations(
                     device_ids, l3_action, reservation_id, user_id, get_db_session, dedupe_key, ctx
                 )
-            # Dynamic-instance teardown (issue #32) runs after physical teardown
-            # on complete/cancel/fail, never on reservation.created.
-            if event_type in DYNAMIC_TEARDOWN_EVENTS:
-                await _execute_dynamic_teardown(reservation_id, user_id, get_db_session, client)
-
-            # Freeze the wiring state on terminal events (ADR 0007 Decision 7,
-            # issue #345 P3b phase 1). Once a reservation ends, a later
-            # wiring_changed event must be a no-op; the frozen flag is that guard.
-            # Phase 1 write is inert (nothing reads frozen yet), so it is
-            # best-effort: a failure here must never NAK an otherwise-processed
-            # teardown.
-            if event_type in DYNAMIC_TEARDOWN_EVENTS:
-                from app.services.l1_assignment_service import freeze_reservation_wiring
-
-                try:
-                    async with get_db_session() as db:
-                        await freeze_reservation_wiring(db, reservation_id)
-                except Exception:
-                    logger.warning(
-                        "failed to freeze wiring state for reservation %s",
-                        reservation_id,
-                        exc_info=True,
-                    )
 
     logger.info(
         "Completed processing reservation event",

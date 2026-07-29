@@ -172,6 +172,17 @@ async def _poll_success_runs(
     return []
 
 
+async def _runs_by_action(client, reservation_id: str, action: str) -> list[dict]:
+    """Single fetch (no poll) of SUCCESS runs for `action`; for negative assertions."""
+    resp = await client.get(
+        "/execution/runs",
+        params={"reservation_id": reservation_id, "status": "SUCCESS", "limit": 200},
+    )
+    if resp.status_code != 200:
+        return []
+    return [r for r in resp.json().get("items", []) if r["action"] == action]
+
+
 async def test_vlan_assigned_on_reservation_create_with_l2_switch(
     admin_client, l2_template, fresh_device
 ):
@@ -207,8 +218,13 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
 
 
 async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fresh_device):
-    """Cancelling an L2 reservation drives remove_from_vlan + delete_vlan on the
-    switch (proof the VlanAssignment was released)."""
+    """Cancelling an L2 reservation drives remove_from_vlan on the switch (proof the
+    membership was released).
+
+    As of ADR 0009 phase 6 the terminal teardown is ledger-driven: it removes the stored
+    l2_port_assignments membership via remove_from_vlan and frees the vlan_assignments
+    allocation IN THE DATABASE (the phase-4 allocation lifecycle coupling), so no delete_vlan
+    driver call fires. The remove_from_vlan run is the observable release."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l2_template["id"], f"mock-l2-sw-{suffix}")
     connection = None
@@ -226,11 +242,13 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
         resp = await admin_client.delete(f"/reservations/{reservation['id']}")
         assert resp.status_code == 204, resp.text
 
-        delete_runs = await _poll_success_runs(admin_client, reservation["id"], "delete_vlan")
-        assert delete_runs, "no SUCCESS delete_vlan run was recorded after cancel"
-        assert str(delete_runs[0]["device_id"]) == switch["id"]
         remove_runs = await _poll_success_runs(admin_client, reservation["id"], "remove_from_vlan")
         assert remove_runs, "no SUCCESS remove_from_vlan run was recorded after cancel"
+        assert str(remove_runs[0]["device_id"]) == switch["id"]
+        # The allocation is freed in the DB, not via a delete_vlan driver op (phase-6).
+        assert await _runs_by_action(admin_client, reservation["id"], "delete_vlan") == [], (
+            "phase-6 ledger teardown frees the allocation in-DB, never calls delete_vlan"
+        )
     finally:
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")

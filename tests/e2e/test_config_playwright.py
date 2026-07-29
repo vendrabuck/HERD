@@ -29,7 +29,9 @@ Scope notes:
 """
 
 import os
+import re
 import subprocess
+import time
 from pathlib import Path
 
 import httpx
@@ -140,3 +142,90 @@ def test_config_save_persists_value_via_api_readback(
         assert restore.status_code == 200
         restored = config_api.get("/api/config/settings").json()["values"]
         assert restored.get("LDAP_USER_FILTER") == baseline.get("LDAP_USER_FILTER")
+
+
+def _filter_field(page):
+    return page.get_by_text(FILTER_LABEL, exact=True).locator("xpath=following-sibling::input")
+
+
+def test_config_full_cycle_edit_and_restore_via_ui(pw_page, config_api, preserve_precedence_marker):
+    """Full config cycle where the RESTORE is also driven through the UI.
+
+    Stronger than the API-restore round-trip above: after asserting the saved
+    sentinel via the config API, this re-enters the original value through the
+    same field and Save button, then asserts the API shows the baseline back.
+    The finally block still full-replaces via the API as a safety net, because
+    a UI restore that failed partway would leave a config.json edit that
+    outranks the environment for the whole shared stack (the PR #374
+    precedence ladder makes that restore load-bearing, not cosmetic).
+    """
+    baseline = config_api.get("/api/config/settings").json()["values"]
+    original_filter = baseline.get("LDAP_USER_FILTER", "") or ""
+    try:
+        _ui_login(pw_page)
+
+        _filter_field(pw_page).fill(SENTINEL_FILTER)
+        pw_page.get_by_role("button", name="Save", exact=True).click()
+        expect(pw_page.get_by_text("Configuration saved")).to_be_visible()
+        saved = config_api.get("/api/config/settings").json()["values"]
+        assert saved["LDAP_USER_FILTER"] == SENTINEL_FILTER
+
+        # Restore the original value THROUGH THE UI, not the API.
+        _filter_field(pw_page).fill(original_filter)
+        pw_page.get_by_role("button", name="Save", exact=True).click()
+        expect(pw_page.get_by_text("Configuration saved")).to_be_visible()
+        restored = config_api.get("/api/config/settings").json()["values"]
+        # Empty string is stored as unset (PR #374), so an originally-empty
+        # value reads back as either "" or absent; both satisfy the baseline.
+        assert (restored.get("LDAP_USER_FILTER") or "") == original_filter
+    finally:
+        config_api.put("/api/config/settings", json={"values": baseline})
+
+
+@pytest.mark.skipif(
+    os.environ.get("HERD_E2E_RESTART") != "1",
+    reason="Save and Restart bounces the whole stack; opt in with HERD_E2E_RESTART=1",
+)
+def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_marker):
+    """Save and Restart: persists a value AND restarts services, asserted by effect.
+
+    Gated behind HERD_E2E_RESTART=1 and MUST NOT run implicitly or concurrently
+    with any other test or agent: clicking Save and Restart bounces every
+    service in this compose project, which would break anything else in flight.
+    Issue #388 item 1 flags it as needing a serial, last-in-run slot; this test
+    is that slot. It is the case that would have caught the #373 restart bug.
+
+    Effect assertions: the restart-result panel renders with a Restarted list,
+    the config service comes back healthy (its status endpoint answers 200),
+    and the edited value is readable via the config API afterward.
+    """
+    baseline = config_api.get("/api/config/settings").json()["values"]
+    try:
+        _ui_login(pw_page)
+        _filter_field(pw_page).fill(SENTINEL_FILTER)
+
+        pw_page.get_by_role("button", name="Save and Restart").click()
+
+        # The restart-result panel is the UI acknowledgment (issue #373's blind
+        # spot); the health poll and API read-back below are the real effect.
+        expect(pw_page.get_by_text("Restart Result")).to_be_visible(timeout=90_000)
+        expect(pw_page.get_by_text(re.compile(r"Restarted:"))).to_be_visible(timeout=90_000)
+
+        deadline = time.monotonic() + 90.0
+        healthy = False
+        while time.monotonic() < deadline:
+            try:
+                with httpx.Client(base_url=HOST_BASE_URL, verify=False, timeout=10.0) as probe:
+                    status = probe.get("/api/config/status")
+                if status.status_code == 200 and status.json().get("configured"):
+                    healthy = True
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(2.0)
+        assert healthy, "config service did not report healthy after Save and Restart"
+
+        saved = config_api.get("/api/config/settings").json()["values"]
+        assert saved["LDAP_USER_FILTER"] == SENTINEL_FILTER
+    finally:
+        config_api.put("/api/config/settings", json={"values": baseline})
