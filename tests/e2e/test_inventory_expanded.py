@@ -1,4 +1,10 @@
-"""E2E tests for the inventory expanded device row."""
+"""E2E tests for the inventory expanded device row.
+
+`test_inventory_expanded_shows_device_info_panel` (the issue #335 flake) was
+ported to Playwright and removed from here; see
+`test_inventory_expanded_playwright.py`. The two tests below share this
+module's `_open_inventory`/`_expand_first_device` helpers and stay on Selenium.
+"""
 
 import time
 
@@ -30,20 +36,6 @@ def _expand_first_device(driver):
         return False
     chevrons[0].click()
     return True
-
-
-def test_inventory_expanded_shows_device_info_panel(logged_in_browser, base_url):
-    """Expanding a device row renders the DeviceInfoPanel with Dates and Audit."""
-    _open_inventory(logged_in_browser, base_url)
-    if not _expand_first_device(logged_in_browser):
-        import pytest
-
-        pytest.skip("no devices to expand")
-
-    time.sleep(0.5)
-    body = logged_in_browser.find_element(By.TAG_NAME, "body").text
-    assert "Created:" in body or "Dates" in body.upper() or "DATES" in body
-    assert "Created by:" in body or "AUDIT" in body.upper() or "Audit" in body
 
 
 def test_inventory_expanded_shows_ports_section(logged_in_browser, base_url):
