@@ -1,11 +1,17 @@
-"""Tests for the reservation.failed teardown paths in nats_consumer.py (issue #244).
+"""Tests for the legacy device-set failed-teardown helpers in nats_consumer.py (issue #244).
 
-The invariant under test throughout: reservation.failed tears down exactly the
-provisioning that landed before the failure, and nothing else. L1 disconnects
-only pairs with a SUCCESS connect_ports run for the reservation; L2 removes
-only what the stored ACTIVE vlan_assignments record (no derived-VLAN fallback)
-and releases the rows only after the switches were driven; L3 needs no special
-handling because deprovision is already pinned-set-driven.
+The invariant under test throughout: the applied-state teardown helpers tear down exactly
+the provisioning that landed before the failure, and nothing else. L1 disconnects only
+pairs with a SUCCESS connect_ports run for the reservation; L2 removes only what the stored
+ACTIVE vlan_assignments record (no derived-VLAN fallback) and releases the rows only after
+the switches were driven; L3 needs no special handling because deprovision is already
+pinned-set-driven.
+
+As of ADR 0009 phase 6, terminal events (reservation.failed/cancelled/completed) no longer
+dispatch through these device-set helpers: handle_reservation_event routes teardown through
+the ledger-driven _teardown_from_ledgers instead (see test_handle_failed_event_dispatches_
+ledger_teardown below). The direct-call tests here continue to pin the legacy helper
+contract, which still serves and retires with the resolvers in phase 7.
 """
 
 import logging
@@ -491,9 +497,10 @@ async def test_l2_cancel_deprovision_still_uses_release_first_fallback_path():
 # --- dispatch ---
 
 
-async def test_handle_failed_event_dispatches_applied_state_teardown():
-    """reservation.failed dispatches all three executors with the teardown
-    flags: L1 only_applied_pairs, L2 failed_cleanup, L3 plain deprovision."""
+async def test_handle_failed_event_dispatches_ledger_teardown():
+    """ADR 0009 phase 6: reservation.failed dispatches the ledger-driven teardown, not the
+    legacy device-set executors. Teardown work comes from the three wiring ledgers, so the
+    device-set resolvers (retiring in phase 7) are not called for a terminal event."""
     event = {
         "event": "reservation.failed",
         "reservation_id": RES_ID,
@@ -501,6 +508,10 @@ async def test_handle_failed_event_dispatches_applied_state_teardown():
         "device_ids": ["dut-1"],
     }
     with (
+        patch(
+            "app.services.nats_consumer._teardown_from_ledgers",
+            new=AsyncMock(),
+        ) as teardown,
         patch(
             "app.services.nats_consumer._execute_switch_operations",
             new=AsyncMock(),
@@ -513,14 +524,18 @@ async def test_handle_failed_event_dispatches_applied_state_teardown():
             "app.services.nats_consumer._execute_l3_switch_operations",
             new=AsyncMock(),
         ) as l3,
+        patch(
+            "app.services.nats_consumer._execute_dynamic_teardown",
+            new=AsyncMock(),
+        ),
     ):
         await handle_reservation_event(event, _db_session_factory(), FAILED_KEY)
 
-    assert l1.await_args.args[0:2] == (["dut-1"], "disconnect_ports")
-    assert l1.await_args.kwargs["only_applied_pairs"] is True
-    assert l2.await_args.args[0:2] == (["dut-1"], "deprovision")
-    assert l2.await_args.kwargs["failed_cleanup"] is True
-    assert l3.await_args.args[0:2] == (["dut-1"], "deprovision")
+    teardown.assert_awaited_once()
+    assert str(teardown.await_args.args[0]) == RES_ID
+    l1.assert_not_awaited()
+    l2.assert_not_awaited()
+    l3.assert_not_awaited()
 
 
 async def test_handle_created_event_does_not_set_teardown_flags():

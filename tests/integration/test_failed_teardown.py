@@ -351,7 +351,14 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
 ):
     """Phase 1: a reservation.failed with NO prior provisioning drives zero
     driver runs (in particular no derived-VLAN fallback teardown). Phase 2: the
-    same topology provisioned then failed removes the STORED VLAN."""
+    same topology provisioned then failed removes the STORED VLAN membership.
+
+    As of ADR 0009 phase 6 the terminal teardown is ledger-driven: it reads the
+    l2_port_assignments membership rows (written by the device-set provision during
+    the phase 4-6 overlap) and drives remove_from_vlan per port, then frees the
+    vlan_assignments allocation IN THE DATABASE (the phase-4 allocation lifecycle
+    coupling), so no delete_vlan driver call fires. The observable release is the
+    remove_from_vlan run carrying the STORED VLAN id."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_switch(
         admin_client, teardown_templates["mock_l2"]["id"], f"failed-l2-sw-{suffix}"
@@ -374,18 +381,20 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
             "a never-provisioned FAILED reservation must not produce any driver run"
         )
 
-        # Phase 2: fail the provisioned reservation; teardown drives the stored
-        # VLAN id, then delete_vlan closes it out.
+        # Phase 2: fail the provisioned reservation; the ledger-driven teardown removes the
+        # stored membership (remove_from_vlan with the stored VLAN id) and frees the
+        # allocation in the DB. No delete_vlan driver call fires (phase-6 semantics).
         await _publish_event("reservation.failed", provisioned_res_id, [fresh_device["id"]])
         remove_runs = await _poll_runs(admin_client, provisioned_res_id, "remove_from_vlan")
-        delete_runs = await _poll_runs(admin_client, provisioned_res_id, "delete_vlan")
-        assert remove_runs and delete_runs, "reservation.failed did not tear down the VLAN"
+        assert remove_runs, "reservation.failed did not remove the stored VLAN membership"
         provisioned_vlan = _method_kwargs(create_runs[0])["vlan_id"]
-        torn_down_vlans = {
-            _method_kwargs(r)["vlan_id"] for r in remove_runs + delete_runs
-        }
+        torn_down_vlans = {_method_kwargs(r)["vlan_id"] for r in remove_runs}
         assert torn_down_vlans == {provisioned_vlan}, (
             "teardown must drive the stored VLAN id, not a re-derived one"
+        )
+        # The allocation is released in the database, not via a delete_vlan driver op.
+        assert await _runs(admin_client, provisioned_res_id, "delete_vlan", "SUCCESS") == [], (
+            "phase-6 ledger teardown frees the allocation in-DB, never calls delete_vlan"
         )
     finally:
         if connection:
