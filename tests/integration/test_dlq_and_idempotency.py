@@ -33,14 +33,14 @@ _EXECUTION_DLQ_SUBJECT = "herd.reservations.dlq.execution"
 _MOCK_L2_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l2"
 
 
-async def _publish_raw(payload: bytes) -> None:
+async def _publish_raw(payload: bytes, subject: str = _RESERVATIONS_SUBJECT) -> None:
     """Publish raw bytes to the reservations stream (bypassing the producer)."""
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
         # Idempotent: the stream is created by the reservations/execution lifespan.
         await js.add_stream(name="HERD_RESERVATIONS", subjects=["herd.reservations.*"])
-        await js.publish(_RESERVATIONS_SUBJECT, payload)
+        await js.publish(subject, payload)
     finally:
         await nc.close()
 
@@ -134,11 +134,13 @@ async def test_poison_reservation_event_is_retained_in_dlq():
 # continues), not NAK'd, and the pull consumers do not redeliver on a late ack,
 # so neither a driver failure nor a slow handler forces a redelivery of an
 # already-succeeded op. The faithful way to exercise the guard is the outbox's
-# own at-least-once path: re-publish the exact reservation.created event the
-# producer emitted (same payload event_id, a NEW stream sequence, as a relay
-# republish after a dedup-window-expired outage would). The consumer keys its
-# idempotency on the payload event_id (issue #21), so the re-seen event skips the
-# already-succeeded create_vlan while the non-guarded login re-runs.
+# own at-least-once path: re-publish the exact event the producer emitted (same
+# payload, a NEW stream sequence, as a relay republish after a
+# dedup-window-expired outage would). As of ADR 0009 phase 7 all wiring rides
+# reservation.wiring_changed (activation stages the fork's initial version), and
+# the consumer's replay guard for it is the per-reservation
+# last_applied_fork_version marker: a re-seen version is a stale no-op before
+# any driver call, so nothing (not even login) re-runs.
 
 
 def _mock_l2_tarball() -> bytes:
@@ -242,12 +244,42 @@ async def _connect(client, dut_id, switch_id, switch_port):
     return resp.json()
 
 
-async def _reserve(client, device_id):
+def _canvas_edge(a_id, b_id):
+    """A committed one-edge canvas wiring device a to device b (React Flow shape)."""
+    return {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": a_id}}},
+            {"id": "nB", "data": {"device": {"id": b_id}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "nA",
+                "target": "nB",
+                "data": {"layer": "L1", "isProposal": False},
+            }
+        ],
+    }
+
+
+async def _create_topology(client, canvas):
+    resp = await client.post(
+        "/cabling/topologies", json={"name": f"int-dlq-{uuid.uuid4().hex[:8]}"}
+    )
+    resp.raise_for_status()
+    topology_id = resp.json()["id"]
+    put = await client.put(f"/cabling/topologies/{topology_id}", json={"canvas_data": canvas})
+    put.raise_for_status()
+    return topology_id
+
+
+async def _reserve(client, device_id, topology_id):
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
             "device_ids": [device_id],
+            "topology_id": topology_id,
             "purpose": "redelivery idempotency test",
             "start_time": now.isoformat(),
             "end_time": (now + timedelta(hours=1)).isoformat(),
@@ -267,19 +299,23 @@ async def _runs(client, reservation_id, action, status=None):
 
 
 @pytest.mark.timeout(120)
-async def test_redelivery_does_not_rerun_succeeded_create_vlan(
-    admin_client, slow_l2_template, fresh_device
+async def test_redelivery_does_not_rerun_succeeded_add_to_vlan(
+    admin_client, slow_l2_template, fresh_devices
 ):
-    """A re-published event (same event_id, new stream sequence) must not re-run
-    an already-succeeded create_vlan.
+    """A re-published wiring_changed (same fork_version, new stream sequence) must
+    not re-run an already-succeeded add_to_vlan.
 
-    Provision normally so create_vlan commits SUCCESS, capture the exact
-    reservation.created event the producer emitted, then re-publish it verbatim.
-    JetStream assigns a new sequence, so the consumer sees a fresh message, but it
-    keys idempotency on the payload event_id, so it skips the already-succeeded
-    create_vlan while the non-guarded login re-runs. Asserts login ran >=2 times
-    (the re-published event was delivered and processed) while create_vlan
-    succeeded exactly once (the event_id guard held across the resequencing).
+    Provision normally through the activation-staged wiring_changed (ADR 0009
+    phase 7: the reservation books a wired parent topology) so add_to_vlan commits
+    SUCCESS, capture the exact reservation.wiring_changed event the producer
+    emitted, then re-publish it verbatim. JetStream assigns a new sequence, so the
+    consumer sees a fresh message, but its replay guard is the per-reservation
+    last_applied_fork_version marker: the re-seen version is a stale no-op before
+    any driver call. Delivery of the re-published event is proven by an ordering
+    anchor (the consumer processes the stream sequentially): a SECOND wired
+    reservation booked after the re-publish provisions, so once its add_to_vlan
+    succeeds the re-published event was consumed; the first reservation's
+    add_to_vlan and login counts must be unchanged.
     """
     try:
         _probe = await nats.connect(NATS_URL_HOST, connect_timeout=5)
@@ -291,53 +327,68 @@ async def test_redelivery_does_not_rerun_succeeded_create_vlan(
     switch = await _create_switch(
         admin_client, slow_l2_template["id"], f"mock-l2-slow-{suffix}", sleep_ms=0
     )
-    reservation = None
-    connection = None
+    dut_a, dut_b = await fresh_devices(2)
+    reservations = []
+    connections = []
+    topology_ids = []
     try:
-        connection = await _connect(admin_client, fresh_device["id"], switch["id"], "eth1")
-        reservation = await _reserve(admin_client, fresh_device["id"])
+        connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "eth1"))
+        topo_a = await _create_topology(admin_client, _canvas_edge(dut_a["id"], switch["id"]))
+        topology_ids.append(topo_a)
+        res_a = await _reserve(admin_client, dut_a["id"], topo_a)
+        reservations.append(res_a)
 
-        # 1. First delivery provisions normally: wait for create_vlan SUCCESS.
+        # 1. First delivery provisions normally: wait for add_to_vlan SUCCESS.
         deadline = asyncio.get_event_loop().time() + 60
         while asyncio.get_event_loop().time() < deadline:
-            if await _runs(admin_client, reservation["id"], "create_vlan", status="SUCCESS"):
+            if await _runs(admin_client, res_a["id"], "add_to_vlan", status="SUCCESS"):
                 break
             await asyncio.sleep(1.0)
-        first = await _runs(admin_client, reservation["id"], "create_vlan", status="SUCCESS")
-        assert len(first) == 1, f"create_vlan did not succeed once on first delivery: {len(first)}"
-        login_before = len(await _runs(admin_client, reservation["id"], "login"))
+        first = await _runs(admin_client, res_a["id"], "add_to_vlan", status="SUCCESS")
+        assert len(first) == 1, f"add_to_vlan did not succeed once on first delivery: {len(first)}"
+        login_before = len(await _runs(admin_client, res_a["id"], "login"))
 
-        # 2. Capture the producer's reservation.created event and re-publish it
-        #    verbatim. Same payload event_id, new JetStream sequence.
-        raw = await _fetch_reservation_event(reservation["id"])
-        assert raw is not None, "could not capture the reservation.created event from the stream"
-        await _publish_raw(raw)
+        # 2. Capture the producer's reservation.wiring_changed event and re-publish
+        #    it verbatim. Same payload (same fork_version), new JetStream sequence.
+        raw = await _fetch_reservation_event(res_a["id"], event="reservation.wiring_changed")
+        assert raw is not None, (
+            "could not capture the reservation.wiring_changed event from the stream"
+        )
+        await _publish_raw(raw, subject="herd.reservations.wiring_changed")
 
-        # 3. The re-published event is delivered (login re-runs) but create_vlan is
-        #    skipped by the event_id guard.
+        # 3. Ordering anchor: a second wired reservation booked AFTER the re-publish.
+        #    Its activation-staged wiring_changed sits behind the re-published event
+        #    on the stream, so its add_to_vlan SUCCESS proves the re-publish was
+        #    consumed.
+        connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "eth2"))
+        topo_b = await _create_topology(admin_client, _canvas_edge(dut_b["id"], switch["id"]))
+        topology_ids.append(topo_b)
+        res_b = await _reserve(admin_client, dut_b["id"], topo_b)
+        reservations.append(res_b)
         deadline = asyncio.get_event_loop().time() + 60
-        login_after = login_before
         while asyncio.get_event_loop().time() < deadline:
-            login_after = len(await _runs(admin_client, reservation["id"], "login"))
-            if login_after > login_before:
+            if await _runs(admin_client, res_b["id"], "add_to_vlan", status="SUCCESS"):
                 break
             await asyncio.sleep(1.0)
-        assert login_after > login_before, (
-            f"the re-published event was never processed (login stayed at {login_before}); "
-            "delivery did not happen"
+        assert await _runs(admin_client, res_b["id"], "add_to_vlan", status="SUCCESS"), (
+            "anchor reservation never provisioned; cannot prove the re-publish was consumed"
         )
-        # Settle, then assert the guard held: still exactly one create_vlan SUCCESS.
-        await asyncio.sleep(3.0)
-        create_success = await _runs(
-            admin_client, reservation["id"], "create_vlan", status="SUCCESS"
+
+        # 4. The stale-version guard held: nothing re-ran for the first reservation,
+        #    not even login (the no-op happens before any driver call).
+        add_success = await _runs(admin_client, res_a["id"], "add_to_vlan", status="SUCCESS")
+        assert len(add_success) == 1, (
+            f"add_to_vlan succeeded {len(add_success)} times across a re-publish; "
+            "the stale-version guard failed to skip the already-applied version"
         )
-        assert len(create_success) == 1, (
-            f"create_vlan succeeded {len(create_success)} times across a re-publish; "
-            "the event_id guard failed to skip the already-applied op"
+        assert len(await _runs(admin_client, res_a["id"], "login")) == login_before, (
+            "a re-published wiring_changed must no-op before any driver call"
         )
     finally:
-        if reservation:
+        for reservation in reservations:
             await admin_client.delete(f"/reservations/{reservation['id']}")
-        if connection:
+        for topology_id in topology_ids:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

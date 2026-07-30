@@ -1,10 +1,14 @@
 """Integration tests for L3 route provisioning via a mock L3 switch driver.
 
-Route provisioning is driven by NATS reservation events to the execution
-service, which runs L3 switch driver code in a subprocess sandbox (issue #20).
-These tests upload the checked-in mock L3 driver (drivers/mock_l3), wire a DUT
-to a Layer 3 Switch device, store a config version whose routes array is the
-route source of truth, reserve the DUT, and assert the resulting
+As of ADR 0009 phase 7 all wiring, initial provisioning included, is fork-driven: a
+reservation books a WIRED parent topology, activation stages a reservation.wiring_changed
+for the fork's initial version, and the execution consumer's layered reconcile derives L3
+adjacency from the fork's recorded hops (issue #20 pin lifecycle unchanged: the routes come
+from the switch's latest config version at provision time). No fork save is needed;
+activation provisions the initial routes directly. These tests upload the checked-in mock
+L3 driver (drivers/mock_l3), wire a DUT to a Layer 3 Switch device on both the physical
+connection graph and the topology canvas, store a config version whose routes array is the
+route source of truth, reserve the DUT with that topology, and assert the resulting
 configure_route / remove_route operations on the switch via GET /execution/runs.
 
 There is no REST endpoint for RouteAssignment rows, so we assert the observable
@@ -119,9 +123,9 @@ async def _create_device(client, template_id: str, name: str) -> dict:
 
 
 async def _create_connection(client, dut_id: str, switch_id: str, switch_port: str) -> dict:
-    # The cabling connection_type field is irrelevant to L3 resolution: the
-    # execution consumer keys on the far-end device's driver connection_type
-    # ("Layer 3 Switch"), not on this field (nats_consumer._resolve_l3_switch_operations).
+    # The cabling connection_type field is irrelevant to L3 adjacency: the L3 reconcile
+    # derives adjacency from the fork's recorded hops, keying on the far-end device's
+    # driver connection_type ("Layer 3 Switch"), not on this field.
     resp = await client.post(
         "/cabling/connections",
         json={
@@ -136,6 +140,33 @@ async def _create_connection(client, dut_id: str, switch_id: str, switch_port: s
     return resp.json()
 
 
+def _canvas_edge(a_id: str, b_id: str) -> dict:
+    """A committed one-edge canvas wiring device a to device b (React Flow shape)."""
+    return {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": a_id}}},
+            {"id": "nB", "data": {"device": {"id": b_id}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "nA",
+                "target": "nB",
+                "data": {"layer": "L1", "isProposal": False},
+            }
+        ],
+    }
+
+
+async def _create_topology(client, canvas: dict) -> str:
+    resp = await client.post("/cabling/topologies", json={"name": f"int-l3-{uuid.uuid4().hex[:8]}"})
+    resp.raise_for_status()
+    topology_id = resp.json()["id"]
+    put = await client.put(f"/cabling/topologies/{topology_id}", json={"canvas_data": canvas})
+    put.raise_for_status()
+    return topology_id
+
+
 async def _create_config_version(client, device_id: str, routes: list[dict]) -> dict:
     """Store a config version whose routes array is the provisioning source."""
     resp = await client.post(
@@ -146,12 +177,13 @@ async def _create_config_version(client, device_id: str, routes: list[dict]) -> 
     return resp.json()
 
 
-async def _create_reservation(client, device_id: str) -> dict:
+async def _create_reservation(client, device_id: str, topology_id: str) -> dict:
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
             "device_ids": [device_id],
+            "topology_id": topology_id,
             "purpose": "l3 route provisioning integration test",
             "start_time": now.isoformat(),
             "end_time": (now + timedelta(hours=1)).isoformat(),
@@ -221,19 +253,24 @@ async def _poll_reservation_status(
 async def test_routes_configured_on_reservation_create_with_l3_switch(
     admin_client, l3_template, fresh_device
 ):
-    """Reserving a DUT cabled to an L3 switch drives one configure_route per
-    route in the switch's latest config version, including the null next_hop
-    passthrough for an interface route."""
+    """Reserving a DUT wired to an L3 switch in the topology drives one configure_route
+    per route in the switch's latest config version at activation, including the null
+    next_hop passthrough for an interface route (ADR 0009 phase 7: the activation-staged
+    wiring_changed reconcile provisions the initial routes off the fork)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     reservation = None
     connection = None
+    topology_id = None
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         runs = await _poll_success_runs(admin_client, reservation["id"], "configure_route")
         assert runs, "no SUCCESS configure_route run was recorded for the L3 switch"
@@ -248,6 +285,8 @@ async def test_routes_configured_on_reservation_create_with_l3_switch(
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -258,12 +297,16 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     connection = None
+    topology_id = None
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         # Provision first, so there is something to release.
         assert await _poll_success_runs(admin_client, reservation["id"], "configure_route"), (
@@ -282,6 +325,8 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
             remove_runs = await _poll_success_runs(admin_client, reservation["id"], "remove_route")
         assert _as_kwarg_set(remove_runs) == _expected_set(ROUTES)
     finally:
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -296,12 +341,16 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     connection = None
+    topology_id = None
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         assert await _poll_success_runs(admin_client, reservation["id"], "configure_route"), (
             "reservation never provisioned routes, cannot test the pinned-set invariant"
@@ -328,25 +377,29 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
             "deprovision must never touch routes from the edited config"
         )
     finally:
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
-async def test_no_route_ops_when_l3_device_has_no_config(
-    admin_client, l3_template, fresh_device
-):
+async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_template, fresh_device):
     """An L3 switch with no config version provisions nothing and does not
-    block the reservation from activating."""
+    block the reservation from activating (the reconcile's empty-config skip)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     reservation = None
     connection = None
+    topology_id = None
     try:
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         # Deterministic anchor: the reservation still activates.
         assert await _poll_reservation_status(admin_client, reservation["id"], "ACTIVE"), (
@@ -365,6 +418,8 @@ async def test_no_route_ops_when_l3_device_has_no_config(
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

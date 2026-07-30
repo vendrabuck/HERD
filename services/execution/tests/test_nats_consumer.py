@@ -1,27 +1,34 @@
-"""Tests for nats_consumer.py: event handling and L1/L2 switch operation resolution."""
+"""Tests for nats_consumer.py: reservation-event dispatch after ADR 0009 phase 7,
+the process_reservation_message DLQ/retry semantics, the fetch helpers, and the
+outbox dedupe-key resolution.
+
+Phase 7 retired the legacy device-set wiring resolvers/executors
+(_resolve_l1/l2/l3_switch_operations, _execute_switch_operations,
+_execute_l2/l3_switch_operations, _assign_vlans_to_operations, the nats_consumer
+_derive_vlan_id copy, EVENT_ACTIONS/L2_EVENT_ACTIONS/L3_EVENT_ACTIONS, and
+_fetch_connections_for_device), so their tests were deleted. All wiring is now
+fork-driven through reservation.wiring_changed; that reconcile is covered by
+test_nats_consumer_wiring_changed.py plus the L2/L3 reconcile suites. What remains
+here is dispatch (which non-wiring roles reservation.created/updated retain, and
+the terminal ledger-driven teardown), plus the surviving process-message, fetch,
+and dedupe-key coverage.
+"""
 
 import json
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from app.services.nats_consumer import (
-    EVENT_ACTIONS,
-    L2_EVENT_ACTIONS,
     NATS_DLQ_SUBJECT,
     NATS_MAX_DELIVER,
     PermanentEventError,
     TransientUpstreamError,
-    _derive_vlan_id,
-    _fetch_connections_for_device,
     _fetch_device,
     _fetch_template,
-    _FetchContext,
-    _resolve_l1_switch_operations,
-    _resolve_l2_switch_operations,
     handle_reservation_event,
     process_reservation_message,
 )
@@ -35,828 +42,186 @@ async def _noop_db_session():
 def _noop_get_db_session():
     """Protocol-correct get_db_session stand-in yielding a mock session.
 
-    The terminal-event wiring-state freeze (ADR 0007 Decision 7, issue #345)
-    opens a session on reservation.cancelled/completed/failed, so get_db_session
-    must be a real async context manager (mock-backed) rather than a bare
-    AsyncMock, which would leak an un-awaited coroutine. Identity is stable, so
-    dispatch-argument assertions still match.
+    The terminal-event teardown and the wiring-state freeze (ADR 0007 Decision 7,
+    issue #345) open a session on reservation.cancelled/completed/failed, so
+    get_db_session must be a real async context manager (mock-backed) rather than a
+    bare AsyncMock, which would leak an un-awaited coroutine.
     """
     return _noop_db_session()
 
 
-@pytest.fixture(autouse=True)
-def _mock_l3_executor():
-    """Keep this module focused on L1/L2: the executors added by later issues
-    would otherwise run inside every handle_reservation_event test here and
-    attempt real HTTP/DB work. The L3 executor (issue #20) and the dynamic
-    teardown (issue #32) have their own suites (test_nats_consumer_l3.py and
-    test_nats_consumer_dynamic.py).
-    """
-    with (
-        patch(
-            "app.services.nats_consumer._execute_l3_switch_operations",
-            new_callable=AsyncMock,
-        ),
-        patch(
-            "app.services.nats_consumer._execute_dynamic_teardown",
-            new_callable=AsyncMock,
-        ),
+# --- ADR 0009 phase 7: retired-symbol tombstones ---
+
+
+def test_retired_wiring_symbols_removed():
+    """Phase 7 deleted the legacy device-set resolvers/executors and their action
+    maps from nats_consumer, plus action_succeeded_for_reservation from
+    execution_service. Pin their absence so a reintroduction is caught in review."""
+    from app.services import execution_service, nats_consumer
+
+    for name in (
+        "EVENT_ACTIONS",
+        "L2_EVENT_ACTIONS",
+        "L3_EVENT_ACTIONS",
+        "_resolve_l1_switch_operations",
+        "_resolve_l2_switch_operations",
+        "_resolve_l3_switch_operations",
+        "_execute_switch_operations",
+        "_execute_l2_switch_operations",
+        "_execute_l3_switch_operations",
+        "_assign_vlans_to_operations",
+        "_fetch_connections_for_device",
     ):
-        yield
+        assert not hasattr(nats_consumer, name), f"{name} should be retired from nats_consumer"
+
+    assert not hasattr(execution_service, "action_succeeded_for_reservation")
 
 
-# --- EVENT_ACTIONS mapping ---
-
-
-def test_event_actions_mapping():
-    assert EVENT_ACTIONS["reservation.created"] == "connect_ports"
-    assert EVENT_ACTIONS["reservation.cancelled"] == "disconnect_ports"
-    assert EVENT_ACTIONS["reservation.completed"] == "disconnect_ports"
-    assert EVENT_ACTIONS["reservation.updated"] == "update_ports"
-
-
-# --- _resolve_l1_switch_operations ---
-
-
-@pytest.mark.asyncio
-async def test_resolve_no_connections():
-    """No connections means no operations."""
-    with patch(
-        "app.services.nats_consumer._fetch_connections_for_device",
-        new_callable=AsyncMock,
-        return_value=[],
-    ):
-        ops = await _resolve_l1_switch_operations(["device-1"])
-    assert ops == []
-
-
-@pytest.mark.asyncio
-async def test_resolve_connection_to_non_switch():
-    """Connections to non-L1-switch devices produce no operations."""
-    connection = {
-        "device_a_id": "device-1",
-        "port_a": "eth0",
-        "device_b_id": "other-device",
-        "port_b": "eth1",
-    }
-    other_device = {
-        "id": "other-device",
-        "connection_type": "Management",
-    }
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            new_callable=AsyncMock,
-            return_value=[connection],
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=other_device,
-        ),
-    ):
-        ops = await _resolve_l1_switch_operations(["device-1"])
-    assert ops == []
-
-
-@pytest.mark.asyncio
-async def test_resolve_connection_to_l1_switch():
-    """Two DUTs connected through an L1 switch produce a port pair operation."""
-    switch_id = "switch-1"
-    conn1 = {
-        "device_a_id": "dut-1",
-        "port_a": "eth0",
-        "device_b_id": switch_id,
-        "port_b": "port-A1",
-    }
-    conn2 = {
-        "device_a_id": "dut-2",
-        "port_a": "eth0",
-        "device_b_id": switch_id,
-        "port_b": "port-A2",
-    }
-    switch_device = {
-        "id": switch_id,
-        "connection_type": "Layer 1 Switch",
-    }
-
-    async def mock_fetch_connections(device_id, client=None):
-        if device_id == "dut-1":
-            return [conn1]
-        if device_id == "dut-2":
-            return [conn2]
-        return []
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            side_effect=mock_fetch_connections,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=switch_device,
-        ),
-    ):
-        ops = await _resolve_l1_switch_operations(["dut-1", "dut-2"])
-
-    assert len(ops) == 1
-    assert ops[0]["switch_device_id"] == switch_id
-    assert ops[0]["switch_port_a"] == "port-A1"
-    assert ops[0]["switch_port_b"] == "port-A2"
-
-
-@pytest.mark.asyncio
-async def test_resolve_device_not_found():
-    """If the other device is not found, skip the connection."""
-    connection = {
-        "device_a_id": "device-1",
-        "port_a": "eth0",
-        "device_b_id": "missing-device",
-        "port_b": "eth1",
-    }
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            new_callable=AsyncMock,
-            return_value=[connection],
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=None,
-        ),
-    ):
-        ops = await _resolve_l1_switch_operations(["device-1"])
-    assert ops == []
-
-
-@pytest.mark.asyncio
-async def test_resolve_switch_is_device_a():
-    """Switch can be on either side of the connection."""
-    switch_id = "switch-1"
-    conn1 = {
-        "device_a_id": switch_id,
-        "port_a": "port-X",
-        "device_b_id": "dut-1",
-        "port_b": "eth0",
-    }
-    conn2 = {
-        "device_a_id": switch_id,
-        "port_a": "port-Y",
-        "device_b_id": "dut-2",
-        "port_b": "eth0",
-    }
-    switch_device = {"id": switch_id, "connection_type": "Layer 1 Switch"}
-
-    async def mock_connections(device_id, client=None):
-        if device_id == "dut-1":
-            return [conn1]
-        if device_id == "dut-2":
-            return [conn2]
-        return []
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            side_effect=mock_connections,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=switch_device,
-        ),
-    ):
-        ops = await _resolve_l1_switch_operations(["dut-1", "dut-2"])
-
-    assert len(ops) == 1
-    assert ops[0]["switch_port_a"] == "port-X"
-    assert ops[0]["switch_port_b"] == "port-Y"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "device_ids",
-    [
-        ["dut-a", "dut-c", "dut-b", "dut-d"],  # the issue's own [A, C, B, D] example
-        ["dut-c", "dut-a", "dut-d", "dut-b"],
-        ["dut-b", "dut-d", "dut-a", "dut-c"],
-    ],
-)
-async def test_resolve_two_pairs_one_switch_never_mispairs(device_ids):
-    """Issue #366: a reservation wiring TWO cross-connect pairs through the SAME
-    L1 switch (dut-a to switch to dut-b, and dut-c to switch to dut-d) must never
-    silently cross-connect the wrong ports under a device_ids order that would
-    positionally interleave them.
-
-    The raw connections graph carries no edge_key at this layer (that only
-    exists on fork connections, ADR 0007), so this is the same ambiguity the
-    wiring-changed consumer's NULL-edge_key group hits (see
-    test_two_edges_one_switch_null_edge_key_fails_safe in
-    test_nats_consumer_wiring_changed.py): a switch touched by four reserved
-    ports has more than one possible pairing and the resolver refuses to
-    guess. The regression this pins is the SILENCE, not a guessed answer: the
-    resolver must never return dut-a paired with dut-c's port or dut-b paired
-    with dut-d's port (the wrong, positionally-adjacent pairing under this
-    device order); it returns no pairs for this switch at all instead of a
-    50/50 guess.
-    """
-    switch_id = "switch-shared"
-    # dut-a to switch port-1 (intended pair with dut-b's port-2)
-    # dut-c to switch port-3 (intended pair with dut-d's port-4)
-    conns = {
-        "dut-a": [
-            {"device_a_id": "dut-a", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-1"}
-        ],
-        "dut-b": [
-            {"device_a_id": "dut-b", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-2"}
-        ],
-        "dut-c": [
-            {"device_a_id": "dut-c", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-3"}
-        ],
-        "dut-d": [
-            {"device_a_id": "dut-d", "port_a": "eth0", "device_b_id": switch_id, "port_b": "port-4"}
-        ],
-    }
-    switch_device = {"id": switch_id, "connection_type": "Layer 1 Switch"}
-
-    async def mock_connections(device_id, client=None):
-        return conns.get(device_id, [])
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            side_effect=mock_connections,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=switch_device,
-        ),
-    ):
-        ops = await _resolve_l1_switch_operations(device_ids)
-
-    wrong_pairs = {
-        frozenset(("port-1", "port-3")),
-        frozenset(("port-2", "port-4")),
-        frozenset(("port-1", "port-4")),
-        frozenset(("port-3", "port-2")),
-    }
-    got_pairs = {frozenset((op["switch_port_a"], op["switch_port_b"])) for op in ops}
-    assert not got_pairs & wrong_pairs, (
-        f"resolver returned a mis-cross-connected pair under device order {device_ids}: {got_pairs}"
-    )
-    # Fails safe rather than guesses: no pair at all for an ambiguous shared switch.
-    assert ops == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("device_ids", [["dut-a", "dut-b"], ["dut-b", "dut-a"]])
-async def test_resolve_parallel_switches_pair_each_switch(device_ids):
-    """Two DUTs wired through TWO switches in parallel must pair BOTH switches.
-
-    The flattened graph here is a cycle (dut-a, switch-one, dut-b, switch-two,
-    dut-a), but per-switch pairing is unambiguous: each switch has exactly two
-    reserved-adjacent ports, so its only possible cross-connect is that pair.
-    Pins the correction to the first issue #366 fix attempt, whose global
-    chain walk treated the cycle as unresolvable and left a legitimate
-    scenario unwired (caught live by
-    test_l1_failed_event_disconnects_only_applied_pairs).
-    """
-    sw1, sw2 = "switch-one", "switch-two"
-    conns = {
-        "dut-a": [
-            {"device_a_id": "dut-a", "port_a": "eth0", "device_b_id": sw1, "port_b": "s1-p1"},
-            {"device_a_id": "dut-a", "port_a": "eth1", "device_b_id": sw2, "port_b": "s2-p1"},
-        ],
-        "dut-b": [
-            {"device_a_id": "dut-b", "port_a": "eth0", "device_b_id": sw1, "port_b": "s1-p2"},
-            {"device_a_id": "dut-b", "port_a": "eth1", "device_b_id": sw2, "port_b": "s2-p2"},
-        ],
-    }
-    switches = {
-        sw1: {"id": sw1, "connection_type": "Layer 1 Switch"},
-        sw2: {"id": sw2, "connection_type": "Layer 1 Switch"},
-    }
-
-    async def mock_connections(device_id, *args, **kwargs):
-        return conns.get(device_id, [])
-
-    async def mock_device(device_id, *args, **kwargs):
-        return switches.get(device_id)
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            side_effect=mock_connections,
-        ),
-        patch("app.services.nats_consumer._fetch_device", side_effect=mock_device),
-    ):
-        ops = await _resolve_l1_switch_operations(device_ids)
-
-    got = {
-        op["switch_device_id"]: frozenset((op["switch_port_a"], op["switch_port_b"])) for op in ops
-    }
-    assert got == {sw1: frozenset(("s1-p1", "s1-p2")), sw2: frozenset(("s2-p1", "s2-p2"))}
-
-
-# --- handle_reservation_event ---
+# --- handle_reservation_event dispatch ---
 
 
 @pytest.mark.asyncio
 async def test_handle_unknown_event():
-    """Unknown event types are ignored."""
+    """Unknown event types warn and return without touching wiring or health tiers."""
     event_data = {"event": "reservation.unknown", "device_ids": []}
-    await handle_reservation_event(event_data, AsyncMock())
-    # Should return without error
-
-
-@pytest.mark.asyncio
-async def test_handle_event_no_operations():
-    """Event with no L1 switch operations is a no-op."""
-    event_data = {
-        "event": "reservation.created",
-        "reservation_id": str(uuid.uuid4()),
-        "user_id": str(uuid.uuid4()),
-        "device_ids": ["device-1"],
-    }
-    with (
-        patch(
-            "app.services.nats_consumer._resolve_l1_switch_operations",
-            new_callable=AsyncMock,
-            return_value=[],
-        ),
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ),
-    ):
-        await handle_reservation_event(event_data, AsyncMock())
-
-
-@pytest.mark.asyncio
-async def test_handle_event_switch_not_found():
-    """If the switch device is not found, skip it and continue."""
-    event_data = {
-        "event": "reservation.created",
-        "reservation_id": str(uuid.uuid4()),
-        "user_id": str(uuid.uuid4()),
-        "device_ids": ["dut-1", "dut-2"],
-    }
-    ops = [{"switch_device_id": "missing-switch", "switch_port_a": "1", "switch_port_b": "2"}]
-
-    with (
-        patch(
-            "app.services.nats_consumer._resolve_l1_switch_operations",
-            new_callable=AsyncMock,
-            return_value=ops,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=None,
-        ),
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ),
-    ):
-        await handle_reservation_event(event_data, AsyncMock())
-
-
-@pytest.mark.asyncio
-async def test_handle_event_template_not_found():
-    """If the switch template is not found, skip the switch."""
-    event_data = {
-        "event": "reservation.created",
-        "reservation_id": str(uuid.uuid4()),
-        "user_id": str(uuid.uuid4()),
-        "device_ids": ["dut-1"],
-    }
-    ops = [{"switch_device_id": "switch-1", "switch_port_a": "1", "switch_port_b": "2"}]
-    switch_data = {
-        "id": "switch-1",
-        "template_id": "tmpl-1",
-        "driver_id": str(uuid.uuid4()),
-        "driver_sha256": "abc",
-        "driver_filename": "driver.zip",
-        "connection_type": "Layer 1 Switch",
-        "name": "Switch",
-        "field_data": {},
-    }
-
-    with (
-        patch(
-            "app.services.nats_consumer._resolve_l1_switch_operations",
-            new_callable=AsyncMock,
-            return_value=ops,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=switch_data,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_template",
-            new_callable=AsyncMock,
-            return_value=None,
-        ),
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ),
-    ):
-        await handle_reservation_event(event_data, AsyncMock())
-
-
-@pytest.mark.asyncio
-async def test_resolve_odd_port_count():
-    """An odd number of DUT touches on one switch is not a simple chain once
-    chain-walked (issue #366 fix): rather than positionally guessing a pair from
-    an ambiguous 3-way share (which could as easily mis-cross-connect as the even
-    case), every touch on that switch is left unresolved and no pair is returned."""
-    switch_id = "switch-1"
-    conn1 = {
-        "device_a_id": "dut-1",
-        "port_a": "eth0",
-        "device_b_id": switch_id,
-        "port_b": "port-A1",
-    }
-    conn2 = {
-        "device_a_id": "dut-2",
-        "port_a": "eth0",
-        "device_b_id": switch_id,
-        "port_b": "port-A2",
-    }
-    conn3 = {
-        "device_a_id": "dut-3",
-        "port_a": "eth0",
-        "device_b_id": switch_id,
-        "port_b": "port-A3",
-    }
-    switch_device = {"id": switch_id, "connection_type": "Layer 1 Switch"}
-
-    async def mock_connections(device_id, client=None):
-        mapping = {"dut-1": [conn1], "dut-2": [conn2], "dut-3": [conn3]}
-        return mapping.get(device_id, [])
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            side_effect=mock_connections,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=switch_device,
-        ),
-    ):
-        ops = await _resolve_l1_switch_operations(["dut-1", "dut-2", "dut-3"])
-
-    # No pair is guessed from the ambiguous 3-way share; the switch is left
-    # entirely unprovisioned rather than risk cross-connecting the wrong two.
-    assert ops == []
-
-
-@pytest.mark.asyncio
-async def test_resolve_connection_neither_side_matches():
-    """Connection where neither side matches the device_id is skipped (line 90)."""
-    # This is an edge case: _fetch_connections_for_device returns a connection
-    # where neither device_a_id nor device_b_id equals the queried device_id
-    connection = {
-        "device_a_id": "other-1",
-        "port_a": "eth0",
-        "device_b_id": "other-2",
-        "port_b": "eth1",
-    }
     with patch(
-        "app.services.nats_consumer._fetch_connections_for_device",
+        "app.services.nats_consumer.apply_reservation_event_tiers",
         new_callable=AsyncMock,
-        return_value=[connection],
-    ):
-        ops = await _resolve_l1_switch_operations(["device-1"])
-    assert ops == []
-
-
-# --- reservation.updated event handling ---
+    ) as tiers:
+        await handle_reservation_event(event_data, _noop_get_db_session)
+    tiers.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_handle_updated_event_no_changes():
-    """Updated event with empty added/removed lists is a no-op."""
+async def test_created_drives_only_health_tiers_no_wiring():
+    """ADR 0009 phase 7: reservation.created applies the health-tier transition and
+    NOTHING else. No fork reconcile, no ledger teardown, no dynamic teardown, and no
+    wiring-state freeze (a freshly activated reservation must stay reconcilable);
+    initial wiring is provisioned by the activation-staged reservation.wiring_changed."""
     event_data = {
-        "event": "reservation.updated",
+        "event": "reservation.created",
         "reservation_id": str(uuid.uuid4()),
         "user_id": str(uuid.uuid4()),
-        "device_ids": ["device-1"],
-        "added_device_ids": [],
-        "removed_device_ids": [],
-    }
-    with (
-        patch(
-            "app.services.nats_consumer._execute_switch_operations",
-            new_callable=AsyncMock,
-        ) as mock_exec,
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ) as mock_l2_exec,
-    ):
-        await handle_reservation_event(event_data, AsyncMock())
-        mock_exec.assert_not_called()
-        mock_l2_exec.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_updated_event_connect_added_devices():
-    """Updated event with added_device_ids triggers connect_ports and L2 provision."""
-    rid = str(uuid.uuid4())
-    uid = str(uuid.uuid4())
-    event_data = {
-        "event": "reservation.updated",
-        "reservation_id": rid,
-        "user_id": uid,
         "device_ids": ["device-1", "device-2"],
-        "added_device_ids": ["device-2"],
-        "removed_device_ids": [],
     }
-    mock_session = AsyncMock()
     with (
         patch(
-            "app.services.nats_consumer._execute_switch_operations",
+            "app.services.nats_consumer.apply_reservation_event_tiers",
             new_callable=AsyncMock,
-        ) as mock_exec,
+        ) as tiers,
         patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
+            "app.services.nats_consumer._teardown_from_ledgers",
             new_callable=AsyncMock,
-        ) as mock_l2_exec,
+        ) as teardown,
+        patch(
+            "app.services.nats_consumer._execute_dynamic_teardown",
+            new_callable=AsyncMock,
+        ) as dyn,
+        patch(
+            "app.services.nats_consumer.handle_wiring_changed",
+            new_callable=AsyncMock,
+        ) as wiring,
+        patch(
+            "app.services.l1_assignment_service.freeze_reservation_wiring",
+            new_callable=AsyncMock,
+        ) as freeze,
     ):
-        await handle_reservation_event(event_data, mock_session)
-        # ANY is the per-event _FetchContext threaded through (issue #137).
-        mock_exec.assert_called_once_with(
-            ["device-2"], "connect_ports", rid, uid, mock_session, None, ANY
-        )
-        mock_l2_exec.assert_called_once_with(
-            ["device-2"], "provision", rid, uid, mock_session, None, ANY
-        )
+        await handle_reservation_event(event_data, _noop_get_db_session)
+
+    tiers.assert_awaited_once()
+    teardown.assert_not_awaited()
+    dyn.assert_not_awaited()
+    wiring.assert_not_awaited()
+    freeze.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_handle_updated_event_disconnect_removed_devices():
-    """Updated event with removed_device_ids triggers disconnect_ports and L2 deprovision."""
+async def test_updated_removed_devices_drive_dynamic_teardown_only():
+    """reservation.updated with removed_device_ids drives dynamic-instance teardown for
+    exactly those devices plus the health-tier transition, and NO wiring: a departed
+    device's physical wiring is released through the fork, not here (Decision 6)."""
     rid = str(uuid.uuid4())
     uid = str(uuid.uuid4())
+    removed = [str(uuid.uuid4()), str(uuid.uuid4())]
     event_data = {
         "event": "reservation.updated",
         "reservation_id": rid,
         "user_id": uid,
         "device_ids": ["device-1"],
         "added_device_ids": [],
-        "removed_device_ids": ["device-3"],
+        "removed_device_ids": removed,
     }
-    mock_session = AsyncMock()
     with (
         patch(
-            "app.services.nats_consumer._execute_switch_operations",
+            "app.services.nats_consumer.apply_reservation_event_tiers",
             new_callable=AsyncMock,
-        ) as mock_exec,
+        ) as tiers,
         patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
+            "app.services.nats_consumer._teardown_from_ledgers",
             new_callable=AsyncMock,
-        ) as mock_l2_exec,
+        ) as teardown,
+        patch(
+            "app.services.nats_consumer._execute_dynamic_teardown",
+            new_callable=AsyncMock,
+        ) as dyn,
+        patch(
+            "app.services.nats_consumer.handle_wiring_changed",
+            new_callable=AsyncMock,
+        ) as wiring,
     ):
-        await handle_reservation_event(event_data, mock_session)
-        mock_exec.assert_called_once_with(
-            ["device-3"], "disconnect_ports", rid, uid, mock_session, None, ANY
-        )
-        mock_l2_exec.assert_called_once_with(
-            ["device-3"], "deprovision", rid, uid, mock_session, None, ANY
-        )
+        await handle_reservation_event(event_data, _noop_get_db_session)
+
+    tiers.assert_awaited_once()
+    dyn.assert_awaited_once()
+    assert dyn.await_args.kwargs["removed_device_ids"] == removed
+    teardown.assert_not_awaited()
+    wiring.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_handle_updated_event_both_added_and_removed():
-    """Updated event with both added and removed devices triggers both L1 and L2 operations."""
-    rid = str(uuid.uuid4())
-    uid = str(uuid.uuid4())
+async def test_updated_added_only_drives_no_teardown_no_wiring():
+    """reservation.updated that only ADDS devices drives no dynamic teardown and no
+    wiring: an added device wires nothing until a fork save draws its connections.
+    Only the health-tier transition runs."""
     event_data = {
         "event": "reservation.updated",
-        "reservation_id": rid,
-        "user_id": uid,
+        "reservation_id": str(uuid.uuid4()),
+        "user_id": str(uuid.uuid4()),
         "device_ids": ["device-1", "device-2"],
         "added_device_ids": ["device-2"],
-        "removed_device_ids": ["device-3"],
+        "removed_device_ids": [],
     }
-    mock_session = AsyncMock()
     with (
         patch(
-            "app.services.nats_consumer._execute_switch_operations",
+            "app.services.nats_consumer.apply_reservation_event_tiers",
             new_callable=AsyncMock,
-        ) as mock_exec,
+        ) as tiers,
         patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
+            "app.services.nats_consumer._teardown_from_ledgers",
             new_callable=AsyncMock,
-        ) as mock_l2_exec,
+        ) as teardown,
+        patch(
+            "app.services.nats_consumer._execute_dynamic_teardown",
+            new_callable=AsyncMock,
+        ) as dyn,
+        patch(
+            "app.services.nats_consumer.handle_wiring_changed",
+            new_callable=AsyncMock,
+        ) as wiring,
     ):
-        await handle_reservation_event(event_data, mock_session)
-        assert mock_exec.call_count == 2
-        mock_exec.assert_any_call(["device-2"], "connect_ports", rid, uid, mock_session, None, ANY)
-        mock_exec.assert_any_call(
-            ["device-3"], "disconnect_ports", rid, uid, mock_session, None, ANY
-        )
-        assert mock_l2_exec.call_count == 2
-        mock_l2_exec.assert_any_call(["device-2"], "provision", rid, uid, mock_session, None, ANY)
-        mock_l2_exec.assert_any_call(["device-3"], "deprovision", rid, uid, mock_session, None, ANY)
+        await handle_reservation_event(event_data, _noop_get_db_session)
 
-
-# --- L2 Switch Operation Resolution ---
-
-
-def test_derive_vlan_id_range():
-    """VLAN ID derived from reservation UUID is in range 2-4094."""
-    for _ in range(100):
-        rid = str(uuid.uuid4())
-        vlan = _derive_vlan_id(rid)
-        assert 2 <= vlan <= 4094
-
-
-def test_derive_vlan_id_deterministic():
-    """Same reservation_id always produces the same VLAN ID."""
-    rid = str(uuid.uuid4())
-    assert _derive_vlan_id(rid) == _derive_vlan_id(rid)
-
-
-def test_l2_event_actions_mapping():
-    """L2 event actions map correctly."""
-    assert L2_EVENT_ACTIONS["reservation.created"] == "provision"
-    assert L2_EVENT_ACTIONS["reservation.cancelled"] == "deprovision"
-    assert L2_EVENT_ACTIONS["reservation.completed"] == "deprovision"
-    assert "reservation.updated" not in L2_EVENT_ACTIONS
-
-
-@pytest.mark.asyncio
-async def test_resolve_l2_no_connections():
-    """No connections means no L2 operations."""
-    with patch(
-        "app.services.nats_consumer._fetch_connections_for_device",
-        new_callable=AsyncMock,
-        return_value=[],
-    ):
-        ops = await _resolve_l2_switch_operations(["device-1"])
-    assert ops == []
-
-
-@pytest.mark.asyncio
-async def test_resolve_l2_connection_to_l2_switch():
-    """DUT connected to an L2 switch produces a per-port operation."""
-    switch_id = "l2-switch-1"
-    conn = {
-        "device_a_id": "dut-1",
-        "port_a": "eth6",
-        "device_b_id": switch_id,
-        "port_b": "eth3",
-    }
-    switch_device = {"id": switch_id, "connection_type": "Layer 2 Switch"}
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            new_callable=AsyncMock,
-            return_value=[conn],
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=switch_device,
-        ),
-    ):
-        ops = await _resolve_l2_switch_operations(["dut-1"])
-
-    assert len(ops) == 1
-    assert ops[0]["switch_device_id"] == switch_id
-    assert ops[0]["switch_port"] == "eth3"
-    assert "vlan_id" not in ops[0]  # VLAN assigned later by fabric-aware service
-    assert ops[0]["tag"] == "tagged"
-
-
-@pytest.mark.asyncio
-async def test_resolve_l2_ignores_l1_switches():
-    """L1 switches are not included in L2 resolution."""
-    conn = {
-        "device_a_id": "dut-1",
-        "port_a": "eth1",
-        "device_b_id": "l1-switch",
-        "port_b": "0/0/1",
-    }
-    l1_device = {"id": "l1-switch", "connection_type": "Layer 1 Switch"}
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            new_callable=AsyncMock,
-            return_value=[conn],
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=l1_device,
-        ),
-    ):
-        ops = await _resolve_l2_switch_operations(["dut-1"])
-
-    assert ops == []
-
-
-@pytest.mark.asyncio
-async def test_resolve_l2_multiple_ports_not_paired():
-    """L2 operations are per-port, not paired like L1."""
-    switch_id = "l2-switch-1"
-    conn1 = {
-        "device_a_id": "dut-1",
-        "port_a": "eth6",
-        "device_b_id": switch_id,
-        "port_b": "eth1",
-    }
-    conn2 = {
-        "device_a_id": "dut-2",
-        "port_a": "eth6",
-        "device_b_id": switch_id,
-        "port_b": "eth2",
-    }
-    conn3 = {
-        "device_a_id": "dut-3",
-        "port_a": "eth6",
-        "device_b_id": switch_id,
-        "port_b": "eth3",
-    }
-    switch_device = {"id": switch_id, "connection_type": "Layer 2 Switch"}
-
-    async def mock_connections(device_id, client=None):
-        mapping = {"dut-1": [conn1], "dut-2": [conn2], "dut-3": [conn3]}
-        return mapping.get(device_id, [])
-
-    with (
-        patch(
-            "app.services.nats_consumer._fetch_connections_for_device",
-            side_effect=mock_connections,
-        ),
-        patch(
-            "app.services.nats_consumer._fetch_device",
-            new_callable=AsyncMock,
-            return_value=switch_device,
-        ),
-    ):
-        ops = await _resolve_l2_switch_operations(["dut-1", "dut-2", "dut-3"])
-
-    # 3 per-port operations (not 1 pair like L1 would produce)
-    assert len(ops) == 3
-    switch_ports = {op["switch_port"] for op in ops}
-    assert switch_ports == {"eth1", "eth2", "eth3"}
-
-
-@pytest.mark.asyncio
-async def test_handle_created_event_calls_l2_provision():
-    """reservation.created triggers both L1 connect and L2 provision."""
-    rid = str(uuid.uuid4())
-    uid = str(uuid.uuid4())
-    event_data = {
-        "event": "reservation.created",
-        "reservation_id": rid,
-        "user_id": uid,
-        "device_ids": ["device-1"],
-    }
-    mock_session = AsyncMock()
-    with (
-        patch(
-            "app.services.nats_consumer._execute_switch_operations",
-            new_callable=AsyncMock,
-        ) as mock_l1,
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ) as mock_l2,
-    ):
-        await handle_reservation_event(event_data, mock_session)
-        mock_l1.assert_called_once_with(
-            ["device-1"],
-            "connect_ports",
-            rid,
-            uid,
-            mock_session,
-            None,
-            ANY,
-            only_applied_pairs=False,
-        )
-        mock_l2.assert_called_once_with(
-            ["device-1"], "provision", rid, uid, mock_session, None, ANY, failed_cleanup=False
-        )
+    tiers.assert_awaited_once()
+    dyn.assert_not_awaited()
+    teardown.assert_not_awaited()
+    wiring.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_handle_cancelled_event_dispatches_ledger_teardown():
-    """ADR 0009 phase 6: reservation.cancelled dispatches the ledger-driven teardown, not
-    the legacy device-set L1/L2 executors (which retire in phase 7). Teardown work is read
-    from the three wiring ledgers by _teardown_from_ledgers."""
+    """A terminal event (reservation.cancelled) dispatches the ledger-driven teardown,
+    then the dynamic-instance teardown, then freezes the wiring state. Wiring comes from
+    the three ledgers via _teardown_from_ledgers, never a device-set resolver (retired)."""
     rid = str(uuid.uuid4())
     uid = str(uuid.uuid4())
     event_data = {
@@ -865,23 +230,22 @@ async def test_handle_cancelled_event_dispatches_ledger_teardown():
         "user_id": uid,
         "device_ids": ["device-1"],
     }
-    mock_session = _noop_get_db_session
     with (
         patch(
             "app.services.nats_consumer._teardown_from_ledgers",
             new_callable=AsyncMock,
         ) as mock_teardown,
         patch(
-            "app.services.nats_consumer._execute_switch_operations",
+            "app.services.nats_consumer._execute_dynamic_teardown",
             new_callable=AsyncMock,
-        ) as mock_l1,
+        ) as mock_dyn,
         patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
+            "app.services.nats_consumer.handle_wiring_changed",
             new_callable=AsyncMock,
-        ) as mock_l2,
-        # Best-effort side-effects on the terminal path (tier flip #24, wiring
-        # freeze #345) are not what this dispatch test asserts; patch them out so
-        # they do not run real DB code against the mock session.
+        ) as mock_wiring,
+        # Best-effort side-effects on the terminal path (tier flip #24, wiring freeze
+        # #345) are not what this dispatch test asserts; patch them out so they do not
+        # run real DB code against the mock session.
         patch(
             "app.services.nats_consumer.apply_reservation_event_tiers",
             new_callable=AsyncMock,
@@ -889,13 +253,15 @@ async def test_handle_cancelled_event_dispatches_ledger_teardown():
         patch(
             "app.services.l1_assignment_service.freeze_reservation_wiring",
             new_callable=AsyncMock,
-        ),
+        ) as mock_freeze,
     ):
-        await handle_reservation_event(event_data, mock_session)
+        await handle_reservation_event(event_data, _noop_get_db_session)
         mock_teardown.assert_awaited_once()
         assert str(mock_teardown.await_args.args[0]) == rid
-        mock_l1.assert_not_awaited()
-        mock_l2.assert_not_awaited()
+        mock_dyn.assert_awaited_once()
+        mock_freeze.assert_awaited_once()
+        # A terminal event does not drive the fork reconcile.
+        mock_wiring.assert_not_awaited()
 
 
 # --- process_reservation_message: DLQ / retry semantics ---
@@ -1137,312 +503,47 @@ async def test_fetch_template_returns_none_on_404():
 
 
 @pytest.mark.asyncio
-async def test_fetch_connections_raises_on_5xx():
-    with _patch_httpx_get(status_code=502):
-        with pytest.raises(TransientUpstreamError):
-            await _fetch_connections_for_device("dev-1")
-
-
-@pytest.mark.asyncio
-async def test_fetch_connections_returns_empty_on_non_5xx_error():
-    # A 404 (or any sub-500 non-200) is treated as "no connections", not transient.
-    with _patch_httpx_get(status_code=404):
-        assert await _fetch_connections_for_device("dev-1") == []
-
-
-@pytest.mark.asyncio
 async def test_fetch_device_raises_on_transport_error():
     with _patch_httpx_get(raises=httpx.ConnectError("connection refused")):
         with pytest.raises(TransientUpstreamError):
             await _fetch_device("dev-1")
 
 
-# --- end-to-end: a 5xx during provisioning NAKs, then DLQs at max_deliver ---
-
-
-def _reservation_created_payload():
-    return json.dumps(
-        {
-            "event": "reservation.created",
-            "reservation_id": str(uuid.uuid4()),
-            "user_id": str(uuid.uuid4()),
-            "device_ids": [str(uuid.uuid4())],
-        }
-    ).encode()
-
-
 @pytest.mark.asyncio
-async def test_upstream_5xx_naks_below_max_deliver():
-    """A 5xx from cabling while resolving operations must propagate so the
-    message NAKs for retry, not ACK as a silent no-op."""
-    js = _make_js()
-    msg = _make_msg(_reservation_created_payload(), num_delivered=1)
+async def test_fetch_context_memoizes_device_and_config_fetches():
+    """_FetchContext's per-event memoization contract, re-expressed from the retired
+    shared-ctx tests: a device (present or 404-None) and a latest-config are fetched at
+    most once per event, and a TransientUpstreamError is NOT cached (a NAK retry should
+    refetch)."""
+    from app.services.nats_consumer import _FetchContext
 
-    with _patch_httpx_get(status_code=503):
-        result = await process_reservation_message(
-            msg, js, handle_reservation_event, session_factory=lambda: None
-        )
-
-    assert result == "nak"
-    msg.nak.assert_awaited_once()
-    msg.ack.assert_not_awaited()
-    js.publish.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_upstream_5xx_routes_to_dlq_at_max_deliver():
-    """Once redelivery is exhausted, the same persistent 5xx routes to the DLQ
-    and acks, rather than looping forever."""
-    js = _make_js()
-    payload = _reservation_created_payload()
-    msg = _make_msg(payload, num_delivered=NATS_MAX_DELIVER)
-
-    with _patch_httpx_get(status_code=503):
-        result = await process_reservation_message(
-            msg,
-            js,
-            handle_reservation_event,
-            session_factory=lambda: None,
-            max_deliver=NATS_MAX_DELIVER,
-        )
-
-    assert result == "dlq"
-    js.publish.assert_awaited_once_with(NATS_DLQ_SUBJECT, payload)
-    msg.ack.assert_awaited_once()
-    msg.nak.assert_not_awaited()
-
-
-# --- issue #137: per-event shared client + memoization caches ---
-#
-# The resolvers used to open a fresh httpx.AsyncClient per request and re-fetch
-# each device's connections (once per resolver pass) and each far-end device
-# (once per connection touching it). These tests pin the new behavior: a single
-# _FetchContext threaded through both passes fetches each device's connections
-# at most once and classifies each far-end device at most once, while producing
-# the same operations and preserving the TransientUpstreamError retry semantics.
-
-
-def _counting_fetch_patches(connections_by_device, devices_by_id):
-    """Patch the two module-level fetch helpers with call-counting AsyncMocks.
-
-    The cache-aware _FetchContext calls these module names, so patching them and
-    inspecting call_count proves how many real round-trips a context would make.
-    Both stubs accept the optional `client` arg the cache wrapper passes.
-    """
-
-    async def fetch_conns(device_id, client=None):
-        return connections_by_device.get(device_id, [])
-
-    async def fetch_dev(device_id, client=None):
-        return devices_by_id.get(device_id)
-
-    conns_mock = AsyncMock(side_effect=fetch_conns)
-    dev_mock = AsyncMock(side_effect=fetch_dev)
-    return (
-        conns_mock,
-        dev_mock,
-        patch("app.services.nats_consumer._fetch_connections_for_device", conns_mock),
-        patch("app.services.nats_consumer._fetch_device", dev_mock),
-    )
-
-
-@pytest.mark.asyncio
-async def test_shared_far_end_switch_fetched_once_per_event():
-    """A far-end switch shared by multiple reserved devices is fetched exactly
-    once across the whole event, not once per connection touching it."""
-    switch_id = "shared-switch"
-    # Three DUTs all cabled to the same L1 switch on distinct switch ports.
-    connections_by_device = {
-        "dut-1": [
-            {"device_a_id": "dut-1", "port_a": "eth0", "device_b_id": switch_id, "port_b": "p1"}
-        ],
-        "dut-2": [
-            {"device_a_id": "dut-2", "port_a": "eth0", "device_b_id": switch_id, "port_b": "p2"}
-        ],
-        "dut-3": [
-            {"device_a_id": "dut-3", "port_a": "eth0", "device_b_id": switch_id, "port_b": "p3"}
-        ],
-    }
-    devices_by_id = {switch_id: {"id": switch_id, "connection_type": "Layer 1 Switch"}}
-
-    conns_mock, dev_mock, p_conns, p_dev = _counting_fetch_patches(
-        connections_by_device, devices_by_id
-    )
-    with p_conns, p_dev:
-        ctx = _FetchContext(object())  # a non-None sentinel client; never used by the stubs
-        await _resolve_l1_switch_operations(["dut-1", "dut-2", "dut-3"], ctx)
-
-    # The shared switch was classified once, even though 3 connections reference it.
-    switch_fetches = [c for c in dev_mock.call_args_list if c.args[0] == switch_id]
-    assert len(switch_fetches) == 1, f"switch fetched {len(switch_fetches)} times, expected 1"
-    # Each DUT's connection set was fetched exactly once.
-    assert conns_mock.call_count == 3
-
-
-@pytest.mark.asyncio
-async def test_connections_not_refetched_across_l1_and_l2_passes():
-    """reservation.created runs BOTH the L1 and L2 resolvers; with a shared ctx
-    each device's connections are fetched once total, not once per pass."""
-    switch_l1 = "l1-switch"
-    switch_l2 = "l2-switch"
-    connections_by_device = {
-        "dut-1": [
-            {"device_a_id": "dut-1", "port_a": "eth0", "device_b_id": switch_l1, "port_b": "a1"},
-            {"device_a_id": "dut-1", "port_a": "eth1", "device_b_id": switch_l2, "port_b": "b1"},
-        ],
-        "dut-2": [
-            {"device_a_id": "dut-2", "port_a": "eth0", "device_b_id": switch_l1, "port_b": "a2"},
-        ],
-    }
-    devices_by_id = {
-        switch_l1: {"id": switch_l1, "connection_type": "Layer 1 Switch"},
-        switch_l2: {"id": switch_l2, "connection_type": "Layer 2 Switch"},
-    }
-
-    conns_mock, dev_mock, p_conns, p_dev = _counting_fetch_patches(
-        connections_by_device, devices_by_id
-    )
-    device_ids = ["dut-1", "dut-2"]
-    with p_conns, p_dev:
-        ctx = _FetchContext(object())
-        await _resolve_l1_switch_operations(device_ids, ctx)
-        await _resolve_l2_switch_operations(device_ids, ctx)
-
-    # Two reserved devices, two passes: still only one connection fetch per device.
-    assert conns_mock.call_count == 2, (
-        f"connections fetched {conns_mock.call_count} times, expected 2 "
-        "(once per device, shared across L1+L2)"
-    )
-    # Each far-end switch classified once despite being seen in both passes.
-    l1_fetches = [c for c in dev_mock.call_args_list if c.args[0] == switch_l1]
-    l2_fetches = [c for c in dev_mock.call_args_list if c.args[0] == switch_l2]
-    assert len(l1_fetches) == 1
-    assert len(l2_fetches) == 1
-
-
-@pytest.mark.asyncio
-async def test_shared_ctx_produces_same_ops_as_independent_resolution():
-    """The shared-context resolution must yield byte-identical L1/L2 operations
-    to resolving each pass with its own (legacy-style) context. Only call
-    efficiency changes, never the result."""
-    switch_l1 = "l1-switch"
-    switch_l2 = "l2-switch"
-    connections_by_device = {
-        "dut-1": [
-            {"device_a_id": "dut-1", "port_a": "eth0", "device_b_id": switch_l1, "port_b": "a1"},
-            {"device_a_id": "dut-1", "port_a": "eth1", "device_b_id": switch_l2, "port_b": "b1"},
-        ],
-        "dut-2": [
-            {"device_a_id": switch_l1, "port_a": "a2", "device_b_id": "dut-2", "port_b": "eth0"},
-            {"device_a_id": "dut-2", "port_a": "eth1", "device_b_id": switch_l2, "port_b": "b2"},
-        ],
-        "dut-3": [
-            # A connection to a plain management device: produces no switch op.
-            {"device_a_id": "dut-3", "port_a": "eth0", "device_b_id": "mgmt", "port_b": "e0"},
-        ],
-    }
-    devices_by_id = {
-        switch_l1: {"id": switch_l1, "connection_type": "Layer 1 Switch"},
-        switch_l2: {"id": switch_l2, "connection_type": "Layer 2 Switch"},
-        "mgmt": {"id": "mgmt", "connection_type": "Management"},
-    }
-    device_ids = ["dut-1", "dut-2", "dut-3"]
-
-    _, _, p_conns, p_dev = _counting_fetch_patches(connections_by_device, devices_by_id)
-
-    with p_conns, p_dev:
-        # Independent, per-pass contexts (mirrors the pre-#137 per-call behavior).
-        l1_independent = await _resolve_l1_switch_operations(device_ids, _FetchContext(object()))
-        l2_independent = await _resolve_l2_switch_operations(device_ids, _FetchContext(object()))
-
-        # One shared context across both passes (the #137 behavior).
-        shared = _FetchContext(object())
-        l1_shared = await _resolve_l1_switch_operations(device_ids, shared)
-        l2_shared = await _resolve_l2_switch_operations(device_ids, shared)
-
-    assert l1_shared == l1_independent
-    assert l2_shared == l2_independent
-    # Sanity: the topology actually exercises both an L1 pair and an L2 per-port op.
-    assert l1_shared and l1_shared[0]["switch_device_id"] == switch_l1
-    assert {op["switch_device_id"] for op in l2_shared} == {switch_l2}
-
-
-@pytest.mark.asyncio
-async def test_shared_ctx_propagates_transient_upstream_error():
-    """A 5xx (or transport error) surfaced through the shared client still raises
-    TransientUpstreamError so the message NAKs and JetStream retries (issue #137
-    must not weaken the #131/#133 retry semantics)."""
-    # Drive a real _FetchContext with a real (mocked) client whose .get returns 503.
-    with _patch_httpx_get(status_code=503):
-        async with httpx.AsyncClient() as client:
-            ctx = _FetchContext(client)
-            with pytest.raises(TransientUpstreamError):
-                await _resolve_l1_switch_operations(["dut-1"], ctx)
-
-
-@pytest.mark.asyncio
-async def test_shared_ctx_caches_not_found_far_end_once():
-    """A far-end device that 404s (returns None) is cached as a real miss, so a
-    second connection to the same missing id does not re-fetch it."""
-    connections_by_device = {
-        "dut-1": [
-            {"device_a_id": "dut-1", "port_a": "eth0", "device_b_id": "ghost", "port_b": "x"},
-        ],
-        "dut-2": [
-            {"device_a_id": "dut-2", "port_a": "eth0", "device_b_id": "ghost", "port_b": "y"},
-        ],
-    }
-    devices_by_id = {}  # "ghost" is absent: fetch returns None
-
-    conns_mock, dev_mock, p_conns, p_dev = _counting_fetch_patches(
-        connections_by_device, devices_by_id
-    )
-    with p_conns, p_dev:
-        ctx = _FetchContext(object())
-        ops = await _resolve_l1_switch_operations(["dut-1", "dut-2"], ctx)
-
-    assert ops == []
-    ghost_fetches = [c for c in dev_mock.call_args_list if c.args[0] == "ghost"]
-    assert len(ghost_fetches) == 1, "a missing far end must be classified at most once"
-
-
-@pytest.mark.asyncio
-async def test_handle_event_opens_single_client_for_whole_event():
-    """handle_reservation_event opens exactly one httpx.AsyncClient per event and
-    threads it through both resolver passes, replacing the prior per-request
-    client churn (issue #137)."""
-    rid = str(uuid.uuid4())
-    uid = str(uuid.uuid4())
-    event_data = {
-        "event": "reservation.created",
-        "reservation_id": rid,
-        "user_id": uid,
-        "device_ids": ["dut-1"],
-    }
-
-    real_async_client = httpx.AsyncClient
-    created = []
-
-    def _track_client(*args, **kwargs):
-        client = real_async_client(*args, **kwargs)
-        created.append(client)
-        return client
+    device = {"id": "dev-1", "connection_type": "Layer 1 Switch"}
+    fetch_device = AsyncMock(side_effect=[device, None])
+    fetch_config = AsyncMock(return_value={"config": {}})
+    boom = AsyncMock(side_effect=TransientUpstreamError("503"))
 
     with (
-        patch("app.services.nats_consumer.httpx.AsyncClient", side_effect=_track_client),
-        # Keep the execution side-effects out; we only care about client lifecycle.
-        patch(
-            "app.services.nats_consumer._execute_switch_operations",
-            new_callable=AsyncMock,
-        ),
-        patch(
-            "app.services.nats_consumer._execute_l2_switch_operations",
-            new_callable=AsyncMock,
-        ),
+        patch("app.services.nats_consumer._fetch_device", new=fetch_device),
+        patch("app.services.nats_consumer._fetch_latest_config", new=fetch_config),
     ):
-        await handle_reservation_event(event_data, AsyncMock())
+        ctx = _FetchContext(None)
+        assert await ctx.get_device("dev-1") == device
+        assert await ctx.get_device("dev-1") == device  # cached, no second fetch
+        assert await ctx.get_device("dev-2") is None
+        assert await ctx.get_device("dev-2") is None  # not-found is cached too
+        assert fetch_device.await_count == 2
+        await ctx.get_latest_config("dev-1")
+        await ctx.get_latest_config("dev-1")
+        assert fetch_config.await_count == 1
 
-    assert len(created) == 1, f"expected exactly one AsyncClient per event, got {len(created)}"
+    with patch("app.services.nats_consumer._fetch_device", new=boom):
+        ctx = _FetchContext(None)
+        with pytest.raises(TransientUpstreamError):
+            await ctx.get_device("dev-3")
+        # The error was not cached as a value: a retry attempts the fetch again.
+        with pytest.raises(TransientUpstreamError):
+            await ctx.get_device("dev-3")
+        assert boom.await_count == 2
 
 
 # --- dedupe key switch: payload event_id over stream:sequence (issue #21) ---

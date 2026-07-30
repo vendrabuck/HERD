@@ -50,10 +50,11 @@ class L1ConnectionAssignment(Base):
     """The applied L1 cross-connect state for one switch port pair.
 
     This table is the connection-addressable applied state (ADR 0007 Decision 4)
-    that replaces the execution_runs inference at
-    execution_service.action_succeeded_for_reservation: "is this pair's
-    cross-connect live" is answered by an ACTIVE row here, not by scanning
-    execution_runs (which remains the per-action audit log). `port_a`/`port_b`
+    that replaced the execution_runs inference of the retired
+    execution_service.action_succeeded_for_reservation helper (deleted in ADR
+    0009 phase 7): "is this pair's cross-connect live" is answered by an ACTIVE
+    row here, not by scanning execution_runs (which remains the per-action audit
+    log). `port_a`/`port_b`
     are the cross-connected switch port pair, canonicalized (sorted) before
     insert so (a, b) and (b, a) collide on the active-unique index.
     `physical_connection_id` is the inventory connection backing the hop; it is

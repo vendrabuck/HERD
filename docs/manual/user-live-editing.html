@@ -110,7 +110,7 @@
                   <span class="hd-btn secondary sm" style="white-space:nowrap;">Cancel</span>
                   <span class="hd-btn primary sm" style="white-space:nowrap;" data-anno="3" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Commit to reservation</span>
                 </div>
-                <p style="font-size:11.5px;color:var(--gray-600);margin:6px 0 0;">Changes commit to the running reservation and re-provision the affected devices. Edits autosave as drafts; committing saves a fork version and leaves the master topology untouched.</p>
+                <p style="font-size:11.5px;color:var(--gray-600);margin:6px 0 0;">Changes commit to the fork and reconcile the wiring to hardware. Edits autosave as drafts; committing saves a fork version and leaves the master topology untouched.</p>
               </div>
               <div class="hd-node" id="ln1" style="left:130px;top:150px;">
                 <span class="handle r"></span><div class="gl"></div><div class="nm">fw-edge-01</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Palo PA-460</div>
@@ -146,7 +146,7 @@
 
     <h2 class="sec" id="commit">Making it real</h2>
     <p class="sectitle">Committing your wiring</p>
-    <p>Click <b>Commit to reservation</b>. HERD reconciles the fork in one transaction: connections you removed are <strong>released</strong>, connections you added are <strong>built</strong> (release before build), and a new fork version is appended. Committing also updates the reservation's device set, so provisioning re-runs for the affected devices.</p>
+    <p>Click <b>Commit to reservation</b>. HERD reconciles the fork in one transaction: connections you removed are <strong>released</strong>, connections you added are <strong>built</strong> (release before build), and a new fork version is appended. The fork is the source of truth for wiring: committing is exactly what reconciles your L1/L2/L3 wiring to the hardware, not a side effect of the reservation's device set.</p>
     <p>A toast reports the result &mdash; <strong>"Fork saved as vN"</strong> with released, built, and unchanged counts &mdash; and expands to list the exact connections released and built.</p>
 
     <div class="callout calm">

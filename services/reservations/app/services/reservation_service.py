@@ -22,6 +22,7 @@ from sqlalchemy import and_, exists, false, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import AsyncSessionLocal
 from app.models.fork_wiring_ledger import ForkWiringLedger
 from app.models.outbox import OutboxEvent
 from app.models.reservation import (
@@ -200,7 +201,7 @@ async def _create_reservation_fork(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
-) -> None:
+) -> int | None:
     """Create the editable per-reservation fork in cabling at activation (issue #25).
 
     Cabling owns the fork (deep-copies the parent canvas, snapshots its relevant
@@ -212,21 +213,26 @@ async def _create_reservation_fork(
     Authenticated as a service-to-service call via X-Internal-Token: the booking
     user does not necessarily own the parent topology.
 
+    Returns the created fork's version_number (v1 for a fresh fork; the current max
+    for an idempotent re-create), which the caller uses to stage the initial
+    reservation.wiring_changed reconcile (ADR 0009 phase 7). Returns None when no
+    fork was created (no parent topology, or no internal token).
+
     Fail-open: a fork-create failure must NOT strand a successfully-provisioned
     reservation. The caller wraps this in retry_with_backoff and, on exhaustion,
     logs and continues, leaving fork_id null. The reservation is still usable; the
-    editable bench is created lazily on first edit or by a sweeper (a later PR).
+    editable bench is created lazily on first edit or by the sweep heal.
     """
     if topology_id is None:
         # Decision 3 Case A: no parent topology, create the fork lazily on first
         # edit rather than manufacturing an empty fork at activation.
-        return
+        return None
     if not settings.internal_api_token:
         logger.warning(
             "internal_api_token not configured; skipping fork creation for %s",
             reservation_id,
         )
-        return
+        return None
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -242,6 +248,8 @@ async def _create_reservation_fork(
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
+    body = resp.json()
+    return int(body["version_number"])
 
 
 async def _create_reservation_fork_best_effort(
@@ -249,20 +257,47 @@ async def _create_reservation_fork_best_effort(
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
 ) -> None:
-    """Create the fork with bounded retry and log-and-continue.
+    """Create the fork with bounded retry, then stage the initial wiring reconcile.
 
     Fork creation is best-effort at activation (issue #25): it must never raise
     out of create_reservation and strand a provisioned reservation. Exhausted
     retries are logged as structured errors and swallowed, leaving the
     reservation ACTIVE with fork_id null. The reservation is still usable on
-    the bench; the fork is created lazily on first edit or by a future sweeper.
-    This fail-open design ensures provisioning success does not depend on a
-    separate cabling service call.
+    the bench; the fork is created lazily on first edit.
+
+    ADR 0009 phase 7 unifies initial provisioning through the fork: instead of the
+    execution service driving legacy device-set resolvers off reservation.created,
+    activation stages a reservation.wiring_changed for the fork's initial version so
+    the consumer's ordered layered reconcile provisions the initial wiring. The heal
+    (delta-less) form is used: released/built are None, which routes the consumer to a
+    full reconcile against cabling's intended set, and for a fresh fork that intended
+    set IS the initial wiring. A delta form is unnecessary here (there is no prior
+    applied state to diff against) and the heal form is exactly what the sweep already
+    stages, so the two initial-provision paths converge on one code path.
+
+    Failure interplay (pinned by unit test): the wiring_changed is staged ONLY after a
+    successful fork create, so the ordering is create-fork then stage-wiring. If fork
+    creation fails here, no wiring_changed is staged and the fork_wiring_ledger is not
+    advanced. The backstop is the expiration sweep (_backstop_missing_forks): it
+    fork-creates for any ACTIVE topology-carrying reservation cabling has no fork for,
+    through this same helper, so the staging follows; the owner's first GET/edit
+    (_lazy_create_reservation_fork) plus the sweep's wiring heal (_heal_wiring_staging,
+    which sees cabling's latest_fork_version exceed the un-advanced ledger) cover the
+    same gap sooner if the user gets there first. A fork-create failure therefore
+    delays initial provisioning at most one sweep interval, and never drops it.
+
+    The wiring_changed staging is itself best-effort and its own atomic commit (the
+    stage_wiring_changed outbox+ledger invariant, mirroring the fork-save path); a
+    staging failure leaves the ledger un-advanced so the same sweep heal covers it.
+    The staging is ledger-guarded: a version already staged (a racing sweep backstop,
+    or an idempotent re-create of a fork that already has saves) stages nothing, so
+    the consumer never sees a duplicate beyond a true photo-finish race, which its
+    stale-version no-op absorbs.
     """
     if topology_id is None:
         return
     try:
-        await retry_with_backoff(
+        fork_version = await retry_with_backoff(
             lambda: _create_reservation_fork(reservation_id, topology_id, created_by),
             attempts=3,
             initial_delay=0.5,
@@ -277,6 +312,188 @@ async def _create_reservation_fork_best_effort(
                 "action": "reservation_fork_create_failed",
                 "reservation_id": str(reservation_id),
                 "topology_id": str(topology_id),
+            },
+            exc_info=True,
+        )
+        return
+
+    if fork_version is None:
+        return
+
+    # Stage the initial reservation.wiring_changed (delta-less heal) for the fresh
+    # fork so execution provisions the initial wiring off the fork (ADR 0009 phase 7).
+    # Its own atomic outbox+ledger commit; best-effort, the sweep heal is the backstop.
+    # Ledger-guarded: skip when this version (or a later one) was already staged, so
+    # the sweep backstop re-running this helper against an existing fork is a no-op.
+    try:
+        async with AsyncSessionLocal() as db:
+            ledger = await db.get(ForkWiringLedger, reservation_id)
+            if ledger is not None and ledger.last_staged_fork_version >= fork_version:
+                return
+            await stage_wiring_changed(
+                db,
+                reservation_id,
+                fork_version,
+                released=None,
+                built=None,
+            )
+    except Exception:
+        logger.error(
+            "Initial wiring_changed staging failed for reservation %s; sweep heal will cover it",
+            reservation_id,
+            extra={
+                "action": "reservation_initial_wiring_stage_failed",
+                "reservation_id": str(reservation_id),
+            },
+            exc_info=True,
+        )
+
+
+def _prune_canvas_for_devices(
+    canvas: dict, removed_ids: set[str]
+) -> tuple[dict, bool, set[str], set[str]]:
+    """Remove the given devices' nodes (and their incident edges) from a fork canvas.
+
+    Returns (pruned_canvas, edges_pruned, pruned_node_ids, remaining_edge_ids). Node
+    device resolution mirrors cabling's node_to_device_map (node.data.device.id), so
+    a node this helper keeps is exactly a node the save resolver would keep.
+    """
+    nodes = canvas.get("nodes") or []
+    edges = canvas.get("edges") or []
+    pruned_node_ids = {
+        node.get("id")
+        for node in nodes
+        if str(((node.get("data") or {}).get("device") or {}).get("id")) in removed_ids
+    }
+    kept_nodes = [n for n in nodes if n.get("id") not in pruned_node_ids]
+    kept_edges = [
+        e
+        for e in edges
+        if e.get("source") not in pruned_node_ids and e.get("target") not in pruned_node_ids
+    ]
+    pruned = {**canvas, "nodes": kept_nodes, "edges": kept_edges}
+    remaining_edge_ids = {str(e.get("id")) for e in kept_edges if e.get("id") is not None}
+    return pruned, len(kept_edges) != len(edges), pruned_node_ids, remaining_edge_ids
+
+
+async def _prune_removed_devices_from_fork(
+    reservation_id: uuid.UUID,
+    removed_device_ids: list[uuid.UUID],
+    created_by: str,
+) -> None:
+    """Release a removed device's wiring by re-saving its pruned fork (Decision 6).
+
+    The REMOVE half of the ADR 0009 phase 7 device-set semantics: a device removed
+    via the PATCH releases its wiring THROUGH the fork, not through a device-set
+    resolver. This routes the release through the exact save-shaped path a user fork
+    save takes: prune the removed devices' nodes and incident edges from the fork's
+    stored canvas, push the pruned canvas through cabling's save reconcile
+    (set-arithmetic release, fork_version bump, port-claim release), and stage the
+    returned delta via stage_wiring_changed (atomic outbox+ledger), so the release
+    rides the normal full/delta reconcile apply with release-direction retryable rows.
+
+    No-op rules (idempotent under PATCH retries, no spurious version bumps):
+    - no fork (404): nothing to release (PENDING, or Case A before lazy-create);
+    - no incident canvas edges AND no stale fork_connections for the devices: skip
+      the save entirely (a bare node prune is not worth a version);
+    - a stale fork_connection (its edge_key absent from the remaining canvas edges,
+      the loose-draft divergence case) still forces the save so the recorded wire
+      releases; a hop whose edge_key belongs to a REMAINING edge is a through-hop
+      serving another edge and never re-triggers a save.
+
+    A cabling 409 (ARCHIVED fork, or a port conflict a concurrent save created) is
+    logged and dropped: the reservation ended, or a later save/heal converges it.
+    Raises on transport/5xx so the best-effort wrapper's retry loop can see it.
+    """
+    resp = await _cabling_fork_call("GET", f"/internal/forks/{reservation_id}")
+    if resp.status_code == 404:
+        return
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cabling fork GET returned {resp.status_code}: {resp.text}")
+    fork = resp.json()
+
+    removed = {str(d) for d in removed_device_ids}
+    canvas = fork.get("canvas_data") or {}
+    pruned_canvas, edges_pruned, _pruned_nodes, remaining_edge_ids = _prune_canvas_for_devices(
+        canvas, removed
+    )
+
+    stale_wire = any(
+        (str(conn.get("device_a_id")) in removed or str(conn.get("device_b_id")) in removed)
+        and conn.get("edge_key") is not None
+        and str(conn.get("edge_key")) not in remaining_edge_ids
+        for conn in fork.get("connections") or []
+    )
+    if not edges_pruned and not stale_wire:
+        return
+
+    resp = await _cabling_fork_call(
+        "POST",
+        f"/internal/forks/{reservation_id}/save",
+        json_body={"canvas_data": pruned_canvas, "created_by": created_by},
+    )
+    if resp.status_code == 409:
+        logger.warning(
+            "Fork prune save refused (409) for reservation %s; a later save or heal converges",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_prune_refused",
+                "reservation_id": str(reservation_id),
+            },
+        )
+        return
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cabling fork prune save returned {resp.status_code}: {resp.text}")
+    data = resp.json()
+
+    # Stage the released/built delta exactly as the user save handler does; its own
+    # atomic outbox+ledger commit. A staging failure leaves cabling's committed
+    # version ahead of the ledger, so the sweep's delta-less heal fires (the phase 7
+    # backstop sentence for removals holds through this ledger gap).
+    async with AsyncSessionLocal() as db:
+        await stage_wiring_changed(
+            db,
+            reservation_id,
+            int(data["version_number"]),
+            released=data.get("released") or [],
+            built=data.get("built") or [],
+        )
+
+
+async def _prune_removed_devices_from_fork_best_effort(
+    reservation_id: uuid.UUID,
+    removed_device_ids: list[uuid.UUID],
+    created_by: str,
+) -> None:
+    """Prune with bounded retry and log-and-continue (the Decision 6 fail-open posture).
+
+    Mirrors _create_reservation_fork_best_effort: the device-set edit has already
+    committed and must not be unwound by a cabling outage. Exhausted retries are
+    structured-logged and swallowed; recovery is any later fork save (the user's
+    canvas no longer shows the device) or a PATCH retry.
+    """
+    if not removed_device_ids:
+        return
+    if not settings.internal_api_token:
+        return
+    try:
+        await retry_with_backoff(
+            lambda: _prune_removed_devices_from_fork(
+                reservation_id, removed_device_ids, created_by
+            ),
+            attempts=3,
+            initial_delay=0.5,
+            factor=2.0,
+            max_delay=5.0,
+        )
+    except Exception:
+        logger.error(
+            "Fork prune failed for reservation %s; removed-device wiring not yet released",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_prune_failed",
+                "reservation_id": str(reservation_id),
+                "removed_device_ids": [str(d) for d in removed_device_ids],
             },
             exc_info=True,
         )
@@ -1487,6 +1704,17 @@ async def update_reservation(
     )
     await db.commit()
     await db.refresh(reservation)
+
+    # Decision 6 REMOVE half (ADR 0009 phase 7): a device removed from an ACTIVE
+    # reservation releases its wiring through the fork. Prune its nodes/edges from the
+    # fork and push the pruned canvas through the save reconcile, staging the released
+    # delta; best-effort after the committed edit, exactly like fork creation at
+    # activation. PENDING reservations have no fork (the prune 404s to a no-op) and
+    # are skipped outright; the ADD half deliberately wires nothing until a fork save.
+    if removed_ids and reservation.status == ReservationStatus.ACTIVE:
+        await _prune_removed_devices_from_fork_best_effort(
+            reservation.id, removed_ids, created_by=str(user_id)
+        )
 
     logger.info(
         "Reservation updated: %s",

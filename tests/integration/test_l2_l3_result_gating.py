@@ -10,17 +10,18 @@ run_driver_action, and of the L1 conversion (PRs #365/#367) for the connection-
 driven wiring path: after the fix these run at FAILED with the driver's error.
 
 For L3 specifically, a driver-result failure on remove_route must also leave
-the reservation's route pin ACTIVE (the same posture the existing transport-
-failure case already has: see test_execute_l3_deprovision_keeps_pin_when_
-remove_route_result_fails and its new semantic-failure sibling in
-test_nats_consumer_l3.py). There is no REST endpoint for route_assignments
-rows (route_assignments gains FAILED/attempts columns only in ADR 0009 phase
-3, not yet delivered), so this suite proves the pin-kept invariant the same
+the reservation's route pin ACTIVE (pinned directly against the ledger at the
+unit level in test_nats_consumer_l3_reconcile.py and
+test_nats_consumer_ledger_teardown.py). There is no REST endpoint for
+route_assignments rows, so this suite proves the pin-kept invariant the same
 way test_l3_route_provisioning.py proves everything else: through the
 execution_runs the driver actually ran, plus the reservation reaching
 CANCELLED normally (a driver-result failure ACKs, it never NAKs the message).
-The ACTIVE-pin assertion itself is covered directly against the ledger at the
-unit level in test_nats_consumer_l3.py.
+
+As of ADR 0009 phase 7 initial provisioning is fork-driven: each test books a
+WIRED parent topology (a committed DUT-to-switch canvas edge), so activation
+stages the reservation.wiring_changed reconcile that drives the knobbed
+L2/L3 driver calls; no fork save is needed.
 
 Self-seeds its own drivers/templates (session fixtures), per the integration-
 test seeding convention.
@@ -196,12 +197,42 @@ async def _create_config_version(client, device_id: str, routes: list[dict]) -> 
     return resp.json()
 
 
-async def _create_reservation(client, device_id: str) -> dict:
+def _canvas_edge(a_id: str, b_id: str) -> dict:
+    """A committed one-edge canvas wiring device a to device b (React Flow shape)."""
+    return {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": a_id}}},
+            {"id": "nB", "data": {"device": {"id": b_id}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "nA",
+                "target": "nB",
+                "data": {"layer": "L1", "isProposal": False},
+            }
+        ],
+    }
+
+
+async def _create_topology(client, canvas: dict) -> str:
+    resp = await client.post(
+        "/cabling/topologies", json={"name": f"int-393-{uuid.uuid4().hex[:8]}"}
+    )
+    resp.raise_for_status()
+    topology_id = resp.json()["id"]
+    put = await client.put(f"/cabling/topologies/{topology_id}", json={"canvas_data": canvas})
+    put.raise_for_status()
+    return topology_id
+
+
+async def _create_reservation(client, device_id: str, topology_id: str) -> dict:
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
             "device_ids": [device_id],
+            "topology_id": topology_id,
             "purpose": "L2/L3 result gating integration test (#393)",
             "start_time": now.isoformat(),
             "end_time": (now + timedelta(hours=1)).isoformat(),
@@ -256,33 +287,38 @@ async def test_l2_add_to_vlan_result_failure_records_failed(
 ):
     """add_to_vlan returning {"success": False, ...} (transport ok, driver-
     reported failure) lands the run at FAILED with the driver's error, not
-    SUCCESS. create_vlan (not knobbed) still succeeds, proving the gate is
-    per-action, not switch-wide."""
+    SUCCESS. login (not knobbed) still succeeds on the same switch, proving the
+    gate is per-action, not switch-wide. (create_vlan is no longer part of the
+    flow: the fork-driven L2 reconcile is membership-only, ADR 0009 phases 4/7.)"""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(
         admin_client, gating_l2_template["id"], f"mock-l2-393-sw-{suffix}", "add_to_vlan"
     )
     reservation = None
     connection = None
+    topology_id = None
     try:
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "eth1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
-
-        success_create = await _poll_runs(
-            admin_client, reservation["id"], "create_vlan", status="SUCCESS"
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        assert success_create, "create_vlan (not knobbed) must still succeed"
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         failed_add = await _poll_runs(
             admin_client, reservation["id"], "add_to_vlan", status="FAILED"
         )
         assert failed_add, "add_to_vlan driver-result failure must record a FAILED run"
         assert failed_add[0]["error"] == "mock injected failure on add_to_vlan"
+
+        success_login = await _poll_runs(admin_client, reservation["id"], "login", status="SUCCESS")
+        assert success_login, "login (not knobbed) must still succeed: the gate is per-action"
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -302,13 +338,17 @@ async def test_l3_configure_route_result_failure_records_failed(
     )
     reservation = None
     connection = None
+    topology_id = None
     routes = [{"destination": "10.90.0.0/24", "next_hop": "192.168.90.1", "interface": "eth0"}]
     try:
         await _create_config_version(admin_client, switch["id"], routes)
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         failed_runs = await _poll_runs(
             admin_client, reservation["id"], "configure_route", status="FAILED"
@@ -318,6 +358,8 @@ async def test_l3_configure_route_result_failure_records_failed(
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -334,9 +376,9 @@ async def test_l3_remove_route_result_failure_keeps_pin_and_acks(
     failures-ACK posture) the reservation still reaches CANCELLED rather than
     getting stuck retrying the whole message. The route pin itself staying
     ACTIVE is pinned directly against the ledger at the unit level (see
-    test_execute_l3_deprovision_keeps_pin_when_remove_route_semantic_result_fails
-    in test_nats_consumer_l3.py); there is no REST surface for route_assignments
-    yet to reassert it live."""
+    test_nats_consumer_ledger_teardown.py's
+    test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released); there
+    is no REST surface for route_assignments to reassert it live."""
     suffix = uuid.uuid4().hex[:8]
     # Only remove_route is knobbed: configure_route must succeed so there is a
     # pin to attempt removing.
@@ -344,13 +386,17 @@ async def test_l3_remove_route_result_failure_keeps_pin_and_acks(
         admin_client, gating_l3_template["id"], f"mock-l3-393-sw-{suffix}", "remove_route"
     )
     connection = None
+    topology_id = None
     routes = [{"destination": "10.91.0.0/24", "next_hop": "192.168.91.1", "interface": "eth0"}]
     try:
         await _create_config_version(admin_client, switch["id"], routes)
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         assert await _poll_runs(
             admin_client, reservation["id"], "configure_route", status="SUCCESS"
@@ -372,6 +418,8 @@ async def test_l3_remove_route_result_failure_keeps_pin_and_acks(
             "reservation must still reach CANCELLED after a driver-result failure"
         )
     finally:
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

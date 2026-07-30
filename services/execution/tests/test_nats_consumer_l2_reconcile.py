@@ -302,3 +302,97 @@ async def test_reconcile_present_key_falsy_result_is_failure():
     async with TestSessionLocal() as s:
         rows = (await s.execute(select(L2PortAssignment))).scalars().all()
     assert [r.status for r in rows] == ["FAILED"]
+
+
+async def test_reconcile_bare_data_output_stays_success():
+    """A driver returning bare data (no success key in the output) is a success: the
+    absent-key rule of driver_result_failed, the L2 twin of the L3 pin (issue #393)."""
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "add_to_vlan":
+            # Bare-data output: no "success" key at all. Must stay a success.
+            return {"success": True, "output": {"vlan": 123}, "error": None, "duration_ms": 1}
+        return SUCCESS_RESULT
+
+    await _reconcile([_wire(DUT1, "eth0", SW_L2, "0/0/1")], execute_fn=execute_fn, calls=[])
+    assert (SW_L2, "0/0/1") in await _active_memberships()
+
+
+# --- allocation grouping by fabric (re-expressed from the retired legacy pins
+# --- test_assign_vlans_groups_switches_by_fabric and
+# --- test_assign_vlans_uses_fallback_when_fabric_lookup_fails) ---
+
+
+async def _reconcile_with_fabric(fork_wires, fabric_fetch):
+    from contextlib import ExitStack
+
+    execute_fn, calls = _l2_recorder()
+    patches = _patches(execute_fn, fork_wires)[:-1] + [
+        patch("app.services.vlan_service.fetch_fabric_id", new=AsyncMock(side_effect=fabric_fetch))
+    ]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await handle_wiring_changed(
+            {"reservation_id": RES_ID, "fork_version": 1},
+            _db_session_factory(),
+        )
+    return calls
+
+
+async def test_allocation_groups_switches_by_fabric():
+    """Two L2 switches in DIFFERENT fabrics get one allocation each; memberships key on
+    their own fabric's allocation."""
+    fabric_a, fabric_b = uuid.uuid4(), uuid.uuid4()
+    fabric_of = {SW_L2: fabric_a, SW_L2_B: fabric_b}
+
+    async def fabric_fetch(switch_id):
+        return fabric_of[str(switch_id)]
+
+    await _reconcile_with_fabric(
+        [_wire(DUT1, "eth0", SW_L2, "0/0/1"), _wire(DUT2, "eth0", SW_L2_B, "0/0/2")],
+        fabric_fetch,
+    )
+
+    async with TestSessionLocal() as s:
+        allocations = (await s.execute(select(VlanAssignment))).scalars().all()
+    assert {a.fabric_id for a in allocations} == {fabric_a, fabric_b}
+    memberships = await _active_memberships()
+    alloc_by_fabric = {a.fabric_id: a.id for a in allocations}
+    assert memberships[(SW_L2, "0/0/1")] == alloc_by_fabric[fabric_a]
+    assert memberships[(SW_L2_B, "0/0/2")] == alloc_by_fabric[fabric_b]
+
+
+async def test_allocation_shares_one_vlan_within_a_fabric():
+    """Two L2 switches in the SAME fabric share one allocation (one VLAN number)."""
+
+    async def fabric_fetch(switch_id):
+        return FABRIC
+
+    await _reconcile_with_fabric(
+        [_wire(DUT1, "eth0", SW_L2, "0/0/1"), _wire(DUT2, "eth0", SW_L2_B, "0/0/2")],
+        fabric_fetch,
+    )
+
+    async with TestSessionLocal() as s:
+        allocations = (await s.execute(select(VlanAssignment))).scalars().all()
+    assert len(allocations) == 1
+    memberships = await _active_memberships()
+    assert set(memberships.values()) == {allocations[0].id}
+
+
+async def test_allocation_falls_back_when_fabric_lookup_fails():
+    """A switch whose fabric cannot be determined still allocates, under a deterministic
+    per-switch fallback fabric id (uuid5 of the switch id), so provisioning never blocks
+    on the fabric endpoint."""
+
+    async def fabric_fetch(switch_id):
+        return None
+
+    await _reconcile_with_fabric([_wire(DUT1, "eth0", SW_L2, "0/0/1")], fabric_fetch)
+
+    async with TestSessionLocal() as s:
+        allocations = (await s.execute(select(VlanAssignment))).scalars().all()
+    assert len(allocations) == 1
+    assert allocations[0].fabric_id == uuid.uuid5(uuid.NAMESPACE_DNS, SW_L2)
+    assert (SW_L2, "0/0/1") in await _active_memberships()

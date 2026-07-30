@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base
+from app.models.execution_run import ExecutionRun
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services.nats_consumer import (
@@ -362,7 +363,7 @@ async def test_heal_at_last_applied_plus_one_takes_full_reconcile():
     path would connect nothing."""
     await _seed_state(last_applied=0)
     execute_fn, calls = _sandbox_recorder()
-    # released/built absent (None) => heal marker; version 1 == last_applied + 1.
+    # released/built absent (None) is the heal marker; version 1 == last_applied + 1.
     await _run(_event(1, released=None, built=None), execute_fn, fork_wires=PAIR_12)
 
     active = await _assignments("ACTIVE")
@@ -635,7 +636,114 @@ async def test_release_direction_driver_failure_lands_failed_row_intended_releas
     assert await _last_applied() == 1
 
 
+@pytest.mark.asyncio
+async def test_login_failure_parks_pairs_failed_and_skips_port_ops():
+    """A per-switch login failure parks every pair on that switch FAILED, tagged with
+    its direction, without any port op or a NAK (Decision 7). Re-expresses the legacy
+    device-set pin (test_handle_event_login_failure_skips_ports, retired with the
+    resolvers in ADR 0009 phase 7) against the fork-driven apply."""
+    await _seed_state(last_applied=0)
+    await _seed_active("0/0/3", "0/0/4")
+    execute_fn, calls = _sandbox_recorder(fail_actions={"login"})
+    release = [
+        _wire(DUT1, "eth0", SWITCH_ID, "0/0/3", str(uuid.uuid4())),
+        _wire(SWITCH_ID, "0/0/4", DUT2, "eth0", str(uuid.uuid4())),
+    ]
+
+    await _run(_event(1, released=release, built=PAIR_12), execute_fn)
+
+    # No port op fired; only the login attempt reached the driver.
+    assert [c for c in calls if c[0] in ("connect_ports", "disconnect_ports")] == []
+    failed = await _assignments("FAILED")
+    assert {(r.port_a, r.port_b, r.intended) for r in failed} == {
+        ("0/0/1", "0/0/2", "ACTIVE"),
+        ("0/0/3", "0/0/4", "RELEASED"),
+    }
+    assert all("driver login failed" in r.last_error for r in failed)
+    # A per-switch driver failure never blocks the ordering marker.
+    assert await _last_applied() == 1
+
+
+@pytest.mark.asyncio
+async def test_logout_failure_does_not_fail_the_pass():
+    """A logout failure after successful port ops neither fails the applied pairs nor
+    blocks the version stamp (re-expresses the legacy test_handle_event_logout_failure
+    pin on the fork-driven apply): the connect landed, the row is ACTIVE, and the
+    FAILED logout run is only audit metadata."""
+    await _seed_state(last_applied=0)
+    execute_fn, calls = _sandbox_recorder(fail_actions={"logout"})
+
+    await _run(_event(1, released=[], built=PAIR_12), execute_fn)
+
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    assert len(await _assignments("ACTIVE")) == 1
+    assert await _last_applied() == 1
+
+
+@pytest.mark.asyncio
+async def test_port_action_runs_carry_timestamps():
+    """Every port-action execution run records started_at and completed_at, with
+    started_at captured no later than completion (the audit-duration contract the
+    legacy started_at pins covered)."""
+    await _seed_state(last_applied=0)
+    execute_fn, _calls = _sandbox_recorder()
+
+    await _run(_event(1, released=[], built=PAIR_12), execute_fn)
+
+    async with TestSessionLocal() as s:
+        runs = list((await s.execute(select(ExecutionRun))).scalars().all())
+    port_runs = [r for r in runs if r.action == "connect_ports"]
+    assert port_runs
+    for run in port_runs:
+        assert run.started_at is not None
+        assert run.completed_at is not None
+        assert run.started_at <= run.completed_at
+
+
 # --- Verbatim-hop / unresolvable (Decision 5) -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_driver_load_raise_parks_pairs_failed_without_nak():
+    """A load_driver RAISE (broken package, cache miss gone wrong) parks every pair on
+    the switch FAILED with the pinned unresolvable driver-load reason, fires no driver
+    call, never NAKs, and still stamps the version. Re-expresses the retired legacy
+    test_handle_event_driver_load_failure pin on the fork-driven apply."""
+    await _seed_state(last_applied=0)
+    execute_fn, calls = _sandbox_recorder()
+    device_fetch = _device_lookup()
+
+    ps = [
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch(
+            "app.services.driver_loader.load_driver",
+            new=AsyncMock(side_effect=RuntimeError("cache download failed")),
+        ),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=[]),
+        ),
+    ]
+    for p in ps:
+        p.start()
+    try:
+        # Should not raise (a load failure is a per-switch failure, not an upstream NAK).
+        await handle_reservation_event(_event(1, released=[], built=PAIR_12), _db_session_factory())
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert calls == [], "no driver call may fire when the driver cannot be loaded"
+    failed = await _assignments("FAILED")
+    assert len(failed) == 1
+    assert failed[0].intended == "ACTIVE"
+    assert WIRING_UNRESOLVABLE_REASON in failed[0].last_error
+    assert "driver load failed" in failed[0].last_error
+    assert await _last_applied() == 1
 
 
 @pytest.mark.asyncio

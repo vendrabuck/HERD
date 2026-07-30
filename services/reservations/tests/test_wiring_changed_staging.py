@@ -19,7 +19,7 @@ the app engine, so this suite shares that engine (mirrors test_fork_archive_reco
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -31,7 +31,12 @@ from app.models.outbox import OutboxEvent
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import bearer_scheme
 from app.services import reservation_service
-from app.services.reservation_service import WIRING_CHANGED_SUBJECT, stage_wiring_changed
+from app.services.reservation_service import (
+    WIRING_CHANGED_SUBJECT,
+    _create_reservation_fork_best_effort,
+    _prune_removed_devices_from_fork,
+    stage_wiring_changed,
+)
 from app.tasks.expiration import _run_fork_archive_reconcile
 from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
@@ -53,11 +58,17 @@ async def setup_db():
         await conn.run_sync(Base.metadata.drop_all)
 
 
-async def _insert(status: ReservationStatus, *, user_id: uuid.UUID = USER_ID) -> uuid.UUID:
+async def _insert(
+    status: ReservationStatus,
+    *,
+    user_id: uuid.UUID = USER_ID,
+    topology_id: uuid.UUID | None = None,
+) -> uuid.UUID:
     res = Reservation(
         user_id=user_id,
         owner_name="owner",
         device_ids=[str(uuid.uuid4())],
+        topology_id=topology_id,
         topology_type=TopologyType.PHYSICAL,
         purpose="t",
         start_time=NOW - timedelta(hours=1),
@@ -288,6 +299,190 @@ async def test_heal_isolated_from_cabling_fetch_failure():
     assert await _ledger(rid) is None
 
 
+# --- Initial-provision unification: activation stages the initial wiring (phase 7) ----
+
+
+@pytest.mark.asyncio
+async def test_activation_stages_initial_wiring_heal_after_fork_create():
+    """After a successful fork create, activation stages a delta-less wiring_changed.
+
+    ADR 0009 phase 7: initial provisioning unifies through the fork. The staged event
+    for the fork's initial version (v1) carries released/built as null (the heal form),
+    so the execution consumer full-reconciles against cabling's intended set, which for
+    a fresh fork IS the initial wiring. The outbox row and the ledger advance together
+    (the stage_wiring_changed atomicity invariant).
+    """
+    rid = uuid.uuid4()
+    topology_id = uuid.uuid4()
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(return_value=1),
+    ):
+        await _create_reservation_fork_best_effort(rid, topology_id, created_by=str(USER_ID))
+
+    rows = await _wiring_rows()
+    assert len(rows) == 1
+    payload = rows[0].payload
+    assert payload["reservation_id"] == str(rid)
+    assert payload["fork_version"] == 1
+    assert payload["released"] is None
+    assert payload["built"] is None
+    # Atomic with the outbox row: the ledger advanced to the staged version.
+    assert (await _ledger(rid)).last_staged_fork_version == 1
+
+
+@pytest.mark.asyncio
+async def test_activation_stages_nothing_when_fork_create_fails():
+    """A fork-create failure stages no wiring_changed and does not advance the ledger.
+
+    The failure is swallowed (best-effort activation) and the sweep wiring-heal is the
+    documented backstop: once the fork is lazily created, the heal stages the wiring.
+    Here we pin only that activation itself leaves nothing staged.
+    """
+    rid = uuid.uuid4()
+    topology_id = uuid.uuid4()
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(side_effect=RuntimeError("cabling down")),
+    ):
+        await _create_reservation_fork_best_effort(rid, topology_id, created_by=str(USER_ID))
+
+    assert await _wiring_rows() == []
+    assert await _ledger(rid) is None
+
+
+@pytest.mark.asyncio
+async def test_activation_stages_nothing_when_no_topology():
+    """No parent topology means no fork and no initial wiring at activation (Case A)."""
+    rid = uuid.uuid4()
+    await _create_reservation_fork_best_effort(rid, None, created_by=str(USER_ID))
+    assert await _wiring_rows() == []
+    assert await _ledger(rid) is None
+
+
+@pytest.mark.asyncio
+async def test_activation_staging_is_ledger_guarded():
+    """A version already staged is not staged again by the activation helper.
+
+    The idempotent fork re-create case (and the photo-finish with the sweep backstop):
+    cabling returns the fork's current version, but the ledger already carries it, so
+    the helper stages nothing and the outbox gains no duplicate row.
+    """
+    rid = uuid.uuid4()
+    topology_id = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        await stage_wiring_changed(db, rid, 1, released=None, built=None)
+    assert len(await _wiring_rows()) == 1
+
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(return_value=1),
+    ):
+        await _create_reservation_fork_best_effort(rid, topology_id, created_by=str(USER_ID))
+
+    assert len(await _wiring_rows()) == 1
+    assert (await _ledger(rid)).last_staged_fork_version == 1
+
+
+# --- Missing-fork sweep backstop (phase 7) -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_creates_missing_fork_and_stages_initial_wiring():
+    """An ACTIVE topology-carrying reservation with no cabling fork is backstopped.
+
+    The fork-creation-failure case: activation's fork POST failed, so cabling lists no
+    fork for the reservation. The sweep creates the fork through the same idempotent
+    helper activation uses, and the initial delta-less wiring_changed is staged with
+    the ledger advanced (ADR 0009 phase 7).
+    """
+    topology_id = uuid.uuid4()
+    rid = await _insert(ReservationStatus.ACTIVE, topology_id=topology_id)
+    create = AsyncMock(return_value=1)
+    with (
+        _forks(),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+        patch("app.services.reservation_service._create_reservation_fork", new=create),
+    ):
+        await _run_fork_archive_reconcile()
+
+    create.assert_awaited_once_with(rid, topology_id, str(USER_ID))
+    rows = await _wiring_rows()
+    assert len(rows) == 1
+    payload = rows[0].payload
+    assert payload["reservation_id"] == str(rid)
+    assert payload["fork_version"] == 1
+    assert payload["released"] is None
+    assert payload["built"] is None
+    assert (await _ledger(rid)).last_staged_fork_version == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_backstop_skips_reservation_with_existing_fork():
+    """A reservation cabling already holds a fork for is not re-created."""
+    topology_id = uuid.uuid4()
+    rid = await _insert(ReservationStatus.ACTIVE, topology_id=topology_id)
+    async with TestSessionLocal() as db:
+        db.add(ForkWiringLedger(reservation_id=rid, last_staged_fork_version=1))
+        await db.commit()
+    create = AsyncMock(return_value=1)
+    with (
+        _forks((rid, 1)),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+        patch("app.services.reservation_service._create_reservation_fork", new=create),
+    ):
+        await _run_fork_archive_reconcile()
+
+    create.assert_not_awaited()
+    assert await _wiring_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_backstop_skips_topologyless_and_non_active():
+    """Case A (no parent topology) and non-ACTIVE reservations are never backstopped."""
+    await _insert(ReservationStatus.ACTIVE, topology_id=None)
+    await _insert(ReservationStatus.PENDING, topology_id=uuid.uuid4())
+    await _insert(ReservationStatus.COMPLETED, topology_id=uuid.uuid4())
+    create = AsyncMock(return_value=1)
+    with (
+        _forks(),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+        patch("app.services.reservation_service._create_reservation_fork", new=create),
+    ):
+        await _run_fork_archive_reconcile()
+
+    create.assert_not_awaited()
+    assert await _wiring_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_backstop_one_failure_does_not_block_the_rest():
+    """A fork-create failure for one reservation leaves the other backstopped."""
+    topo_a, topo_b = uuid.uuid4(), uuid.uuid4()
+    rid_a = await _insert(ReservationStatus.ACTIVE, topology_id=topo_a)
+    rid_b = await _insert(ReservationStatus.ACTIVE, topology_id=topo_b)
+
+    async def _create(reservation_id, topology_id, created_by=None):
+        if reservation_id == rid_a:
+            raise RuntimeError("cabling down for a")
+        return 1
+
+    with (
+        _forks(),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+        patch(
+            "app.services.reservation_service._create_reservation_fork",
+            new=AsyncMock(side_effect=_create),
+        ),
+    ):
+        await _run_fork_archive_reconcile()
+
+    rows = await _wiring_rows()
+    assert [r.payload["reservation_id"] for r in rows] == [str(rid_b)]
+    assert await _ledger(rid_a) is None
+    assert (await _ledger(rid_b)).last_staged_fork_version == 1
+
+
 # --- Save handler: stages on success, nothing on the ARCHIVED 409 -------------------
 
 
@@ -380,3 +575,202 @@ async def test_save_handler_archived_409_stages_nothing():
     assert await _ledger(rid) is None
 
     app.dependency_overrides.clear()
+
+
+# --- Decision 6 REMOVE half: PATCH-remove prunes the fork and stages the delta ------
+
+
+def _fork_resp(status_code, body=None, text=""):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = text
+    resp.json.return_value = body or {}
+    return resp
+
+
+def _fork_body(canvas, connections):
+    return {
+        "id": str(uuid.uuid4()),
+        "reservation_id": str(uuid.uuid4()),
+        "status": "ACTIVE",
+        "canvas_data": canvas,
+        "connections": connections,
+        "versions": [],
+    }
+
+
+def _two_node_canvas(dut_id, other_id):
+    return {
+        "nodes": [
+            {"id": "nD", "data": {"device": {"id": dut_id}}},
+            {"id": "nO", "data": {"device": {"id": other_id}}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "nD", "target": "nO", "data": {"layer": "L1"}},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_patch_remove_prunes_fork_and_stages_released_delta():
+    """PATCH-remove pushes the pruned canvas through the save path EXACTLY once and
+    stages the returned released delta atomically with the ledger (Decision 6)."""
+    rid = uuid.uuid4()
+    dut_id, other_id = str(uuid.uuid4()), str(uuid.uuid4())
+    released = [_wire()]
+    save_body = {"version_number": 2, "released": released, "built": []}
+    calls = []
+
+    async def fork_call(method, path, json_body=None):
+        calls.append((method, path, json_body))
+        if method == "GET":
+            return _fork_resp(200, _fork_body(_two_node_canvas(dut_id, other_id), []))
+        return _fork_resp(200, save_body)
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(side_effect=fork_call),
+    ):
+        await _prune_removed_devices_from_fork(rid, [uuid.UUID(dut_id)], "system")
+
+    saves = [c for c in calls if c[0] == "POST"]
+    assert len(saves) == 1, "the pruned save must be pushed exactly once"
+    saved_canvas = saves[0][2]["canvas_data"]
+    assert [n["id"] for n in saved_canvas["nodes"]] == ["nO"]
+    assert saved_canvas["edges"] == []
+
+    rows = await _wiring_rows()
+    assert len(rows) == 1
+    payload = rows[0].payload
+    assert payload["reservation_id"] == str(rid)
+    assert payload["fork_version"] == 2
+    assert payload["released"] == released
+    assert payload["built"] == []
+    assert (await _ledger(rid)).last_staged_fork_version == 2
+
+
+@pytest.mark.asyncio
+async def test_patch_remove_noop_when_device_has_no_fork_edges():
+    """A removed device with a bare node (no incident edges, no recorded wires) prunes
+    nothing: no save, no version bump, no staging."""
+    rid = uuid.uuid4()
+    dut_id = str(uuid.uuid4())
+    canvas = {
+        "nodes": [{"id": "nD", "data": {"device": {"id": dut_id}}}],
+        "edges": [],
+    }
+    calls = []
+
+    async def fork_call(method, path, json_body=None):
+        calls.append(method)
+        return _fork_resp(200, _fork_body(canvas, []))
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(side_effect=fork_call),
+    ):
+        await _prune_removed_devices_from_fork(rid, [uuid.UUID(dut_id)], "system")
+
+    assert calls == ["GET"], "no save may be pushed for an edgeless device"
+    assert await _wiring_rows() == []
+    assert await _ledger(rid) is None
+
+
+@pytest.mark.asyncio
+async def test_patch_remove_noop_on_missing_fork():
+    """No fork (404: PENDING, or Case A before lazy-create) is a clean no-op."""
+    rid = uuid.uuid4()
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(return_value=_fork_resp(404)),
+    ):
+        await _prune_removed_devices_from_fork(rid, [uuid.uuid4()], "system")
+
+    assert await _wiring_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_patch_remove_stale_recorded_wire_still_saves():
+    """A recorded fork wire for the removed device whose edge_key is NOT among the
+    remaining canvas edges (the loose-draft divergence case) still forces the save,
+    so the stale wire releases even though the canvas had nothing left to prune."""
+    rid = uuid.uuid4()
+    dut_id = str(uuid.uuid4())
+    canvas = {"nodes": [], "edges": []}
+    connections = [
+        {
+            "device_a_id": dut_id,
+            "port_a": "eth0",
+            "device_b_id": str(uuid.uuid4()),
+            "port_b": "p1",
+            "layer": "L1",
+            "edge_key": "e-gone",
+        }
+    ]
+    save_body = {"version_number": 3, "released": [_wire()], "built": []}
+    calls = []
+
+    async def fork_call(method, path, json_body=None):
+        calls.append(method)
+        if method == "GET":
+            return _fork_resp(200, _fork_body(canvas, connections))
+        return _fork_resp(200, save_body)
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(side_effect=fork_call),
+    ):
+        await _prune_removed_devices_from_fork(rid, [uuid.UUID(dut_id)], "system")
+
+    assert calls == ["GET", "POST"]
+    assert (await _ledger(rid)).last_staged_fork_version == 3
+
+
+@pytest.mark.asyncio
+async def test_patch_remove_through_hop_does_not_resave():
+    """A recorded wire touching the removed device whose edge_key belongs to a
+    REMAINING canvas edge is a through-hop serving another edge: it must not
+    re-trigger a save (the PATCH-retry idempotency guarantee)."""
+    rid = uuid.uuid4()
+    switch_id = str(uuid.uuid4())
+    a_id, b_id = str(uuid.uuid4()), str(uuid.uuid4())
+    canvas = {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": a_id}}},
+            {"id": "nB", "data": {"device": {"id": b_id}}},
+        ],
+        "edges": [{"id": "e1", "source": "nA", "target": "nB", "data": {"layer": "L1"}}],
+    }
+    connections = [
+        {
+            "device_a_id": a_id,
+            "port_a": "eth0",
+            "device_b_id": switch_id,
+            "port_b": "p1",
+            "layer": "L1",
+            "edge_key": "e1",
+        },
+        {
+            "device_a_id": switch_id,
+            "port_a": "p2",
+            "device_b_id": b_id,
+            "port_b": "eth0",
+            "layer": "L1",
+            "edge_key": "e1",
+        },
+    ]
+    calls = []
+
+    async def fork_call(method, path, json_body=None):
+        calls.append(method)
+        return _fork_resp(200, _fork_body(canvas, connections))
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(side_effect=fork_call),
+    ):
+        await _prune_removed_devices_from_fork(rid, [uuid.UUID(switch_id)], "system")
+
+    assert calls == ["GET"], "a through-hop for a remaining edge must not force a save"
+    assert await _wiring_rows() == []
