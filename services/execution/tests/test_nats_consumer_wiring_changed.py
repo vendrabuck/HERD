@@ -704,6 +704,49 @@ async def test_port_action_runs_carry_timestamps():
 
 
 @pytest.mark.asyncio
+async def test_driver_load_raise_parks_pairs_failed_without_nak():
+    """A load_driver RAISE (broken package, cache miss gone wrong) parks every pair on
+    the switch FAILED with the pinned unresolvable driver-load reason, fires no driver
+    call, never NAKs, and still stamps the version. Re-expresses the retired legacy
+    test_handle_event_driver_load_failure pin on the fork-driven apply."""
+    await _seed_state(last_applied=0)
+    execute_fn, calls = _sandbox_recorder()
+    device_fetch = _device_lookup()
+
+    ps = [
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch(
+            "app.services.driver_loader.load_driver",
+            new=AsyncMock(side_effect=RuntimeError("cache download failed")),
+        ),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=[]),
+        ),
+    ]
+    for p in ps:
+        p.start()
+    try:
+        # Should not raise (a load failure is a per-switch failure, not an upstream NAK).
+        await handle_reservation_event(_event(1, released=[], built=PAIR_12), _db_session_factory())
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert calls == [], "no driver call may fire when the driver cannot be loaded"
+    failed = await _assignments("FAILED")
+    assert len(failed) == 1
+    assert failed[0].intended == "ACTIVE"
+    assert WIRING_UNRESOLVABLE_REASON in failed[0].last_error
+    assert "driver load failed" in failed[0].last_error
+    assert await _last_applied() == 1
+
+
+@pytest.mark.asyncio
 async def test_unresolvable_hop_lands_failed_with_pinned_reason():
     """A built hop whose switch endpoint is gone (404) is a FAILED row, never re-routed."""
     await _seed_state(last_applied=0)

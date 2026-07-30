@@ -3,19 +3,26 @@
 As of ADR 0009 phase 7 all wiring, initial provisioning included, is fork-driven: a
 reservation books a WIRED parent topology, activation stages a reservation.wiring_changed
 for the fork's initial version, and the execution consumer's layered reconcile derives L2
-membership from the fork's recorded hops and drives create_vlan / add_to_vlan on the
-switch. No fork save is needed; activation provisions the initial wiring directly. These
-tests upload the checked-in mock L2 driver (drivers/mock_l2), wire a DUT to a Layer 2
-Switch device on both the physical connection graph and the topology canvas, reserve the
-DUT with that topology, and assert the resulting create_vlan / add_to_vlan / remove_from_vlan
-operations on the switch via GET /execution/runs.
+membership from the fork's recorded hops and drives add_to_vlan on the switch. No fork
+save is needed; activation provisions the initial wiring directly. These tests upload the
+checked-in mock L2 driver (drivers/mock_l2), wire a DUT to a Layer 2 Switch device on
+both the physical connection graph and the topology canvas, reserve the DUT with that
+topology, and assert the resulting add_to_vlan / remove_from_vlan operations on the
+switch via GET /execution/runs.
+
+Note the membership-only vocabulary: the fork-driven L2 path (phase 4) drives per-port
+add_to_vlan/remove_from_vlan and never create_vlan/delete_vlan; the VLAN number is a
+per-fabric DATABASE allocation (find_or_assign_vlan), and the VLAN-definition lifecycle
+on the switch is the issue #442 boundary. create_vlan was only ever driven by the legacy
+device-set path, retired in phase 7.
 
 There is no REST endpoint for VlanAssignment rows, so we assert the observable
-downstream effect instead: the driver actually ran the VLAN ops with an
+downstream effect instead: the driver actually ran the membership ops with an
 HERD-assigned vlan_id. The run only exists after find_or_assign_vlan created the
-ACTIVE allocation, so a SUCCESS create_vlan run is end-to-end proof the
-allocation was made; a SUCCESS remove_from_vlan run on cancel is proof the membership
-was released (the phase-6 ledger teardown frees the allocation in-DB, no delete_vlan).
+ACTIVE allocation, so a SUCCESS add_to_vlan run carrying the assigned vlan_id is
+end-to-end proof the allocation was made; a SUCCESS remove_from_vlan run on cancel is
+proof the membership was released (the phase-6 ledger teardown frees the allocation
+in-DB, no delete_vlan).
 
 The suite self-seeds the mock L2 driver via a session fixture, so it no longer
 depends on the HERD_VLAN_TEST_DRIVER_ID env gate.
@@ -186,7 +193,7 @@ async def _poll_active(client, reservation_id: str, *, timeout: float = 20.0) ->
 
 
 def _vlan_of(run: dict) -> int:
-    """Read the HERD-assigned vlan_id from a create_vlan / add_to_vlan run.
+    """Read the HERD-assigned vlan_id from an add_to_vlan / remove_from_vlan run.
 
     create_execution_run nests the driver method kwargs under
     input_params["method_kwargs"] for queryability (execution_service.py:44-47).
@@ -231,10 +238,10 @@ async def _runs_by_action(client, reservation_id: str, action: str) -> list[dict
 async def test_vlan_assigned_on_reservation_create_with_l2_switch(
     admin_client, l2_template, fresh_device
 ):
-    """Reserving a DUT wired to an L2 switch in the topology drives create_vlan +
-    add_to_vlan on the switch with an HERD-assigned vlan_id at activation (ADR 0009
-    phase 7: the activation-staged wiring_changed reconcile provisions the initial
-    L2 membership off the fork, no fork save needed)."""
+    """Reserving a DUT wired to an L2 switch in the topology drives add_to_vlan on
+    the switch with an HERD-assigned vlan_id at activation (ADR 0009 phase 7: the
+    activation-staged wiring_changed reconcile provisions the initial L2 membership
+    off the fork, no fork save needed; membership-only, no create_vlan)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l2_template["id"], f"mock-l2-sw-{suffix}")
     reservation = None
@@ -250,17 +257,19 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
         reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
         assert await _poll_active(admin_client, reservation["id"]), "reservation never activated"
 
-        create_runs = await _poll_success_runs(admin_client, reservation["id"], "create_vlan")
-        assert create_runs, "no SUCCESS create_vlan run was recorded for the L2 switch"
-        run = create_runs[0]
+        add_runs = await _poll_success_runs(admin_client, reservation["id"], "add_to_vlan")
+        assert add_runs, "no SUCCESS add_to_vlan run was recorded for the L2 switch"
+        run = add_runs[0]
         assert str(run["device_id"]) == switch["id"]
         vlan_id = _vlan_of(run)
         assert 2 <= vlan_id <= 4094, f"vlan_id {vlan_id} out of the valid 2..4094 range"
-
-        add_runs = await _poll_success_runs(admin_client, reservation["id"], "add_to_vlan")
-        assert add_runs, "no SUCCESS add_to_vlan run was recorded for the L2 switch"
-        assert str(add_runs[0]["device_id"]) == switch["id"]
-        assert _vlan_of(add_runs[0]) == vlan_id
+        # The port joined is the fork hop's switch-side port.
+        assert run["input_params"]["method_kwargs"]["port"] == "eth1"
+        # Membership-only vocabulary: the fork-driven path never drives create_vlan.
+        assert await _runs_by_action(admin_client, reservation["id"], "create_vlan") == [], (
+            "the fork-driven L2 reconcile must not drive create_vlan (retired with the "
+            "legacy device-set path in ADR 0009 phase 7)"
+        )
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
@@ -295,8 +304,8 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
         assert await _poll_active(admin_client, reservation["id"]), "reservation never activated"
 
         # Provision first (activation-staged reconcile), so there is something to release.
-        assert await _poll_success_runs(admin_client, reservation["id"], "create_vlan"), (
-            "reservation never provisioned a VLAN, cannot test release"
+        assert await _poll_success_runs(admin_client, reservation["id"], "add_to_vlan"), (
+            "reservation never provisioned the L2 membership, cannot test release"
         )
 
         resp = await admin_client.delete(f"/reservations/{reservation['id']}")
@@ -350,8 +359,8 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
         assert await _poll_active(admin_client, res_a["id"]), "reservation A never activated"
         assert await _poll_active(admin_client, res_b["id"]), "reservation B never activated"
 
-        runs_a = await _poll_success_runs(admin_client, res_a["id"], "create_vlan")
-        runs_b = await _poll_success_runs(admin_client, res_b["id"], "create_vlan")
+        runs_a = await _poll_success_runs(admin_client, res_a["id"], "add_to_vlan")
+        runs_b = await _poll_success_runs(admin_client, res_b["id"], "add_to_vlan")
         assert runs_a and runs_b, "both reservations must provision a VLAN on the shared switch"
 
         vlan_a = _vlan_of(runs_a[0])

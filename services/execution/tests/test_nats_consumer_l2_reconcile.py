@@ -304,6 +304,20 @@ async def test_reconcile_present_key_falsy_result_is_failure():
     assert [r.status for r in rows] == ["FAILED"]
 
 
+async def test_reconcile_bare_data_output_stays_success():
+    """A driver returning bare data (no success key in the output) is a success: the
+    absent-key rule of driver_result_failed, the L2 twin of the L3 pin (issue #393)."""
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "add_to_vlan":
+            # Bare-data output: no "success" key at all. Must stay a success.
+            return {"success": True, "output": {"vlan": 123}, "error": None, "duration_ms": 1}
+        return SUCCESS_RESULT
+
+    await _reconcile([_wire(DUT1, "eth0", SW_L2, "0/0/1")], execute_fn=execute_fn, calls=[])
+    assert (SW_L2, "0/0/1") in await _active_memberships()
+
+
 # --- allocation grouping by fabric (re-expressed from the retired legacy pins
 # --- test_assign_vlans_groups_switches_by_fabric and
 # --- test_assign_vlans_uses_fallback_when_fabric_lookup_fails) ---

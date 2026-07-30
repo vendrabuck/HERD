@@ -297,12 +297,16 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     connection = None
+    topology_id = None
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         # Provision first, so there is something to release.
         assert await _poll_success_runs(admin_client, reservation["id"], "configure_route"), (
@@ -321,6 +325,8 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
             remove_runs = await _poll_success_runs(admin_client, reservation["id"], "remove_route")
         assert _as_kwarg_set(remove_runs) == _expected_set(ROUTES)
     finally:
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -335,12 +341,16 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     connection = None
+    topology_id = None
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         assert await _poll_success_runs(admin_client, reservation["id"], "configure_route"), (
             "reservation never provisioned routes, cannot test the pinned-set invariant"
@@ -367,6 +377,8 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
             "deprovision must never touch routes from the edited config"
         )
     finally:
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -374,16 +386,20 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
 
 async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_template, fresh_device):
     """An L3 switch with no config version provisions nothing and does not
-    block the reservation from activating."""
+    block the reservation from activating (the reconcile's empty-config skip)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     reservation = None
     connection = None
+    topology_id = None
     try:
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
         # Deterministic anchor: the reservation still activates.
         assert await _poll_reservation_status(admin_client, reservation["id"], "ACTIVE"), (
@@ -402,6 +418,8 @@ async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_templa
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

@@ -460,8 +460,8 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
         )
         reservation = await _reserve(admin_client, [fresh_device["id"]], topology_id)
         provisioned_res_id = reservation["id"]
-        create_runs = await _poll_runs(admin_client, provisioned_res_id, "create_vlan")
-        assert create_runs, "anchor provisioning never completed"
+        add_runs = await _poll_runs(admin_client, provisioned_res_id, "add_to_vlan")
+        assert add_runs, "anchor provisioning never completed"
         assert await _runs(admin_client, unprovisioned_res_id) == [], (
             "a never-provisioned FAILED reservation must not produce any driver run"
         )
@@ -472,7 +472,7 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
         await _publish_event("reservation.failed", provisioned_res_id, [fresh_device["id"]])
         remove_runs = await _poll_runs(admin_client, provisioned_res_id, "remove_from_vlan")
         assert remove_runs, "reservation.failed did not remove the stored VLAN membership"
-        provisioned_vlan = _method_kwargs(create_runs[0])["vlan_id"]
+        provisioned_vlan = _method_kwargs(add_runs[0])["vlan_id"]
         torn_down_vlans = {_method_kwargs(r)["vlan_id"] for r in remove_runs}
         assert torn_down_vlans == {provisioned_vlan}, (
             "teardown must drive the stored VLAN id, not a re-derived one"

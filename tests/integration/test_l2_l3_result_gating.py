@@ -287,8 +287,9 @@ async def test_l2_add_to_vlan_result_failure_records_failed(
 ):
     """add_to_vlan returning {"success": False, ...} (transport ok, driver-
     reported failure) lands the run at FAILED with the driver's error, not
-    SUCCESS. create_vlan (not knobbed) still succeeds, proving the gate is
-    per-action, not switch-wide."""
+    SUCCESS. login (not knobbed) still succeeds on the same switch, proving the
+    gate is per-action, not switch-wide. (create_vlan is no longer part of the
+    flow: the fork-driven L2 reconcile is membership-only, ADR 0009 phases 4/7.)"""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(
         admin_client, gating_l2_template["id"], f"mock-l2-393-sw-{suffix}", "add_to_vlan"
@@ -305,16 +306,14 @@ async def test_l2_add_to_vlan_result_failure_records_failed(
         )
         reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
 
-        success_create = await _poll_runs(
-            admin_client, reservation["id"], "create_vlan", status="SUCCESS"
-        )
-        assert success_create, "create_vlan (not knobbed) must still succeed"
-
         failed_add = await _poll_runs(
             admin_client, reservation["id"], "add_to_vlan", status="FAILED"
         )
         assert failed_add, "add_to_vlan driver-result failure must record a FAILED run"
         assert failed_add[0]["error"] == "mock injected failure on add_to_vlan"
+
+        success_login = await _poll_runs(admin_client, reservation["id"], "login", status="SUCCESS")
+        assert success_login, "login (not knobbed) must still succeed: the gate is per-action"
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
