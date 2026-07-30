@@ -21,10 +21,13 @@ surface as layer "l2" wiring-status rows.
 
 The default auto-retry channel (WIRING_RETRY_INTERVAL_SECONDS=60,
 WIRING_RETRY_MAX_ATTEMPTS=10, docs/ENV_VARS.md) is not overridden in the dev
-stack, so a test that finishes well inside that 60s window cannot race the
-background sweep into parking the rows past the attempts cap. The attempts
-count is asserted below the cap before the manual retry click as a guard
-against a slow run.
+stack. The background sweep CAN fire mid-test (its 60s tick is wall-clock from
+service start, not from row creation), but every interleaving converges: a
+sweep while the fail knob is armed only increments attempts (asserted below
+the cap before the manual retry click), and a sweep after the knob clears
+flips the rows ACTIVE server-side, in which case the manual retry is a no-op
+that still passes the ACTIVE read-back. Do not weaken the attempts-cap guard
+on the strength of the happy-path timing.
 """
 
 import io

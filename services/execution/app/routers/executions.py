@@ -435,8 +435,8 @@ class WiringConnectionStatus(BaseModel):
     when recorded), "l2" for an l2_port_assignments VLAN membership row
     (port/vlan_assignment_id/vlan populated), or "l3" for a route_assignments
     per-switch route pin (route_count populated, no port fields). The layer-specific
-    fields are optional so a row omits the ones that do not apply; existing L1
-    consumers read the same fields they always did.
+    fields are optional and serialize as null on rows they do not apply to; existing
+    L1 consumers read the same fields they always did.
 
     `intended` (ADR 0009 Decision 2, issue #369; additive field) is the direction
     the row's last write was attempting: ACTIVE for a connect/build, RELEASED for

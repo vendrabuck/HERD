@@ -73,11 +73,12 @@ The device's template decides which category it falls in. If a reservation is re
 
 ### Reservation detail
 
-Click any reservation in the list to open the detail modal. Four tabs:
+Click any reservation in the list to open the detail modal. Five tabs (plus an AI Assistant tab when the assistant is enabled):
 
 - **Details** (default): basic info (id, purpose, dates, status).
 - **Inventory**: the devices in the reservation. Expand a row to see its ports and what each port is physically connected to.
 - **Routes**: for DUT-to-DUT pairs, shows the hop-by-hop path through L1 switches computed by the pathfinder. Green badges for reachable pairs, red for unreachable.
+- **Wiring**: the applied wiring state across all three layers (L1 cross-connects, L2 VLAN memberships, L3 route pins), with per-row status and a Retry button for failed rows on active reservations. See the topology-editing section for details.
 - **Schedule**: inline edit of end time and purpose.
 
 The reservation owner can also click **Edit Resources** to add or remove devices while the reservation is active or pending. Added exclusive devices are checked for conflicts and flipped to `RESERVED`; removed devices are released back to `AVAILABLE`. Adding a device does not wire it to anything by itself: draw its connections in the topology editor and commit, and the commit is what builds them (removing a device releases its wiring the same way, through the topology reconcile).
