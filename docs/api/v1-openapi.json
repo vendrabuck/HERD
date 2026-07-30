@@ -731,6 +731,52 @@
         ]
       }
     },
+    "/reservations/{reservation_id}/wiring-status": {
+      "get": {
+        "description": "Read a reservation's layered per-connection wiring status (ADR 0009 phase 8).\n\nRead-only passthrough to the reservations service's owner-or-admin gated\nwiring-status proxy: ownership and visibility are enforced downstream as the real\ncaller, exactly like the other facade endpoints. The payload is relayed verbatim\nrather than frozen into a v1 model: its shape is owned by the wiring-status\nsurface (rows tagged `layer` \"l1\"/\"l2\"/\"l3\" plus the reservation-level\nlast_applied_fork_version and frozen markers, documented in docs/EXTERNAL_API.md)\nand evolves additively there, so freezing a copy here would only drift. The\nmanual retry channel is deliberately NOT exposed through the facade: retry is an\noperational action scoped to the interactive UI and internal surface.",
+        "operationId": "get_reservation_wiring_status_reservations__reservation_id__wiring_status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reservation_id",
+            "required": true,
+            "schema": {
+              "title": "Reservation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Reservation Wiring Status",
+        "tags": [
+          "v1-reservations"
+        ]
+      }
+    },
     "/webhooks": {
       "get": {
         "description": "List subscriptions. Secret omitted for hygiene.",

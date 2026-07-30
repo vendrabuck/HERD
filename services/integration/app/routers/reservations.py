@@ -196,8 +196,6 @@ async def get_reservation_wiring_status(
     manual retry channel is deliberately NOT exposed through the facade: retry is an
     operational action scoped to the interactive UI and internal surface.
     """
-    resp = await _forward(
-        "GET", f"/{reservation_id}/wiring-status", token=credentials.credentials
-    )
+    resp = await _forward("GET", f"/{reservation_id}/wiring-status", token=credentials.credentials)
     _propagate_if_error(resp)
     return resp.json()

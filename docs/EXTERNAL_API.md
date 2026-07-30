@@ -148,6 +148,40 @@ Cancel a reservation. Returns `204`.
 Release a reservation early, freeing its devices before the scheduled end time.
 Returns the updated `V1ReservationResponse`.
 
+### GET /api/v1/reservations/{id}/wiring-status
+
+Read the reservation's layered per-connection wiring status: what HERD actually
+applied to the hardware for this reservation, row by row, across all three
+layers (ADR 0009). Read-only; allowed for any reservation status, so an ended
+reservation's response is its as-built record. Ownership and visibility are
+enforced downstream exactly as for the other endpoints.
+
+Response:
+
+- `reservation_id` (UUID).
+- `last_applied_fork_version` (integer or null): the topology-fork version the
+  hardware state was last reconciled to; null before the first apply.
+- `frozen` (boolean): true once the reservation has ended and its wiring is
+  torn down (no further builds will be applied).
+- `connections`: one row per wiring-ledger entry. Common fields on every row:
+  `id`, `switch_device_id`, `layer`, `status` (`ACTIVE` applied, `RELEASED`
+  removed, `FAILED` the driver call failed), `intended` (`ACTIVE` the row's
+  last write was a build, `RELEASED` it was a release), `attempts`,
+  `last_error` (string or null), `retryable` (boolean: whether the failure is
+  a transient driver error; false means the recorded intent can no longer be
+  applied and recovery is a topology re-save), `created_at`, `released_at`.
+  Layer-specific fields:
+  - `layer: "l1"` (switch cross-connect): `port_a`, `port_b`,
+    `physical_connection_id` (UUID or null).
+  - `layer: "l2"` (VLAN membership): `port`, `vlan_assignment_id`, `vlan`
+    (integer, or null while the allocation is unresolved).
+  - `layer: "l3"` (per-switch route pin): `route_count`.
+
+The payload is relayed verbatim from the internal wiring surface and evolves
+additively: treat unknown fields (and unknown `layer` values) as
+forward-compatible extensions. The manual wiring retry channel is not exposed
+through this API; retry is an interactive/operator action.
+
 ### Worked example: reserve, poll status, release
 
 ```bash
@@ -166,6 +200,10 @@ RID=$(curl -sS -X POST "$BASE/reservations" -H "$AUTH" \
 
 # Poll status until it is ACTIVE
 curl -sS "$BASE/reservations/$RID" -H "$AUTH" | jq .status
+
+# Inspect the applied wiring, layer by layer
+curl -sS "$BASE/reservations/$RID/wiring-status" -H "$AUTH" \
+  | jq '.connections[] | {layer, status, last_error}'
 
 # Release early when the job finishes
 curl -sS -X PUT "$BASE/reservations/$RID/release" -H "$AUTH" | jq .status
