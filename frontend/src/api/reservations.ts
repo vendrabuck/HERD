@@ -197,12 +197,13 @@ export function useSaveReservationFork() {
   });
 }
 
-// --- Per-connection L1 wiring status (ADR 0007, issue #345 P3b) ------------
-// After a fork save reconciles the intended wiring, execution applies each L1
-// cross-connect and records per-connection applied state. These owner-or-admin
-// gated endpoints proxy execution's internal wiring-status and retry surface so
-// the reservation detail can show which cross-connects landed, which FAILED, and
-// (for ACTIVE reservations) reattempt the hardware-retryable ones.
+// --- Layered per-connection wiring status (ADR 0007 / ADR 0009) ------------
+// After a fork save reconciles the intended wiring, execution applies each layer
+// (L1 cross-connects, L2 VLAN memberships, L3 route pins) and records
+// per-connection applied state, each row tagged with `layer`. These
+// owner-or-admin gated endpoints proxy execution's internal wiring-status and
+// retry surface so the reservation detail can show which rows landed, which
+// FAILED, and (for ACTIVE reservations) reattempt the hardware-retryable ones.
 
 export function wiringStatusKey(reservationId: string): (string | undefined)[] {
   return ["reservations", reservationId, "wiring-status"];

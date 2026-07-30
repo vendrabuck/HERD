@@ -198,6 +198,75 @@ async def test_release_maps(monkeypatch):
     assert resp.json()["status"] == "COMPLETED"
 
 
+async def test_wiring_status_relays_layered_payload_verbatim(monkeypatch):
+    """GET /reservations/{id}/wiring-status forwards the JWT and relays the layered
+    payload verbatim (ADR 0009 phase 8): rows keep their `layer` tags and
+    layer-specific fields, and the reservation-level markers pass through untouched."""
+    rid = str(uuid.uuid4())
+    upstream = {
+        "reservation_id": rid,
+        "last_applied_fork_version": 3,
+        "frozen": False,
+        "connections": [
+            {
+                "id": str(uuid.uuid4()),
+                "switch_device_id": str(uuid.uuid4()),
+                "layer": "l1",
+                "port_a": "0/0/1",
+                "port_b": "0/0/2",
+                "status": "ACTIVE",
+                "intended": "ACTIVE",
+                "attempts": 1,
+                "last_error": None,
+                "retryable": False,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "switch_device_id": str(uuid.uuid4()),
+                "layer": "l2",
+                "port": "p3",
+                "vlan": 101,
+                "status": "FAILED",
+                "intended": "ACTIVE",
+                "attempts": 2,
+                "last_error": "add_to_vlan boom",
+                "retryable": True,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "switch_device_id": str(uuid.uuid4()),
+                "layer": "l3",
+                "route_count": 2,
+                "status": "ACTIVE",
+                "intended": "ACTIVE",
+                "attempts": 1,
+                "last_error": None,
+                "retryable": False,
+            },
+        ],
+    }
+
+    def handler(method, url, headers, json, params):
+        assert method == "GET"
+        assert url.endswith(f"/{rid}/wiring-status")
+        return httpx.Response(200, json=upstream)
+
+    _install_handler(monkeypatch, handler)
+    token = _token()
+    async with _client() as c:
+        resp = await c.get(f"/reservations/{rid}/wiring-status", headers=_auth(token))
+
+    assert resp.status_code == 200
+    assert CAPTURED["headers"]["Authorization"] == f"Bearer {token}"
+    assert resp.json() == upstream
+
+
+async def test_wiring_status_requires_jwt(monkeypatch):
+    async with _client() as c:
+        resp = await c.get(f"/reservations/{uuid.uuid4()}/wiring-status")
+    assert resp.status_code in (401, 403)
+
+
 async def test_missing_jwt_is_rejected(monkeypatch):
     # Auth rejects before any upstream call.
     async with _client() as c:

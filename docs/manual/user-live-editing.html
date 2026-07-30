@@ -195,7 +195,7 @@
 
     <h2 class="sec" id="wiring">Did the hardware take it?</h2>
     <p class="sectitle">The Wiring tab</p>
-    <p>Committing records your <em>intent</em>. HERD then applies the L1 wiring to the actual switches one cross-connect at a time &mdash; and the reservation detail modal's <b>Wiring</b> tab shows how each one went.</p>
+    <p>Committing records your <em>intent</em>. HERD then applies your wiring to the actual switches one connection at a time, layer by layer, and the reservation detail modal's <b>Wiring</b> tab shows how each one went, grouped into sections: <b>L1 cross-connects</b> (switch port pairs), <b>L2 VLAN memberships</b> (each port and its allocated VLAN), and <b>L3 route pins</b> (each L3 switch's pinned routes).</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -217,6 +217,7 @@
                   <span style="flex:1"></span>
                   <span class="hd-btn primary sm" style="white-space:nowrap;" data-anno="3" data-anno-pin="l" data-anno-arrow data-anno-color="blue">Retry failed</span>
                 </div>
+                <p style="font-size:10.5px;font-weight:500;color:var(--gray-500);text-transform:uppercase;letter-spacing:.05em;margin:0 0 6px;">L1 cross-connects</p>
                 <div style="border:1px solid var(--gray-200);border-radius:6px;overflow:hidden;margin-bottom:8px;" data-anno="1" data-anno-pin="r" data-anno-arrow>
                   <div style="display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--gray-50);border-bottom:1px solid var(--gray-100);font-size:13px;">
                     <span style="font-weight:500;">l1-patch-mux</span>
@@ -234,18 +235,27 @@
                   <div style="padding:5px 12px 2px;font-size:11.5px;color:var(--gray-500);">Attempts: <b style="color:var(--gray-700);">3</b></div>
                   <p style="padding:0 12px 8px;font-size:11.5px;color:#dc2626;margin:0;">Driver timeout: no response from switch after 30s</p>
                 </div>
+                <p style="font-size:10.5px;font-weight:500;color:var(--gray-500);text-transform:uppercase;letter-spacing:.05em;margin:10px 0 6px;">L2 VLAN memberships</p>
+                <div style="border:1px solid var(--gray-200);border-radius:6px;overflow:hidden;">
+                  <div style="display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--gray-50);border-bottom:1px solid var(--gray-100);font-size:13px;">
+                    <span style="font-weight:500;">l2-fabric-a</span>
+                    <span style="font-family:var(--font-mono);font-size:11.5px;color:var(--gray-500);white-space:nowrap;">port ge-12 VLAN 210</span>
+                    <span style="margin-left:auto;font-size:11px;font-weight:500;padding:2px 6px;border-radius:4px;background:var(--res-active-bg);color:var(--res-active-fg);">ACTIVE</span>
+                  </div>
+                  <div style="padding:5px 12px;font-size:11.5px;color:var(--gray-500);">Attempts: <b style="color:var(--gray-700);">1</b></div>
+                </div>
               </div>
             </div>
           </div></div>
         </div>
       </div>
-      <p class="shotcap"><b>The Wiring tab.</b> One card per switch cross-connect, with the honest per-connection verdict.</p>
+      <p class="shotcap"><b>The Wiring tab.</b> One card per wiring row, grouped by layer, with the honest per-connection verdict.</p>
     </figure>
 
     <ol class="legend">
-      <li><b>A healthy connection.</b> The switch, the port pair, an <span class="badge active">ACTIVE</span> status, and the attempt count. Released connections show a gray RELEASED instead.</li>
+      <li><b>A healthy connection.</b> The switch, the layer-specific detail (an L1 port pair, an L2 port and VLAN, or an L3 route count), an <span class="badge active">ACTIVE</span> status, and the attempt count. Released rows show a gray RELEASED instead.</li>
       <li><b>A failed connection.</b> The status goes red and the driver's actual error is printed underneath. <strong>Your saved wiring is not rolled back</strong> &mdash; the intent stays durable, only the hardware apply failed.</li>
-      <li><b>Retry failed.</b> Reattempts every retryable failed connection at once; a toast summarizes how many reconnected, released, are still failing, or are not retryable. The button appears only while the reservation is <span class="badge active">ACTIVE</span> and something is actually retryable.</li>
+      <li><b>Retry failed.</b> Reattempts every retryable failed row across all layers at once; a toast summarizes how many reconnected, released, are still failing, or are not retryable. The button appears only while the reservation is <span class="badge active">ACTIVE</span> and something is actually retryable.</li>
     </ol>
 
     <div class="callout tip">

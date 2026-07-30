@@ -26,6 +26,10 @@
     ],
     [
       "GET",
+      "/reservations/{reservation_id}/wiring-status"
+    ],
+    [
+      "GET",
       "/webhooks"
     ],
     [

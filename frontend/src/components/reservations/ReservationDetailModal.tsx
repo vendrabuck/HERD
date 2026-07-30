@@ -204,7 +204,8 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
           <ReservationRoutesTab deviceIds={reservation.device_ids} />
         )}
 
-        {/* Wiring tab: per-connection L1 wiring status + manual retry (ADR 0007) */}
+        {/* Wiring tab: layered per-connection wiring status + manual retry
+            (ADR 0007; layered L1/L2/L3 by ADR 0009 phase 8) */}
         {activeTab === "wiring" && (
           <ReservationWiringTab
             reservationId={reservation.id}

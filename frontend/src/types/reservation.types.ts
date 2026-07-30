@@ -154,16 +154,26 @@ export interface ForkConflictDetail {
   conflicts: ForkPortConflict[];
 }
 
-// --- Per-connection L1 wiring status (ADR 0007, issue #345 P3b) -------------
-// After a fork save reconciles the intended wiring, execution applies each L1
-// cross-connect connection-by-connection and records the applied state in its
-// l1_connection_assignments ledger. These types mirror the execution-side
-// WiringStatusResponse / WiringRetryResponse that reservations proxies at
-// GET /reservations/{id}/wiring-status and POST /reservations/{id}/wiring/retry.
+// --- Layered per-connection wiring status (ADR 0007 / ADR 0009) -------------
+// After a fork save reconciles the intended wiring, execution applies each layer
+// connection-by-connection and records the applied state in its wiring ledgers
+// (l1_connection_assignments, l2_port_assignments, route_assignments). These
+// types mirror the execution-side WiringStatusResponse / WiringRetryResponse
+// that reservations proxies at GET /reservations/{id}/wiring-status and
+// POST /reservations/{id}/wiring/retry.
 
 export type WiringConnectionState = "ACTIVE" | "RELEASED" | "FAILED";
 
-// One l1_connection_assignments row: a switch port pair and its applied state.
+export type WiringLayer = "l1" | "l2" | "l3";
+
+// One wiring-ledger row and its applied state. Layered since ADR 0009 phase 8:
+// `layer` is "l1" for a switch cross-connect (port_a/port_b populated), "l2"
+// for a VLAN membership (port/vlan populated), or "l3" for a per-switch route
+// pin (route_count populated). `layer` is optional only for tolerance of a
+// pre-phase-8 backend during a rolling deploy; treat an absent layer as "l1".
+// `intended` (ADR 0009, issue #369) is the direction the row's last write was
+// attempting (ACTIVE build vs RELEASED teardown), so a FAILED release after the
+// reservation ends is distinguishable from a FAILED build.
 // `retryable` is true only for a FAILED row whose failure is a transient driver
 // error (hardware-retryable); a FAILED row with retryable=false is an
 // unresolvable/not-a-simple-chain intent whose recovery is a fork re-save
@@ -171,10 +181,19 @@ export type WiringConnectionState = "ACTIVE" | "RELEASED" | "FAILED";
 export interface WiringConnectionStatus {
   id: string;
   switch_device_id: string;
-  port_a: string;
-  port_b: string;
-  physical_connection_id: string | null;
+  layer?: WiringLayer;
+  // L1 cross-connect fields (present for layer "l1").
+  port_a?: string | null;
+  port_b?: string | null;
+  physical_connection_id?: string | null;
+  // L2 membership fields (present for layer "l2").
+  port?: string | null;
+  vlan_assignment_id?: string | null;
+  vlan?: number | null;
+  // L3 route-pin summary field (present for layer "l3").
+  route_count?: number | null;
   status: WiringConnectionState;
+  intended?: "ACTIVE" | "RELEASED";
   attempts: number;
   last_error: string | null;
   retryable: boolean;
@@ -182,8 +201,8 @@ export interface WiringConnectionStatus {
   released_at: string | null;
 }
 
-// GET /reservations/{id}/wiring-status: the reservation's per-connection L1
-// applied state plus its wiring-state markers. A reservation with no rows and no
+// GET /reservations/{id}/wiring-status: the reservation's layered applied
+// wiring state plus its wiring-state markers. A reservation with no rows and no
 // state row is the empty/pre-apply case (physical-only pre-P3b, dynamic-only, or
 // no fork edits): an empty connections list, null version, not frozen.
 export interface WiringStatusResponse {

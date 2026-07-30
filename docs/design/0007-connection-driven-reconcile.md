@@ -1,6 +1,7 @@
 # Decision: Connection-Driven Reconcile for Fork Wiring Deltas, Issue #345 P3b
 
-Status: Accepted; P3b L1 delivered. Extends ADR 0006 Decision 7 (the P3b contract
+Status: Accepted; delivered in full (the L1 half here, the L2/L3 half by ADR
+0009). Extends ADR 0006 Decision 7 (the P3b contract
 sketch), resolves ADR 0006 open risk 1 (multi-hop path drift), and tracks issue
 #345. Built on P3a, which shipped in ADR 0006 phases 1 to 5: the fork save, the
 `fork_versions` rows, and the released/built set arithmetic are P3b's inputs. The
@@ -11,7 +12,10 @@ with the `fork_wiring_ledger` and the save-then-stage sweeper, the connection-dr
 consumer with ordered apply and gap-reconcile, the per-connection wiring-status and
 retry endpoints with the background auto-retry channel, and the reservation-detail
 Wiring tab. Phase 2 (L2 VLAN and L3 route connection-driven reconcile, Decision 1)
-remains. Two review-driven refinements landed during delivery without changing the
+is delivered by ADR 0009 (`0009-l2-l3-connection-driven-reconcile.md`, issue #416,
+phases 1 to 8), which also retired the legacy device-set resolvers and layered the
+wiring-status and Wiring tab surfaces, closing out this ADR entirely. Two
+review-driven refinements landed during delivery without changing the
 decision bodies: the fork save now groups per-hop wiring by a canvas `edge_key` so a
 multi-hop edge round-trips as one logical connection (PR #367); and the L1 apply path
 keys a connection's ACTIVE-versus-FAILED outcome on the driver-result payload the

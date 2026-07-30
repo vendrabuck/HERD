@@ -1,6 +1,6 @@
 # Decision: L2/L3 Connection-Driven Reconcile, P3b Phase 2
 
-Status: Accepted 2026-07-19; delivery tracked by issue #416. Executes the
+Status: Accepted 2026-07-19; delivered (all eight phases, issue #416). Executes the
 phase ADR 0007 Decision 1 bounded but deliberately did not design ("L2 VLAN and L3 route provisioning stay
 device-set-driven until a P3b phase 2"). Absorbs issues #393 (L2/L3 driver
 results transport-gated), #369 (retry direction missing on assignment rows),
@@ -213,7 +213,11 @@ immutable to failure writers) which extends to the new ledgers.
 7. Initial-provision unification (DELIVERED, issue #416): activation stages
    the initial wiring_changed; legacy resolvers retire; device-add semantics
    per Decision 6.
-8. Surfaces and docs: layered wiring-status and Wiring tab, EXTERNAL_API,
+8. Surfaces and docs (DELIVERED, issue #416): layered wiring-status and Wiring
+   tab (rows tagged `layer` across L1 cross-connects, L2 memberships, and L3
+   route pins, grouped by layer in the tab; the retry surface was already
+   layered by phases 4-5), a read-only external-facade passthrough
+   (GET /api/v1/reservations/{id}/wiring-status) documented in EXTERNAL_API.md,
    FEATURES/PLANNED_FEATURES status flips, ADR 0007 status pointer.
 
 ## Test plan
