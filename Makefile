@@ -16,14 +16,19 @@ ROOT_PY := seed_devices_public.py
 # its volumes never collide with the dev stack's: the gate is always born fresh
 # (gate-clean purges only the gate project) and `make up` after a gate run
 # restores the dev stack WITH its data, no reseed needed. Lowercased because
-# compose project names reject uppercase; derived from the directory so
-# worktree gates are isolated per-worktree too.
-GATE_PROJECT := $(shell basename "$$PWD" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-')-gate
+# compose project names reject uppercase (leading non-alphanumerics are
+# stripped, also a compose rule); derived from the directory so worktree gates
+# are isolated per-worktree too.
+#
+# Gate-phase sub-makes that run tests pass COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
+# on the command line: make exports command-line variables to recipe
+# environments, so every bare `docker compose` in those recipes AND in test
+# code (integration tests stop/start containers, the config e2e test execs
+# into the config container) resolves to the gate project. A standalone
+# `make test-e2e` or `make test-integration` has no override and targets the
+# dev stack as before.
+GATE_PROJECT := $(shell printf '%s' '$(notdir $(CURDIR))' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-' | sed 's/^[^a-z0-9]*//')-gate
 GATE_COMPOSE := docker compose -p $(GATE_PROJECT)
-# Overridable compose entry for targets that must run against either stack:
-# standalone `make test-e2e` targets the dev stack; master/everything pass
-# COMPOSE="$(GATE_COMPOSE)" so selenium joins the gate project's network.
-COMPOSE ?= docker compose
 
 # Coverage package name per service. Most are app/; common ships herd_common/.
 cov_pkg = $(if $(filter common,$(1)),herd_common,app)
@@ -143,9 +148,9 @@ master: gate-clean master-quick  ## Full gate: master-quick + ephemeral stack co
 		echo "" && echo "=== Contract tests ===" && \
 		$(MAKE) test-contract && \
 		echo "" && echo "=== Integration tests ===" && \
-		$(MAKE) test-integration && \
+		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
-		$(MAKE) test-e2e COMPOSE="$(GATE_COMPOSE)"
+		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
 	@echo ""
 	@echo "=== master complete ==="
 
@@ -161,7 +166,7 @@ clean-images:
 	@echo "=== Removing HERD compose images ==="
 	-docker compose down --remove-orphans
 	-$(GATE_COMPOSE) down -v --remove-orphans
-	@ids=$$(docker images --filter "reference=herd-*" -q | sort -u); \
+	@ids=$$(docker images --filter "reference=herd-*" --filter "reference=$(GATE_PROJECT)-*" -q | sort -u); \
 		if [ -n "$$ids" ]; then \
 			echo "$$ids" | xargs -r docker rmi -f; \
 		else \
@@ -222,10 +227,10 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 		echo "" && echo "=== Contract tests ===" && \
 		$(MAKE) test-contract && \
 		echo "" && echo "=== Integration tests ===" && \
-		$(MAKE) test-integration && \
+		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
-		$(MAKE) test-e2e COMPOSE="$(GATE_COMPOSE)" && \
-		if [ "$(EVERYTHING_LOAD)" = "1" ]; then \
+		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		if [ "$(EVERYTHING_LOAD)" != "0" ]; then \
 			echo "" && echo "=== Seeding gate stack for load tests ===" && \
 			$(MAKE) _everything-seed && \
 			echo "" && echo "=== Load / stress tests ===" && \
@@ -290,8 +295,8 @@ _master-wait-healthy:
 _master-stack-down:
 	@echo ""
 	@echo "=== Tearing down ephemeral gate stack ==="
-	-$(MAKE) test-e2e-stop COMPOSE="$(GATE_COMPOSE)"
-	-$(GATE_COMPOSE) down -v
+	-$(MAKE) test-e2e-stop COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
+	-$(GATE_COMPOSE) down -v --remove-orphans
 
 ## --- Docker Compose ---
 
@@ -377,13 +382,13 @@ test-load-ui:  ## Run locust with its web UI (needs a running stack)
 	cd tests/load && uv run locust -f locustfile.py --host $${HERD_BASE_URL:-https://localhost}
 
 test-e2e:  ## Run e2e tests, Selenium + Playwright (needs a running stack)
-	-$(COMPOSE) --profile e2e rm -fsv selenium
-	$(COMPOSE) --profile e2e up -d --force-recreate selenium
+	-docker compose --profile e2e rm -fsv selenium
+	docker compose --profile e2e up -d --force-recreate selenium
 	uv run playwright install chromium  # no-op once cached; on a fresh host, missing OS libs need: uv run playwright install --with-deps chromium (sudo)
 	uv run pytest tests/e2e/ -v --tb=short
 
 test-e2e-stop:  ## Stop and remove the e2e Selenium container
-	-$(COMPOSE) --profile e2e rm -fsv selenium
+	-docker compose --profile e2e rm -fsv selenium
 
 # -- Local LDAP test server ---------------------------------------------------
 #
@@ -519,7 +524,7 @@ clean:  ## Stop the stack (KEEPING volumes/data) and remove caches/coverage arti
 # gate run. The gate project itself is purged WITH volumes so every gate is born
 # on a fresh database.
 gate-clean: clean  ## Stop the dev stack (data kept), purge any stale gate-project stack
-	-$(GATE_COMPOSE) down -v --remove-orphans
+	$(GATE_COMPOSE) down -v --remove-orphans
 
 clean-data:  ## DESTRUCTIVE: tear down the dev stack INCLUDING volumes (the pre-gate-isolation `make clean`)
 	docker compose down -v --remove-orphans

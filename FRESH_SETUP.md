@@ -169,8 +169,12 @@ make frontend-dev       # cd frontend && npm run dev
 To completely destroy all containers, volumes (database data), and caches:
 
 ```bash
+make clean-data
 make clean
 ```
+
+(`make clean` alone stops the stack and purges caches but keeps volumes, so
+database data survives a plain clean.)
 
 Then start fresh from step 4.
 
@@ -208,5 +212,6 @@ make shell-acl          # exec into acl container
 make shell-execution    # exec into execution container
 make build              # rebuild images without starting
 make down               # stop containers (preserves volumes)
-make clean              # stop containers + delete volumes + purge caches
+make clean              # stop containers + purge caches (volumes/data kept)
+make clean-data         # stop containers + delete volumes (destructive)
 ```
