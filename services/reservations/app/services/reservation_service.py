@@ -22,6 +22,7 @@ from sqlalchemy import and_, exists, false, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import AsyncSessionLocal
 from app.models.fork_wiring_ledger import ForkWiringLedger
 from app.models.outbox import OutboxEvent
 from app.models.reservation import (
@@ -200,7 +201,7 @@ async def _create_reservation_fork(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
-) -> None:
+) -> int | None:
     """Create the editable per-reservation fork in cabling at activation (issue #25).
 
     Cabling owns the fork (deep-copies the parent canvas, snapshots its relevant
@@ -212,21 +213,26 @@ async def _create_reservation_fork(
     Authenticated as a service-to-service call via X-Internal-Token: the booking
     user does not necessarily own the parent topology.
 
+    Returns the created fork's version_number (v1 for a fresh fork; the current max
+    for an idempotent re-create), which the caller uses to stage the initial
+    reservation.wiring_changed reconcile (ADR 0009 phase 7). Returns None when no
+    fork was created (no parent topology, or no internal token).
+
     Fail-open: a fork-create failure must NOT strand a successfully-provisioned
     reservation. The caller wraps this in retry_with_backoff and, on exhaustion,
     logs and continues, leaving fork_id null. The reservation is still usable; the
-    editable bench is created lazily on first edit or by a sweeper (a later PR).
+    editable bench is created lazily on first edit or by the sweep heal.
     """
     if topology_id is None:
         # Decision 3 Case A: no parent topology, create the fork lazily on first
         # edit rather than manufacturing an empty fork at activation.
-        return
+        return None
     if not settings.internal_api_token:
         logger.warning(
             "internal_api_token not configured; skipping fork creation for %s",
             reservation_id,
         )
-        return
+        return None
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -242,6 +248,8 @@ async def _create_reservation_fork(
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
+    body = resp.json()
+    return int(body["version_number"])
 
 
 async def _create_reservation_fork_best_effort(
@@ -249,20 +257,47 @@ async def _create_reservation_fork_best_effort(
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
 ) -> None:
-    """Create the fork with bounded retry and log-and-continue.
+    """Create the fork with bounded retry, then stage the initial wiring reconcile.
 
     Fork creation is best-effort at activation (issue #25): it must never raise
     out of create_reservation and strand a provisioned reservation. Exhausted
     retries are logged as structured errors and swallowed, leaving the
     reservation ACTIVE with fork_id null. The reservation is still usable on
-    the bench; the fork is created lazily on first edit or by a future sweeper.
-    This fail-open design ensures provisioning success does not depend on a
-    separate cabling service call.
+    the bench; the fork is created lazily on first edit.
+
+    ADR 0009 phase 7 unifies initial provisioning through the fork: instead of the
+    execution service driving legacy device-set resolvers off reservation.created,
+    activation stages a reservation.wiring_changed for the fork's initial version so
+    the consumer's ordered layered reconcile provisions the initial wiring. The heal
+    (delta-less) form is used: released/built are None, which routes the consumer to a
+    full reconcile against cabling's intended set, and for a fresh fork that intended
+    set IS the initial wiring. A delta form is unnecessary here (there is no prior
+    applied state to diff against) and the heal form is exactly what the sweep already
+    stages, so the two initial-provision paths converge on one code path.
+
+    Failure interplay (pinned by unit test): the wiring_changed is staged ONLY after a
+    successful fork create, so the ordering is create-fork then stage-wiring. If fork
+    creation fails here, no wiring_changed is staged and the fork_wiring_ledger is not
+    advanced. The backstop is the expiration sweep (_backstop_missing_forks): it
+    fork-creates for any ACTIVE topology-carrying reservation cabling has no fork for,
+    through this same helper, so the staging follows; the owner's first GET/edit
+    (_lazy_create_reservation_fork) plus the sweep's wiring heal (_heal_wiring_staging,
+    which sees cabling's latest_fork_version exceed the un-advanced ledger) cover the
+    same gap sooner if the user gets there first. A fork-create failure therefore
+    delays initial provisioning at most one sweep interval, and never drops it.
+
+    The wiring_changed staging is itself best-effort and its own atomic commit (the
+    stage_wiring_changed outbox+ledger invariant, mirroring the fork-save path); a
+    staging failure leaves the ledger un-advanced so the same sweep heal covers it.
+    The staging is ledger-guarded: a version already staged (a racing sweep backstop,
+    or an idempotent re-create of a fork that already has saves) stages nothing, so
+    the consumer never sees a duplicate beyond a true photo-finish race, which its
+    stale-version no-op absorbs.
     """
     if topology_id is None:
         return
     try:
-        await retry_with_backoff(
+        fork_version = await retry_with_backoff(
             lambda: _create_reservation_fork(reservation_id, topology_id, created_by),
             attempts=3,
             initial_delay=0.5,
@@ -277,6 +312,38 @@ async def _create_reservation_fork_best_effort(
                 "action": "reservation_fork_create_failed",
                 "reservation_id": str(reservation_id),
                 "topology_id": str(topology_id),
+            },
+            exc_info=True,
+        )
+        return
+
+    if fork_version is None:
+        return
+
+    # Stage the initial reservation.wiring_changed (delta-less heal) for the fresh
+    # fork so execution provisions the initial wiring off the fork (ADR 0009 phase 7).
+    # Its own atomic outbox+ledger commit; best-effort, the sweep heal is the backstop.
+    # Ledger-guarded: skip when this version (or a later one) was already staged, so
+    # the sweep backstop re-running this helper against an existing fork is a no-op.
+    try:
+        async with AsyncSessionLocal() as db:
+            ledger = await db.get(ForkWiringLedger, reservation_id)
+            if ledger is not None and ledger.last_staged_fork_version >= fork_version:
+                return
+            await stage_wiring_changed(
+                db,
+                reservation_id,
+                fork_version,
+                released=None,
+                built=None,
+            )
+    except Exception:
+        logger.error(
+            "Initial wiring_changed staging failed for reservation %s; sweep heal will cover it",
+            reservation_id,
+            extra={
+                "action": "reservation_initial_wiring_stage_failed",
+                "reservation_id": str(reservation_id),
             },
             exc_info=True,
         )

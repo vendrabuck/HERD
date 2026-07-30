@@ -433,8 +433,8 @@ async def _run_expiration_cycle() -> None:
 async def _run_fork_archive_reconcile() -> None:
     """Reconcile ACTIVE forks against reservation state each tick (ADR 0006, ADR 0007).
 
-    Two heals off ONE cabling fetch (ADR 0007 Decision 2: reuse the existing fetch, no
-    second round-trip per tick):
+    Three heals off ONE cabling fetch (ADR 0007 Decision 2: reuse the existing fetch,
+    no second round-trip per tick):
 
     1. Archive (ADR 0006 Decision 5). Cabling keeps a fork ACTIVE until reservations
        archives it on teardown, so a crash between the terminal transition and the
@@ -450,6 +450,13 @@ async def _run_fork_archive_reconcile() -> None:
        whose cabling latest fork_version strictly exceeds its ledger
        (a missing ledger row counts as 0), a delta-less heal event is staged and the
        ledger advanced, atomically, exactly as the save path does.
+    3. Missing-fork backstop (ADR 0009 phase 7). Initial provisioning is fork-driven,
+       so an ACTIVE reservation with a parent topology but NO fork in cabling (its
+       activation-time fork POST exhausted retries, or the process crashed before it)
+       would otherwise stay unwired until the owner happens to open the bench
+       (lazy-create). The sweep closes that gap: it fork-creates for exactly those
+       reservations via the same idempotent create-then-stage helper activation uses,
+       so the initial wiring_changed follows without user action.
 
     A reservation_id cabling reports that this DB does not know is logged and skipped,
     never touched blind: reservations is the lifecycle authority. The cabling fetch is
@@ -466,17 +473,19 @@ async def _run_fork_archive_reconcile() -> None:
         )
         return
 
-    if not forks:
-        return
-
     reservation_ids = [reservation_id for reservation_id, _ in forks]
     version_by_id = {reservation_id: version for reservation_id, version in forks}
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Reservation.id, Reservation.status).where(Reservation.id.in_(reservation_ids))
-        )
-        status_by_id = {row.id: row.status for row in result}
+    if reservation_ids:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Reservation.id, Reservation.status).where(
+                    Reservation.id.in_(reservation_ids)
+                )
+            )
+            status_by_id = {row.id: row.status for row in result}
+    else:
+        status_by_id = {}
 
     active_ids: list[uuid.UUID] = []
     for reservation_id in reservation_ids:
@@ -509,6 +518,7 @@ async def _run_fork_archive_reconcile() -> None:
             active_ids.append(reservation_id)
 
     await _heal_wiring_staging(active_ids, version_by_id)
+    await _backstop_missing_forks(set(version_by_id.keys()))
 
 
 async def _heal_wiring_staging(
@@ -552,6 +562,47 @@ async def _heal_wiring_staging(
                     "fork_version": cabling_version,
                 },
             )
+
+
+async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
+    """Fork-create for ACTIVE topology-carrying reservations cabling has no fork for.
+
+    The ADR 0009 phase 7 backstop for the fork-creation-failure case: initial wiring
+    is provisioned by the fork's activation-staged reservation.wiring_changed, so a
+    reservation whose activation-time fork POST failed (exhausted retries, or a crash
+    before the call) has no wiring source at all until its fork exists. Reservations
+    with no parent topology are skipped, exactly as activation skips them (ADR 0001
+    Decision 3 Case A: their fork is lazily created on first edit and starts empty,
+    so there is no initial wiring to stage).
+
+    Delegates to _create_reservation_fork_best_effort, so the create is the same
+    idempotent cabling POST activation uses and the initial wiring_changed staging
+    (ledger-guarded against double-staging a version) follows a success. Best-effort
+    per reservation: one failure never blocks the rest, and the next tick retries.
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Reservation.id, Reservation.topology_id, Reservation.user_id).where(
+                Reservation.status == ReservationStatus.ACTIVE,
+                Reservation.topology_id.is_not(None),
+            )
+        )
+        rows = result.all()
+
+    for row in rows:
+        if row.id in known_fork_ids:
+            continue
+        logger.info(
+            "Fork backstop: ACTIVE reservation %s has a topology but no fork; creating",
+            row.id,
+            extra={
+                "action": "fork_backstop_create",
+                "reservation_id": str(row.id),
+            },
+        )
+        await _create_reservation_fork_best_effort(
+            row.id, row.topology_id, created_by=str(row.user_id)
+        )
 
 
 async def expiration_loop(interval_seconds: int = 60) -> None:

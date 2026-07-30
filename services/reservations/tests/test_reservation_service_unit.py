@@ -1607,6 +1607,7 @@ async def test_create_reservation_fork_posts_to_cabling():
 
     mock_resp = MagicMock()
     mock_resp.status_code = 201
+    mock_resp.json.return_value = {"fork_id": str(uuid.uuid4()), "version_number": 1}
     mock_client = AsyncMock()
     mock_client.post.return_value = mock_resp
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -1618,7 +1619,9 @@ async def test_create_reservation_fork_posts_to_cabling():
     ):
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cabling:8000"
-        await _create_reservation_fork(reservation_id, topology_id)
+        # Returns the fresh fork's version_number so the caller can stage the
+        # initial wiring_changed reconcile (ADR 0009 phase 7).
+        assert await _create_reservation_fork(reservation_id, topology_id) == 1
 
     mock_client.post.assert_awaited_once()
     _, kwargs = mock_client.post.call_args
@@ -1638,6 +1641,7 @@ async def test_create_reservation_fork_threads_created_by():
 
     mock_resp = MagicMock()
     mock_resp.status_code = 201
+    mock_resp.json.return_value = {"fork_id": str(uuid.uuid4()), "version_number": 1}
     mock_client = AsyncMock()
     mock_client.post.return_value = mock_resp
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
