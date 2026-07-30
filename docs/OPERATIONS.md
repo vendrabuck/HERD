@@ -8,8 +8,9 @@ Day-2 operational procedures for whoever is running a HERD deployment. For initi
 make up            # start stack (dev mode: hot-reload)
 make prod          # start stack (production mode)
 make down          # stop stack, preserve volumes
-make clean         # stop + delete all volumes + purge caches (destructive)
-make clean-images  # down + remove every herd-* image + prune dangling (HERD-only; unrelated images untouched)
+make clean         # stop stack (volumes/data KEPT) + purge caches
+make clean-data    # stop + delete all volumes including Postgres data (destructive)
+make clean-images  # down + remove every HERD image + prune dangling (HERD-only; unrelated images untouched)
 make restart       # restart without losing data
 make logs          # tail all container logs
 make shell-<svc>   # exec into a service container (auth, inventory, ...)
@@ -18,7 +19,7 @@ make migrate       # run alembic upgrade head in every migratable service
 make migrate-<svc> # single-service migration
 ```
 
-`make clean` drops every Docker volume including Postgres data. Never run it on an environment you care about without a backup. `make clean-images` goes further: it also deletes every HERD-tagged Docker image and prunes dangling layers so the next `make up` or `make build` rebuilds from scratch; it does not touch unrelated images on the host.
+`make clean` stops the stack and purges caches but KEEPS every Docker volume, so data survives; the `make master` and `make everything` gates run in a separate `<dir>-gate` compose project and never touch the dev stack's volumes either. `make clean-data` is the destructive variant: it drops every dev-stack volume including Postgres data. Never run it on an environment you care about without a backup. `make clean-images` goes further still: it also deletes every HERD-tagged Docker image (dev and gate projects) and prunes dangling layers so the next `make up` or `make build` rebuilds from scratch; it does not touch unrelated images on the host.
 
 ## Config-service first-run
 

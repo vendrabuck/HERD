@@ -12,13 +12,31 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # format-checked locally and in CI. Today this is just the seed script.
 ROOT_PY := seed_devices_public.py
 
+# The ephemeral master/everything gate stack runs in its OWN compose project so
+# its volumes never collide with the dev stack's: the gate is always born fresh
+# (gate-clean purges only the gate project) and `make up` after a gate run
+# restores the dev stack WITH its data, no reseed needed. Lowercased because
+# compose project names reject uppercase (leading non-alphanumerics are
+# stripped, also a compose rule); derived from the directory so worktree gates
+# are isolated per-worktree too.
+#
+# Gate-phase sub-makes that run tests pass COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
+# on the command line: make exports command-line variables to recipe
+# environments, so every bare `docker compose` in those recipes AND in test
+# code (integration tests stop/start containers, the config e2e test execs
+# into the config container) resolves to the gate project. A standalone
+# `make test-e2e` or `make test-integration` has no override and targets the
+# dev stack as before.
+GATE_PROJECT := $(shell printf '%s' '$(notdir $(CURDIR))' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-' | sed 's/^[^a-z0-9]*//')-gate
+GATE_COMPOSE := docker compose -p $(GATE_PROJECT)
+
 # Coverage package name per service. Most are app/; common ships herd_common/.
 cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 
 # Self-documenting help is the default goal: a bare `make` prints the target list.
 .DEFAULT_GOAL := help
 
-.PHONY: help audit master master-quick master-clean clean-images everything \
+.PHONY: help audit master master-quick master-clean clean-images everything everything-noload \
 	up dev prod down build logs restart \
 	migrate test coverage \
 	$(addprefix test-,$(SERVICES)) \
@@ -27,7 +45,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix shell-,$(DB_SERVICES)) \
 	test-frontend test-integration test-contract test-load test-load-ui test-e2e test-e2e-stop test-auth-ldap \
 	test-root coverage-parallel coverage-frontend \
-	install frontend-install frontend-dev lint format clean seed \
+	install frontend-install frontend-dev lint format clean clean-data gate-clean seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed
 
@@ -120,7 +138,7 @@ master-quick:  ## Fast gate: format + lint + unit + frontend + build
 	@echo ""
 	@echo "=== master-quick complete ==="
 
-master: clean master-quick  ## Full gate: master-quick + ephemeral stack contract/integration/e2e
+master: gate-clean master-quick  ## Full gate: master-quick + ephemeral stack contract/integration/e2e
 	@echo ""
 	@echo "=== Starting ephemeral stack for integration + e2e ==="
 	@# Always tear the stack down, even if integration or e2e fails.
@@ -130,9 +148,9 @@ master: clean master-quick  ## Full gate: master-quick + ephemeral stack contrac
 		echo "" && echo "=== Contract tests ===" && \
 		$(MAKE) test-contract && \
 		echo "" && echo "=== Integration tests ===" && \
-		$(MAKE) test-integration && \
+		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
-		$(MAKE) test-e2e
+		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
 	@echo ""
 	@echo "=== master complete ==="
 
@@ -146,8 +164,9 @@ master: clean master-quick  ## Full gate: master-quick + ephemeral stack contrac
 clean-images:
 	@echo ""
 	@echo "=== Removing HERD compose images ==="
-	-docker compose down -v --remove-orphans
-	@ids=$$(docker images --filter "reference=herd-*" -q | sort -u); \
+	-docker compose down --remove-orphans
+	-$(GATE_COMPOSE) down -v --remove-orphans
+	@ids=$$(docker images --filter "reference=herd-*" --filter "reference=$(GATE_PROJECT)-*" -q | sort -u); \
 		if [ -n "$$ids" ]; then \
 			echo "$$ids" | xargs -r docker rmi -f; \
 		else \
@@ -168,7 +187,11 @@ master-clean: clean-images  ## master with all HERD compose images rebuilt --no-
 #   - Adds headless locust stress test after e2e.
 # Everything stops on first failure; teardown is trapped.
 
-everything: clean  ## Closest-to-CI gate: master + coverage + format-check + load tests
+# Set EVERYTHING_LOAD=0 (or use everything-noload) to stop after e2e: no seed,
+# no locust. Everything else is identical, including the gate-project stack.
+EVERYTHING_LOAD ?= 1
+
+everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check + load tests
 	@echo ""
 	@echo "=== Installing Python dependencies ==="
 	uv sync --all-extras
@@ -204,15 +227,22 @@ everything: clean  ## Closest-to-CI gate: master + coverage + format-check + loa
 		echo "" && echo "=== Contract tests ===" && \
 		$(MAKE) test-contract && \
 		echo "" && echo "=== Integration tests ===" && \
-		$(MAKE) test-integration && \
+		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
-		$(MAKE) test-e2e && \
-		echo "" && echo "=== Seeding stack for load tests ===" && \
-		$(MAKE) _everything-seed && \
-		echo "" && echo "=== Load / stress tests ===" && \
-		HERD_BASE_URL=https://localhost $(MAKE) test-load
+		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		if [ "$(EVERYTHING_LOAD)" != "0" ]; then \
+			echo "" && echo "=== Seeding gate stack for load tests ===" && \
+			$(MAKE) _everything-seed && \
+			echo "" && echo "=== Load / stress tests ===" && \
+			HERD_BASE_URL=https://localhost $(MAKE) test-load; \
+		else \
+			echo "" && echo "=== Skipping seed + load tests (EVERYTHING_LOAD=0) ==="; \
+		fi
 	@echo ""
 	@echo "=== everything complete ==="
+
+everything-noload:  ## everything minus the seed + load-test tail
+	$(MAKE) everything EVERYTHING_LOAD=0
 
 # Seeds the running stack via seed_devices_public.py: users, drivers, templates,
 # devices, ports, L1/L2 switches, cabling, device/user groups, 6 isolated demo
@@ -248,7 +278,7 @@ _everything-seed:
 seed: _everything-seed  ## Seed a running stack with demo users, devices, cabling, and topologies
 
 _master-stack-up:
-	docker compose up -d --build
+	$(GATE_COMPOSE) up -d --build
 
 _master-wait-healthy:
 	@echo "Waiting for stack to report healthy..."
@@ -264,9 +294,9 @@ _master-wait-healthy:
 
 _master-stack-down:
 	@echo ""
-	@echo "=== Tearing down ephemeral stack ==="
-	-$(MAKE) test-e2e-stop
-	-docker compose down -v
+	@echo "=== Tearing down ephemeral gate stack ==="
+	-$(MAKE) test-e2e-stop COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
+	-$(GATE_COMPOSE) down -v --remove-orphans
 
 ## --- Docker Compose ---
 
@@ -479,11 +509,22 @@ format:  ## Format and autofix backend Python (services/ + root scripts)
 
 # -- Cleanup ------------------------------------------------------------------
 
-clean:  ## Tear down stack and remove caches/coverage artifacts
-	docker compose down -v --remove-orphans
+clean:  ## Stop the stack (KEEPING volumes/data) and remove caches/coverage artifacts
+	docker compose down --remove-orphans
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name htmlcov -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name coverage.xml -delete 2>/dev/null || true
 	find . -type f -name .coverage -delete 2>/dev/null || true
+
+# Pre-gate cleanup for master/everything. Both compose projects publish the same
+# host ports, so the dev stack must be STOPPED before the gate stack can boot;
+# stopping without -v is what preserves the dev volumes (data and seed) across a
+# gate run. The gate project itself is purged WITH volumes so every gate is born
+# on a fresh database.
+gate-clean: clean  ## Stop the dev stack (data kept), purge any stale gate-project stack
+	$(GATE_COMPOSE) down -v --remove-orphans
+
+clean-data:  ## DESTRUCTIVE: tear down the dev stack INCLUDING volumes (the pre-gate-isolation `make clean`)
+	docker compose down -v --remove-orphans
