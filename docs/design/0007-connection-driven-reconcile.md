@@ -55,9 +55,12 @@ P3b phase 1 delivers connection-driven reconcile for L1 only: disconnect the
 released physical pairs, then connect the built pairs, keyed by a new L1 assignment
 table (Decision 4). L2 VLAN and L3 route provisioning stay device-set-driven until a
 P3b phase 2, which this ADR bounds but does not fully design. (Superseded for L2:
-ADR 0009 phase 4, issue #416, has since made L2 VLAN membership connection-driven on
-the same wiring_changed apply; L3 remains device-set-driven pending its own ADR 0009
-phase. The statements below describe the phase-1 boundary as it stood.)
+ADR 0009 phase 4, issue #416, made L2 VLAN membership connection-driven on the same
+wiring_changed apply; for L3: ADR 0009 phase 5 made route adjacency connection-driven
+the same way. ADR 0009 phase 7 then retired the legacy device-set resolvers entirely,
+so initial provisioning is now fork-driven via an activation-staged wiring_changed
+reconcile, not device-set-driven at all. The statements below describe the phase-1
+boundary as it stood.)
 
 Rationale: a fork's wiring is L1 by construction. `resolve_canvas_wiring`
 (`services/cabling/app/services/fork_save_service.py:79-90`) resolves every canvas

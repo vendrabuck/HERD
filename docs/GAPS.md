@@ -35,7 +35,7 @@ MEDIUM, LOW) and a concrete target file path.
 
 - **[MEDIUM] Execution consumer: inventory/cabling 5xx during fetch.** Covered
   in principle by the existing transient-error NAK test, but no concrete test
-  drives an HTTP 5xx from `_fetch_device` / `_fetch_connections_for_device`
+  drives an HTTP 5xx from `_fetch_device` / `_fetch_fork_intended_wires`
   through to NAK and then DLQ after max-deliver. Target: extend
   `services/execution/tests/test_nats_consumer.py`.
 

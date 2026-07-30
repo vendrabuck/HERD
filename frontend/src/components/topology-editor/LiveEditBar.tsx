@@ -55,9 +55,9 @@ export function LiveEditBar({
             )}
           </div>
           <p className="text-xs text-gray-600 mt-1">
-            Changes commit to the running reservation and re-provision the
-            affected devices. Edits autosave as drafts; committing saves a fork
-            version and leaves the master topology untouched.
+            Changes commit to the fork and reconcile the wiring to hardware.
+            Edits autosave as drafts; committing saves a fork version and
+            leaves the master topology untouched.
           </p>
           {blocked && (
             <p className="text-xs text-red-600 mt-1">

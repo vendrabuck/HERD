@@ -210,9 +210,9 @@ immutable to failure writers) which extends to the new ledgers.
    adjacency-aware release.
 6. Ledger-driven teardown: terminal transitions release from ledgers;
    failed-teardown migrates off action_succeeded_for_reservation.
-7. Initial-provision unification: activation stages the initial
-   wiring_changed; legacy resolvers retire; device-add semantics per
-   Decision 6.
+7. Initial-provision unification (DELIVERED, issue #416): activation stages
+   the initial wiring_changed; legacy resolvers retire; device-add semantics
+   per Decision 6.
 8. Surfaces and docs: layered wiring-status and Wiring tab, EXTERNAL_API,
    FEATURES/PLANNED_FEATURES status flips, ADR 0007 status pointer.
 

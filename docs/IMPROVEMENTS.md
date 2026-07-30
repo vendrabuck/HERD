@@ -72,17 +72,16 @@ heavy-usage reports become common
 These are not bugs; they are shape improvements that reduce the cost of the next change.
 They are the core of the "larger refactor another time" scope.
 
-- **Extract the per-switch driver-execution loop.** `_execute_switch_operations` (L1),
-  `_execute_l2_switch_operations`, and `_execute_l3_switch_operations` in
-  `services/execution/app/services/nats_consumer.py` now share a large, near-identical
-  skeleton: resolve adjacent switches, per switch load the driver, one login, a guarded
-  per-item action loop with ExecutionRun bookkeeping, one logout. The three copies drift
-  (the L2/L3 deprovision ordering difference is real and load-bearing, but the login /
-  logout / ExecutionRun / dedupe scaffolding is boilerplate). A shared helper that takes a
-  per-connection-type "plan" (the ordered list of guarded actions plus their kwargs and
-  identity) would collapse three ~250-line functions into one skeleton plus three small
-  planners, and would make a future Layer 4 or vendor-specific contract a planner rather
-  than a fourth copy. This is the single highest-leverage refactor in the backend.
+- **Extract the per-switch driver-execution loop.** The three layered reconcile appliers
+  (`_apply_wiring_pairs` for L1, `_apply_l2_memberships`, `_apply_l3_adjacency`) in
+  `services/execution/app/services/nats_consumer.py` share a near-identical per-switch
+  skeleton: load the driver, one login, a guarded per-item action loop with ExecutionRun
+  bookkeeping and result-gated ledger writes, one logout. (ADR 0009 phase 7 deleted the
+  previous three `_execute_*_switch_operations` copies of this pattern; the reconcile
+  appliers inherited its shape.) A shared helper that takes a per-connection-type "plan"
+  (the ordered list of guarded actions plus their kwargs and identity) would collapse the
+  copies into one skeleton plus three small planners, and would make a future Layer 4 or
+  vendor-specific contract a planner rather than a fourth copy.
 - **A shared internal-service HTTP client in `herd_common`.** Every service hand-rolls
   `httpx.AsyncClient(...)` calls to peers with an inline timeout and an `X-Internal-Token`
   header, and each re-implements the 5xx-is-transient / 404-is-absent classification
