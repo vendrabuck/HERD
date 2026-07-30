@@ -2985,11 +2985,12 @@ async def handle_reservation_event(
             # Device add/remove changes meaning in ADR 0009 phase 7 (Decision 6, the
             # user-visible change): an added device wires NOTHING until a fork save draws
             # its connections, and a removed device's wiring releases through the fork
-            # (a fork save prunes the departed device's edges from the intended set and
-            # stages a wiring_changed that releases them; the sweep heal is the backstop).
-            # So the device-set PATCH no longer drives any L1/L2/L3 wiring here. It keeps
-            # its two non-wiring roles: the health-tier transition above, and dynamic
-            # teardown for a removed device whose materialized instance must be destroyed.
+            # (the reservations PATCH handler prunes the device's nodes/edges from the
+            # fork through the save reconcile and stages the released delta; the sweep
+            # heal covers a missed staging). So the device-set PATCH no longer drives any
+            # L1/L2/L3 wiring here. It keeps its two non-wiring roles: the health-tier
+            # transition above, and dynamic teardown for a removed device whose
+            # materialized instance must be destroyed.
             removed_ids = event_data.get("removed_device_ids", [])
             if removed_ids:
                 await _execute_dynamic_teardown(

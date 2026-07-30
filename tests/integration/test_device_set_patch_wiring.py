@@ -1,18 +1,22 @@
-"""End-to-end pin of ADR 0009 Decision 6: the device-set PATCH drives no wiring.
+"""End-to-end pin of ADR 0009 Decision 6: device-set PATCH wiring semantics.
 
-The one user-visible semantics change of the ADR 0009 phase 7 unification: adding
-a device to a reservation via the device-set PATCH wires NOTHING (the PATCH keeps
-only its dynamic-instance and health-tier roles); the device's wiring comes from
-the fork, so it is wired exactly when a fork save draws its connections. This
-suite proves both halves live:
+The one user-visible semantics change of the ADR 0009 phase 7 unification. ADD half:
+adding a device via the device-set PATCH wires NOTHING (the PATCH keeps only its
+dynamic-instance and health-tier roles); the device is wired exactly when a fork save
+draws its connections. REMOVE half: removing a device prunes its nodes/edges from the
+fork through the save reconcile, releasing its cross-connects and freeing its port
+claims for other reservations.
 
-1. PATCH-add produces zero driver runs. Deterministic via the ordering anchor
-   pattern: the execution consumer processes the reservations stream
-   sequentially, so once the wiring_changed staged by the LATER fork save has
-   provisioned, the PATCH's reservation.updated was provably consumed, and any
-   wiring it drove would already be visible in /execution/runs.
-2. The subsequent fork save that draws the added device's edge is what connects
-   it (a connect_ports SUCCESS on the switch, and exactly one such run in total).
+The ADD proof is deterministic via a same-reservation ordering anchor: the execution
+consumer processes the reservations stream sequentially, so once the wiring_changed
+staged by the LATER fork save (for this same reservation) has provisioned, the
+PATCH's earlier reservation.updated was provably consumed; had it wired anything,
+that run would already be visible in /execution/runs, and the total connect_ports
+count would exceed the save's one.
+
+The REMOVE proof asserts both observables: the released pair's disconnect_ports
+SUCCESS run, and the freed port claim (a second reservation's fork save claims the
+same switch port without the cross-reservation 409).
 
 Self-seeds the mock L1 driver (session fixtures), per the integration-test
 seeding convention.
@@ -195,30 +199,36 @@ async def _poll_runs(
     return matched
 
 
-async def test_patch_add_wires_nothing_until_fork_save(
+async def test_patch_add_wires_nothing_until_fork_save_and_remove_releases(
     admin_client, patch_l1_template, fresh_devices
 ):
-    """Decision 6 end to end: a device-set PATCH add drives zero wiring; the
-    subsequent fork save that draws the device's edge connects it."""
+    """Decision 6 end to end. ADD: a device-set PATCH add drives zero wiring; the
+    subsequent fork save that draws the device's edge connects it. REMOVE: a
+    device-set PATCH remove prunes the device's fork edges through the save
+    reconcile, releasing its cross-connect (disconnect_ports) and freeing its port
+    claims for another reservation's save."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, patch_l1_template["id"], f"mock-l1-d6-{suffix}")
-    dut_a, dut_b = await fresh_devices(2)
-    reservation = None
+    dut_a, dut_b, dut_c = await fresh_devices(3)
+    reservations = []
     connections = []
-    topology_id = None
+    topology_ids = []
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
+        connections.append(await _connect(admin_client, dut_c["id"], switch["id"], "p3"))
 
         # Book dut_a alone against an EDGELESS topology: the fork exists from
         # activation but its intended set is empty, so activation wires nothing.
-        topology_id = await _create_topology(admin_client, _canvas([dut_a["id"]], []))
-        reservation = await _reserve(admin_client, [dut_a["id"]], topology_id)
-        res_id = reservation["id"]
+        topo_a = await _create_topology(admin_client, _canvas([dut_a["id"]], []))
+        topology_ids.append(topo_a)
+        res_a = await _reserve(admin_client, [dut_a["id"]], topo_a)
+        reservations.append(res_a)
+        res_id = res_a["id"]
         assert await _poll_active(admin_client, res_id), "reservation never activated"
 
-        # Add dut_b via the device-set PATCH. Decision 6: this reserves the device
-        # (dynamic/health-tier roles) but wires NOTHING.
+        # ADD half. Add dut_b via the device-set PATCH. Decision 6: this reserves the
+        # device (dynamic/health-tier roles) but wires NOTHING.
         resp = await admin_client.patch(
             f"/reservations/{res_id}",
             json={"device_ids": [dut_a["id"], dut_b["id"]]},
@@ -239,17 +249,52 @@ async def test_patch_add_wires_nothing_until_fork_save(
         kw = runs[0]["input_params"]["method_kwargs"]
         assert {kw["port_a"], kw["port_b"]} == {"p1", "p2"}
 
-        # Ordering anchor: the save's wiring_changed was staged AFTER the PATCH's
-        # reservation.updated, and the consumer processes the stream sequentially,
-        # so the PATCH event is provably consumed by now. Exactly one connect_ports
-        # exists: the save's. The PATCH added none.
+        # Ordering anchor (same reservation): the save's wiring_changed was staged
+        # AFTER the PATCH's reservation.updated, and the consumer processes the
+        # stream sequentially, so the PATCH event is provably consumed by now.
+        # Exactly one connect_ports exists: the save's. The PATCH added none.
         assert len(await _runs(admin_client, res_id, "connect_ports")) == 1, (
             "the device-set PATCH must not wire an added device (ADR 0009 Decision 6)"
         )
+
+        # REMOVE half. Remove dut_b: reservations prunes its fork edges through the
+        # save reconcile and stages the released delta, so the pair disconnects.
+        resp = await admin_client.patch(
+            f"/reservations/{res_id}",
+            json={"device_ids": [dut_a["id"]]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["device_ids"] == [dut_a["id"]]
+
+        disconnects = await _poll_runs(admin_client, res_id, "disconnect_ports")
+        assert disconnects, "PATCH-remove never released the removed device's pair"
+        assert str(disconnects[0]["device_id"]) == switch["id"]
+        kw = disconnects[0]["input_params"]["method_kwargs"]
+        assert {kw["port_a"], kw["port_b"]} == {"p1", "p2"}
+
+        # The port claims are gone: a SECOND reservation can claim switch port p2
+        # (previously held by res_a's fork) without the cross-reservation 409.
+        # dut_b is AVAILABLE again after the PATCH released it.
+        topo_b = await _create_topology(admin_client, _canvas([dut_b["id"], dut_c["id"]], []))
+        topology_ids.append(topo_b)
+        res_b = await _reserve(admin_client, [dut_b["id"], dut_c["id"]], topo_b)
+        reservations.append(res_b)
+        assert await _poll_active(admin_client, res_b["id"]), "reservation B never activated"
+        save_b = await admin_client.post(
+            f"/reservations/{res_b['id']}/fork/save",
+            json={"canvas_data": _canvas([dut_b["id"], dut_c["id"]], [(dut_b["id"], dut_c["id"])])},
+        )
+        assert save_b.status_code == 200, (
+            f"port claim was not released by the PATCH-remove prune: {save_b.text}"
+        )
+        runs_b = await _poll_runs(admin_client, res_b["id"], "connect_ports")
+        assert runs_b, "reservation B's save never connected its pair"
+        kw_b = runs_b[0]["input_params"]["method_kwargs"]
+        assert {kw_b["port_a"], kw_b["port_b"]} == {"p2", "p3"}
     finally:
-        if reservation:
+        for reservation in reservations:
             await admin_client.delete(f"/reservations/{reservation['id']}")
-        if topology_id:
+        for topology_id in topology_ids:
             await admin_client.delete(f"/cabling/topologies/{topology_id}")
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")

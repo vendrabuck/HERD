@@ -349,6 +349,156 @@ async def _create_reservation_fork_best_effort(
         )
 
 
+def _prune_canvas_for_devices(
+    canvas: dict, removed_ids: set[str]
+) -> tuple[dict, bool, set[str], set[str]]:
+    """Remove the given devices' nodes (and their incident edges) from a fork canvas.
+
+    Returns (pruned_canvas, edges_pruned, pruned_node_ids, remaining_edge_ids). Node
+    device resolution mirrors cabling's node_to_device_map (node.data.device.id), so
+    a node this helper keeps is exactly a node the save resolver would keep.
+    """
+    nodes = canvas.get("nodes") or []
+    edges = canvas.get("edges") or []
+    pruned_node_ids = {
+        node.get("id")
+        for node in nodes
+        if str(((node.get("data") or {}).get("device") or {}).get("id")) in removed_ids
+    }
+    kept_nodes = [n for n in nodes if n.get("id") not in pruned_node_ids]
+    kept_edges = [
+        e
+        for e in edges
+        if e.get("source") not in pruned_node_ids and e.get("target") not in pruned_node_ids
+    ]
+    pruned = {**canvas, "nodes": kept_nodes, "edges": kept_edges}
+    remaining_edge_ids = {str(e.get("id")) for e in kept_edges if e.get("id") is not None}
+    return pruned, len(kept_edges) != len(edges), pruned_node_ids, remaining_edge_ids
+
+
+async def _prune_removed_devices_from_fork(
+    reservation_id: uuid.UUID,
+    removed_device_ids: list[uuid.UUID],
+    created_by: str,
+) -> None:
+    """Release a removed device's wiring by re-saving its pruned fork (Decision 6).
+
+    The REMOVE half of the ADR 0009 phase 7 device-set semantics: a device removed
+    via the PATCH releases its wiring THROUGH the fork, not through a device-set
+    resolver. This routes the release through the exact save-shaped path a user fork
+    save takes: prune the removed devices' nodes and incident edges from the fork's
+    stored canvas, push the pruned canvas through cabling's save reconcile
+    (set-arithmetic release, fork_version bump, port-claim release), and stage the
+    returned delta via stage_wiring_changed (atomic outbox+ledger), so the release
+    rides the normal full/delta reconcile apply with release-direction retryable rows.
+
+    No-op rules (idempotent under PATCH retries, no spurious version bumps):
+    - no fork (404): nothing to release (PENDING, or Case A before lazy-create);
+    - no incident canvas edges AND no stale fork_connections for the devices: skip
+      the save entirely (a bare node prune is not worth a version);
+    - a stale fork_connection (its edge_key absent from the remaining canvas edges,
+      the loose-draft divergence case) still forces the save so the recorded wire
+      releases; a hop whose edge_key belongs to a REMAINING edge is a through-hop
+      serving another edge and never re-triggers a save.
+
+    A cabling 409 (ARCHIVED fork, or a port conflict a concurrent save created) is
+    logged and dropped: the reservation ended, or a later save/heal converges it.
+    Raises on transport/5xx so the best-effort wrapper's retry loop can see it.
+    """
+    resp = await _cabling_fork_call("GET", f"/internal/forks/{reservation_id}")
+    if resp.status_code == 404:
+        return
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cabling fork GET returned {resp.status_code}: {resp.text}")
+    fork = resp.json()
+
+    removed = {str(d) for d in removed_device_ids}
+    canvas = fork.get("canvas_data") or {}
+    pruned_canvas, edges_pruned, _pruned_nodes, remaining_edge_ids = _prune_canvas_for_devices(
+        canvas, removed
+    )
+
+    stale_wire = any(
+        (str(conn.get("device_a_id")) in removed or str(conn.get("device_b_id")) in removed)
+        and conn.get("edge_key") is not None
+        and str(conn.get("edge_key")) not in remaining_edge_ids
+        for conn in fork.get("connections") or []
+    )
+    if not edges_pruned and not stale_wire:
+        return
+
+    resp = await _cabling_fork_call(
+        "POST",
+        f"/internal/forks/{reservation_id}/save",
+        json_body={"canvas_data": pruned_canvas, "created_by": created_by},
+    )
+    if resp.status_code == 409:
+        logger.warning(
+            "Fork prune save refused (409) for reservation %s; a later save or heal converges",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_prune_refused",
+                "reservation_id": str(reservation_id),
+            },
+        )
+        return
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Cabling fork prune save returned {resp.status_code}: {resp.text}")
+    data = resp.json()
+
+    # Stage the released/built delta exactly as the user save handler does; its own
+    # atomic outbox+ledger commit. A staging failure leaves cabling's committed
+    # version ahead of the ledger, so the sweep's delta-less heal fires (the phase 7
+    # backstop sentence for removals holds through this ledger gap).
+    async with AsyncSessionLocal() as db:
+        await stage_wiring_changed(
+            db,
+            reservation_id,
+            int(data["version_number"]),
+            released=data.get("released") or [],
+            built=data.get("built") or [],
+        )
+
+
+async def _prune_removed_devices_from_fork_best_effort(
+    reservation_id: uuid.UUID,
+    removed_device_ids: list[uuid.UUID],
+    created_by: str,
+) -> None:
+    """Prune with bounded retry and log-and-continue (the Decision 6 fail-open posture).
+
+    Mirrors _create_reservation_fork_best_effort: the device-set edit has already
+    committed and must not be unwound by a cabling outage. Exhausted retries are
+    structured-logged and swallowed; recovery is any later fork save (the user's
+    canvas no longer shows the device) or a PATCH retry.
+    """
+    if not removed_device_ids:
+        return
+    if not settings.internal_api_token:
+        return
+    try:
+        await retry_with_backoff(
+            lambda: _prune_removed_devices_from_fork(
+                reservation_id, removed_device_ids, created_by
+            ),
+            attempts=3,
+            initial_delay=0.5,
+            factor=2.0,
+            max_delay=5.0,
+        )
+    except Exception:
+        logger.error(
+            "Fork prune failed for reservation %s; removed-device wiring not yet released",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_prune_failed",
+                "reservation_id": str(reservation_id),
+                "removed_device_ids": [str(d) for d in removed_device_ids],
+            },
+            exc_info=True,
+        )
+
+
 async def _cabling_fork_call(
     method: str,
     path: str,
@@ -1554,6 +1704,17 @@ async def update_reservation(
     )
     await db.commit()
     await db.refresh(reservation)
+
+    # Decision 6 REMOVE half (ADR 0009 phase 7): a device removed from an ACTIVE
+    # reservation releases its wiring through the fork. Prune its nodes/edges from the
+    # fork and push the pruned canvas through the save reconcile, staging the released
+    # delta; best-effort after the committed edit, exactly like fork creation at
+    # activation. PENDING reservations have no fork (the prune 404s to a no-op) and
+    # are skipped outright; the ADD half deliberately wires nothing until a fork save.
+    if removed_ids and reservation.status == ReservationStatus.ACTIVE:
+        await _prune_removed_devices_from_fork_best_effort(
+            reservation.id, removed_ids, created_by=str(user_id)
+        )
 
     logger.info(
         "Reservation updated: %s",
