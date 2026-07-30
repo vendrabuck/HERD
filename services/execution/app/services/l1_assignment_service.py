@@ -605,9 +605,9 @@ def compute_backfill_assignments(runs) -> list[dict]:
 
     `runs` is any iterable of rows exposing reservation_id, device_id (the
     switch), action, status, port_a, port_b, created_at (dicts or attribute
-    objects both work). This mirrors the execution_runs inference
-    action_succeeded_for_reservation uses (a SUCCESS connect_ports means the pair
-    was cross-connected), refined to a projection of CURRENT state: a pair is live
+    objects both work). This mirrors the execution_runs inference the retired
+    action_succeeded_for_reservation helper used (a SUCCESS connect_ports means the
+    pair was cross-connected), refined to a projection of CURRENT state: a pair is live
     only when its latest SUCCESS connect_ports is not followed by a SUCCESS
     disconnect_ports. Keying on (switch_device_id, canonical pair) yields at most
     one ACTIVE row per pair, so the backfill can never violate the active-unique

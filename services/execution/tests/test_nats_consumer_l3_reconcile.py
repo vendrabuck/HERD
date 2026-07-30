@@ -18,8 +18,11 @@ import pytest
 from app.database import Base
 from app.models.route_assignment import RouteAssignment
 from app.services.nats_consumer import (
+    TransientUpstreamError,
     _derive_l3_adjacency,
+    _fetch_latest_config,
     _FetchContext,
+    _route_run_identity,
     handle_wiring_changed,
 )
 from app.services.route_service import record_route_active, record_route_failed
@@ -384,3 +387,71 @@ async def test_l3_pass_runs_after_l2_within_one_apply():
     assert actions.index("add_to_vlan") < actions.index("configure_route"), (
         "the L2 membership pass must complete before the L3 adjacency pass"
     )
+
+
+async def test_provision_skips_switch_whose_config_has_no_routes():
+    """A newly adjacent L3 switch whose latest config declares no routes provisions
+    nothing and pins nothing (re-expresses the retired legacy pin
+    test_execute_l3_provision_noops_when_config_has_no_routes on the reconcile path)."""
+
+    async def _no_routes_config(device_id, client=None):
+        return {"config": {"routes": []}}
+
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], config_fetch=_no_routes_config
+    )
+    assert [c for c in calls if c[0] == "configure_route"] == []
+    assert await _rows() == []
+
+
+async def test_provision_wraps_routes_in_one_login_logout():
+    """All of a switch's routes provision inside ONE login/logout session
+    (re-expresses the retired legacy pin
+    test_execute_l3_provision_wraps_routes_in_one_login_logout)."""
+    calls = await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")])
+    actions = [a for a, _ in calls]
+    assert actions.count("login") == 1
+    assert actions.count("logout") == 1
+    assert actions.count("configure_route") == len(ROUTES)
+    assert actions.index("login") < actions.index("configure_route")
+    assert actions.index("logout") > max(i for i, a in enumerate(actions) if a == "configure_route")
+
+
+# --- surviving-helper unit tests (moved here when the retired device-set L3
+# --- executor tests in test_nats_consumer_l3.py were deleted for ADR 0009 phase 7) ---
+
+
+def test_route_run_identity_packs_three_fields():
+    """A route's idempotency identity puts destination in port_a and packs
+    interface plus next_hop into port_b as "interface|next_hop"; a None next_hop
+    renders as an empty string."""
+    assert _route_run_identity("10.0.0.0/24", "192.168.1.1", "eth0") == (
+        "10.0.0.0/24",
+        "eth0|192.168.1.1",
+    )
+    # None next_hop (an interface route) renders empty after the pipe.
+    assert _route_run_identity("10.1.0.0/24", None, "eth1") == ("10.1.0.0/24", "eth1|")
+
+
+async def test_config_fetch_5xx_raises_transient_for_nak():
+    """An inventory 5xx while fetching a switch's latest config must NAK the event
+    (raise TransientUpstreamError), not silently skip the reconcile."""
+
+    class _Resp:
+        status_code = 500
+
+    client = AsyncMock()
+    client.get = AsyncMock(return_value=_Resp())
+    with pytest.raises(TransientUpstreamError):
+        await _fetch_latest_config(SW_L3, client)
+
+
+async def test_config_fetch_404_returns_none():
+    """A 404 (no config version for the switch) resolves to None, a clean no-op."""
+
+    class _Resp:
+        status_code = 404
+
+    client = AsyncMock()
+    client.get = AsyncMock(return_value=_Resp())
+    assert await _fetch_latest_config(SW_L3, client) is None

@@ -300,6 +300,95 @@ async def test_partial_ledger_only_l3_pin_tears_down_cleanly():
     assert "remove_from_vlan" not in calls
 
 
+async def test_teardown_scoped_to_the_reservation():
+    """Another reservation's ACTIVE rows are untouched by this reservation's teardown.
+
+    Re-expresses the retired legacy pin (test_l1_failed_teardown_ignores_other_
+    reservations_connects) against the ledger path: the release query is scoped by
+    reservation_id, so a shared switch keeps serving its other tenants.
+    """
+    other_res = uuid.uuid4()
+    await _seed_l1()
+    async with TestSessionLocal() as s:
+        s.add(
+            L1ConnectionAssignment(
+                reservation_id=other_res,
+                switch_device_id=uuid.UUID(SW_L1),
+                port_a="0/0/7",
+                port_b="0/0/8",
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        await s.commit()
+
+    execute_fn, calls = _recorder()
+    await _teardown(execute_fn)
+
+    assert await _statuses(L1ConnectionAssignment) == ["RELEASED"]
+    async with TestSessionLocal() as s:
+        other_rows = (
+            (
+                await s.execute(
+                    select(L1ConnectionAssignment).where(
+                        L1ConnectionAssignment.reservation_id == other_res
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [r.status for r in other_rows] == ["ACTIVE"]
+    assert calls.count("disconnect_ports") == 1
+
+
+async def test_redelivered_terminal_event_is_idempotent():
+    """A redelivered terminal event tears down nothing more: the first delivery released
+    every row, so the second finds empty ACTIVE ledgers and drives zero driver calls.
+    Re-expresses the retired legacy pin (test_l1_failed_teardown_redelivery_is_idempotent)
+    at the ledger level, where released-state idempotency replaces the dedupe-key guard."""
+    await _seed_l1()
+    await _seed_l2()
+    await _seed_l3()
+
+    execute_fn, calls = _recorder()
+    await _handle("reservation.failed", execute_fn)
+    first_calls = list(calls)
+    assert "disconnect_ports" in first_calls
+
+    await _handle("reservation.failed", execute_fn)
+    assert calls == first_calls, "a redelivered terminal event must drive no further teardown"
+    assert await _statuses(L1ConnectionAssignment) == ["RELEASED"]
+    assert await _statuses(L2PortAssignment) == ["RELEASED"]
+    assert await _statuses(RouteAssignment) == ["RELEASED"]
+
+
+async def test_teardown_upstream_error_naks_and_keeps_rows_active():
+    """An UPSTREAM transient (inventory unreachable while resolving the switch) raises
+    for a NAK and leaves the ledger rows ACTIVE, so the redelivery retries the teardown.
+    Re-expresses the retired legacy keeps-rows-active-on-transient pin at the ledger
+    level: a transient is not a driver failure, so no FAILED row is written either."""
+    from app.services.nats_consumer import TransientUpstreamError
+
+    await _seed_l1()
+    execute_fn, _calls = _recorder()
+
+    with ExitStack() as stack:
+        for p in _driver_patches(execute_fn):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._fetch_device",
+                new=AsyncMock(side_effect=TransientUpstreamError("inventory 503")),
+            )
+        )
+        ctx = _FetchContext(None)
+        with pytest.raises(TransientUpstreamError):
+            await _teardown_from_ledgers(RES_ID, ctx, _db_session_factory())
+
+    assert await _statuses(L1ConnectionAssignment) == ["ACTIVE"]
+
+
 # --- driver failure lands a retryable FAILED intended-RELEASED row ---
 
 
@@ -363,22 +452,17 @@ async def test_failed_teardown_row_converges_on_manual_retry():
     assert await _statuses(L1ConnectionAssignment) == ["RELEASED"]
 
 
-# --- action_succeeded_for_reservation is no longer consulted ---
+# --- action_succeeded_for_reservation is retired (ADR 0009 phase 7 tombstone) ---
 
 
-async def test_action_succeeded_for_reservation_not_consulted():
-    """The ledger-driven teardown reads the ACTIVE ledgers directly and never calls the
-    legacy applied-state helper (issue #244 migration): the ACTIVE row IS the applied set."""
-    await _seed_l1()
-    execute_fn, _calls = _recorder()
-    with patch(
-        "app.services.execution_service.action_succeeded_for_reservation",
-        new=AsyncMock(return_value=True),
-    ) as spy:
-        await _teardown(execute_fn)
+def test_action_succeeded_for_reservation_is_removed():
+    """The legacy applied-state helper had no live caller after the ledger-driven
+    teardown landed, so ADR 0009 phase 7 deleted it. The ledger teardown reads the
+    ACTIVE ledgers directly (the ACTIVE row IS the applied set); pin its absence so a
+    reintroduction is caught."""
+    from app.services import execution_service
 
-    spy.assert_not_awaited()
-    assert await _statuses(L1ConnectionAssignment) == ["RELEASED"]
+    assert not hasattr(execution_service, "action_succeeded_for_reservation")
 
 
 # --- freeze ordering ---

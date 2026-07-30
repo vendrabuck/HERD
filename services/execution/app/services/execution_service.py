@@ -100,45 +100,6 @@ async def action_already_succeeded(
     return result.scalar_one_or_none() is not None
 
 
-async def action_succeeded_for_reservation(
-    db: AsyncSession,
-    reservation_id: uuid.UUID | None,
-    device_id: uuid.UUID,
-    action: str,
-    port_a: str | None,
-    port_b: str | None,
-) -> bool:
-    """Has this driver action ever SUCCEEDED for this reservation, any message?
-
-    Applied-state guard (issue #244), keyed on reservation_id rather than the source
-    message's dedupe_key (unlike action_already_succeeded), because the provision runs it
-    looks for were recorded by a different message (reservation.created or
-    reservation.updated), which carries a different key.
-
-    As of ADR 0009 phase 6 the terminal teardown no longer consults this helper: it reads
-    the ACTIVE wiring ledgers directly (see nats_consumer._teardown_from_ledgers), where an
-    ACTIVE l1_connection_assignments row IS an applied pair, so the applied-state-only
-    guarantee is intrinsic. This helper REMAINS for the pre-phase-2 device-set teardown
-    fallback (_execute_switch_operations' only_applied_pairs branch, retired with the legacy
-    resolvers in phase 7) and for execution-run backfill reads.
-
-    Returns False when reservation_id is None: with no reservation to scope
-    the lookup to, nothing counts as applied.
-    """
-    if reservation_id is None:
-        return False
-    conditions = [
-        ExecutionRun.reservation_id == reservation_id,
-        ExecutionRun.device_id == device_id,
-        ExecutionRun.action == action,
-        ExecutionRun.status == "SUCCESS",
-        ExecutionRun.port_a.is_(None) if port_a is None else ExecutionRun.port_a == port_a,
-        ExecutionRun.port_b.is_(None) if port_b is None else ExecutionRun.port_b == port_b,
-    ]
-    result = await db.execute(select(ExecutionRun.id).where(*conditions).limit(1))
-    return result.scalar_one_or_none() is not None
-
-
 async def update_execution_run(
     db: AsyncSession,
     run: ExecutionRun,
