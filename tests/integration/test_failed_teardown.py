@@ -1,20 +1,20 @@
 """Integration tests for reservation.failed provisioning teardown (issue #244).
 
-The producer currently emits reservation.failed only when the initial inventory
-flip fails, which happens BEFORE reservation.created is staged, so a genuinely
-half-provisioned FAILED reservation cannot be manufactured through the REST
-API. These tests therefore drive the execution consumer directly with synthetic
-reservation.created / reservation.failed events on the reservations stream (the
-consumer acts on payload device_ids and validates nothing against the
-reservations service). That is exactly the contract issue #244 hardens: the
-consumer's teardown invariant must hold for any producer ordering, current or
-future.
+The invariant under test: reservation.failed tears down exactly the provisioning
+that landed before the failure, and nothing else. As of ADR 0009 phase 6 the
+teardown is ledger-driven (an ACTIVE ledger row IS an applied op), and as of
+phase 7 the provisioning that writes those ledgers is fork-driven: each scenario
+books a reservation against a WIRED parent topology, so the activation-staged
+reservation.wiring_changed reconcile provisions the initial wiring and records
+the ledger rows the teardown then releases.
 
-The invariant under test: reservation.failed tears down exactly the
-provisioning that landed before the failure, and nothing else. Observability is
-GET /execution/runs (there is no REST endpoint for vlan/route assignment rows;
-a SUCCESS remove_* run driven by the stored state is the end-to-end proof the
-stored state existed and was used).
+The failed events themselves are still published synthetically onto the
+reservations stream: the consumer acts on its own ledgers and validates nothing
+against the reservations service, which is exactly the contract issue #244
+hardens (the teardown invariant must hold for any producer ordering, current or
+future). Observability is GET /execution/runs (there is no REST endpoint for
+vlan/route assignment rows; a SUCCESS remove_* run driven by the stored state is
+the end-to-end proof the stored state existed and was used).
 
 Ordering anchor pattern: the execution consumer processes the reservations
 stream sequentially, so publishing a later event and waiting for its runs
@@ -28,6 +28,7 @@ import json
 import os
 import tarfile
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -66,9 +67,9 @@ def _admin_session_client(base_url, admin_token):
 async def _publish_event(event: str, reservation_id: str, device_ids: list[str]) -> dict:
     """Publish a synthetic reservation lifecycle event to the reservations stream.
 
-    Stamps a fresh event_id (as the outbox relay does) so consumer-side action
-    dedupe keys on it; publishing the SAME returned payload again simulates a
-    JetStream redelivery / relay republish of one logical event.
+    Stamps a fresh event_id (as the outbox relay does); publishing the SAME
+    returned payload again simulates a JetStream redelivery / relay republish of
+    one logical event.
     """
     payload = {
         "event": event,
@@ -232,8 +233,58 @@ async def _create_config_version(client, device_id: str, routes: list[dict]) -> 
     return resp.json()
 
 
+def _canvas(edges: list[tuple[str, str]]) -> dict:
+    """A committed canvas wiring each (a_id, b_id) pair (React Flow shape)."""
+    node_ids: dict[str, str] = {}
+    nodes = []
+    for a_id, b_id in edges:
+        for device_id in (a_id, b_id):
+            if device_id not in node_ids:
+                node_ids[device_id] = f"n{len(node_ids)}"
+                nodes.append({"id": node_ids[device_id], "data": {"device": {"id": device_id}}})
+    return {
+        "nodes": nodes,
+        "edges": [
+            {
+                "id": f"e{i}",
+                "source": node_ids[a_id],
+                "target": node_ids[b_id],
+                "data": {"layer": "L1", "isProposal": False},
+            }
+            for i, (a_id, b_id) in enumerate(edges, start=1)
+        ],
+    }
+
+
+async def _create_topology(client, canvas: dict) -> str:
+    resp = await client.post(
+        "/cabling/topologies", json={"name": f"int-244-{uuid.uuid4().hex[:8]}"}
+    )
+    resp.raise_for_status()
+    topology_id = resp.json()["id"]
+    put = await client.put(f"/cabling/topologies/{topology_id}", json={"canvas_data": canvas})
+    put.raise_for_status()
+    return topology_id
+
+
+async def _reserve(client, device_ids: list[str], topology_id: str) -> dict:
+    now = datetime.now(timezone.utc)
+    resp = await client.post(
+        "/reservations/",
+        json={
+            "device_ids": device_ids,
+            "topology_id": topology_id,
+            "purpose": "issue #244 failed-teardown test",
+            "start_time": now.isoformat(),
+            "end_time": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempotent(
-    admin_client, teardown_templates, fresh_device
+    admin_client, teardown_templates, fresh_devices
 ):
     """reservation.failed after full L3 provisioning removes exactly the pinned
     routes; a redelivered failed event (same event_id) tears down nothing more."""
@@ -241,21 +292,28 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
     switch = await _create_switch(
         admin_client, teardown_templates["mock_l3"]["id"], f"failed-l3-sw-{suffix}"
     )
-    connection = None
-    res_id = str(uuid.uuid4())
-    anchor_res_id = str(uuid.uuid4())
+    dut_a, dut_b = await fresh_devices(2)
+    connections = []
+    topology_ids = []
+    reservations = []
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
-        connection = await _connect(
-            admin_client, fresh_device["id"], "eth0", switch["id"], "ge-0/0/1"
+        connections.append(
+            await _connect(admin_client, dut_a["id"], "eth0", switch["id"], "ge-0/0/1")
         )
 
-        await _publish_event("reservation.created", res_id, [fresh_device["id"]])
+        # Provision through the phase-7 path: a wired reservation whose activation
+        # stages the wiring_changed reconcile that pins and configures the routes.
+        topo_a = await _create_topology(admin_client, _canvas([(dut_a["id"], switch["id"])]))
+        topology_ids.append(topo_a)
+        res_a = await _reserve(admin_client, [dut_a["id"]], topo_a)
+        reservations.append(res_a)
+        res_id = res_a["id"]
         assert len(
             await _poll_runs(admin_client, res_id, "configure_route", count=len(ROUTES))
         ) == len(ROUTES), "provisioning never completed, cannot test failed teardown"
 
-        failed_payload = await _publish_event("reservation.failed", res_id, [fresh_device["id"]])
+        failed_payload = await _publish_event("reservation.failed", res_id, [dut_a["id"]])
         remove_runs = await _poll_runs(admin_client, res_id, "remove_route", count=len(ROUTES))
         assert len(remove_runs) == len(ROUTES), (
             "reservation.failed did not remove the pinned routes"
@@ -267,20 +325,29 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
         assert removed == {(r["destination"], r.get("next_hop"), r["interface"]) for r in ROUTES}
 
         # Redelivery: the same logical event again (same event_id). The pinned
-        # set is RELEASED and every action's SUCCESS run carries the key, so no
-        # further teardown may run. Anchor on a later event to avoid a sleep.
+        # set is RELEASED, so the ledger teardown finds nothing applied and no
+        # further teardown may run. Anchor on a later provisioning event (a second
+        # wired reservation on the same switch) to avoid a sleep.
         await _publish_raw("herd.reservations.failed", json.dumps(failed_payload).encode())
-        await _publish_event("reservation.created", anchor_res_id, [fresh_device["id"]])
-        assert await _poll_runs(admin_client, anchor_res_id, "configure_route"), (
-            "anchor event was never processed"
+        connections.append(
+            await _connect(admin_client, dut_b["id"], "eth0", switch["id"], "ge-0/0/2")
+        )
+        topo_b = await _create_topology(admin_client, _canvas([(dut_b["id"], switch["id"])]))
+        topology_ids.append(topo_b)
+        res_b = await _reserve(admin_client, [dut_b["id"]], topo_b)
+        reservations.append(res_b)
+        assert await _poll_runs(admin_client, res_b["id"], "configure_route"), (
+            "anchor reservation was never provisioned"
         )
         assert len(await _runs(admin_client, res_id, "remove_route", "SUCCESS")) == len(ROUTES), (
             "a redelivered reservation.failed re-ran teardown"
         )
     finally:
-        # Clean the anchor reservation's pinned routes for hygiene.
-        await _publish_event("reservation.failed", anchor_res_id, [fresh_device["id"]])
-        if connection:
+        for res in reservations:
+            await admin_client.delete(f"/reservations/{res['id']}")
+        for topology_id in topology_ids:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
@@ -299,26 +366,36 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
     sw_broken = await _create_switch(
         admin_client, template_id, f"failed-l1-broken-{suffix}", raise_actions="connect_ports"
     )
-    duts = await fresh_devices(2)
+    duts = await fresh_devices(4)
     connections = []
-    res_id = str(uuid.uuid4())
+    topology_id = None
+    reservation = None
     device_ids = [d["id"] for d in duts]
     try:
-        for i, dut in enumerate(duts, start=1):
+        # One DUT pair cabled through each switch, and one canvas edge per pair, so
+        # the fork's hops resolve deterministically: (dut0, dut1) through sw_ok and
+        # (dut2, dut3) through sw_broken. (A single DUT pair cabled to BOTH switches
+        # would leave the pathfinder free to pick either, making which switch
+        # provisions nondeterministic.)
+        for i, dut in enumerate(duts[:2], start=1):
             connections.append(
                 await _connect(admin_client, dut["id"], "eth0", sw_ok["id"], f"ok-p{i}")
             )
+        for i, dut in enumerate(duts[2:], start=1):
             connections.append(
-                await _connect(admin_client, dut["id"], "eth1", sw_broken["id"], f"bad-p{i}")
+                await _connect(admin_client, dut["id"], "eth0", sw_broken["id"], f"bad-p{i}")
             )
+        topology_id = await _create_topology(
+            admin_client,
+            _canvas([(duts[0]["id"], duts[1]["id"]), (duts[2]["id"], duts[3]["id"])]),
+        )
+        reservation = await _reserve(admin_client, device_ids, topology_id)
+        res_id = reservation["id"]
 
-        await _publish_event("reservation.created", res_id, device_ids)
         ok_connects = await _poll_runs(admin_client, res_id, "connect_ports")
         assert ok_connects, "connect_ports never succeeded on the healthy switch"
         assert {str(r["device_id"]) for r in ok_connects} == {sw_ok["id"]}
-        failed_connects = await _poll_runs(
-            admin_client, res_id, "connect_ports", status="FAILED"
-        )
+        failed_connects = await _poll_runs(admin_client, res_id, "connect_ports", status="FAILED")
         assert failed_connects, "the broken switch was supposed to raise on connect_ports"
         assert {str(r["device_id"]) for r in failed_connects} == {sw_broken["id"]}
 
@@ -332,14 +409,17 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
         torn_down = {(k["port_a"], k["port_b"]) for k in (_method_kwargs(r) for r in disconnects)}
         assert torn_down == applied
 
-        # The broken switch got no disconnect attempt in ANY status: the
-        # applied-state guard skips it before login.
+        # The broken switch got no disconnect attempt in ANY status: an ACTIVE
+        # ledger row is the teardown's only trigger, and its connect never landed
+        # one (the applied-state-only guarantee, now intrinsic to the ledger).
         all_runs = await _runs(admin_client, res_id)
-        broken_actions = {
-            r["action"] for r in all_runs if str(r["device_id"]) == sw_broken["id"]
-        }
+        broken_actions = {r["action"] for r in all_runs if str(r["device_id"]) == sw_broken["id"]}
         assert "disconnect_ports" not in broken_actions
     finally:
+        if reservation:
+            await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{sw_ok['id']}")
@@ -353,9 +433,9 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
     driver runs (in particular no derived-VLAN fallback teardown). Phase 2: the
     same topology provisioned then failed removes the STORED VLAN membership.
 
-    As of ADR 0009 phase 6 the terminal teardown is ledger-driven: it reads the
-    l2_port_assignments membership rows (written by the device-set provision during
-    the phase 4-6 overlap) and drives remove_from_vlan per port, then frees the
+    The teardown is ledger-driven (ADR 0009 phase 6): it reads the
+    l2_port_assignments membership rows (written by the fork-driven reconcile,
+    phase 7) and drives remove_from_vlan per port, then frees the
     vlan_assignments allocation IN THE DATABASE (the phase-4 allocation lifecycle
     coupling), so no delete_vlan driver call fires. The observable release is the
     remove_from_vlan run carrying the STORED VLAN id."""
@@ -364,17 +444,22 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
         admin_client, teardown_templates["mock_l2"]["id"], f"failed-l2-sw-{suffix}"
     )
     connection = None
+    topology_id = None
+    reservation = None
     unprovisioned_res_id = str(uuid.uuid4())
-    provisioned_res_id = str(uuid.uuid4())
     try:
         connection = await _connect(
             admin_client, fresh_device["id"], "eth0", switch["id"], "ge-0/0/1"
         )
 
-        # Phase 1: failed with nothing applied; the created event for the next
-        # reservation is the ordering anchor proving it was fully processed.
+        # Phase 1: failed with nothing applied; the provisioning of the next (real,
+        # wired) reservation is the ordering anchor proving it was fully processed.
         await _publish_event("reservation.failed", unprovisioned_res_id, [fresh_device["id"]])
-        await _publish_event("reservation.created", provisioned_res_id, [fresh_device["id"]])
+        topology_id = await _create_topology(
+            admin_client, _canvas([(fresh_device["id"], switch["id"])])
+        )
+        reservation = await _reserve(admin_client, [fresh_device["id"]], topology_id)
+        provisioned_res_id = reservation["id"]
         create_runs = await _poll_runs(admin_client, provisioned_res_id, "create_vlan")
         assert create_runs, "anchor provisioning never completed"
         assert await _runs(admin_client, unprovisioned_res_id) == [], (
@@ -397,6 +482,10 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
             "phase-6 ledger teardown frees the allocation in-DB, never calls delete_vlan"
         )
     finally:
+        if reservation:
+            await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

@@ -2,8 +2,9 @@
 
 End-to-end over a running HERD stack with the checked-in mock L1 driver:
 
-- The save flow: reserve and activate two DUTs cabled through an L1 switch (a
-  connect_ports fires on activation), then save an emptied fork canvas. The save
+- The save flow: reserve and activate two DUTs cabled through an L1 switch against a
+  WIRED parent topology (activation stages the initial wiring_changed reconcile, so a
+  connect_ports fires on activation, ADR 0009 phase 7), then save an emptied fork canvas. The save
   stages reservation.wiring_changed; the execution consumer reconciles the fork's
   now-empty intended set against the ACTIVE cross-connect and drives a
   disconnect_ports on the switch. Asserted through GET /execution/runs, the
@@ -345,11 +346,12 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
     (reservation.cancelled -> _teardown_from_ledgers reads the ACTIVE
     l1_connection_assignments rows and drives disconnect_ports), and the observable
     contract is unchanged: a failed disconnect still lands a FAILED intended-RELEASED
-    row, still surfaced and retryable, converging RELEASED on retry. The reservation is
-    created with no topology/fork; the ACTIVE L1 ledger rows come from the device-set
-    activation path (record_l1_connect on the successful connect), so the ledger-driven
-    teardown has exactly those rows to release. This is the phase-6 analogue of the
-    prior device-set disconnect path.
+    row, still surfaced and retryable, converging RELEASED on retry. As of ADR 0009
+    phase 7 initial provisioning is fork-driven: the reservation books a WIRED parent
+    topology, so activation stages the initial reconcile that connects the cross-connect
+    and writes the ACTIVE l1_connection_assignments rows (record_l1_connect on the gated
+    connect success), giving the ledger-driven teardown exactly those rows to release.
+    The fail knob targets disconnect_ports only, so the activation connect still succeeds.
     """
     nats_err = await probe_nats()
     if nats_err:
@@ -363,12 +365,15 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
     dut_a, dut_b = await fresh_devices(2)
     connections = []
     reservation_id = None
+    topology_id = None
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
         # The knob targets disconnect_ports only, so activation's connect_ports
-        # succeeds regardless.
-        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]])
+        # succeeds regardless. The wired parent topology makes activation stage the
+        # initial wiring_changed reconcile (ADR 0009 phase 7), which connects the pair.
+        topology_id = await _create_topology(admin_client, _canvas_edge(dut_a["id"], dut_b["id"]))
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]], topology_id)
         reservation_id = reservation["id"]
         assert await _poll_active(admin_client, reservation_id), "reservation never activated"
         assert await _poll_run_count_at_least(admin_client, reservation_id, "connect_ports", 1)
@@ -416,6 +421,8 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
         if reservation_id:
             # Already CANCELLED; a second cancel is a terminal-status no-op.
             await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -605,7 +612,11 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
 ):
     """After the reservation completes (teardown freezes the wiring state), an injected
     stale wiring_changed does not reconnect: the frozen guard is a no-op before any
-    driver call (ADR 0007 Decision 7)."""
+    driver call (ADR 0007 Decision 7).
+
+    A WIRED parent topology makes activation stage the initial wiring_changed reconcile
+    (ADR 0009 phase 7), which connects the pair; completion then tears it down and freezes.
+    """
     nats_err = await probe_nats()
     if nats_err:
         pytest.skip(f"NATS not reachable from host: {nats_err}")
@@ -614,10 +625,12 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
     dut_a, dut_b = await fresh_devices(2)
     connections = []
     reservation_id = None
+    topology_id = None
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
-        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]])
+        topology_id = await _create_topology(admin_client, _canvas_edge(dut_a["id"], dut_b["id"]))
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]], topology_id)
         reservation_id = reservation["id"]
 
         assert await _poll_run_count_at_least(admin_client, reservation_id, "connect_ports", 1)
@@ -664,6 +677,8 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

@@ -1,10 +1,13 @@
 """Integration tests for Layer 1 cross-connect provisioning via a mock L1 driver.
 
-Reserving two DUTs that are cabled to the same Layer 1 Switch device drives a
-single connect_ports(port_a, port_b) on the switch (the consumer pairs the two
-switch-side ports), and cancelling drives disconnect_ports. These tests upload
-the checked-in mock L1 driver (drivers/mock_l1), build that topology, and assert
-the switch operations via GET /execution/runs.
+As of ADR 0009 phase 7 all wiring, initial provisioning included, is fork-driven: the
+reservation books a WIRED parent topology (a committed DUT-to-DUT canvas edge), activation
+stages a reservation.wiring_changed for the fork's initial version, and the execution
+consumer's reconcile resolves the fork's recorded hops through the L1 switch and drives a
+single connect_ports(port_a, port_b) pairing the two switch-side ports. Cancelling drives
+disconnect_ports from the l1_connection_assignments ledger (phase 6). These tests upload
+the checked-in mock L1 driver (drivers/mock_l1), build that topology, and assert the
+switch operations via GET /execution/runs.
 
 The suite self-seeds the mock L1 driver via a session fixture.
 """
@@ -114,12 +117,40 @@ async def _connect(client, dut_id: str, switch_id: str, switch_port: str) -> dic
     return resp.json()
 
 
-async def _reserve(client, device_ids: list[str]) -> dict:
+def _canvas_edge(a_id: str, b_id: str) -> dict:
+    """A committed one-edge canvas wiring device a to device b (React Flow shape)."""
+    return {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": a_id}}},
+            {"id": "nB", "data": {"device": {"id": b_id}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "nA",
+                "target": "nB",
+                "data": {"layer": "L1", "isProposal": False},
+            }
+        ],
+    }
+
+
+async def _create_topology(client, canvas: dict) -> str:
+    resp = await client.post("/cabling/topologies", json={"name": f"int-l1-{uuid.uuid4().hex[:8]}"})
+    resp.raise_for_status()
+    topology_id = resp.json()["id"]
+    put = await client.put(f"/cabling/topologies/{topology_id}", json={"canvas_data": canvas})
+    put.raise_for_status()
+    return topology_id
+
+
+async def _reserve(client, device_ids: list[str], topology_id: str) -> dict:
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
             "device_ids": device_ids,
+            "topology_id": topology_id,
             "purpose": "l1 provisioning integration test",
             "start_time": now.isoformat(),
             "end_time": (now + timedelta(hours=1)).isoformat(),
@@ -154,26 +185,32 @@ def _ports_of(run: dict) -> set:
 
 
 async def test_l1_ports_connected_on_reservation_create(admin_client, l1_template, fresh_devices):
-    """Reserving two DUTs cabled to one L1 switch drives a single connect_ports on
-    the switch pairing the two switch-side ports."""
+    """Reserving two DUTs wired DUT-to-DUT in the topology, both cabled to one L1
+    switch, drives a single connect_ports on the switch pairing the two switch-side
+    ports at activation (ADR 0009 phase 7: the activation-staged wiring_changed
+    reconcile resolves the fork's recorded hops; no fork save is needed)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l1_template["id"], f"mock-l1-sw-{suffix}")
     dut_a, dut_b = await fresh_devices(2)
     reservation = None
     connections = []
+    topology_id = None
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
-        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]])
+        topology_id = await _create_topology(admin_client, _canvas_edge(dut_a["id"], dut_b["id"]))
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]], topology_id)
 
         runs = await _poll_success_runs(admin_client, reservation["id"], "connect_ports")
         assert runs, "no SUCCESS connect_ports run was recorded for the L1 switch"
         assert str(runs[0]["device_id"]) == switch["id"]
-        # The pair order depends on device iteration, so assert the set of ports.
+        # The pair order depends on hop resolution, so assert the set of ports.
         assert _ports_of(runs[0]) == {"p1", "p2"}
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -183,15 +220,18 @@ async def test_l1_ports_disconnected_on_reservation_cancel(
     admin_client, l1_template, fresh_devices
 ):
     """Cancelling the reservation drives disconnect_ports on the switch for the
-    same port pair."""
+    same port pair, released from the l1_connection_assignments ledger the
+    activation-staged reconcile recorded (phase 6 teardown over phase 7 wiring)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l1_template["id"], f"mock-l1-sw-{suffix}")
     dut_a, dut_b = await fresh_devices(2)
     connections = []
+    topology_id = None
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
-        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]])
+        topology_id = await _create_topology(admin_client, _canvas_edge(dut_a["id"], dut_b["id"]))
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]], topology_id)
 
         assert await _poll_success_runs(admin_client, reservation["id"], "connect_ports"), (
             "reservation never connected the ports, cannot test disconnect"
@@ -205,6 +245,8 @@ async def test_l1_ports_disconnected_on_reservation_cancel(
         assert str(runs[0]["device_id"]) == switch["id"]
         assert _ports_of(runs[0]) == {"p1", "p2"}
     finally:
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

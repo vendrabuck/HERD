@@ -1,16 +1,21 @@
 """Integration tests for fabric-aware VLAN assignment via a mock L2 switch driver.
 
-VLAN provisioning is driven by NATS reservation events to the execution service,
-which runs L2 switch driver code in a subprocess sandbox. These tests upload the
-checked-in mock L2 driver (drivers/mock_l2), wire a DUT to a Layer 2 Switch
-device, reserve the DUT, and assert the resulting create_vlan / add_to_vlan /
-delete_vlan operations on the switch via GET /execution/runs.
+As of ADR 0009 phase 7 all wiring, initial provisioning included, is fork-driven: a
+reservation books a WIRED parent topology, activation stages a reservation.wiring_changed
+for the fork's initial version, and the execution consumer's layered reconcile derives L2
+membership from the fork's recorded hops and drives create_vlan / add_to_vlan on the
+switch. No fork save is needed; activation provisions the initial wiring directly. These
+tests upload the checked-in mock L2 driver (drivers/mock_l2), wire a DUT to a Layer 2
+Switch device on both the physical connection graph and the topology canvas, reserve the
+DUT with that topology, and assert the resulting create_vlan / add_to_vlan / remove_from_vlan
+operations on the switch via GET /execution/runs.
 
 There is no REST endpoint for VlanAssignment rows, so we assert the observable
 downstream effect instead: the driver actually ran the VLAN ops with an
 HERD-assigned vlan_id. The run only exists after find_or_assign_vlan created the
-ACTIVE assignment, so a SUCCESS create_vlan run is end-to-end proof the
-assignment was made; a SUCCESS delete_vlan run is proof it was released.
+ACTIVE allocation, so a SUCCESS create_vlan run is end-to-end proof the
+allocation was made; a SUCCESS remove_from_vlan run on cancel is proof the membership
+was released (the phase-6 ledger teardown frees the allocation in-DB, no delete_vlan).
 
 The suite self-seeds the mock L2 driver via a session fixture, so it no longer
 depends on the HERD_VLAN_TEST_DRIVER_ID env gate.
@@ -108,9 +113,9 @@ async def _create_device(client, template_id: str, name: str) -> dict:
 
 
 async def _create_connection(client, dut_id: str, switch_id: str, switch_port: str) -> dict:
-    # The cabling connection_type field is irrelevant to L2 resolution: the
-    # execution consumer keys on the far-end device's driver connection_type
-    # ("Layer 2 Switch"), not on this field (nats_consumer._resolve_l2_switch_operations).
+    # The cabling connection_type field is irrelevant to L2 membership: the L2 reconcile
+    # derives membership from the fork's recorded hops (option C), keying on the far-end
+    # device's driver connection_type ("Layer 2 Switch"), not on this field.
     resp = await client.post(
         "/cabling/connections",
         json={
@@ -125,12 +130,42 @@ async def _create_connection(client, dut_id: str, switch_id: str, switch_port: s
     return resp.json()
 
 
-async def _create_reservation(client, device_id: str) -> dict:
+def _canvas_edge(a_id: str, b_id: str) -> dict:
+    """A committed one-edge canvas wiring device a to device b (React Flow shape)."""
+    return {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": a_id}}},
+            {"id": "nB", "data": {"device": {"id": b_id}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "nA",
+                "target": "nB",
+                "data": {"layer": "L1", "isProposal": False},
+            }
+        ],
+    }
+
+
+async def _create_topology(client, canvas: dict) -> str:
+    resp = await client.post(
+        "/cabling/topologies", json={"name": f"int-vlan-{uuid.uuid4().hex[:8]}"}
+    )
+    resp.raise_for_status()
+    topology_id = resp.json()["id"]
+    put = await client.put(f"/cabling/topologies/{topology_id}", json={"canvas_data": canvas})
+    put.raise_for_status()
+    return topology_id
+
+
+async def _create_reservation(client, device_id: str, topology_id: str) -> dict:
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
             "device_ids": [device_id],
+            "topology_id": topology_id,
             "purpose": "vlan assignment integration test",
             "start_time": now.isoformat(),
             "end_time": (now + timedelta(hours=1)).isoformat(),
@@ -138,6 +173,16 @@ async def _create_reservation(client, device_id: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+async def _poll_active(client, reservation_id: str, *, timeout: float = 20.0) -> bool:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        resp = await client.get(f"/reservations/{reservation_id}")
+        if resp.status_code == 200 and resp.json().get("status") == "ACTIVE":
+            return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 def _vlan_of(run: dict) -> int:
@@ -186,17 +231,24 @@ async def _runs_by_action(client, reservation_id: str, action: str) -> list[dict
 async def test_vlan_assigned_on_reservation_create_with_l2_switch(
     admin_client, l2_template, fresh_device
 ):
-    """Reserving a DUT cabled to an L2 switch drives create_vlan + add_to_vlan on
-    the switch with an HERD-assigned vlan_id (proof the VlanAssignment was made)."""
+    """Reserving a DUT wired to an L2 switch in the topology drives create_vlan +
+    add_to_vlan on the switch with an HERD-assigned vlan_id at activation (ADR 0009
+    phase 7: the activation-staged wiring_changed reconcile provisions the initial
+    L2 membership off the fork, no fork save needed)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l2_template["id"], f"mock-l2-sw-{suffix}")
     reservation = None
     connection = None
+    topology_id = None
     try:
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "eth1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        assert await _poll_active(admin_client, reservation["id"]), "reservation never activated"
 
         create_runs = await _poll_success_runs(admin_client, reservation["id"], "create_vlan")
         assert create_runs, "no SUCCESS create_vlan run was recorded for the L2 switch"
@@ -212,6 +264,8 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -228,13 +282,19 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l2_template["id"], f"mock-l2-sw-{suffix}")
     connection = None
+    topology_id = None
+    reservation = None
     try:
         connection = await _create_connection(
             admin_client, fresh_device["id"], switch["id"], "eth1"
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"])
+        topology_id = await _create_topology(
+            admin_client, _canvas_edge(fresh_device["id"], switch["id"])
+        )
+        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        assert await _poll_active(admin_client, reservation["id"]), "reservation never activated"
 
-        # Provision first, so there is something to release.
+        # Provision first (activation-staged reconcile), so there is something to release.
         assert await _poll_success_runs(admin_client, reservation["id"], "create_vlan"), (
             "reservation never provisioned a VLAN, cannot test release"
         )
@@ -250,6 +310,10 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
             "phase-6 ledger teardown frees the allocation in-DB, never calls delete_vlan"
         )
     finally:
+        if reservation:
+            await admin_client.delete(f"/reservations/{reservation['id']}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -263,6 +327,7 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
     dut_a, dut_b = await fresh_devices(2)
     reservations = []
     connections = []
+    topology_ids = []
     try:
         connections.append(
             await _create_connection(admin_client, dut_a["id"], switch["id"], "eth1")
@@ -271,10 +336,19 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
             await _create_connection(admin_client, dut_b["id"], switch["id"], "eth2")
         )
 
-        res_a = await _create_reservation(admin_client, dut_a["id"])
+        # Each reservation books its own wired topology (its DUT to the shared switch),
+        # so activation stages each one's initial L2 membership reconcile independently.
+        topo_a = await _create_topology(admin_client, _canvas_edge(dut_a["id"], switch["id"]))
+        topology_ids.append(topo_a)
+        topo_b = await _create_topology(admin_client, _canvas_edge(dut_b["id"], switch["id"]))
+        topology_ids.append(topo_b)
+
+        res_a = await _create_reservation(admin_client, dut_a["id"], topo_a)
         reservations.append(res_a)
-        res_b = await _create_reservation(admin_client, dut_b["id"])
+        res_b = await _create_reservation(admin_client, dut_b["id"], topo_b)
         reservations.append(res_b)
+        assert await _poll_active(admin_client, res_a["id"]), "reservation A never activated"
+        assert await _poll_active(admin_client, res_b["id"]), "reservation B never activated"
 
         runs_a = await _poll_success_runs(admin_client, res_a["id"], "create_vlan")
         runs_b = await _poll_success_runs(admin_client, res_b["id"], "create_vlan")
@@ -289,6 +363,8 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
     finally:
         for res in reservations:
             await admin_client.delete(f"/reservations/{res['id']}")
+        for tid in topology_ids:
+            await admin_client.delete(f"/cabling/topologies/{tid}")
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
