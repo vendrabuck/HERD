@@ -74,14 +74,16 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   fork is frozen to an immutable as-built record, viewable read-only. Two behavior
   changes from the previous design: live edits no longer mutate the shared parent
   topology or append parent versions, and PENDING reservations no longer offer
-  topology editing (the fork exists only from activation). A commit now also
-  reconciles the L1 hardware connection-by-connection: the execution service applies
-  the released/built wire delta against a per-connection `l1_connection_assignments`
-  ledger, and the reservation detail's Wiring tab shows each cross-connect's status
-  (ACTIVE / RELEASED / FAILED, attempts, last error) with a manual retry for the
-  hardware-retryable failures on top of the background auto-retry. L2 and L3
-  provisioning remain device-set-driven. See ADR 0006 and ADR 0007 (issue #345 P3b,
-  L1 delivered).
+  topology editing (the fork exists only from activation). The fork is the wiring
+  source of truth for every layer: a commit reconciles the hardware
+  connection-by-connection across L1 switch cross-connects, L2 VLAN memberships, and
+  L3 route pins, recording each outcome in a per-layer wiring ledger
+  (`l1_connection_assignments`, `l2_port_assignments`, `route_assignments`), and the
+  reservation detail's Wiring tab groups the rows by layer with each row's status
+  (ACTIVE / RELEASED / FAILED, attempts, last error) and a manual retry for the
+  hardware-retryable failures on top of the background auto-retry, both
+  direction-aware (a failed release retries as a release). See ADR 0006, ADR 0007,
+  and ADR 0009 (issues #345 and #416, delivered).
 - **Shortest-path cable routing** (Shipped): on-demand BFS (minimum-hop) pathfinding through
   Layer 1 switch infrastructure, with visual feedback on the canvas (green stroke
   and hop-count badge when a path exists, red stroke when not).
@@ -93,14 +95,18 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Conflict detection** (Shipped): time-window conflict checks for exclusive devices.
 - **Automatic expiration** (Shipped): pending reservations activate and active
   reservations complete on schedule.
-- **Automatic infrastructure provisioning** (Shipped): reservation lifecycle events
-  drive the connected infrastructure through drivers: Layer 1 port cross-connects,
-  Layer 2 VLAN creation and membership (fabric-aware, conflict-free VLAN ids), and
-  Layer 3 static routes taken from the switch's latest config version, pinned at
-  provision time so teardown removes exactly what was applied. Deprovisioning runs
-  on cancel or completion.
+- **Automatic infrastructure provisioning** (Shipped): the reservation's topology
+  fork drives the connected infrastructure through drivers, initial provisioning
+  included (activation stages the fork's wiring for the same connection-driven
+  reconcile that later commits use): Layer 1 port cross-connects, Layer 2 VLAN
+  creation and membership (fabric-aware, conflict-free VLAN ids), and Layer 3
+  static routes taken from the switch's latest config version, pinned at provision
+  time so teardown removes exactly what was applied. Deprovisioning on cancel or
+  completion releases from the per-layer wiring ledgers (ADR 0009).
 - **Live editing** (Shipped): modify device lists, extend end times, and update
-  purpose on an active reservation.
+  purpose on an active reservation. A device added to the device list wires
+  nothing by itself: its connections are built when a topology commit draws them
+  (ADR 0009 Decision 6); removing a device releases its wiring via the fork prune.
 - **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,
   status filters, and click-to-view details.
 
