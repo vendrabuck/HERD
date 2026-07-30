@@ -1,13 +1,15 @@
 import { useAllDeviceNames } from "@/api/inventory";
 import { useReservationWiringStatus, useRetryReservationWiring } from "@/api/reservations";
-import type { WiringConnectionStatus } from "@/types/reservation.types";
+import type { WiringConnectionStatus, WiringLayer } from "@/types/reservation.types";
 
-// Per-connection L1 wiring status (ADR 0007, issue #345 P3b phase 5). After a
-// fork save reconciles the intended wiring, execution applies each L1
-// cross-connect connection-by-connection; this panel surfaces the applied state
-// (ACTIVE / RELEASED / FAILED), the reservation-level last-applied fork version
-// and frozen marker, and, for an ACTIVE reservation, a manual retry of the
-// hardware-retryable FAILED rows. FAILED rows that are not hardware-retryable
+// Layered per-connection wiring status (ADR 0007, issue #345 P3b; layered by
+// ADR 0009 phase 8, issue #416). After a fork save reconciles the intended
+// wiring, execution applies each layer connection-by-connection; this panel
+// groups the applied rows by layer (L1 switch cross-connects, L2 VLAN
+// memberships, L3 route pins) and surfaces each row's state (ACTIVE / RELEASED
+// / FAILED), the reservation-level last-applied fork version and frozen marker,
+// and, for an ACTIVE reservation, a manual retry of the hardware-retryable
+// FAILED rows across every layer. FAILED rows that are not hardware-retryable
 // (an unresolvable or not-a-simple-chain intent) explain that a fork re-save is
 // the recovery, not a retry (ADR 0007 Decision 5/6).
 
@@ -25,6 +27,35 @@ const STATUS_COLORS: Record<string, string> = {
   FAILED: "bg-red-200 text-red-900",
 };
 
+const LAYER_ORDER: WiringLayer[] = ["l1", "l2", "l3"];
+
+const LAYER_HEADINGS: Record<WiringLayer, string> = {
+  l1: "L1 cross-connects",
+  l2: "L2 VLAN memberships",
+  l3: "L3 route pins",
+};
+
+// A pre-phase-8 backend omits `layer`; those rows are L1 cross-connects.
+function rowLayer(conn: WiringConnectionStatus): WiringLayer {
+  return conn.layer ?? "l1";
+}
+
+// The row's layer-specific identity line: an L1 row names its port pair, an L2
+// row its member port and allocated VLAN (null while the allocation is parked),
+// an L3 row its pinned-route count.
+function rowDetail(conn: WiringConnectionStatus): string {
+  const layer = rowLayer(conn);
+  if (layer === "l2") {
+    const vlan = conn.vlan != null ? `VLAN ${conn.vlan}` : "VLAN unassigned";
+    return `port ${conn.port ?? "?"} ${vlan}`;
+  }
+  if (layer === "l3") {
+    const n = conn.route_count ?? 0;
+    return n === 1 ? "1 route" : `${n} routes`;
+  }
+  return `${conn.port_a} to ${conn.port_b}`;
+}
+
 function ConnectionRow({
   conn,
   deviceNames,
@@ -40,9 +71,12 @@ function ConnectionRow({
     <div className="border border-gray-200 rounded overflow-hidden">
       <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 border-b border-gray-100">
         <span className="text-sm font-medium text-gray-800">{switchName}</span>
-        <span className="text-xs font-mono text-gray-500">
-          {conn.port_a} to {conn.port_b}
-        </span>
+        <span className="text-xs font-mono text-gray-500">{rowDetail(conn)}</span>
+        {isFailed && conn.intended === "RELEASED" && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">
+            release pending
+          </span>
+        )}
         <span
           className={`ml-auto text-xs px-1.5 py-0.5 rounded font-medium ${
             STATUS_COLORS[conn.status] ?? "bg-gray-100 text-gray-600"
@@ -95,12 +129,21 @@ export function ReservationWiringTab({ reservationId, active }: Props) {
     );
   }
 
-  // A single retry button reattempts every hardware-retryable FAILED row at once,
-  // matching the endpoint's all-FAILED semantics. It renders only for an ACTIVE
-  // reservation with at least one retryable FAILED row (the endpoint 409s for a
-  // non-ACTIVE reservation, and a retry with nothing to retry is a no-op).
+  // A single retry button reattempts every hardware-retryable FAILED row across
+  // all layers at once, matching the endpoint's all-FAILED semantics. It renders
+  // only for an ACTIVE reservation with at least one retryable FAILED row (the
+  // endpoint 409s for a non-provisioned reservation, and a retry with nothing to
+  // retry is a no-op).
   const hasRetryable = connections.some((c) => c.status === "FAILED" && c.retryable);
   const failedCount = connections.filter((c) => c.status === "FAILED").length;
+
+  // Group rows by layer, in fixed L1/L2/L3 order; a section renders only when it
+  // has rows, so an L1-only reservation still reads as a single flat list under
+  // one heading.
+  const sections = LAYER_ORDER.map((layer) => ({
+    layer,
+    rows: connections.filter((c) => rowLayer(c) === layer),
+  })).filter((s) => s.rows.length > 0);
 
   return (
     <div className="space-y-3">
@@ -132,11 +175,16 @@ export function ReservationWiringTab({ reservationId, active }: Props) {
         )}
       </div>
 
-      <div className="space-y-2">
-        {connections.map((conn) => (
-          <ConnectionRow key={conn.id} conn={conn} deviceNames={deviceNames} />
-        ))}
-      </div>
+      {sections.map((section) => (
+        <div key={section.layer} className="space-y-2">
+          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">
+            {LAYER_HEADINGS[section.layer]}
+          </p>
+          {section.rows.map((conn) => (
+            <ConnectionRow key={conn.id} conn={conn} deviceNames={deviceNames} />
+          ))}
+        </div>
+      ))}
     </div>
   );
 }

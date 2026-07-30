@@ -802,11 +802,13 @@ async def get_reservation_wiring_status(
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
 ):
-    """Return the reservation's per-connection L1 wiring status (ADR 0007 Decision 6).
+    """Return the reservation's layered per-connection wiring status (ADR 0009 phase 8).
 
     Owner-or-admin gated, allowed for ANY reservation status: reading the per-connection
     applied state (including FAILED rows needing retry, and the RELEASED/ACTIVE as-built
-    record after the reservation ends) is the point, exactly like GET /{id}/fork. Proxies
+    record after the reservation ends) is the point, exactly like GET /{id}/fork. The
+    relayed rows span all three layers since ADR 0009 Decision 7, each tagged with
+    `layer`: L1 cross-connects, L2 VLAN memberships, and L3 route pins. Proxies
     execution's internal wiring-status endpoint and relays its structured response
     verbatim; an unreachable execution service maps to 503.
     """
@@ -831,7 +833,10 @@ async def retry_reservation_wiring(
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
 ):
-    """Reattempt the reservation's FAILED cross-connects now (ADR 0007 Decision 6).
+    """Reattempt the reservation's FAILED wiring rows now, across all layers.
+
+    ADR 0007 Decision 6; layered (L1 cross-connects, L2 VLAN memberships, L3 route
+    pins) since ADR 0009 phases 4-5, with each relayed outcome tagged `layer`.
 
     Owner-or-admin gated. Permitted for ACTIVE and the terminal statuses
     (COMPLETED/CANCELLED/FAILED); only PENDING and PENDING_PROVISION are refused with a

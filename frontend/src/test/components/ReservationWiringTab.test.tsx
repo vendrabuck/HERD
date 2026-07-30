@@ -23,10 +23,12 @@ function conn(overrides: Partial<WiringConnectionStatus> = {}): WiringConnection
   return {
     id: "c-1",
     switch_device_id: "sw-1",
+    layer: "l1",
     port_a: "et1",
     port_b: "et2",
     physical_connection_id: "p-1",
     status: "ACTIVE",
+    intended: "ACTIVE",
     attempts: 1,
     last_error: null,
     retryable: false,
@@ -34,6 +36,32 @@ function conn(overrides: Partial<WiringConnectionStatus> = {}): WiringConnection
     released_at: null,
     ...overrides,
   };
+}
+
+function l2Conn(overrides: Partial<WiringConnectionStatus> = {}): WiringConnectionStatus {
+  return conn({
+    id: "m-1",
+    layer: "l2",
+    port_a: null,
+    port_b: null,
+    physical_connection_id: null,
+    port: "p3",
+    vlan_assignment_id: "va-1",
+    vlan: 101,
+    ...overrides,
+  });
+}
+
+function l3Conn(overrides: Partial<WiringConnectionStatus> = {}): WiringConnectionStatus {
+  return conn({
+    id: "r-1",
+    layer: "l3",
+    port_a: null,
+    port_b: null,
+    physical_connection_id: null,
+    route_count: 2,
+    ...overrides,
+  });
 }
 
 function status(overrides: Partial<WiringStatusResponse> = {}): WiringStatusResponse {
@@ -123,6 +151,80 @@ describe("ReservationWiringTab", () => {
     setStatus({ data: status({ frozen: true, connections: [conn()] }) });
     render(<ReservationWiringTab reservationId={RES_ID} active={false} />);
     expect(screen.getByText("Frozen")).toBeInTheDocument();
+  });
+
+  it("groups layered rows into L1/L2/L3 sections with layer-specific detail", () => {
+    setStatus({
+      data: status({
+        connections: [conn(), l2Conn(), l3Conn()],
+      }),
+    });
+    render(<ReservationWiringTab reservationId={RES_ID} active />);
+    expect(screen.getByText("L1 cross-connects")).toBeInTheDocument();
+    expect(screen.getByText("L2 VLAN memberships")).toBeInTheDocument();
+    expect(screen.getByText("L3 route pins")).toBeInTheDocument();
+    expect(screen.getByText("et1 to et2")).toBeInTheDocument();
+    expect(screen.getByText("port p3 VLAN 101")).toBeInTheDocument();
+    expect(screen.getByText("2 routes")).toBeInTheDocument();
+  });
+
+  it("renders only nonempty layer sections", () => {
+    setStatus({ data: status({ connections: [conn()] }) });
+    render(<ReservationWiringTab reservationId={RES_ID} active />);
+    expect(screen.getByText("L1 cross-connects")).toBeInTheDocument();
+    expect(screen.queryByText("L2 VLAN memberships")).not.toBeInTheDocument();
+    expect(screen.queryByText("L3 route pins")).not.toBeInTheDocument();
+  });
+
+  it("treats a row without a layer tag as L1 (pre-phase-8 backend tolerance)", () => {
+    setStatus({ data: status({ connections: [conn({ layer: undefined })] }) });
+    render(<ReservationWiringTab reservationId={RES_ID} active />);
+    expect(screen.getByText("L1 cross-connects")).toBeInTheDocument();
+    expect(screen.getByText("et1 to et2")).toBeInTheDocument();
+  });
+
+  it("an L2 row with a parked allocation shows VLAN unassigned", () => {
+    setStatus({
+      data: status({
+        connections: [
+          l2Conn({ vlan: null, status: "FAILED", retryable: true, last_error: "no allocation" }),
+        ],
+      }),
+    });
+    render(<ReservationWiringTab reservationId={RES_ID} active />);
+    expect(screen.getByText("port p3 VLAN unassigned")).toBeInTheDocument();
+  });
+
+  it("a retryable FAILED L2 membership row enables the Retry button", () => {
+    setStatus({
+      data: status({
+        connections: [
+          conn(),
+          l2Conn({ status: "FAILED", retryable: true, last_error: "add_to_vlan boom" }),
+        ],
+      }),
+    });
+    render(<ReservationWiringTab reservationId={RES_ID} active />);
+    expect(screen.getByRole("button", { name: /Retry failed/i })).toBeInTheDocument();
+    expect(screen.getByText("add_to_vlan boom")).toBeInTheDocument();
+    expect(screen.getByText("1 failed")).toBeInTheDocument();
+  });
+
+  it("a FAILED row intended RELEASED shows the release-pending marker", () => {
+    setStatus({
+      data: status({
+        connections: [
+          l3Conn({
+            status: "FAILED",
+            intended: "RELEASED",
+            retryable: true,
+            last_error: "remove_route boom",
+          }),
+        ],
+      }),
+    });
+    render(<ReservationWiringTab reservationId={RES_ID} active={false} />);
+    expect(screen.getByText("release pending")).toBeInTheDocument();
   });
 
   it("clicking Retry failed calls the retry mutation with the reservation id", () => {

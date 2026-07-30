@@ -9,11 +9,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.auth import make_auth_dependencies
 from herd_common.internal_auth import internal_token_matches
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
 from app.models.execution_run import ExecutionRun
+from app.models.vlan_assignment import VlanAssignment
 from app.schemas.command_log import CommandLogEntry
 from app.schemas.execution import (
     DeviceCheckRequest,
@@ -39,7 +41,9 @@ from app.services.l1_assignment_service import (
     all_assignments_for_reservation,
     get_wiring_state,
 )
+from app.services.l2_membership_service import all_memberships_for_reservation
 from app.services.nats_consumer import TransientUpstreamError
+from app.services.route_service import all_route_assignments_for_reservation
 from app.services.wiring_retry_service import (
     WiringReservationFrozen,
     is_retryable_failure,
@@ -423,7 +427,16 @@ async def retry_run(
 
 
 class WiringConnectionStatus(BaseModel):
-    """One l1_connection_assignments row projected for the wiring-status surface.
+    """One wiring-ledger row projected for the wiring-status surface.
+
+    Layered since ADR 0009 phase 8 (Decision 7, issue #416), mirroring
+    WiringRetryOutcome: `layer` is "l1" for an l1_connection_assignments cross-connect
+    row (the original shape: port_a/port_b always populated, physical_connection_id
+    when recorded), "l2" for an l2_port_assignments VLAN membership row
+    (port/vlan_assignment_id/vlan populated), or "l3" for a route_assignments
+    per-switch route pin (route_count populated, no port fields). The layer-specific
+    fields are optional so a row omits the ones that do not apply; existing L1
+    consumers read the same fields they always did.
 
     `intended` (ADR 0009 Decision 2, issue #369; additive field) is the direction
     the row's last write was attempting: ACTIVE for a connect/build, RELEASED for
@@ -434,9 +447,18 @@ class WiringConnectionStatus(BaseModel):
 
     id: uuid.UUID
     switch_device_id: uuid.UUID
-    port_a: str
-    port_b: str
+    layer: str = "l1"
+    # L1 cross-connect fields (present for layer "l1").
+    port_a: str | None = None
+    port_b: str | None = None
     physical_connection_id: uuid.UUID | None = None
+    # L2 membership fields (present for layer "l2"). `vlan` is the allocated fabric
+    # VLAN number, or null while the row's allocation is the parked placeholder.
+    port: str | None = None
+    vlan_assignment_id: uuid.UUID | None = None
+    vlan: int | None = None
+    # L3 route-pin summary field (present for layer "l3").
+    route_count: int | None = None
     status: str
     intended: str
     attempts: int
@@ -447,7 +469,12 @@ class WiringConnectionStatus(BaseModel):
 
 
 class WiringStatusResponse(BaseModel):
-    """The reservation's per-connection L1 applied state plus its wiring-state markers."""
+    """The reservation's layered applied wiring state plus its wiring-state markers.
+
+    `connections` carries one row per wiring-ledger entry across all three layers
+    (L1 cross-connects, then L2 VLAN memberships, then L3 route pins), each tagged
+    with `layer`.
+    """
 
     reservation_id: uuid.UUID
     last_applied_fork_version: int | None = None
@@ -501,22 +528,28 @@ async def internal_wiring_status(
     _: None = Depends(_require_internal_token),
     db: AsyncSession = Depends(get_db),
 ):
-    """Per-connection L1 wiring status for a reservation (ADR 0007 Decision 6).
+    """Layered per-connection wiring status for a reservation (ADR 0009 Decision 7).
 
     Service-to-service (X-Internal-Token); reservations proxies it as an owner-gated
-    user endpoint. Returns every l1_connection_assignments row (ACTIVE cross-connects,
-    RELEASED history, and FAILED rows) plus last_applied_fork_version and frozen from
-    reservation_wiring_state. A reservation with no rows and no state row is the
+    user endpoint. Returns every wiring-ledger row across the three layers, each tagged
+    with `layer`: l1_connection_assignments cross-connects, l2_port_assignments VLAN
+    memberships, and route_assignments per-switch route pins (ACTIVE applied state,
+    RELEASED history, and FAILED rows alike), plus last_applied_fork_version and frozen
+    from reservation_wiring_state. A reservation with no rows and no state row is the
     empty/pre-apply case: an empty connection list, null version, not frozen. Each row
     carries `retryable` so a caller can distinguish a driver failure (hardware-retryable)
     from a pinned unresolvable/not-a-simple-chain intent (recovery is a re-save).
     """
     rows = await all_assignments_for_reservation(db, reservation_id)
+    l2_rows = await all_memberships_for_reservation(db, reservation_id)
+    l3_rows = await all_route_assignments_for_reservation(db, reservation_id)
     state = await get_wiring_state(db, reservation_id)
+
     connections = [
         WiringConnectionStatus(
             id=row.id,
             switch_device_id=row.switch_device_id,
+            layer="l1",
             port_a=row.port_a,
             port_b=row.port_b,
             physical_connection_id=row.physical_connection_id,
@@ -530,6 +563,51 @@ async def internal_wiring_status(
         )
         for row in rows
     ]
+
+    # Resolve each membership's allocated fabric VLAN number for display. A row whose
+    # allocation is the parked nil-UUID placeholder, or whose vlan_assignment no longer
+    # resolves, reports vlan null (the retry channel re-resolves it before driving).
+    if l2_rows:
+        va_ids = {row.vlan_assignment_id for row in l2_rows}
+        va_result = await db.execute(select(VlanAssignment).where(VlanAssignment.id.in_(va_ids)))
+        vlan_by_va = {v.id: v.vlan_id for v in va_result.scalars().all()}
+    else:
+        vlan_by_va = {}
+    connections.extend(
+        WiringConnectionStatus(
+            id=row.id,
+            switch_device_id=row.switch_device_id,
+            layer="l2",
+            port=row.port,
+            vlan_assignment_id=row.vlan_assignment_id,
+            vlan=vlan_by_va.get(row.vlan_assignment_id),
+            status=row.status,
+            intended=row.intended,
+            attempts=row.attempts,
+            last_error=row.last_error,
+            retryable=(row.status == "FAILED" and is_retryable_failure(row.last_error)),
+            created_at=row.created_at,
+            released_at=row.released_at,
+        )
+        for row in l2_rows
+    )
+    connections.extend(
+        WiringConnectionStatus(
+            id=row.id,
+            switch_device_id=row.device_id,
+            layer="l3",
+            route_count=len(row.routes or []),
+            status=row.status,
+            intended=row.intended,
+            attempts=row.attempts,
+            last_error=row.last_error,
+            retryable=(row.status == "FAILED" and is_retryable_failure(row.last_error)),
+            created_at=row.created_at,
+            released_at=row.released_at,
+        )
+        for row in l3_rows
+    )
+
     return WiringStatusResponse(
         reservation_id=reservation_id,
         last_applied_fork_version=(state.last_applied_fork_version if state else None),

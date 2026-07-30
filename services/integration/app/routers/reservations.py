@@ -176,3 +176,28 @@ async def release_reservation(
     resp = await _forward("PUT", f"/{reservation_id}/release", token=credentials.credentials)
     _propagate_if_error(resp)
     return _to_v1(resp.json())
+
+
+@router.get("/reservations/{reservation_id}/wiring-status")
+async def get_reservation_wiring_status(
+    reservation_id: str,
+    _payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    """Read a reservation's layered per-connection wiring status (ADR 0009 phase 8).
+
+    Read-only passthrough to the reservations service's owner-or-admin gated
+    wiring-status proxy: ownership and visibility are enforced downstream as the real
+    caller, exactly like the other facade endpoints. The payload is relayed verbatim
+    rather than frozen into a v1 model: its shape is owned by the wiring-status
+    surface (rows tagged `layer` "l1"/"l2"/"l3" plus the reservation-level
+    last_applied_fork_version and frozen markers, documented in docs/EXTERNAL_API.md)
+    and evolves additively there, so freezing a copy here would only drift. The
+    manual retry channel is deliberately NOT exposed through the facade: retry is an
+    operational action scoped to the interactive UI and internal surface.
+    """
+    resp = await _forward(
+        "GET", f"/{reservation_id}/wiring-status", token=credentials.credentials
+    )
+    _propagate_if_error(resp)
+    return resp.json()
