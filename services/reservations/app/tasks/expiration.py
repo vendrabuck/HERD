@@ -564,6 +564,19 @@ async def _heal_wiring_staging(
             )
 
 
+# ADR 0009 phase 7 hardening (issue #448 item 1): a give-up counter for the fork
+# backstop below. A reservation whose fork create fails PERMANENTLY (e.g. its parent
+# topology was deleted before any fork ever existed) would otherwise re-run the
+# 3-attempt retry backoff every tick forever, delaying the same loop that also drives
+# activation and completion. This is a per-process in-memory counter, not persisted:
+# a process restart resetting it back to zero is acceptable, since the alternative
+# (a schema change to persist give-up state for a best-effort backstop) is overkill,
+# and a restart-triggered retry of a genuinely stuck reservation costs at most one
+# more round of sweep attempts before giving up again.
+_FORK_BACKSTOP_MAX_ATTEMPTS = 5
+_fork_backstop_attempts: dict[uuid.UUID, int] = {}
+
+
 async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
     """Fork-create for ACTIVE topology-carrying reservations cabling has no fork for.
 
@@ -579,6 +592,14 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
     idempotent cabling POST activation uses and the initial wiring_changed staging
     (ledger-guarded against double-staging a version) follows a success. Best-effort
     per reservation: one failure never blocks the rest, and the next tick retries.
+
+    Give-up (issue #448 item 1): each reservation still missing a fork after a call
+    here increments _fork_backstop_attempts; at _FORK_BACKSTOP_MAX_ATTEMPTS a warning
+    is logged once and the reservation is skipped on every later tick (no create call,
+    no further logging) until either the process restarts or the fork shows up via
+    another path (lazy-create, a racing sweep). A reservation that now has a fork
+    (present in known_fork_ids, including right after a successful create here) has
+    its counter cleared, so a later unrelated failure starts a fresh count.
     """
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -591,6 +612,10 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
 
     for row in rows:
         if row.id in known_fork_ids:
+            _fork_backstop_attempts.pop(row.id, None)
+            continue
+        if _fork_backstop_attempts.get(row.id, 0) >= _FORK_BACKSTOP_MAX_ATTEMPTS:
+            # Already gave up on this reservation; do not re-log or re-attempt.
             continue
         logger.info(
             "Fork backstop: ACTIVE reservation %s has a topology but no fork; creating",
@@ -600,9 +625,27 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
                 "reservation_id": str(row.id),
             },
         )
-        await _create_reservation_fork_best_effort(
+        created = await _create_reservation_fork_best_effort(
             row.id, row.topology_id, created_by=str(row.user_id)
         )
+        if created:
+            _fork_backstop_attempts.pop(row.id, None)
+            continue
+
+        attempts = _fork_backstop_attempts.get(row.id, 0) + 1
+        _fork_backstop_attempts[row.id] = attempts
+        if attempts >= _FORK_BACKSTOP_MAX_ATTEMPTS:
+            logger.warning(
+                "Fork backstop: giving up on reservation %s after %d failed attempts; "
+                "will not retry until a process restart or the fork appears via another path",
+                row.id,
+                attempts,
+                extra={
+                    "action": "fork_backstop_give_up",
+                    "reservation_id": str(row.id),
+                    "attempts": attempts,
+                },
+            )
 
 
 async def expiration_loop(interval_seconds: int = 60) -> None:

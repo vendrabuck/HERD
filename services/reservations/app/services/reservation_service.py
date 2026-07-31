@@ -256,7 +256,7 @@ async def _create_reservation_fork_best_effort(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
-) -> None:
+) -> bool:
     """Create the fork with bounded retry, then stage the initial wiring reconcile.
 
     Fork creation is best-effort at activation (issue #25): it must never raise
@@ -264,6 +264,14 @@ async def _create_reservation_fork_best_effort(
     retries are logged as structured errors and swallowed, leaving the
     reservation ACTIVE with fork_id null. The reservation is still usable on
     the bench; the fork is created lazily on first edit.
+
+    Returns True unless the create itself exhausted its retries (the genuine
+    failure case), so a caller that wants to notice repeated failure, like the
+    expiration sweep's fork backstop, can (issue #448 item 1). A null topology_id
+    (Decision 3 Case A) is a deliberate skip, not a failure, and still returns
+    True; only the retry-exhausted except branch returns False. The best-effort
+    wiring_changed staging that follows a successful create is itself independently
+    best-effort and does not affect this return value.
 
     ADR 0009 phase 7 unifies initial provisioning through the fork: instead of the
     execution service driving legacy device-set resolvers off reservation.created,
@@ -295,7 +303,7 @@ async def _create_reservation_fork_best_effort(
     stale-version no-op absorbs.
     """
     if topology_id is None:
-        return
+        return True
     try:
         fork_version = await retry_with_backoff(
             lambda: _create_reservation_fork(reservation_id, topology_id, created_by),
@@ -315,10 +323,10 @@ async def _create_reservation_fork_best_effort(
             },
             exc_info=True,
         )
-        return
+        return False
 
     if fork_version is None:
-        return
+        return True
 
     # Stage the initial reservation.wiring_changed (delta-less heal) for the fresh
     # fork so execution provisions the initial wiring off the fork (ADR 0009 phase 7).
@@ -329,7 +337,7 @@ async def _create_reservation_fork_best_effort(
         async with AsyncSessionLocal() as db:
             ledger = await db.get(ForkWiringLedger, reservation_id)
             if ledger is not None and ledger.last_staged_fork_version >= fork_version:
-                return
+                return True
             await stage_wiring_changed(
                 db,
                 reservation_id,
@@ -347,6 +355,8 @@ async def _create_reservation_fork_best_effort(
             },
             exc_info=True,
         )
+
+    return True
 
 
 def _prune_canvas_for_devices(
