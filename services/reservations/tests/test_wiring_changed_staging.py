@@ -318,7 +318,9 @@ async def test_activation_stages_initial_wiring_heal_after_fork_create():
         "app.services.reservation_service._create_reservation_fork",
         new=AsyncMock(return_value=1),
     ):
-        await _create_reservation_fork_best_effort(rid, topology_id, created_by=str(USER_ID))
+        result = await _create_reservation_fork_best_effort(
+            rid, topology_id, created_by=str(USER_ID)
+        )
 
     rows = await _wiring_rows()
     assert len(rows) == 1
@@ -329,6 +331,8 @@ async def test_activation_stages_initial_wiring_heal_after_fork_create():
     assert payload["built"] is None
     # Atomic with the outbox row: the ledger advanced to the staged version.
     assert (await _ledger(rid)).last_staged_fork_version == 1
+    # The bool contract (issue #448 item 1): a real success returns True.
+    assert result is True
 
 
 @pytest.mark.asyncio
@@ -345,19 +349,26 @@ async def test_activation_stages_nothing_when_fork_create_fails():
         "app.services.reservation_service._create_reservation_fork",
         new=AsyncMock(side_effect=RuntimeError("cabling down")),
     ):
-        await _create_reservation_fork_best_effort(rid, topology_id, created_by=str(USER_ID))
+        result = await _create_reservation_fork_best_effort(
+            rid, topology_id, created_by=str(USER_ID)
+        )
 
     assert await _wiring_rows() == []
     assert await _ledger(rid) is None
+    # The bool contract (issue #448 item 1): exhausted retries return False, the one
+    # genuine failure signal the sweep's give-up counter relies on.
+    assert result is False
 
 
 @pytest.mark.asyncio
 async def test_activation_stages_nothing_when_no_topology():
     """No parent topology means no fork and no initial wiring at activation (Case A)."""
     rid = uuid.uuid4()
-    await _create_reservation_fork_best_effort(rid, None, created_by=str(USER_ID))
+    result = await _create_reservation_fork_best_effort(rid, None, created_by=str(USER_ID))
     assert await _wiring_rows() == []
     assert await _ledger(rid) is None
+    # A null topology is a deliberate skip, not a failure (issue #448 item 1).
+    assert result is True
 
 
 @pytest.mark.asyncio
@@ -378,10 +389,15 @@ async def test_activation_staging_is_ledger_guarded():
         "app.services.reservation_service._create_reservation_fork",
         new=AsyncMock(return_value=1),
     ):
-        await _create_reservation_fork_best_effort(rid, topology_id, created_by=str(USER_ID))
+        result = await _create_reservation_fork_best_effort(
+            rid, topology_id, created_by=str(USER_ID)
+        )
 
     assert len(await _wiring_rows()) == 1
     assert (await _ledger(rid)).last_staged_fork_version == 1
+    # The fork create itself succeeded (the ledger guard only skips the staging
+    # sub-step), so the bool contract still reports True (issue #448 item 1).
+    assert result is True
 
 
 # --- Missing-fork sweep backstop (phase 7) -------------------------------------------

@@ -600,6 +600,14 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
     another path (lazy-create, a racing sweep). A reservation that now has a fork
     (present in known_fork_ids, including right after a successful create here) has
     its counter cleared, so a later unrelated failure starts a fresh count.
+
+    Pruning (review follow-up): a reservation that accrues a nonzero counter and then
+    leaves this tick's ACTIVE-with-topology row set entirely (the reservation ends,
+    e.g. the user cancels a reservation whose parent topology was deleted, without the
+    fork ever succeeding) is otherwise never visited again, so neither pop site above
+    fires and its key would leak for the life of the process. Every key not present in
+    this tick's row-id set is pruned up front, before the per-row loop, so the counter
+    dict never outlives the reservations it tracks.
     """
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -609,6 +617,10 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
             )
         )
         rows = result.all()
+
+    current_ids = {row.id for row in rows}
+    for stale_id in set(_fork_backstop_attempts.keys()) - current_ids:
+        _fork_backstop_attempts.pop(stale_id, None)
 
     for row in rows:
         if row.id in known_fork_ids:

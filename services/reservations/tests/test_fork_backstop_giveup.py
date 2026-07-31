@@ -155,3 +155,43 @@ async def test_different_reservation_unaffected():
     healthy_calls = sum(1 for c in create.await_args_list if c.args[0] == healthy)
     assert stuck_calls == expiration._FORK_BACKSTOP_MAX_ATTEMPTS
     assert healthy_calls == expiration._FORK_BACKSTOP_MAX_ATTEMPTS + 2
+
+
+@pytest.mark.asyncio
+async def test_stale_counter_pruned_when_reservation_leaves_active():
+    """A reservation that accrues a nonzero counter and then leaves the ACTIVE-with-
+    topology row set entirely (e.g. the user cancels it before the fork ever succeeds,
+    the exact target scenario: parent topology deleted, reservation never fixed) must
+    not leak its counter forever. Neither existing pop site fires for a reservation
+    that is no longer visited at all, so the top-of-function prune is what clears it.
+    A sibling reservation that also has a nonzero counter but stays ACTIVE must keep
+    its counter across that same prune: pruning is scoped to the departed key, not a
+    blanket clear.
+    """
+    departs = await _insert_active()
+    stays = await _insert_active()
+
+    # Both fail every create; both accrue a counter of 2.
+    create = AsyncMock(return_value=False)
+    with patch.object(expiration, "_create_reservation_fork_best_effort", create):
+        await _backstop_missing_forks(known_fork_ids=set())
+        await _backstop_missing_forks(known_fork_ids=set())
+
+    assert expiration._fork_backstop_attempts[departs] == 2
+    assert expiration._fork_backstop_attempts[stays] == 2
+
+    # `departs` ends (cancelled) before its fork ever succeeded: it drops out of the
+    # ACTIVE-with-topology query entirely, so it is never visited by the per-row loop
+    # again.
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, departs)
+        res.status = ReservationStatus.CANCELLED
+        await db.commit()
+
+    with patch.object(expiration, "_create_reservation_fork_best_effort", create):
+        await _backstop_missing_forks(known_fork_ids=set())
+
+    assert departs not in expiration._fork_backstop_attempts
+    # `stays` is still ACTIVE and still forkless, so it is visited, fails again, and
+    # its counter is untouched by the prune (it only advances from the normal path).
+    assert expiration._fork_backstop_attempts[stays] == 3

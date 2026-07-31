@@ -1698,7 +1698,10 @@ async def test_fork_best_effort_swallows_exhausted_retries():
         new=AsyncMock(side_effect=RuntimeError("cabling down")),
     ):
         # No exception escapes.
-        await _create_reservation_fork_best_effort(uuid.uuid4(), uuid.uuid4())
+        result = await _create_reservation_fork_best_effort(uuid.uuid4(), uuid.uuid4())
+    # Exhausted-retries is the one genuine failure the bool contract reports (issue
+    # #448 item 1: the sweep's give-up counter relies on this).
+    assert result is False
 
 
 @pytest.mark.asyncio
@@ -1708,8 +1711,11 @@ async def test_fork_best_effort_skips_no_topology():
         "app.services.reservation_service._create_reservation_fork",
         new=AsyncMock(),
     ) as mock_fork:
-        await _create_reservation_fork_best_effort(uuid.uuid4(), None)
+        result = await _create_reservation_fork_best_effort(uuid.uuid4(), None)
     mock_fork.assert_not_called()
+    # A null topology is a deliberate skip, not a failure: the bool contract reports
+    # True (issue #448 item 1).
+    assert result is True
 
 
 @pytest.mark.asyncio
