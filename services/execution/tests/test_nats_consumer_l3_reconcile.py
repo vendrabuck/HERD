@@ -252,6 +252,47 @@ async def test_reconcile_provisions_pinned_routes_on_first_adjacency():
     assert rows[0].routes == ROUTES, "the switch's config routes were pinned verbatim"
 
 
+ROUTES_ECMP = [
+    {"destination": "10.5.0.0/24", "next_hop": "192.168.1.1", "interface": "eth0"},
+    {"destination": "10.5.0.0/24", "next_hop": "192.168.1.2", "interface": "eth0"},
+]
+
+
+async def test_reconcile_ecmp_siblings_both_configured_not_collapsed():
+    """Two ECMP routes to the same destination via different next hops must both be
+    configured through the L3 apply path, not collapsed to one (issue #448 item 3).
+
+    Restores end-to-end strength for the ECMP non-collapse property: previously it
+    was pinned only at the _route_run_identity identity-function level
+    (test_route_run_identity_packs_three_fields below), which proves the two
+    siblings WOULD get distinct idempotency keys but never proves the reconcile
+    apply loop actually drives a driver call for each one rather than deduping by
+    destination somewhere upstream (the retired legacy device-set L3 executor had
+    an end-to-end pin for exactly this that was deleted with it in ADR 0009 phase
+    7). This test drives the real fork-reconcile path (handle_wiring_changed to
+    _reconcile_l3_adjacency to _apply_l3_adjacency) with a switch config carrying
+    both siblings and asserts both configure_route calls happen and both routes
+    are pinned verbatim.
+    """
+
+    async def _ecmp_config_fetch(device_id, client=None):
+        if str(device_id) == SW_L3:
+            return {"config": {"routes": ROUTES_ECMP}}
+        return None
+
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], config_fetch=_ecmp_config_fetch
+    )
+    configure_calls = [c for c in calls if c[0] == "configure_route"]
+    assert configure_calls.count(("configure_route", "10.5.0.0/24")) == 2, (
+        "both ECMP siblings must be configured, not collapsed into a single call"
+    )
+
+    rows = await _rows("ACTIVE")
+    assert len(rows) == 1
+    assert rows[0].routes == ROUTES_ECMP, "the pinned set retains both ECMP siblings verbatim"
+
+
 async def test_reconcile_deprovisions_on_last_adjacency_lost():
     """Emptying the canvas removes exactly the pinned set and releases the pin."""
     await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1)

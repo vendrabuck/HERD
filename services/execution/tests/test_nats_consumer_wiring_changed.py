@@ -389,6 +389,52 @@ async def test_frozen_reservation_is_noop_zero_driver_calls():
     assert await _last_applied() == 0
 
 
+@pytest.mark.asyncio
+async def test_missing_reservation_id_warns_and_returns_without_raising(caplog):
+    """A wiring_changed event with no reservation_id is a guarded no-op (issue #448
+    item 2): it warns and returns cleanly before any DB read or driver call, so the
+    NATS loop acks it rather than routing it through the exception/NAK/DLQ path."""
+    execute_fn, calls = _sandbox_recorder()
+    event = {
+        "event": "reservation.wiring_changed",
+        "reservation_id": None,
+        "fork_version": 1,
+        "released": [],
+        "built": PAIR_12,
+    }
+    with caplog.at_level("WARNING"):
+        await _run(event, execute_fn)
+
+    assert calls == []
+    assert await _assignments() == []
+    assert any(
+        "wiring_changed event missing reservation_id or fork_version" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_fork_version_warns_and_returns_without_raising(caplog):
+    """Same guard, the fork_version-missing half: also a warn-and-return no-op."""
+    execute_fn, calls = _sandbox_recorder()
+    event = {
+        "event": "reservation.wiring_changed",
+        "reservation_id": RES_ID,
+        "fork_version": None,
+        "released": [],
+        "built": PAIR_12,
+    }
+    with caplog.at_level("WARNING"):
+        await _run(event, execute_fn)
+
+    assert calls == []
+    assert await _assignments() == []
+    assert any(
+        "wiring_changed event missing reservation_id or fork_version" in rec.message
+        for rec in caplog.records
+    )
+
+
 # --- Release-before-build (Decision 4/6) ------------------------------------
 
 
