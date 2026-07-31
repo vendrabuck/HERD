@@ -64,7 +64,7 @@ make migrate                     # alembic upgrade head for every service
 make restart                     # bounce the stack
 ```
 
-Alembic migrations are per-service (one migration chain per database schema). On a brand-new stack, tables auto-create on startup via `create_all` and migrations aren't strictly required; on existing stacks always run migrations after code changes that touch the schema.
+Alembic migrations are per-service (one migration chain per database schema). On a brand-new stack, tables auto-create on startup via `create_all` and the schema is stamped at the Alembic head, so migrations aren't strictly required. Once a schema carries that stamp, startup never runs `create_all` again (issue #419): the schema evolves only through Alembic. On an upgraded-in-place stack this means a table introduced by a new release does not exist until `make migrate` runs; the booting service logs a warning naming the stamped revision and the new head. Always run `make migrate` after pulling code that touches the schema; the order in the block above (migrate before restart) avoids the window entirely.
 
 If a migration fails mid-flight, the service stays down. Fix the cause, re-run `make migrate-<service>` for just that one.
 
