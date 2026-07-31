@@ -17,6 +17,7 @@ import { DeviceGroupsPage } from "@/pages/admin/DeviceGroupsPage";
 import { DeviceGroupDetailPage } from "@/pages/admin/DeviceGroupDetailPage";
 import { DriversPage } from "@/pages/admin/DriversPage";
 import { ConnectionsPage } from "@/pages/admin/ConnectionsPage";
+import { GrantsPage } from "@/pages/admin/GrantsPage";
 import { TemplatesPage } from "@/pages/TemplatesPage";
 import { TemplateEditorPage } from "@/pages/TemplateEditorPage";
 import { TopologyTemplatesPage } from "@/pages/TopologyTemplatesPage";
@@ -96,6 +97,7 @@ export default function App() {
           <Route path="/admin/device-groups/:id" element={<DeviceGroupDetailPage />} />
           <Route path="/admin/connections" element={<ConnectionsPage />} />
           <Route path="/admin/drivers" element={<DriversPage />} />
+          <Route path="/admin/grants" element={<GrantsPage />} />
         </Route>
         <Route path="/dashboard" element={<Navigate to="/topology" replace />} />
         <Route path="*" element={<Navigate to="/topology" replace />} />

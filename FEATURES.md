@@ -23,8 +23,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   [docs/ROLES.md](docs/ROLES.md).
 - **User groups** (Shipped): organize users into teams with bulk member management.
 - **Resource-level ACL grants** (Shipped): group-based view and manage grants on
-  topologies, reservations, and secrets, via the acl service's API. There is no
-  grants-management UI yet; admins drive the API directly (issue #397).
+  devices, topologies, reservations, and secrets, via the acl service's API and
+  an admin-only Grants page (`/admin/grants`) to list, filter, create, and
+  delete grants (issue #397).
 - **Encrypted-at-rest credential store** (Shipped): a dedicated secrets service
   holding named secrets whose payloads are AES-GCM envelope-encrypted (an
   environment-supplied key-encryption key wraps per-version data-encryption

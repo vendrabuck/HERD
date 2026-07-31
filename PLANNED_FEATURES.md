@@ -22,7 +22,7 @@ HERD is a lab reservation and topology-management platform built as independent 
 ## Identity, security, and compliance
 
 - `Shipped` LDAP / Active Directory authentication. A pluggable authentication method with just-in-time user provisioning on first bind and strict separation between local and directory-sourced identities.
-- `Shipped` Resource-level access control. Group-based view and manage grants on topologies and reservations via the acl service's API, providing the foundation for multi-tenant isolation; no grants-management UI exists yet (issue #397).
+- `Shipped` Resource-level access control. Group-based view and manage grants on devices, topologies, reservations, and secrets via the acl service's API, providing the foundation for multi-tenant isolation, with an admin-only Grants page (`/admin/grants`) to manage them (issue #397).
 - `Planned` SAML / OIDC single sign-on. A third authentication method alongside local and directory auth, for federated enterprise identity.
 - `Planned` Directory group mapping and sync. Mirror directory groups into HERD groups and periodically reconcile membership, including deactivating users removed upstream.
 - `Shipped` Encrypted-at-rest credential store. A dedicated secrets service holding named secrets whose payloads are AES-GCM envelope-encrypted, with group-based grants via the ACL service, an internal-token retrieval surface, and online key rotation. This unblocks dynamic resource provisioning.
