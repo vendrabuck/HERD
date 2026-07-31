@@ -132,6 +132,24 @@ describe("GrantsPage", () => {
     expect(toastSuccess).not.toHaveBeenCalled();
   });
 
+  it("blocks create and shows a validation toast when resource id is not a uuid", async () => {
+    server.use(grantsHandler([]));
+    renderWithProviders(<GrantsPage />);
+    await waitFor(() => expect(screen.getByText("No grants found")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Grant" }));
+    const dialog = screen.getByRole("dialog", { name: "Create Grant" });
+    const form = within(dialog);
+    fireEvent.change(form.getByLabelText("Group"), { target: { value: "grp-1" } });
+    fireEvent.change(form.getByLabelText("Resource ID"), { target: { value: "not-a-uuid" } });
+    fireEvent.click(form.getByRole("button", { name: "Create" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Resource ID must be a valid UUID"),
+    );
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
   it("creates a grant through the modal and posts the right payload", async () => {
     let captured: unknown = null;
     server.use(
@@ -187,6 +205,46 @@ describe("GrantsPage", () => {
     await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith("This grant already exists"),
     );
+  });
+
+  it("falls back to a generic message instead of rendering a list-shaped detail", async () => {
+    // FastAPI/pydantic validation errors shape `detail` as a list of error
+    // objects, not a string. Passing that straight to toast.error would throw
+    // "Objects are not valid as a React child" inside the Toaster, which
+    // sits outside the app's ErrorBoundary and would blank the whole page.
+    server.use(
+      grantsHandler([]),
+      http.post("/api/acl/grants", () =>
+        HttpResponse.json(
+          { detail: [{ type: "uuid_parsing", loc: ["body", "resource_id"], msg: "bad uuid" }] },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderWithProviders(<GrantsPage />);
+    await waitFor(() => expect(screen.getByText("No grants found")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Grant" }));
+    const dialog = screen.getByRole("dialog", { name: "Create Grant" });
+    const form = within(dialog);
+    fireEvent.change(form.getByLabelText("Group"), { target: { value: "grp-1" } });
+    // A syntactically valid UUID so the client-side check passes and the
+    // request actually reaches the (mocked) 422 server response.
+    fireEvent.change(form.getByLabelText("Resource ID"), {
+      target: { value: "22222222-2222-2222-2222-222222222222" },
+    });
+    fireEvent.click(form.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Failed to create grant"));
+  });
+
+  it("renders an error state when the grants query fails", async () => {
+    server.use(
+      http.get("/api/acl/grants", () => HttpResponse.json({ detail: "boom" }, { status: 500 })),
+    );
+    renderWithProviders(<GrantsPage />);
+    await waitFor(() => expect(screen.getByText("Failed to load grants")).toBeInTheDocument());
+    expect(screen.queryByText("No grants found")).not.toBeInTheDocument();
   });
 
   it("deletes a grant through the confirm dialog", async () => {

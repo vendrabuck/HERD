@@ -93,7 +93,18 @@ def test_grant_create_effect_and_delete(pw_page):
         dialog.get_by_role("button", name="Create", exact=True).click()
 
         expect(dialog).to_be_hidden()
-        expect(pw_page.get_by_text(group_name)).to_be_visible()
+
+        # The group name also appears in the group filter <option> and in the
+        # (mounted-but-closed) create modal's own <option>, so a bare
+        # get_by_text(group_name) is a Playwright strict-mode violation
+        # (matches 3 elements). Scope to the table row instead. Filtering the
+        # list to this throwaway group also sidesteps a shared-stack ordering
+        # trap: list_grants orders by granted_at ASC, so on a stack with more
+        # than a page of grants the new row would otherwise land past the
+        # first page and the row locator below would never see it.
+        pw_page.locator("#grant-filter-group").select_option(group_id)
+        row = pw_page.locator("tr", has_text=group_name)
+        expect(row).to_be_visible()
 
         # --- Effect assertion: verify via the acl service API, not the UI ---
         matching = _api(
@@ -110,8 +121,6 @@ def test_grant_create_effect_and_delete(pw_page):
         assert grant["resource_id"] == device["id"]
 
         # --- Delete via the UI (the grants table's row action) ---
-        row = pw_page.locator("tr", has_text=group_name)
-        expect(row).to_be_visible()
         row.get_by_role("button", name="Delete", exact=True).click()
 
         confirm_dialog = pw_page.get_by_role("dialog", name="Delete Grant")
@@ -136,6 +145,11 @@ def test_grants_page_blocked_for_non_admin(pw_page):
     pw_page is a fresh browser context per test (see conftest.py's pw_page
     fixture), so logging in as a throwaway user here has no effect on any
     other test's session.
+
+    The auth service exposes no user-delete endpoint, so the registered
+    account cannot be torn down; it uses a unique timestamped username and
+    email so it stays inert, the same mitigation test_register_and_roles.py
+    documents for its own throwaway registration.
     """
     suffix = int(time.time() * 1000)
     username = f"e2epwgrant{suffix}"[:32]

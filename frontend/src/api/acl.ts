@@ -32,20 +32,12 @@ async function deleteGrant(id: string): Promise<void> {
 }
 
 // The acl service's GET /grants is paginated (items/total/skip/limit), not a
-// bare array; callers that just want "every grant matching these filters"
-// should use useAllGrants below rather than reading .data as an array.
+// bare array; read .data.items, not .data, when consuming this hook.
 export function useGrants(filters?: GrantFilters, skip = 0, limit = 50) {
   return useQuery({
     queryKey: ["grants", filters, skip, limit],
     queryFn: () => fetchGrants(filters, skip, limit),
     placeholderData: keepPreviousData,
-  });
-}
-
-export function useAllGrants(filters?: GrantFilters) {
-  return useQuery({
-    queryKey: ["grants", "all", filters],
-    queryFn: () => fetchGrants(filters, 0, 500).then((r) => r.items),
   });
 }
 

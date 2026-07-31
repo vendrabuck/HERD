@@ -12,6 +12,18 @@ import type { Grant, GrantCreate } from "@/types/acl.types";
 const RESOURCE_TYPES: Grant["resource_type"][] = ["device", "topology", "reservation", "secret"];
 const PERMISSIONS: Grant["permission"][] = ["view", "manage"];
 
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+// The acl service returns error detail as either a string or, on a pydantic
+// validation failure (e.g. a non-UUID resource_id), a list of error objects.
+// Passing that list straight to toast.error renders raw objects as a React
+// child and throws inside the Toaster, which sits outside the ErrorBoundary
+// in App.tsx and blanks the app. Only ever surface a string.
+function errorDetail(err: unknown, fallback: string): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  return typeof detail === "string" ? detail : fallback;
+}
+
 export function GrantsPage() {
   const user = useAuthStore((s) => s.user);
   const navigate = useNavigate();
@@ -23,11 +35,17 @@ export function GrantsPage() {
   const [filterResourceType, setFilterResourceType] = useState("");
   const [filterResourceId, setFilterResourceId] = useState("");
 
-  const { data, isLoading } = useGrants(
+  // A partial/invalid UUID in the filter would 422 the request; treat
+  // anything that doesn't parse as a UUID as "no resource_id filter" rather
+  // than firing a doomed request on every keystroke.
+  const trimmedFilterResourceId = filterResourceId.trim();
+  const filterResourceIdValid = UUID_RE.test(trimmedFilterResourceId);
+
+  const { data, isLoading, isError } = useGrants(
     {
       group_id: filterGroupId || undefined,
       resource_type: filterResourceType || undefined,
-      resource_id: filterResourceId.trim() || undefined,
+      resource_id: filterResourceIdValid ? trimmedFilterResourceId : undefined,
     },
     skip,
     limit,
@@ -77,6 +95,10 @@ export function GrantsPage() {
       toast.error("Resource ID is required");
       return;
     }
+    if (!UUID_RE.test(newResourceId.trim())) {
+      toast.error("Resource ID must be a valid UUID");
+      return;
+    }
     const body: GrantCreate = {
       group_id: newGroupId,
       resource_type: newResourceType,
@@ -88,10 +110,7 @@ export function GrantsPage() {
       toast.success("Grant created");
       closeCreateModal();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to create grant";
-      toast.error(msg);
+      toast.error(errorDetail(err, "Failed to create grant"));
     }
   };
 
@@ -101,10 +120,7 @@ export function GrantsPage() {
       await deleteGrant.mutateAsync(deleteId);
       toast.success("Grant deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to delete grant";
-      toast.error(msg);
+      toast.error(errorDetail(err, "Failed to delete grant"));
     }
     setDeleteId(null);
   };
@@ -215,6 +231,8 @@ export function GrantsPage() {
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
           {isLoading ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading grants...</p>
+          ) : isError ? (
+            <p className="text-sm text-red-600 px-4 py-4">Failed to load grants</p>
           ) : !grants || grants.length === 0 ? (
             <p className="text-sm text-gray-500 px-4 py-4">No grants found</p>
           ) : (
