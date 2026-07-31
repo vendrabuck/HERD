@@ -261,8 +261,8 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **Team workspaces** (Planned): organizational isolation where teams have their own
   device pools, topologies, and reservations. Builds on resource-level ACL to
-  provide workspace-level boundaries with cross-workspace sharing when
-  explicitly granted.
+  provide workspace-level boundaries. Cross-workspace resource sharing is a
+  later consideration, deliberately out of the first slice (issue #35).
 
 ## Future considerations
 
@@ -272,9 +272,10 @@ Longer-term ideas under exploration; not yet committed to a near-term slot.
   distributed labs into a unified view.
 - **Hardware-in-the-loop simulation**: integrate virtual or simulated devices
   alongside physical hardware in the same topology.
-- **Mobile-friendly interface**: list and table pages are responsive today;
-  dedicated mobile views for on-the-go reservation management are a future
-  consideration.
+- **Mobile-friendly interface**: list and table pages degrade gracefully on
+  narrow viewports (tables scroll horizontally rather than reflowing), and the
+  hover-based navigation is not touch-friendly; dedicated mobile views for
+  on-the-go reservation management are a future consideration (issue #44).
 - **Audit logging service**: comprehensive, tamper-evident audit trail of user
   actions and system events for compliance and troubleshooting.
 - **Plugin and extension system**: allow third-party or internal extensions for

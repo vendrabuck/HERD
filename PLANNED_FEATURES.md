@@ -59,7 +59,7 @@ These are directions of interest that are not yet scoped:
 
 - Federated labs: connect multiple HERD instances into a unified, searchable view.
 - Hardware-in-the-loop: model virtual or simulated devices alongside physical hardware in the same topology.
-- Mobile-friendly interface: dedicated mobile views beyond the already-responsive list and table pages.
+- Mobile-friendly interface: dedicated mobile views; today's list and table pages degrade gracefully (horizontal scroll) but do not reflow, and the hover navigation is not touch-friendly (issue #44).
 
 ## How this maps to today
 
