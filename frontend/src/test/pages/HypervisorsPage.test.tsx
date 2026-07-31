@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
 // Mock HTMLDialogElement methods (jsdom has no native <dialog> support)
@@ -220,5 +220,109 @@ describe("HypervisorsPage", () => {
     fireEvent.click(deleteButtons[0]);
     expect(screen.getByText("Delete Hypervisor")).toBeInTheDocument();
     expect(screen.getByText(/Delete "Proxmox Lab"\?/)).toBeInTheDocument();
+  });
+
+  // Mutation-failure toast surfacing. inventory (like acl) shapes error
+  // detail as either a string or, on a pydantic validation failure, a list
+  // of error objects; only the string case may reach toast.error directly
+  // (a list passed to it renders as a raw object child and throws inside the
+  // Toaster, which sits outside App.tsx's ErrorBoundary and blanks the app).
+  // Mirrors GrantsPage.test.tsx's create-failure/list-shaped-detail coverage.
+
+  it("create failure surfaces the server detail message", async () => {
+    mockCreateHypervisor.mutateAsync.mockRejectedValueOnce({
+      response: { data: { detail: "This hypervisor already exists" } },
+    });
+    render(<HypervisorsPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Register Hypervisor" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "New HV" } });
+    fireEvent.change(screen.getByLabelText("Endpoint"), {
+      target: { value: "https://hv.example.local" },
+    });
+    fireEvent.change(screen.getByLabelText("Hypervisor Type"), {
+      target: { value: "proxmox" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "s1" } });
+    const dialog = document.querySelectorAll("dialog")[0];
+    const submitBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Register",
+    )!;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("This hypervisor already exists"),
+    );
+  });
+
+  it("create failure with a list-shaped detail falls back to a generic message", async () => {
+    mockCreateHypervisor.mutateAsync.mockRejectedValueOnce({
+      response: {
+        data: {
+          detail: [{ type: "uuid_parsing", loc: ["body", "secret_id"], msg: "bad uuid" }],
+        },
+      },
+    });
+    render(<HypervisorsPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Register Hypervisor" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "New HV" } });
+    fireEvent.change(screen.getByLabelText("Endpoint"), {
+      target: { value: "https://hv.example.local" },
+    });
+    fireEvent.change(screen.getByLabelText("Hypervisor Type"), {
+      target: { value: "proxmox" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "s1" } });
+    const dialog = document.querySelectorAll("dialog")[0];
+    const submitBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Register",
+    )!;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("Failed to register hypervisor"),
+    );
+    // The raw array must never reach toast.error.
+    expect(mockToastError).not.toHaveBeenCalledWith(expect.any(Array));
+  });
+
+  it("update failure surfaces the server detail message", async () => {
+    mockUpdateHypervisor.mutateAsync.mockRejectedValueOnce({
+      response: { data: { detail: "endpoint is already registered" } },
+    });
+    render(<HypervisorsPage />);
+    const editButtons = screen.getAllByText("Edit");
+    fireEvent.click(editButtons[0]);
+    const dialog = document.querySelectorAll("dialog")[0];
+    const submitBtn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Save",
+    )!;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("endpoint is already registered"),
+    );
+  });
+
+  it("delete failure surfaces the backend's 409 detail message", async () => {
+    mockDeleteHypervisor.mutateAsync.mockRejectedValueOnce({
+      response: {
+        data: { detail: "Cannot delete hypervisor: templates still reference it" },
+      },
+    });
+    render(<HypervisorsPage />);
+    const deleteButtons = screen.getAllByText("Delete");
+    fireEvent.click(deleteButtons[0]);
+
+    const confirmDialog = document.querySelectorAll("dialog")[1];
+    const confirmBtn = Array.from(confirmDialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Delete",
+    )!;
+    fireEvent.click(confirmBtn);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith(
+        "Cannot delete hypervisor: templates still reference it",
+      ),
+    );
   });
 });

@@ -14,6 +14,17 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { Hypervisor } from "@/types/hypervisor.types";
 
+// inventory (like acl) returns error detail as either a string or, on a
+// pydantic validation failure, a list of error objects. Passing that list
+// straight to toast.error renders raw objects as a React child and throws
+// inside the Toaster, which sits outside the ErrorBoundary in App.tsx and
+// blanks the app. Only ever surface a string. Mirrors GrantsPage's
+// errorDetail() (frontend/src/pages/admin/GrantsPage.tsx).
+function errorDetail(err: unknown, fallback: string): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  return typeof detail === "string" ? detail : fallback;
+}
+
 interface FormState {
   name: string;
   description: string;
@@ -117,10 +128,7 @@ export function HypervisorsPage() {
       toast.success("Hypervisor registered");
       closeCreateModal();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to register hypervisor";
-      toast.error(msg);
+      toast.error(errorDetail(err, "Failed to register hypervisor"));
     }
   };
 
@@ -142,10 +150,7 @@ export function HypervisorsPage() {
       toast.success("Hypervisor updated");
       closeEditModal();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to update hypervisor";
-      toast.error(msg);
+      toast.error(errorDetail(err, "Failed to update hypervisor"));
     }
   };
 
@@ -155,10 +160,7 @@ export function HypervisorsPage() {
       await deleteHypervisor.mutateAsync(deleteTarget.id);
       toast.success("Hypervisor deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete hypervisor";
-      toast.error(msg);
+      toast.error(errorDetail(err, "Failed to delete hypervisor"));
     }
     setDeleteTarget(null);
   };
