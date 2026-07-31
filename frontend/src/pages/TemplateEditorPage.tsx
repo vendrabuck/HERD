@@ -7,6 +7,7 @@ import {
   useUpdateTemplate,
 } from "@/api/templates";
 import { useDrivers } from "@/api/drivers";
+import { useHypervisors } from "@/api/hypervisors";
 import { useAIStatus, useSuggestTemplateIdentity } from "@/api/ai";
 import { useAuthStore } from "@/stores/authStore";
 import { FieldRow } from "@/components/templates/FieldRow";
@@ -43,6 +44,7 @@ export function TemplateEditorPage() {
   const createTemplate = useCreateTemplate();
   const updateTemplate = useUpdateTemplate();
   const { data: drivers } = useDrivers();
+  const { data: hypervisors } = useHypervisors();
   const { data: aiStatus } = useAIStatus();
   const suggestIdentity = useSuggestTemplateIdentity();
   const user = useAuthStore((s) => s.user);
@@ -50,8 +52,9 @@ export function TemplateEditorPage() {
 
   const [editing, setEditing] = useState(isNew);
   const [name, setName] = useState("");
-  const [templateType, setTemplateType] = useState<"device" | "port">("device");
+  const [templateType, setTemplateType] = useState<"device" | "port" | "dynamic">("device");
   const [driverId, setDriverId] = useState<string | null>(null);
+  const [hypervisorId, setHypervisorId] = useState<string | null>(null);
   const [exclusive, setExclusive] = useState(true);
   const [description, setDescription] = useState("");
   const [icon, setIcon] = useState<string | null>(null);
@@ -66,8 +69,9 @@ export function TemplateEditorPage() {
   if (existing && existing.id !== syncedId) {
     setSyncedId(existing.id);
     setName(existing.name);
-    setTemplateType(existing.template_type as "device" | "port");
+    setTemplateType(existing.template_type as "device" | "port" | "dynamic");
     setDriverId(existing.driver_id);
+    setHypervisorId(existing.hypervisor_id);
     setExclusive(existing.exclusive);
     setDescription(existing.description ?? "");
     setIcon(existing.icon);
@@ -185,6 +189,14 @@ export function TemplateEditorPage() {
       toast.error("Device templates must have a driver");
       return;
     }
+    if (templateType === "dynamic" && !driverId) {
+      toast.error("Dynamic templates must have a recipe driver");
+      return;
+    }
+    if (templateType === "dynamic" && !hypervisorId) {
+      toast.error("Dynamic templates must have a hypervisor");
+      return;
+    }
     if (identityRequired && (!vendor.trim() || !model.trim())) {
       toast.error("Vendor and Model are required for device templates");
       return;
@@ -210,11 +222,16 @@ export function TemplateEditorPage() {
     }
 
     try {
+      const driverIdForType =
+        templateType === "device" || templateType === "dynamic" ? driverId : null;
+      const hypervisorIdForType = templateType === "dynamic" ? hypervisorId : null;
+
       if (isNew) {
         await createTemplate.mutateAsync({
           name: name.trim(),
           template_type: templateType,
-          driver_id: templateType === "device" ? driverId : null,
+          driver_id: driverIdForType,
+          hypervisor_id: hypervisorIdForType,
           exclusive,
           icon,
           description: description.trim() || undefined,
@@ -231,7 +248,8 @@ export function TemplateEditorPage() {
           id: id!,
           data: {
             name: name.trim(),
-            driver_id: templateType === "device" ? driverId : null,
+            driver_id: driverIdForType,
+            hypervisor_id: hypervisorIdForType,
             exclusive,
             icon,
             description: description.trim() || undefined,
@@ -260,8 +278,9 @@ export function TemplateEditorPage() {
     }
     if (existing) {
       setName(existing.name);
-      setTemplateType(existing.template_type as "device" | "port");
+      setTemplateType(existing.template_type as "device" | "port" | "dynamic");
       setDriverId(existing.driver_id);
+      setHypervisorId(existing.hypervisor_id);
       setExclusive(existing.exclusive);
       setDescription(existing.description ?? "");
       setIcon(existing.icon);
@@ -375,15 +394,21 @@ export function TemplateEditorPage() {
                     id="tmpl-type"
                     value={templateType}
                     onChange={(e) => {
-                      const val = e.target.value as "device" | "port";
+                      const val = e.target.value as "device" | "port" | "dynamic";
                       setTemplateType(val);
-                      if (val !== "device") setDriverId(null);
+                      // The valid driver set differs per type (device drivers vs.
+                      // Hypervisor-type recipe drivers), and hypervisor_id is only
+                      // meaningful on dynamic templates, so both reset on any type
+                      // change rather than carrying a now-invalid selection forward.
+                      setDriverId(null);
+                      if (val !== "dynamic") setHypervisorId(null);
                     }}
                     disabled={!isNew}
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:text-gray-500"
                   >
                     <option value="device">Device</option>
                     <option value="port">Port</option>
+                    <option value="dynamic">Dynamic (Hypervisor)</option>
                   </select>
                 </div>
                 <div>
@@ -435,13 +460,13 @@ export function TemplateEditorPage() {
                   Exclusive (single reservation at a time)
                 </label>
               </div>
-              {templateType === "device" && (
+              {(templateType === "device" || templateType === "dynamic") && (
                 <div>
                   <label
                     htmlFor="tmpl-driver"
                     className="block text-sm font-medium text-gray-700 mb-1"
                   >
-                    Driver
+                    {templateType === "dynamic" ? "Recipe Driver" : "Driver"}
                   </label>
                   <select
                     id="tmpl-driver"
@@ -452,12 +477,59 @@ export function TemplateEditorPage() {
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                   >
                     <option value="">Select a driver</option>
-                    {drivers?.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name} ({d.connection_type})
+                    {/* Mirrors template_service._validate_driver_connection_type: a
+                        dynamic template's driver must be Hypervisor-type (the
+                        recipe); a device template's driver must not be. */}
+                    {drivers
+                      ?.filter((d) =>
+                        templateType === "dynamic"
+                          ? d.connection_type === "Hypervisor"
+                          : d.connection_type !== "Hypervisor",
+                      )
+                      .map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.name} ({d.connection_type})
+                        </option>
+                      ))}
+                  </select>
+                  {templateType === "dynamic" &&
+                    drivers &&
+                    drivers.filter((d) => d.connection_type === "Hypervisor").length === 0 && (
+                      <p className="text-xs text-amber-600 mt-1">
+                        No Hypervisor-type drivers uploaded yet. Upload a recipe driver
+                        from the Drivers page first.
+                      </p>
+                    )}
+                </div>
+              )}
+
+              {templateType === "dynamic" && (
+                <div>
+                  <label
+                    htmlFor="tmpl-hypervisor"
+                    className="block text-sm font-medium text-gray-700 mb-1"
+                  >
+                    Hypervisor
+                  </label>
+                  <select
+                    id="tmpl-hypervisor"
+                    value={hypervisorId ?? ""}
+                    onChange={(e) => setHypervisorId(e.target.value || null)}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="">Select a hypervisor</option>
+                    {hypervisors?.map((h) => (
+                      <option key={h.id} value={h.id}>
+                        {h.name} ({h.hypervisor_type})
                       </option>
                     ))}
                   </select>
+                  {hypervisors && hypervisors.length === 0 && (
+                    <p className="text-xs text-amber-600 mt-1">
+                      No hypervisors registered. Register one from the Hypervisors
+                      admin page first.
+                    </p>
+                  )}
                 </div>
               )}
               <div>
@@ -654,13 +726,25 @@ export function TemplateEditorPage() {
                   <p className="text-sm text-gray-600">{existing?.description ?? "-"}</p>
                 </div>
                 <div>
-                  <p className="text-xs font-medium text-gray-500 uppercase mb-1">Driver</p>
+                  <p className="text-xs font-medium text-gray-500 uppercase mb-1">
+                    {existing?.template_type === "dynamic" ? "Recipe Driver" : "Driver"}
+                  </p>
                   <p className="text-sm text-gray-600">
                     {existing?.driver_name
                       ? `${existing.driver_name} (${existing.connection_type})`
                       : "-"}
                   </p>
                 </div>
+                {existing?.template_type === "dynamic" && (
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 uppercase mb-1">Hypervisor</p>
+                    <p className="text-sm text-gray-600">
+                      {hypervisors?.find((h) => h.id === existing.hypervisor_id)?.name ??
+                        existing.hypervisor_id ??
+                        "-"}
+                    </p>
+                  </div>
+                )}
                 <div>
                   <p className="text-xs font-medium text-gray-500 uppercase mb-1">Vendor</p>
                   <p className="text-sm text-gray-600">

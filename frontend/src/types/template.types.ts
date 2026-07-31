@@ -21,6 +21,7 @@ export interface DeviceTemplate {
   driver_id: string | null;
   driver_name: string | null;
   connection_type: string | null;
+  hypervisor_id: string | null;
   exclusive: boolean;
   icon: string | null;
   description: string | null;
@@ -35,8 +36,9 @@ export interface DeviceTemplate {
 
 export interface TemplateCreate {
   name: string;
-  template_type?: "device" | "port";
+  template_type?: "device" | "port" | "dynamic";
   driver_id?: string | null;
+  hypervisor_id?: string | null;
   exclusive?: boolean;
   icon?: string | null;
   description?: string;
@@ -50,6 +52,7 @@ export interface TemplateCreate {
 export interface TemplateUpdate {
   name?: string;
   driver_id?: string | null;
+  hypervisor_id?: string | null;
   exclusive?: boolean;
   icon?: string | null;
   description?: string;
