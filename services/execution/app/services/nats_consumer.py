@@ -2951,6 +2951,16 @@ async def handle_reservation_event(
         ctx = _FetchContext(client)
 
         if event_type in DYNAMIC_TEARDOWN_EVENTS:
+            # Missing-field guard (issue #455), mirroring handle_wiring_changed's: a
+            # terminal event with no reservation_id would otherwise flow str(None) into
+            # _teardown_from_ledgers, where uuid.UUID("None") raises a bare ValueError
+            # that the outer consumer NAKs, burning all max_deliver redeliveries before
+            # the DLQ. Our own outbox producers always stamp reservation_id, so this is
+            # unreachable from first-party events; the guard is cheap symmetry.
+            if reservation_id is None:
+                logger.warning("%s event missing reservation_id; ignoring", event_type)
+                return
+
             # ADR 0009 phase 6: terminal teardown (cancelled/completed/failed) releases
             # from the three wiring ledgers, not the device set. Reading the ACTIVE ledger
             # set gives the issue #244 applied-state-only guarantee directly (an ACTIVE row

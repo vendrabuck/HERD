@@ -10,6 +10,7 @@ ACTIVE rows across all three ledgers, drive the terminal path, and assert the re
 the freeze ordering, mirroring the test_nats_consumer_l2_reconcile.py fixtures.
 """
 
+import logging
 import uuid
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
@@ -270,19 +271,17 @@ async def test_terminal_event_releases_all_three_ledgers(event_type):
 @pytest.mark.parametrize(
     "event_type", ["reservation.cancelled", "reservation.completed", "reservation.failed"]
 )
-async def test_terminal_event_none_reservation_id_raises(event_type):
-    """Pins ACTUAL current behavior (issue #448 item 2): a terminal event with a None
-    reservation_id is NOT skipped by any guard. handle_reservation_event has no
-    missing-reservation_id check on this path (unlike handle_wiring_changed's explicit
-    guard), so `str(None)` flows into _teardown_from_ledgers as the literal string
-    "None" and uuid.UUID("None") raises ValueError. This is a deliberate,
-    already-accepted poison-handling outcome per the issue: process_reservation_message's
-    generic `except Exception` branch NAKs the message for redelivery and only routes it
-    to the DLQ once num_delivered reaches max_deliver (it is NOT raised as
-    PermanentEventError, so it is not DLQ'd on the first delivery). This test pins the
-    handler-level raise; it does not exercise the outer NATS message loop.
+async def test_terminal_event_none_reservation_id_warns_and_skips(event_type, caplog):
+    """Pins the fixed behavior (issue #455): the terminal branch now mirrors
+    handle_wiring_changed's missing-field guard. A terminal event with a None
+    reservation_id logs a warning naming the event type and returns without raising,
+    instead of letting `str(None)` flow into _teardown_from_ledgers where
+    uuid.UUID("None") raised a bare ValueError; that ValueError fell into
+    process_reservation_message's generic `except Exception` branch, which NAKs for
+    redelivery, burning all max_deliver redeliveries before the DLQ. This test pins
+    the handler-level warn-and-return; it does not exercise the outer NATS message loop.
     """
-    execute_fn, _calls = _recorder()
+    execute_fn, calls = _recorder()
     event = {
         "event": event_type,
         "reservation_id": None,
@@ -292,8 +291,14 @@ async def test_terminal_event_none_reservation_id_raises(event_type):
     with ExitStack() as stack:
         for p in _event_patches(execute_fn):
             stack.enter_context(p)
-        with pytest.raises(ValueError):
+        with caplog.at_level(logging.WARNING, logger="app.services.nats_consumer"):
             await handle_reservation_event(event, _db_session_factory())
+
+    assert calls == [], "the guard returns before any driver call"
+    assert any(
+        event_type in record.message and "reservation_id" in record.message
+        for record in caplog.records
+    ), "warning must name the event type"
 
 
 async def test_empty_ledgers_noop_without_driver_calls():
