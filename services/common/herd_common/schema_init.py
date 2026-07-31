@@ -127,6 +127,7 @@ def _log_managed_schema_drift(
     schema: str | None,
     script_location: str,
     stamp: str | None,
+    had_tables: bool,
     missing_model_tables: set[str],
 ) -> None:
     """Advisory-only drift check for a migration-managed schema.
@@ -135,8 +136,26 @@ def _log_managed_schema_drift(
     issue #419, so a broken or missing script directory must not become a new
     boot failure mode.
     """
+    if missing_model_tables and not had_tables:
+        # A stamp with ZERO model tables: a manual `alembic stamp` on an empty
+        # schema, or a partial restore that kept alembic_version. `make migrate`
+        # cannot fix this: the stamp claims the missing tables' migrations
+        # already ran, so upgrade replays nothing.
+        log.warning(
+            "Schema '%s' carries an Alembic stamp (%s) but none of the service's "
+            "model tables exist: the stamp does not match the actual schema "
+            "contents (a manual stamp on an empty schema, or a partial restore "
+            "that kept alembic_version). `make migrate` will NOT recreate tables "
+            "the stamp claims exist. Either restore the schema contents or drop "
+            "the alembic_version row so the next boot can bootstrap it fresh.",
+            schema,
+            stamp,
+        )
+        return
+
     try:
-        head = _script_directory(script_location).get_current_head()
+        script = _script_directory(script_location)
+        head = script.get_current_head()
     except Exception as exc:  # advisory only; never block boot
         log.warning(
             "Schema '%s' is migration-managed; could not read the Alembic chain at %s "
@@ -148,15 +167,33 @@ def _log_managed_schema_drift(
         return
 
     if head is not None and stamp != head:
-        log.warning(
-            "Schema '%s' is migration-managed and stamped at %s, but this build's "
-            "Alembic head is %s. Startup no longer pre-creates model tables on a "
-            "managed schema (issue #419), so tables from unapplied migrations are "
-            "absent until `make migrate` (or `make migrate-<svc>`) runs.",
-            schema,
-            stamp,
-            head,
-        )
+        try:
+            script.get_revision(stamp)
+            stamp_in_chain = True
+        except Exception:
+            stamp_in_chain = False
+        if stamp_in_chain:
+            # The chain is linear, so a resolvable non-head stamp is behind head.
+            log.warning(
+                "Schema '%s' is migration-managed and stamped at %s, but this build's "
+                "Alembic head is %s. Startup no longer pre-creates model tables on a "
+                "managed schema (issue #419), so tables from unapplied migrations are "
+                "absent until `make migrate` (or `make migrate-<svc>`) runs.",
+                schema,
+                stamp,
+                head,
+            )
+        else:
+            log.warning(
+                "Schema '%s' is stamped at %s, which is not in this build's migration "
+                "chain (head %s): the schema was migrated by a newer build than this "
+                "image (a rollback). Startup makes no schema changes; behavior is "
+                "read-compatible best-effort until the image and schema versions "
+                "match again.",
+                schema,
+                stamp,
+                head,
+            )
     elif missing_model_tables:
         log.warning(
             "Schema '%s' is stamped at the Alembic head %s, but model tables %s do "
@@ -206,6 +243,7 @@ async def create_all_and_stamp(
                 schema=schema,
                 script_location=script_location,
                 stamp=stamp,
+                had_tables=had_tables,
                 missing_model_tables=missing_model_tables,
             )
             return action

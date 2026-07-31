@@ -60,11 +60,13 @@ For new schema additions between HERD versions:
 ```bash
 git pull                         # get the new code
 make build                       # rebuild images with the new code
+docker compose up -d             # recreate containers onto the new images
 make migrate                     # alembic upgrade head for every service
-make restart                     # bounce the stack
 ```
 
-Alembic migrations are per-service (one migration chain per database schema). On a brand-new stack, tables auto-create on startup via `create_all` and the schema is stamped at the Alembic head, so migrations aren't strictly required. Once a schema carries that stamp, startup never runs `create_all` again (issue #419): the schema evolves only through Alembic. On an upgraded-in-place stack this means a table introduced by a new release does not exist until `make migrate` runs; the booting service logs a warning naming the stamped revision and the new head. Always run `make migrate` after pulling code that touches the schema; the order in the block above (migrate before restart) avoids the window entirely.
+The order matters. `make migrate` execs into the running containers, and `make restart` (`docker compose restart`) never swaps a container onto a rebuilt image, so migrating or restarting before the `docker compose up -d` recreate would run the OLD image's migration files. Recreate first, then migrate: the exec then sees the new release's migrations.
+
+Alembic migrations are per-service (one migration chain per database schema). On a brand-new stack, tables auto-create on startup via `create_all` and the schema is stamped at the Alembic head, so migrations aren't strictly required. Once a schema carries that stamp, startup never runs `create_all` again (issue #419): the schema evolves only through Alembic. Between the recreate and the migrate, a service whose new release adds a table boots without it and logs a warning naming the stamped revision and the new head; `make migrate` creates the table, and the warning clears on the next restart.
 
 If a migration fails mid-flight, the service stays down. Fix the cause, re-run `make migrate-<service>` for just that one.
 

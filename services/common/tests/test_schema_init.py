@@ -316,6 +316,73 @@ async def test_stamped_at_head_missing_table_warns_missing_migration(
     assert "missing" in message
 
 
+async def test_stamped_empty_schema_warns_stamp_mismatch(
+    metadata, script_location, make_engine, caplog
+):
+    """A stamp with ZERO model tables gets the distinct stamp-mismatch warning.
+
+    Reachable via a manual `alembic stamp` on an empty schema or a partial
+    restore that kept alembic_version. `make migrate` cannot fix it (the stamp
+    claims the missing tables' migrations already ran), so the message must
+    name that remedy gap, not misdiagnose it as a missing migration.
+    """
+    engine = make_engine()
+    # Stamp head with an EMPTY model set: alembic_version exists, no tables.
+    first = await create_all_and_stamp(
+        engine, MetaData(), schema=None, script_location=script_location
+    )
+    assert first is SchemaInitResult.STAMPED_FRESH
+
+    with caplog.at_level(logging.WARNING):
+        result = await create_all_and_stamp(
+            engine, metadata, schema=None, script_location=script_location
+        )
+
+    assert result is SchemaInitResult.ALREADY_MANAGED
+    assert "widget" not in await _table_names(engine)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a stamp-mismatch warning"
+    message = warnings[0].getMessage()
+    assert "does not match the actual schema contents" in message
+    assert "alembic_version" in message
+    # Distinct from the other managed-path warnings: neither of their remedies.
+    assert "unapplied migrations" not in message
+    assert "missing from the chain" not in message
+
+
+async def test_stamp_ahead_of_build_head_warns_rollback(
+    metadata, script_location, make_engine, caplog
+):
+    """A stamp not in this build's chain (image rollback) is not told to migrate.
+
+    Nothing is absent on a rollback, so the behind-head wording ("absent until
+    make migrate runs") would be false; the message must name the newer-build
+    condition instead.
+    """
+    engine = make_engine()
+    await create_all_and_stamp(engine, metadata, schema=None, script_location=script_location)
+
+    # Simulate the rollback: the database was migrated to a revision this
+    # build's chain does not contain.
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE alembic_version SET version_num = '9999_future'"))
+
+    with caplog.at_level(logging.WARNING):
+        result = await create_all_and_stamp(
+            engine, metadata, schema=None, script_location=script_location
+        )
+
+    assert result is SchemaInitResult.ALREADY_MANAGED
+    assert await _stamp_value(engine) == "9999_future"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a rollback warning"
+    message = warnings[0].getMessage()
+    assert "newer build" in message
+    assert "9999_future" in message
+    assert HEAD_REVISION in message
+    assert "absent until" not in message
+
+
 async def test_managed_steady_state_is_quiet(metadata, script_location, make_engine, caplog):
     """Stamped at head, no drift: no warnings on a routine restart."""
     engine = make_engine()
