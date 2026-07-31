@@ -1,5 +1,6 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import type { Grant, GrantCreate } from "@/types/acl.types";
+import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
 
 interface GrantFilters {
@@ -8,14 +9,16 @@ interface GrantFilters {
   resource_id?: string;
 }
 
-async function fetchGrants(filters?: GrantFilters): Promise<Grant[]> {
-  const params = new URLSearchParams();
-  if (filters?.group_id) params.set("group_id", filters.group_id);
-  if (filters?.resource_type) params.set("resource_type", filters.resource_type);
-  if (filters?.resource_id) params.set("resource_id", filters.resource_id);
-  const query = params.toString();
-  const url = `/acl/grants${query ? `?${query}` : ""}`;
-  const resp = await apiClient.get<Grant[]>(url);
+async function fetchGrants(
+  filters?: GrantFilters,
+  skip = 0,
+  limit = 50,
+): Promise<PaginatedResponse<Grant>> {
+  const params: Record<string, string | number> = { skip, limit };
+  if (filters?.group_id) params.group_id = filters.group_id;
+  if (filters?.resource_type) params.resource_type = filters.resource_type;
+  if (filters?.resource_id) params.resource_id = filters.resource_id;
+  const resp = await apiClient.get<PaginatedResponse<Grant>>("/acl/grants", { params });
   return resp.data;
 }
 
@@ -28,10 +31,21 @@ async function deleteGrant(id: string): Promise<void> {
   await apiClient.delete(`/acl/grants/${id}`);
 }
 
-export function useGrants(filters?: GrantFilters) {
+// The acl service's GET /grants is paginated (items/total/skip/limit), not a
+// bare array; callers that just want "every grant matching these filters"
+// should use useAllGrants below rather than reading .data as an array.
+export function useGrants(filters?: GrantFilters, skip = 0, limit = 50) {
   return useQuery({
-    queryKey: ["grants", filters],
-    queryFn: () => fetchGrants(filters),
+    queryKey: ["grants", filters, skip, limit],
+    queryFn: () => fetchGrants(filters, skip, limit),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useAllGrants(filters?: GrantFilters) {
+  return useQuery({
+    queryKey: ["grants", "all", filters],
+    queryFn: () => fetchGrants(filters, 0, 500).then((r) => r.items),
   });
 }
 

@@ -19,30 +19,35 @@ const GRANT = {
   group_id: "ug-1",
   resource_type: "device",
   resource_id: "d-1",
-  permission: "use",
+  permission: "view",
+  granted_by: "admin-1",
+  granted_at: "2026-07-30T00:00:00Z",
 };
 
 describe("acl api hooks", () => {
-  it("useGrants fetches with no filters", async () => {
+  it("useGrants fetches the paginated shape with skip/limit and no filters", async () => {
     let capturedUrl = "";
     server.use(
       http.get("/api/acl/grants", ({ request }) => {
         capturedUrl = request.url;
-        return HttpResponse.json([GRANT]);
+        return HttpResponse.json({ items: [GRANT], total: 1, skip: 0, limit: 50 });
       }),
     );
     const { result } = renderHook(() => useGrants(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toHaveLength(1);
-    expect(capturedUrl).not.toMatch(/\?/);
+    expect(result.current.data?.items).toHaveLength(1);
+    expect(result.current.data?.total).toBe(1);
+    expect(capturedUrl).toMatch(/skip=0/);
+    expect(capturedUrl).toMatch(/limit=50/);
+    expect(capturedUrl).not.toMatch(/group_id/);
   });
 
-  it("useGrants forwards filter params", async () => {
+  it("useGrants forwards filter params alongside pagination", async () => {
     let capturedUrl = "";
     server.use(
       http.get("/api/acl/grants", ({ request }) => {
         capturedUrl = request.url;
-        return HttpResponse.json([]);
+        return HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 });
       }),
     );
     const { result } = renderHook(
@@ -65,7 +70,7 @@ describe("acl api hooks", () => {
     server.use(
       http.post("/api/acl/grants", async ({ request }) => {
         captured = await request.json();
-        return HttpResponse.json(GRANT);
+        return HttpResponse.json(GRANT, { status: 201 });
       }),
     );
     const { result } = renderHook(() => useCreateGrant(), { wrapper });
