@@ -1,8 +1,7 @@
-from herd_common.config_loader import herd_settings_sources
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+from herd_common.base_settings import HerdBaseSettings
 
 
-class Settings(BaseSettings):
+class Settings(HerdBaseSettings):
     database_url: str
     db_schema: str = "notifications"
     secret_key: str
@@ -51,25 +50,6 @@ class Settings(BaseSettings):
     webhook_timeout_seconds: float = 10.0
 
     log_level: str = "INFO"
-
-    model_config = {"env_file": ".env", "case_sensitive": False}
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        return herd_settings_sources(
-            settings_cls,
-            init_settings,
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )
 
 
 settings = Settings()

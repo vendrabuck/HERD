@@ -1,14 +1,13 @@
 import logging
 from typing import Literal
 
-from herd_common.config_loader import herd_settings_sources
+from herd_common.base_settings import HerdBaseSettings
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 logger = logging.getLogger(__name__)
 
 
-class Settings(BaseSettings):
+class Settings(HerdBaseSettings):
     secret_key: str = "ai-orchestrator-dev-secret"
     algorithm: str = "HS256"
     cors_origins: str = ""
@@ -103,8 +102,6 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    model_config = {"env_file": ".env", "case_sensitive": False}
-
     @field_validator("assistant_conversation_ttl_hours")
     @classmethod
     def _validate_assistant_conversation_ttl_hours(cls, v: int) -> int:
@@ -114,23 +111,6 @@ class Settings(BaseSettings):
                 f"(got {v}); 0 or negative would expire every conversation instantly"
             )
         return v
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        return herd_settings_sources(
-            settings_cls,
-            init_settings,
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )
 
 
 settings = Settings()
