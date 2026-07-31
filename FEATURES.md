@@ -115,12 +115,14 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **Hypervisor-backed dynamic templates** (Shipped): a `dynamic` template type
   materializes an instance from a registered hypervisor when a reservation needs it,
-  rather than referencing a pre-existing device row. Dynamic template authoring is
-  API, seed, or bulk-import only today; the template editor UI offers no dynamic
-  option (deferred per ADR 0004, issue #398). Admins register hypervisors
-  (endpoint, a free-string hypervisor type, and a secrets-service credential reference
-  validated at registration) and pair a dynamic template with both a hypervisor and a
-  recipe driver package: an ordinary driver with a new `Hypervisor` connection type
+  rather than referencing a pre-existing device row. Admins register hypervisors
+  from an admin Hypervisors page (list, register, edit, delete) with an endpoint, a
+  free-string hypervisor type, and a secrets-service credential reference validated
+  at registration, and pair a dynamic template with both a hypervisor and a recipe
+  driver package from the template editor, which offers a Dynamic type option
+  alongside Device and Port and enforces the Hypervisor-driver requirement
+  client-side (issue #398). The recipe driver is an ordinary driver package with a
+  new `Hypervisor` connection type
   (`login`, `logout`, `create_instance`, `destroy_instance`, `status`) that reuses the
   existing sandbox, cache, and metadata machinery. Booking a dynamic template lists it
   under `dynamic_requests` on the reservation; a reservation carrying any dynamic
