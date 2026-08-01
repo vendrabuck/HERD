@@ -28,8 +28,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.l2_port_assignment import L2PortAssignment
+from app.services.l1_assignment_service import get_wiring_state
 
 logger = logging.getLogger(__name__)
+
+# The L2 analogue of l1_assignment_service.FROZEN_BUILD_PENDING_RELEASE (issue #461):
+# a successful add_to_vlan whose reservation froze mid-flight is parked FAILED
+# intended RELEASED under this reason so the release-direction retry channels drive
+# the remove_from_vlan. Deliberately outside the non-retryable prefixes.
+FROZEN_JOIN_PENDING_REMOVAL = "join landed after wiring freeze; pending removal"
 
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
@@ -88,7 +95,12 @@ async def record_l2_membership_active(
     allocation) short-circuits, and a concurrent join that claims the port first trips
     the active-unique index, whereupon we roll back and return the winner's row. A prior
     FAILED row for this reservation's (switch, port) is flipped ACTIVE in place rather
-    than duplicated. Mirrors record_l1_connect.
+    than duplicated. Mirrors record_l1_connect, including its record-time freeze
+    re-check (issue #461, the #412 discipline): a join whose reservation froze while
+    the driver call was in flight must not be recorded ACTIVE (the terminal teardown
+    has already snapshotted the ledger), so it is parked FAILED intended RELEASED
+    (FROZEN_JOIN_PENDING_REMOVAL) for the release-direction retry channels, which run
+    while frozen and drive the remove_from_vlan.
     """
     res_uuid = _as_uuid(reservation_id)
     vlan_uuid = _as_uuid(vlan_assignment_id)
@@ -97,6 +109,39 @@ async def record_l2_membership_active(
     existing = await _find_active(db, switch_uuid, port, vlan_uuid)
     if existing is not None:
         return existing
+
+    state = await get_wiring_state(db, res_uuid)
+    if state is not None and state.frozen:
+        row = await _find_reusable_failed(db, res_uuid, switch_uuid, port)
+        if row is None:
+            row = L2PortAssignment(
+                reservation_id=res_uuid,
+                vlan_assignment_id=vlan_uuid,
+                switch_device_id=switch_uuid,
+                port=port,
+                status="FAILED",
+                intended="RELEASED",
+                attempts=0,
+                last_error=FROZEN_JOIN_PENDING_REMOVAL,
+            )
+            db.add(row)
+        else:
+            row.status = "FAILED"
+            row.intended = "RELEASED"
+            # Overwrite the allocation with the one the successful join actually used,
+            # so the pending remove drives the real fabric VLAN.
+            row.vlan_assignment_id = vlan_uuid
+            row.last_error = FROZEN_JOIN_PENDING_REMOVAL
+        await db.commit()
+        await db.refresh(row)
+        logger.warning(
+            "Join for frozen reservation %s landed on switch %s port %s; "
+            "parked FAILED intended RELEASED for the release retry channel",
+            res_uuid,
+            switch_uuid,
+            port,
+        )
+        return row
 
     reusable = await _find_reusable_failed(db, res_uuid, switch_uuid, port)
     if reusable is not None:

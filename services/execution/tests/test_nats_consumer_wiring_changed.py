@@ -841,3 +841,106 @@ async def test_upstream_error_on_fork_fetch_raises():
     with pytest.raises(TransientUpstreamError):
         await _run(_event(5, released=[], built=[]), execute_fn, fork_raises=boom)
     assert await _last_applied() == 0
+
+
+# --- Fork fetch fail-closed on non-404 4xx (issue #460) ----------------------
+
+
+class _StubResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+
+class _StubClient:
+    """Minimal httpx.AsyncClient stand-in answering every GET with one response."""
+
+    def __init__(self, status_code, payload=None):
+        self._response = _StubResponse(status_code, payload)
+
+    async def get(self, url, **kwargs):
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_fork_fetch_403_raises_transient():
+    """A 403 from cabling's fork GET (the INTERNAL_API_TOKEN rotation case) raises
+    TransientUpstreamError, never an empty intended set (issue #460): an auth error
+    from the wiring source of truth is not evidence that the wiring is empty."""
+    from app.services.nats_consumer import _fetch_fork_intended_wires
+
+    with pytest.raises(TransientUpstreamError):
+        await _fetch_fork_intended_wires(RES_ID, _StubClient(403))
+
+
+@pytest.mark.asyncio
+async def test_fork_fetch_422_raises_transient():
+    """Any other non-200 non-404 (a shape error, 422) also fails closed (issue #460)."""
+    from app.services.nats_consumer import _fetch_fork_intended_wires
+
+    with pytest.raises(TransientUpstreamError):
+        await _fetch_fork_intended_wires(RES_ID, _StubClient(422))
+
+
+@pytest.mark.asyncio
+async def test_fork_fetch_404_still_means_empty():
+    """A genuine 404 (no fork yet) still reads as the empty intended set: the ONLY
+    non-200 the reconcile may converge toward empty from."""
+    from app.services.nats_consumer import _fetch_fork_intended_wires
+
+    assert await _fetch_fork_intended_wires(RES_ID, _StubClient(404)) == []
+
+
+@pytest.mark.asyncio
+async def test_fork_fetch_403_naks_heal_and_preserves_wiring():
+    """End to end through the handler at the real status-code level: a heal whose fork
+    GET answers 403 raises (NAK), fires no driver action, leaves the ACTIVE ledger rows
+    untouched, and does not stamp the version, so the heal re-stages after the token is
+    fixed (issue #460: the pre-fix behavior tore down all live wiring and stamped)."""
+    import app.services.nats_consumer as nc
+
+    await _seed_state(last_applied=0)
+    await _seed_active("0/0/1", "0/0/2")
+    execute_fn, calls = _sandbox_recorder()
+    device_fetch = _device_lookup()
+
+    class _StubAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return _StubClient(403)
+
+        async def __aexit__(self, *args):
+            return False
+
+    ps = [
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch.object(nc.httpx, "AsyncClient", _StubAsyncClient),
+    ]
+    for p in ps:
+        p.start()
+    try:
+        with pytest.raises(TransientUpstreamError):
+            # Delta-less heal: always the full-reconcile path, whose first fetch is the fork.
+            await handle_reservation_event(
+                _event(5, released=None, built=None), _db_session_factory()
+            )
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert calls == [], "no driver action may fire when the intended set is unreadable"
+    active = await _assignments("ACTIVE")
+    assert [(r.port_a, r.port_b) for r in active] == [("0/0/1", "0/0/2")], (
+        "the live wiring must survive an unreadable intended set"
+    )
+    assert await _last_applied() == 0, "the version must not stamp, so the heal re-stages"

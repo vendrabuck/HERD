@@ -614,3 +614,85 @@ async def test_scheduler_start_respects_enable_flag(monkeypatch):
     assert getattr(app.state, "wiring_retry_task", None) is not None
     await stop_wiring_retry_scheduler(app)
     assert app.state.wiring_retry_task.cancelled() or app.state.wiring_retry_task.done()
+
+
+# --- Record-time freeze re-check: the issue #461 interleaving ----------------
+
+
+@pytest.mark.asyncio
+async def test_tick_build_racing_terminal_freeze_does_not_strand_active_row():
+    """The exact issue #461 interleaving, pinned at unit level (black-box reproduction
+    is unforceable, the PR #414 precedent): the tick selects a FAILED build row while
+    frozen is still false, the terminal handler's freeze lands while the build is in
+    flight, and the connect succeeds on hardware. The record path must re-check frozen
+    and park the row FAILED intended RELEASED instead of flipping it ACTIVE, because
+    the teardown pass has already snapshotted the ledger and will never release it."""
+    from app.services.l1_assignment_service import (
+        FROZEN_BUILD_PENDING_RELEASE,
+        freeze_reservation_wiring,
+    )
+
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=0, intended="ACTIVE")
+
+    frozen_landed = {}
+
+    async def _device_then_freeze(device_id, client=None):
+        # The switch resolve is awaited after row selection and before the driver call:
+        # the deterministic seam for a freeze landing inside the in-flight window.
+        if not frozen_landed:
+            async with TestSessionLocal() as s:
+                await freeze_reservation_wiring(s, uuid.UUID(RES_ID))
+            frozen_landed["done"] = True
+        return SWITCH_DATA if str(device_id) == SWITCH_ID else None
+
+    execute_fn, calls = _sandbox_recorder()
+    ps = [
+        patch(
+            "app.services.nats_consumer._fetch_device",
+            new=AsyncMock(side_effect=_device_then_freeze),
+        ),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ]
+    for p in ps:
+        p.start()
+    try:
+        await run_wiring_retry_tick(_db_session_factory())
+    finally:
+        for p in ps:
+            p.stop()
+
+    # The driver call itself fired (selection saw frozen=false; that is the race).
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    # But the record path re-checked frozen: no ACTIVE row exists, the same row is
+    # parked FAILED intended RELEASED for the release-direction channel.
+    assert await _rows("ACTIVE") == []
+    failed = await _rows("FAILED")
+    assert [r.id for r in failed] == [fid]
+    assert failed[0].intended == "RELEASED"
+    assert failed[0].last_error == FROZEN_BUILD_PENDING_RELEASE
+
+
+@pytest.mark.asyncio
+async def test_parked_post_freeze_build_converges_released_on_next_tick():
+    """The parked row from the #461 interleaving converges: the next tick retries it in
+    the release direction (allowed while frozen, ADR 0009 phase 3), the disconnect
+    succeeds, and the row ends RELEASED with the hardware clean."""
+    from app.services.l1_assignment_service import FROZEN_BUILD_PENDING_RELEASE
+
+    await _seed_state(frozen=True)
+    fid = await _seed_failed(
+        "0/0/1", "0/0/2", attempts=0, intended="RELEASED", last_error=FROZEN_BUILD_PENDING_RELEASE
+    )
+
+    execute_fn, calls = _sandbox_recorder()
+    stats = await _run_tick(execute_fn)
+
+    assert ("disconnect_ports", "0/0/1", "0/0/2") in calls
+    assert ("connect_ports", "0/0/1", "0/0/2") not in calls
+    released = await _rows("RELEASED")
+    assert [r.id for r in released] == [fid]
+    assert stats["released"] == 1

@@ -232,3 +232,63 @@ async def test_release_routes_for_device_scopes_to_one_switch(db):
     )
     assert len(remaining) == 1
     assert str(remaining[0].device_id) == sid2
+
+
+# --- record-time freeze re-check (issue #461) ---
+
+
+async def test_record_route_active_frozen_parks_failed_intended_released(db):
+    """A provision that lands after the wiring freeze is parked FAILED intended
+    RELEASED with the routes pinned (the record-time analogue of the #412 guard,
+    mirroring record_l1_connect), so the release-direction retry channels can remove
+    exactly the set that was applied."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.route_service import (
+        FROZEN_PROVISION_PENDING_REMOVAL,
+        record_route_active,
+    )
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    db.add(ReservationWiringState(reservation_id=rid, frozen=True))
+    await db.commit()
+
+    row = await record_route_active(db, rid, sid, ROUTES)
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.routes == ROUTES, "the pinned set survives so the removal drives it verbatim"
+    assert row.last_error == FROZEN_PROVISION_PENDING_REMOVAL
+    assert row.attempts == 0
+
+    active = (
+        (await db.execute(select(RouteAssignment).where(RouteAssignment.status == "ACTIVE")))
+        .scalars()
+        .all()
+    )
+    assert active == []
+
+
+async def test_record_route_active_frozen_reuses_failed_row_keeps_pinned_routes(db):
+    """The retry-tick interleaving shape: the FAILED provision row being retried is
+    parked in place, keeping its already-pinned routes (the immutable set) and its
+    accumulated attempts."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.route_service import (
+        FROZEN_PROVISION_PENDING_REMOVAL,
+        record_route_active,
+        record_route_failed,
+    )
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    failed = await record_route_failed(db, rid, sid, ROUTES, 2, "boom", intended="ACTIVE")
+    db.add(ReservationWiringState(reservation_id=rid, frozen=True))
+    await db.commit()
+
+    row = await record_route_active(db, rid, sid, EDITED_ROUTES)
+    assert row.id == failed.id, "the same row is parked, not a parallel row"
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.routes == ROUTES, "the flip keeps the original pinned set, never the edit"
+    assert row.attempts == 2
+    assert row.last_error == FROZEN_PROVISION_PENDING_REMOVAL

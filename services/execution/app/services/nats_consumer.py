@@ -324,8 +324,16 @@ async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> list[d
     internal fork GET returns every fork_connections row, the intended wiring as the
     human reviewed and saved it. Raises TransientUpstreamError on a 5xx or transport
     error so the message NAKs (an UPSTREAM failure, Decision 7); a 404 (no fork yet)
-    returns [] so the reconcile converges the applied set to empty. Only L1 rows are
-    returned; phase 1 wiring is L1 by construction, and a stray non-L1 row is ignored.
+    returns [] so the reconcile converges the applied set to empty. Any OTHER non-200
+    (a 403 during an INTERNAL_API_TOKEN rotation is the realistic case) also raises
+    TransientUpstreamError (issue #460): this list is the DESIRED set the L1/L2/L3
+    full reconciles converge live wiring toward, so misreading an auth or shape error
+    as "empty" would tear down a live reservation's entire wiring and then stamp the
+    version so nothing re-applies it. Unreadable intent must defer convergence (ADR
+    0007), never destroy state. This deliberately diverges from the sibling _fetch_*
+    helpers above, whose non-200-means-absent reading only degrades one connection;
+    do not "symmetrize" this branch with theirs. Only L1 rows are returned; phase 1
+    wiring is L1 by construction, and a stray non-L1 row is ignored.
     """
     url = f"{settings.cabling_service_url}/internal/forks/{reservation_id}"
     async with _client_ctx(client) as c:
@@ -339,12 +347,10 @@ async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> list[d
         if resp.status_code == 404:
             return []
         if resp.status_code != 200:
-            logger.warning(
-                "Unexpected status fetching fork wiring for reservation %s: %s",
-                reservation_id,
-                resp.status_code,
+            raise TransientUpstreamError(
+                f"fetch fork wiring for reservation {reservation_id}: "
+                f"unexpected status {resp.status_code}"
             )
-            return []
         data = resp.json()
         connections = data.get("connections", []) if isinstance(data, dict) else []
         return [c for c in connections if (c.get("layer") or "L1") == "L1"]
@@ -2817,8 +2823,11 @@ async def _teardown_from_ledgers(
     membership removes plus allocation frees, then L3 pin removals. Empty ledgers no-op
     with no driver call. The wiring freeze is deliberately NOT consulted here: the freeze
     gates a LATE wiring_changed event and build-direction retries, never the terminal
-    teardown pass itself. The caller sets frozen AFTER this pass, preserving the
-    pre-phase-6 ordering (teardown, then dynamic teardown, then freeze).
+    teardown pass itself. The caller sets frozen BEFORE this pass (issue #461: freeze
+    first, then tear down): driver calls run off the event loop, so the same-process
+    auto-retry tick can fire mid-pass, and only a freeze that is already durable makes
+    its direction-scoped build skip cover the whole teardown window. Because this pass
+    ignores frozen, the reorder does not change what it releases.
     """
     from app.services.l1_assignment_service import active_assignments_for_reservation
     from app.services.l2_membership_service import active_memberships_for_reservation
@@ -2961,6 +2970,23 @@ async def handle_reservation_event(
                 logger.warning("%s event missing reservation_id; ignoring", event_type)
                 return
 
+            # Freeze the wiring state FIRST (ADR 0007 Decision 7; reordered by issue
+            # #461). Once a reservation ends, a later wiring_changed event must be a
+            # no-op and build-direction retries must be refused; the frozen flag is
+            # that guard. It must be durable BEFORE the ledger teardown below runs,
+            # because teardown driver calls run off the event loop and the same-process
+            # auto-retry tick can fire mid-pass: with the old teardown-then-freeze
+            # order the tick read frozen=false, rebuilt a FAILED build row, and left an
+            # ACTIVE ledger row on live hardware that nothing would ever release. The
+            # teardown pass itself deliberately ignores frozen, so freezing first does
+            # not change what it releases. NOT best-effort: a freeze failure raises so
+            # the message NAKs and the whole (idempotent) terminal handling is
+            # redelivered; proceeding to tear down unfrozen would reopen the race.
+            from app.services.l1_assignment_service import freeze_reservation_wiring
+
+            async with get_db_session() as db:
+                await freeze_reservation_wiring(db, reservation_id)
+
             # ADR 0009 phase 6: terminal teardown (cancelled/completed/failed) releases
             # from the three wiring ledgers, not the device set. Reading the ACTIVE ledger
             # set gives the issue #244 applied-state-only guarantee directly (an ACTIVE row
@@ -2970,27 +2996,9 @@ async def handle_reservation_event(
             await _teardown_from_ledgers(reservation_id, ctx, get_db_session)
 
             # Dynamic-instance teardown (issue #32) runs after physical teardown
-            # on complete/cancel/fail.
+            # on complete/cancel/fail. The wiring freeze already happened above
+            # (issue #461: freeze first, then tear down).
             await _execute_dynamic_teardown(reservation_id, user_id, get_db_session, client)
-
-            # Freeze the wiring state on terminal events (ADR 0007 Decision 7,
-            # issue #345 P3b phase 1). Once a reservation ends, a later wiring_changed
-            # event must be a no-op; the frozen flag is that guard. Set AFTER the teardown
-            # pass (unchanged ordering): the ledger teardown above is deliberately NOT gated
-            # by frozen (the freeze gates late wiring_changed events and build-direction
-            # retries, never the terminal teardown itself). Best-effort: a failure here must
-            # never NAK an otherwise-processed teardown.
-            from app.services.l1_assignment_service import freeze_reservation_wiring
-
-            try:
-                async with get_db_session() as db:
-                    await freeze_reservation_wiring(db, reservation_id)
-            except Exception:
-                logger.warning(
-                    "failed to freeze wiring state for reservation %s",
-                    reservation_id,
-                    exc_info=True,
-                )
         elif event_type == "reservation.updated":
             # Device add/remove changes meaning in ADR 0009 phase 7 (Decision 6, the
             # user-visible change): an added device wires NOTHING until a fork save draws

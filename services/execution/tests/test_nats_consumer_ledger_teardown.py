@@ -502,9 +502,12 @@ def test_action_succeeded_for_reservation_is_removed():
 # --- freeze ordering ---
 
 
-async def test_teardown_runs_before_freeze_and_frozen_is_set_last():
-    """The terminal handler releases the ledgers BEFORE it sets frozen: at freeze time the
-    L1 row is already RELEASED. Pins the pre-phase-6 ordering (teardown, then freeze)."""
+async def test_freeze_lands_before_teardown_releases():
+    """The terminal handler sets frozen BEFORE it releases the ledgers (issue #461): at
+    freeze time the L1 row is still ACTIVE, and the teardown then releases it anyway
+    (the pass is not frozen-gated). Replaces the pre-#461 teardown-then-freeze pin: the
+    old order left a window where the same-process auto-retry tick, gated on frozen at
+    selection only, rebuilt a FAILED row mid-teardown and stranded it ACTIVE forever."""
     await _seed_l1()
     seen_status = {}
 
@@ -530,7 +533,77 @@ async def test_teardown_runs_before_freeze_and_frozen_is_set_last():
         )
         await handle_reservation_event(_make_event("reservation.cancelled"), _db_session_factory())
 
-    assert seen_status["at_freeze"] == ["RELEASED"], "teardown released the row before freezing"
+    assert seen_status["at_freeze"] == ["ACTIVE"], "frozen must be set before any release"
+    assert await _statuses(L1ConnectionAssignment) == ["RELEASED"], (
+        "the teardown still releases the row after the freeze (the pass is not frozen-gated)"
+    )
+    state = await _wiring_state()
+    assert state is not None and state.frozen is True
+
+
+async def test_frozen_is_durable_before_first_teardown_driver_call():
+    """The frozen flag is committed before the first teardown driver call fires (issue
+    #461): the retry tick's direction-scoped build skip can only cover the teardown
+    window if the freeze is already durable when the window opens."""
+    await _seed_l1()
+    order = []
+
+    from app.services import l1_assignment_service as l1svc
+
+    real_freeze = l1svc.freeze_reservation_wiring
+
+    async def _spy_freeze(db, reservation_id):
+        result = await real_freeze(db, reservation_id)
+        order.append("freeze")
+        return result
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        order.append(action)
+        return SUCCESS_RESULT
+
+    with ExitStack() as stack:
+        for p in _event_patches(execute_fn):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch(
+                "app.services.l1_assignment_service.freeze_reservation_wiring",
+                new=AsyncMock(side_effect=_spy_freeze),
+            )
+        )
+        await handle_reservation_event(_make_event("reservation.completed"), _db_session_factory())
+
+    assert "disconnect_ports" in order
+    assert order[0] == "freeze", f"freeze must precede every driver call, got order {order}"
+
+
+async def test_freeze_failure_raises_and_blocks_teardown():
+    """A freeze write failure propagates (the consumer NAKs and redelivers the whole
+    idempotent terminal handling) and the ledger teardown does NOT run unfrozen: tearing
+    down without a durable freeze would reopen the issue #461 race."""
+    await _seed_l1()
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _event_patches(execute_fn):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch(
+                "app.services.l1_assignment_service.freeze_reservation_wiring",
+                new=AsyncMock(side_effect=RuntimeError("db down")),
+            )
+        )
+        teardown_mock = stack.enter_context(
+            patch("app.services.nats_consumer._teardown_from_ledgers", new_callable=AsyncMock)
+        )
+        with pytest.raises(RuntimeError):
+            await handle_reservation_event(
+                _make_event("reservation.cancelled"), _db_session_factory()
+            )
+
+    teardown_mock.assert_not_awaited()
+    assert calls == []
+    assert await _statuses(L1ConnectionAssignment) == ["ACTIVE"], (
+        "the ledger row survives untouched for the redelivery"
+    )
 
 
 async def test_teardown_not_blocked_by_preexisting_frozen():

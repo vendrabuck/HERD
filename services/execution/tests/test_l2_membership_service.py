@@ -274,3 +274,53 @@ def test_backfill_ignores_non_success_runs():
     runs = [_run(res, sw, "add_to_vlan", "eth1", 1, status="FAILED")]
     allocs = [_alloc(va, res, [str(sw)])]
     assert compute_backfill_l2_memberships(runs, allocs) == []
+
+
+# --- record-time freeze re-check (issue #461) ---
+
+
+async def test_record_active_frozen_parks_failed_intended_released(db):
+    """A join that lands after the wiring freeze is parked FAILED intended RELEASED
+    (the record-time analogue of the #412 guard, mirroring record_l1_connect): the
+    terminal teardown has already snapshotted the ledger, so an ACTIVE write here
+    would strand the membership on the switch forever."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.l2_membership_service import FROZEN_JOIN_PENDING_REMOVAL
+
+    res, va, sw = _ids()
+    db.add(ReservationWiringState(reservation_id=res, frozen=True))
+    await db.commit()
+
+    row = await record_l2_membership_active(db, res, va, sw, "eth1")
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.vlan_assignment_id == va, "the remove must drive the real allocation"
+    assert row.last_error == FROZEN_JOIN_PENDING_REMOVAL
+    assert row.attempts == 0
+
+    active = (
+        (await db.execute(select(L2PortAssignment).where(L2PortAssignment.status == "ACTIVE")))
+        .scalars()
+        .all()
+    )
+    assert active == []
+
+
+async def test_record_active_frozen_reuses_failed_row_and_keeps_attempts(db):
+    """The retry-tick interleaving shape: the FAILED join row being retried is parked in
+    place (same row, intended RELEASED, allocation healed) and attempts do not inflate."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.l2_membership_service import FROZEN_JOIN_PENDING_REMOVAL
+
+    res, va, sw = _ids()
+    failed = await record_l2_failed(db, res, None, sw, "eth1", 3, "boom", intended="ACTIVE")
+    db.add(ReservationWiringState(reservation_id=res, frozen=True))
+    await db.commit()
+
+    row = await record_l2_membership_active(db, res, va, sw, "eth1")
+    assert row.id == failed.id, "the same row is parked, not a parallel row"
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.vlan_assignment_id == va
+    assert row.attempts == 3
+    assert row.last_error == FROZEN_JOIN_PENDING_REMOVAL
