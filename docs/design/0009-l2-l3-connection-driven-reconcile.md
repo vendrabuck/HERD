@@ -262,3 +262,27 @@ immutable to failure writers) which extends to the new ledgers.
 - Ladder length: eight phases is the longest arc since #32; phases 1 to 3
   are small and front-load the three open issues, so value lands early
   even if later phases pause.
+
+## Addendum: VLAN definition lifecycle (issue #442, resolved 2026-08-01)
+
+Phases 4 to 7 left the switch-side VLAN DEFINITION unowned: the fork-driven
+L2 reconcile was membership-only (no code path drove create_vlan after phase
+7 retired the legacy resolvers) and the ledger teardown freed the allocation
+in the database without delete_vlan. Issue #442 resolved both sides as
+Option B (vendra, 2026-08-01): definition lifecycle is HERD-owned, coupled
+to the allocation lifecycle in the shared allocation-transition step, so the
+fork-save reconcile, the terminal teardown, and both retry channels share
+one implementation. create_vlan runs when a fabric allocation first gains a
+built membership, before the first add_to_vlan per switch; the definition
+scope is transit-inclusive (the membership hop walk WITHOUT the trunk
+exclusion, since an undefined VLAN on a transit switch forwards nothing on
+strict NOS); delete_vlan runs on last-free per switch the VLAN was provably
+defined on (vlan_assignments.defined_switch_ids, migration 0020),
+supersession-guarded against fabric-level VLAN-number reuse (the #424 rule).
+A create failure parks the dependent membership builds on that switch as
+FAILED ledger rows (retryable, no new row type); a delete failure is
+log-and-continue (the allocation is already RELEASED; bounded lingering is
+accepted over a free-after-delete state). create_vlan against an
+already-defined VLAN is a documented driver idempotency requirement
+(docs/DRIVERS.md). The phase 6/7 test pins asserting the absence of
+delete_vlan and create_vlan were deliberately flipped with this change.

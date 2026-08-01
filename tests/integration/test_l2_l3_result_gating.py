@@ -288,8 +288,9 @@ async def test_l2_add_to_vlan_result_failure_records_failed(
     """add_to_vlan returning {"success": False, ...} (transport ok, driver-
     reported failure) lands the run at FAILED with the driver's error, not
     SUCCESS. login (not knobbed) still succeeds on the same switch, proving the
-    gate is per-action, not switch-wide. (create_vlan is no longer part of the
-    flow: the fork-driven L2 reconcile is membership-only, ADR 0009 phases 4/7.)"""
+    gate is per-action, not switch-wide. (Since issue #442 the flow also drives an
+    unknobbed create_vlan first, define-on-allocation; it succeeds and does not
+    block the knobbed membership op from being attempted and gated.)"""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(
         admin_client, gating_l2_template["id"], f"mock-l2-393-sw-{suffix}", "add_to_vlan"

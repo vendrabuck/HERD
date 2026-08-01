@@ -10,19 +10,21 @@ both the physical connection graph and the topology canvas, reserve the DUT with
 topology, and assert the resulting add_to_vlan / remove_from_vlan operations on the
 switch via GET /execution/runs.
 
-Note the membership-only vocabulary: the fork-driven L2 path (phase 4) drives per-port
-add_to_vlan/remove_from_vlan and never create_vlan/delete_vlan; the VLAN number is a
-per-fabric DATABASE allocation (find_or_assign_vlan), and the VLAN-definition lifecycle
-on the switch is the issue #442 boundary. create_vlan was only ever driven by the legacy
-device-set path, retired in phase 7.
+The VLAN-definition lifecycle is HERD-owned as of issue #442 (Option B, decided
+2026-08-01): the VLAN number stays a per-fabric DATABASE allocation
+(find_or_assign_vlan), and the allocation transitions now drive the switch-side
+definition too: create_vlan runs when the allocation first gains a built membership
+(before the first add_to_vlan per switch in the transit-inclusive scope), and
+delete_vlan runs on last-free per defined switch, supersession-guarded. These pins
+deliberately FLIPPED from the phase 6/7 membership-only vocabulary when #442 landed.
 
 There is no REST endpoint for VlanAssignment rows, so we assert the observable
-downstream effect instead: the driver actually ran the membership ops with an
-HERD-assigned vlan_id. The run only exists after find_or_assign_vlan created the
-ACTIVE allocation, so a SUCCESS add_to_vlan run carrying the assigned vlan_id is
-end-to-end proof the allocation was made; a SUCCESS remove_from_vlan run on cancel is
-proof the membership was released (the phase-6 ledger teardown frees the allocation
-in-DB, no delete_vlan).
+downstream effect instead: the driver actually ran the definition and membership ops
+with an HERD-assigned vlan_id. The run only exists after find_or_assign_vlan created
+the ACTIVE allocation, so a SUCCESS add_to_vlan run carrying the assigned vlan_id is
+end-to-end proof the allocation was made; SUCCESS remove_from_vlan and delete_vlan
+runs on cancel are proof the membership was released and the definition undefined
+(the allocation itself is still freed in-DB by the ledger teardown).
 
 The suite self-seeds the mock L2 driver via a session fixture, so it no longer
 depends on the HERD_VLAN_TEST_DRIVER_ID env gate.
@@ -193,7 +195,7 @@ async def _poll_active(client, reservation_id: str, *, timeout: float = 20.0) ->
 
 
 def _vlan_of(run: dict) -> int:
-    """Read the HERD-assigned vlan_id from an add_to_vlan / remove_from_vlan run.
+    """Read the HERD-assigned vlan_id from a VLAN membership or definition run.
 
     create_execution_run nests the driver method kwargs under
     input_params["method_kwargs"] for queryability (execution_service.py:44-47).
@@ -224,24 +226,14 @@ async def _poll_success_runs(
     return []
 
 
-async def _runs_by_action(client, reservation_id: str, action: str) -> list[dict]:
-    """Single fetch (no poll) of SUCCESS runs for `action`; for negative assertions."""
-    resp = await client.get(
-        "/execution/runs",
-        params={"reservation_id": reservation_id, "status": "SUCCESS", "limit": 200},
-    )
-    if resp.status_code != 200:
-        return []
-    return [r for r in resp.json().get("items", []) if r["action"] == action]
-
-
 async def test_vlan_assigned_on_reservation_create_with_l2_switch(
     admin_client, l2_template, fresh_device
 ):
-    """Reserving a DUT wired to an L2 switch in the topology drives add_to_vlan on
-    the switch with an HERD-assigned vlan_id at activation (ADR 0009 phase 7: the
-    activation-staged wiring_changed reconcile provisions the initial L2 membership
-    off the fork, no fork save needed; membership-only, no create_vlan)."""
+    """Reserving a DUT wired to an L2 switch in the topology drives create_vlan then
+    add_to_vlan on the switch with an HERD-assigned vlan_id at activation (ADR 0009
+    phase 7: the activation-staged wiring_changed reconcile provisions the initial L2
+    membership off the fork, no fork save needed; issue #442: the allocation's first
+    built membership defines the VLAN on the switch before the membership joins)."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l2_template["id"], f"mock-l2-sw-{suffix}")
     reservation = None
@@ -265,11 +257,15 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
         assert 2 <= vlan_id <= 4094, f"vlan_id {vlan_id} out of the valid 2..4094 range"
         # The port joined is the fork hop's switch-side port.
         assert run["input_params"]["method_kwargs"]["port"] == "eth1"
-        # Membership-only vocabulary: the fork-driven path never drives create_vlan.
-        assert await _runs_by_action(admin_client, reservation["id"], "create_vlan") == [], (
-            "the fork-driven L2 reconcile must not drive create_vlan (retired with the "
-            "legacy device-set path in ADR 0009 phase 7)"
+        # Define on allocation (issue #442): the first built membership drove a SUCCESS
+        # create_vlan on the switch, naming the same allocated VLAN number.
+        create_runs = await _poll_success_runs(admin_client, reservation["id"], "create_vlan")
+        assert create_runs, (
+            "no SUCCESS create_vlan run was recorded: issue #442 defines the VLAN on "
+            "the allocation's first built membership"
         )
+        assert str(create_runs[0]["device_id"]) == switch["id"]
+        assert _vlan_of(create_runs[0]) == vlan_id, "definition and membership share the VLAN id"
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
@@ -281,13 +277,13 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
 
 
 async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fresh_device):
-    """Cancelling an L2 reservation drives remove_from_vlan on the switch (proof the
-    membership was released).
+    """Cancelling an L2 reservation drives remove_from_vlan then delete_vlan on the
+    switch (proof the membership was released and the definition undefined).
 
-    As of ADR 0009 phase 6 the terminal teardown is ledger-driven: it removes the stored
+    The terminal teardown is ledger-driven (ADR 0009 phase 6): it removes the stored
     l2_port_assignments membership via remove_from_vlan and frees the vlan_assignments
-    allocation IN THE DATABASE (the phase-4 allocation lifecycle coupling), so no delete_vlan
-    driver call fires. The remove_from_vlan run is the observable release."""
+    allocation in the database. As of issue #442 the last-free also undefines the VLAN:
+    a SUCCESS delete_vlan run on the switch is the observable definition cleanup."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l2_template["id"], f"mock-l2-sw-{suffix}")
     connection = None
@@ -314,10 +310,15 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
         remove_runs = await _poll_success_runs(admin_client, reservation["id"], "remove_from_vlan")
         assert remove_runs, "no SUCCESS remove_from_vlan run was recorded after cancel"
         assert str(remove_runs[0]["device_id"]) == switch["id"]
-        # The allocation is freed in the DB, not via a delete_vlan driver op (phase-6).
-        assert await _runs_by_action(admin_client, reservation["id"], "delete_vlan") == [], (
-            "phase-6 ledger teardown frees the allocation in-DB, never calls delete_vlan"
+        # Undefine on last-free (issue #442): the freed allocation drives delete_vlan on
+        # the switch it was defined on, with the same VLAN number.
+        delete_runs = await _poll_success_runs(admin_client, reservation["id"], "delete_vlan")
+        assert delete_runs, (
+            "no SUCCESS delete_vlan run was recorded after cancel: issue #442 undefines "
+            "the VLAN on last-free"
         )
+        assert str(delete_runs[0]["device_id"]) == switch["id"]
+        assert _vlan_of(delete_runs[0]) == _vlan_of(remove_runs[0])
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")

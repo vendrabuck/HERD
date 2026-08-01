@@ -100,7 +100,8 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   fork drives the connected infrastructure through drivers, initial provisioning
   included (activation stages the fork's wiring for the same connection-driven
   reconcile that later commits use): Layer 1 port cross-connects, Layer 2 VLAN
-  creation and membership (fabric-aware, conflict-free VLAN ids), and Layer 3
+  definition and membership (fabric-aware, conflict-free VLAN ids, defined on
+  the switches on first use and deleted when the last membership releases), and Layer 3
   static routes taken from the switch's latest config version, pinned at provision
   time so teardown removes exactly what was applied. Deprovisioning on cancel or
   completion releases from the per-layer wiring ledgers (ADR 0009).

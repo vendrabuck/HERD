@@ -37,7 +37,17 @@ class VlanAssignment(Base):
     )
     fabric_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
     vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The allocation's current VLAN-definition scope (issue #442): the transit-inclusive
+    # set of L2 switch ids derived from the recorded-hop walk (membership switches PLUS
+    # trunk-transit switches). Refreshed on every fork-driven reconcile; the retry-path
+    # resolve seeds it with the add switches only, and the next reconcile widens it.
     switch_device_ids: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    # The switches on which create_vlan has CONFIRMED success for this allocation
+    # (issue #442, define-on-allocation). Grows on a gated create_vlan success, shrinks
+    # on a gated delete_vlan success at last-free; the delete pass targets THIS list,
+    # never the scope, so a switch that was never defined is never contacted and a
+    # pre-#442 allocation (backfilled empty) drives no unprovable deletes.
+    defined_switch_ids: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

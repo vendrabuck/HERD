@@ -1727,6 +1727,15 @@ async def _apply_one_port_action(
 # intervening L1 matrix switches, since it classifies both endpoints of every recorded hop
 # rather than only reserved-device adjacencies. That is the one deliberate divergence, and
 # it is strictly more correct (it never misses a terminal L2 port a multi-hop path reaches).
+#
+# VLAN DEFINITION lifecycle (issue #442, Option B, decided 2026-08-01) is HERD-owned and
+# coupled to the allocation lifecycle: create_vlan on the first built membership of a
+# fabric allocation (before the first add_to_vlan per switch), delete_vlan on last-free.
+# The definition scope is the same hop walk WITHOUT the trunk exclusion (transit switches
+# need the definition to forward). Both halves live in the shared allocation-transition
+# code (_define_pending_for_allocations inside _apply_l2_memberships, and the undefine in
+# _release_orphaned_allocations), so the fork-save reconcile, the terminal teardown, and
+# both retry channels get one implementation.
 
 
 async def _derive_l2_memberships(
@@ -1765,6 +1774,257 @@ async def _derive_l2_memberships(
     return memberships
 
 
+async def _derive_l2_definition_scope(
+    wires: list[dict],
+    ctx: "_FetchContext",
+) -> set[str]:
+    """Derive the VLAN-DEFINITION scope from a set of recorded hops (issue #442).
+
+    Returns {switch_device_id} for EVERY hop endpoint that lands on a Layer 2 Switch,
+    trunk hops included. The same recorded-hop walk as _derive_l2_memberships with the
+    trunk exclusion deliberately dropped: the exclusion is correct for MEMBERSHIP (a
+    trunk port is not an access member of the reservation's VLAN) and wrong for
+    DEFINITIONS (an undefined VLAN on a trunk-transit switch forwards nothing on strict
+    NOS), so the definition scope is the membership switches plus the trunk-transit
+    switches. Unresolvable endpoints are omitted exactly as in the membership walk; a
+    5xx while classifying raises TransientUpstreamError through ctx.get_device and NAKs
+    the whole message.
+    """
+    scope: set[str] = set()
+    for wire in wires:
+        for dev_id in (str(wire.get("device_a_id")), str(wire.get("device_b_id"))):
+            dev = await ctx.get_device(dev_id)
+            if dev is not None and dev.get("connection_type") == "Layer 2 Switch":
+                scope.add(dev_id)
+    return scope
+
+
+async def _run_vlan_definition_op(
+    switch_id: str,
+    action: str,
+    vlan_id: int,
+    res_uuid: uuid.UUID,
+    ctx: "_FetchContext",
+    get_db_session,
+) -> tuple[bool, int, str | None]:
+    """Drive one create_vlan/delete_vlan definition op on a switch (issue #442).
+
+    A self-contained driver session (login, action, best-effort logout) with one
+    execution_run audit row for the definition action itself, result-gated through
+    _run_driver_with_retry like every other L2/L3 driver site (Decision 3). Definition
+    ops are rare (an allocation's first built membership, a scope growth, last-free),
+    so the extra login alongside the membership loop's own session is accepted for the
+    simplicity of one shared helper serving create and delete alike. Returns
+    (ok, attempts, error); the CALLER owns the consequence of a failure (park the
+    dependent membership builds for create, log-and-continue for delete).
+    """
+    from datetime import datetime, timezone
+
+    from app.services.driver_loader import load_driver
+    from app.services.execution_service import (
+        build_context,
+        create_execution_run,
+        extract_password_keys,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+
+    switch_uuid = uuid.UUID(switch_id)
+    switch_data = await ctx.get_device(switch_id)
+    template_data = (
+        await _fetch_template(switch_data.get("template_id", ""), ctx.client)
+        if switch_data
+        else None
+    )
+    if switch_data is None:
+        return False, 0, f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
+    if template_data is None:
+        return (
+            False,
+            0,
+            f"{WIRING_UNRESOLVABLE_REASON}: template for L2 switch {switch_id} not found",
+        )
+
+    driver_id = uuid.UUID(switch_data["driver_id"])
+    driver_sha256 = switch_data.get("driver_sha256", "unknown")
+    driver_filename = switch_data.get("driver_filename", "driver.zip")
+    connection_type = switch_data.get("connection_type", "Layer 2 Switch")
+    context = build_context(switch_data, switch_uuid, WIRING_SYSTEM_USER, res_uuid)
+    password_keys = extract_password_keys(template_data)
+    async with get_db_session() as db:
+        try:
+            driver_path = await load_driver(
+                db, driver_id, driver_sha256, driver_filename, connection_type
+            )
+        except Exception as exc:  # noqa: BLE001 - a load failure strands the op
+            return False, 0, f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: {exc}"
+
+    redacted = redact_context_for_logging(context, password_keys)
+    method_kwargs = {"vlan_id": vlan_id}
+    async with get_db_session() as db:
+        run = await create_execution_run(
+            db,
+            switch_uuid,
+            driver_id,
+            driver_sha256,
+            action,
+            WIRING_SYSTEM_USER,
+            redacted,
+            res_uuid,
+            method_kwargs=method_kwargs,
+        )
+        started = datetime.now(timezone.utc)
+        login_ok, login_attempts, login_err, _lr = await _run_driver_with_retry(
+            driver_path, "login", context, password_keys
+        )
+        if not login_ok:
+            err = f"driver login failed: {login_err}"
+            await update_execution_run(
+                db,
+                run,
+                "FAILED",
+                error=err,
+                started_at=started,
+                completed_at=datetime.now(timezone.utc),
+            )
+            return False, login_attempts, err
+        ok, attempts, err, result = await _run_driver_with_retry(
+            driver_path, action, context, password_keys, method_kwargs=method_kwargs
+        )
+        await update_execution_run(
+            db,
+            run,
+            "SUCCESS" if ok else "FAILED",
+            output=json.dumps(result["output"], default=str) if ok and result else None,
+            error=None if ok else err,
+            started_at=started,
+            completed_at=datetime.now(timezone.utc),
+        )
+        # Logout is best-effort: the definition outcome is already decided and recorded.
+        await _run_driver_with_retry(driver_path, "logout", context, password_keys)
+    return ok, attempts, err
+
+
+async def _define_pending_for_allocations(
+    allocation_ids: set,
+    ctx: "_FetchContext",
+    get_db_session,
+) -> dict[str, tuple[int, str]]:
+    """Drive create_vlan on every scope switch not yet defined, per allocation (issue #442).
+
+    The define half of the shared allocation-transition step: for each ACTIVE
+    allocation, the pending set is switch_device_ids (the transit-inclusive definition
+    scope) minus defined_switch_ids, so a transit-only switch is defined even though it
+    never gains a membership, and a switch whose earlier create failed is re-attempted
+    on the next apply. A gated success appends the switch to defined_switch_ids;
+    create_vlan against an already-defined VLAN is REQUIRED to succeed (the documented
+    driver idempotency contract), which is what makes this convergence loop safe under
+    redelivery and concurrent list updates. Returns {switch_id: (attempts, error)} for
+    the failures; the caller parks that switch's dependent membership builds (no new
+    row type, per the #442 decision) and a transit-only failure is only loudly logged
+    here (there is no membership row to park; the pending set keeps it retried).
+    """
+    from app.models.vlan_assignment import VlanAssignment
+
+    failures: dict[str, tuple[int, str]] = {}
+    nil = uuid.UUID(int=0)
+    for va_id in allocation_ids:
+        va_uuid = va_id if isinstance(va_id, uuid.UUID) else uuid.UUID(str(va_id))
+        if va_uuid == nil:
+            continue
+        async with get_db_session() as db:
+            row = (
+                await db.execute(
+                    select(VlanAssignment).where(
+                        VlanAssignment.id == va_uuid,
+                        VlanAssignment.status == "ACTIVE",
+                    )
+                )
+            ).scalar_one_or_none()
+        if row is None:
+            continue
+        pending = [
+            str(s)
+            for s in (row.switch_device_ids or [])
+            if str(s) not in {str(d) for d in (row.defined_switch_ids or [])}
+        ]
+        for switch_id in pending:
+            ok, attempts, err = await _run_vlan_definition_op(
+                switch_id, "create_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
+            )
+            if ok:
+                async with get_db_session() as db:
+                    fresh = (
+                        await db.execute(select(VlanAssignment).where(VlanAssignment.id == va_uuid))
+                    ).scalar_one_or_none()
+                    if fresh is not None:
+                        defined = {str(d) for d in (fresh.defined_switch_ids or [])}
+                        defined.add(switch_id)
+                        fresh.defined_switch_ids = sorted(defined)
+                        await db.commit()
+            else:
+                failures[switch_id] = (attempts, err or "create_vlan failed")
+                logger.error(
+                    "create_vlan for VLAN %d failed on switch %s (allocation %s, "
+                    "reservation %s): %s; dependent membership builds on this switch "
+                    "are parked FAILED and retryable",
+                    row.vlan_id,
+                    switch_id,
+                    va_uuid,
+                    row.reservation_id,
+                    err,
+                )
+    return failures
+
+
+async def _refresh_allocation_scopes(
+    reservation_id: str,
+    scope: set[str],
+    get_db_session,
+) -> list[uuid.UUID]:
+    """Stamp the current transit-inclusive definition scope onto the reservation's
+    ACTIVE allocations, grouped by fabric (issue #442). Returns their ids.
+
+    switch_device_ids is REPLACED with the derived scope (per fabric), so it always
+    mirrors the latest recorded-hop walk; a switch that left the scope keeps its
+    definition (defined_switch_ids is untouched here) and is undefined at last-free,
+    the accepted bounded lingering. Uses the same uuid5 fabric fallback as
+    _resolve_add_allocations so a scope switch maps to the identical fabric id.
+    """
+    from app.models.vlan_assignment import VlanAssignment
+    from app.services.vlan_service import fetch_fabric_id
+
+    async with get_db_session() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(VlanAssignment).where(
+                        VlanAssignment.reservation_id == uuid.UUID(reservation_id),
+                        VlanAssignment.status == "ACTIVE",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return []
+
+        fabric_of: dict[str, uuid.UUID] = {}
+        for sid in scope:
+            fid = await fetch_fabric_id(sid)
+            if fid is None:
+                fid = uuid.uuid5(uuid.NAMESPACE_DNS, sid)
+            fabric_of[sid] = fid
+
+        for row in rows:
+            new_scope = sorted(s for s, f in fabric_of.items() if f == row.fabric_id)
+            if set(new_scope) != {str(s) for s in (row.switch_device_ids or [])}:
+                row.switch_device_ids = new_scope
+        await db.commit()
+        return [row.id for row in rows]
+
+
 async def _resolve_add_allocations(
     reservation_id: str,
     add_switch_ports: set[tuple[str, str]],
@@ -1777,7 +2037,12 @@ async def _resolve_add_allocations(
     ACTIVE allocation for the (reservation, fabric) is returned, so a fabric with a live
     membership keeps its number), and reads back the vlan_assignments row id. Allocation
     happens on a fabric's FIRST built membership (ADR 0009 Decision 4): only switches with
-    an add are grouped, so a fabric with no add allocates nothing here.
+    an add are grouped, so a fabric with no add allocates nothing here. A NEW allocation
+    is seeded with the add switches as its switch_device_ids; the reconcile then stamps
+    the transit-inclusive definition scope over it via _refresh_allocation_scopes before
+    the define pre-pass reads it (issue #442). The retry channel resolves through here
+    with no wires in hand, so its allocations keep the add-switch seed until the next
+    fork-driven reconcile widens them.
     """
     from app.models.vlan_assignment import VlanAssignment
     from app.services.vlan_service import fetch_fabric_id, find_or_assign_vlan
@@ -1853,12 +2118,27 @@ async def _vlan_ids_for(
 async def _release_orphaned_allocations(
     vlan_assignment_ids: set[uuid.UUID],
     get_db_session,
+    ctx: "_FetchContext",
 ) -> None:
-    """Release each vlan_assignment left with zero ACTIVE memberships (Decision 4).
+    """Release each vlan_assignment left with zero ACTIVE memberships (Decision 4),
+    then undefine the freed VLAN on each switch it was defined on (issue #442).
 
     Runs AFTER the whole membership pass (removes and adds both applied), so a port moved
     to a different port on the same fabric leaves the fabric with one member and its
     allocation intact; only a fabric whose last member truly left is freed.
+
+    The undefine half of the shared allocation-transition step (issue #442, Option B):
+    on last-free, delete_vlan runs per switch in defined_switch_ids (what create_vlan
+    provably defined, never the raw scope). Guards, per the decision:
+
+      - Reuse race: skipped entirely when another ACTIVE allocation now holds the same
+        (fabric, vlan_id): the number was re-allocated by the time the delete would run,
+        so deleting would strip the newer reservation's definition (the #424 supersession
+        rule, applied to definitions). The winner's own define pass is idempotent.
+      - Delete-failure: log-and-continue with a loud line. The allocation row is already
+        RELEASED (allocation lifecycle is a database decision, never coupled to hardware
+        cleanup) and bounded lingering of an empty VLAN definition is accepted; there is
+        deliberately no free-after-delete state and no parked row.
     """
     from datetime import datetime, timezone
 
@@ -1884,6 +2164,60 @@ async def _release_orphaned_allocations(
             await db.commit()
             logger.info("Released orphaned VLAN allocation %s (last membership left)", va_id)
 
+        defined = [str(s) for s in (row.defined_switch_ids or [])]
+        if not defined:
+            continue
+
+        async with get_db_session() as db:
+            winner = (
+                await db.execute(
+                    select(VlanAssignment.id).where(
+                        VlanAssignment.fabric_id == row.fabric_id,
+                        VlanAssignment.vlan_id == row.vlan_id,
+                        VlanAssignment.status == "ACTIVE",
+                        VlanAssignment.id != row.id,
+                    )
+                )
+            ).first()
+        if winner is not None:
+            logger.warning(
+                "Skipping delete_vlan for VLAN %d on fabric %s: the number was "
+                "re-allocated (allocation %s superseded by %s) by the time the delete "
+                "would run",
+                row.vlan_id,
+                row.fabric_id,
+                row.id,
+                winner[0],
+            )
+            continue
+
+        remaining: list[str] = []
+        for switch_id in defined:
+            ok, _attempts, err = await _run_vlan_definition_op(
+                switch_id, "delete_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
+            )
+            if ok:
+                continue
+            remaining.append(switch_id)
+            logger.error(
+                "delete_vlan for VLAN %d failed on switch %s (allocation %s, "
+                "reservation %s): %s; the empty VLAN definition lingers on the switch "
+                "(log-and-continue, allocation already RELEASED)",
+                row.vlan_id,
+                switch_id,
+                row.id,
+                row.reservation_id,
+                err,
+            )
+        if remaining != defined:
+            async with get_db_session() as db:
+                fresh = (
+                    await db.execute(select(VlanAssignment).where(VlanAssignment.id == row.id))
+                ).scalar_one_or_none()
+                if fresh is not None:
+                    fresh.defined_switch_ids = remaining
+                    await db.commit()
+
 
 async def _apply_l2_memberships(
     reservation_id: str,
@@ -1891,6 +2225,7 @@ async def _apply_l2_memberships(
     adds: list[dict],
     ctx: "_FetchContext",
     get_db_session,
+    define_allocation_ids: set | None = None,
 ) -> None:
     """Apply an L2 membership reconcile: leave the removed ports, then join the added ones.
 
@@ -1904,7 +2239,21 @@ async def _apply_l2_memberships(
     continues (Decision 6, never NAKs). A switch that cannot be driven parks its adds and
     still-live removes FAILED. After the whole pass, an allocation left with no ACTIVE
     membership is released (allocation lifecycle coupling, Decision 4). This one apply is
-    shared by the reconcile and both retry channels.
+    shared by the reconcile, the terminal teardown, and both retry channels, which is
+    exactly why the issue #442 VLAN-definition lifecycle lives here and in the
+    orphan-release step it ends with, not in any single caller:
+
+      - Define pre-pass: before any membership op, create_vlan runs for every pending
+        (allocation, switch) in scope via _define_pending_for_allocations, over the
+        allocations referenced by the adds plus `define_allocation_ids` (the reconcile
+        passes the reservation's ACTIVE allocations so transit-only scope growth
+        defines too; retries and teardown pass nothing extra). Running the whole
+        pre-pass first trivially preserves the define-before-first-add ordering per
+        switch. A create failure parks that switch's adds FAILED intended ACTIVE with
+        the create error (the membership ledger row is the parking spot, no new row
+        type) and their driver calls are skipped; removes are unaffected (a switch
+        with a live membership was necessarily already defined).
+      - Undefine: _release_orphaned_allocations drives delete_vlan on last-free.
     """
     from datetime import datetime, timezone
 
@@ -1924,6 +2273,33 @@ async def _apply_l2_memberships(
 
     res_uuid = uuid.UUID(reservation_id)
     touched_allocations: set[uuid.UUID] = {uuid.UUID(str(r["vlan_assignment_id"])) for r in removes}
+
+    define_ids = {uuid.UUID(str(a["vlan_assignment_id"])) for a in adds}
+    define_ids.update(uuid.UUID(str(v)) for v in (define_allocation_ids or ()) if v is not None)
+    define_failures = (
+        await _define_pending_for_allocations(define_ids, ctx, get_db_session) if define_ids else {}
+    )
+    if define_failures:
+        parked_adds = [a for a in adds if str(a["switch_device_id"]) in define_failures]
+        adds = [a for a in adds if str(a["switch_device_id"]) not in define_failures]
+        async with get_db_session() as db:
+            for a in parked_adds:
+                attempts, err = define_failures[str(a["switch_device_id"])]
+                park_error = (
+                    err
+                    if err.startswith(WIRING_UNRESOLVABLE_REASON)
+                    else f"create_vlan failed: {err}"
+                )
+                await record_l2_failed(
+                    db,
+                    res_uuid,
+                    a["vlan_assignment_id"],
+                    uuid.UUID(str(a["switch_device_id"])),
+                    a["port"],
+                    attempts,
+                    park_error,
+                    intended="ACTIVE",
+                )
 
     removes_by_switch: dict[str, list[dict]] = {}
     adds_by_switch: dict[str, list[dict]] = {}
@@ -2118,7 +2494,7 @@ async def _apply_l2_memberships(
                 completed_at=datetime.now(timezone.utc),
             )
 
-    await _release_orphaned_allocations(touched_allocations, get_db_session)
+    await _release_orphaned_allocations(touched_allocations, get_db_session, ctx)
 
 
 async def _apply_one_vlan_action(
@@ -2230,6 +2606,7 @@ async def _reconcile_l2_memberships(
     from app.services.l2_membership_service import active_memberships_for_reservation
 
     intended = await _derive_l2_memberships(intended_wires, ctx)
+    definition_scope = await _derive_l2_definition_scope(intended_wires, ctx)
 
     async with get_db_session() as db:
         active_rows = await active_memberships_for_reservation(db, reservation_id)
@@ -2241,9 +2618,25 @@ async def _reconcile_l2_memberships(
     remove_keys = set(current.keys()) - intended
 
     if not add_keys and not remove_keys:
+        # No membership delta, but the DEFINITION scope may still have changed (issue
+        # #442): a re-wire can reroute through a new trunk-transit switch while every
+        # terminal membership stays put. Refresh the stored scope on the reservation's
+        # ACTIVE allocations and define any newly-pending switches; a create failure
+        # here has no dependent membership build to park, so it is loudly logged by
+        # the define step and stays pending for the next apply.
+        alloc_ids = await _refresh_allocation_scopes(
+            reservation_id, definition_scope, get_db_session
+        )
+        if alloc_ids:
+            await _define_pending_for_allocations(set(alloc_ids), ctx, get_db_session)
         return
 
     alloc_by_switch = await _resolve_add_allocations(reservation_id, add_keys, get_db_session)
+    # Refresh AFTER resolving so allocations created for first-membership fabrics get
+    # the transit-inclusive scope stamped before the define pre-pass reads it (#442).
+    define_allocation_ids = set(
+        await _refresh_allocation_scopes(reservation_id, definition_scope, get_db_session)
+    )
 
     adds: list[dict] = []
     for switch_id, port in add_keys:
@@ -2289,7 +2682,14 @@ async def _reconcile_l2_memberships(
             }
         )
 
-    await _apply_l2_memberships(reservation_id, removes, adds, ctx, get_db_session)
+    await _apply_l2_memberships(
+        reservation_id,
+        removes,
+        adds,
+        ctx,
+        get_db_session,
+        define_allocation_ids=define_allocation_ids,
+    )
 
 
 # --- L3 layered reconcile (ADR 0009 phase 5, issue #416) ---------------------
@@ -2854,7 +3254,9 @@ async def _teardown_from_ledgers(
 
     # L2: remove every ACTIVE membership, then release each now-orphaned allocation. The
     # allocation coupling runs inside _apply_l2_memberships after the whole membership pass,
-    # so a fabric whose last member left is freed (Decision 4).
+    # so a fabric whose last member left is freed (Decision 4) and its VLAN definition is
+    # deleted from every switch create_vlan defined it on (issue #442: supersession-guarded,
+    # delete-failure is log-and-continue with accepted bounded lingering).
     async with get_db_session() as db:
         l2_rows = await active_memberships_for_reservation(db, res_str)
     if l2_rows:
