@@ -91,3 +91,83 @@ async def test_stop_outbox_relay_noop_when_never_started():
     app = SimpleNamespace(state=SimpleNamespace())
     # Must not raise.
     await stop_outbox_relay(app)
+
+
+# --- consumer schema gate lifespan wiring (issue #463) ---
+
+
+def _stub_lifespan_periphery(monkeypatch):
+    """Stub every lifespan start/stop except schema init and the consumer gate."""
+    for name in (
+        "start_health_scheduler",
+        "stop_health_scheduler",
+        "start_outbox_relay",
+        "stop_outbox_relay",
+        "start_wiring_retry_scheduler",
+        "stop_wiring_retry_scheduler",
+        "_ensure_health_stream",
+        "_ensure_dlq_stream",
+    ):
+        monkeypatch.setattr(main_module, name, AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_lifespan_starts_consumer_immediately_when_schema_ready(monkeypatch):
+    """No managed-path drift: the consumer starts inline, no gate task exists."""
+    from herd_common.schema_init import SchemaInitOutcome, SchemaInitResult
+
+    _stub_lifespan_periphery(monkeypatch)
+    monkeypatch.setattr(
+        main_module,
+        "create_all_and_stamp",
+        AsyncMock(return_value=SchemaInitOutcome(SchemaInitResult.ALREADY_MANAGED)),
+    )
+    started = AsyncMock()
+    monkeypatch.setattr(main_module, "start_nats_consumer", started)
+
+    app = SimpleNamespace(state=SimpleNamespace())
+    async with main_module.lifespan(app):
+        started.assert_awaited_once_with(app)
+        assert getattr(app.state, "consumer_schema_gate_task", None) is None
+        # The stream ensures still run right after consumer start.
+        main_module._ensure_health_stream.assert_awaited_once_with(app)
+        main_module._ensure_dlq_stream.assert_awaited_once_with(app)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_defers_consumer_on_managed_schema_missing_tables(monkeypatch):
+    """The issue #463 window: consumer start is gated; shutdown cancels the gate.
+
+    The rest of the lifespan (schedulers, outbox relay) starts as usual; only
+    the consumer waits. The gate's poll interval is the 5s default, so within
+    this context nothing touches the real database engine.
+    """
+    from herd_common.schema_init import SchemaInitOutcome, SchemaInitResult
+
+    _stub_lifespan_periphery(monkeypatch)
+    monkeypatch.setattr(
+        main_module,
+        "create_all_and_stamp",
+        AsyncMock(
+            return_value=SchemaInitOutcome(
+                SchemaInitResult.ALREADY_MANAGED, frozenset({"l2_port_assignments"})
+            )
+        ),
+    )
+    started = AsyncMock()
+    monkeypatch.setattr(main_module, "start_nats_consumer", started)
+
+    app = SimpleNamespace(state=SimpleNamespace())
+    async with main_module.lifespan(app):
+        started.assert_not_awaited()
+        gate_task = app.state.consumer_schema_gate_task
+        assert gate_task is not None and not gate_task.done()
+        # Everything else started despite the gated consumer.
+        main_module.start_health_scheduler.assert_awaited_once()
+        main_module.start_outbox_relay.assert_awaited_once()
+        main_module.start_wiring_retry_scheduler.assert_awaited_once()
+        # The stream ensures ride the deferred consumer start, so not yet.
+        main_module._ensure_dlq_stream.assert_not_awaited()
+
+    assert gate_task.cancelled()
+    started.assert_not_awaited()

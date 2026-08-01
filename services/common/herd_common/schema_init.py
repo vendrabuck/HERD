@@ -32,6 +32,7 @@ that ``create_all`` is about to add does not flip a legacy volume to "fresh".
 """
 
 import logging
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -48,6 +49,31 @@ class SchemaInitResult(str, Enum):
     STAMPED_FRESH = "stamped_fresh"
     UNSTAMPED_LEGACY = "unstamped_legacy"
     ALREADY_MANAGED = "already_managed"
+
+
+@dataclass(frozen=True)
+class SchemaInitOutcome:
+    """What ``create_all_and_stamp`` observed and did, in machine-readable form.
+
+    ``action`` carries the unchanged three-way classification. ``missing_model_tables``
+    surfaces the advisory drift set the managed path previously only logged (issue
+    #463): model tables the database does not have. It is nonempty only on the
+    ALREADY_MANAGED path, because the fresh and legacy paths still run
+    ``create_all``, after which every model table exists.
+    """
+
+    action: SchemaInitResult
+    missing_model_tables: frozenset[str] = frozenset()
+
+    @property
+    def consumer_should_wait(self) -> bool:
+        """True when an event consumer started now would fail on absent tables.
+
+        Only a migration-managed schema can be in this state (boot never creates
+        tables there, issue #419); ``make migrate`` is the remedy. Fresh and
+        legacy schemas never gate: create_all ran, so nothing is missing.
+        """
+        return self.action is SchemaInitResult.ALREADY_MANAGED and bool(self.missing_model_tables)
 
 
 def decide_schema_action(*, had_tables: bool, had_stamp: bool) -> SchemaInitResult:
@@ -68,6 +94,27 @@ def _qualified(schema: str | None, table: str) -> str:
     return f"{schema}.{table}" if schema else table
 
 
+def _missing_model_tables_sync(
+    connection: Connection, metadata: MetaData, schema: str | None
+) -> set[str]:
+    """Model tables absent from the database right now."""
+    existing = set(inspect(connection).get_table_names(schema=schema))
+    return {table.name for table in metadata.tables.values()} - existing
+
+
+async def missing_model_tables(
+    engine: AsyncEngine, metadata: MetaData, *, schema: str | None
+) -> frozenset[str]:
+    """Re-run the missing-tables check outside boot (the issue #463 readiness poll).
+
+    Same computation ``create_all_and_stamp`` performs; a consumer gate polls it
+    so `make migrate` creating the tables is observed without a restart.
+    """
+    schema = schema or None
+    async with engine.connect() as conn:
+        return frozenset(await conn.run_sync(_missing_model_tables_sync, metadata, schema))
+
+
 def _inspect_state(
     connection: Connection, metadata: MetaData, schema: str | None
 ) -> tuple[bool, str | None, set[str]]:
@@ -75,7 +122,7 @@ def _inspect_state(
 
     ``stamp`` is the recorded ``alembic_version`` revision, or None when the
     schema carries no stamp. ``missing_model_tables`` are model tables absent
-    from the database, used only for advisory drift logging on the managed path.
+    from the database, surfaced on the managed path via ``SchemaInitOutcome``.
     """
     inspector = inspect(connection)
     existing = set(inspector.get_table_names(schema=schema))
@@ -213,7 +260,7 @@ async def create_all_and_stamp(
     schema: str | None,
     script_location: str | Path,
     log: logging.Logger | None = None,
-) -> SchemaInitResult:
+) -> SchemaInitOutcome:
     """Create tables only on a schema Alembic does not manage yet; stamp when fresh.
 
     ``schema`` is the service's ``db_schema`` (None for the schemaless SQLite
@@ -224,6 +271,12 @@ async def create_all_and_stamp(
     no stamp (issue #419). Pending migrations there are applied by
     ``make migrate``, never implicitly at boot, so a bare ``op.create_table``
     migration can never collide with a table create_all pre-created.
+
+    Returns a ``SchemaInitOutcome``: the classification in ``.action`` (same
+    three-way semantics as before issue #463) plus the managed-path
+    ``missing_model_tables`` set, so a caller can gate work that would fail on
+    an absent table (a NATS consumer) instead of relying on the advisory log
+    line. The advisory drift check itself still never raises.
     """
     log = log or logger
     script_location = str(script_location)
@@ -246,7 +299,7 @@ async def create_all_and_stamp(
                 had_tables=had_tables,
                 missing_model_tables=missing_model_tables,
             )
-            return action
+            return SchemaInitOutcome(action, frozenset(missing_model_tables))
 
         await conn.run_sync(metadata.create_all)
 
@@ -277,4 +330,5 @@ async def create_all_and_stamp(
                 schema,
             )
 
-    return action
+    # create_all ran on this path, so every model table now exists.
+    return SchemaInitOutcome(action)

@@ -3,6 +3,10 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from herd_common.consumer_schema_gate import (
+    start_consumer_when_schema_ready,
+    stop_consumer_schema_gate,
+)
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
 
@@ -18,14 +22,25 @@ setup_logging("notifications", level=settings.log_level)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_all_and_stamp(
+    outcome = await create_all_and_stamp(
         engine,
         Base.metadata,
         schema=settings.db_schema,
         script_location=Path(__file__).resolve().parents[1] / "migrations",
     )
-    await start_nats_consumer(app)
+    # Issue #463: defer consumer start while a managed schema is missing this
+    # release's tables, so events wait on the stream instead of dead-lettering.
+    await start_consumer_when_schema_ready(
+        app,
+        outcome,
+        engine=engine,
+        metadata=Base.metadata,
+        schema=settings.db_schema,
+        start_consumer=start_nats_consumer,
+        service="notifications",
+    )
     yield
+    await stop_consumer_schema_gate(app)
     await stop_nats_consumer(app)
 
 
