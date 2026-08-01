@@ -10,9 +10,13 @@ than duplicating it), then runs the existing build_adjacency_graph / validate
 path so an imported topology with an unreachable edge is rejected exactly as an
 interactively drawn one is.
 
-An update matched by name is guarded by the same reservation-scoped lock as
-PUT /topologies/{id}: a topology held by another user's active reservation is
-not rewired, its row is rejected instead (admins bypass, matching the PUT).
+An update matched by name is guarded like PUT /topologies/{id}: only the
+topology's creator or an admin may update it, so a name match on another
+user's topology is rejected per-row (issue #464), and a topology held by
+another user's active reservation is not rewired, its row is rejected instead
+(admins bypass, matching the PUT). When several topologies share a name, the
+actor's own is matched before any other user's, so importing your own export
+never targets a same-named topology someone else created.
 
 Per-row error handling means one bad topology is rejected with a reason without
 aborting the batch. A dry_run import runs full parsing, name resolution, and
@@ -43,6 +47,16 @@ from app.services.version_service import commit_with_new_version
 _LOCKED_TOPOLOGY_REASON = (
     "topology is in use by an active reservation owned by another user; "
     "bulk import cannot rewire it"
+)
+
+# Pinned reject reason when an import row matches a topology created by another
+# user and the actor is not an admin (issue #464). Mirrors the creator-or-admin
+# gate on PUT /topologies/{id}: import is a batched caller of the same edit
+# surface, not a back door around its authorization. The "not_authorized"
+# prefix is the machine-readable token; the rest explains it to a human.
+_NOT_OWNED_TOPOLOGY_REASON = (
+    "not_authorized: topology was created by another user; "
+    "only its creator or an admin can update it via import"
 )
 
 # CSV export of a topology is a flat edge list: one row per canvas edge with the
@@ -330,17 +344,26 @@ async def import_topologies(
             # Match by name to update in place, mirroring the inventory device
             # and template importers so a re-imported export updates the original
             # rather than creating a silent duplicate (issue #336). Topology names
-            # carry no unique constraint, so historical create-only imports may
-            # have left duplicates; pick the earliest-created row as the canonical
-            # target deterministically rather than raising on multiple matches.
-            existing = (
-                await db.execute(
-                    select(Topology)
-                    .where(Topology.name == name)
-                    .order_by(Topology.created_at.asc(), Topology.id.asc())
-                    .limit(1)
+            # carry no unique constraint, so multiple rows may match; the actor's
+            # own topology is preferred (issue #464: importing your own export
+            # must never target a same-named topology someone else created),
+            # falling back to the earliest-created row as the deterministic
+            # canonical target.
+            matches = list(
+                (
+                    await db.execute(
+                        select(Topology)
+                        .where(Topology.name == name)
+                        .order_by(Topology.created_at.asc(), Topology.id.asc())
+                    )
                 )
-            ).scalar_one_or_none()
+                .scalars()
+                .all()
+            )
+            existing = next(
+                (t for t in matches if str(t.created_by) == str(actor_id)),
+                matches[0] if matches else None,
+            )
 
             if existing is None:
                 if not dry_run:
@@ -364,6 +387,25 @@ async def import_topologies(
                     db.add(snapshot)
                     await db.commit()
                 report.rows.append(RowResult(row=index, action="create", identity=name))
+                continue
+
+            # Creator-or-admin gate, mirroring PUT /topologies/{id} (issue
+            # #464): a non-admin may only update a topology they created. A
+            # non-owned name match is rejected per-row with a pinned reason,
+            # never silently skipped and never a whole-request 403, keeping
+            # the batch semantics of the other reject paths. It runs before
+            # the changed-canvas check because the interactive PUT refuses a
+            # non-owner regardless of body. The create branch above stays
+            # open to any authenticated user, matching POST /topologies.
+            if not is_admin and str(existing.created_by) != str(actor_id):
+                report.rows.append(
+                    RowResult(
+                        row=index,
+                        action="reject",
+                        identity=name,
+                        reason=_NOT_OWNED_TOPOLOGY_REASON,
+                    )
+                )
                 continue
 
             # Update path. Only a canvas that actually differs rewires the

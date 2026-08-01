@@ -9,7 +9,9 @@ rejected. A dry_run import writes nothing and returns the per-row report.
 
 RBAC matches the interactive topology surface: creating topologies is open to any
 authenticated user, so import is too; export likewise. The per-topology
-creator-or-admin gate on the existing endpoints still governs later edits.
+creator-or-admin gate that governs PUT /topologies/{id} is enforced per row on
+the import update path (issue #464): a row matching a topology created by
+another user is rejected, not silently skipped, unless the actor is an admin.
 """
 
 import uuid
@@ -70,7 +72,11 @@ async def import_topologies_endpoint(
     """Import topologies from CSV or JSON.
 
     Each topology is matched by name: an existing topology is updated in place
-    (appending a new version), otherwise a new one is created. Each is validated
+    (appending a new version), otherwise a new one is created. When several
+    topologies share the name, the caller's own is matched before any other
+    user's. Updating is creator-or-admin, enforced per row: a name match on a
+    topology created by another user is rejected with a pinned not_authorized
+    reason (admins bypass, matching the interactive PUT). Each is validated
     through the existing build_adjacency_graph / validate path before any write;
     one with an unreachable edge is rejected. A topology held by another user's
     active reservation is not silently rewired: a would-be update to its wiring
