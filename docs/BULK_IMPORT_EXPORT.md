@@ -36,10 +36,20 @@ cabling service. There is no cross-schema bulk path.
 | `GET /api/inventory/templates/export?format=csv\|json` | templates | admin |
 | `POST /api/inventory/templates/import?format=csv\|json&dry_run=true\|false` | templates | admin |
 | `GET /api/cabling/topologies/export?format=csv\|json` | topologies | any authenticated user |
-| `POST /api/cabling/topologies/import?format=csv\|json&dry_run=true\|false` | topologies | any authenticated user |
+| `POST /api/cabling/topologies/import?format=csv\|json&dry_run=true\|false` | topologies | any authenticated user (create); creator or admin, per row (update) |
 
 Import endpoints accept a single multipart file field named `file`. `format`
 defaults to `json`. `dry_run` defaults to `false`.
+
+Topology import enforces the same creator-or-admin gate as
+`PUT /api/cabling/topologies/{id}`, per row on the update path: a row whose
+name matches a topology created by another user is rejected with a
+`not_authorized` reason unless the caller is an admin. When several
+topologies share a name, the importer matches the caller's own topology
+before any other user's, so importing your own export never overwrites a
+same-named topology someone else created. Creating a new topology by import
+stays open to any authenticated user, matching
+`POST /api/cabling/topologies`.
 
 ## Dry run and the per-row report
 

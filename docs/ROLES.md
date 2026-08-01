@@ -31,7 +31,7 @@ in their JWT access token and enforced independently by each service.
 | Create topologies | yes | yes | yes |
 | Update, delete topologies (creator or admin) | creator | yes | yes |
 | Bulk export and import devices and templates | | yes | yes |
-| Bulk export and import topologies | yes | yes | yes |
+| Bulk export and import topologies | yes (import updates: creator only) | yes | yes |
 | View user groups and members | yes | yes | yes |
 | Create, update, delete groups | | yes | yes |
 | Add and remove group members | | yes | yes |
@@ -1356,6 +1356,8 @@ Authorization: Bearer <admin-token>
 | `/api/cabling/topologies` | POST | yes | yes | yes |
 | `/api/cabling/topologies/{id}` | PUT | creator | yes | yes |
 | `/api/cabling/topologies/{id}` | DELETE | creator | yes | yes |
+| `/api/cabling/topologies/export` | GET | yes | yes | yes |
+| `/api/cabling/topologies/import` | POST | create yes; update creator, per row | yes | yes |
 | `/api/cabling/internal/forks` | POST | internal | internal | internal |
 | `/api/acl/grants` | GET | | yes | yes |
 | `/api/acl/grants/{id}` | GET | | yes | yes |

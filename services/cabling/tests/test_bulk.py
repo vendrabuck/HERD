@@ -9,6 +9,7 @@ and the existing validator rejecting an unreachable edge on import.
 import io
 import json
 import uuid
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,7 +17,7 @@ from app.database import Base, get_db
 from app.dependencies import get_current_user_payload
 from app.main import app
 from app.models.connection import Connection
-from app.models.topology import TopologyVersion
+from app.models.topology import Topology, TopologyVersion
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -26,6 +27,17 @@ ADMIN_PAYLOAD = {"sub": ADMIN_ID, "username": "admin", "role": "admin"}
 
 USER_ID = str(uuid.uuid4())
 USER_PAYLOAD = {"sub": USER_ID, "username": "user1", "role": "user"}
+
+# A third user who owns topologies the acting user did not create (issue #464).
+OTHER_ID = str(uuid.uuid4())
+
+# The pinned per-row reject reason for a non-admin updating another user's
+# topology via import (issue #464). Asserted verbatim: the "not_authorized"
+# prefix is the machine-readable token consumers may key on.
+NOT_OWNED_REASON = (
+    "not_authorized: topology was created by another user; "
+    "only its creator or an admin can update it via import"
+)
 
 # Two real device ids that exist in this instance's inventory (the cabling
 # service only stores connections by device id). The resolver maps names to
@@ -502,3 +514,187 @@ async def test_admin_bypasses_reservation_lock(admin_client):
     report = resp.json()
     assert report["updated"] == 1
     assert report["rejected"] == 0
+
+
+# Creator-or-admin gate on the update path (issue #464) -----------------------
+
+
+def _canvas_with_ids():
+    """The stored form of _canvas_with_names(): device ids already resolved."""
+    return {
+        "nodes": [
+            {
+                "id": "n1",
+                "data": {"device": {"id": DEV_A, "name": "switch-a"}, "label": "switch-a"},
+            },
+            {
+                "id": "n2",
+                "data": {"device": {"id": DEV_B, "name": "switch-b"}, "label": "switch-b"},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source": "n1", "target": "n2", "data": {"layer": "L1"}},
+        ],
+    }
+
+
+async def _seed_topology(name, created_by, canvas, created_at=None):
+    """Seed a topology row directly so created_by can be an arbitrary user."""
+    async with TestSessionLocal() as session:
+        topology = Topology(
+            name=name,
+            created_by=uuid.UUID(created_by),
+            owner_name="seeded",
+            canvas_data=canvas,
+        )
+        if created_at is not None:
+            topology.created_at = created_at
+        session.add(topology)
+        await session.commit()
+        return str(topology.id)
+
+
+async def _stored_canvas(topology_id):
+    async with TestSessionLocal() as session:
+        topology = await session.get(Topology, uuid.UUID(topology_id))
+        return topology.canvas_data
+
+
+@pytest.mark.asyncio
+async def test_cross_owner_update_rejected_for_nonadmin(user_client):
+    """A non-admin importing a name owned by another user is rejected per row
+    with the pinned not_authorized reason; the victim canvas is untouched."""
+    await _seed_connection()
+    seeded = _canvas_with_ids()
+    tid = await _seed_topology("Theirs", OTHER_ID, seeded)
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        resp = await _import_json(
+            user_client, [{"name": "Theirs", "canvas": _isolated_nodes_canvas()}]
+        )
+    report = resp.json()
+    assert report["rejected"] == 1
+    assert report["updated"] == 0
+    assert report["created"] == 0
+    row = report["rows"][0]
+    assert row["action"] == "reject"
+    assert row["identity"] == "Theirs"
+    assert row["reason"] == NOT_OWNED_REASON
+    # The overwrite was refused: stored canvas is byte-identical to the seed
+    # and no version row was appended.
+    assert await _stored_canvas(tid) == seeded
+    assert await _count_versions() == 0
+
+
+@pytest.mark.asyncio
+async def test_self_update_succeeds_for_nonadmin(user_client):
+    """A non-admin updating their own topology by import still succeeds."""
+    await _seed_connection()
+    tid = await _seed_topology("Mine464", USER_ID, _canvas_with_ids())
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}), _blocking([]):
+        resp = await _import_json(
+            user_client, [{"name": "Mine464", "canvas": _isolated_nodes_canvas()}]
+        )
+    report = resp.json()
+    assert report["updated"] == 1
+    assert report["rejected"] == 0
+    assert (await _stored_canvas(tid))["edges"] == []
+
+
+@pytest.mark.asyncio
+async def test_cross_owner_update_succeeds_for_admin(admin_client):
+    """An admin may update another user's topology by import (matching PUT)."""
+    await _seed_connection()
+    tid = await _seed_topology("TheirsAdmin", OTHER_ID, _canvas_with_ids())
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        resp = await _import_json(
+            admin_client, [{"name": "TheirsAdmin", "canvas": _isolated_nodes_canvas()}]
+        )
+    report = resp.json()
+    assert report["updated"] == 1
+    assert report["rejected"] == 0
+    assert (await _stored_canvas(tid))["edges"] == []
+    assert await _count_versions() == 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_cross_owner_rejection_identically(user_client):
+    """dry_run surfaces the same pinned rejection as a committing import."""
+    await _seed_connection()
+    seeded = _canvas_with_ids()
+    tid = await _seed_topology("TheirsDry", OTHER_ID, seeded)
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        resp = await _import_json(
+            user_client,
+            [{"name": "TheirsDry", "canvas": _isolated_nodes_canvas()}],
+            dry_run="true",
+        )
+    report = resp.json()
+    assert report["dry_run"] is True
+    assert report["rejected"] == 1
+    assert report["updated"] == 0
+    assert report["rows"][0]["reason"] == NOT_OWNED_REASON
+    assert await _stored_canvas(tid) == seeded
+    assert await _count_versions() == 0
+
+
+@pytest.mark.asyncio
+async def test_owned_match_preferred_over_older_foreign_topology(user_client):
+    """When names collide, the actor's own topology is the update target even
+    when another user's same-named topology is older; the foreign row is
+    untouched and nothing is rejected (the accidental-clobber half of #464)."""
+    await _seed_connection()
+    foreign_canvas = _canvas_with_ids()
+    foreign_tid = await _seed_topology(
+        "Shared", OTHER_ID, foreign_canvas, created_at=datetime(2020, 1, 1)
+    )
+    own_tid = await _seed_topology(
+        "Shared", USER_ID, _canvas_with_ids(), created_at=datetime(2024, 1, 1)
+    )
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}), _blocking([]):
+        resp = await _import_json(
+            user_client, [{"name": "Shared", "canvas": _isolated_nodes_canvas()}]
+        )
+    report = resp.json()
+    assert report["updated"] == 1
+    assert report["rejected"] == 0
+    assert (await _stored_canvas(own_tid))["edges"] == []
+    assert await _stored_canvas(foreign_tid) == foreign_canvas
+
+
+@pytest.mark.asyncio
+async def test_admin_owned_match_preferred_on_name_collision(admin_client):
+    """The owned-match preference applies to admins too: an admin importing
+    their own export updates their own row, not another user's older one."""
+    await _seed_connection()
+    foreign_canvas = _canvas_with_ids()
+    foreign_tid = await _seed_topology(
+        "SharedAdmin", OTHER_ID, foreign_canvas, created_at=datetime(2020, 1, 1)
+    )
+    own_tid = await _seed_topology(
+        "SharedAdmin", ADMIN_ID, _canvas_with_ids(), created_at=datetime(2024, 1, 1)
+    )
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        resp = await _import_json(
+            admin_client, [{"name": "SharedAdmin", "canvas": _isolated_nodes_canvas()}]
+        )
+    report = resp.json()
+    assert report["updated"] == 1
+    assert report["rejected"] == 0
+    assert (await _stored_canvas(own_tid))["edges"] == []
+    assert await _stored_canvas(foreign_tid) == foreign_canvas
+
+
+@pytest.mark.asyncio
+async def test_ownership_gate_precedes_reservation_lock(user_client):
+    """A cross-owner match rejects on ownership, not the reservation lock,
+    mirroring the interactive PUT's check order."""
+    await _seed_connection()
+    await _seed_topology("TheirsLocked", OTHER_ID, _canvas_with_ids())
+    other = {"id": str(uuid.uuid4()), "status": "ACTIVE", "user_id": OTHER_ID}
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}), _blocking([other]):
+        resp = await _import_json(
+            user_client, [{"name": "TheirsLocked", "canvas": _isolated_nodes_canvas()}]
+        )
+    report = resp.json()
+    assert report["rejected"] == 1
+    assert report["rows"][0]["reason"] == NOT_OWNED_REASON
