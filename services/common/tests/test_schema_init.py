@@ -18,6 +18,7 @@ from herd_common.schema_init import (
     SchemaInitResult,
     create_all_and_stamp,
     decide_schema_action,
+    missing_model_tables,
 )
 from sqlalchemy import Column, Integer, MetaData, String, Table, text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -106,7 +107,9 @@ async def test_fresh_schema_stamps_head(metadata, script_location, make_engine, 
         result = await create_all_and_stamp(
             engine, metadata, schema=None, script_location=script_location
         )
-    assert result is SchemaInitResult.STAMPED_FRESH
+    assert result.action is SchemaInitResult.STAMPED_FRESH
+    assert result.missing_model_tables == frozenset()
+    assert result.consumer_should_wait is False
     assert await _stamp_value(engine) == HEAD_REVISION
     assert any(HEAD_REVISION in r.getMessage() for r in caplog.records)
 
@@ -124,7 +127,7 @@ async def test_legacy_unstamped_tables_warn_and_do_not_stamp(
             engine, metadata, schema=None, script_location=script_location
         )
 
-    assert result is SchemaInitResult.UNSTAMPED_LEGACY
+    assert result.action is SchemaInitResult.UNSTAMPED_LEGACY
     assert not await _has_alembic_version(engine)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings, "expected a loud legacy-volume warning"
@@ -137,13 +140,13 @@ async def test_already_stamped_schema_is_untouched(metadata, script_location, ma
     first = await create_all_and_stamp(
         engine, metadata, schema=None, script_location=script_location
     )
-    assert first is SchemaInitResult.STAMPED_FRESH
+    assert first.action is SchemaInitResult.STAMPED_FRESH
 
     # A second call must not re-stamp or alter the recorded revision.
     second = await create_all_and_stamp(
         engine, metadata, schema=None, script_location=script_location
     )
-    assert second is SchemaInitResult.ALREADY_MANAGED
+    assert second.action is SchemaInitResult.ALREADY_MANAGED
     assert await _stamp_value(engine) == HEAD_REVISION
 
 
@@ -155,7 +158,7 @@ async def test_fresh_schema_without_revisions_is_left_unstamped(
     engine = make_engine()
     with caplog.at_level(logging.WARNING):
         result = await create_all_and_stamp(engine, metadata, schema=None, script_location=empty)
-    assert result is SchemaInitResult.STAMPED_FRESH
+    assert result.action is SchemaInitResult.STAMPED_FRESH
     assert not await _has_alembic_version(engine)
 
 
@@ -223,7 +226,7 @@ async def test_stamped_schema_gets_no_ghost_tables(metadata, script_location, ma
     first = await create_all_and_stamp(
         engine, metadata, schema=None, script_location=script_location
     )
-    assert first is SchemaInitResult.STAMPED_FRESH
+    assert first.action is SchemaInitResult.STAMPED_FRESH
 
     # New image boots: the model now declares "gadget", its migration not yet run.
     grown = _metadata_with_gadget(metadata)
@@ -232,7 +235,7 @@ async def test_stamped_schema_gets_no_ghost_tables(metadata, script_location, ma
             engine, grown, schema=None, script_location=script_location
         )
 
-    assert second is SchemaInitResult.ALREADY_MANAGED
+    assert second.action is SchemaInitResult.ALREADY_MANAGED
     names = await _table_names(engine)
     assert "widget" in names
     assert "gadget" not in names, "create_all must not run on a stamped schema"
@@ -259,7 +262,7 @@ async def test_upgrade_in_place_unguarded_migration_applies_cleanly(
         first = await create_all_and_stamp(
             engine, metadata, schema=None, script_location=script_location
         )
-        assert first is SchemaInitResult.STAMPED_FRESH
+        assert first.action is SchemaInitResult.STAMPED_FRESH
         assert await _stamp_value(engine) == HEAD_REVISION
 
         # Deploy the new image: revision 0002 appears in the chain, model grows.
@@ -271,7 +274,7 @@ async def test_upgrade_in_place_unguarded_migration_applies_cleanly(
             second = await create_all_and_stamp(
                 engine, grown, schema=None, script_location=script_location
             )
-        assert second is SchemaInitResult.ALREADY_MANAGED
+        assert second.action is SchemaInitResult.ALREADY_MANAGED
         assert "gadget" not in await _table_names(engine)
         pending = [
             r
@@ -307,7 +310,7 @@ async def test_stamped_at_head_missing_table_warns_missing_migration(
             engine, grown, schema=None, script_location=script_location
         )
 
-    assert result is SchemaInitResult.ALREADY_MANAGED
+    assert result.action is SchemaInitResult.ALREADY_MANAGED
     assert "gadget" not in await _table_names(engine)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings, "expected a missing-migration warning"
@@ -331,14 +334,18 @@ async def test_stamped_empty_schema_warns_stamp_mismatch(
     first = await create_all_and_stamp(
         engine, MetaData(), schema=None, script_location=script_location
     )
-    assert first is SchemaInitResult.STAMPED_FRESH
+    assert first.action is SchemaInitResult.STAMPED_FRESH
 
     with caplog.at_level(logging.WARNING):
         result = await create_all_and_stamp(
             engine, metadata, schema=None, script_location=script_location
         )
 
-    assert result is SchemaInitResult.ALREADY_MANAGED
+    assert result.action is SchemaInitResult.ALREADY_MANAGED
+    # The mismatch also surfaces machine-readably: everything is missing, and a
+    # consumer must wait (starting it would fail every event into the DLQ).
+    assert result.missing_model_tables == frozenset({"widget"})
+    assert result.consumer_should_wait is True
     assert "widget" not in await _table_names(engine)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings, "expected a stamp-mismatch warning"
@@ -372,7 +379,7 @@ async def test_stamp_ahead_of_build_head_warns_rollback(
             engine, metadata, schema=None, script_location=script_location
         )
 
-    assert result is SchemaInitResult.ALREADY_MANAGED
+    assert result.action is SchemaInitResult.ALREADY_MANAGED
     assert await _stamp_value(engine) == "9999_future"
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings, "expected a rollback warning"
@@ -393,7 +400,9 @@ async def test_managed_steady_state_is_quiet(metadata, script_location, make_eng
             engine, metadata, schema=None, script_location=script_location
         )
 
-    assert result is SchemaInitResult.ALREADY_MANAGED
+    assert result.action is SchemaInitResult.ALREADY_MANAGED
+    assert result.missing_model_tables == frozenset()
+    assert result.consumer_should_wait is False
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
@@ -408,7 +417,7 @@ async def test_managed_path_survives_broken_script_location(
     with caplog.at_level(logging.WARNING):
         result = await create_all_and_stamp(engine, metadata, schema=None, script_location=missing)
 
-    assert result is SchemaInitResult.ALREADY_MANAGED
+    assert result.action is SchemaInitResult.ALREADY_MANAGED
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings, "expected a could-not-read-chain warning"
     assert "could not read" in warnings[0].getMessage().lower()
@@ -426,6 +435,73 @@ async def test_legacy_volume_still_gets_new_tables(metadata, script_location, ma
             engine, grown, schema=None, script_location=script_location
         )
 
-    assert result is SchemaInitResult.UNSTAMPED_LEGACY
+    assert result.action is SchemaInitResult.UNSTAMPED_LEGACY
+    # create_all ran, so the legacy limp-along path never gates a consumer.
+    assert result.missing_model_tables == frozenset()
+    assert result.consumer_should_wait is False
     assert "gadget" in await _table_names(engine)
     assert not await _has_alembic_version(engine)
+
+
+# -- Issue #463: the managed-path drift signal is machine-readable ------------
+
+
+async def test_managed_missing_tables_surfaced_in_outcome(metadata, script_location, make_engine):
+    """The boot-before-migrate window: the outcome names the missing tables."""
+    engine = make_engine()
+    first = await create_all_and_stamp(
+        engine, metadata, schema=None, script_location=script_location
+    )
+    assert first.consumer_should_wait is False
+
+    grown = _metadata_with_gadget(metadata)
+    outcome = await create_all_and_stamp(
+        engine, grown, schema=None, script_location=script_location
+    )
+
+    assert outcome.action is SchemaInitResult.ALREADY_MANAGED
+    assert outcome.missing_model_tables == frozenset({"gadget"})
+    assert outcome.consumer_should_wait is True
+
+
+async def test_broken_script_location_still_surfaces_missing_tables(
+    metadata, script_location, tmp_path, make_engine
+):
+    """The gate signal must not depend on the Alembic chain being readable.
+
+    The advisory drift LOG needs the script directory; the missing-tables SET
+    comes from database inspection alone, so a broken chain still never raises
+    (the #452 contract) and still reports the drift.
+    """
+    engine = make_engine()
+    await create_all_and_stamp(engine, metadata, schema=None, script_location=script_location)
+
+    grown = _metadata_with_gadget(metadata)
+    missing = tmp_path / "does-not-exist"
+    outcome = await create_all_and_stamp(engine, grown, schema=None, script_location=missing)
+
+    assert outcome.action is SchemaInitResult.ALREADY_MANAGED
+    assert outcome.missing_model_tables == frozenset({"gadget"})
+    assert outcome.consumer_should_wait is True
+
+
+async def test_missing_model_tables_recheck_clears_when_table_appears(
+    metadata, script_location, make_engine
+):
+    """The readiness poll's re-check flips as soon as the table exists.
+
+    This is the `make migrate` heal: the same computation boot ran, re-run
+    against the live database, observes the migration's create_table without
+    any restart.
+    """
+    engine = make_engine()
+    await create_all_and_stamp(engine, metadata, schema=None, script_location=script_location)
+
+    grown = _metadata_with_gadget(metadata)
+    assert await missing_model_tables(engine, grown, schema=None) == frozenset({"gadget"})
+
+    # Stand in for `make migrate` creating the table.
+    async with engine.begin() as conn:
+        await conn.run_sync(grown.tables["gadget"].create)
+
+    assert await missing_model_tables(engine, grown, schema=None) == frozenset()

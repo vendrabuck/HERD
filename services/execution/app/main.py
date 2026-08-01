@@ -5,6 +5,10 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from herd_common.consumer_schema_gate import (
+    start_consumer_when_schema_ready,
+    stop_consumer_schema_gate,
+)
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.outbox import run_outbox_relay
 from herd_common.schema_init import create_all_and_stamp
@@ -113,18 +117,40 @@ async def stop_outbox_relay(app: FastAPI) -> None:
         pass
 
 
+async def _start_consumer_and_streams(app: FastAPI) -> None:
+    """Start the NATS consumer, then ensure the streams its connection enables.
+
+    The stream ensures read app.state.nats, which start_nats_consumer sets, so
+    they must follow it. Grouped so the issue #463 schema gate preserves that
+    ordering when consumer start is deferred past boot.
+    """
+    await start_nats_consumer(app)
+    await _ensure_health_stream(app)
+    await _ensure_dlq_stream(app)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_all_and_stamp(
+    outcome = await create_all_and_stamp(
         engine,
         Base.metadata,
         schema=settings.db_schema,
         script_location=Path(__file__).resolve().parents[1] / "migrations",
         log=logger,
     )
-    await start_nats_consumer(app)
-    await _ensure_health_stream(app)
-    await _ensure_dlq_stream(app)
+    # Issue #463: on a managed schema missing this release's tables (boot before
+    # `make migrate`), defer consumer start so events wait on the stream instead
+    # of dead-lettering; everything below still starts as usual.
+    await start_consumer_when_schema_ready(
+        app,
+        outcome,
+        engine=engine,
+        metadata=Base.metadata,
+        schema=settings.db_schema,
+        start_consumer=_start_consumer_and_streams,
+        service="execution",
+        log=logger,
+    )
     await start_health_scheduler(app)
     await start_outbox_relay(app)
     await start_wiring_retry_scheduler(app)
@@ -132,6 +158,7 @@ async def lifespan(app: FastAPI):
     await stop_wiring_retry_scheduler(app)
     await stop_outbox_relay(app)
     await stop_health_scheduler(app)
+    await stop_consumer_schema_gate(app)
     await stop_nats_consumer(app)
 
 
