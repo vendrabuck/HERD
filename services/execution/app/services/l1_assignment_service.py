@@ -21,6 +21,13 @@ from app.models.reservation_wiring_state import ReservationWiringState
 
 logger = logging.getLogger(__name__)
 
+# The last_error written when a successful build lands AFTER the reservation's wiring
+# freeze (issue #461): the hardware is now wired for a dead reservation, so the row is
+# parked FAILED intended RELEASED and the release-direction retry channels (which run
+# while frozen, ADR 0009 phase 3) drive the disconnect. Deliberately outside the
+# non-retryable prefixes in wiring_retry_service so the auto channel sweeps it.
+FROZEN_BUILD_PENDING_RELEASE = "connect landed after wiring freeze; pending release"
+
 
 def canonical_port_pair(port_a: str, port_b: str) -> tuple[str, str]:
     """Order a switch port pair deterministically.
@@ -47,19 +54,64 @@ async def record_l1_connect(
 ) -> L1ConnectionAssignment | None:
     """Insert an ACTIVE assignment after a successful connect_ports.
 
-    Idempotent under redelivery: an existing ACTIVE row for the same
+    Idempotent under redelivery: this reservation's existing ACTIVE row for the same
     (switch, canonical pair) short-circuits, and a concurrent connect that claims
     the pair first trips the active-unique index, whereupon we roll back and
     return the winner's row. Mirrors find_or_assign_vlan's insert-then-catch
     discipline.
+
+    Two guards added by issue #461:
+
+    - Another reservation's ACTIVE row on the same pair is superseded, not adopted:
+      an L1 matrix port carries exactly one cross-connect, so THIS successful connect
+      proves the old cross-connect no longer exists (the supersede_release_if_reclaimed
+      physics, in the build direction). The stale row (typically stranded by a terminal
+      teardown that never completed) flips RELEASED and this reservation records its
+      own ACTIVE row. Adopting the stale row instead (the pre-#461 behavior) left this
+      reservation with NO ledger row, so its own teardown released nothing.
+    - If the reservation's wiring is already frozen at record time (the terminal
+      handler's freeze landed while our driver call was in flight), the build must NOT
+      be recorded ACTIVE: the teardown pass has already snapshotted the ledger and will
+      never see it. The row is parked FAILED intended RELEASED
+      (FROZEN_BUILD_PENDING_RELEASE) so the release-direction retry channels, which run
+      while frozen, tear the just-built cross-connect down. This is the record-time
+      analogue of the issue #412 guard: the commit path re-checks the invariant the
+      caller checked before the driver call.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
     ca, cb = canonical_port_pair(port_a, port_b)
 
     existing = await _find_active(db, switch_uuid, ca, cb)
-    if existing is not None:
+    if existing is not None and existing.reservation_id == res_uuid:
         return existing
+    if existing is not None:
+        # Cross-reservation stale ACTIVE row: superseded by this build (see docstring).
+        # Flipped in this session; the commit below (park or insert path) persists both
+        # writes together, and an IntegrityError rollback discards both consistently.
+        existing.status = "RELEASED"
+        existing.intended = "RELEASED"
+        existing.released_at = datetime.now(timezone.utc)
+        # Flush the release NOW: SQLAlchemy flushes inserts before updates, so without
+        # this the ACTIVE insert below would hit the active-unique index while the
+        # stale row is still ACTIVE in the database.
+        await db.flush()
+        logger.warning(
+            "Superseding stale ACTIVE L1 row of reservation %s for switch %s pair "
+            "(%s, %s): reservation %s proved the pair by a successful connect",
+            existing.reservation_id,
+            switch_uuid,
+            ca,
+            cb,
+            res_uuid,
+        )
+
+    # Record-time freeze re-check (issue #461, the #412 discipline): the selection-time
+    # frozen checks (wiring_changed entry, retry-tick row skip) cannot cover a freeze
+    # that lands while the driver call is off-loop; only the commit path can.
+    state = await get_wiring_state(db, res_uuid)
+    if state is not None and state.frozen:
+        return await _park_frozen_build(db, res_uuid, switch_uuid, ca, cb)
 
     # Reuse this reservation's own prior FAILED row for the same pair (a build that
     # failed, then succeeded on a later apply or a retry): flip it ACTIVE in place
@@ -197,6 +249,63 @@ async def _find_reusable_failed(
         )
     )
     return result.scalars().first()
+
+
+async def _park_frozen_build(
+    db: AsyncSession,
+    res_uuid: uuid.UUID,
+    switch_uuid: uuid.UUID,
+    port_a: str,
+    port_b: str,
+) -> L1ConnectionAssignment:
+    """Park a post-freeze successful build as FAILED intended RELEASED (issue #461).
+
+    The connect succeeded on hardware but the reservation's wiring froze while the
+    driver call was in flight, so the terminal teardown never saw (and never will see)
+    this pair. Recording it ACTIVE would strand live switch config forever; parking it
+    FAILED intended RELEASED hands it to the release-direction retry channels, which
+    are allowed to run on a frozen reservation (ADR 0009 phase 3) and drive the
+    disconnect. attempts are NOT incremented: the release direction has not failed yet,
+    and inflating the counter would push the pending disconnect toward the auto-retry
+    cap for no reason. Ports arrive already canonical from record_l1_connect.
+    """
+    result = await db.execute(
+        select(L1ConnectionAssignment).where(
+            L1ConnectionAssignment.reservation_id == res_uuid,
+            L1ConnectionAssignment.switch_device_id == switch_uuid,
+            L1ConnectionAssignment.port_a == port_a,
+            L1ConnectionAssignment.port_b == port_b,
+            L1ConnectionAssignment.status != "RELEASED",
+        )
+    )
+    row = result.scalars().first()
+    if row is None:
+        row = L1ConnectionAssignment(
+            reservation_id=res_uuid,
+            switch_device_id=switch_uuid,
+            port_a=port_a,
+            port_b=port_b,
+            status="FAILED",
+            intended="RELEASED",
+            attempts=0,
+            last_error=FROZEN_BUILD_PENDING_RELEASE,
+        )
+        db.add(row)
+    else:
+        row.status = "FAILED"
+        row.intended = "RELEASED"
+        row.last_error = FROZEN_BUILD_PENDING_RELEASE
+    await db.commit()
+    await db.refresh(row)
+    logger.warning(
+        "Build for frozen reservation %s landed on switch %s pair (%s, %s); "
+        "parked FAILED intended RELEASED for the release retry channel",
+        res_uuid,
+        switch_uuid,
+        port_a,
+        port_b,
+    )
+    return row
 
 
 async def freeze_reservation_wiring(

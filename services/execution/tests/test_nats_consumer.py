@@ -219,9 +219,10 @@ async def test_updated_added_only_drives_no_teardown_no_wiring():
 
 @pytest.mark.asyncio
 async def test_handle_cancelled_event_dispatches_ledger_teardown():
-    """A terminal event (reservation.cancelled) dispatches the ledger-driven teardown,
-    then the dynamic-instance teardown, then freezes the wiring state. Wiring comes from
-    the three ledgers via _teardown_from_ledgers, never a device-set resolver (retired)."""
+    """A terminal event (reservation.cancelled) freezes the wiring state FIRST (issue
+    #461), then dispatches the ledger-driven teardown, then the dynamic-instance
+    teardown. Wiring comes from the three ledgers via _teardown_from_ledgers, never a
+    device-set resolver (retired)."""
     rid = str(uuid.uuid4())
     uid = str(uuid.uuid4())
     event_data = {

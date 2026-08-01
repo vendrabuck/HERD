@@ -18,8 +18,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.route_assignment import RouteAssignment
+from app.services.l1_assignment_service import get_wiring_state
 
 logger = logging.getLogger(__name__)
+
+# The L3 analogue of l1_assignment_service.FROZEN_BUILD_PENDING_RELEASE (issue #461):
+# a clean route provision whose reservation froze mid-flight is parked FAILED
+# intended RELEASED under this reason so the release-direction retry channels drive
+# the remove_route pass. Deliberately outside the non-retryable prefixes.
+FROZEN_PROVISION_PENDING_REMOVAL = "routes landed after wiring freeze; pending removal"
 
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
@@ -234,6 +241,13 @@ async def record_route_active(
     reservation's switch is flipped ACTIVE in place (the pinned `routes` it already
     carried are the immutable set; we keep them and ignore the `routes` argument on the
     flip, so a redelivery cannot re-pin an edited config).
+
+    Mirrors record_l1_connect's record-time freeze re-check (issue #461, the #412
+    discipline): a provision whose reservation froze while the driver call was in
+    flight must not be recorded ACTIVE (the terminal teardown has already snapshotted
+    the ledger), so it is parked FAILED intended RELEASED
+    (FROZEN_PROVISION_PENDING_REMOVAL) for the release-direction retry channels, which
+    run while frozen and drive the route removal with the pinned set.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)
@@ -249,6 +263,47 @@ async def record_route_active(
     ).scalar_one_or_none()
     if existing is not None:
         return existing
+
+    state = await get_wiring_state(db, res_uuid)
+    if state is not None and state.frozen:
+        row = (
+            (
+                await db.execute(
+                    select(RouteAssignment).where(
+                        RouteAssignment.reservation_id == res_uuid,
+                        RouteAssignment.device_id == dev_uuid,
+                        RouteAssignment.status != "RELEASED",
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if row is None:
+            row = RouteAssignment(
+                reservation_id=res_uuid,
+                device_id=dev_uuid,
+                routes=routes,
+                status="FAILED",
+                intended="RELEASED",
+                attempts=0,
+                last_error=FROZEN_PROVISION_PENDING_REMOVAL,
+            )
+            db.add(row)
+        else:
+            # Keep the row's existing pinned routes (the immutable set) on a flip.
+            row.status = "FAILED"
+            row.intended = "RELEASED"
+            row.last_error = FROZEN_PROVISION_PENDING_REMOVAL
+        await db.commit()
+        await db.refresh(row)
+        logger.warning(
+            "Route provision for frozen reservation %s landed on switch %s; "
+            "parked FAILED intended RELEASED for the release retry channel",
+            res_uuid,
+            dev_uuid,
+        )
+        return row
 
     reusable = (
         (

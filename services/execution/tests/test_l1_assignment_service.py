@@ -688,3 +688,111 @@ def test_backfill_intended_multiple_rows_independent():
 def test_backfill_intended_empty_rows_yields_nothing():
     runs = [_run(uuid.uuid4(), uuid.uuid4(), "connect_ports", "SUCCESS", "A", "B", 1)]
     assert compute_backfill_intended([], runs) == {}
+
+
+# --- record-time freeze re-check and cross-reservation supersession (issue #461) ---
+
+
+@pytest.mark.asyncio
+async def test_record_connect_frozen_parks_failed_intended_released(db):
+    """A build that lands after the wiring freeze is parked FAILED intended RELEASED
+    (the record-time analogue of the #412 guard): recording it ACTIVE would strand
+    live switch config the terminal teardown has already snapshotted past."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    db.add(ReservationWiringState(reservation_id=rid, frozen=True))
+    await db.commit()
+
+    row = await record_l1_connect(db, rid, switch, "0/0/2", "0/0/1")
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.last_error == svc.FROZEN_BUILD_PENDING_RELEASE
+    assert (row.port_a, row.port_b) == ("0/0/1", "0/0/2"), "parked in canonical order"
+    assert row.attempts == 0
+
+    active = (
+        (
+            await db.execute(
+                select(L1ConnectionAssignment).where(L1ConnectionAssignment.status == "ACTIVE")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert active == [], "no ACTIVE row may exist for a frozen reservation's build"
+    # The parked reason is hardware-retryable so the release channel sweeps it.
+    from app.services.wiring_retry_service import is_retryable_failure
+
+    assert is_retryable_failure(row.last_error) is True
+
+
+@pytest.mark.asyncio
+async def test_record_connect_frozen_reuses_failed_row_and_keeps_attempts(db):
+    """The retry-tick interleaving shape: the FAILED build row that was being retried is
+    parked in place (same row, intended flipped to RELEASED) and attempts do NOT
+    inflate: the release direction has not failed yet."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    failed = await record_l1_failed(
+        db, rid, switch, "0/0/1", "0/0/2", attempts=2, last_error="boom", intended="ACTIVE"
+    )
+    db.add(ReservationWiringState(reservation_id=rid, frozen=True))
+    await db.commit()
+
+    row = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
+    assert row.id == failed.id, "the same row is parked, not a parallel row"
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.attempts == 2
+    assert row.last_error == svc.FROZEN_BUILD_PENDING_RELEASE
+
+
+@pytest.mark.asyncio
+async def test_record_connect_frozen_short_circuits_own_active_row_unchanged(db):
+    """A redelivery for a pair this reservation already holds ACTIVE stays a pure
+    idempotent no-op even when frozen: no new state transition happened in this call,
+    so there is nothing to park (the row predates the freeze and the teardown saw it)."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    first = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
+    db.add(ReservationWiringState(reservation_id=rid, frozen=True))
+    await db.commit()
+
+    again = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
+    assert again.id == first.id
+    assert again.status == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_record_connect_supersedes_stale_cross_reservation_active_row(db):
+    """Issue #461 secondary: a successful connect proves the pair, so another
+    reservation's stale ACTIVE row on the same (switch, canonical pair) is flipped
+    RELEASED and THIS reservation records its own ACTIVE row. The pre-#461 adoption of
+    the stale row left the new reservation with no ledger row, so its own teardown
+    released nothing and the leak propagated to every later booking of the pair."""
+    stale_res = uuid.uuid4()
+    new_res = uuid.uuid4()
+    switch = uuid.uuid4()
+    stale = await record_l1_connect(db, stale_res, switch, "0/0/1", "0/0/2")
+    assert stale.status == "ACTIVE"
+
+    row = await record_l1_connect(db, new_res, switch, "0/0/2", "0/0/1")
+    assert row is not None
+    assert row.reservation_id == new_res, "the new reservation records its OWN row"
+    assert row.status == "ACTIVE"
+
+    await db.refresh(stale)
+    assert stale.status == "RELEASED"
+    assert stale.intended == "RELEASED"
+    assert stale.released_at is not None
+
+    active = (
+        (
+            await db.execute(
+                select(L1ConnectionAssignment).where(L1ConnectionAssignment.status == "ACTIVE")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [r.reservation_id for r in active] == [new_res], "exactly one ACTIVE row remains"
