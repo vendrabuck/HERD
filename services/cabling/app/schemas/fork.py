@@ -162,6 +162,33 @@ class ForkSaveResponse(BaseModel):
         return str(value)
 
 
+class ForkPruneRequest(BaseModel):
+    """Body for POST /internal/forks/{reservation_id}/prune-devices (issue #459).
+
+    The device ids removed from the reservation whose fork wiring must release.
+    """
+
+    device_ids: list[uuid.UUID]
+
+
+class ForkPruneResponse(BaseModel):
+    """POST .../prune-devices result: the released delta and whether a version landed.
+
+    ``changed`` False means nothing was left to release (an idempotent replay, or the
+    devices carried no saved wiring); ``version_number`` is then the current latest
+    version, unbumped, and the caller must stage no wiring_changed for it.
+    """
+
+    fork_id: uuid.UUID
+    version_number: int
+    changed: bool
+    released: list[ForkConnectionDelta]
+
+    @field_serializer("fork_id")
+    def serialize_fork_id(self, value: uuid.UUID) -> str:
+        return str(value)
+
+
 class ForkArchiveResponse(BaseModel):
     """POST .../archive result: the frozen fork's identity and ARCHIVED status."""
 

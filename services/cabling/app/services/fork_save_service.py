@@ -65,6 +65,21 @@ class ForkSaveResult:
     unchanged_count: int
 
 
+@dataclass
+class ForkPruneResult:
+    """The device-prune outcome (ADR 0009 Decision 6 REMOVE half, issue #459).
+
+    ``changed`` is True iff wiring was released and a fork_versions row appended;
+    a no-op replay (nothing left to release) returns the current latest version
+    with ``changed`` False so the caller stages nothing.
+    """
+
+    fork_id: uuid.UUID
+    version_number: int
+    changed: bool
+    released: list[WireSpec]
+
+
 def node_to_device_map(canvas: dict) -> dict[str, uuid.UUID]:
     """Map React Flow node ids to device UUIDs, mirroring _run_topology_validation."""
     nodes = canvas.get("nodes") or []
@@ -379,11 +394,208 @@ async def save_fork(
     )
 
 
+def prune_canvas_for_devices(
+    canvas: dict | None, removed_ids: set[str]
+) -> tuple[dict | None, bool, set[str], set[str]]:
+    """Remove the given devices' nodes and incident edges from a canvas.
+
+    Returns ``(pruned_canvas, changed, remaining_edge_ids, pruned_edge_ids)``. Node
+    device resolution mirrors node_to_device_map (node.data.device.id), so a node this
+    helper keeps is exactly a node the save resolver would keep. The two edge-id sets
+    partition the canvas's identifiable edges: ``pruned_edge_ids`` are edges incident
+    to a removed device's node, ``remaining_edge_ids`` are everything else. A None or
+    empty canvas prunes to itself with empty sets.
+    """
+    if not canvas:
+        return canvas, False, set(), set()
+    nodes = canvas.get("nodes") or []
+    edges = canvas.get("edges") or []
+    pruned_node_ids = {
+        node.get("id")
+        for node in nodes
+        if str(((node.get("data") or {}).get("device") or {}).get("id")) in removed_ids
+    }
+    kept_nodes = [n for n in nodes if n.get("id") not in pruned_node_ids]
+    kept_edges: list[dict] = []
+    dropped_edges: list[dict] = []
+    for edge in edges:
+        if edge.get("source") in pruned_node_ids or edge.get("target") in pruned_node_ids:
+            dropped_edges.append(edge)
+        else:
+            kept_edges.append(edge)
+    changed = len(kept_nodes) != len(nodes) or bool(dropped_edges)
+    pruned = {**canvas, "nodes": kept_nodes, "edges": kept_edges}
+    remaining_edge_ids = {str(e.get("id")) for e in kept_edges if e.get("id") is not None}
+    pruned_edge_ids = {str(e.get("id")) for e in dropped_edges if e.get("id") is not None}
+    return pruned, changed, remaining_edge_ids, pruned_edge_ids
+
+
+def _rows_released_by_prune(
+    rows: list[ForkConnection],
+    removed: set[str],
+    remaining_edge_ids: set[str],
+    pruned_edge_ids: set[str],
+) -> list[ForkConnection]:
+    """Select the fork_connections a device removal releases (issue #459).
+
+    The intended set is ``fork_connections`` (the last saved wiring), never the draft
+    canvas, and the edge-id sets come from the last SAVED canvas. A row releases when:
+
+    - its edge_key belongs to a PRUNED saved edge (an edge whose endpoint device was
+      removed): every hop of that edge releases, including far hops that do not touch
+      the removed device (a multi-hop path's remote cable); or
+    - it touches a removed device and its edge_key is NOT a REMAINING saved edge. A
+      row whose edge_key IS a remaining edge is a through-hop: the removed device sits
+      mid-path on an edge between devices still held, and that wiring stays. A NULL or
+      stale edge_key on a row touching a removed device cannot prove a remaining edge
+      is served, so it releases (the pre-#345 ungrouped rows and the loose-draft
+      divergence case both land here).
+    """
+    released: list[ForkConnection] = []
+    for row in rows:
+        edge_key = str(row.edge_key) if row.edge_key is not None else None
+        if edge_key is not None and edge_key in pruned_edge_ids:
+            released.append(row)
+            continue
+        if str(row.device_a_id) not in removed and str(row.device_b_id) not in removed:
+            continue
+        if edge_key is None or edge_key not in remaining_edge_ids:
+            released.append(row)
+    return released
+
+
+async def prune_fork_devices(
+    db: AsyncSession,
+    fork: ReservationFork,
+    device_ids: list[uuid.UUID],
+) -> ForkPruneResult:
+    """Release removed devices' wiring from the fork's INTENDED set (issue #459).
+
+    The ADR 0009 Decision 6 REMOVE half, redesigned to never read the draft canvas as
+    wiring intent: the release is computed set-arithmetically from ``fork_connections``
+    (the last saved wiring) plus the last SAVED canvas's edge incidence, so an unsaved
+    draft edit can neither be built nor released by a device removal. Three effects in
+    one transaction:
+
+    - the released rows are deleted (their cross-reservation port claims free with
+      them; a pure release computes no ``to_build``, so unlike a save this can never
+      409 on a port claim, issue #462's deterministic trigger);
+    - the stored DRAFT canvas is scrubbed of the removed devices' nodes and incident
+      edges, leaving every other draft edit untouched (unsaved edges between remaining
+      devices survive, un-built and un-released), so a later user save cannot rebuild
+      wiring for a device the reservation no longer holds;
+    - a fork_versions row is appended whose canvas is the last SAVED canvas pruned of
+      the removed devices, never the draft, so the version history only ever snapshots
+      saved states.
+
+    Rides ``commit_fork_with_new_version`` exactly like save_fork; the reconcile hook
+    re-reads the committed draft, latest version, and rows fresh, so a lost version
+    race recomputes against the winner's committed state (including a winner save that
+    replaced the draft). Idempotent: a replay finds nothing to release and returns
+    ``changed`` False with no version appended (a draft-only scrub earns no version;
+    drafts are cheap and fork_versions must only snapshot saved states).
+    """
+    removed = {str(d) for d in device_ids}
+    fork_id = fork.id
+
+    async def _latest_version() -> ForkVersion | None:
+        return (
+            (
+                await db.execute(
+                    select(ForkVersion)
+                    .where(ForkVersion.fork_id == fork_id)
+                    .order_by(ForkVersion.version_number.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    async def _current_rows() -> list[ForkConnection]:
+        return (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+
+    latest = await _latest_version()
+    current_version = latest.version_number if latest is not None else 0
+    saved_canvas = latest.canvas_data if latest is not None else None
+    _, _, remaining_edge_ids, pruned_edge_ids = prune_canvas_for_devices(saved_canvas, removed)
+    to_release = _rows_released_by_prune(
+        await _current_rows(), removed, remaining_edge_ids, pruned_edge_ids
+    )
+    pruned_draft, draft_changed, _, _ = prune_canvas_for_devices(fork.canvas_data, removed)
+
+    if not to_release:
+        if draft_changed:
+            fork.canvas_data = pruned_draft
+            await db.commit()
+        return ForkPruneResult(
+            fork_id=fork_id, version_number=current_version, changed=False, released=[]
+        )
+
+    result: dict = {}
+    snapshot = ForkVersion(fork_id=fork_id, canvas_data=None)
+
+    async def reconcile() -> None:
+        # Re-read committed state fresh: identical to the setup reads on the first
+        # pass, and recomputed against the winner's rows on a version-race retry
+        # (which may have replaced the draft, appended a version, or already released
+        # some rows). The direct column select bypasses the stale in-session value a
+        # rollback reapply restores.
+        committed_draft = (
+            await db.execute(
+                select(ReservationFork.canvas_data).where(ReservationFork.id == fork_id)
+            )
+        ).scalar_one()
+        fork.canvas_data = prune_canvas_for_devices(committed_draft, removed)[0]
+
+        latest_now = await _latest_version()
+        pruned_saved, _, remaining_now, pruned_now = prune_canvas_for_devices(
+            latest_now.canvas_data if latest_now is not None else None, removed
+        )
+        snapshot.canvas_data = pruned_saved
+
+        release_rows = _rows_released_by_prune(
+            await _current_rows(), removed, remaining_now, pruned_now
+        )
+        for row in release_rows:
+            await db.delete(row)
+        await db.flush()
+        result["released"] = [
+            WireSpec(
+                device_a_id=row.device_a_id,
+                port_a=row.port_a,
+                device_b_id=row.device_b_id,
+                port_b=row.port_b,
+                layer=row.layer,
+                physical_connection_id=row.physical_connection_id,
+                edge_key=row.edge_key,
+            )
+            for row in release_rows
+        ]
+
+    await reconcile()
+    await commit_fork_with_new_version(db, fork, snapshot, reconcile=reconcile)
+
+    return ForkPruneResult(
+        fork_id=fork_id,
+        version_number=snapshot.version_number,
+        changed=True,
+        released=result["released"],
+    )
+
+
 __all__ = [
+    "ForkPruneResult",
     "ForkSaveResult",
     "WireSpec",
     "connection_identity",
     "node_to_device_map",
+    "prune_canvas_for_devices",
+    "prune_fork_devices",
     "reconcile_connection_sets",
     "resolve_canvas_wiring",
     "save_fork",
