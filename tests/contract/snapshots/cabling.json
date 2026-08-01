@@ -50,6 +50,10 @@
     ],
     [
       "POST",
+      "/internal/forks/{reservation_id}/prune-devices"
+    ],
+    [
+      "POST",
       "/internal/forks/{reservation_id}/save"
     ],
     [
@@ -371,6 +375,30 @@
         "status",
         "updated_at",
         "versions"
+      ],
+      "type": "object"
+    },
+    "ForkPruneRequest": {
+      "properties": {
+        "device_ids": "array"
+      },
+      "required": [
+        "device_ids"
+      ],
+      "type": "object"
+    },
+    "ForkPruneResponse": {
+      "properties": {
+        "changed": "boolean",
+        "fork_id": "string",
+        "released": "array",
+        "version_number": "integer"
+      },
+      "required": [
+        "changed",
+        "fork_id",
+        "released",
+        "version_number"
       ],
       "type": "object"
     },

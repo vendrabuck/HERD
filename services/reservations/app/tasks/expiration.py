@@ -21,10 +21,12 @@ from app.models.reservation import (
 from app.services.reservation_service import (
     _archive_reservation_fork_best_effort,
     _claim_provision_transition,
+    _clear_pending_fork_prune,
     _create_reservation_fork_best_effort,
     _fetch_active_forks,
     _fetch_devices_best_effort,
     _provision_requested_event,
+    _prune_removed_devices_from_fork_best_effort,
     _release_exclusive_devices_best_effort,
     _reservation_created_event,
     _reservation_failed_event,
@@ -660,6 +662,85 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
             )
 
 
+# Per-tick cap on pending-prune retries, bounding the sweep's cabling fan-out the
+# same way the active-fork fetch bounds the other heals. A backlog past the cap is
+# picked up on later ticks (ordered by updated_at, so the oldest converge first).
+_PENDING_PRUNE_BATCH = 20
+
+
+async def _run_pending_prune_reconcile() -> None:
+    """Retry pending device-removal fork prunes each tick (issue #462).
+
+    The REMOVE half's standing reconciler, the partner of the archive heal, the
+    wiring-staging heal, and the missing-fork backstop: the device-set PATCH records
+    removed device ids in pending_fork_prune_device_ids atomically with the edit, so
+    a prune that failed its immediate best-effort attempts (cabling outage, 5xx, or a
+    crash between the commit and the call) stays durably visible here. Each tick
+    retries up to _PENDING_PRUNE_BATCH marked reservations with ONE attempt each (the
+    PATCH fast path already ran the backoff; a persistent outage retries next tick,
+    the same forever-until-converged posture as the wiring heal). The prune replay is
+    idempotent, and success clears exactly the retried ids from the marker
+    (set-difference under a row lock, so ids a concurrent PATCH unioned in survive).
+
+    A reservation that went terminal meanwhile drops its marker without a prune:
+    terminal teardown releases its wiring from execution's intended ledgers and the
+    fork archive settles the port claims, so there is nothing left for a prune to do
+    (cabling would answer the ARCHIVED 409 anyway). ACTIVE is the only status that
+    writes the marker, so non-ACTIVE here means terminal.
+    """
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(
+                    Reservation.id,
+                    Reservation.status,
+                    Reservation.pending_fork_prune_device_ids,
+                )
+                .where(Reservation.pending_fork_prune_device_ids.is_not(None))
+                .order_by(Reservation.updated_at)
+                .limit(_PENDING_PRUNE_BATCH)
+            )
+        ).all()
+
+    for row in rows:
+        pending = row.pending_fork_prune_device_ids or []
+        if row.status != ReservationStatus.ACTIVE:
+            await _clear_pending_fork_prune(row.id, pending)
+            logger.info(
+                "Pending prune reconcile: reservation %s is %s; teardown owns the release",
+                row.id,
+                row.status.value,
+                extra={
+                    "action": "pending_prune_terminal_cleared",
+                    "reservation_id": str(row.id),
+                },
+            )
+            continue
+        device_ids: list[uuid.UUID] = []
+        bad_entries: list = []
+        for raw in pending:
+            try:
+                device_ids.append(uuid.UUID(str(raw)))
+            except (ValueError, TypeError):
+                # Defensive: the marker is written from validated UUIDs, so a bad
+                # entry is corruption; clear it rather than wedging the reconciler.
+                bad_entries.append(raw)
+        if bad_entries:
+            await _clear_pending_fork_prune(row.id, bad_entries)
+        if not device_ids:
+            continue
+        logger.info(
+            "Pending prune reconcile: retrying fork prune for reservation %s (%d devices)",
+            row.id,
+            len(device_ids),
+            extra={
+                "action": "pending_prune_retry",
+                "reservation_id": str(row.id),
+            },
+        )
+        await _prune_removed_devices_from_fork_best_effort(row.id, device_ids, attempts=1)
+
+
 async def expiration_loop(interval_seconds: int = 60) -> None:
     """Run expiration cycles forever at the given interval.
 
@@ -683,4 +764,8 @@ async def expiration_loop(interval_seconds: int = 60) -> None:
             await _run_fork_archive_reconcile()
         except Exception:
             logger.error("Fork archive reconcile cycle failed", exc_info=True)
+        try:
+            await _run_pending_prune_reconcile()
+        except Exception:
+            logger.error("Pending fork-prune reconcile cycle failed", exc_info=True)
         await asyncio.sleep(interval_seconds)

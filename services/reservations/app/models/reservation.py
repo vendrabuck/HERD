@@ -4,6 +4,7 @@ from datetime import datetime
 
 from herd_common.enums import TopologyType
 from sqlalchemy import (
+    JSON,
     DateTime,
     Enum,
     ForeignKey,
@@ -85,6 +86,13 @@ class Reservation(Base):
     expiry_reminder_sent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Durable fork-prune marker (issue #462): device ids (JSON list of UUID strings)
+    # removed from this ACTIVE reservation whose fork wiring release has not yet
+    # converged. Written in the SAME transaction as the device-set edit, cleared per
+    # id when cabling's prune-devices call succeeds, and retried each tick by the
+    # expiration sweep's pending-prune reconciler while it is non-null. Null means
+    # nothing pending.
+    pending_fork_prune_device_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # Devices live in the `reservation_devices` join table (single source of truth).
     # selectin eager-loads them with the parent so reading `device_ids` during async

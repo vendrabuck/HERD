@@ -32,6 +32,8 @@ from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import bearer_scheme
 from app.services import reservation_service
 from app.services.reservation_service import (
+    _PRUNE_OUTCOME_CONVERGED,
+    _PRUNE_OUTCOME_NO_FORK,
     WIRING_CHANGED_SUBJECT,
     _create_reservation_fork_best_effort,
     _prune_removed_devices_from_fork,
@@ -593,7 +595,14 @@ async def test_save_handler_archived_409_stages_nothing():
     app.dependency_overrides.clear()
 
 
-# --- Decision 6 REMOVE half: PATCH-remove prunes the fork and stages the delta ------
+# --- Decision 6 REMOVE half: PATCH-remove prunes the intended set (#459) ------------
+#
+# The prune is ONE cabling call (POST /internal/forks/{id}/prune-devices): cabling
+# computes the release from fork_connections plus the last SAVED canvas, never the
+# draft, and reservations only relays and stages. The which-rows-release rules
+# (through-hops, pruned-edge far hops, stale edge_keys, no-op replays) are cabling's
+# and are pinned in services/cabling/tests/test_fork_prune.py; this section pins the
+# reservations side: the call shape, the outcome mapping, and the staging contract.
 
 
 def _fork_resp(status_code, body=None, text=""):
@@ -604,56 +613,35 @@ def _fork_resp(status_code, body=None, text=""):
     return resp
 
 
-def _fork_body(canvas, connections):
-    return {
-        "id": str(uuid.uuid4()),
-        "reservation_id": str(uuid.uuid4()),
-        "status": "ACTIVE",
-        "canvas_data": canvas,
-        "connections": connections,
-        "versions": [],
-    }
-
-
-def _two_node_canvas(dut_id, other_id):
-    return {
-        "nodes": [
-            {"id": "nD", "data": {"device": {"id": dut_id}}},
-            {"id": "nO", "data": {"device": {"id": other_id}}},
-        ],
-        "edges": [
-            {"id": "e1", "source": "nD", "target": "nO", "data": {"layer": "L1"}},
-        ],
-    }
-
-
 @pytest.mark.asyncio
-async def test_patch_remove_prunes_fork_and_stages_released_delta():
-    """PATCH-remove pushes the pruned canvas through the save path EXACTLY once and
-    stages the returned released delta atomically with the ledger (Decision 6)."""
+async def test_patch_remove_calls_prune_devices_and_stages_released_delta():
+    """The prune posts the removed ids to prune-devices EXACTLY once and stages the
+    returned released delta (built empty) atomically with the ledger (Decision 6)."""
     rid = uuid.uuid4()
-    dut_id, other_id = str(uuid.uuid4()), str(uuid.uuid4())
+    dut_id = uuid.uuid4()
     released = [_wire()]
-    save_body = {"version_number": 2, "released": released, "built": []}
+    prune_body = {
+        "fork_id": str(uuid.uuid4()),
+        "version_number": 2,
+        "changed": True,
+        "released": released,
+    }
     calls = []
 
     async def fork_call(method, path, json_body=None):
         calls.append((method, path, json_body))
-        if method == "GET":
-            return _fork_resp(200, _fork_body(_two_node_canvas(dut_id, other_id), []))
-        return _fork_resp(200, save_body)
+        return _fork_resp(200, prune_body)
 
     with patch(
         "app.services.reservation_service._cabling_fork_call",
         new=AsyncMock(side_effect=fork_call),
     ):
-        await _prune_removed_devices_from_fork(rid, [uuid.UUID(dut_id)], "system")
+        outcome = await _prune_removed_devices_from_fork(rid, [dut_id])
 
-    saves = [c for c in calls if c[0] == "POST"]
-    assert len(saves) == 1, "the pruned save must be pushed exactly once"
-    saved_canvas = saves[0][2]["canvas_data"]
-    assert [n["id"] for n in saved_canvas["nodes"]] == ["nO"]
-    assert saved_canvas["edges"] == []
+    assert outcome == _PRUNE_OUTCOME_CONVERGED
+    assert calls == [
+        ("POST", f"/internal/forks/{rid}/prune-devices", {"device_ids": [str(dut_id)]})
+    ]
 
     rows = await _wiring_rows()
     assert len(rows) == 1
@@ -666,127 +654,105 @@ async def test_patch_remove_prunes_fork_and_stages_released_delta():
 
 
 @pytest.mark.asyncio
-async def test_patch_remove_noop_when_device_has_no_fork_edges():
-    """A removed device with a bare node (no incident edges, no recorded wires) prunes
-    nothing: no save, no version bump, no staging."""
+async def test_patch_remove_unchanged_prune_stages_nothing():
+    """A changed-false prune (idempotent replay, or no saved wiring for the devices)
+    converges without staging: no event, no ledger row, no spurious version."""
     rid = uuid.uuid4()
-    dut_id = str(uuid.uuid4())
-    canvas = {
-        "nodes": [{"id": "nD", "data": {"device": {"id": dut_id}}}],
-        "edges": [],
+    prune_body = {
+        "fork_id": str(uuid.uuid4()),
+        "version_number": 3,
+        "changed": False,
+        "released": [],
     }
-    calls = []
-
-    async def fork_call(method, path, json_body=None):
-        calls.append(method)
-        return _fork_resp(200, _fork_body(canvas, []))
 
     with patch(
         "app.services.reservation_service._cabling_fork_call",
-        new=AsyncMock(side_effect=fork_call),
+        new=AsyncMock(return_value=_fork_resp(200, prune_body)),
     ):
-        await _prune_removed_devices_from_fork(rid, [uuid.UUID(dut_id)], "system")
+        outcome = await _prune_removed_devices_from_fork(rid, [uuid.uuid4()])
 
-    assert calls == ["GET"], "no save may be pushed for an edgeless device"
+    assert outcome == _PRUNE_OUTCOME_CONVERGED
     assert await _wiring_rows() == []
     assert await _ledger(rid) is None
 
 
 @pytest.mark.asyncio
-async def test_patch_remove_noop_on_missing_fork():
-    """No fork (404: PENDING, or Case A before lazy-create) is a clean no-op."""
+async def test_patch_remove_no_fork_reports_no_fork_outcome():
+    """A 404 (PENDING, Case A before lazy-create, or a failed activation fork create)
+    stages nothing and reports NO_FORK so the marker logic can decide convergence."""
     rid = uuid.uuid4()
 
     with patch(
         "app.services.reservation_service._cabling_fork_call",
         new=AsyncMock(return_value=_fork_resp(404)),
     ):
-        await _prune_removed_devices_from_fork(rid, [uuid.uuid4()], "system")
+        outcome = await _prune_removed_devices_from_fork(rid, [uuid.uuid4()])
+
+    assert outcome == _PRUNE_OUTCOME_NO_FORK
+    assert await _wiring_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_patch_remove_archived_409_converges_without_staging():
+    """The prune endpoint's only 409 is an ARCHIVED fork (a pure release checks no
+    port claims, issue #462): the reservation ended, terminal teardown owns the
+    release, so the outcome converges and nothing is staged."""
+    rid = uuid.uuid4()
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(
+            return_value=_fork_resp(409, {"detail": "Fork is archived and cannot be edited"})
+        ),
+    ):
+        outcome = await _prune_removed_devices_from_fork(rid, [uuid.uuid4()])
+
+    assert outcome == _PRUNE_OUTCOME_CONVERGED
+    assert await _wiring_rows() == []
+    assert await _ledger(rid) is None
+
+
+@pytest.mark.asyncio
+async def test_patch_remove_5xx_raises_for_retry():
+    """A cabling 5xx raises so the best-effort wrapper's retry loop (and the sweep's
+    next tick) can see it; nothing is staged."""
+    rid = uuid.uuid4()
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(return_value=_fork_resp(503, text="upstream down")),
+    ):
+        with pytest.raises(RuntimeError):
+            await _prune_removed_devices_from_fork(rid, [uuid.uuid4()])
 
     assert await _wiring_rows() == []
 
 
 @pytest.mark.asyncio
-async def test_patch_remove_stale_recorded_wire_still_saves():
-    """A recorded fork wire for the removed device whose edge_key is NOT among the
-    remaining canvas edges (the loose-draft divergence case) still forces the save,
-    so the stale wire releases even though the canvas had nothing left to prune."""
+async def test_patch_remove_staging_failure_still_converges():
+    """A staging failure after a committed prune converges anyway: cabling's version
+    now outruns the ledger, so the sweep's delta-less heal covers it, and the marker
+    may clear (the prune itself landed)."""
     rid = uuid.uuid4()
-    dut_id = str(uuid.uuid4())
-    canvas = {"nodes": [], "edges": []}
-    connections = [
-        {
-            "device_a_id": dut_id,
-            "port_a": "eth0",
-            "device_b_id": str(uuid.uuid4()),
-            "port_b": "p1",
-            "layer": "L1",
-            "edge_key": "e-gone",
-        }
-    ]
-    save_body = {"version_number": 3, "released": [_wire()], "built": []}
-    calls = []
-
-    async def fork_call(method, path, json_body=None):
-        calls.append(method)
-        if method == "GET":
-            return _fork_resp(200, _fork_body(canvas, connections))
-        return _fork_resp(200, save_body)
-
-    with patch(
-        "app.services.reservation_service._cabling_fork_call",
-        new=AsyncMock(side_effect=fork_call),
-    ):
-        await _prune_removed_devices_from_fork(rid, [uuid.UUID(dut_id)], "system")
-
-    assert calls == ["GET", "POST"]
-    assert (await _ledger(rid)).last_staged_fork_version == 3
-
-
-@pytest.mark.asyncio
-async def test_patch_remove_through_hop_does_not_resave():
-    """A recorded wire touching the removed device whose edge_key belongs to a
-    REMAINING canvas edge is a through-hop serving another edge: it must not
-    re-trigger a save (the PATCH-retry idempotency guarantee)."""
-    rid = uuid.uuid4()
-    switch_id = str(uuid.uuid4())
-    a_id, b_id = str(uuid.uuid4()), str(uuid.uuid4())
-    canvas = {
-        "nodes": [
-            {"id": "nA", "data": {"device": {"id": a_id}}},
-            {"id": "nB", "data": {"device": {"id": b_id}}},
-        ],
-        "edges": [{"id": "e1", "source": "nA", "target": "nB", "data": {"layer": "L1"}}],
+    prune_body = {
+        "fork_id": str(uuid.uuid4()),
+        "version_number": 2,
+        "changed": True,
+        "released": [_wire()],
     }
-    connections = [
-        {
-            "device_a_id": a_id,
-            "port_a": "eth0",
-            "device_b_id": switch_id,
-            "port_b": "p1",
-            "layer": "L1",
-            "edge_key": "e1",
-        },
-        {
-            "device_a_id": switch_id,
-            "port_a": "p2",
-            "device_b_id": b_id,
-            "port_b": "eth0",
-            "layer": "L1",
-            "edge_key": "e1",
-        },
-    ]
-    calls = []
 
-    async def fork_call(method, path, json_body=None):
-        calls.append(method)
-        return _fork_resp(200, _fork_body(canvas, connections))
-
-    with patch(
-        "app.services.reservation_service._cabling_fork_call",
-        new=AsyncMock(side_effect=fork_call),
+    with (
+        patch(
+            "app.services.reservation_service._cabling_fork_call",
+            new=AsyncMock(return_value=_fork_resp(200, prune_body)),
+        ),
+        patch.object(
+            reservation_service,
+            "stage_wiring_changed",
+            new=AsyncMock(side_effect=RuntimeError("stage boom")),
+        ),
     ):
-        await _prune_removed_devices_from_fork(rid, [uuid.UUID(switch_id)], "system")
+        outcome = await _prune_removed_devices_from_fork(rid, [uuid.uuid4()])
 
-    assert calls == ["GET"], "a through-hop for a remaining edge must not force a save"
+    assert outcome == _PRUNE_OUTCOME_CONVERGED
     assert await _wiring_rows() == []

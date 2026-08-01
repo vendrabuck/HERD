@@ -37,11 +37,13 @@ from app.schemas.fork import (
     ForkCreate,
     ForkCreateResponse,
     ForkDetailResponse,
+    ForkPruneRequest,
+    ForkPruneResponse,
     ForkSaveRequest,
     ForkSaveResponse,
     ForkVersionSummary,
 )
-from app.services.fork_save_service import save_fork
+from app.services.fork_save_service import prune_fork_devices, save_fork
 from app.services.fork_service import create_fork
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
@@ -309,6 +311,51 @@ async def save_fork_internal(
             for spec in result.built
         ],
         unchanged_count=result.unchanged_count,
+    )
+
+
+@router.post("/{reservation_id}/prune-devices", response_model=ForkPruneResponse)
+async def prune_fork_devices_internal(
+    reservation_id: uuid.UUID,
+    body: ForkPruneRequest,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Release removed devices' wiring from the fork's saved intended set (issue #459).
+
+    The device-set PATCH's REMOVE half (ADR 0009 Decision 6): reservations calls this
+    when devices leave an ACTIVE reservation. Unlike the save endpoint this never
+    reads the draft canvas as wiring intent: the release is computed from
+    fork_connections plus the last SAVED canvas, the draft is only scrubbed of the
+    removed devices (all other draft edits survive un-built), and the appended
+    version snapshots the pruned SAVED canvas, never the draft. A pure release builds
+    nothing, so no port-claim 409 is possible (issue #462); the only 409 is an
+    ARCHIVED fork, whose release the terminal teardown owns. Idempotent: a replay
+    releases nothing and reports changed false with no version appended.
+    """
+    _check_internal_token(x_internal_token)
+    fork = await _load_fork(db, reservation_id)
+    if fork.status == ForkStatus_ARCHIVED:
+        raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
+
+    result = await prune_fork_devices(db, fork, body.device_ids)
+
+    return ForkPruneResponse(
+        fork_id=result.fork_id,
+        version_number=result.version_number,
+        changed=result.changed,
+        released=[
+            ForkConnectionDelta(
+                device_a_id=spec.device_a_id,
+                port_a=spec.port_a,
+                device_b_id=spec.device_b_id,
+                port_b=spec.port_b,
+                layer=spec.layer,
+                physical_connection_id=spec.physical_connection_id,
+                edge_key=spec.edge_key,
+            )
+            for spec in result.released
+        ],
     )
 
 
