@@ -437,8 +437,9 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
     l2_port_assignments membership rows (written by the fork-driven reconcile,
     phase 7) and drives remove_from_vlan per port, then frees the
     vlan_assignments allocation IN THE DATABASE (the phase-4 allocation lifecycle
-    coupling), so no delete_vlan driver call fires. The observable release is the
-    remove_from_vlan run carrying the STORED VLAN id."""
+    coupling). As of issue #442 the last-free also undefines the VLAN on the
+    switch: the observable release is the remove_from_vlan run carrying the
+    STORED VLAN id, followed by a delete_vlan run with the same id."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_switch(
         admin_client, teardown_templates["mock_l2"]["id"], f"failed-l2-sw-{suffix}"
@@ -467,8 +468,8 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
         )
 
         # Phase 2: fail the provisioned reservation; the ledger-driven teardown removes the
-        # stored membership (remove_from_vlan with the stored VLAN id) and frees the
-        # allocation in the DB. No delete_vlan driver call fires (phase-6 semantics).
+        # stored membership (remove_from_vlan with the stored VLAN id), frees the
+        # allocation in the DB, and undefines the VLAN via delete_vlan (issue #442).
         await _publish_event("reservation.failed", provisioned_res_id, [fresh_device["id"]])
         remove_runs = await _poll_runs(admin_client, provisioned_res_id, "remove_from_vlan")
         assert remove_runs, "reservation.failed did not remove the stored VLAN membership"
@@ -477,10 +478,14 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
         assert torn_down_vlans == {provisioned_vlan}, (
             "teardown must drive the stored VLAN id, not a re-derived one"
         )
-        # The allocation is released in the database, not via a delete_vlan driver op.
-        assert await _runs(admin_client, provisioned_res_id, "delete_vlan", "SUCCESS") == [], (
-            "phase-6 ledger teardown frees the allocation in-DB, never calls delete_vlan"
+        # Undefine on last-free (issue #442): the freed allocation drives delete_vlan
+        # with the same stored VLAN id, on the same switch.
+        delete_runs = await _poll_runs(admin_client, provisioned_res_id, "delete_vlan")
+        assert delete_runs, (
+            "no SUCCESS delete_vlan run after teardown: issue #442 undefines on last-free"
         )
+        assert {_method_kwargs(r)["vlan_id"] for r in delete_runs} == {provisioned_vlan}
+        assert str(delete_runs[0]["device_id"]) == switch["id"]
     finally:
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")

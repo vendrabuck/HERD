@@ -500,9 +500,14 @@ class Driver:
         ...
 
     def create_vlan(self, vlan_id: int) -> dict:
-        """Create a VLAN on the switch.
+        """Define a VLAN on the switch.
 
-        Called once per switch before adding ports to the VLAN.
+        Called once per switch in the reservation's definition scope, before the
+        first add_to_vlan on that switch (issue #442, define on allocation).
+
+        MUST be idempotent: defining a VLAN that already exists on the switch is
+        a SUCCESS, not an error. HERD relies on this to converge under event
+        redelivery, retries, and VLAN-number reuse after a skipped cleanup.
 
         Args:
             vlan_id: VLAN ID (range 2-4094)
@@ -542,9 +547,14 @@ class Driver:
         ...
 
     def delete_vlan(self, vlan_id: int) -> dict:
-        """Delete a VLAN from the switch.
+        """Delete a VLAN definition from the switch.
 
-        Called once per switch after removing all ports from the VLAN.
+        Called once per switch the VLAN was defined on, after the reservation's
+        last port membership in that VLAN has been released (issue #442, undefine
+        on last-free). Deleting a VLAN that does not exist should also succeed
+        (the idempotency mirror of create_vlan); a failure here is logged and
+        tolerated by HERD (the definition lingers until an operator cleans it),
+        never retried against a VLAN number another reservation has since taken.
 
         Args:
             vlan_id: VLAN ID to delete
@@ -565,25 +575,35 @@ class Driver:
 
 ### When methods are called
 
+All L2 wiring is fork-driven (ADR 0009): activation, fork saves, retries, and terminal
+teardown all reconcile VLAN membership from the reservation's recorded wiring, and the
+VLAN definition lifecycle is coupled to the per-fabric allocation (issue #442, decided
+2026-08-01).
+
 | Event | Sequence |
 |---|---|
-| Reservation created (DUTs connected through L2 switch) | login(), create_vlan(vlan_id), add_to_vlan(port, vlan_id, tag) for each port, logout() |
-| Reservation cancelled or completed | login(), remove_from_vlan(port, vlan_id) for each port, delete_vlan(vlan_id), logout() |
-| Reservation failed | same as cancelled, but driven strictly from the stored VLAN assignment; a switch that never got create_vlan is not contacted |
+| VLAN definition (a fabric allocation's first built membership, or a scope growth) | login(), create_vlan(vlan_id), logout(), once per switch in the definition scope, before the first add_to_vlan on that switch |
+| Membership reconcile (activation, fork save, heal, retry) | login(), remove_from_vlan(port, vlan_id) for each departed port, add_to_vlan(port, vlan_id, tag) for each joined port, logout() |
+| Reservation ended (cancelled, completed, failed) | membership removes as above, driven strictly from the stored ledger; then login(), delete_vlan(vlan_id), logout() per switch the VLAN was defined on (skipped when the number was re-allocated on the fabric) |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
-Unlike L1 operations (which pair two ports), L2 operations are per-port: each DUT port
-connected to an L2 switch yields one add_to_vlan or remove_from_vlan call.
+The definition scope is transit-inclusive: it covers every L2 switch the reservation's
+recorded wiring touches, including switches crossed only by inter-switch trunk hops,
+which carry the VLAN but hold no port membership in it. A create_vlan failure fails the
+dependent membership builds on that switch (parked as FAILED wiring rows, retryable); a
+delete_vlan failure is logged and tolerated.
 
-When multiple DUT ports go through the same L2 switch in a single reservation, the
-execution service batches them: one login/logout wrapping one create_vlan/delete_vlan
-and all per-port add/remove calls.
+Unlike L1 operations (which pair two ports), L2 membership operations are per-port: each
+DUT port connected to an L2 switch yields one add_to_vlan or remove_from_vlan call.
+Membership calls to the same switch share one login/logout session; each definition call
+runs in its own session.
 
 ### VLAN ID derivation
 
-The execution service derives the VLAN ID deterministically from the reservation UUID:
-`int(uuid.UUID(reservation_id).int % 4093) + 2`, producing values in the range 2-4094
-(avoiding VLAN 1). Collisions are possible but acceptable for the current design.
+The execution service allocates a conflict-free VLAN ID per L2 fabric: the ID derived
+from the reservation UUID (`int(uuid.UUID(reservation_id).int % 4093) + 2`, range
+2-4094, avoiding VLAN 1) is preferred, and the lowest free ID in the fabric is used when
+the preferred one is taken. No two active reservations in one fabric share a VLAN ID.
 
 ### Port identity
 
