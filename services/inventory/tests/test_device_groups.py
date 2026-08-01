@@ -604,6 +604,91 @@ async def test_visible_devices_requires_auth():
     assert resp.status_code in (401, 403)
 
 
+# --- Issue #465: visible-devices is self-or-admin ---
+
+
+@pytest.mark.asyncio
+@patch(
+    "app.routers.device_groups._fetch_user_group_ids",
+    new_callable=AsyncMock,
+)
+async def test_visible_devices_foreign_user_forbidden_for_user_role(mock_fetch, user_client):
+    """A non-admin querying another user's user_id gets 403 with a pinned
+    detail, and the guard fires before any group lookup reaches auth."""
+    mock_fetch.return_value = []
+    resp = await user_client.get(f"/device-groups/visible-devices?user_id={uuid.uuid4()}")
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Cannot query visible devices for another user"
+    mock_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch(
+    "app.routers.device_groups._fetch_user_group_ids",
+    new_callable=AsyncMock,
+)
+async def test_visible_devices_self_lookup_allowed_for_user_role(mock_fetch, user_client):
+    """A non-admin querying its OWN user_id still gets the full 200 device
+    list. Reservations' _fetch_visible_device_ids always passes the caller's
+    own sub, so this path must never 403 or the visibility filter would
+    silently disappear via its fail-open non-200 handling."""
+    ug_id = uuid.uuid4()
+    mock_fetch.return_value = [ug_id]
+
+    # Stage the data through admin-only endpoints, then restore the user identity.
+    app.dependency_overrides[get_current_user_payload] = override_auth_admin
+    template = await _create_template(user_client, "VisSelfTpl")
+    dev = await _create_device(user_client, template["id"], "vis-self-dev1")
+    group = await _create_device_group(user_client, "VisSelfGroup")
+    await user_client.post(
+        f"/device-groups/{group['id']}/devices/bulk",
+        json={"device_ids": [dev["id"]]},
+    )
+    await user_client.post(
+        f"/device-groups/{group['id']}/permissions/bulk",
+        json={"user_group_ids": [str(ug_id)]},
+    )
+    app.dependency_overrides[get_current_user_payload] = override_auth_user
+
+    resp = await user_client.get(f"/device-groups/visible-devices?user_id={USER_UUID}")
+    assert resp.status_code == 200
+    assert dev["id"] in resp.json()["device_ids"]
+
+
+@pytest.mark.asyncio
+@patch(
+    "app.routers.device_groups._fetch_user_group_ids",
+    new_callable=AsyncMock,
+)
+async def test_visible_devices_admin_foreign_user_allowed(mock_fetch, client):
+    """Admin introspection of any user's visible set is not regressed."""
+    mock_fetch.return_value = []
+    resp = await client.get(f"/device-groups/visible-devices?user_id={uuid.uuid4()}")
+    assert resp.status_code == 200
+    assert resp.json()["device_ids"] == []
+
+
+@pytest.mark.asyncio
+@patch(
+    "app.routers.device_groups._fetch_user_group_ids",
+    new_callable=AsyncMock,
+)
+async def test_visible_devices_superadmin_foreign_user_allowed(mock_fetch):
+    """Superadmin introspection of any user's visible set is not regressed."""
+    mock_fetch.return_value = []
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user_payload] = lambda: {
+        "sub": str(uuid.uuid4()),
+        "username": "testsuper",
+        "role": "superadmin",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        resp = await ac.get(f"/device-groups/visible-devices?user_id={uuid.uuid4()}")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json()["device_ids"] == []
+
+
 # --- Auth-service upstream failure tests ---
 
 

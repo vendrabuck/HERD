@@ -3,6 +3,7 @@ import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.auth import ADMIN_ROLES
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -140,14 +141,34 @@ async def list_device_groups_endpoint(
     )
 
 
+def _authorize_subject(payload: dict, target_user_id: uuid.UUID) -> None:
+    """Enforce that a visibility query is for the caller's own identity.
+
+    /visible-devices answers "which devices can this user see", which is
+    self-service. Without this guard any authenticated user could pass an
+    arbitrary user_id and enumerate another user's device entitlements
+    (issue #465, the same IDOR class as acl issue #128 and the same shape
+    as acl's _authorize_subject). Admins and superadmins may introspect
+    any user. Raises 403 otherwise.
+    """
+    if payload.get("role") in ADMIN_ROLES:
+        return
+    if str(target_user_id) != payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot query visible devices for another user",
+        )
+
+
 @router.get("/visible-devices")
 async def get_visible_devices_endpoint(
     user_id: uuid.UUID = Query(...),
     authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
-    _: dict = Depends(get_current_user_payload),
+    payload: dict = Depends(get_current_user_payload),
 ):
     """Get visible device IDs for a user by resolving their group memberships."""
+    _authorize_subject(payload, user_id)
     user_group_ids = await _fetch_user_group_ids(user_id, authorization)
     visible = await get_visible_device_ids(db, user_group_ids)
     return {"device_ids": [str(d) for d in visible]}

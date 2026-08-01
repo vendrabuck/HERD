@@ -547,6 +547,11 @@ Authorization: Bearer <any-authenticated-token>
 Resolves the user's group memberships via the auth service, then returns all device
 IDs accessible through device group permissions.
 
+This endpoint is self-service: a non-admin caller may only query its own `user_id`.
+A request whose `user_id` does not match the caller's token returns 403. Admins and
+superadmins may introspect any user's visible devices. This is the same rule the
+acl permission-query endpoints enforce.
+
 ### Default "No Pool" group
 
 A device group named "No Pool" is automatically created on inventory service startup.
@@ -1326,7 +1331,7 @@ Authorization: Bearer <admin-token>
 | `/api/inventory/device-groups/{id}/devices/bulk-remove` | POST | | yes | yes |
 | `/api/inventory/device-groups/{id}/permissions/bulk` | POST | | yes | yes |
 | `/api/inventory/device-groups/{id}/permissions/bulk-remove` | POST | | yes | yes |
-| `/api/inventory/device-groups/visible-devices` | GET | yes | yes | yes |
+| `/api/inventory/device-groups/visible-devices` | GET | yes (own `user_id` only) | yes | yes |
 | `/api/reservations/` | POST | yes | yes | yes |
 | `/api/reservations/` | GET | yes (own only) | own, or all with `all=true` | own, or all with `all=true` |
 | `/api/reservations/calendar` | GET | yes | yes | yes |
