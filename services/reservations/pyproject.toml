@@ -1,6 +1,6 @@
 [project]
 name = "herd-reservations"
-version = "0.2.0"
+version = "0.3.0.dev0"
 description = "HERD Reservations Service"
 requires-python = ">=3.12"
 dependencies = [
