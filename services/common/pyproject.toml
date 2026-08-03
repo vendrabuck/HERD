@@ -1,6 +1,6 @@
 [project]
 name = "herd-common"
-version = "0.2.0.dev0"
+version = "0.2.0"
 description = "Shared utilities for HERD services"
 requires-python = ">=3.12"
 dependencies = [
