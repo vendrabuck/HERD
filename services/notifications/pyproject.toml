@@ -1,6 +1,6 @@
 [project]
 name = "herd-notifications"
-version = "0.2.0.dev0"
+version = "0.2.0"
 description = "HERD Notifications Service"
 requires-python = ">=3.12"
 dependencies = [
