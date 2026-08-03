@@ -1,6 +1,6 @@
 [project]
 name = "herd-inventory"
-version = "0.2.0"
+version = "0.3.0.dev0"
 description = "HERD Inventory Service"
 requires-python = ">=3.12"
 dependencies = [

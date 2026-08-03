@@ -1,6 +1,6 @@
 [project]
 name = "herd-integration"
-version = "0.2.0"
+version = "0.3.0.dev0"
 description = "HERD Integration Service (versioned v1 external API facade)"
 requires-python = ">=3.12"
 dependencies = [
