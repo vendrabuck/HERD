@@ -325,4 +325,54 @@ describe("HypervisorsPage", () => {
       ),
     );
   });
+
+  // Issue #456 orphan rendering: a deleted secret leaves a dangling
+  // secret_id; the page must say so explicitly rather than show a bare
+  // truncated id (list) or an empty dropdown (edit form).
+
+  const ORPHANED = {
+    ...SAMPLE_HYPERVISORS[0],
+    id: "h3",
+    name: "Orphaned HV",
+    secret_id: "deadbeef-0000-4000-8000-000000000000",
+  };
+
+  it("list labels an orphaned secret reference explicitly", () => {
+    mockUsePaginatedHypervisors.mockReturnValue({
+      data: { items: [ORPHANED], total: 1 },
+      isLoading: false,
+    });
+    render(<HypervisorsPage />);
+    expect(screen.getByText("Deleted secret deadbeef")).toBeInTheDocument();
+  });
+
+  it("list keeps the neutral truncated id while secrets are still loading", () => {
+    mockUsePaginatedHypervisors.mockReturnValue({
+      data: { items: [ORPHANED], total: 1 },
+      isLoading: false,
+    });
+    mockUseSecrets.mockReturnValue({ data: undefined });
+    render(<HypervisorsPage />);
+    expect(screen.getByText("deadbeef...")).toBeInTheDocument();
+    expect(screen.queryByText(/Deleted secret/)).not.toBeInTheDocument();
+  });
+
+  it("edit form selects the orphaned option and warns", () => {
+    mockUsePaginatedHypervisors.mockReturnValue({
+      data: { items: [ORPHANED], total: 1 },
+      isLoading: false,
+    });
+    render(<HypervisorsPage />);
+    fireEvent.click(screen.getAllByText("Edit")[0]);
+    const select = screen.getByLabelText("Secret") as HTMLSelectElement;
+    expect(select.value).toBe("deadbeef-0000-4000-8000-000000000000");
+    expect(
+      screen.getByText(/references a secret that no longer exists/),
+    ).toBeInTheDocument();
+    // Selecting a live secret clears the warning.
+    fireEvent.change(select, { target: { value: "s1" } });
+    expect(
+      screen.queryByText(/references a secret that no longer exists/),
+    ).not.toBeInTheDocument();
+  });
 });

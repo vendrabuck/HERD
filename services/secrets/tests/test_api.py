@@ -17,6 +17,7 @@ from app.database import Base, get_db
 from app.main import app
 from app.models import Secret
 from app.services.keyring import bootstrap_keyring
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -58,6 +59,20 @@ async def client():
         yield c
     app.dependency_overrides.clear()
     await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _no_secret_references(monkeypatch):
+    """Default the issue #456 delete guard to "no referencing hypervisors".
+
+    Unit tests run with no inventory service; tests that exercise the guard's
+    409/503 behavior override this with their own monkeypatch.
+    """
+
+    async def _none(secret_id):
+        return []
+
+    monkeypatch.setattr(routers.secrets, "find_hypervisors_referencing_secret", _none)
 
 
 def _patch_grants(monkeypatch, *, view: bool = False, manage: bool = False):
@@ -205,6 +220,51 @@ async def test_delete_then_404(client):
     assert resp.status_code == 204
     resp = await client.get(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
     assert resp.status_code == 404
+
+
+async def test_delete_refused_while_hypervisor_references_secret(client, monkeypatch):
+    """Issue #456: the delete 409s, naming the referencing hypervisors."""
+    body = await _create(client, name="hv-cred-in-use")
+    hv_id = str(uuid.uuid4())
+    seen: list[uuid.UUID] = []
+
+    async def _referencing(secret_id):
+        seen.append(secret_id)
+        return [{"id": hv_id, "name": "Proxmox A"}]
+
+    monkeypatch.setattr(routers.secrets, "find_hypervisors_referencing_secret", _referencing)
+    resp = await client.delete(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "secret_in_use",
+        "hypervisor_ids": [hv_id],
+        "hypervisor_names": ["Proxmox A"],
+    }
+    assert seen == [uuid.UUID(body["id"])]
+    # The refused delete left the secret intact.
+    resp = await client.get(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
+    assert resp.status_code == 200
+
+
+async def test_delete_fails_closed_when_inventory_unreachable(client, monkeypatch):
+    """Issue #456: an unverifiable reference check blocks the delete (503)."""
+    body = await _create(client, name="hv-cred-unverifiable")
+
+    async def _unreachable(secret_id):
+        raise HTTPException(
+            status_code=503,
+            detail="inventory service unreachable while checking secret references",
+        )
+
+    monkeypatch.setattr(routers.secrets, "find_hypervisors_referencing_secret", _unreachable)
+    resp = await client.delete(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == (
+        "inventory service unreachable while checking secret references"
+    )
+    # Fail-closed means blocked, not deleted.
+    resp = await client.get(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
+    assert resp.status_code == 200
 
 
 async def test_rotate_endpoint(client):

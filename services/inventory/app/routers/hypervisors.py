@@ -13,6 +13,7 @@ from app.schemas.hypervisor import (
     HypervisorCreate,
     HypervisorInternalResponse,
     HypervisorResponse,
+    HypervisorSecretRefResponse,
     HypervisorUpdate,
     PaginatedHypervisorResponse,
 )
@@ -21,6 +22,7 @@ from app.services.hypervisor_service import (
     delete_hypervisor,
     get_hypervisor,
     list_hypervisors,
+    list_hypervisors_by_secret,
     update_hypervisor,
 )
 
@@ -83,6 +85,27 @@ async def get_hypervisor_internal(
     if not hypervisor:
         raise HTTPException(status_code=404, detail="Hypervisor not found")
     return HypervisorInternalResponse.model_validate(hypervisor)
+
+
+@router.get(
+    "/hypervisors/by-secret/{secret_id}/internal",
+    response_model=list[HypervisorSecretRefResponse],
+)
+async def get_hypervisors_by_secret_internal(
+    secret_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Hypervisors referencing this secret. Internal token only.
+
+    Issue #456: backs the secrets service's delete guard, the reverse of
+    validate_secret_exists at registration. An unknown secret_id is not an
+    error here; it simply references nothing and returns [].
+    """
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    hypervisors = await list_hypervisors_by_secret(db, secret_id)
+    return [HypervisorSecretRefResponse.model_validate(h) for h in hypervisors]
 
 
 @router.get("/hypervisors/{hypervisor_id}", response_model=HypervisorResponse)

@@ -106,7 +106,7 @@ Read by services that need to call other services. The defaults assume the compo
 | Variable | Default | Read by |
 |---|---|---|
 | `AUTH_SERVICE_URL` | `http://auth:8000` | inventory, acl (forward user JWT to resolve groups) |
-| `INVENTORY_SERVICE_URL` | `http://inventory:8000` | reservations, execution, ai-orchestrator, cabling (device-group boundary check) |
+| `INVENTORY_SERVICE_URL` | `http://inventory:8000` | reservations, execution, ai-orchestrator, cabling (device-group boundary check), secrets (delete-time hypervisor reference guard, issue #456) |
 | `CABLING_SERVICE_URL` | `http://cabling:8000` | execution, ai-orchestrator, reservations (connectivity validation via `/validate/internal`) |
 | `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | ai-orchestrator, inventory (apply scheduler checks reservation activity via `/internal/{id}`), execution (dynamic-resources provision-result callback, `/internal/{id}/provision-result`, ADR 0004) |
 | `EXECUTION_SERVICE_URL` | `http://execution:8000` | ai-orchestrator, inventory (apply scheduler dispatches configure runs) |

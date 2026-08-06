@@ -293,3 +293,53 @@ async def test_internal_get_hypervisor_not_found(client):
         f"/hypervisors/{uuid.uuid4()}/internal", headers={"X-Internal-Token": "test-token"}
     )
     assert resp.status_code == 404
+
+
+# --- by-secret reverse lookup (issue #456) -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_by_secret_internal_lists_referencing_hypervisors(client):
+    """The lookup returns exactly the referencing hypervisors, name-ordered."""
+    secret_id = str(uuid.uuid4())
+    with _secret_ok():
+        r1 = await client.post(
+            "/hypervisors", json=_hypervisor_payload(name="B HV", secret_id=secret_id)
+        )
+        r2 = await client.post(
+            "/hypervisors", json=_hypervisor_payload(name="A HV", secret_id=secret_id)
+        )
+        r3 = await client.post("/hypervisors", json=_hypervisor_payload(name="Other HV"))
+    assert r1.status_code == 201 and r2.status_code == 201 and r3.status_code == 201
+
+    resp = await client.get(
+        f"/hypervisors/by-secret/{secret_id}/internal",
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 200
+    items = resp.json()
+    assert [i["name"] for i in items] == ["A HV", "B HV"]
+    assert {i["id"] for i in items} == {r1.json()["id"], r2.json()["id"]}
+    # The pinned minimal pair: the secrets guard needs nothing else.
+    assert all(set(i.keys()) == {"id", "name"} for i in items)
+
+
+@pytest.mark.asyncio
+async def test_by_secret_internal_unknown_secret_returns_empty(client):
+    """An unreferenced (or nonexistent) secret is not an error: 200 []."""
+    resp = await client.get(
+        f"/hypervisors/by-secret/{uuid.uuid4()}/internal",
+        headers={"X-Internal-Token": "test-token"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_by_secret_internal_bad_token_403(client):
+    resp = await client.get(
+        f"/hypervisors/by-secret/{uuid.uuid4()}/internal",
+        headers={"X-Internal-Token": "wrong"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Invalid internal token"

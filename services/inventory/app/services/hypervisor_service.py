@@ -63,6 +63,18 @@ async def list_hypervisors(
     return list(result.scalars().all()), total
 
 
+async def list_hypervisors_by_secret(db: AsyncSession, secret_id: uuid.UUID) -> list[Hypervisor]:
+    """Hypervisors whose secret_id references the given secret (issue #456).
+
+    Backs the secrets service's delete guard; the full row set is small
+    (hypervisors are registered by hand), so no pagination.
+    """
+    result = await db.execute(
+        select(Hypervisor).where(Hypervisor.secret_id == secret_id).order_by(Hypervisor.name)
+    )
+    return list(result.scalars().all())
+
+
 async def get_hypervisor(db: AsyncSession, hypervisor_id: uuid.UUID) -> Hypervisor | None:
     result = await db.execute(select(Hypervisor).where(Hypervisor.id == hypervisor_id))
     return result.scalar_one_or_none()

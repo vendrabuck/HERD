@@ -8,6 +8,8 @@ class Settings(HerdBaseSettings):
     algorithm: str = "HS256"
     cors_origins: str = ""
     acl_service_url: str = "http://acl:8000"
+    # Issue #456: the delete-time reference guard's reverse lookup.
+    inventory_service_url: str = "http://inventory:8000"
     internal_api_token: str = ""
 
     # Key-encryption key (issue #39): base64-encoded 32 bytes. There is

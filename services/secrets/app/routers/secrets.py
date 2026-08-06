@@ -33,6 +33,7 @@ from app.schemas.secret import (
     SecretValueResponse,
 )
 from app.services import crypto
+from app.services.inventory_guard import find_hypervisors_referencing_secret
 from app.services.keyring import deserialize_data, rotate_dek, serialize_data
 
 logger = logging.getLogger(__name__)
@@ -229,9 +230,27 @@ async def delete_secret(
     _payload: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """Delete a secret. Admin or superadmin only.
+
+    Issue #456: refused with 409 while any hypervisor still references the
+    secret (inventory reverse lookup, fail-closed 503 when inventory is
+    unreachable, no force flag; see inventory_guard's module docstring). The
+    409 names the referencing hypervisors so the fix is actionable: re-point
+    or delete them first.
+    """
     secret = await db.get(Secret, secret_id)
     if secret is None:
         raise HTTPException(status_code=404, detail="Secret not found")
+    referencing = await find_hypervisors_referencing_secret(secret_id)
+    if referencing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "secret_in_use",
+                "hypervisor_ids": [str(h.get("id")) for h in referencing],
+                "hypervisor_names": [str(h.get("name")) for h in referencing],
+            },
+        )
     await db.delete(secret)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

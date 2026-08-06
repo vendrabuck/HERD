@@ -209,6 +209,10 @@
       "/hypervisors"
     ],
     [
+      "GET",
+      "/hypervisors/by-secret/{secret_id}/internal"
+    ],
+    [
       "DELETE",
       "/hypervisors/{hypervisor_id}"
     ],
@@ -838,6 +842,17 @@
         "name",
         "secret_id",
         "updated_at"
+      ],
+      "type": "object"
+    },
+    "HypervisorSecretRefResponse": {
+      "properties": {
+        "id": "string",
+        "name": "string"
+      },
+      "required": [
+        "id",
+        "name"
       ],
       "type": "object"
     },

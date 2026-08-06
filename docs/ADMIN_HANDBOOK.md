@@ -209,7 +209,7 @@ Admins manage named secrets in the secrets service; values are encrypted at rest
 
 - `POST /api/secrets/secrets` creates a secret: `{name, type, description, data: {key: value, ...}}`. The response carries metadata only; plaintext is never echoed on create, list, or get.
 - `GET /api/secrets/secrets/{id}/value` reveals the plaintext. Non-admin reveal requires a `manage` grant on the secret (`view` sees metadata only, and gets 403 on reveal).
-- `PUT /api/secrets/secrets/{id}` replaces the payload (re-encrypted wholesale); `DELETE` removes it.
+- `PUT /api/secrets/secrets/{id}` replaces the payload (re-encrypted wholesale); `DELETE` removes it, refused with 409 (naming the blockers) while any hypervisor still references the secret: delete or re-point the hypervisor first. The check fails closed with 503 if inventory is unreachable.
 - `POST /api/secrets/keys/rotate` (admin) introduces a new encryption-key version and re-encrypts every secret.
 - `SECRETS_KEK` in `.env` is the key-encryption key; the service refuses to boot without it. See `docs/ENV_VARS.md` for generation and the `SECRETS_KEK_PREVIOUS` rotation flow.
 
