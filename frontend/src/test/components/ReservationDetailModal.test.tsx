@@ -194,6 +194,47 @@ describe("ReservationDetailModal", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalled());
   });
 
+  it("renders no dynamic instances section when the field is absent", () => {
+    renderModal();
+    expect(screen.queryByText(/Dynamic instances/)).not.toBeInTheDocument();
+  });
+
+  it("renders no dynamic instances section when the array is empty", () => {
+    renderModal({ dynamic_requests: [] });
+    expect(screen.queryByText(/Dynamic instances/)).not.toBeInTheDocument();
+  });
+
+  it("renders dynamic requests grouped by template with resolved names (issue #473)", async () => {
+    // The modal resolves template ids through GET /inventory/templates
+    // (template_type=dynamic). tpl-vm resolves to a name; tpl-db is absent from
+    // the response, so its row falls back to the truncated id.
+    server.use(
+      http.get("/api/inventory/templates", () =>
+        HttpResponse.json({
+          items: [{ id: "tpl-vm-11111111", name: "ubuntu-vm" }],
+          total: 1,
+          skip: 0,
+          limit: 500,
+        }),
+      ),
+    );
+    renderModal({
+      dynamic_requests: [
+        { id: "dr-1", template_id: "tpl-vm-11111111" },
+        { id: "dr-2", template_id: "tpl-vm-11111111" },
+        { id: "dr-3", template_id: "tpl-db-22222222" },
+      ],
+    });
+
+    // Three booked instances across two templates.
+    expect(screen.getByText("Dynamic instances (3)")).toBeInTheDocument();
+    expect(await screen.findByText("ubuntu-vm")).toBeInTheDocument();
+    expect(screen.getByText("x2")).toBeInTheDocument();
+    // Unresolvable template id renders truncated.
+    expect(screen.getByText("tpl-db-2")).toBeInTheDocument();
+    expect(screen.getByText("x1")).toBeInTheDocument();
+  });
+
   it("releases the reservation and closes on success", async () => {
     let released = false;
     server.use(

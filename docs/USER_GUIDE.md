@@ -71,6 +71,16 @@ Transitions the system runs automatically:
 
 The device's template decides which category it falls in. If a reservation is rejected for conflicts, the response tells you which specific exclusive devices are already booked.
 
+### Dynamic (hypervisor-backed) resources
+
+Some resources do not exist until you book them: virtual machines or containers that a hypervisor creates for your reservation and destroys when it ends. Admins publish these as **dynamic templates**, and you book them from the same Create Reservation modal:
+
+1. In the **Dynamic instances** block, click **Add dynamic instance**, pick a dynamic template, and set a count. A reservation can mix devices and dynamic instances, or be dynamic-only (no devices at all). If the block says "No dynamic templates available", none have been published yet.
+2. Submit. The reservation stays in `PENDING_PROVISION` while the hypervisor creates the instances and only turns `ACTIVE` once they all exist. If creation fails after retries, the reservation lands in `FAILED` and any instances that were created are torn down.
+3. The detail modal's **Details** tab lists the booked dynamic instances by template and count.
+
+**For admins**, authoring has two parts: register the hypervisor (endpoint, type, credential secret) under **Admin > Hypervisors**, then create a template with type `dynamic` in the template editor and point it at both a `Hypervisor`-connection-type recipe driver and the registered hypervisor. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#templates) and [DRIVERS.md](DRIVERS.md) for the recipe package format.
+
 ### Reservation detail
 
 Click any reservation in the list to open the detail modal. Five tabs (plus an AI Assistant tab when the assistant is enabled):

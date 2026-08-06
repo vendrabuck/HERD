@@ -41,6 +41,11 @@ vi.mock("@/api/reservations", () => ({
 vi.mock("@/api/ai", () => ({
   useAIStatus: () => ({ data: { enabled: false } }),
 }));
+// The dynamic-request name lookup (issue #473) is exercised in
+// ReservationDetailModal.test.tsx; stub it here for the same no-QueryClient reason.
+vi.mock("@/api/templates", () => ({
+  useTemplates: () => ({ data: [] }),
+}));
 
 // The tab bodies and side modals are exercised in their own tests. Stub them so
 // this test isolates the header's "Edit topology" button gating.
