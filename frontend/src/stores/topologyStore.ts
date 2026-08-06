@@ -9,10 +9,10 @@ import {
   type Node,
   type NodeChange,
 } from "@xyflow/react";
-import type { CanvasData, DeviceNodeData, LayerEdgeData, EdgeLayerType } from "@/types/topology.types";
+import type { CanvasData, CanvasNodeData, LayerEdgeData, EdgeLayerType } from "@/types/topology.types";
 
 interface TopologyState {
-  nodes: Node<DeviceNodeData>[];
+  nodes: Node<CanvasNodeData>[];
   edges: Edge<LayerEdgeData>[];
   selectedEdgeLayer: EdgeLayerType;
 
@@ -20,7 +20,8 @@ interface TopologyState {
   onEdgesChange: (changes: EdgeChange[]) => void;
   onConnect: (connection: Connection) => void;
   addEnrichedEdge: (connection: Connection, data: LayerEdgeData) => void;
-  addDeviceNode: (node: Node<DeviceNodeData>) => void;
+  addDeviceNode: (node: Node<CanvasNodeData>) => void;
+  setDynamicPlaceholderCount: (nodeId: string, count: number) => void;
   setSelectedEdgeLayer: (layer: EdgeLayerType) => void;
   updateEdgePathStatus: (edgeId: string, pathValid: boolean | null, hopCount?: number) => void;
   clearTopology: () => void;
@@ -35,7 +36,7 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
   selectedEdgeLayer: "L2",
 
   onNodesChange: (changes) =>
-    set((state) => ({ nodes: applyNodeChanges(changes, state.nodes) as Node<DeviceNodeData>[] })),
+    set((state) => ({ nodes: applyNodeChanges(changes, state.nodes) as Node<CanvasNodeData>[] })),
 
   onEdgesChange: (changes) =>
     set((state) => ({ edges: applyEdgeChanges(changes, state.edges) as Edge<LayerEdgeData>[] })),
@@ -66,6 +67,15 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
 
   addDeviceNode: (node) =>
     set((state) => ({ nodes: [...state.nodes, node] })),
+
+  setDynamicPlaceholderCount: (nodeId, count) =>
+    set((state) => ({
+      nodes: state.nodes.map((n) =>
+        n.id === nodeId && n.type === "dynamicPlaceholderNode"
+          ? { ...n, data: { ...n.data, count } }
+          : n
+      ),
+    })),
 
   setSelectedEdgeLayer: (layer) => set({ selectedEdgeLayer: layer }),
 

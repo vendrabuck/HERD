@@ -48,13 +48,16 @@ import { Modal } from "@/components/ui/Modal";
 import { useCreateTemplateFromTopology } from "@/api/topologyTemplates";
 import apiClient from "@/api/client";
 import { DeviceNode } from "@/components/topology-editor/nodes/DeviceNode";
+import { DynamicPlaceholderNode } from "@/components/topology-editor/nodes/DynamicPlaceholderNode";
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
 import type { Device } from "@/types/device.types";
 import type { AIGenerateResponse } from "@/types/ai.types";
 import type { ForkConflictDetail } from "@/types/reservation.types";
 import type {
   CanvasData,
+  CanvasNodeData,
   DeviceNodeData,
+  DynamicPlaceholderNodeData,
   EdgeLayerType,
   LayerEdgeData,
   TopologyVersion,
@@ -69,8 +72,13 @@ interface PendingConnection {
   targetDeviceName: string;
 }
 
-const nodeTypes = { deviceNode: DeviceNode };
+const nodeTypes = { deviceNode: DeviceNode, dynamicPlaceholderNode: DynamicPlaceholderNode };
 const edgeTypes = { layerEdge: LayerEdge };
+
+// Placeholder nodes are canvas-local planning artifacts: no inventory device
+// id, no cabling, never persisted as devices or wiring.
+const isDynamicPlaceholder = (node: Node<CanvasNodeData>) =>
+  node.type === "dynamicPlaceholderNode";
 
 const LAYER_OPTIONS: EdgeLayerType[] = ["L1", "L2", "L3"];
 
@@ -260,16 +268,26 @@ function TopologyEditorInner() {
     }
   }, [isLiveEdit, fork, topology, loadCanvas, clearTopology]);
 
+  // Placeholders are excluded from every persistence path (parent topology
+  // save, fork save, fork autosave): they are not devices or wiring, only a
+  // reserve-time planning aid. Edges touching one are refused at draw time;
+  // the edge filter here is belt and braces.
+  const persistableCanvas = useMemo<CanvasData>(() => {
+    const placeholderIds = new Set(nodes.filter(isDynamicPlaceholder).map((n) => n.id));
+    if (placeholderIds.size === 0) return { nodes, edges, selectedEdgeLayer };
+    return {
+      nodes: nodes.filter((n) => !placeholderIds.has(n.id)),
+      edges: edges.filter((e) => !placeholderIds.has(e.source) && !placeholderIds.has(e.target)),
+      selectedEdgeLayer,
+    };
+  }, [nodes, edges, selectedEdgeLayer]);
+
   // Debounced fork-draft autosave: PUTs the loose canvas a couple of seconds
   // after edits pause and flushes on unmount. Enabled only for an editable
   // (non-archived) fork that has finished loading.
-  const liveCanvas = useMemo<CanvasData>(
-    () => ({ nodes, edges, selectedEdgeLayer }),
-    [nodes, edges, selectedEdgeLayer],
-  );
   const autosave = useForkAutosave({
     reservationId: isLiveEdit ? reservationId : null,
-    canvas: liveCanvas,
+    canvas: persistableCanvas,
     enabled: isLiveEdit && !isReadOnly && forkLoaded,
   });
 
@@ -282,7 +300,25 @@ function TopologyEditorInner() {
   }, [id, reservationId]);
 
   const allDeviceIds = useMemo(
-    () => [...new Set(nodes.map((n) => (n.data as DeviceNodeData).device.id))],
+    () =>
+      [
+        ...new Set(
+          nodes
+            .filter((n) => !isDynamicPlaceholder(n))
+            .map((n) => (n.data as DeviceNodeData).device.id)
+        ),
+      ],
+    [nodes]
+  );
+
+  // One entry per placeholder node: the reserve modal prefills its dynamic
+  // requests from these (count expands into repeated {template_id} items).
+  const dynamicPrefill = useMemo(
+    () =>
+      nodes.filter(isDynamicPlaceholder).map((n) => {
+        const data = n.data as DynamicPlaceholderNodeData;
+        return { templateId: data.templateId, count: data.count };
+      }),
     [nodes]
   );
 
@@ -292,6 +328,13 @@ function TopologyEditorInner() {
       const targetNode = nodes.find((n) => n.id === connection.target);
 
       if (!sourceNode || !targetNode) return false;
+
+      if (isDynamicPlaceholder(sourceNode) || isDynamicPlaceholder(targetNode)) {
+        toast.error("Dynamic placeholders have no ports until the reservation activates", {
+          id: "dynamic-placeholder",
+        });
+        return false;
+      }
 
       const sourceType = (sourceNode.data as DeviceNodeData).device.topology_type;
       const targetType = (targetNode.data as DeviceNodeData).device.topology_type;
@@ -312,6 +355,41 @@ function TopologyEditorInner() {
     (event: React.DragEvent) => {
       event.preventDefault();
       if (isReadOnly) return;
+
+      const dynamicJson = event.dataTransfer.getData("application/herd-dynamic-template");
+      if (dynamicJson) {
+        // Dynamic requests are fixed at reservation create time; a live
+        // reservation's fork cannot grow new instances.
+        if (isLiveEdit) {
+          toast.error("Dynamic instances are set when the reservation is created", {
+            id: "dynamic-live-edit",
+          });
+          return;
+        }
+        const template: { id: string; name: string; icon?: string | null } =
+          JSON.parse(dynamicJson);
+
+        // One placeholder per template; edit its count instead of stacking copies.
+        if (dynamicPrefill.some((entry) => entry.templateId === template.id)) return;
+
+        const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
+        const placeholder: Node<DynamicPlaceholderNodeData> = {
+          id:
+            self.crypto?.randomUUID?.() ??
+            `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+          type: "dynamicPlaceholderNode",
+          position,
+          data: {
+            templateId: template.id,
+            templateName: template.name,
+            templateIcon: template.icon ?? null,
+            count: 1,
+          },
+        };
+        addDeviceNode(placeholder);
+        return;
+      }
+
       const deviceJson = event.dataTransfer.getData("application/herd-device");
       if (!deviceJson) return;
 
@@ -338,7 +416,7 @@ function TopologyEditorInner() {
 
       addDeviceNode(newNode);
     },
-    [isReadOnly, addDeviceNode, screenToFlowPosition, allDeviceIds]
+    [isReadOnly, isLiveEdit, addDeviceNode, screenToFlowPosition, allDeviceIds, dynamicPrefill]
   );
 
   const onDragOver = useCallback((event: React.DragEvent) => {
@@ -352,6 +430,9 @@ function TopologyEditorInner() {
       const sourceNode = nodes.find((n) => n.id === connection.source);
       const targetNode = nodes.find((n) => n.id === connection.target);
       if (!sourceNode || !targetNode) return;
+      // isValidConnection already refuses these with a toast; guard again so a
+      // placeholder can never reach the port-selection modal.
+      if (isDynamicPlaceholder(sourceNode) || isDynamicPlaceholder(targetNode)) return;
 
       const sourceDevice = (sourceNode.data as DeviceNodeData).device;
       const targetDevice = (targetNode.data as DeviceNodeData).device;
@@ -404,7 +485,7 @@ function TopologyEditorInner() {
       // cannot see the canvas and could pick a device the user just dropped.
       const canvasDeviceIdSet = new Set(
         nodes
-          .filter((n) => !(n.data as DeviceNodeData).isProposal)
+          .filter((n) => !isDynamicPlaceholder(n) && !(n.data as DeviceNodeData).isProposal)
           .map((n) => (n.data as DeviceNodeData).device.id)
       );
       const duplicates = response.devices.filter(
@@ -479,7 +560,8 @@ function TopologyEditorInner() {
     try {
       await updateTopology.mutateAsync({
         id,
-        canvas_data: { nodes, edges, selectedEdgeLayer },
+        // Dynamic placeholders never persist into the parent topology.
+        canvas_data: persistableCanvas,
         ...(trimmed ? { description: trimmed } : {}),
       });
     } catch {
@@ -509,7 +591,7 @@ function TopologyEditorInner() {
     try {
       const result = await saveFork.mutateAsync({
         reservationId,
-        canvasData: { nodes, edges, selectedEdgeLayer },
+        canvasData: persistableCanvas,
       });
       // The reconcile captured this canvas, so cancel any pending draft flush.
       autosave.markClean();
@@ -553,9 +635,7 @@ function TopologyEditorInner() {
     hasInvalidEdges,
     saveFork,
     autosave,
-    nodes,
-    edges,
-    selectedEdgeLayer,
+    persistableCanvas,
     updateReservation,
     allDeviceIds,
   ]);
@@ -707,7 +787,7 @@ function TopologyEditorInner() {
             {!isLiveEdit && (
               <button
                 onClick={() => setShowReserveModal(true)}
-                disabled={allDeviceIds.length === 0 || hasInvalidEdges}
+                disabled={(allDeviceIds.length === 0 && dynamicPrefill.length === 0) || hasInvalidEdges}
                 title={
                   hasInvalidEdges
                     ? `Cannot reserve: ${invalidEdges.length} edge${invalidEdges.length !== 1 ? "s" : ""} have no physical path or use uncabled ports`
@@ -827,6 +907,7 @@ function TopologyEditorInner() {
             <Controls />
             <MiniMap
               nodeColor={(node) => {
+                if (node.type === "dynamicPlaceholderNode") return "#a855f7";
                 const data = node.data as DeviceNodeData;
                 return data?.device?.topology_type === "CLOUD" ? "#a855f7" : "#3b82f6";
               }}
@@ -852,6 +933,7 @@ function TopologyEditorInner() {
             open={showReserveModal}
             deviceIds={allDeviceIds}
             topologyId={id}
+            initialDynamicEntries={dynamicPrefill}
             onClose={() => setShowReserveModal(false)}
           />
         )}

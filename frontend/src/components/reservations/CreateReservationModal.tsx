@@ -8,7 +8,7 @@ import type { DynamicRequestSpec } from "@/types/reservation.types";
 // Mirrors the backend cap: ReservationCreate.dynamic_requests has max_length=50.
 const MAX_DYNAMIC_REQUESTS = 50;
 
-interface DynamicEntry {
+export interface DynamicEntry {
   templateId: string;
   count: number;
 }
@@ -23,15 +23,30 @@ interface CreateReservationModalProps {
   open: boolean;
   deviceIds: string[];
   topologyId?: string;
+  // Prefills the dynamic-request list (e.g. from the topology canvas's dynamic
+  // placeholders). Applied once at mount: callers that keep the modal mounted
+  // while toggling `open` must remount it to re-prefill.
+  initialDynamicEntries?: DynamicEntry[];
   onClose: () => void;
 }
 
-export function CreateReservationModal({ open, deviceIds, topologyId, onClose }: CreateReservationModalProps) {
+export function CreateReservationModal({
+  open,
+  deviceIds,
+  topologyId,
+  initialDynamicEntries,
+  onClose,
+}: CreateReservationModalProps) {
   const create = useCreateReservation();
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
   const [purpose, setPurpose] = useState("");
-  const [dynamicEntries, setDynamicEntries] = useState<DynamicEntry[]>([]);
+  const [dynamicEntries, setDynamicEntries] = useState<DynamicEntry[]>(() =>
+    (initialDynamicEntries ?? []).map((entry) => ({
+      templateId: entry.templateId,
+      count: clampCount(entry.count),
+    })),
+  );
 
   // Only fetch dynamic templates while the modal is open; this component stays
   // mounted (closed) on pages like the topology editor.

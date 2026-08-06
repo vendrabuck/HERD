@@ -300,6 +300,55 @@ describe("CreateReservationModal", () => {
     expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
   });
 
+  it("prefills dynamic entries from initialDynamicEntries and expands them on submit", async () => {
+    mockDynamicTemplates();
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/api/reservations/", async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ id: "r-4" });
+      }),
+    );
+
+    renderWithProviders(
+      <CreateReservationModal
+        open
+        deviceIds={["d-1"]}
+        initialDynamicEntries={[{ templateId: DYNAMIC_TEMPLATE.id, count: 2 }]}
+        onClose={() => {}}
+      />,
+    );
+
+    // The prefill renders as a normal editable entry with its count.
+    expect(screen.getByLabelText("Instance count 1")).toHaveValue(2);
+
+    fillTimes("2026-06-01T10:00", "2026-06-01T12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Reservation created"));
+    expect(body).toMatchObject({
+      device_ids: ["d-1"],
+      dynamic_requests: [
+        { template_id: DYNAMIC_TEMPLATE.id },
+        { template_id: DYNAMIC_TEMPLATE.id },
+      ],
+    });
+  });
+
+  it("clamps an out-of-bounds prefilled count", () => {
+    mockDynamicTemplates();
+    renderWithProviders(
+      <CreateReservationModal
+        open
+        deviceIds={[]}
+        initialDynamicEntries={[{ templateId: DYNAMIC_TEMPLATE.id, count: 0 }]}
+        onClose={() => {}}
+      />,
+    );
+
+    expect(screen.getByLabelText("Instance count 1")).toHaveValue(1);
+  });
+
   it("disables the add button and shows a hint when no dynamic templates exist", async () => {
     mockDynamicTemplates([]);
     renderWithProviders(
