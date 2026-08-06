@@ -10,6 +10,19 @@ export interface DeviceNodeData extends Record<string, unknown> {
   isProposal?: boolean;
 }
 
+// A canvas-local planning artifact for a dynamic (hypervisor-backed) template:
+// one node per template with an editable instance count. It carries no inventory
+// device id and is never persisted into a topology's canvas_data or device set;
+// at reserve time count expands into repeated {template_id} dynamic_requests.
+export interface DynamicPlaceholderNodeData extends Record<string, unknown> {
+  templateId: string;
+  templateName: string;
+  templateIcon: string | null;
+  count: number;
+}
+
+export type CanvasNodeData = DeviceNodeData | DynamicPlaceholderNodeData;
+
 export interface LayerEdgeData extends Record<string, unknown> {
   layer: EdgeLayerType;
   source_port_id?: string;
@@ -23,6 +36,7 @@ export interface LayerEdgeData extends Record<string, unknown> {
 }
 
 export type DeviceNode = Node<DeviceNodeData, "deviceNode">;
+export type DynamicPlaceholderNode = Node<DynamicPlaceholderNodeData, "dynamicPlaceholderNode">;
 export type LayerEdge = Edge<LayerEdgeData>;
 
 export interface Topology {
@@ -36,7 +50,7 @@ export interface Topology {
 }
 
 export interface CanvasData {
-  nodes: Node<DeviceNodeData>[];
+  nodes: Node<CanvasNodeData>[];
   edges: Edge<LayerEdgeData>[];
   selectedEdgeLayer?: EdgeLayerType;
 }

@@ -1,8 +1,8 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { http, HttpResponse } from "msw";
 
 import { server } from "../mocks/server";
@@ -54,6 +54,18 @@ function paginate<T>(items: T[]) {
 function stubTemplates(items: { id: string; name: string }[] = []) {
   server.use(
     http.get("/api/inventory/templates", () => HttpResponse.json(paginate(items))),
+  );
+}
+
+// The browser now issues two template queries (template_type=device for the
+// filter dropdown, template_type=dynamic for the dynamic section); this stub
+// answers each with its own list.
+function stubTemplatesByType(byType: Record<string, Array<Record<string, unknown>>>) {
+  server.use(
+    http.get("/api/inventory/templates", ({ request }) => {
+      const type = new URL(request.url).searchParams.get("template_type") ?? "";
+      return HttpResponse.json(paginate(byType[type] ?? []));
+    }),
   );
 }
 
@@ -191,5 +203,59 @@ describe("EquipmentBrowser", () => {
       expect(screen.queryByText("reserved-exclusive")).not.toBeInTheDocument(),
     );
     expect(screen.getByText("available-one")).toBeInTheDocument();
+  });
+
+  it("renders dynamic templates in their own section as drag sources", async () => {
+    stubTemplatesByType({
+      device: [],
+      dynamic: [{ id: "dt-1", name: "Ubuntu VM", icon: null, template_type: "dynamic" }],
+    });
+    stubDevices([]);
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    expect(await screen.findByText("Dynamic templates (1)")).toBeInTheDocument();
+    expect(screen.getByText("Ubuntu VM")).toBeInTheDocument();
+    expect(screen.getByText("DYN")).toBeInTheDocument();
+
+    // Dragging a template card stages the dynamic-template payload, a separate
+    // MIME type from the device drag.
+    const card = screen.getByTitle("Drag onto canvas");
+    const setData = vi.fn();
+    fireEvent.dragStart(card, { dataTransfer: { setData, effectAllowed: "" } });
+    expect(setData).toHaveBeenCalledWith(
+      "application/herd-dynamic-template",
+      JSON.stringify({ id: "dt-1", name: "Ubuntu VM", icon: null }),
+    );
+  });
+
+  it("collapses and re-expands the dynamic templates section", async () => {
+    stubTemplatesByType({
+      device: [],
+      dynamic: [{ id: "dt-1", name: "Ubuntu VM", icon: null, template_type: "dynamic" }],
+    });
+    stubDevices([]);
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    const toggle = await screen.findByRole("button", { name: /Dynamic templates \(1\)/ });
+    expect(screen.getByText("Ubuntu VM")).toBeInTheDocument();
+
+    await userEvent.click(toggle);
+    expect(screen.queryByText("Ubuntu VM")).not.toBeInTheDocument();
+
+    await userEvent.click(toggle);
+    expect(screen.getByText("Ubuntu VM")).toBeInTheDocument();
+  });
+
+  it("omits the dynamic templates section when no dynamic templates exist", async () => {
+    stubTemplatesByType({ device: [{ id: "tmpl-1", name: "EX2200" }], dynamic: [] });
+    stubDevices([makeDevice({})]);
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    // Wait for the data to land, then assert the section is absent entirely.
+    expect(await screen.findByText("device-1")).toBeInTheDocument();
+    expect(screen.queryByText(/Dynamic templates/)).not.toBeInTheDocument();
   });
 });

@@ -2,6 +2,7 @@ import { useState, useDeferredValue, useMemo } from "react";
 import { useDevices } from "@/api/inventory";
 import { useTemplates } from "@/api/templates";
 import type { Device, TopologyType } from "@/types/device.types";
+import type { DeviceTemplate } from "@/types/template.types";
 
 function TemplateIcon({ device }: { device: Device }) {
   if (device.template_icon) {
@@ -63,6 +64,50 @@ function DeviceCard({ device }: { device: Device }) {
   );
 }
 
+function DynamicTemplateCard({ template }: { template: DeviceTemplate }) {
+  const onDragStart = (e: React.DragEvent) => {
+    e.dataTransfer.setData(
+      "application/herd-dynamic-template",
+      JSON.stringify({ id: template.id, name: template.name, icon: template.icon }),
+    );
+    e.dataTransfer.effectAllowed = "copy";
+  };
+
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      className="flex items-center gap-2 p-2 rounded border border-dashed border-purple-300 bg-purple-50 cursor-grab active:cursor-grabbing hover:shadow-sm transition-shadow select-none"
+      title="Drag onto canvas"
+    >
+      {template.icon ? (
+        <img src={template.icon} alt={template.name} className="w-5 h-5 object-contain" />
+      ) : (
+        <span className="inline-block w-5 h-5 bg-gray-300 rounded" />
+      )}
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium truncate">{template.name}</p>
+        <p className="text-xs text-gray-500 truncate">Hypervisor-backed</p>
+      </div>
+      <span className="text-xs px-1 py-0.5 rounded shrink-0 bg-purple-200 text-purple-800">DYN</span>
+    </div>
+  );
+}
+
+function ChevronIcon({ expanded }: { expanded: boolean }) {
+  return (
+    <svg
+      className={`w-4 h-4 text-gray-400 transition-transform ${expanded ? "rotate-90" : ""}`}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+    </svg>
+  );
+}
+
 interface EquipmentBrowserProps {
   canvasDeviceIds?: string[];
 }
@@ -72,9 +117,12 @@ export function EquipmentBrowser({ canvasDeviceIds = [] }: EquipmentBrowserProps
   const [topoFilter, setTopoFilter] = useState<TopologyType | "">("");
   const [search, setSearch] = useState("");
   const [showReserved, setShowReserved] = useState(true);
+  const [showDynamic, setShowDynamic] = useState(true);
   const deferredSearch = useDeferredValue(search);
 
   const { data: templates } = useTemplates("device");
+  // Separate query on purpose: the device list's dut_only shape stays untouched.
+  const { data: dynamicTemplates } = useTemplates("dynamic");
   const { data: devices, isLoading, isError } = useDevices({
     template_id: templateFilter || undefined,
     topology_type: topoFilter || undefined,
@@ -183,6 +231,29 @@ export function EquipmentBrowser({ canvasDeviceIds = [] }: EquipmentBrowserProps
           <DeviceCard key={device.id} device={device} />
         ))}
       </div>
+
+      {/* Dynamic templates: hypervisor-backed, no physical device. Absent when
+          no dynamic templates exist. */}
+      {dynamicTemplates && dynamicTemplates.length > 0 && (
+        <div className="border-t border-gray-200 bg-white">
+          <button
+            type="button"
+            onClick={() => setShowDynamic((v) => !v)}
+            aria-expanded={showDynamic}
+            className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-50 transition-colors"
+          >
+            Dynamic templates ({dynamicTemplates.length})
+            <ChevronIcon expanded={showDynamic} />
+          </button>
+          {showDynamic && (
+            <div className="px-2 pb-2 space-y-1.5 max-h-40 overflow-y-auto">
+              {dynamicTemplates.map((t) => (
+                <DynamicTemplateCard key={t.id} template={t} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Legend */}
       <div className="px-3 py-2 border-t border-gray-200 bg-white">
