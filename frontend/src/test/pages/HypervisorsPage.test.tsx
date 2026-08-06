@@ -343,7 +343,7 @@ describe("HypervisorsPage", () => {
       isLoading: false,
     });
     render(<HypervisorsPage />);
-    expect(screen.getByText("deleted secret deadbeef")).toBeInTheDocument();
+    expect(screen.getByText("Deleted secret deadbeef")).toBeInTheDocument();
   });
 
   it("list keeps the neutral truncated id while secrets are still loading", () => {
@@ -354,7 +354,7 @@ describe("HypervisorsPage", () => {
     mockUseSecrets.mockReturnValue({ data: undefined });
     render(<HypervisorsPage />);
     expect(screen.getByText("deadbeef...")).toBeInTheDocument();
-    expect(screen.queryByText(/deleted secret/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Deleted secret/)).not.toBeInTheDocument();
   });
 
   it("edit form selects the orphaned option and warns", () => {

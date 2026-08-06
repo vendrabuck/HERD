@@ -17,6 +17,11 @@ through. No force flag, per the issue #391 reasoning: the escape hatch is
 re-pointing or deleting the referencing hypervisor first, which is the
 correct order anyway.
 
+Known and accepted TOCTOU window, the same class #337 accepted: a
+hypervisor registering (which validates the secret exists) concurrently
+with a delete whose reverse lookup ran first can still produce a dangle;
+both sides are rare admin actions and the UI renders the orphaned state.
+
 If a second service ever grows a reference to secrets, the fan-out here is
 the signal to migrate to a claims registry local to this service (the
 option C shape in the #456 decision writeup); the 409 contract stays the

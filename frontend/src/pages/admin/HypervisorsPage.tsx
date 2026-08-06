@@ -172,7 +172,7 @@ export function HypervisorsPage() {
   const secretName = (id: string) => {
     const match = secrets?.find((s) => s.id === id);
     if (match) return match.name;
-    return secrets ? `deleted secret ${id.slice(0, 8)}` : id.slice(0, 8) + "...";
+    return secrets ? `Deleted secret ${id.slice(0, 8)}` : id.slice(0, 8) + "...";
   };
 
   const renderForm = (onSubmit: () => void, submitLabel: string, pending: boolean) => (
@@ -239,7 +239,7 @@ export function HypervisorsPage() {
         >
           <option value="">Select a secret</option>
           {form.secretId && secretIsOrphaned(form.secretId) && (
-            <option value={form.secretId}>deleted secret {form.secretId.slice(0, 8)}</option>
+            <option value={form.secretId}>Deleted secret {form.secretId.slice(0, 8)}</option>
           )}
           {secrets?.map((s) => (
             <option key={s.id} value={s.id}>
