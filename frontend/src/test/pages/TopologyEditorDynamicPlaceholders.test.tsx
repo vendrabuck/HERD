@@ -303,12 +303,32 @@ describe("TopologyEditorPage dynamic placeholders", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Topology saved"));
+    // Ephemeral-plus-warn (owner's #472 call): the save succeeds but tells the
+    // user placeholders are not part of the saved topology.
+    await waitFor(() =>
+      expect(toastSuccess).toHaveBeenCalledWith(
+        "Topology saved. Dynamic placeholders are not saved; reserve to keep them",
+      ),
+    );
     const canvas = (putBody as Record<string, unknown> | null)?.canvas_data as {
       nodes: Array<{ id: string }>;
     };
     expect(canvas.nodes.map((n) => n.id)).toEqual(["n-dev"]);
     // The placeholder stays on the live canvas as a planning artifact.
     expect(placeholders()).toHaveLength(1);
+  });
+
+  it("saving without placeholders keeps the plain success toast", async () => {
+    server.use(
+      ...baseHandlers(),
+      http.put(`/api/cabling/topologies/${TOPO_ID}`, async () =>
+        HttpResponse.json(PARENT_TOPOLOGY),
+      ),
+    );
+    await renderPageWithCanvas([deviceNode("n-dev", "d-1")]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Topology saved"));
   });
 });

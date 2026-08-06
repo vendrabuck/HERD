@@ -571,7 +571,13 @@ function TopologyEditorInner() {
       return;
     }
     setDescription("");
-    toast.success("Topology saved");
+    if (dynamicPrefill.length > 0) {
+      // Owner's call on #472: placeholders are ephemeral, but a save must not
+      // silently drop planning work on the next reload.
+      toast.success("Topology saved. Dynamic placeholders are not saved; reserve to keep them");
+    } else {
+      toast.success("Topology saved");
+    }
   };
 
   // Live-edit commit (ADR 0006 Decision 6): reconcile the reservation's FORK
