@@ -38,6 +38,17 @@ logger = logging.getLogger(__name__)
 # the remove_from_vlan. Deliberately outside the non-retryable prefixes.
 FROZEN_JOIN_PENDING_REMOVAL = "join landed after wiring freeze; pending removal"
 
+# Issue #479: a stale cross-reservation ACTIVE membership discovered at record time is
+# parked under this reason. Unlike L1's record-time supersession (issue #461), the row
+# is NOT flipped straight to RELEASED: a successful add_to_vlan proves nothing about
+# whether the stale membership left the hardware (memberships can coexist on a port),
+# so the release-direction retry channels own the settlement, usually via the
+# supersede_l2_release_if_reclaimed no-driver path once the superseding reservation's
+# ACTIVE row exists. Deliberately outside the non-retryable prefixes.
+STALE_JOIN_SUPERSEDED_PENDING_REMOVAL = (
+    "superseded at record time by another reservation's membership; pending removal"
+)
+
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(value)
@@ -109,6 +120,41 @@ async def record_l2_membership_active(
     existing = await _find_active(db, switch_uuid, port, vlan_uuid)
     if existing is not None:
         return existing
+
+    # Issue #479: another reservation's ACTIVE membership on this (switch, port) is
+    # stale once this join succeeds (port claims are cross-reservation exclusive),
+    # but it may still exist on the hardware, so park it FAILED intended RELEASED
+    # for the release-direction channels rather than flipping it RELEASED (the L1
+    # record-time rule, whose physics does not transfer: connect_ports displaces
+    # the old cross-connect, add_to_vlan displaces nothing). Without this the stale
+    # row is invisible to every convergence mechanism (retry selects FAILED rows
+    # only), misreporting wiring status and delaying its allocation's last-free
+    # release. Own-reservation rows are deliberately out of scope: the owning
+    # reconcile's remove pass already converges those.
+    stale_result = await db.execute(
+        select(L2PortAssignment).where(
+            L2PortAssignment.switch_device_id == switch_uuid,
+            L2PortAssignment.port == port,
+            L2PortAssignment.reservation_id != res_uuid,
+            L2PortAssignment.status == "ACTIVE",
+        )
+    )
+    for stale in stale_result.scalars().all():
+        stale.status = "FAILED"
+        stale.intended = "RELEASED"
+        # Fresh budget: prior attempts counted the build direction, and the usual
+        # settlement (the #424 supersession) needs one tick, not a driver call.
+        stale.attempts = 0
+        stale.last_error = STALE_JOIN_SUPERSEDED_PENDING_REMOVAL
+        logger.warning(
+            "Parking stale ACTIVE L2 membership of reservation %s on switch %s "
+            "port %s FAILED intended RELEASED: reservation %s recorded a "
+            "successful join on the port",
+            stale.reservation_id,
+            switch_uuid,
+            port,
+            res_uuid,
+        )
 
     state = await get_wiring_state(db, res_uuid)
     if state is not None and state.frozen:
