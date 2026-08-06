@@ -13,7 +13,10 @@ from types import SimpleNamespace
 import pytest
 from app.database import Base
 from app.models.l2_port_assignment import L2PortAssignment
+from app.services.l1_assignment_service import freeze_reservation_wiring, stamp_last_applied
 from app.services.l2_membership_service import (
+    FROZEN_JOIN_PENDING_REMOVAL,
+    STALE_JOIN_SUPERSEDED_PENDING_REMOVAL,
     compute_backfill_l2_memberships,
     count_active_memberships_for_vlan,
     is_membership_active,
@@ -23,6 +26,7 @@ from app.services.l2_membership_service import (
     release_l2_membership,
     supersede_l2_release_if_reclaimed,
 )
+from app.services.wiring_retry_service import is_retryable_failure
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -324,3 +328,132 @@ async def test_record_active_frozen_reuses_failed_row_and_keeps_attempts(db):
     assert row.vlan_assignment_id == va
     assert row.attempts == 3
     assert row.last_error == FROZEN_JOIN_PENDING_REMOVAL
+
+
+# --- record-time supersession of stale cross-reservation rows (issue #479) ---
+
+
+async def test_record_parks_stale_cross_reservation_active_row(db):
+    sw = uuid.uuid4()
+    stale_res, stale_va = uuid.uuid4(), uuid.uuid4()
+    new_res, new_va = uuid.uuid4(), uuid.uuid4()
+    stale = await record_l2_membership_active(db, stale_res, stale_va, sw, "eth1")
+    # The stale reservation's teardown froze its wiring (freeze-first, #461) and
+    # was then interrupted; only that proves the row condemned.
+    await freeze_reservation_wiring(db, stale_res)
+    row = await record_l2_membership_active(db, new_res, new_va, sw, "eth1")
+    assert row is not None and row.status == "ACTIVE"
+    assert row.reservation_id == new_res
+    await db.refresh(stale)
+    # Parked for the release-direction channels, NOT flipped RELEASED: the join
+    # proves port occupancy moved, not that the stale membership left the hardware.
+    assert stale.status == "FAILED"
+    assert stale.intended == "RELEASED"
+    assert stale.attempts == 0
+    assert stale.last_error == STALE_JOIN_SUPERSEDED_PENDING_REMOVAL
+    assert is_retryable_failure(stale.last_error) is True
+
+
+async def test_record_parks_every_stale_row_on_the_port(db):
+    """Two pre-fix stale ACTIVE rows (built directly: the API can no longer mint
+    them) are both parked by one successful join."""
+    sw = uuid.uuid4()
+    stales = []
+    for _ in range(2):
+        r = L2PortAssignment(
+            reservation_id=uuid.uuid4(),
+            vlan_assignment_id=uuid.uuid4(),
+            switch_device_id=sw,
+            port="eth1",
+            status="ACTIVE",
+            intended="ACTIVE",
+        )
+        db.add(r)
+        stales.append(r)
+    await db.commit()
+    for r in stales:
+        await freeze_reservation_wiring(db, r.reservation_id)
+
+    await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    for r in stales:
+        await db.refresh(r)
+        assert r.status == "FAILED"
+        assert r.intended == "RELEASED"
+        assert r.last_error == STALE_JOIN_SUPERSEDED_PENDING_REMOVAL
+
+
+async def test_record_leaves_own_other_vlan_row_alone(db):
+    """Scope pin: an own-reservation membership in another VLAN on the same port is
+    NOT superseded; the owning reconcile's remove pass converges those."""
+    res, sw = uuid.uuid4(), uuid.uuid4()
+    old = await record_l2_membership_active(db, res, uuid.uuid4(), sw, "eth1")
+    new = await record_l2_membership_active(db, res, uuid.uuid4(), sw, "eth1")
+    assert new is not None and new.status == "ACTIVE"
+    await db.refresh(old)
+    assert old.status == "ACTIVE"
+    assert old.intended == "ACTIVE"
+
+
+async def test_parked_stale_row_settles_superseded_without_driver(db):
+    """The full #479 convergence chain at unit level: record-time park, then the
+    #424 release-side guard settles the row with no driver call, since the
+    superseding reservation's ACTIVE row now holds the port."""
+    sw = uuid.uuid4()
+    stale_res = uuid.uuid4()
+    stale = await record_l2_membership_active(db, stale_res, uuid.uuid4(), sw, "eth1")
+    await freeze_reservation_wiring(db, stale_res)
+    await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    await db.refresh(stale)
+    assert stale.status == "FAILED" and stale.intended == "RELEASED"
+    assert await supersede_l2_release_if_reclaimed(db, stale) is True
+    await db.refresh(stale)
+    assert stale.status == "RELEASED"
+
+
+async def test_record_frozen_still_parks_stale_row(db):
+    """A join landing on a frozen reservation parks BOTH rows: the stale
+    cross-reservation row (issue #479) and its own join (issue #461)."""
+    sw = uuid.uuid4()
+    new_res = uuid.uuid4()
+    stale_res = uuid.uuid4()
+    stale = await record_l2_membership_active(db, stale_res, uuid.uuid4(), sw, "eth1")
+    await freeze_reservation_wiring(db, stale_res)
+    await freeze_reservation_wiring(db, new_res)
+    own = await record_l2_membership_active(db, new_res, uuid.uuid4(), sw, "eth1")
+    assert own is not None and own.status == "FAILED"
+    assert own.intended == "RELEASED"
+    assert own.last_error == FROZEN_JOIN_PENDING_REMOVAL
+    await db.refresh(stale)
+    assert stale.status == "FAILED"
+    assert stale.intended == "RELEASED"
+    assert stale.last_error == STALE_JOIN_SUPERSEDED_PENDING_REMOVAL
+
+
+async def test_record_leaves_unfrozen_cross_reservation_row_alone(db):
+    """The load-bearing gate (issue #479 review): an UNFROZEN cross-reservation
+    ACTIVE row can be the port's rightful live holder (e.g. this join is a
+    stale-intent build reattempt, issue #491), so it must never be parked."""
+    sw = uuid.uuid4()
+    live_res = uuid.uuid4()
+    live = await record_l2_membership_active(db, live_res, uuid.uuid4(), sw, "eth1")
+    row = await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    assert row is not None and row.status == "ACTIVE"
+    await db.refresh(live)
+    assert live.status == "ACTIVE"
+    assert live.intended == "ACTIVE"
+    assert live.last_error is None
+
+
+async def test_record_leaves_unfrozen_state_row_cross_reservation_alone(db):
+    """The frozen=False branch of the same gate: a live reservation WITH a
+    wiring_state row (the common production shape, minted by stamp_last_applied)
+    is equally protected from the park."""
+    sw = uuid.uuid4()
+    live_res = uuid.uuid4()
+    live = await record_l2_membership_active(db, live_res, uuid.uuid4(), sw, "eth1")
+    await stamp_last_applied(db, live_res, 1)
+    row = await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    assert row is not None and row.status == "ACTIVE"
+    await db.refresh(live)
+    assert live.status == "ACTIVE"
+    assert live.intended == "ACTIVE"

@@ -322,6 +322,7 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
         WIRING_UNRESOLVABLE_REASON,
         _apply_l2_memberships,
         _FetchContext,
+        _release_orphaned_allocations,
         _resolve_add_allocations,
     )
 
@@ -341,10 +342,19 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
     vlan_by_va = {v.id: v.vlan_id for v in va_rows}
 
     superseded_ids: set[uuid.UUID] = set()
+    superseded_va_ids: set[uuid.UUID] = set()
     async with get_db_session() as db:
         for row in rows:
             if row.intended == "RELEASED" and await supersede_l2_release_if_reclaimed(db, row):
                 superseded_ids.add(row.id)
+                # A superseded row never rides _apply_l2_memberships, whose tail is
+                # the ONLY live allocation-release site, so its allocation must be
+                # freed here or a dead reservation's fabric VLAN number leaks
+                # forever (issue #479). _release_orphaned_allocations re-checks the
+                # zero-ACTIVE-memberships condition itself, so a still-live
+                # allocation is untouched.
+                if row.vlan_assignment_id and row.vlan_assignment_id != _NIL:
+                    superseded_va_ids.add(row.vlan_assignment_id)
 
     def _add_needs_resolution(row: L2PortAssignment) -> bool:
         # A build-direction row whose allocation is unusable: the nil placeholder or a
@@ -425,6 +435,8 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
         ctx = _FetchContext(client)
         for res_str, sets in by_res.items():
             await _apply_l2_memberships(res_str, sets["removes"], sets["adds"], ctx, get_db_session)
+        if superseded_va_ids:
+            await _release_orphaned_allocations(superseded_va_ids, get_db_session, ctx)
 
     async with get_db_session() as db:
         refreshed = (
