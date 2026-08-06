@@ -165,7 +165,15 @@ export function HypervisorsPage() {
     setDeleteTarget(null);
   };
 
-  const secretName = (id: string) => secrets?.find((s) => s.id === id)?.name ?? id.slice(0, 8) + "...";
+  // Issue #456: a deleted secret leaves an orphaned reference; render that
+  // state explicitly instead of a bare truncated id. While secrets are still
+  // loading, absence proves nothing, so keep the neutral truncated fallback.
+  const secretIsOrphaned = (id: string) => Boolean(secrets && !secrets.some((s) => s.id === id));
+  const secretName = (id: string) => {
+    const match = secrets?.find((s) => s.id === id);
+    if (match) return match.name;
+    return secrets ? `deleted secret ${id.slice(0, 8)}` : id.slice(0, 8) + "...";
+  };
 
   const renderForm = (onSubmit: () => void, submitLabel: string, pending: boolean) => (
     <div className="space-y-4">
@@ -230,12 +238,21 @@ export function HypervisorsPage() {
           className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
           <option value="">Select a secret</option>
+          {form.secretId && secretIsOrphaned(form.secretId) && (
+            <option value={form.secretId}>deleted secret {form.secretId.slice(0, 8)}</option>
+          )}
           {secrets?.map((s) => (
             <option key={s.id} value={s.id}>
               {s.name} ({s.type})
             </option>
           ))}
         </select>
+        {form.secretId && secretIsOrphaned(form.secretId) && (
+          <p className="text-xs text-amber-600 mt-1">
+            This hypervisor references a secret that no longer exists. Saving keeps the stored
+            reference; select a live secret to repair it.
+          </p>
+        )}
         {secrets && secrets.length === 0 && (
           <p className="text-xs text-amber-600 mt-1">
             No secrets exist yet. Create one via the secrets API first, then register the
@@ -313,7 +330,13 @@ export function HypervisorsPage() {
                       <td className="px-4 py-3 font-medium text-gray-900">{h.name}</td>
                       <td className="px-4 py-3 text-gray-600">{h.hypervisor_type}</td>
                       <td className="px-4 py-3 text-gray-600 font-mono text-xs">{h.endpoint}</td>
-                      <td className="px-4 py-3 text-gray-600">{secretName(h.secret_id)}</td>
+                      <td
+                        className={`px-4 py-3 ${
+                          secretIsOrphaned(h.secret_id) ? "text-amber-600" : "text-gray-600"
+                        }`}
+                      >
+                        {secretName(h.secret_id)}
+                      </td>
                       <td className="px-4 py-3 text-gray-600">{h.enabled ? "Yes" : "No"}</td>
                       <td className="px-4 py-3 text-gray-500">
                         {new Date(h.created_at).toLocaleDateString()}

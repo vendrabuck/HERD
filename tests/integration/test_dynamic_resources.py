@@ -593,3 +593,63 @@ async def test_provision_requested_redelivery_is_idempotent(
         assert sorted(body["device_ids"]) == sorted(active["device_ids"])
     finally:
         await _cancel_and_drain(admin_client, reservation["id"], device_id)
+
+
+# --- secret delete reference guard (issue #456) ------------------------------
+
+
+async def test_secret_delete_refused_while_hypervisor_references_it(base_url, admin_token):
+    """A referenced secret cannot be deleted; an unreferenced one can.
+
+    Issue #456: secrets' delete calls inventory's by-secret reverse lookup and
+    409s with the referencing hypervisor ids/names. Deleting the hypervisor
+    first (the correct order) unblocks the delete. Test-local resources, not
+    the shared session fixtures, since this test must delete them.
+    """
+    async with _admin_session_client(base_url, admin_token) as client:
+        resp = await client.post(
+            "/secrets/secrets",
+            json={
+                "name": f"int-guard-secret-{uuid.uuid4().hex[:8]}",
+                "type": "password",
+                "description": "issue #456 delete-guard credential",
+                "data": {"username": "svc", "password": "integration-guard-password"},
+            },
+        )
+        resp.raise_for_status()
+        secret = resp.json()
+        hv = None
+        try:
+            resp = await client.post(
+                "/inventory/hypervisors",
+                json={
+                    "name": f"int-guard-hv-{uuid.uuid4().hex[:8]}",
+                    "description": "issue #456 delete-guard hypervisor",
+                    "endpoint": "https://guard-hv.example:8006",
+                    "hypervisor_type": "mock",
+                    "secret_id": secret["id"],
+                },
+            )
+            resp.raise_for_status()
+            hv = resp.json()
+
+            resp = await client.delete(f"/secrets/secrets/{secret['id']}")
+            assert resp.status_code == 409, resp.text
+            detail = resp.json()["detail"]
+            assert detail["error"] == "secret_in_use"
+            assert hv["id"] in detail["hypervisor_ids"]
+            assert hv["name"] in detail["hypervisor_names"]
+
+            # The refused delete left the secret intact and revealable.
+            resp = await client.get(f"/secrets/secrets/{secret['id']}")
+            assert resp.status_code == 200
+        finally:
+            if hv is not None:
+                resp = await client.delete(f"/inventory/hypervisors/{hv['id']}")
+                assert resp.status_code in (204, 404), resp.text
+
+        # With the reference gone, the same delete succeeds.
+        resp = await client.delete(f"/secrets/secrets/{secret['id']}")
+        assert resp.status_code == 204, resp.text
+        resp = await client.get(f"/secrets/secrets/{secret['id']}")
+        assert resp.status_code == 404

@@ -69,6 +69,15 @@ class HypervisorInternalResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class HypervisorSecretRefResponse(BaseModel):
+    # Issue #456: the by-secret reverse lookup returns exactly this pair; the
+    # secrets delete guard needs the ids, the names make its 409 actionable.
+    id: uuid.UUID
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
 class PaginatedHypervisorResponse(BaseModel):
     items: list[HypervisorResponse]
     total: int

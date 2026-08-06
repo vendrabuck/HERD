@@ -30,7 +30,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   holding named secrets whose payloads are AES-GCM envelope-encrypted (an
   environment-supplied key-encryption key wraps per-version data-encryption
   keys), with ACL-gated reveal, an internal-token retrieval surface for
-  automated provisioning, and online key rotation. See
+  automated provisioning, and online key rotation. Deleting a secret is
+  refused with 409 while any hypervisor still references it (fail-closed when
+  inventory is unreachable, no force flag). See
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Device group visibility** (Shipped): non-admin users only see devices in their
   assigned groups.

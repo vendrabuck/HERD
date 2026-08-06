@@ -316,6 +316,7 @@ services:
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       ACL_SERVICE_URL: http://acl:8000
+      INVENTORY_SERVICE_URL: http://inventory:8000
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
       # No default, deliberately: the service refuses to boot without a valid
