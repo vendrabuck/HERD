@@ -12,12 +12,12 @@ import uuid
 
 import pytest
 from app import routers
-from fastapi import HTTPException
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import Secret
 from app.services.keyring import bootstrap_keyring
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
