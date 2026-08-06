@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from app.database import Base
 from app.models.l2_port_assignment import L2PortAssignment
-from app.services.l1_assignment_service import freeze_reservation_wiring
+from app.services.l1_assignment_service import freeze_reservation_wiring, stamp_last_applied
 from app.services.l2_membership_service import (
     FROZEN_JOIN_PENDING_REMOVAL,
     STALE_JOIN_SUPERSEDED_PENDING_REMOVAL,
@@ -442,3 +442,18 @@ async def test_record_leaves_unfrozen_cross_reservation_row_alone(db):
     assert live.status == "ACTIVE"
     assert live.intended == "ACTIVE"
     assert live.last_error is None
+
+
+async def test_record_leaves_unfrozen_state_row_cross_reservation_alone(db):
+    """The frozen=False branch of the same gate: a live reservation WITH a
+    wiring_state row (the common production shape, minted by stamp_last_applied)
+    is equally protected from the park."""
+    sw = uuid.uuid4()
+    live_res = uuid.uuid4()
+    live = await record_l2_membership_active(db, live_res, uuid.uuid4(), sw, "eth1")
+    await stamp_last_applied(db, live_res, 1)
+    row = await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    assert row is not None and row.status == "ACTIVE"
+    await db.refresh(live)
+    assert live.status == "ACTIVE"
+    assert live.intended == "ACTIVE"

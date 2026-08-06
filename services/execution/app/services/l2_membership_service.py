@@ -138,7 +138,9 @@ async def record_l2_membership_active(
     # (this join may itself be a stale-intent build reattempt, see the issue #491
     # flaw), and port-claim exclusivity in cabling proves nothing about which
     # ledger writer is current. Those rows are left alone (the pre-#479
-    # release-side guard still covers a genuinely stale unfrozen residual).
+    # release-side FAILED-row guard covers what it covered before; an unfrozen
+    # stale row left ACTIVE remains invisible, the pre-#479 status quo, traded
+    # deliberately for soundness).
     # Own-reservation rows are also out of scope: the owning reconcile's remove
     # pass converges those.
     stale_result = await db.execute(
