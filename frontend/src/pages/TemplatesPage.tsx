@@ -27,6 +27,7 @@ const TYPE_FILTER_OPTIONS = [
   { label: "All", value: "" },
   { label: "Device", value: "device" },
   { label: "Port", value: "port" },
+  { label: "Dynamic", value: "dynamic" },
 ];
 
 export function TemplatesPage() {
@@ -56,11 +57,23 @@ export function TemplatesPage() {
 
   const handleCopy = async (t: DeviceTemplate) => {
     try {
+      // Carry every creatable field through so the copy round-trips the backend
+      // validators: dynamic templates require driver_id AND hypervisor_id, device
+      // templates require driver_id plus vendor/model (issue #473). hypervisor_id
+      // and driver_id are null on the types they do not apply to, which the
+      // backend accepts (only a non-null value is type-checked).
       await createTemplate.mutateAsync({
         name: `Copy of ${t.name}`,
-        template_type: t.template_type as "device" | "port",
+        template_type: t.template_type as "device" | "port" | "dynamic",
+        driver_id: t.driver_id,
+        hypervisor_id: t.hypervisor_id,
+        exclusive: t.exclusive,
         icon: t.icon ?? undefined,
         description: t.description ?? undefined,
+        vendor: t.vendor,
+        model: t.model,
+        part_number: t.part_number,
+        poll_interval_seconds: t.poll_interval_seconds,
         sections: JSON.parse(JSON.stringify(t.sections)),
       });
       toast.success("Template duplicated");

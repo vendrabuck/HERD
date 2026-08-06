@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useCancelReservation, useReleaseReservation } from "@/api/reservations";
+import { useTemplates } from "@/api/templates";
 import { useAIStatus } from "@/api/ai";
 import { useAuthStore } from "@/stores/authStore";
 import { ReservationInventoryTab } from "./ReservationInventoryTab";
@@ -13,7 +14,7 @@ import { AIApplyConfirmModal } from "./AIApplyConfirmModal";
 import { AIAssistantTab } from "./AIAssistantTab";
 import { EditDevicesModal } from "./EditDevicesModal";
 import type { PendingApply, ToolCall } from "@/types/ai.types";
-import type { Reservation } from "@/types/reservation.types";
+import type { DynamicRequestResponse, Reservation } from "@/types/reservation.types";
 
 const STATUS_COLORS: Record<string, string> = {
   ACTIVE: "bg-green-100 text-green-800",
@@ -25,6 +26,18 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 type Tab = "details" | "inventory" | "routes" | "wiring" | "status" | "assistant";
+
+// The backend books one row per requested instance (same template_id N times
+// means N instances); collapse them to template + count for display.
+function groupDynamicRequests(
+  requests: DynamicRequestResponse[],
+): { templateId: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const r of requests) {
+    counts.set(r.template_id, (counts.get(r.template_id) ?? 0) + 1);
+  }
+  return Array.from(counts.entries()).map(([templateId, count]) => ({ templateId, count }));
+}
 
 interface Props {
   reservation: Reservation | null;
@@ -46,8 +59,16 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
   const user = useAuthStore((s) => s.user);
   const { data: aiStatus } = useAIStatus();
   const navigate = useNavigate();
+  // Resolve dynamic-request template ids to names; fetch only when the
+  // reservation actually carries dynamic requests (issue #473).
+  const dynamicRequests = reservation?.dynamic_requests ?? [];
+  const { data: dynamicTemplates } = useTemplates("dynamic", {
+    enabled: dynamicRequests.length > 0,
+  });
 
   if (!reservation) return null;
+
+  const templateNames = new Map((dynamicTemplates ?? []).map((t) => [t.id, t.name]));
 
   const isOwner = user?.id === reservation.user_id;
   const canAct = isOwner && reservation.status === "ACTIVE";
@@ -173,6 +194,27 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
                 ))}
               </ul>
             </div>
+            {dynamicRequests.length > 0 && (
+              <div>
+                <span className="text-gray-500">
+                  Dynamic instances ({dynamicRequests.length})
+                </span>
+                <ul className="mt-1 space-y-0.5">
+                  {groupDynamicRequests(dynamicRequests).map((g) => (
+                    <li key={g.templateId} className="flex justify-between text-xs">
+                      {templateNames.has(g.templateId) ? (
+                        <span className="text-gray-700">{templateNames.get(g.templateId)}</span>
+                      ) : (
+                        <span className="text-gray-700 font-mono">
+                          {g.templateId.slice(0, 8)}
+                        </span>
+                      )}
+                      <span className="text-gray-500">x{g.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {canAct && (
               <div className="flex gap-2 pt-2 border-t border-gray-200">
                 <button
