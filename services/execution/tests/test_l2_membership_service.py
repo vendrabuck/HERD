@@ -338,6 +338,9 @@ async def test_record_parks_stale_cross_reservation_active_row(db):
     stale_res, stale_va = uuid.uuid4(), uuid.uuid4()
     new_res, new_va = uuid.uuid4(), uuid.uuid4()
     stale = await record_l2_membership_active(db, stale_res, stale_va, sw, "eth1")
+    # The stale reservation's teardown froze its wiring (freeze-first, #461) and
+    # was then interrupted; only that proves the row condemned.
+    await freeze_reservation_wiring(db, stale_res)
     row = await record_l2_membership_active(db, new_res, new_va, sw, "eth1")
     assert row is not None and row.status == "ACTIVE"
     assert row.reservation_id == new_res
@@ -368,6 +371,8 @@ async def test_record_parks_every_stale_row_on_the_port(db):
         db.add(r)
         stales.append(r)
     await db.commit()
+    for r in stales:
+        await freeze_reservation_wiring(db, r.reservation_id)
 
     await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
     for r in stales:
@@ -394,7 +399,9 @@ async def test_parked_stale_row_settles_superseded_without_driver(db):
     #424 release-side guard settles the row with no driver call, since the
     superseding reservation's ACTIVE row now holds the port."""
     sw = uuid.uuid4()
-    stale = await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    stale_res = uuid.uuid4()
+    stale = await record_l2_membership_active(db, stale_res, uuid.uuid4(), sw, "eth1")
+    await freeze_reservation_wiring(db, stale_res)
     await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
     await db.refresh(stale)
     assert stale.status == "FAILED" and stale.intended == "RELEASED"
@@ -408,7 +415,9 @@ async def test_record_frozen_still_parks_stale_row(db):
     cross-reservation row (issue #479) and its own join (issue #461)."""
     sw = uuid.uuid4()
     new_res = uuid.uuid4()
-    stale = await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    stale_res = uuid.uuid4()
+    stale = await record_l2_membership_active(db, stale_res, uuid.uuid4(), sw, "eth1")
+    await freeze_reservation_wiring(db, stale_res)
     await freeze_reservation_wiring(db, new_res)
     own = await record_l2_membership_active(db, new_res, uuid.uuid4(), sw, "eth1")
     assert own is not None and own.status == "FAILED"
@@ -418,3 +427,18 @@ async def test_record_frozen_still_parks_stale_row(db):
     assert stale.status == "FAILED"
     assert stale.intended == "RELEASED"
     assert stale.last_error == STALE_JOIN_SUPERSEDED_PENDING_REMOVAL
+
+
+async def test_record_leaves_unfrozen_cross_reservation_row_alone(db):
+    """The load-bearing gate (issue #479 review): an UNFROZEN cross-reservation
+    ACTIVE row can be the port's rightful live holder (e.g. this join is a
+    stale-intent build reattempt, issue #491), so it must never be parked."""
+    sw = uuid.uuid4()
+    live_res = uuid.uuid4()
+    live = await record_l2_membership_active(db, live_res, uuid.uuid4(), sw, "eth1")
+    row = await record_l2_membership_active(db, uuid.uuid4(), uuid.uuid4(), sw, "eth1")
+    assert row is not None and row.status == "ACTIVE"
+    await db.refresh(live)
+    assert live.status == "ACTIVE"
+    assert live.intended == "ACTIVE"
+    assert live.last_error is None

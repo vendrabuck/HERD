@@ -107,13 +107,14 @@ def _patches(execute_fn):
     return stack
 
 
-async def _seed_alloc(reservation_id=RES_ID, vlan_id=100, sids=None):
+async def _seed_alloc(reservation_id=RES_ID, vlan_id=100, sids=None, defined=None):
     async with TestSessionLocal() as s:
         va = VlanAssignment(
             reservation_id=uuid.UUID(reservation_id),
             fabric_id=FABRIC,
             vlan_id=vlan_id,
             switch_device_ids=sids or [SW_L2],
+            defined_switch_ids=defined or [],
             status="ACTIVE",
         )
         s.add(va)
@@ -266,6 +267,11 @@ async def test_release_superseded_settles_without_driver_call():
     assert result["results"][0]["outcome"] == "superseded"
     row = await _l2_row(rid)
     assert row.status == "RELEASED"
+    # Issue #479: the superseded row was its allocation's last membership, and the
+    # settlement path (not only _apply_l2_memberships) must free the allocation.
+    async with TestSessionLocal() as s:
+        va_row = await s.get(VlanAssignment, va1)
+        assert va_row.status == "RELEASED"
 
 
 # --- mixed L1 + L2 batch, per-layer labeling ---
@@ -363,3 +369,23 @@ async def test_nil_allocation_build_retry_resolution_failure_makes_no_driver_cal
     assert row.status == "FAILED"
     assert row.attempts > 2, "attempts accumulate on the re-park"
     assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_superseded_settlement_undefines_provably_defined_vlan():
+    """Issue #479 + #442: a superseded settlement that last-frees an allocation with
+    a provable definition scope drives delete_vlan through the shared release."""
+    va1 = await _seed_alloc(defined=[SW_L2])
+    va2 = await _seed_alloc(reservation_id=OTHER_RES, vlan_id=200)
+    await _seed_l2_failed("0/0/1", "RELEASED", va1)
+    await _seed_l2_active("0/0/1", va2, reservation_id=OTHER_RES)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert result["results"][0]["outcome"] == "superseded"
+    actions = [a for a, _ in calls]
+    assert "delete_vlan" in actions, "the freed allocation's provable definition is undefined"
+    assert not {"add_to_vlan", "remove_from_vlan"} & set(actions), "no membership ops"
+
+    async with TestSessionLocal() as s:
+        va_row = await s.get(VlanAssignment, va1)
+        assert va_row.status == "RELEASED"

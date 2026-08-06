@@ -38,13 +38,14 @@ logger = logging.getLogger(__name__)
 # the remove_from_vlan. Deliberately outside the non-retryable prefixes.
 FROZEN_JOIN_PENDING_REMOVAL = "join landed after wiring freeze; pending removal"
 
-# Issue #479: a stale cross-reservation ACTIVE membership discovered at record time is
-# parked under this reason. Unlike L1's record-time supersession (issue #461), the row
-# is NOT flipped straight to RELEASED: a successful add_to_vlan proves nothing about
-# whether the stale membership left the hardware (memberships can coexist on a port),
-# so the release-direction retry channels own the settlement, usually via the
+# Issue #479: a FROZEN reservation's stale ACTIVE membership discovered at record time
+# is parked under this reason. Unlike L1's record-time supersession (issue #461), the
+# row is NOT flipped straight to RELEASED: a successful add_to_vlan proves nothing
+# about whether the stale membership left the hardware (memberships can coexist on a
+# port), so the release-direction retry channels own the settlement, usually via the
 # supersede_l2_release_if_reclaimed no-driver path once the superseding reservation's
-# ACTIVE row exists. Deliberately outside the non-retryable prefixes.
+# ACTIVE row exists; the retry pass then releases the settled rows' orphaned
+# allocations. Deliberately outside the non-retryable prefixes.
 STALE_JOIN_SUPERSEDED_PENDING_REMOVAL = (
     "superseded at record time by another reservation's membership; pending removal"
 )
@@ -121,16 +122,25 @@ async def record_l2_membership_active(
     if existing is not None:
         return existing
 
-    # Issue #479: another reservation's ACTIVE membership on this (switch, port) is
-    # stale once this join succeeds (port claims are cross-reservation exclusive),
-    # but it may still exist on the hardware, so park it FAILED intended RELEASED
-    # for the release-direction channels rather than flipping it RELEASED (the L1
-    # record-time rule, whose physics does not transfer: connect_ports displaces
-    # the old cross-connect, add_to_vlan displaces nothing). Without this the stale
-    # row is invisible to every convergence mechanism (retry selects FAILED rows
-    # only), misreporting wiring status and delaying its allocation's last-free
-    # release. Own-reservation rows are deliberately out of scope: the owning
-    # reconcile's remove pass already converges those.
+    # Issue #479: another reservation's ACTIVE membership on this (switch, port)
+    # whose reservation's wiring is FROZEN is provably stale: the freeze lands and
+    # commits before any teardown driver call (issue #461), so a frozen row is by
+    # definition condemned wiring an interrupted teardown left behind. It is parked
+    # FAILED intended RELEASED for the release-direction channels rather than
+    # flipped RELEASED (the L1 record-time rule, whose physics does not transfer:
+    # connect_ports displaces the old cross-connect, add_to_vlan displaces
+    # nothing, so the membership may still exist on the hardware). Without this
+    # the stale row is invisible to every convergence mechanism (retry selects
+    # FAILED rows only) and misreports wiring status for its dead reservation.
+    #
+    # The frozen gate is load-bearing, not an optimization: an UNFROZEN
+    # cross-reservation ACTIVE row can belong to the port's rightful LIVE holder
+    # (this join may itself be a stale-intent build reattempt, see the issue #491
+    # flaw), and port-claim exclusivity in cabling proves nothing about which
+    # ledger writer is current. Those rows are left alone (the pre-#479
+    # release-side guard still covers a genuinely stale unfrozen residual).
+    # Own-reservation rows are also out of scope: the owning reconcile's remove
+    # pass converges those.
     stale_result = await db.execute(
         select(L2PortAssignment).where(
             L2PortAssignment.switch_device_id == switch_uuid,
@@ -140,6 +150,18 @@ async def record_l2_membership_active(
         )
     )
     for stale in stale_result.scalars().all():
+        stale_state = await get_wiring_state(db, stale.reservation_id)
+        if stale_state is None or not stale_state.frozen:
+            logger.warning(
+                "Cross-reservation ACTIVE L2 membership of reservation %s on "
+                "switch %s port %s is not frozen; leaving it untouched while "
+                "reservation %s records a join on the same port",
+                stale.reservation_id,
+                switch_uuid,
+                port,
+                res_uuid,
+            )
+            continue
         stale.status = "FAILED"
         stale.intended = "RELEASED"
         # Fresh budget: prior attempts counted the build direction, and the usual
@@ -147,14 +169,17 @@ async def record_l2_membership_active(
         stale.attempts = 0
         stale.last_error = STALE_JOIN_SUPERSEDED_PENDING_REMOVAL
         logger.warning(
-            "Parking stale ACTIVE L2 membership of reservation %s on switch %s "
-            "port %s FAILED intended RELEASED: reservation %s recorded a "
-            "successful join on the port",
+            "Parking stale ACTIVE L2 membership of frozen reservation %s on "
+            "switch %s port %s FAILED intended RELEASED: reservation %s "
+            "recorded a successful join on the port",
             stale.reservation_id,
             switch_uuid,
             port,
             res_uuid,
         )
+    # Unlike record_l1_connect there is no flush-before-insert concern: parked rows
+    # always differ from the new row in vlan_assignment_id (allocations are
+    # per-reservation), so the partial-unique index cannot collide.
 
     state = await get_wiring_state(db, res_uuid)
     if state is not None and state.frozen:
