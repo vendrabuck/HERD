@@ -45,6 +45,15 @@ A FAILED row whose reason is one of the pinned verbatim-apply reasons (a recorde
 that no longer resolves, or a hop set that is not a simple chain: ADR 0007 Decision 5)
 is NOT hardware-retryable: the wiring intent itself cannot be applied and the recovery
 is a fork re-save, so it is reported as such without burning a driver call.
+
+Build-intent revalidation (issue #491): both channels verify a BUILD-direction row's
+wiring against cabling's CURRENT intended set (fetched once per reservation) before
+driving the driver, because a fork re-save may have removed the wiring while the row
+sat FAILED. A stale build is never driven: it is parked FAILED intended RELEASED
+(nats_consumer.WIRING_STALE_BUILD_REASON, attempts reset per the #479 rationale) and
+settles through the release-direction machinery on a later pass. An unverifiable
+intended set (fetch failure) drives nothing build-direction for that reservation that
+tick: unverifiable intent never drives hardware (the issue #460 philosophy).
 """
 
 from __future__ import annotations
@@ -61,23 +70,27 @@ from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.l2_port_assignment import L2PortAssignment
 from app.models.route_assignment import RouteAssignment
 from app.services.l1_assignment_service import (
+    canonical_port_pair,
     due_failed_rows,
     failed_assignments_for_reservation,
     get_wiring_state,
+    park_stale_l1_build,
     supersede_release_if_reclaimed,
 )
 from app.services.l2_membership_service import (
     due_failed_l2_rows,
     failed_memberships_for_reservation,
+    park_stale_l2_build,
     supersede_l2_release_if_reclaimed,
 )
 from app.services.nats_consumer import (
-    WIRING_NOT_SIMPLE_CHAIN_REASON,
+    NON_RETRYABLE_REASON_PREFIXES,
     WIRING_UNRESOLVABLE_REASON,
 )
 from app.services.route_service import (
     due_failed_route_rows,
     failed_route_assignments_for_reservation,
+    park_stale_route_build,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,7 +102,9 @@ logger = logging.getLogger(__name__)
 # load-error variants ("recorded hop unresolvable: switch <id> not found", etc.) start
 # with the same prefix and are non-retryable for the same reason: there is no resolvable
 # driver to call.
-_NON_RETRYABLE_PREFIXES = (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
+# Single-sourced from nats_consumer (issue #491 review): the reconcile's stale-build
+# exclusions use the same tuple, so the two sides cannot drift.
+_NON_RETRYABLE_PREFIXES = NON_RETRYABLE_REASON_PREFIXES
 
 
 class WiringReservationFrozen(RuntimeError):
@@ -220,11 +235,30 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
     set (ADR 0009 phase 3, issue #369). Both retry channels reach this function, so
     both get the guard.
 
-    A TransientUpstreamError from resolving a switch (inventory/cabling 5xx) propagates
-    to the caller: the manual endpoint maps it to 503; the background tick logs it and
-    moves on. The rows stay FAILED for the next sweep.
+    Build-intent revalidation (issue #491): before any BUILD-direction row is driven,
+    cabling's CURRENT intended set is fetched once per reservation and the row's
+    (switch, canonical pair) identity, derived exactly as the reconcile derives it
+    (_wires_to_switch_pairs), is checked against it. A row whose intent is gone is NOT
+    driven: it is parked FAILED intended RELEASED (WIRING_STALE_BUILD_REASON, attempts
+    reset) so the release-direction channels settle it, and it reads back
+    "still_failed" this tick. If the intended set cannot be fetched
+    (TransientUpstreamError, fail-closed per issue #460), NO build row of that
+    reservation is driven this tick: unverifiable intent never drives hardware. The
+    rows stay FAILED untouched and read back "still_failed"; release-direction rows are
+    unaffected by all of this.
+
+    A TransientUpstreamError from resolving a switch during the apply (inventory 5xx)
+    still propagates to the caller: the manual endpoint maps it to 503; the background
+    tick logs it and moves on. The rows stay FAILED for the next sweep.
     """
-    from app.services.nats_consumer import _apply_wiring_pairs, _FetchContext
+    from app.services.nats_consumer import (
+        WIRING_STALE_BUILD_REASON,
+        TransientUpstreamError,
+        _apply_wiring_pairs,
+        _fetch_fork_intended_wires,
+        _FetchContext,
+        _wires_to_switch_pairs,
+    )
 
     if not rows:
         return []
@@ -240,23 +274,61 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
             if row.intended == "RELEASED" and await supersede_release_if_reclaimed(db, row):
                 superseded_ids.add(row.id)
 
-    # reservation -> switch -> [(port_a, port_b, physical_connection_id)], split by
-    # the row's intended direction. Superseded rows are already settled, so they are
-    # left out of both apply sets.
-    by_res_build: dict[str, dict[str, list[tuple[str, str, str | None]]]] = {}
+    # reservation -> switch -> [(port_a, port_b, physical_connection_id)] for the
+    # release direction; build-direction rows are kept whole per reservation so the
+    # revalidation below can key each one. Superseded rows are already settled, so
+    # they are left out of both apply sets.
     by_res_release: dict[str, dict[str, list[tuple[str, str, str | None]]]] = {}
+    build_rows_by_res: dict[str, list[L1ConnectionAssignment]] = {}
     for row in rows:
         if row.id in superseded_ids:
             continue
-        phys = str(row.physical_connection_id) if row.physical_connection_id else None
         res_str = str(row.reservation_id)
-        target = by_res_release if row.intended == "RELEASED" else by_res_build
-        target.setdefault(res_str, {}).setdefault(str(row.switch_device_id), []).append(
-            (row.port_a, row.port_b, phys)
-        )
+        if row.intended == "RELEASED":
+            phys = str(row.physical_connection_id) if row.physical_connection_id else None
+            by_res_release.setdefault(res_str, {}).setdefault(str(row.switch_device_id), []).append(
+                (row.port_a, row.port_b, phys)
+            )
+        else:
+            build_rows_by_res.setdefault(res_str, []).append(row)
 
     async with httpx.AsyncClient() as client:
         ctx = _FetchContext(client)
+
+        by_res_build: dict[str, dict[str, list[tuple[str, str, str | None]]]] = {}
+        for res_str, res_rows in build_rows_by_res.items():
+            try:
+                wires = await _fetch_fork_intended_wires(res_str, client)
+                intended_pairs, _unresolvable = await _wires_to_switch_pairs(wires, ctx)
+            except TransientUpstreamError as exc:
+                logger.warning(
+                    "wiring retry: cannot verify build intent for reservation %s (%s); "
+                    "%d build row(s) not driven this tick (unverifiable intent never "
+                    "drives hardware, issue #491)",
+                    res_str,
+                    exc,
+                    len(res_rows),
+                )
+                continue
+            intended_keys = {
+                (switch_id, *canonical_port_pair(pa, pb))
+                for switch_id, pairs in intended_pairs.items()
+                for pa, pb, _phys in pairs
+            }
+            for row in res_rows:
+                key = (
+                    str(row.switch_device_id),
+                    *canonical_port_pair(row.port_a, row.port_b),
+                )
+                if key not in intended_keys:
+                    async with get_db_session() as db:
+                        await park_stale_l1_build(db, row.id, WIRING_STALE_BUILD_REASON)
+                    continue
+                phys = str(row.physical_connection_id) if row.physical_connection_id else None
+                by_res_build.setdefault(res_str, {}).setdefault(
+                    str(row.switch_device_id), []
+                ).append((row.port_a, row.port_b, phys))
+
         for res_str in {*by_res_build, *by_res_release}:
             build_by_switch = by_res_build.get(res_str, {})
             release_by_switch = by_res_release.get(res_str, {})
@@ -315,12 +387,28 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
     0) and record_l2_membership_active heals the row's allocation on success. If
     re-resolution fails again, the row is NOT driven: it is re-parked FAILED with the
     no-allocation reason (attempts accumulate) and reported "still_failed".
+
+    Build-intent revalidation (issue #491), the _reattempt_rows analogue: before any
+    BUILD-direction row is driven, cabling's CURRENT intended set is fetched once per
+    reservation and the row's (switch, port) identity, derived exactly as the reconcile
+    derives it (_derive_l2_memberships), is checked against it. Revalidation runs
+    BEFORE re-resolution so no allocation is minted for dead intent. A stale row with a
+    resolvable allocation is parked FAILED intended RELEASED (WIRING_STALE_BUILD_REASON,
+    attempts reset) for the release-direction channels and reads back "still_failed"; a
+    stale row whose allocation is the nil placeholder (or dangling) has no VLAN number
+    the release channel could drive remove_from_vlan against and provably never reached
+    the driver, so it flips RELEASED directly with no driver call and reads back
+    "released". A fetch failure drives NOTHING build-direction for that reservation
+    this tick (fail-closed, issue #460); release-direction rows are unaffected.
     """
     from app.models.vlan_assignment import VlanAssignment
-    from app.services.l2_membership_service import record_l2_failed
+    from app.services.l2_membership_service import record_l2_failed, release_l2_membership
     from app.services.nats_consumer import (
-        WIRING_UNRESOLVABLE_REASON,
+        WIRING_STALE_BUILD_REASON,
+        TransientUpstreamError,
         _apply_l2_memberships,
+        _derive_l2_memberships,
+        _fetch_fork_intended_wires,
         _FetchContext,
         _release_orphaned_allocations,
         _resolve_add_allocations,
@@ -363,76 +451,126 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
             row.vlan_assignment_id == _NIL or row.vlan_assignment_id not in vlan_by_va
         )
 
-    # Re-resolve allocations per reservation for the add rows that need it, so the retry
-    # never drives add_to_vlan against the nil/vlan-0 placeholder.
-    resolve_targets: dict[str, set[tuple[str, str]]] = {}
-    for row in rows:
-        if row.id in superseded_ids:
-            continue
-        if _add_needs_resolution(row):
-            resolve_targets.setdefault(str(row.reservation_id), set()).add(
-                (str(row.switch_device_id), row.port)
-            )
-    resolved: dict[str, dict[str, tuple[uuid.UUID, int]]] = {}
-    for res_str, targets in resolve_targets.items():
-        alloc = await _resolve_add_allocations(res_str, targets, get_db_session)
-        resolved[res_str] = alloc
-        # Fold the freshly-resolved VLAN numbers into the read-back map so a healed row's
-        # outcome reports its real VLAN, not None.
-        for va_id, vlan_id in alloc.values():
-            vlan_by_va[va_id] = vlan_id
+    async with httpx.AsyncClient() as client:
+        ctx = _FetchContext(client)
 
-    # reservation -> {"removes": [...], "adds": [...]} of membership op dicts.
-    by_res: dict[str, dict[str, list[dict]]] = {}
-    unresolved_ids: set[uuid.UUID] = set()
-    for row in rows:
-        if row.id in superseded_ids:
-            continue
-        res_str = str(row.reservation_id)
-        if row.intended == "RELEASED":
+        # Build-intent revalidation (issue #491), BEFORE re-resolution so no allocation
+        # is minted for dead intent. blocked_build_ids collects every build row that
+        # must not be driven this tick: parked stale rows, directly-released nil rows,
+        # and every build row of a reservation whose intent could not be verified.
+        build_rows_by_res: dict[str, list[L2PortAssignment]] = {}
+        for row in rows:
+            if row.id in superseded_ids or row.intended == "RELEASED":
+                continue
+            build_rows_by_res.setdefault(str(row.reservation_id), []).append(row)
+
+        blocked_build_ids: set[uuid.UUID] = set()
+        for res_str, res_rows in build_rows_by_res.items():
+            try:
+                wires = await _fetch_fork_intended_wires(res_str, client)
+                intended_l2 = await _derive_l2_memberships(wires, ctx)
+            except TransientUpstreamError as exc:
+                logger.warning(
+                    "wiring retry: cannot verify build intent for reservation %s (%s); "
+                    "%d L2 build row(s) not driven this tick (unverifiable intent "
+                    "never drives hardware, issue #491)",
+                    res_str,
+                    exc,
+                    len(res_rows),
+                )
+                blocked_build_ids.update(row.id for row in res_rows)
+                continue
+            for row in res_rows:
+                if (str(row.switch_device_id), row.port) in intended_l2:
+                    continue
+                blocked_build_ids.add(row.id)
+                if _add_needs_resolution(row):
+                    # Nil or dangling allocation: no VLAN number to remove and no
+                    # driver call ever happened for this join; settle directly.
+                    async with get_db_session() as db:
+                        await release_l2_membership(
+                            db, row.reservation_id, row.switch_device_id, row.port
+                        )
+                    logger.warning(
+                        "wiring retry: build intent gone for reservation %s switch %s "
+                        "port %s with no resolvable allocation; released directly "
+                        "with no driver call (issue #491)",
+                        res_str,
+                        row.switch_device_id,
+                        row.port,
+                    )
+                else:
+                    async with get_db_session() as db:
+                        await park_stale_l2_build(db, row.id, WIRING_STALE_BUILD_REASON)
+
+        # Re-resolve allocations per reservation for the add rows that need it, so the
+        # retry never drives add_to_vlan against the nil/vlan-0 placeholder.
+        resolve_targets: dict[str, set[tuple[str, str]]] = {}
+        for row in rows:
+            if row.id in superseded_ids or row.id in blocked_build_ids:
+                continue
+            if _add_needs_resolution(row):
+                resolve_targets.setdefault(str(row.reservation_id), set()).add(
+                    (str(row.switch_device_id), row.port)
+                )
+        resolved: dict[str, dict[str, tuple[uuid.UUID, int]]] = {}
+        for res_str, targets in resolve_targets.items():
+            alloc = await _resolve_add_allocations(res_str, targets, get_db_session)
+            resolved[res_str] = alloc
+            # Fold the freshly-resolved VLAN numbers into the read-back map so a healed
+            # row's outcome reports its real VLAN, not None.
+            for va_id, vlan_id in alloc.values():
+                vlan_by_va[va_id] = vlan_id
+
+        # reservation -> {"removes": [...], "adds": [...]} of membership op dicts.
+        by_res: dict[str, dict[str, list[dict]]] = {}
+        unresolved_ids: set[uuid.UUID] = set()
+        for row in rows:
+            if row.id in superseded_ids or row.id in blocked_build_ids:
+                continue
+            res_str = str(row.reservation_id)
+            if row.intended == "RELEASED":
+                entry = {
+                    "switch_device_id": str(row.switch_device_id),
+                    "port": row.port,
+                    "vlan_assignment_id": row.vlan_assignment_id,
+                    "vlan_id": vlan_by_va.get(row.vlan_assignment_id, 0),
+                }
+                by_res.setdefault(res_str, {"removes": [], "adds": []})["removes"].append(entry)
+                continue
+
+            if _add_needs_resolution(row):
+                alloc = resolved.get(res_str, {}).get(str(row.switch_device_id))
+                if alloc is None:
+                    # Re-resolution failed again: do NOT drive the driver against a bad
+                    # VLAN. Re-park FAILED with the (non-retryable) no-allocation reason
+                    # so recovery is a re-save, and report still_failed on read-back.
+                    unresolved_ids.add(row.id)
+                    async with get_db_session() as db:
+                        await record_l2_failed(
+                            db,
+                            row.reservation_id,
+                            None,
+                            row.switch_device_id,
+                            row.port,
+                            1,
+                            f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation for fabric",
+                            intended="ACTIVE",
+                        )
+                    continue
+                va_id, vlan_id = alloc
+            else:
+                va_id = row.vlan_assignment_id
+                vlan_id = vlan_by_va[row.vlan_assignment_id]
+
             entry = {
                 "switch_device_id": str(row.switch_device_id),
                 "port": row.port,
-                "vlan_assignment_id": row.vlan_assignment_id,
-                "vlan_id": vlan_by_va.get(row.vlan_assignment_id, 0),
+                "vlan_assignment_id": va_id,
+                "vlan_id": vlan_id,
             }
-            by_res.setdefault(res_str, {"removes": [], "adds": []})["removes"].append(entry)
-            continue
+            by_res.setdefault(res_str, {"removes": [], "adds": []})["adds"].append(entry)
 
-        if _add_needs_resolution(row):
-            alloc = resolved.get(res_str, {}).get(str(row.switch_device_id))
-            if alloc is None:
-                # Re-resolution failed again: do NOT drive the driver against a bad VLAN.
-                # Re-park FAILED with the (non-retryable) no-allocation reason so recovery
-                # is a re-save, and report still_failed on read-back.
-                unresolved_ids.add(row.id)
-                async with get_db_session() as db:
-                    await record_l2_failed(
-                        db,
-                        row.reservation_id,
-                        None,
-                        row.switch_device_id,
-                        row.port,
-                        1,
-                        f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation for fabric",
-                        intended="ACTIVE",
-                    )
-                continue
-            va_id, vlan_id = alloc
-        else:
-            va_id = row.vlan_assignment_id
-            vlan_id = vlan_by_va[row.vlan_assignment_id]
-
-        entry = {
-            "switch_device_id": str(row.switch_device_id),
-            "port": row.port,
-            "vlan_assignment_id": va_id,
-            "vlan_id": vlan_id,
-        }
-        by_res.setdefault(res_str, {"removes": [], "adds": []})["adds"].append(entry)
-
-    async with httpx.AsyncClient() as client:
-        ctx = _FetchContext(client)
         for res_str, sets in by_res.items():
             await _apply_l2_memberships(res_str, sets["removes"], sets["adds"], ctx, get_db_session)
         if superseded_va_ids:
@@ -481,8 +619,26 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     reconfigures or removes this reservation's pinned routes. A stale release therefore
     cannot strip a newer reservation's live state the way a re-fired L1/L2 port op could,
     so there is nothing for a supersession guard to settle. See the module note below.
+
+    Build-intent revalidation (issue #491), the _reattempt_rows analogue: before any
+    BUILD-direction (provision) row is driven, cabling's CURRENT intended set is
+    fetched once per reservation and the row's switch is checked against the adjacency
+    derived exactly as the reconcile derives it (_derive_l3_adjacency). A row whose
+    switch is no longer adjacent is NOT driven: it is parked FAILED intended RELEASED
+    (WIRING_STALE_BUILD_REASON, attempts reset) so the release-direction channels
+    remove the pinned set verbatim (the #20 discipline), and it reads back
+    "still_failed" this tick. A fetch failure drives NOTHING build-direction for that
+    reservation this tick (fail-closed, issue #460); release-direction rows are
+    unaffected.
     """
-    from app.services.nats_consumer import _apply_l3_adjacency, _FetchContext
+    from app.services.nats_consumer import (
+        WIRING_STALE_BUILD_REASON,
+        TransientUpstreamError,
+        _apply_l3_adjacency,
+        _derive_l3_adjacency,
+        _fetch_fork_intended_wires,
+        _FetchContext,
+    )
 
     if not rows:
         return []
@@ -490,15 +646,47 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     retry_ids: list[uuid.UUID] = [row.id for row in rows]
 
     # reservation -> {"deprovisions": [...], "provisions": [...]} of {device_id, routes}.
+    # Deprovisions group up front; provisions are revalidated first (issue #491), so
+    # build rows are kept whole per reservation until their intent is confirmed.
     by_res: dict[str, dict[str, list[dict]]] = {}
+    build_rows_by_res: dict[str, list[RouteAssignment]] = {}
     for row in rows:
         res_str = str(row.reservation_id)
-        entry = {"device_id": str(row.device_id), "routes": row.routes or []}
-        bucket = "deprovisions" if row.intended == "RELEASED" else "provisions"
-        by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[bucket].append(entry)
+        if row.intended == "RELEASED":
+            entry = {"device_id": str(row.device_id), "routes": row.routes or []}
+            by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[
+                "deprovisions"
+            ].append(entry)
+        else:
+            build_rows_by_res.setdefault(res_str, []).append(row)
 
     async with httpx.AsyncClient() as client:
         ctx = _FetchContext(client)
+
+        for res_str, res_rows in build_rows_by_res.items():
+            try:
+                wires = await _fetch_fork_intended_wires(res_str, client)
+                intended_adjacency = await _derive_l3_adjacency(wires, ctx)
+            except TransientUpstreamError as exc:
+                logger.warning(
+                    "wiring retry: cannot verify build intent for reservation %s (%s); "
+                    "%d L3 build row(s) not driven this tick (unverifiable intent "
+                    "never drives hardware, issue #491)",
+                    res_str,
+                    exc,
+                    len(res_rows),
+                )
+                continue
+            for row in res_rows:
+                if str(row.device_id) not in intended_adjacency:
+                    async with get_db_session() as db:
+                        await park_stale_route_build(db, row.id, WIRING_STALE_BUILD_REASON)
+                    continue
+                entry = {"device_id": str(row.device_id), "routes": row.routes or []}
+                by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[
+                    "provisions"
+                ].append(entry)
+
         for res_str, sets in by_res.items():
             await _apply_l3_adjacency(
                 res_str, sets["deprovisions"], sets["provisions"], ctx, get_db_session

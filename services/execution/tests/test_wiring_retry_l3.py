@@ -58,11 +58,13 @@ def _db_session_factory():
 
 SW_L3 = str(uuid.uuid4())
 SW_L3_B = str(uuid.uuid4())
+SW_L1 = str(uuid.uuid4())
+DUT = str(uuid.uuid4())
 DRIVER_ID = str(uuid.uuid4())
 RES_ID = str(uuid.uuid4())
 
 
-def _switch_data(device_id):
+def _switch_data(device_id, ctype="Layer 3 Switch"):
     return {
         "id": device_id,
         "name": "L3",
@@ -70,15 +72,41 @@ def _switch_data(device_id):
         "driver_id": DRIVER_ID,
         "driver_sha256": "sha",
         "driver_filename": "driver.zip",
-        "connection_type": "Layer 3 Switch",
+        "connection_type": ctype,
         "field_data": {"ip": "10.0.0.1"},
     }
 
 
 SWITCH_DATA = _switch_data(SW_L3)
-SWITCHES = {SW_L3: SWITCH_DATA, SW_L3_B: _switch_data(SW_L3_B)}
+SWITCHES = {
+    SW_L3: SWITCH_DATA,
+    SW_L3_B: _switch_data(SW_L3_B),
+    SW_L1: _switch_data(SW_L1, ctype="Layer 1 Switch"),
+}
 TEMPLATE_DATA = {"id": "tmpl-1", "name": "L3 Template", "sections": []}
 SUCCESS_RESULT = {"success": True, "output": {"result": True}, "error": None, "duration_ms": 5}
+
+
+def _fork_wire(device_a, port_a, device_b, port_b, edge_key=None):
+    return {
+        "device_a_id": device_a,
+        "port_a": port_a,
+        "device_b_id": device_b,
+        "port_b": port_b,
+        "layer": "L1",
+        "physical_connection_id": None,
+        "edge_key": edge_key,
+    }
+
+
+# The build-intent revalidation (issue #491) fetches cabling's intended set before any
+# build-direction reattempt; the default fork keeps every seeded build intended: SW_L3
+# adjacency plus an (a1, a2) L1 pair on SW_L1 for the mixed-batch test.
+DEFAULT_FORK_WIRES = [
+    _fork_wire(DUT, "eth0", SW_L3, "ge-0/0/1"),
+    _fork_wire(str(uuid.uuid4()), "eth0", SW_L1, "a1", edge_key="e1"),
+    _fork_wire(SW_L1, "a2", str(uuid.uuid4()), "eth0", edge_key="e1"),
+]
 
 PINNED = [
     {"destination": "10.0.0.0/24", "next_hop": "192.168.1.1", "interface": "eth0"},
@@ -101,9 +129,13 @@ def _recorder(fail=None):
     return execute_fn, calls
 
 
-def _patches(execute_fn):
+def _patches(execute_fn, fork_wires=None):
     async def _device(device_id, client=None):
-        return SWITCHES.get(str(device_id))
+        found = SWITCHES.get(str(device_id))
+        if found is not None:
+            return found
+        # Wire far ends resolve as plain servers so the revalidation derivations work.
+        return {"id": str(device_id), "name": "dut", "connection_type": "Server", "field_data": {}}
 
     # The switch config is EDITED out from under the pin: any retry that re-derives from
     # config (a bug) would drive CURRENT_CONFIG, which the assertions catch.
@@ -121,6 +153,10 @@ def _patches(execute_fn):
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=DEFAULT_FORK_WIRES if fork_wires is None else fork_wires),
+        ),
     ]:
         stack.enter_context(p)
     return stack
@@ -271,7 +307,7 @@ async def test_tick_labels_layers_and_counts_l3(monkeypatch):
         s.add(
             L1ConnectionAssignment(
                 reservation_id=uuid.UUID(RES_ID),
-                switch_device_id=uuid.UUID(SW_L3),
+                switch_device_id=uuid.UUID(SW_L1),
                 port_a="a1",
                 port_b="a2",
                 status="FAILED",
@@ -291,3 +327,63 @@ async def test_tick_labels_layers_and_counts_l3(monkeypatch):
     assert stats["l3_rows_retried"] == 1
     assert stats["rows_retried"] == 2
     assert stats["reconnected"] == 2
+
+
+# --- Build-intent revalidation before a build retry (issue #491) ---
+
+
+async def test_l3_build_intent_gone_parks_and_makes_no_driver_call():
+    from app.services.nats_consumer import WIRING_STALE_BUILD_REASON
+
+    rid = await _seed_l3_failed("ACTIVE", attempts=3)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, fork_wires=[]):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert calls == [], "no driver call for a provision whose adjacency is gone"
+    row = await _l3_row(rid)
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED", "the direction flipped to the release channel"
+    assert row.attempts == 0, "attempts reset: the release direction has not failed yet"
+    assert row.last_error == WIRING_STALE_BUILD_REASON
+    assert row.routes == PINNED, "the pinned set survives the park verbatim (issue #20)"
+    assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_l3_parked_stale_provision_settles_through_remove_on_next_pass():
+    """The #479 chain shape for L3: pass 1 parks the stale provision; pass 2 drives
+    remove_route for the PINNED set verbatim and the row converges RELEASED."""
+    rid = await _seed_l3_failed("ACTIVE", attempts=3)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, fork_wires=[]):
+        await reattempt_reservation(RES_ID, _db_session_factory())
+    with _patches(execute_fn, fork_wires=[]):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    removed = {d for a, d in calls if a == "remove_route"}
+    assert removed == {"10.0.0.0/24", "10.1.0.0/24"}, "the PINNED set, never re-derived"
+    assert not any(a == "configure_route" for a, _d in calls)
+    row = await _l3_row(rid)
+    assert row.status == "RELEASED"
+    assert result["results"][0]["outcome"] == "released"
+
+
+async def test_l3_fetch_failure_leaves_build_row_untouched():
+    from app.services.nats_consumer import TransientUpstreamError
+
+    rid = await _seed_l3_failed("ACTIVE", attempts=3)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn):
+        with patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(side_effect=TransientUpstreamError("cabling down")),
+        ):
+            result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert calls == [], "unverifiable intent never drives hardware"
+    row = await _l3_row(rid)
+    assert row.status == "FAILED"
+    assert row.intended == "ACTIVE", "an unverifiable row is left untouched, not parked"
+    assert row.attempts == 3
+    assert row.last_error == "boom"
+    assert result["results"][0]["outcome"] == "still_failed"

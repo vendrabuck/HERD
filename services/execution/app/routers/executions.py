@@ -632,7 +632,10 @@ async def internal_wiring_retry(
     accumulating attempts/last_error on a repeat failure. A row whose reason is a pinned
     unresolvable/not-a-simple-chain intent is reported "not_retryable" without a driver
     call (Decision 5). A frozen reservation refuses retry (409). An upstream resolve
-    failure (inventory/cabling 5xx) maps to 503.
+    failure during the APPLY (inventory/cabling 5xx) maps to 503; a failure of the
+    build-intent revalidation fetch (issue #491) instead fails closed per row, which
+    is reported "still_failed" with nothing driven, so the endpoint stays usable for
+    the release-direction rows.
 
     Runs against fresh sessions (the driver apply opens its own), so it does not use the
     request-scoped db handle.

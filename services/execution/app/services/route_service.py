@@ -484,6 +484,40 @@ async def release_route_membership(
     return row
 
 
+async def park_stale_route_build(
+    db: AsyncSession,
+    assignment_id: uuid.UUID,
+    reason: str,
+) -> RouteAssignment | None:
+    """Flip a FAILED intended-ACTIVE route pin to intended RELEASED: its intent is gone.
+
+    Issue #491, the park_stale_l1_build mirror for L3: the switch this provision was
+    targeting is no longer in cabling's intended adjacency set, so the provision must
+    never be reattempted. The row stays FAILED, flips to intended RELEASED (which
+    route_needs_remove admits) and the release-direction channels drive remove_route for
+    the PINNED set verbatim (issue #20), settling whatever the failed provision may have
+    half-applied. attempts RESET to 0 (the #479 rationale: the release direction has not
+    failed yet). A row no longer FAILED is left untouched (ACTIVE: a concurrent writer
+    won, the #412 discipline; RELEASED: already settled).
+    """
+    result = await db.execute(select(RouteAssignment).where(RouteAssignment.id == assignment_id))
+    row = result.scalar_one_or_none()
+    if row is None or row.status != "FAILED":
+        return row
+    row.intended = "RELEASED"
+    row.attempts = 0
+    row.last_error = reason
+    await db.commit()
+    logger.warning(
+        "Build intent gone for L3 route pin %s (switch %s, reservation %s); "
+        "parked FAILED intended RELEASED for the release-direction channels",
+        row.id,
+        row.device_id,
+        row.reservation_id,
+    )
+    return row
+
+
 async def is_route_active(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,

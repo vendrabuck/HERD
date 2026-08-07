@@ -380,6 +380,43 @@ async def record_l2_failed(
     return row
 
 
+async def park_stale_l2_build(
+    db: AsyncSession,
+    assignment_id: uuid.UUID,
+    reason: str,
+) -> L2PortAssignment | None:
+    """Flip a FAILED intended-ACTIVE membership to intended RELEASED: its intent is gone.
+
+    Issue #491, the park_stale_l1_build mirror: the (switch, port) this join was trying
+    to establish is no longer in cabling's intended membership set, so the join must
+    never be reattempted. The row stays FAILED, flips to intended RELEASED (which
+    membership_needs_remove admits) and the release-direction channels drive the
+    idempotent remove_from_vlan against the row's recorded allocation. attempts RESET to
+    0 (the #479 rationale: the release direction has not failed yet). A row no longer
+    FAILED is left untouched (ACTIVE: a concurrent writer won, the #412 discipline;
+    RELEASED: already settled). Callers must NOT park a nil-allocation row through here:
+    with no resolvable VLAN number there is nothing for the release channel to drive, so
+    such rows are settled directly via release_l2_membership instead.
+    """
+    result = await db.execute(select(L2PortAssignment).where(L2PortAssignment.id == assignment_id))
+    row = result.scalar_one_or_none()
+    if row is None or row.status != "FAILED":
+        return row
+    row.intended = "RELEASED"
+    row.attempts = 0
+    row.last_error = reason
+    await db.commit()
+    logger.warning(
+        "Build intent gone for L2 membership %s (switch %s port %s, reservation %s); "
+        "parked FAILED intended RELEASED for the release-direction channels",
+        row.id,
+        row.switch_device_id,
+        row.port,
+        row.reservation_id,
+    )
+    return row
+
+
 async def is_membership_active(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,

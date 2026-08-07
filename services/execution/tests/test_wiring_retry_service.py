@@ -20,7 +20,9 @@ from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services.nats_consumer import (
     WIRING_NOT_SIMPLE_CHAIN_REASON,
+    WIRING_STALE_BUILD_REASON,
     WIRING_UNRESOLVABLE_REASON,
+    TransientUpstreamError,
 )
 from app.services.wiring_retry_service import (
     WiringReservationFrozen,
@@ -86,6 +88,52 @@ SWITCH_DATA = {
 TEMPLATE_DATA = {"id": "tmpl-1", "name": "L1 Template", "sections": []}
 SUCCESS_RESULT = {"success": True, "output": {"result": True}, "error": None, "duration_ms": 5}
 
+# The build-intent revalidation (issue #491) fetches cabling's intended set before any
+# build-direction reattempt, so the harness serves a fork whose wires cover every pair
+# the build tests seed; a stale-intent test passes its own (narrower) pair list.
+DEFAULT_FORK_PAIRS = [("0/0/1", "0/0/2"), ("0/0/3", "0/0/4")] + [
+    (f"0/0/{i}", f"0/1/{i}") for i in range(5)
+]
+
+
+def _wires_for_pairs(pairs, switch_id=SWITCH_ID):
+    """Recorded-hop wires whose chain-walk yields exactly `pairs` on the switch.
+
+    Each pair becomes one canvas edge (shared edge_key): DUT - switch:port_a and
+    switch:port_b - DUT, the two-hop shape the reconcile tests use. Far-end DUT ids
+    are unique per hop so endpoints never collide across edges.
+    """
+    wires = []
+    for pa, pb in pairs:
+        edge = str(uuid.uuid4())
+        wires.append(
+            {
+                "device_a_id": str(uuid.uuid4()),
+                "port_a": "eth0",
+                "device_b_id": switch_id,
+                "port_b": pa,
+                "layer": "L1",
+                "physical_connection_id": None,
+                "edge_key": edge,
+            }
+        )
+        wires.append(
+            {
+                "device_a_id": switch_id,
+                "port_a": pb,
+                "device_b_id": str(uuid.uuid4()),
+                "port_b": "eth0",
+                "layer": "L1",
+                "physical_connection_id": None,
+                "edge_key": edge,
+            }
+        )
+    return wires
+
+
+def _dut_data(device_id):
+    return {"id": str(device_id), "name": "dut", "connection_type": "Server", "field_data": {}}
+
 
 def _sandbox_recorder(fail_pairs=None):
     fail_pairs = fail_pairs or set()
@@ -102,10 +150,14 @@ def _sandbox_recorder(fail_pairs=None):
     return execute_fn, calls
 
 
-def _patches(execute_fn):
+def _patches(execute_fn, fork_pairs=None):
     async def _device(device_id, client=None):
-        return SWITCH_DATA if str(device_id) == SWITCH_ID else None
+        if str(device_id) == SWITCH_ID:
+            return SWITCH_DATA
+        # Wire far ends resolve as plain servers so the revalidation chain-walk works.
+        return _dut_data(device_id)
 
+    wires = _wires_for_pairs(DEFAULT_FORK_PAIRS if fork_pairs is None else fork_pairs)
     return [
         patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device)),
         patch(
@@ -113,6 +165,10 @@ def _patches(execute_fn):
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=wires),
+        ),
     ]
 
 
@@ -176,8 +232,8 @@ async def _rows(status=None):
     return [r for r in rows if status is None or r.status == status]
 
 
-async def _run_reattempt(execute_fn):
-    ps = _patches(execute_fn)
+async def _run_reattempt(execute_fn, fork_pairs=None):
+    ps = _patches(execute_fn, fork_pairs)
     for p in ps:
         p.start()
     try:
@@ -187,8 +243,8 @@ async def _run_reattempt(execute_fn):
             p.stop()
 
 
-async def _run_tick(execute_fn):
-    ps = _patches(execute_fn)
+async def _run_tick(execute_fn, fork_pairs=None):
+    ps = _patches(execute_fn, fork_pairs)
     for p in ps:
         p.start()
     try:
@@ -637,13 +693,14 @@ async def test_tick_build_racing_terminal_freeze_does_not_strand_active_row():
     frozen_landed = {}
 
     async def _device_then_freeze(device_id, client=None):
-        # The switch resolve is awaited after row selection and before the driver call:
-        # the deterministic seam for a freeze landing inside the in-flight window.
+        # The first device resolve (a revalidation wire endpoint since issue #491) is
+        # awaited after row selection and before the driver call: the deterministic
+        # seam for a freeze landing inside the in-flight window.
         if not frozen_landed:
             async with TestSessionLocal() as s:
                 await freeze_reservation_wiring(s, uuid.UUID(RES_ID))
             frozen_landed["done"] = True
-        return SWITCH_DATA if str(device_id) == SWITCH_ID else None
+        return SWITCH_DATA if str(device_id) == SWITCH_ID else _dut_data(device_id)
 
     execute_fn, calls = _sandbox_recorder()
     ps = [
@@ -656,6 +713,10 @@ async def test_tick_build_racing_terminal_freeze_does_not_strand_active_row():
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=_wires_for_pairs([("0/0/1", "0/0/2")])),
+        ),
     ]
     for p in ps:
         p.start()
@@ -696,3 +757,110 @@ async def test_parked_post_freeze_build_converges_released_on_next_tick():
     released = await _rows("RELEASED")
     assert [r.id for r in released] == [fid]
     assert stats["released"] == 1
+
+
+# --- Build-intent revalidation before a build retry (issue #491) --------------
+
+
+@pytest.mark.asyncio
+async def test_retry_build_intent_gone_parks_and_makes_no_build_call():
+    """A build row whose pair is absent from cabling's CURRENT intended set is never
+    driven: it parks FAILED intended RELEASED under the shared stale-build reason with
+    attempts reset, and reports still_failed (the row genuinely stays FAILED this tick;
+    its settlement rides the next release pass)."""
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=3)
+    execute_fn, calls = _sandbox_recorder()
+    result = await _run_reattempt(execute_fn, fork_pairs=[])
+
+    assert calls == [], "no driver call for a build whose intent is gone"
+    failed = await _rows("FAILED")
+    assert [r.id for r in failed] == [fid]
+    assert failed[0].intended == "RELEASED", "the direction flipped to the release channel"
+    assert failed[0].attempts == 0, "attempts reset: the release direction has not failed yet"
+    assert failed[0].last_error == WIRING_STALE_BUILD_REASON
+    assert is_retryable_failure(failed[0].last_error) is True, (
+        "the stale-build reason must ride the release-direction channels"
+    )
+    assert result["results"][0]["outcome"] == "still_failed"
+
+
+@pytest.mark.asyncio
+async def test_retry_mixed_intent_builds_present_pair_and_parks_absent_pair():
+    """One reservation, two build rows: the pair still in the intended set builds
+    normally, the pair that left it is parked with no driver call."""
+    keep_id = await _seed_failed("0/0/1", "0/0/2")
+    gone_id = await _seed_failed("0/0/3", "0/0/4")
+    execute_fn, calls = _sandbox_recorder()
+    result = await _run_reattempt(execute_fn, fork_pairs=[("0/0/1", "0/0/2")])
+
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    assert ("connect_ports", "0/0/3", "0/0/4") not in calls
+    outcomes = {r["id"]: r["outcome"] for r in result["results"]}
+    assert outcomes[str(keep_id)] == "reconnected"
+    assert outcomes[str(gone_id)] == "still_failed"
+    parked = {r.id: r for r in await _rows("FAILED")}
+    assert parked[gone_id].intended == "RELEASED"
+    assert parked[gone_id].last_error == WIRING_STALE_BUILD_REASON
+
+
+@pytest.mark.asyncio
+async def test_tick_fetch_failure_drives_nothing_for_that_reservation_only(monkeypatch):
+    """An intended-set fetch failure fails CLOSED for exactly that reservation: its
+    build rows are left untouched (no park, no driver call, still_failed), while other
+    reservations in the same batch retry normally (issue #460 philosophy)."""
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    blocked_id = await _seed_failed("0/0/1", "0/0/2", attempts=3)
+    other_id = await _seed_failed("0/0/3", "0/0/4", reservation_id=OTHER_RES_ID)
+
+    async def fork_fetch(reservation_id, client=None):
+        if str(reservation_id) == RES_ID:
+            raise TransientUpstreamError("cabling down")
+        return _wires_for_pairs([("0/0/3", "0/0/4")])
+
+    execute_fn, calls = _sandbox_recorder()
+    ps = _patches(execute_fn)
+    # Override the default fork patch with the per-reservation split (last start wins).
+    ps.append(
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(side_effect=fork_fetch),
+        )
+    )
+    for p in ps:
+        p.start()
+    try:
+        stats = await run_wiring_retry_tick(_db_session_factory())
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert ("connect_ports", "0/0/1", "0/0/2") not in calls
+    assert ("connect_ports", "0/0/3", "0/0/4") in calls
+    rows = {r.id: r for r in await _rows()}
+    blocked = rows[blocked_id]
+    assert blocked.status == "FAILED"
+    assert blocked.intended == "ACTIVE", "an unverifiable row is left untouched, not parked"
+    assert blocked.attempts == 3
+    assert blocked.last_error == "boom"
+    assert rows[other_id].status == "ACTIVE"
+    assert stats["still_failed"] == 1
+    assert stats["reconnected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_parked_stale_build_settles_through_release_on_a_later_pass():
+    """The #479 chain shape: pass 1 parks the stale build with no driver call; pass 2
+    sweeps the parked row in the RELEASE direction, the disconnect fires, and the row
+    converges RELEASED through the existing release machinery."""
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=3)
+    execute_fn, calls = _sandbox_recorder()
+    first = await _run_reattempt(execute_fn, fork_pairs=[])
+    assert first["results"][0]["outcome"] == "still_failed"
+    assert calls == []
+
+    second = await _run_reattempt(execute_fn, fork_pairs=[])
+    assert ("disconnect_ports", "0/0/1", "0/0/2") in calls
+    assert not any(a == "connect_ports" for a, _pa, _pb in calls)
+    released = await _rows("RELEASED")
+    assert [r.id for r in released] == [fid]
+    assert second["results"][0]["outcome"] == "released"

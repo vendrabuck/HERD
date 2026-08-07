@@ -688,6 +688,47 @@ async def record_l1_failed(
     return row
 
 
+async def park_stale_l1_build(
+    db: AsyncSession,
+    assignment_id: uuid.UUID,
+    reason: str,
+) -> L1ConnectionAssignment | None:
+    """Flip a FAILED intended-ACTIVE row to intended RELEASED: its build intent is gone.
+
+    Issue #491: the pair this build was trying to establish is no longer in cabling's
+    intended set (a fork re-save removed the connection), so the build must never be
+    reattempted. The row stays FAILED but flips to intended RELEASED so the
+    release-direction channels (which pair_needs_release now admits) drive the idempotent
+    disconnect that settles whatever the failed build may have half-applied. attempts
+    RESET to 0 (the #479 rationale, mirrored from _park_frozen_build: the release
+    direction has not failed yet, and a carried-over build count would push the pending
+    disconnect toward the auto-retry cap for no reason). A row no longer FAILED is left
+    untouched: ACTIVE means a concurrent writer proved the pair connects (the #412
+    discipline; the widened reconcile release settles it on a later pass), RELEASED means
+    it is already settled.
+    """
+    result = await db.execute(
+        select(L1ConnectionAssignment).where(L1ConnectionAssignment.id == assignment_id)
+    )
+    row = result.scalar_one_or_none()
+    if row is None or row.status != "FAILED":
+        return row
+    row.intended = "RELEASED"
+    row.attempts = 0
+    row.last_error = reason
+    await db.commit()
+    logger.warning(
+        "Build intent gone for L1 assignment %s (switch %s pair (%s, %s), reservation %s); "
+        "parked FAILED intended RELEASED for the release-direction channels",
+        row.id,
+        row.switch_device_id,
+        row.port_a,
+        row.port_b,
+        row.reservation_id,
+    )
+    return row
+
+
 def _row_get(row, name: str):
     if isinstance(row, dict):
         return row.get(name)

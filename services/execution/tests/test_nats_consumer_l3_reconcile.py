@@ -496,3 +496,53 @@ async def test_config_fetch_404_returns_none():
     client = AsyncMock()
     client.get = AsyncMock(return_value=_Resp())
     assert await _fetch_latest_config(SW_L3, client) is None
+
+
+# --- Stale-intent settlement in the full reconcile (issue #491) ---
+
+
+async def _seed_l3_failed(*, routes=None, attempts=2, err="boom"):
+    async with TestSessionLocal() as db:
+        row = await record_route_failed(
+            db,
+            RES_ID,
+            SW_L3,
+            routes if routes is not None else ROUTES,
+            attempts,
+            err,
+            intended="ACTIVE",
+        )
+        return row.id
+
+
+async def test_reconcile_settles_stale_failed_provision_through_remove():
+    """A FAILED intended-ACTIVE pin whose switch left the intended adjacency rides the
+    deprovision path: remove_route drives the PINNED set verbatim and the row lands
+    RELEASED (issue #491)."""
+    rid = await _seed_l3_failed()
+    calls = await _reconcile([])
+
+    removed = {d for a, d in calls if a == "remove_route"}
+    assert removed == {"10.0.0.0/24", "10.1.0.0/24"}, "exactly the pinned set was removed"
+    assert not any(a == "configure_route" for a, _d in calls), (
+        "a stale provision must never be rebuilt"
+    )
+    released = await _rows("RELEASED")
+    assert [r.id for r in released] == [rid], "the same row settled RELEASED in place"
+    assert await _rows("FAILED") == []
+
+
+async def test_reconcile_still_rebuilds_failed_provision_that_is_still_intended():
+    """The asymmetry pin (issue #491): the deprovision diff is widened with FAILED
+    intended-ACTIVE pins, but the ADD diff keeps comparing intended against ACTIVE rows
+    only, so a failed provision whose switch is STILL adjacent is rebuilt (with its
+    pinned set, issue #20), never deprovisioned."""
+    rid = await _seed_l3_failed()
+    calls = await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")])
+
+    dests = {d for a, d in calls if a == "configure_route"}
+    assert dests == {"10.0.0.0/24", "10.1.0.0/24"}
+    assert not any(a == "remove_route" for a, _d in calls)
+    active = await _rows("ACTIVE")
+    assert [r.id for r in active] == [rid], "the FAILED row flipped ACTIVE in place"
+    assert await _rows("FAILED") == []

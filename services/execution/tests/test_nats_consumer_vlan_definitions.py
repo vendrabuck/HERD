@@ -287,8 +287,10 @@ async def test_create_failure_retry_defines_then_joins():
     await _reconcile([_wire(DUT1, "eth0", SW_L2, "0/0/1")], execute_fn=execute_fn, calls=calls)
 
     retry_fn, retry_calls = _recorder()
+    # The retry's build-intent revalidation (issue #491) reads the fork, so the intended
+    # wires must still carry the membership or the reattempt would (correctly) park it.
     with ExitStack() as stack:
-        for p in _patches(retry_fn, []):
+        for p in _patches(retry_fn, [_wire(DUT1, "eth0", SW_L2, "0/0/1")]):
             stack.enter_context(p)
         result = await reattempt_reservation(RES_ID, _db_session_factory())
 
