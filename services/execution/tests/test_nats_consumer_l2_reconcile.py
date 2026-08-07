@@ -396,3 +396,92 @@ async def test_allocation_falls_back_when_fabric_lookup_fails():
     assert len(allocations) == 1
     assert allocations[0].fabric_id == uuid.uuid5(uuid.NAMESPACE_DNS, SW_L2)
     assert (SW_L2, "0/0/1") in await _active_memberships()
+
+
+# --- Stale-intent settlement in the full reconcile (issue #491) ---
+
+
+async def _seed_alloc(vlan_id=100):
+    async with TestSessionLocal() as s:
+        va = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=vlan_id,
+            switch_device_ids=[SW_L2],
+            defined_switch_ids=[],
+            status="ACTIVE",
+        )
+        s.add(va)
+        await s.commit()
+        await s.refresh(va)
+        return va.id
+
+
+async def _seed_l2_failed(port, va_id, *, intended="ACTIVE", attempts=2, err="boom"):
+    async with TestSessionLocal() as s:
+        row = L2PortAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            vlan_assignment_id=va_id,
+            switch_device_id=uuid.UUID(SW_L2),
+            port=port,
+            status="FAILED",
+            intended=intended,
+            attempts=attempts,
+            last_error=err,
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        return row.id
+
+
+async def _l2_rows(status=None):
+    async with TestSessionLocal() as s:
+        rows = (await s.execute(select(L2PortAssignment))).scalars().all()
+    return [r for r in rows if status is None or r.status == status]
+
+
+async def test_reconcile_settles_stale_failed_join_through_remove():
+    """A FAILED intended-ACTIVE membership whose (switch, port) left the intended set
+    rides the remove path: remove_from_vlan drives with the row's recorded VLAN and the
+    row lands RELEASED (issue #491)."""
+    va = await _seed_alloc()
+    rid = await _seed_l2_failed("0/0/7", va)
+    calls = await _reconcile([])
+
+    assert ("remove_from_vlan", "0/0/7", 100) in calls
+    assert not any(a == "add_to_vlan" for a, _p, _v in calls), "a stale join must never be rebuilt"
+    released = await _l2_rows("RELEASED")
+    assert [r.id for r in released] == [rid], "the same row settled RELEASED in place"
+    assert await _l2_rows("FAILED") == []
+
+
+async def test_reconcile_still_rebuilds_failed_join_that_is_still_intended():
+    """The asymmetry pin (issue #491): the remove diff is widened with FAILED
+    intended-ACTIVE rows, but the ADD diff keeps comparing intended against ACTIVE rows
+    only, so a failed join whose port is STILL intended is rebuilt, never removed."""
+    va = await _seed_alloc()
+    rid = await _seed_l2_failed("0/0/1", va)
+    calls = await _reconcile([_wire(DUT1, "eth0", SW_L2, "0/0/1")])
+
+    actions = [(a, p) for a, p, _v in calls]
+    assert ("add_to_vlan", "0/0/1") in actions
+    assert ("remove_from_vlan", "0/0/1") not in actions
+    active = await _l2_rows("ACTIVE")
+    assert [r.id for r in active] == [rid], "the FAILED row flipped ACTIVE in place"
+    assert await _l2_rows("FAILED") == []
+
+
+async def test_reconcile_stale_nil_allocation_join_flips_released_with_no_driver_call():
+    """A stale FAILED intended-ACTIVE row holding the nil-UUID allocation placeholder
+    has no VLAN number to drive remove_from_vlan against, and the nil allocation proves
+    the build never reached the driver, so it flips RELEASED directly (issue #491)."""
+    rid = await _seed_l2_failed(
+        "0/0/7", uuid.UUID(int=0), attempts=0, err="recorded hop unresolvable: no VLAN allocation"
+    )
+    calls = await _reconcile([])
+
+    assert calls == [], "no driver call may settle a nil-allocation stale join"
+    released = await _l2_rows("RELEASED")
+    assert [r.id for r in released] == [rid]
+    assert await _l2_rows("FAILED") == []

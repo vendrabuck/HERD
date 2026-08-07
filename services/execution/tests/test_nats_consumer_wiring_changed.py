@@ -944,3 +944,95 @@ async def test_fork_fetch_403_naks_heal_and_preserves_wiring():
         "the live wiring must survive an unreadable intended set"
     )
     assert await _last_applied() == 0, "the version must not stamp, so the heal re-stages"
+
+
+# --- Stale-intent settlement in the full reconcile (issue #491) ---------------
+
+
+async def _seed_failed(port_a, port_b, *, intended="ACTIVE", attempts=2, last_error="boom"):
+    async with TestSessionLocal() as s:
+        row = L1ConnectionAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            switch_device_id=uuid.UUID(SWITCH_ID),
+            port_a=port_a,
+            port_b=port_b,
+            status="FAILED",
+            intended=intended,
+            attempts=attempts,
+            last_error=last_error,
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        return row.id
+
+
+@pytest.mark.asyncio
+async def test_full_reconcile_settles_stale_failed_build_through_release():
+    """A FAILED intended-ACTIVE row whose pair is NOT in the intended set (a fork
+    re-save removed the wiring while the build sat FAILED) rides the release path: the
+    idempotent disconnect is driven and the row lands RELEASED (issue #491)."""
+    fid = await _seed_failed("0/0/1", "0/0/2")
+    execute_fn, calls = _sandbox_recorder()
+    # Delta-less heal at any version takes the full-reconcile path; the intended set is
+    # empty, so the stale build must be settled, not rebuilt.
+    await _run(_event(1, released=None, built=None), execute_fn, fork_wires=[])
+
+    assert ("disconnect_ports", "0/0/1", "0/0/2") in calls
+    assert not any(a == "connect_ports" for a, _pa, _pb in calls), (
+        "a stale build must never be rebuilt"
+    )
+    released = await _assignments("RELEASED")
+    assert [r.id for r in released] == [fid], "the same row settled RELEASED in place"
+    assert released[0].intended == "RELEASED"
+    assert await _assignments("FAILED") == []
+
+
+@pytest.mark.asyncio
+async def test_full_reconcile_still_rebuilds_failed_build_that_is_still_intended():
+    """The asymmetry pin (issue #491): the release diff is widened with FAILED
+    intended-ACTIVE rows, but the BUILD diff keeps comparing desired against ACTIVE
+    rows only, so a failed build whose pair is STILL in the intended set is rebuilt by
+    the full reconcile, never released."""
+    fid = await _seed_failed("0/0/1", "0/0/2")
+    execute_fn, calls = _sandbox_recorder()
+    await _run(_event(1, released=None, built=None), execute_fn, fork_wires=PAIR_12)
+
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    assert not any(a == "disconnect_ports" for a, _pa, _pb in calls)
+    active = await _assignments("ACTIVE")
+    assert [r.id for r in active] == [fid], "the FAILED row flipped ACTIVE in place"
+    assert await _assignments("FAILED") == []
+
+
+@pytest.mark.asyncio
+async def test_stale_build_release_failure_parks_failed_intended_released_retryable():
+    """When the settlement disconnect itself fails, the stale row parks FAILED intended
+    RELEASED with a retryable reason, so the release-direction channels finish the job."""
+    from app.services.wiring_retry_service import is_retryable_failure
+
+    fid = await _seed_failed("0/0/1", "0/0/2")
+    execute_fn, calls = _sandbox_recorder(fail_pairs={frozenset({"0/0/1", "0/0/2"})})
+    await _run(_event(1, released=None, built=None), execute_fn, fork_wires=[])
+
+    assert ("disconnect_ports", "0/0/1", "0/0/2") in calls
+    failed = await _assignments("FAILED")
+    assert [r.id for r in failed] == [fid]
+    assert failed[0].intended == "RELEASED"
+    assert is_retryable_failure(failed[0].last_error) is True
+
+
+@pytest.mark.asyncio
+async def test_stale_pinned_reason_build_row_is_not_release_driven():
+    """A FAILED intended-ACTIVE row parked with a pinned verbatim-apply reason is NOT
+    widened into the release diff (issue #491 scoping): it never reached a driver, its
+    identity is a raw hop rather than a switch pair, and its recovery stays a re-save."""
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=0, last_error=WIRING_UNRESOLVABLE_REASON)
+    execute_fn, calls = _sandbox_recorder()
+    await _run(_event(1, released=None, built=None), execute_fn, fork_wires=[])
+
+    assert calls == [], "no driver call for a pinned-reason row"
+    failed = await _assignments("FAILED")
+    assert [r.id for r in failed] == [fid]
+    assert failed[0].intended == "ACTIVE"
+    assert failed[0].last_error == WIRING_UNRESOLVABLE_REASON

@@ -55,6 +55,8 @@ def _db_session_factory():
 
 
 SW_L2 = str(uuid.uuid4())
+SW_L1 = str(uuid.uuid4())
+DUT = str(uuid.uuid4())
 DRIVER_ID = str(uuid.uuid4())
 RES_ID = str(uuid.uuid4())
 OTHER_RES = str(uuid.uuid4())
@@ -70,8 +72,31 @@ SWITCH_DATA = {
     "connection_type": "Layer 2 Switch",
     "field_data": {"ip": "10.0.0.1"},
 }
+L1_SWITCH_DATA = {**SWITCH_DATA, "id": SW_L1, "name": "L1", "connection_type": "Layer 1 Switch"}
 TEMPLATE_DATA = {"id": "tmpl-1", "name": "L2 Template", "sections": []}
 SUCCESS_RESULT = {"success": True, "output": {"result": True}, "error": None, "duration_ms": 5}
+
+
+def _fork_wire(device_a, port_a, device_b, port_b, edge_key=None):
+    return {
+        "device_a_id": device_a,
+        "port_a": port_a,
+        "device_b_id": device_b,
+        "port_b": port_b,
+        "layer": "L1",
+        "physical_connection_id": None,
+        "edge_key": edge_key,
+    }
+
+
+# The build-intent revalidation (issue #491) fetches cabling's intended set before any
+# build-direction reattempt; the default fork keeps every seeded build intended: the
+# (SW_L2, 0/0/1) membership plus an (a1, a2) L1 pair on SW_L1 for the mixed-batch test.
+DEFAULT_FORK_WIRES = [
+    _fork_wire(DUT, "eth0", SW_L2, "0/0/1"),
+    _fork_wire(str(uuid.uuid4()), "eth0", SW_L1, "a1", edge_key="e1"),
+    _fork_wire(SW_L1, "a2", str(uuid.uuid4()), "eth0", edge_key="e1"),
+]
 
 
 def _recorder(fail=None):
@@ -88,9 +113,14 @@ def _recorder(fail=None):
     return execute_fn, calls
 
 
-def _patches(execute_fn):
+def _patches(execute_fn, fork_wires=None):
     async def _device(device_id, client=None):
-        return SWITCH_DATA if str(device_id) == SW_L2 else None
+        if str(device_id) == SW_L2:
+            return SWITCH_DATA
+        if str(device_id) == SW_L1:
+            return L1_SWITCH_DATA
+        # Wire far ends resolve as plain servers so the revalidation derivations work.
+        return {"id": str(device_id), "name": "dut", "connection_type": "Server", "field_data": {}}
 
     from contextlib import ExitStack
 
@@ -102,6 +132,10 @@ def _patches(execute_fn):
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=DEFAULT_FORK_WIRES if fork_wires is None else fork_wires),
+        ),
     ]:
         stack.enter_context(p)
     return stack
@@ -286,7 +320,7 @@ async def test_tick_labels_layers_and_counts_per_layer(monkeypatch):
         s.add(
             L1ConnectionAssignment(
                 reservation_id=uuid.UUID(RES_ID),
-                switch_device_id=uuid.UUID(SW_L2),
+                switch_device_id=uuid.UUID(SW_L1),
                 port_a="a1",
                 port_b="a2",
                 status="FAILED",
@@ -369,6 +403,97 @@ async def test_nil_allocation_build_retry_resolution_failure_makes_no_driver_cal
     assert row.status == "FAILED"
     assert row.attempts > 2, "attempts accumulate on the re-park"
     assert result["results"][0]["outcome"] == "still_failed"
+
+
+# --- Build-intent revalidation before a build retry (issue #491) ---
+
+
+async def test_l2_build_intent_gone_parks_and_makes_no_driver_call():
+    from app.services.nats_consumer import WIRING_STALE_BUILD_REASON
+
+    va = await _seed_alloc()
+    rid = await _seed_l2_failed("0/0/1", "ACTIVE", va, attempts=3)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, fork_wires=[]):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert calls == [], "no driver call for a join whose intent is gone"
+    row = await _l2_row(rid)
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED", "the direction flipped to the release channel"
+    assert row.attempts == 0, "attempts reset: the release direction has not failed yet"
+    assert row.last_error == WIRING_STALE_BUILD_REASON
+    assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_l2_parked_stale_join_settles_and_frees_allocation_on_next_pass():
+    """The #479 chain shape for L2: pass 1 parks the stale join; pass 2 drives the
+    remove_from_vlan with the row's recorded VLAN, the row converges RELEASED, and the
+    last-free releases the allocation."""
+    va = await _seed_alloc()
+    rid = await _seed_l2_failed("0/0/1", "ACTIVE", va, attempts=3)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, fork_wires=[]):
+        await reattempt_reservation(RES_ID, _db_session_factory())
+    with _patches(execute_fn, fork_wires=[]):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert ("remove_from_vlan", "0/0/1") in calls
+    assert not any(a == "add_to_vlan" for a, _p in calls)
+    row = await _l2_row(rid)
+    assert row.status == "RELEASED"
+    assert result["results"][0]["outcome"] == "released"
+    async with TestSessionLocal() as s:
+        va_row = await s.get(VlanAssignment, va)
+    assert va_row.status == "RELEASED", "the settled join was its allocation's last member"
+
+
+async def test_l2_nil_allocation_stale_build_flips_released_and_mints_no_allocation():
+    """A nil-allocation build row whose intent is gone is settled BEFORE re-resolution:
+    it flips RELEASED directly (no VLAN number exists to remove and the build provably
+    never reached the driver), with zero driver calls and NO allocation minted for the
+    dead intent (issue #491)."""
+    rid = await _seed_l2_failed("0/0/1", "ACTIVE", uuid.UUID(int=0), attempts=3)
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn, fork_wires=[]):
+        with patch("app.services.vlan_service.fetch_fabric_id", new=AsyncMock(return_value=FABRIC)):
+            result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert calls == [], "no driver call and no re-resolution for dead intent"
+    row = await _l2_row(rid)
+    assert row.status == "RELEASED"
+    assert result["results"][0]["outcome"] == "released"
+    async with TestSessionLocal() as s:
+        vas = (await s.execute(select(VlanAssignment))).scalars().all()
+    assert vas == [], "revalidation runs BEFORE re-resolution: no allocation is minted"
+
+
+async def test_l2_fetch_failure_blocks_builds_but_releases_still_run():
+    """An intended-set fetch failure fails closed for the build direction only: the
+    build row is left untouched and reports still_failed, while the same reservation's
+    release-direction row is still driven (issue #460 philosophy)."""
+    from app.services.nats_consumer import TransientUpstreamError
+
+    va = await _seed_alloc()
+    build_id = await _seed_l2_failed("0/0/1", "ACTIVE", va)
+    release_id = await _seed_l2_failed("0/0/2", "RELEASED", va)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn):
+        with patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(side_effect=TransientUpstreamError("cabling down")),
+        ):
+            result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert ("add_to_vlan", "0/0/1") not in calls
+    assert ("remove_from_vlan", "0/0/2") in calls
+    outcomes = {r["id"]: r["outcome"] for r in result["results"]}
+    assert outcomes[str(build_id)] == "still_failed"
+    assert outcomes[str(release_id)] == "released"
+    build_row = await _l2_row(build_id)
+    assert build_row.intended == "ACTIVE", "an unverifiable row is left untouched, not parked"
+    assert build_row.attempts == 3
+    assert build_row.last_error == "boom"
 
 
 async def test_superseded_settlement_undefines_provably_defined_vlan():

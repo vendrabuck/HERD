@@ -89,6 +89,14 @@ WIRING_UNRESOLVABLE_REASON = "recorded hop unresolvable"
 # the canvas edge, which the delta discards), so the reconcile refuses to guess and
 # fails those hops rather than risk a physical mis-cross-connect (ADR 0007 review).
 WIRING_NOT_SIMPLE_CHAIN_REASON = "hop set is not a simple chain"
+# Reason pinned when a FAILED build row's wiring is no longer in cabling's intended set
+# (issue #491): a fork re-save removed the connection while the build was parked FAILED,
+# so reattempting the build would wire hardware for intent that no longer exists. The row
+# is re-parked FAILED intended RELEASED (attempts reset, the #479 rationale: the release
+# direction has not failed yet) and the release-direction channels settle whatever the
+# failed build may have half-applied. Deliberately OUTSIDE wiring_retry_service's
+# _NON_RETRYABLE_PREFIXES so the auto channel sweeps it in the release direction.
+WIRING_STALE_BUILD_REASON = "build intent gone; pending release"
 
 
 async def _run_sandbox(*args, **kwargs):
@@ -2603,21 +2611,51 @@ async def _reconcile_l2_memberships(
     L1 reconcile keeps its verbatim delta semantics untouched; this runs after it so L2
     removes land after L1 builds (Decision 4 ordering).
     """
-    from app.services.l2_membership_service import active_memberships_for_reservation
+    from app.services.l2_membership_service import (
+        active_memberships_for_reservation,
+        failed_memberships_for_reservation,
+        park_stale_l2_build,
+        release_l2_membership,
+    )
 
     intended = await _derive_l2_memberships(intended_wires, ctx)
     definition_scope = await _derive_l2_definition_scope(intended_wires, ctx)
 
     async with get_db_session() as db:
         active_rows = await active_memberships_for_reservation(db, reservation_id)
+        failed_rows = await failed_memberships_for_reservation(db, reservation_id)
     current: dict[tuple[str, str], object] = {
         (str(row.switch_device_id), row.port): row for row in active_rows
     }
 
+    # Stale-build widening (issue #491): FAILED intended-ACTIVE memberships whose
+    # (switch, port) left the intended set join the REMOVE side so the failed join is
+    # settled instead of being rebuilt forever by the retry channel. The ADD diff below
+    # deliberately keeps comparing intended against ACTIVE rows ONLY: widening it would
+    # make a failed-but-still-intended membership look "current" and stop being rebuilt
+    # (the load-bearing asymmetry). Nil-allocation rows are widened regardless of their
+    # (non-retryable) parking reason: they provably never drove add_to_vlan, so their
+    # settlement is a direct flip below, never a driver call. Other pinned-reason rows
+    # (switch/template gone) stay parked: their recovery is a re-save.
+    _nil = uuid.UUID(int=0)
+    stale_rows = []
+    for row in failed_rows:
+        if row.intended != "ACTIVE":
+            continue
+        key = (str(row.switch_device_id), row.port)
+        if key in intended or key in current:
+            continue
+        nil_alloc = row.vlan_assignment_id is None or row.vlan_assignment_id == _nil
+        if not nil_alloc and (row.last_error or "").startswith(
+            (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
+        ):
+            continue
+        stale_rows.append(row)
+
     add_keys = intended - set(current.keys())
     remove_keys = set(current.keys()) - intended
 
-    if not add_keys and not remove_keys:
+    if not add_keys and not remove_keys and not stale_rows:
         # No membership delta, but the DEFINITION scope may still have changed (issue
         # #442): a re-wire can reroute through a new trunk-transit switch while every
         # terminal membership stays put. Refresh the stored scope on the reservation's
@@ -2669,6 +2707,11 @@ async def _reconcile_l2_memberships(
         )
 
     remove_alloc_ids = {current[key].vlan_assignment_id for key in remove_keys}
+    remove_alloc_ids.update(
+        row.vlan_assignment_id
+        for row in stale_rows
+        if row.vlan_assignment_id is not None and row.vlan_assignment_id != _nil
+    )
     vlan_by_alloc = await _vlan_ids_for(remove_alloc_ids, get_db_session)
     removes: list[dict] = []
     for switch_id, port in remove_keys:
@@ -2679,6 +2722,39 @@ async def _reconcile_l2_memberships(
                 "port": port,
                 "vlan_assignment_id": row.vlan_assignment_id,
                 "vlan_id": vlan_by_alloc.get(row.vlan_assignment_id, 0),
+            }
+        )
+
+    # Settle stale failed builds (issue #491). A row whose allocation resolves rides
+    # the normal remove path: direction flipped FIRST so membership_needs_remove admits
+    # it, then remove_from_vlan drives result-gated (success flips it RELEASED via
+    # release_l2_membership, which matches FAILED rows; failure re-parks it FAILED
+    # intended RELEASED for the retry channels). A nil-placeholder or dangling
+    # allocation has NO VLAN number to drive remove_from_vlan against, and a nil
+    # allocation proves the build never reached the driver, so such rows flip RELEASED
+    # directly with no driver call.
+    for row in stale_rows:
+        va_id = row.vlan_assignment_id
+        if va_id is None or va_id == _nil or va_id not in vlan_by_alloc:
+            async with get_db_session() as db:
+                await release_l2_membership(db, row.reservation_id, row.switch_device_id, row.port)
+            logger.warning(
+                "Stale L2 build for reservation %s switch %s port %s has no resolvable "
+                "VLAN allocation (%s); released directly with no driver call (issue #491)",
+                reservation_id,
+                row.switch_device_id,
+                row.port,
+                va_id,
+            )
+            continue
+        async with get_db_session() as db:
+            await park_stale_l2_build(db, row.id, WIRING_STALE_BUILD_REASON)
+        removes.append(
+            {
+                "switch_device_id": str(row.switch_device_id),
+                "port": row.port,
+                "vlan_assignment_id": va_id,
+                "vlan_id": vlan_by_alloc[va_id],
             }
         )
 
@@ -2996,18 +3072,43 @@ async def _reconcile_l3_adjacency(
     config version on a genuinely fresh provision; a switch whose config declares no routes
     is skipped and nothing is pinned.
     """
-    from app.services.route_service import get_effective_pinned_routes, get_route_assignments
+    from app.services.route_service import (
+        failed_route_assignments_for_reservation,
+        get_effective_pinned_routes,
+        get_route_assignments,
+        park_stale_route_build,
+    )
 
     intended = await _derive_l3_adjacency(intended_wires, ctx)
 
     async with get_db_session() as db:
         active_rows = await get_route_assignments(db, reservation_id)
+        failed_rows = await failed_route_assignments_for_reservation(db, reservation_id)
     current: dict[str, object] = {str(row.device_id): row for row in active_rows}
+
+    # Stale-build widening (issue #491): FAILED intended-ACTIVE pins whose switch left
+    # the intended adjacency join the DEPROVISION side so the failed provision is
+    # settled instead of being rebuilt forever by the retry channel. The ADD diff below
+    # deliberately keeps comparing intended against ACTIVE rows ONLY: widening it would
+    # make a failed-but-still-intended switch look "current" and stop being rebuilt
+    # (the load-bearing asymmetry). Pinned-reason rows (switch/template/driver gone)
+    # never reached a driver and stay parked; their recovery is a re-save. The #20 pin
+    # lifecycle is untouched: the settlement deprovisions the row's PINNED set verbatim.
+    stale_rows = [
+        row
+        for row in failed_rows
+        if row.intended == "ACTIVE"
+        and str(row.device_id) not in intended
+        and str(row.device_id) not in current
+        and not (row.last_error or "").startswith(
+            (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
+        )
+    ]
 
     add_switches = intended - set(current.keys())
     remove_switches = set(current.keys()) - intended
 
-    if not add_switches and not remove_switches:
+    if not add_switches and not remove_switches and not stale_rows:
         return
 
     provisions: list[dict] = []
@@ -3031,6 +3132,14 @@ async def _reconcile_l3_adjacency(
     for switch_id in remove_switches:
         row = current[switch_id]
         deprovisions.append({"device_id": switch_id, "routes": row.routes})
+    for row in stale_rows:
+        # Direction flipped FIRST so the deprovision path's route_needs_remove gate
+        # admits the row; remove_route then drives the pinned set verbatim, and either
+        # release_route_membership flips the row RELEASED (it matches FAILED rows) or
+        # a failure re-parks it FAILED intended RELEASED for the retry channels.
+        async with get_db_session() as db:
+            await park_stale_route_build(db, row.id, WIRING_STALE_BUILD_REASON)
+        deprovisions.append({"device_id": str(row.device_id), "routes": row.routes or []})
 
     if not provisions and not deprovisions:
         return
@@ -3119,26 +3228,63 @@ async def handle_wiring_changed(
             async with get_db_session() as db:
                 from app.services.l1_assignment_service import (
                     active_assignments_for_reservation,
+                    failed_assignments_for_reservation,
                 )
                 from app.services.l1_assignment_service import (
                     canonical_port_pair as _canon,
                 )
 
                 active_rows = await active_assignments_for_reservation(db, reservation_id)
+                failed_rows = await failed_assignments_for_reservation(db, reservation_id)
             current: dict[tuple[str, str, str], None] = {}
             for row in active_rows:
                 ca, cb = _canon(row.port_a, row.port_b)
                 current[(str(row.switch_device_id), ca, cb)] = None
+            # Stale-build widening (issue #491): FAILED intended-ACTIVE rows join the
+            # RELEASE diff so a build that failed and then lost its intent (a fork
+            # re-save removed the wiring) is settled instead of surviving as a row the
+            # retry channel rebuilds forever. Scoped to hardware-retryable failures:
+            # a pinned-reason row (unresolvable / not-a-simple-chain) never reached a
+            # driver, is keyed on raw hop endpoints rather than a switch pair, and its
+            # documented recovery is a re-save, so it is not a release candidate.
+            failed_intended_active: dict[tuple[str, str, str], object] = {}
+            for row in failed_rows:
+                if row.intended != "ACTIVE":
+                    continue
+                if (row.last_error or "").startswith(
+                    (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
+                ):
+                    continue
+                ca, cb = _canon(row.port_a, row.port_b)
+                failed_intended_active[(str(row.switch_device_id), ca, cb)] = row
             desired: dict[tuple[str, str, str], tuple[str, str, str | None]] = {}
             for switch_id, pairs in desired_by_switch.items():
                 for port_a, port_b, phys in pairs:
                     ca, cb = _canon(port_a, port_b)
                     desired[(switch_id, ca, cb)] = (port_a, port_b, phys)
 
+            # The asymmetry is load-bearing (issue #491): releases diff against
+            # (ACTIVE UNION FAILED intended-ACTIVE) so stale failed builds are settled,
+            # but builds keep diffing desired against ACTIVE rows ONLY. Widening the
+            # build diff would make a failed-but-still-intended pair look "current" and
+            # stop being rebuilt by the reconcile, a regression.
             release_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
             build_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
             for key in current.keys() - desired.keys():
                 switch_id, ca, cb = key
+                release_by_switch.setdefault(switch_id, []).append((ca, cb, None))
+            stale_keys = failed_intended_active.keys() - desired.keys() - current.keys()
+            for key in stale_keys:
+                switch_id, ca, cb = key
+                stale_row = failed_intended_active[key]
+                # Flip the row's direction FIRST so the release path's
+                # pair_needs_release gate admits it; the disconnect then either flips
+                # it RELEASED (release_l1_connection matches FAILED rows) or re-parks
+                # it FAILED intended RELEASED for the retry channels.
+                async with get_db_session() as db:
+                    from app.services.l1_assignment_service import park_stale_l1_build
+
+                    await park_stale_l1_build(db, stale_row.id, WIRING_STALE_BUILD_REASON)
                 release_by_switch.setdefault(switch_id, []).append((ca, cb, None))
             for key in desired.keys() - current.keys():
                 switch_id, ca, cb = key
