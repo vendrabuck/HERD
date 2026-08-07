@@ -98,6 +98,12 @@ WIRING_NOT_SIMPLE_CHAIN_REASON = "hop set is not a simple chain"
 # _NON_RETRYABLE_PREFIXES so the auto channel sweeps it in the release direction.
 WIRING_STALE_BUILD_REASON = "build intent gone; pending release"
 
+# The canonical non-retryable prefix set (ADR 0007 Decision 5). Single-sourced here
+# (issue #491 review): the three stale-build reconcile exclusions below and
+# wiring_retry_service._NON_RETRYABLE_PREFIXES must never drift apart, or the most
+# safety-critical exclusion in the reconcile misclassifies asymmetrically.
+NON_RETRYABLE_REASON_PREFIXES = (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
+
 
 async def _run_sandbox(*args, **kwargs):
     """Run the synchronous driver sandbox off the event loop (issue #317).
@@ -2646,9 +2652,7 @@ async def _reconcile_l2_memberships(
         if key in intended or key in current:
             continue
         nil_alloc = row.vlan_assignment_id is None or row.vlan_assignment_id == _nil
-        if not nil_alloc and (row.last_error or "").startswith(
-            (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
-        ):
+        if not nil_alloc and (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES):
             continue
         stale_rows.append(row)
 
@@ -3100,9 +3104,7 @@ async def _reconcile_l3_adjacency(
         if row.intended == "ACTIVE"
         and str(row.device_id) not in intended
         and str(row.device_id) not in current
-        and not (row.last_error or "").startswith(
-            (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
-        )
+        and not (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES)
     ]
 
     add_switches = intended - set(current.keys())
@@ -3251,9 +3253,7 @@ async def handle_wiring_changed(
             for row in failed_rows:
                 if row.intended != "ACTIVE":
                     continue
-                if (row.last_error or "").startswith(
-                    (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
-                ):
+                if (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES):
                     continue
                 ca, cb = _canon(row.port_a, row.port_b)
                 failed_intended_active[(str(row.switch_device_id), ca, cb)] = row

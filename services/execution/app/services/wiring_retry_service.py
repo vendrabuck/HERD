@@ -84,7 +84,7 @@ from app.services.l2_membership_service import (
     supersede_l2_release_if_reclaimed,
 )
 from app.services.nats_consumer import (
-    WIRING_NOT_SIMPLE_CHAIN_REASON,
+    NON_RETRYABLE_REASON_PREFIXES,
     WIRING_UNRESOLVABLE_REASON,
 )
 from app.services.route_service import (
@@ -102,7 +102,9 @@ logger = logging.getLogger(__name__)
 # load-error variants ("recorded hop unresolvable: switch <id> not found", etc.) start
 # with the same prefix and are non-retryable for the same reason: there is no resolvable
 # driver to call.
-_NON_RETRYABLE_PREFIXES = (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
+# Single-sourced from nats_consumer (issue #491 review): the reconcile's stale-build
+# exclusions use the same tuple, so the two sides cannot drift.
+_NON_RETRYABLE_PREFIXES = NON_RETRYABLE_REASON_PREFIXES
 
 
 class WiringReservationFrozen(RuntimeError):
@@ -403,7 +405,6 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
     from app.services.l2_membership_service import record_l2_failed, release_l2_membership
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
-        WIRING_UNRESOLVABLE_REASON,
         TransientUpstreamError,
         _apply_l2_memberships,
         _derive_l2_memberships,
