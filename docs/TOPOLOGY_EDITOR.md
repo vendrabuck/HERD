@@ -14,14 +14,18 @@ Navigation: **Topology** in the nav bar, then either pick an existing topology t
 
 The palette is a floating, collapsible panel in the upper-left of the canvas. You can drag it around by its title bar and collapse it with the `-` button.
 
-The palette lists every DUT (Management-connection device) you have visibility on:
+The palette lists every DUT (Management-connection device) you have visibility on, plus a collapsible **Dynamic templates** section when any hypervisor-backed templates are published:
 
 - Already-reserved exclusive devices are shown by default. Toggle **Show reserved resources** off to hide them.
 - Filters: search, template dropdown, topology type dropdown.
 - Search matches the device name (a case-insensitive substring match); it does not search field values.
 - Devices already on the canvas are hidden from the palette. Removing a node from the canvas restores it to the palette.
 
-Regardless of your role, the palette only shows Management-type devices; infrastructure (L1/L2/L3 switches) is used automatically by the routing system and is not dragged in by hand.
+Regardless of your role, the palette shows Management-type devices and published dynamic templates; infrastructure (L1/L2/L3 switches) is used automatically by the routing system and is not dragged in by hand.
+
+## Dynamic placeholders
+
+Dragging a dynamic template onto the canvas creates one placeholder node per template (dashed purple, tagged DYNAMIC) carrying an editable instance count. Placeholders are planning artifacts, not devices: they cannot be cabled (a connection attempt is refused with a toast, since instances have no ports until the reservation activates), they are never saved into the parent topology (saving with placeholders present says so in the toast; reserve first to keep them), and **Reserve Topology** prefills the reservation's dynamic instances from them, one request per count. A canvas holding only placeholders can still be reserved (dynamic-only bookings are valid).
 
 ## Adding devices
 

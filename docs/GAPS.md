@@ -50,24 +50,27 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Frontend: pages and components
 
-**11 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
-`DeviceGroupDetailPage`, `DevicePage`, `DriversPage`, `InventoryPage`, `LoginPage`,
-`RegisterPage`, `ReportingPage`, `ReservationsPage`, `SettingsPage`); 12 pages remain
-untested.
+**17 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
+`DeviceGroupDetailPage`, `DevicePage`, `DriversPage`, `GrantsPage`, `HypervisorsPage`,
+`InventoryPage`, `LoginPage`, `RegisterPage`, `ReportingPage`, `ReservationsPage`,
+`SettingsPage`, `TemplateEditorPage`, `TemplatesPage`, plus two TopologyEditorPage
+suites: `TopologyEditorForkMode` and `TopologyEditorDynamicPlaceholders`).
 
 - [HIGH] Page smoke tests (render, key interactions):
   - `frontend/src/pages/ReservationCalendarPage.tsx`
-  - `frontend/src/pages/TopologyEditorPage.tsx`
-- [MEDIUM] Remaining pages: Dashboard, Templates, TemplateEditor, Topology,
-  TopologyTemplates, and the admin-only AddDevice, DeviceGroups, GroupDetail, Groups,
-  and Users pages.
+  - `frontend/src/pages/TopologyEditorPage.tsx` beyond the fork-mode and
+    dynamic-placeholder suites: the base editor flows (device drop, edge draw,
+    parent save) still lack direct page-level coverage.
+- [MEDIUM] Remaining pages: Dashboard, Topology, TopologyTemplates, and the
+  admin-only AddDevice, DeviceGroups, GroupDetail, Groups, and Users pages.
 
-**21 components have zero coverage.** Priorities:
+**Component coverage priorities** (`CreateReservationModal` and
+`ReservationDetailModal` now carry targeted suites, incl. the dynamic-requests
+paths; the dead `TopologyEditor` component was deleted in issue #489):
 
-- [HIGH] `TopologyEditor`, `AIDialog`, `AIProposalBar`, `AICommitDialog` (complex
-  logic paths, state machines).
-- [MEDIUM] `CreateReservationModal`, `ReservationDetailModal`, `EditDevicesModal`,
-  `DeviceDetailModal`, `PortsSection`.
+- [HIGH] `AIDialog`, `AIProposalBar`, `AICommitDialog` (complex logic paths,
+  state machines).
+- [MEDIUM] `EditDevicesModal`, `DeviceDetailModal`, `PortsSection`.
 - [LOW] `AppLayout`, `FloatingPanel`, `FieldRow` (lower-complexity presentation).
 
 ## Frontend: API clients (8 still untested)
