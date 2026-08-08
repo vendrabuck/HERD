@@ -69,8 +69,8 @@ Templates define the fields your devices carry. Three template types:
 Typical workflow:
 
 1. **Templates > New template** (Templates is its own top-level nav item).
-2. Pick `device` or `port`.
-3. If `device`, pick the driver and mark `exclusive` (default true). Exclusive devices enforce one-reservation-at-a-time; non-exclusive are shared infrastructure.
+2. Pick `device`, `port`, or `dynamic`.
+3. If `device`, pick the driver and mark `exclusive` (default true). Exclusive devices enforce one-reservation-at-a-time; non-exclusive are shared infrastructure. If `dynamic`, pick a `Hypervisor`-connection-type recipe driver and a registered hypervisor (see Hypervisors below and [docs/design/0004-dynamic-resources.md](design/0004-dynamic-resources.md)).
 4. Fill in **Vendor** and **Model** (e.g. `Juniper Networks` / `EX2300`). **Part number** is optional and only used when the template represents a specific orderable SKU. The **Suggest with AI** button (admin only, requires an AI provider to be configured) infers vendor/model from the template name; review and edit before saving. Identity fields enable the AI reservation assistant to ground responses in actual hardware context.
 5. Add field sections with typed fields (`string`, `number`, `boolean`, `password`, `dropdown`). Add per-field defaults where useful. Password fields are masked in the UI and excluded from search.
 6. Save.

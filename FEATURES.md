@@ -56,8 +56,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Topology
 
 - **Drag-and-drop topology editor** (Shipped): floating equipment palette with search,
-  template, and topology-type filters; Layer 1/2/3 connection creation with port
-  selection modals.
+  template, and topology-type filters, plus a dynamic-templates section whose entries
+  drop onto the canvas as count-carrying placeholder nodes that prefill a
+  reservation's dynamic requests (issue #472); Layer 1/2/3 connection creation with
+  port selection modals.
 - **Physical and cloud topology separation** (Shipped): physical and cloud devices
   cannot be mixed in a single topology, enforced at database, service, and UI
   layers.
@@ -124,8 +126,12 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   at registration, and pair a dynamic template with both a hypervisor and a recipe
   driver package from the template editor, which offers a Dynamic type option
   alongside Device and Port and enforces the Hypervisor-driver requirement
-  client-side (issue #398). The recipe driver is an ordinary driver package with a
-  new `Hypervisor` connection type
+  client-side (issue #398). Booking is both reservation-first (the Create
+  Reservation modal's dynamic instances block) and canvas-first (Equipment Browser
+  dynamic templates drop as placeholder nodes whose counts prefill Reserve
+  Topology, issue #472), and a booked reservation's dynamic requests render in the
+  detail modal's Details tab (issue #473). The recipe driver is an ordinary driver
+  package with a new `Hypervisor` connection type
   (`login`, `logout`, `create_instance`, `destroy_instance`, `status`) that reuses the
   existing sandbox, cache, and metadata machinery. Booking a dynamic template lists it
   under `dynamic_requests` on the reservation; a reservation carrying any dynamic
