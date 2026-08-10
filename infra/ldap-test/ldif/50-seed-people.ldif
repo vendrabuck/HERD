@@ -1,0 +1,210 @@
+# Fixture entries for the live-LDAP auth tests. The layout and values are
+# asserted by services/auth/tests/test_ldap_service_live.py (user1..user6)
+# and tests/integration/test_ldap_auth.py (defaults to user10, documents
+# user1..user25): ou=people under dc=company,dc=local, uid=userN, mail
+# userN@company.local, password Password1. slapd hashes userPassword on
+# import; simple binds compare against it.
+
+dn: ou=people,dc=company,dc=local
+objectClass: organizationalUnit
+ou: people
+
+dn: uid=user1,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user1
+cn: Test User1
+sn: User1
+mail: user1@company.local
+userPassword: Password1
+
+dn: uid=user2,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user2
+cn: Test User2
+sn: User2
+mail: user2@company.local
+userPassword: Password1
+
+dn: uid=user3,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user3
+cn: Test User3
+sn: User3
+mail: user3@company.local
+userPassword: Password1
+
+dn: uid=user4,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user4
+cn: Test User4
+sn: User4
+mail: user4@company.local
+userPassword: Password1
+
+dn: uid=user5,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user5
+cn: Test User5
+sn: User5
+mail: user5@company.local
+userPassword: Password1
+
+dn: uid=user6,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user6
+cn: Test User6
+sn: User6
+mail: user6@company.local
+userPassword: Password1
+
+dn: uid=user7,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user7
+cn: Test User7
+sn: User7
+mail: user7@company.local
+userPassword: Password1
+
+dn: uid=user8,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user8
+cn: Test User8
+sn: User8
+mail: user8@company.local
+userPassword: Password1
+
+dn: uid=user9,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user9
+cn: Test User9
+sn: User9
+mail: user9@company.local
+userPassword: Password1
+
+dn: uid=user10,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user10
+cn: Test User10
+sn: User10
+mail: user10@company.local
+userPassword: Password1
+
+dn: uid=user11,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user11
+cn: Test User11
+sn: User11
+mail: user11@company.local
+userPassword: Password1
+
+dn: uid=user12,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user12
+cn: Test User12
+sn: User12
+mail: user12@company.local
+userPassword: Password1
+
+dn: uid=user13,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user13
+cn: Test User13
+sn: User13
+mail: user13@company.local
+userPassword: Password1
+
+dn: uid=user14,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user14
+cn: Test User14
+sn: User14
+mail: user14@company.local
+userPassword: Password1
+
+dn: uid=user15,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user15
+cn: Test User15
+sn: User15
+mail: user15@company.local
+userPassword: Password1
+
+dn: uid=user16,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user16
+cn: Test User16
+sn: User16
+mail: user16@company.local
+userPassword: Password1
+
+dn: uid=user17,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user17
+cn: Test User17
+sn: User17
+mail: user17@company.local
+userPassword: Password1
+
+dn: uid=user18,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user18
+cn: Test User18
+sn: User18
+mail: user18@company.local
+userPassword: Password1
+
+dn: uid=user19,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user19
+cn: Test User19
+sn: User19
+mail: user19@company.local
+userPassword: Password1
+
+dn: uid=user20,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user20
+cn: Test User20
+sn: User20
+mail: user20@company.local
+userPassword: Password1
+
+dn: uid=user21,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user21
+cn: Test User21
+sn: User21
+mail: user21@company.local
+userPassword: Password1
+
+dn: uid=user22,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user22
+cn: Test User22
+sn: User22
+mail: user22@company.local
+userPassword: Password1
+
+dn: uid=user23,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user23
+cn: Test User23
+sn: User23
+mail: user23@company.local
+userPassword: Password1
+
+dn: uid=user24,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user24
+cn: Test User24
+sn: User24
+mail: user24@company.local
+userPassword: Password1
+
+dn: uid=user25,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: user25
+cn: Test User25
+sn: User25
+mail: user25@company.local
+userPassword: Password1

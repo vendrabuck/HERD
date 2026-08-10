@@ -15,7 +15,10 @@ ROOT_PY := seed_devices_public.py
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh
 # (gate-clean purges only the gate project) and `make up` after a gate run
-# restores the dev stack WITH its data, no reseed needed. Lowercased because
+# restores the dev stack WITH its data, no reseed needed. A SUCCESSFUL
+# `make everything` leaves its gate stack running and seeded (both projects
+# publish the same host ports, so run `make gate-down` before `make up`);
+# master always tears its gate stack down. Lowercased because
 # compose project names reject uppercase (leading non-alphanumerics are
 # stripped, also a compose rule); derived from the directory so worktree gates
 # are isolated per-worktree too.
@@ -43,10 +46,10 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix coverage-,$(SERVICES)) \
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
-	test-frontend test-integration test-contract test-load test-load-ui test-e2e test-e2e-stop test-auth-ldap \
+	test-frontend test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-stop test-auth-ldap \
 	test-root coverage-parallel coverage-frontend \
-	install frontend-install frontend-dev lint format clean clean-data gate-clean seed \
-	ldap-up ldap-down ldap-status ldap-logs ldap-reset \
+	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
+	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed
 
 ## --- Meta ---
@@ -138,7 +141,10 @@ master-quick:  ## Fast gate: format + lint + unit + frontend + build
 	@echo ""
 	@echo "=== master-quick complete ==="
 
-master: gate-clean master-quick  ## Full gate: master-quick + ephemeral stack contract/integration/e2e
+master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + ephemeral stack contract/integration/e2e
+	@echo ""
+	@echo "=== Live LDAP auth tests ==="
+	$(MAKE) _gate-ldap-tests
 	@echo ""
 	@echo "=== Starting ephemeral stack for integration + e2e ==="
 	@# Always tear the stack down, even if integration or e2e fails.
@@ -185,10 +191,15 @@ master-clean: clean-images  ## master with all HERD compose images rebuilt --no-
 #   - `ruff format --check` instead of `ruff format` (no source mutation).
 #   - Runs backend and frontend tests under coverage (master skips coverage).
 #   - Adds headless locust stress test after e2e.
-# Everything stops on first failure; teardown is trapped.
+#   - On SUCCESS the gate stack is left RUNNING and seeded (a live,
+#     freshly-validated stack at https://localhost); `make gate-down` stops
+#     it, and the next gate run's gate-clean purges it anyway, so every gate
+#     is still born fresh. On failure the stack is torn down as before.
+# Everything stops on first failure; failure teardown is trapped.
 
-# Set EVERYTHING_LOAD=0 (or use everything-noload) to stop after e2e: no seed,
-# no locust. Everything else is identical, including the gate-project stack.
+# Set EVERYTHING_LOAD=0 (or use everything-noload) to skip the locust load
+# test. The seed still runs (the stack left behind should be usable either
+# way); only the load-test tail is skipped.
 EVERYTHING_LOAD ?= 1
 
 everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check + load tests
@@ -200,16 +211,19 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 	cd frontend && npm ci
 	@echo ""
 	@echo "=== Checking Python formatting (fail on dirty) ==="
-	uv run ruff format --check services/
+	uv run ruff format --check services/ $(ROOT_PY)
 	@echo ""
 	@echo "=== Linting Python ==="
-	uv run ruff check services/
+	uv run ruff check services/ $(ROOT_PY)
 	@echo ""
 	@echo "=== Linting frontend ==="
 	cd frontend && npx eslint src --max-warnings 0
 	@echo ""
 	@echo "=== Backend tests with coverage ($(words $(SERVICES)) services) ==="
 	$(MAKE) coverage
+	@echo ""
+	@echo "=== Live LDAP auth tests ==="
+	$(MAKE) _gate-ldap-tests
 	@echo ""
 	@echo "=== Frontend tests with coverage ==="
 	$(MAKE) coverage-frontend
@@ -221,7 +235,7 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 	docker compose build
 	@echo ""
 	@echo "=== Starting ephemeral stack for integration + e2e + load ==="
-	@trap '$(MAKE) _master-stack-down' EXIT INT TERM; \
+	@ok=0; trap 'if [ "$$ok" != 1 ]; then $(MAKE) _master-stack-down; fi' EXIT INT TERM; \
 		$(MAKE) _master-stack-up && \
 		$(MAKE) _master-wait-healthy && \
 		echo "" && echo "=== Contract tests ===" && \
@@ -230,18 +244,21 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== Seeding gate stack ===" && \
+		$(MAKE) _everything-seed && \
 		if [ "$(EVERYTHING_LOAD)" != "0" ]; then \
-			echo "" && echo "=== Seeding gate stack for load tests ===" && \
-			$(MAKE) _everything-seed && \
 			echo "" && echo "=== Load / stress tests ===" && \
 			HERD_BASE_URL=https://localhost $(MAKE) test-load; \
 		else \
-			echo "" && echo "=== Skipping seed + load tests (EVERYTHING_LOAD=0) ==="; \
-		fi
+			echo "" && echo "=== Skipping load tests (EVERYTHING_LOAD=0) ==="; \
+		fi && \
+		$(MAKE) test-e2e-stop COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		ok=1
 	@echo ""
-	@echo "=== everything complete ==="
+	@echo "=== everything complete: gate stack left running and seeded at https://localhost ==="
+	@echo "    make gate-down   stop it (then 'make up' restores the dev stack)"
 
-everything-noload:  ## everything minus the seed + load-test tail
+everything-noload:  ## everything minus the load-test tail (stack still seeded and left up)
 	$(MAKE) everything EVERYTHING_LOAD=0
 
 # Seeds the running stack via seed_devices_public.py: users, drivers, templates,
@@ -297,6 +314,11 @@ _master-stack-down:
 	@echo "=== Tearing down ephemeral gate stack ==="
 	-$(MAKE) test-e2e-stop COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
 	-$(GATE_COMPOSE) down -v --remove-orphans
+
+# Public name for stopping a gate stack that a successful `make everything`
+# left running (master always tears its stack down itself). After gate-down,
+# `make up` restores the dev stack with its data.
+gate-down: _master-stack-down  ## Stop and purge the gate stack an `everything` run left up
 
 ## --- Docker Compose ---
 
@@ -359,8 +381,16 @@ test: test-root  ## Run every backend service's unit suite (plus tests/unit)
 		(cd services/$$svc && uv run pytest tests/ -v) || exit $$?; \
 	done
 
-$(addprefix test-,$(SERVICES)):
+# The generated per-service pattern must not emit test-integration: that name
+# belongs to the cross-service suite below, and make would let the later
+# explicit recipe silently shadow the generated one (it did, until 2026-08-10;
+# `make test-integration` could never reach the integration service's unit
+# suite). The service's own suite gets an unambiguous name instead.
+$(addprefix test-,$(filter-out integration,$(SERVICES))):
 	cd services/$(@:test-%=%) && uv run pytest tests/ -v
+
+test-integration-service:  ## Run the integration service's unit suite (test-<svc> for the others)
+	cd services/integration && uv run pytest tests/ -v
 
 test-frontend:  ## Run the frontend vitest suite
 	cd frontend && npm test
@@ -390,49 +420,62 @@ test-e2e:  ## Run e2e tests, Selenium + Playwright (needs a running stack)
 test-e2e-stop:  ## Stop and remove the e2e Selenium container
 	-docker compose --profile e2e rm -fsv selenium
 
-# -- Local LDAP test server ---------------------------------------------------
+# -- LDAP test server (infra/ldap-test) ---------------------------------------
 #
-# A standalone osixia/openldap container lives outside this repo (defaults to
-# $(HOME)/ldapserver, see docs/local-ldap on this machine). The targets below
-# drive its lifecycle and run the live-LDAP auth tests against it. Override
-# HERD_LDAP_DIR to point elsewhere.
+# A checked-in osixia/openldap compose file under infra/ldap-test seeds the
+# exact fixtures the live-LDAP auth tests assert (user1..user25, Password1,
+# dc=company,dc=local). It is stateless: down discards the directory, up
+# reseeds it from the bundled LDIF. The compose healthcheck searches for
+# uid=user1 as cn=admin, so `up --wait` returns only once the seed is
+# actually queryable, not merely once slapd answers.
+#
+# The master and everything gates run these tests through _gate-ldap-tests,
+# which hard-requires the server (HERD_TEST_LDAP_REQUIRED=1 turns the
+# unreachable-server skip into a failure) and stops it afterward only if the
+# gate started it; a server you started yourself is left running.
 
-HERD_LDAP_DIR ?= $(HOME)/ldapserver
+LDAP_COMPOSE := docker compose -f infra/ldap-test/docker-compose.yml
 HERD_TEST_LDAP_HOST ?= 127.0.0.1
 HERD_TEST_LDAP_PORT ?= 389
 
-ldap-up:
-	@if [ ! -d "$(HERD_LDAP_DIR)" ]; then \
-		echo "LDAP server dir not found at $(HERD_LDAP_DIR)."; \
-		echo "Set HERD_LDAP_DIR or follow docs/local-ldap to install it."; exit 1; \
-	fi
-	@if [ -x "$(HERD_LDAP_DIR)/setup.sh" ] && ! docker ps --format '{{.Names}}' | grep -q '^ldap-test$$'; then \
-		cd "$(HERD_LDAP_DIR)" && ./setup.sh; \
-	else \
-		cd "$(HERD_LDAP_DIR)" && docker compose start; \
-	fi
-	@echo "LDAP server up on ldap://$(HERD_TEST_LDAP_HOST):$(HERD_TEST_LDAP_PORT)"
+ldap-up:  ## Start the checked-in LDAP test server (infra/ldap-test), wait until seeded
+	HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) $(LDAP_COMPOSE) up -d --wait
+	@echo "LDAP test server up on ldap://$(HERD_TEST_LDAP_HOST):$(HERD_TEST_LDAP_PORT)"
 
-ldap-down:
-	@if [ -d "$(HERD_LDAP_DIR)" ]; then cd "$(HERD_LDAP_DIR)" && docker compose stop; fi
+ldap-down:  ## Stop and remove the LDAP test server
+	$(LDAP_COMPOSE) down -v --remove-orphans
 
 ldap-status:
-	@if [ -d "$(HERD_LDAP_DIR)" ]; then cd "$(HERD_LDAP_DIR)" && docker compose ps; \
-	else echo "LDAP server dir not found at $(HERD_LDAP_DIR)"; fi
+	$(LDAP_COMPOSE) ps
 
 ldap-logs:
-	@if [ -d "$(HERD_LDAP_DIR)" ]; then cd "$(HERD_LDAP_DIR)" && docker compose logs -f; \
-	else echo "LDAP server dir not found at $(HERD_LDAP_DIR)"; exit 1; fi
+	$(LDAP_COMPOSE) logs -f
 
 ldap-reset:
-	@if [ ! -d "$(HERD_LDAP_DIR)" ]; then echo "LDAP server dir not found at $(HERD_LDAP_DIR)"; exit 1; fi
-	cd "$(HERD_LDAP_DIR)" && docker compose down -v && ./setup.sh
+	$(LDAP_COMPOSE) down -v --remove-orphans
+	$(MAKE) ldap-up
 
-# Run only the live-LDAP auth tests. Requires the directory above to be up;
-# `make ldap-up test-auth-ldap` will start it first if needed.
-test-auth-ldap:
+# Run only the live-LDAP auth tests, hard-required: asking for them explicitly
+# and getting 10 skips because the server is down would be a silent no-op, so
+# this fails loudly instead. `make ldap-up test-auth-ldap` starts the server
+# first.
+test-auth-ldap:  ## Run the live-LDAP auth tests (no skips; needs ldap-up)
 	cd services/auth && HERD_TEST_LDAP_HOST=$(HERD_TEST_LDAP_HOST) HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) \
-		uv run pytest tests/test_ldap_service_live.py -v
+		HERD_TEST_LDAP_REQUIRED=1 uv run pytest tests/test_ldap_service_live.py -v
+
+# Gate phase used by master and everything: boot the server if (and only if)
+# it is not already running, run the hard-required tests, then tear down only
+# what this run started. The trap covers the failure path too, so a red test
+# run cannot strand a gate-started container.
+_gate-ldap-tests:
+	@started=0; \
+	if ! docker ps --format '{{.Names}}' | grep -q '^ldap-test$$'; then \
+		$(MAKE) ldap-up; started=1; \
+	else \
+		echo "LDAP test server already running; leaving it up afterward."; \
+	fi; \
+	trap 'if [ "$$started" = 1 ]; then $(MAKE) ldap-down; fi' EXIT INT TERM; \
+	$(MAKE) test-auth-ldap
 
 # -- Coverage -----------------------------------------------------------------
 #
