@@ -2,8 +2,13 @@
 
 Skipped automatically when nothing is listening on the configured host/port,
 so the suite stays green on CI without the container. To run locally, start
-the directory (e.g. `osixia/openldap` seeded with the fixtures asserted here)
-and rerun pytest.
+the checked-in test directory (`make ldap-up`, which boots infra/ldap-test
+seeded with the fixtures asserted here) and rerun pytest.
+
+Setting HERD_TEST_LDAP_REQUIRED=1 disables the skip: an unreachable server
+then fails every test with an explicit message instead. The master and
+everything gates set it (via `make test-auth-ldap`) so these tests can never
+silently skip inside a gate run.
 
 Expected directory layout:
 
@@ -47,10 +52,22 @@ def _ldap_reachable() -> bool:
         return False
 
 
+_LDAP_REQUIRED = os.getenv("HERD_TEST_LDAP_REQUIRED", "") not in ("", "0")
+_LDAP_REACHABLE = _ldap_reachable()
+
 pytestmark = pytest.mark.skipif(
-    not _ldap_reachable(),
+    not _LDAP_REQUIRED and not _LDAP_REACHABLE,
     reason=f"No LDAP server reachable at {LDAP_URL}; start the test directory to run.",
 )
+
+
+@pytest.fixture(autouse=True)
+def _fail_when_required_but_unreachable():
+    if _LDAP_REQUIRED and not _LDAP_REACHABLE:
+        pytest.fail(
+            f"HERD_TEST_LDAP_REQUIRED is set but no LDAP server is reachable at {LDAP_URL}; "
+            "run `make ldap-up` (infra/ldap-test) or unset HERD_TEST_LDAP_REQUIRED."
+        )
 
 
 @pytest.fixture

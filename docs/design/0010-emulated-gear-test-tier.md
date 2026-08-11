@@ -177,17 +177,21 @@ production driver would be.
 Recommendation: add an opt-in Makefile target family for the emulated-gear tier,
 env-gated on lab reachability, following the established `make ldap-up` /
 `make test-auth-ldap` / `make ldap-down` pattern for an external-dependency suite.
-That pattern is the precedent for a test tier that needs a resource outside the repo
-and outside GitHub-hosted CI: the LDAP targets start an external container living at
-`HERD_LDAP_DIR`, fail with a clear message when it is absent, and gate a live suite
-(`tests/test_ldap_service_live.py`) that PR CI never runs.
+That pattern is the precedent for a test tier that needs a resource outside
+GitHub-hosted PR CI: the LDAP targets boot a checked-in compose file
+(`infra/ldap-test/`) seeded with the exact fixtures the suite asserts, and gate a
+live suite (`tests/test_ldap_service_live.py`) that PR CI never runs; the
+master/everything gates run it hard-required via `HERD_TEST_LDAP_REQUIRED=1`.
+Unlike LDAP, the emulated-gear lab cannot be checked in, so this tier keeps the
+external-resource shape: verify reachability, fail with a clear message when the
+lab is absent.
 
 Proposed targets (names for review):
 
 - `make emulator-up`: bring up the `network-simulator` lab (the containerlab slice and,
   once it exists, the L1 recording server), or verify reachability of an already-running
   lab on the Proxmox host. Fails closed with a pointer to `network-simulator` setup when
-  the lab dir or host is not configured, exactly as `ldap-up` does.
+  the lab dir or host is not configured.
 - `make test-drivers-emulated`: run the driver dialect suite against the reachable lab.
   Gated on an env flag plus a reachability probe of the lab subnet, so a bare
   `make test` never touches it.

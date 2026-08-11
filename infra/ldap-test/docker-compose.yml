@@ -1,0 +1,50 @@
+# Checked-in LDAP test directory for the live-LDAP auth tests
+# (services/auth/tests/test_ldap_service_live.py) and the master/everything
+# gate's LDAP phase.
+#
+# The osixia image creates the dc=company,dc=local base entry itself from
+# LDAP_DOMAIN and the cn=admin bind account from LDAP_ADMIN_PASSWORD; the
+# mounted LDIF in ./ldif adds ou=people and the fixture users the tests
+# assert (user1..user25 / Password1). --copy-service is required for the
+# bootstrap LDIF mount to be picked up.
+#
+# Deliberately stateless: no named volumes, so `docker compose down` discards
+# the directory and the next `up` reseeds it from the LDIF. Plain LDAP on
+# port 389 only (LDAP_TLS false); the tests bind without TLS.
+
+name: herd-ldap-test
+
+services:
+  ldap:
+    image: osixia/openldap:1.5.0
+    container_name: ldap-test
+    command: [--copy-service]
+    environment:
+      LDAP_ORGANISATION: "Company Local Test Directory"
+      LDAP_DOMAIN: "company.local"
+      LDAP_ADMIN_PASSWORD: "admin"
+      LDAP_TLS: "false"
+    ports:
+      - "${HERD_TEST_LDAP_PORT:-389}:389"
+    volumes:
+      - ./ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "ldapsearch",
+          "-x",
+          "-H",
+          "ldap://localhost",
+          "-b",
+          "ou=people,dc=company,dc=local",
+          "-D",
+          "cn=admin,dc=company,dc=local",
+          "-w",
+          "admin",
+          "(uid=user1)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
