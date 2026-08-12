@@ -7,6 +7,7 @@ in the integration stack, not here.
 """
 
 import ssl
+from contextlib import contextmanager
 
 import pytest
 from app.config import settings
@@ -235,3 +236,60 @@ def test_build_server_attaches_validating_tls_when_tls_enabled(monkeypatch):
     server = ldap_service._build_server()
     assert server.tls is not None
     assert server.tls.validate == ssl.CERT_REQUIRED
+
+
+# --- _fetch_group_sync branches the live directory cannot express: the LDIF
+#     fixtures use groupOfNames, whose schema makes cn and member mandatory,
+#     so the missing-attribute branches are pinned here with a stubbed entry
+#     (AD models an empty group as an entry with no member attribute) ---
+
+_GROUP_DN = "CN=eng,OU=Groups,DC=example,DC=com"
+
+
+class _FakeAttribute:
+    def __init__(self, values):
+        self.values = values
+
+
+class _FakeEntry:
+    def __init__(self, dn, attrs):
+        self.entry_dn = dn
+        self._attrs = attrs
+
+    def __contains__(self, attr):
+        return attr in self._attrs
+
+    def __getitem__(self, attr):
+        return _FakeAttribute(self._attrs[attr])
+
+
+def _patch_group_fetch(monkeypatch, entry):
+    @contextmanager
+    def fake_connection(require_service_account=False):
+        yield object()
+
+    monkeypatch.setattr(ldap_service, "_service_connection", fake_connection)
+    monkeypatch.setattr(ldap_service, "_base_entry", lambda conn, dn, attrs: entry)
+
+
+def test_fetch_group_missing_name_attribute_falls_back_to_dn(monkeypatch):
+    # The cached directory_name must never be empty; a group entry without
+    # its display-name attribute keeps the DN as its name.
+    entry = _FakeEntry(_GROUP_DN, {"member": ["uid=a,ou=people,dc=example,dc=com"]})
+    _patch_group_fetch(monkeypatch, entry)
+    group = ldap_service._fetch_group_sync(_GROUP_DN)
+    assert group is not None
+    assert group.name == _GROUP_DN
+    assert group.member_dns == ("uid=a,ou=people,dc=example,dc=com",)
+
+
+def test_fetch_group_missing_member_attribute_is_empty_membership(monkeypatch):
+    # An entry lacking the member attribute is an empty group (the AD empty
+    # group shape), not an error: the reconciler must receive an empty
+    # desired set, never a KeyError or LdapUnavailableError.
+    entry = _FakeEntry(_GROUP_DN, {"cn": ["eng"]})
+    _patch_group_fetch(monkeypatch, entry)
+    group = ldap_service._fetch_group_sync(_GROUP_DN)
+    assert group is not None
+    assert group.name == "eng"
+    assert group.member_dns == ()
