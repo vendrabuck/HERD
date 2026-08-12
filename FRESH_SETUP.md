@@ -155,7 +155,7 @@ make format             # ruff format + ruff check --fix
 ### Full validation
 
 ```bash
-make master             # clean, install deps, format, lint, test all, build frontend + Docker
+make master             # full gate: deps, format, lint, unit, frontend, image build, live LDAP, ephemeral-stack contract + integration + e2e
 ```
 
 ### Frontend dev server

@@ -203,9 +203,9 @@ make test-e2e        # Run E2E browser tests (Selenium + Playwright, requires ru
 make coverage        # Run all backend tests with coverage report
 make lint            # ruff check + eslint
 make format          # ruff format + ruff check --fix
-make master          # Full validation: lint + unit + frontend + build + ephemeral stack + integration + e2e (no coverage)
+make master          # Full validation: lint + unit + frontend + build + live LDAP + ephemeral stack + integration + e2e (no coverage)
 make master-clean    # Same as master, but wipes herd-* images first and forces a no-cache rebuild
-make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, seed, headless locust load
+make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, seed, headless locust load; on success the seeded gate stack is left running (make gate-down to stop)
 make migrate         # Run Alembic migrations
 make logs            # Tail logs
 make frontend-dev    # Run frontend dev server

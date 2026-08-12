@@ -19,7 +19,7 @@ make migrate       # run alembic upgrade head in every migratable service
 make migrate-<svc> # single-service migration
 ```
 
-`make clean` stops the stack and purges caches but KEEPS every Docker volume, so data survives; the `make master` and `make everything` gates run in a separate `<dir>-gate` compose project and never touch the dev stack's volumes either. `make clean-data` is the destructive variant: it drops every dev-stack volume including Postgres data. Never run it on an environment you care about without a backup. `make clean-images` goes further still: it also deletes every HERD-tagged Docker image (dev and gate projects) and prunes dangling layers so the next `make up` or `make build` rebuilds from scratch; it does not touch unrelated images on the host.
+`make clean` stops the stack and purges caches but KEEPS every Docker volume, so data survives; the `make master` and `make everything` gates run in a separate `<dir>-gate` compose project and never touch the dev stack's volumes either. A successful `make everything` deliberately leaves that gate stack running and seeded (usable at `https://localhost` without re-seeding); `make gate-down` stops and purges it, after which `make up` restores the dev stack. A failed run tears the gate stack down itself. `make clean-data` is the destructive variant: it drops every dev-stack volume including Postgres data. Never run it on an environment you care about without a backup. `make clean-images` goes further still: it also deletes every HERD-tagged Docker image (dev and gate projects) and prunes dangling layers so the next `make up` or `make build` rebuilds from scratch; it does not touch unrelated images on the host.
 
 ## Config-service first-run
 
