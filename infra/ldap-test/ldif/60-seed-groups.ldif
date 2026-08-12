@@ -1,0 +1,61 @@
+# Group fixtures for the ADR 0011 group-sync live tests
+# (services/auth/tests/test_ldap_service_live.py). Loaded after
+# 50-seed-people.ldif (files apply in filename order), so ou=people exists
+# when the extra person entries here are added.
+#
+# Layout the tests assert:
+#   ou=people additions:
+#     uid=nomail1  inetOrgPerson WITHOUT a mail attribute (member resolution
+#                  must skip it with reason missing_email)
+#     cn=nouid1    inetOrgPerson with mail but WITHOUT a uid attribute
+#                  (skipped with reason missing_username)
+#   ou=groups (groupOfNames, member values are DNs):
+#     cn=herd-eng   user1, user2, user3        (fully resolvable)
+#     cn=herd-qa    user4, user5               (fully resolvable)
+#     cn=herd-mixed user6, nomail1, nouid1     (per-member skip cases)
+#     cn=herd-stale user6, uid=ghost1 (a DN that does not exist; resolution
+#                   of that member is proven not_found, not an error)
+
+dn: uid=nomail1,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: nomail1
+cn: No Mail1
+sn: Mail1
+userPassword: Password1
+
+dn: cn=nouid1,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+cn: nouid1
+sn: NoUid1
+mail: nouid1@company.local
+userPassword: Password1
+
+dn: ou=groups,dc=company,dc=local
+objectClass: organizationalUnit
+ou: groups
+
+dn: cn=herd-eng,ou=groups,dc=company,dc=local
+objectClass: groupOfNames
+cn: herd-eng
+member: uid=user1,ou=people,dc=company,dc=local
+member: uid=user2,ou=people,dc=company,dc=local
+member: uid=user3,ou=people,dc=company,dc=local
+
+dn: cn=herd-qa,ou=groups,dc=company,dc=local
+objectClass: groupOfNames
+cn: herd-qa
+member: uid=user4,ou=people,dc=company,dc=local
+member: uid=user5,ou=people,dc=company,dc=local
+
+dn: cn=herd-mixed,ou=groups,dc=company,dc=local
+objectClass: groupOfNames
+cn: herd-mixed
+member: uid=user6,ou=people,dc=company,dc=local
+member: uid=nomail1,ou=people,dc=company,dc=local
+member: cn=nouid1,ou=people,dc=company,dc=local
+
+dn: cn=herd-stale,ou=groups,dc=company,dc=local
+objectClass: groupOfNames
+cn: herd-stale
+member: uid=user6,ou=people,dc=company,dc=local
+member: uid=ghost1,ou=people,dc=company,dc=local

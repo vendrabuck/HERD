@@ -15,6 +15,13 @@ Expected directory layout:
     dc=company,dc=local
         ou=people
             uid=user1..user6   (mail=userN@company.local, password=Password1)
+            uid=nomail1        (no mail attribute)
+            cn=nouid1          (mail but no uid attribute)
+        ou=groups              (groupOfNames; see 60-seed-groups.ldif)
+            cn=herd-eng        (user1..user3)
+            cn=herd-qa         (user4, user5)
+            cn=herd-mixed      (user6, nomail1, nouid1)
+            cn=herd-stale      (user6 plus a nonexistent member DN)
 
 Bind DN for the service account: cn=admin,dc=company,dc=local / admin.
 """
@@ -205,3 +212,119 @@ async def test_login_endpoint_succeeds_against_live_ldap(ldap_settings, http_cli
 async def test_login_endpoint_rejects_bad_password_against_live_ldap(ldap_settings, http_client):
     resp = await http_client.post("/login", json={"email": "user4", "password": "nope"})
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 group-sync directory client (fixtures in 60-seed-groups.ldif).
+# The load-bearing contract under test: None / skip_reason are answers the
+# directory actually gave; LdapUnavailableError is raised whenever it could
+# not be asked, so fail-closed consumers never mistake an outage for absence.
+# ---------------------------------------------------------------------------
+
+GROUPS_DN = f"ou=groups,{BASE_DN}"
+
+
+@pytest.mark.asyncio
+async def test_fetch_group_returns_name_and_member_dns(ldap_settings):
+    group = await ldap_service.fetch_group(f"cn=herd-eng,{GROUPS_DN}")
+    assert group is not None
+    assert group.name == "herd-eng"
+    members = {dn.lower() for dn in group.member_dns}
+    assert members == {f"uid=user{n},{PEOPLE_DN}".lower() for n in (1, 2, 3)}
+
+
+@pytest.mark.asyncio
+async def test_fetch_group_nonexistent_dn_is_dangling_none(ldap_settings):
+    assert await ldap_service.fetch_group(f"cn=renamed-away,{GROUPS_DN}") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_group_bad_service_account_raises(monkeypatch, ldap_settings):
+    monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.fetch_group(f"cn=herd-eng,{GROUPS_DN}")
+
+
+@pytest.mark.asyncio
+async def test_fetch_group_unreachable_server_raises(monkeypatch, ldap_settings):
+    # A closed port refuses the connection; that is an outage, never a
+    # dangling mapping.
+    monkeypatch.setattr(
+        settings, "ldap_server_url", f"ldap://{LDAP_HOST}:{LDAP_PORT + 10000}", raising=False
+    )
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.fetch_group(f"cn=herd-eng,{GROUPS_DN}")
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_returns_identity(ldap_settings):
+    resolution = await ldap_service.resolve_member(f"uid=user1,{PEOPLE_DN}")
+    assert resolution.skip_reason is None
+    assert resolution.identity is not None
+    assert resolution.identity.email == "user1@company.local"
+    assert resolution.identity.username == "user1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_nonexistent_dn_is_proven_not_found(ldap_settings):
+    # herd-stale lists this DN as a member even though no entry exists; the
+    # directory answers noSuchObject, which is proof, not an error.
+    resolution = await ldap_service.resolve_member(f"uid=ghost1,{PEOPLE_DN}")
+    assert resolution.identity is None
+    assert resolution.skip_reason == ldap_service.MEMBER_SKIP_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_without_email_is_skipped(ldap_settings):
+    resolution = await ldap_service.resolve_member(f"uid=nomail1,{PEOPLE_DN}")
+    assert resolution.identity is None
+    assert resolution.skip_reason == ldap_service.MEMBER_SKIP_MISSING_EMAIL
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_without_username_is_skipped(ldap_settings):
+    resolution = await ldap_service.resolve_member(f"cn=nouid1,{PEOPLE_DN}")
+    assert resolution.identity is None
+    assert resolution.skip_reason == ldap_service.MEMBER_SKIP_MISSING_USERNAME
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_bad_service_account_raises(monkeypatch, ldap_settings):
+    monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.resolve_member(f"uid=user1,{PEOPLE_DN}")
+
+
+@pytest.mark.asyncio
+async def test_user_present_by_email_found(ldap_settings):
+    assert await ldap_service.user_present_by_email("user1@company.local") is True
+
+
+@pytest.mark.asyncio
+async def test_user_present_by_email_proven_absent(ldap_settings):
+    assert await ldap_service.user_present_by_email("ghost1@company.local") is False
+
+
+@pytest.mark.asyncio
+async def test_user_present_by_email_escapes_filter_metacharacters(ldap_settings):
+    # Unescaped, the wildcard would match every seeded user and "prove"
+    # presence for an email that belongs to no one.
+    assert await ldap_service.user_present_by_email("user*@company.local") is False
+
+
+@pytest.mark.asyncio
+async def test_user_present_by_email_bad_service_account_raises(monkeypatch, ldap_settings):
+    monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.user_present_by_email("user1@company.local")
+
+
+@pytest.mark.asyncio
+async def test_user_present_by_email_bad_base_dn_raises_not_absent(monkeypatch, ldap_settings):
+    # The asymmetry pin: a base-scope lookup on a missing DN is proof for
+    # fetch_group/resolve_member, but a presence search under a missing BASE
+    # proves nothing about the user. Reporting False here is exactly the
+    # misread that would let a misconfigured base DN mass-deactivate.
+    monkeypatch.setattr(settings, "ldap_user_base_dn", f"ou=nowhere,{BASE_DN}", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.user_present_by_email("user1@company.local")

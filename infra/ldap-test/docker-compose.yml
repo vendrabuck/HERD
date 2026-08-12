@@ -5,8 +5,9 @@
 # The osixia image creates the dc=company,dc=local base entry itself from
 # LDAP_DOMAIN and the cn=admin bind account from LDAP_ADMIN_PASSWORD; the
 # mounted LDIF in ./ldif adds ou=people and the fixture users the tests
-# assert (user1..user25 / Password1). --copy-service is required for the
-# bootstrap LDIF mount to be picked up.
+# assert (user1..user25 / Password1), plus the ou=groups fixtures for the
+# ADR 0011 group-sync tests (60-seed-groups.ldif). --copy-service is
+# required for the bootstrap LDIF mount to be picked up.
 #
 # Deliberately stateless: no named volumes, so `docker compose down` discards
 # the directory and the next `up` reseeds it from the LDIF. Plain LDAP on

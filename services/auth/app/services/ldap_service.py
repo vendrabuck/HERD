@@ -9,6 +9,14 @@ Flow (when settings.auth_method == "ldap"):
 4. Open a second connection and bind as that user DN with the submitted
    password. Success here is proof the password is correct.
 
+Beyond login binds, this module is the directory client for the ADR 0011
+group sync (docs/design/0011-ldap-group-sync.md): group entry fetch, member
+DN resolution, and the email-keyed user presence search. Those callers need
+to distinguish "the directory answered: not there" (safe to act on) from
+"the directory could not be asked" (proves nothing), so the sync-facing
+functions raise LdapUnavailableError on the latter instead of collapsing
+every failure to None the way the login path does.
+
 Blocking ldap3 calls are dispatched to a worker thread so they do not stall
 the event loop.
 """
@@ -17,10 +25,11 @@ from __future__ import annotations
 
 import logging
 import ssl
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import anyio
-from ldap3 import ALL, SIMPLE, SUBTREE, Connection, Server, Tls
+from ldap3 import ALL, BASE, SIMPLE, SUBTREE, Connection, Server, Tls
 from ldap3.core.exceptions import LDAPException
 from ldap3.utils.conv import escape_filter_chars
 
@@ -58,11 +67,50 @@ def _build_tls() -> Tls:
     )
 
 
+class LdapUnavailableError(Exception):
+    """The directory could not be asked: bind failure, timeout, or LDAP error.
+
+    Callers must treat this as proving nothing about the queried entry; per
+    ADR 0011 an error is never absence, so fail-closed consumers skip the
+    affected work and defer convergence rather than acting on it.
+    """
+
+
 @dataclass(frozen=True)
 class LdapIdentity:
     username: str
     email: str
     dn: str
+
+
+@dataclass(frozen=True)
+class LdapGroupEntry:
+    """A directory group entry: its DN, display name, and member DNs."""
+
+    dn: str
+    name: str
+    member_dns: tuple[str, ...]
+
+
+# skip_reason vocabulary for LdapMemberResolution; the reconciler persists
+# these strings in ldap_sync_runs.detail, so treat them as a small API.
+MEMBER_SKIP_NOT_FOUND = "not_found"
+MEMBER_SKIP_MISSING_EMAIL = "missing_email"
+MEMBER_SKIP_MISSING_USERNAME = "missing_username"
+
+
+@dataclass(frozen=True)
+class LdapMemberResolution:
+    """Outcome of resolving one member DN to a HERD-usable identity.
+
+    identity is None when the directory PROVED the member unusable (entry
+    gone, or present without the email/username attributes JIT provisioning
+    requires); skip_reason then says why. A directory error never produces
+    a resolution; it raises LdapUnavailableError instead.
+    """
+
+    identity: LdapIdentity | None
+    skip_reason: str | None = None
 
 
 def _build_server() -> Server:
@@ -74,17 +122,16 @@ def _build_server() -> Server:
     return Server(settings.ldap_server_url, get_info=ALL, tls=tls)
 
 
-def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
-    """Bind as service account, then search for the user DN and attributes.
+@contextmanager
+def _service_connection():
+    """Yield a service-account-bound read-only connection.
 
-    Returns (user_dn, {email_attr: [values], username_attr: [values]}) on
-    success, or None on any failure (bind failed, search returned no results,
-    LDAP exception). The service account (ldap_bind_dn + ldap_bind_password)
-    must have search permission on ldap_user_base_dn. The search_filter is
-    template'd with the escaped username to prevent filter injection. This
-    function is always synchronous (blocking ldap3 calls); callers use
-    anyio.to_thread to dispatch it.
+    Raises LdapUnavailableError when the connection cannot be established
+    (missing configuration, TLS or transport failure, service-account bind
+    refused). The connection is unbound on exit.
     """
+    if not settings.ldap_server_url:
+        raise LdapUnavailableError("LDAP is not configured (ldap_server_url is empty)")
     server = _build_server()
     conn = Connection(
         server,
@@ -95,39 +142,78 @@ def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
         read_only=True,
     )
     try:
-        if settings.ldap_use_tls and not settings.ldap_server_url.lower().startswith("ldaps://"):
-            conn.start_tls()
-        if not conn.bind():
-            logger.warning(
-                "LDAP service-account bind failed",
-                extra={"action": "ldap_bind_failure", "dn": settings.ldap_bind_dn},
-            )
-            return None
-        safe_username = escape_filter_chars(username)
-        search_filter = settings.ldap_user_filter.format(username=safe_username)
-        ok = conn.search(
-            search_base=settings.ldap_user_base_dn,
-            search_filter=search_filter,
-            search_scope=SUBTREE,
-            attributes=[
-                settings.ldap_email_attribute,
-                settings.ldap_username_attribute,
-            ],
-        )
-        if not ok or not conn.entries:
-            return None
-        entry = conn.entries[0]
-        attrs = {
-            settings.ldap_email_attribute: list(entry[settings.ldap_email_attribute].values)
-            if settings.ldap_email_attribute in entry
-            else [],
-            settings.ldap_username_attribute: list(entry[settings.ldap_username_attribute].values)
-            if settings.ldap_username_attribute in entry
-            else [],
-        }
-        return entry.entry_dn, attrs
+        try:
+            if settings.ldap_use_tls and not settings.ldap_server_url.lower().startswith(
+                "ldaps://"
+            ):
+                conn.start_tls()
+            if not conn.bind():
+                logger.warning(
+                    "LDAP service-account bind failed",
+                    extra={"action": "ldap_bind_failure", "dn": settings.ldap_bind_dn},
+                )
+                raise LdapUnavailableError("service-account bind failed")
+        except LDAPException as exc:
+            raise LdapUnavailableError(f"LDAP connection failed: {exc}") from exc
+        yield conn
     finally:
-        conn.unbind()
+        try:
+            conn.unbind()
+        except Exception:
+            pass
+        # ldap3's failed-connect path (_open_socket) abandons its created
+        # socket without closing it, and unbind() on a never-opened
+        # connection does not close it either; left to the GC it surfaces a
+        # ResourceWarning, which the root filterwarnings=error config turns
+        # into a failure in whatever test runs next.
+        sock = getattr(conn, "socket", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
+    """Bind as service account, then search for the user DN and attributes.
+
+    Returns (user_dn, {email_attr: [values], username_attr: [values]}) on
+    success, or None on any failure (bind failed, search returned no results,
+    LDAP exception): the login path deliberately does not distinguish
+    directory errors from absent users. The search_filter is template'd with
+    the escaped username to prevent filter injection. This function is always
+    synchronous (blocking ldap3 calls); callers use anyio.to_thread to
+    dispatch it.
+    """
+    try:
+        with _service_connection() as conn:
+            safe_username = escape_filter_chars(username)
+            search_filter = settings.ldap_user_filter.format(username=safe_username)
+            ok = conn.search(
+                search_base=settings.ldap_user_base_dn,
+                search_filter=search_filter,
+                search_scope=SUBTREE,
+                attributes=[
+                    settings.ldap_email_attribute,
+                    settings.ldap_username_attribute,
+                ],
+            )
+            if not ok or not conn.entries:
+                return None
+            entry = conn.entries[0]
+            attrs = {
+                settings.ldap_email_attribute: list(entry[settings.ldap_email_attribute].values)
+                if settings.ldap_email_attribute in entry
+                else [],
+                settings.ldap_username_attribute: list(
+                    entry[settings.ldap_username_attribute].values
+                )
+                if settings.ldap_username_attribute in entry
+                else [],
+            }
+            return entry.entry_dn, attrs
+    except LdapUnavailableError:
+        return None
 
 
 def _bind_as_user(user_dn: str, password: str) -> bool:
@@ -210,3 +296,134 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
 async def bind_user(username: str, password: str) -> LdapIdentity | None:
     """Verify the user's password against LDAP and return their identity, or None."""
     return await anyio.to_thread.run_sync(_bind_user_sync, username, password)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 group-sync directory client. Unlike the login path above, these
+# raise LdapUnavailableError when the directory cannot be asked; None (or a
+# skip_reason) is reserved for answers the directory actually gave.
+# ---------------------------------------------------------------------------
+
+# ldap3 reports a base-scope search on a nonexistent DN as a failed search
+# with result code 32 (noSuchObject), not as an empty success, so proven
+# absence must be told apart from real errors by result code.
+_RESULT_SUCCESS = 0
+_RESULT_NO_SUCH_OBJECT = 32
+
+
+def _base_entry(conn: Connection, dn: str, attributes: list[str]):
+    """Base-scope search for one entry by DN.
+
+    Returns the entry, or None when the directory proved it absent (search
+    succeeded with no entries, or noSuchObject). Raises LdapUnavailableError
+    on any other outcome: an errored search proves nothing.
+    """
+    try:
+        ok = conn.search(
+            search_base=dn,
+            search_filter="(objectClass=*)",
+            search_scope=BASE,
+            attributes=attributes,
+        )
+    except LDAPException as exc:
+        raise LdapUnavailableError(f"base search on {dn} failed: {exc}") from exc
+    if ok and conn.entries:
+        return conn.entries[0]
+    result_code = (conn.result or {}).get("result")
+    if result_code in (_RESULT_SUCCESS, _RESULT_NO_SUCH_OBJECT):
+        return None
+    raise LdapUnavailableError(f"base search on {dn} failed: {conn.result}")
+
+
+def _fetch_group_sync(group_dn: str) -> LdapGroupEntry | None:
+    name_attr = settings.ldap_group_name_attribute
+    member_attr = settings.ldap_group_member_attribute
+    with _service_connection() as conn:
+        entry = _base_entry(conn, group_dn, [name_attr, member_attr])
+    if entry is None:
+        return None
+    name_values = entry[name_attr].values if name_attr in entry else []
+    if not name_values:
+        # A group without its display-name attribute is still usable; the DN
+        # stands in so the cached directory_name is never empty.
+        logger.warning(
+            "LDAP group has no %s attribute; falling back to its DN",
+            name_attr,
+            extra={"action": "ldap_group_missing_name", "dn": group_dn},
+        )
+    member_values = entry[member_attr].values if member_attr in entry else []
+    return LdapGroupEntry(
+        dn=entry.entry_dn,
+        name=str(name_values[0]) if name_values else group_dn,
+        member_dns=tuple(str(v) for v in member_values),
+    )
+
+
+def _resolve_member_sync(member_dn: str) -> LdapMemberResolution:
+    email_attr = settings.ldap_email_attribute
+    username_attr = settings.ldap_username_attribute
+    with _service_connection() as conn:
+        entry = _base_entry(conn, member_dn, [email_attr, username_attr])
+    if entry is None:
+        return LdapMemberResolution(None, MEMBER_SKIP_NOT_FOUND)
+    email_values = entry[email_attr].values if email_attr in entry else []
+    username_values = entry[username_attr].values if username_attr in entry else []
+    if not email_values:
+        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_EMAIL)
+    if not username_values:
+        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_USERNAME)
+    return LdapMemberResolution(
+        LdapIdentity(
+            username=str(username_values[0]),
+            email=str(email_values[0]),
+            dn=entry.entry_dn,
+        )
+    )
+
+
+def _user_present_by_email_sync(email: str) -> bool:
+    """SUBTREE-search ldap_user_base_dn for the email; True iff an entry matched.
+
+    Asymmetric with _base_entry on purpose: here even noSuchObject raises,
+    because a missing or misconfigured user_base_dn proves nothing about the
+    user being searched for, and the deactivation sweep may only act on
+    proven absence.
+    """
+    with _service_connection() as conn:
+        safe_email = escape_filter_chars(email)
+        search_filter = f"({settings.ldap_email_attribute}={safe_email})"
+        try:
+            ok = conn.search(
+                search_base=settings.ldap_user_base_dn,
+                search_filter=search_filter,
+                search_scope=SUBTREE,
+                attributes=[settings.ldap_email_attribute],
+            )
+        except LDAPException as exc:
+            raise LdapUnavailableError(f"presence search for {email} failed: {exc}") from exc
+        if ok:
+            return bool(conn.entries)
+        result_code = (conn.result or {}).get("result")
+        if result_code == _RESULT_SUCCESS:
+            return False
+        raise LdapUnavailableError(f"presence search for {email} failed: {conn.result}")
+
+
+async def fetch_group(group_dn: str) -> LdapGroupEntry | None:
+    """Fetch a mapped group's entry: None means the DN provably does not resolve.
+
+    That None is the ADR 0011 dangling case (mapping validation 422s on it;
+    the reconciler skips the group fail-closed). Directory errors raise
+    LdapUnavailableError instead.
+    """
+    return await anyio.to_thread.run_sync(_fetch_group_sync, group_dn)
+
+
+async def resolve_member(member_dn: str) -> LdapMemberResolution:
+    """Resolve one group-member DN to the (email, username) JIT provisioning trusts."""
+    return await anyio.to_thread.run_sync(_resolve_member_sync, member_dn)
+
+
+async def user_present_by_email(email: str) -> bool:
+    """Email-keyed presence probe for the deactivation sweep; errors raise."""
+    return await anyio.to_thread.run_sync(_user_present_by_email_sync, email)

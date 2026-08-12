@@ -34,6 +34,13 @@ class Settings(HerdBaseSettings):
     ldap_user_filter: str = "(sAMAccountName={username})"
     ldap_email_attribute: str = "mail"
     ldap_username_attribute: str = "sAMAccountName"
+    # Group sync (ADR 0011). The group entry's membership attribute, values
+    # interpreted as member DNs (Active Directory and groupOfNames "member";
+    # posixGroup memberUid is out of scope), and the attribute cached as the
+    # mapping's display name. Remaining sync keys land with the phases that
+    # consult them.
+    ldap_group_member_attribute: str = "member"
+    ldap_group_name_attribute: str = "cn"
     ldap_use_tls: bool = True
     # Verify the directory server's TLS certificate. Defaults to True (the bind
     # transmits the service-account and every user's password, so an unvalidated
