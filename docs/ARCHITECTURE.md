@@ -43,7 +43,7 @@ Three roles (`user`, `admin`, `superadmin`) encoded in a JWT signed with a share
 Credential verification is pluggable via `AUTH_METHOD` (see [ENV_VARS.md](ENV_VARS.md#auth)):
 
 - `local` (default): bcrypt-hashed passwords in the `auth.users` table. `/register` is open.
-- `ldap`: the auth service binds against a configured LDAP / Active Directory server on every login. Accounts are provisioned just-in-time (`auth_source='ldap'`, no local hash) on first successful bind; `/register` returns 409. HERD role and group assignment still happen inside HERD; LDAP groups are not mirrored in v1.
+- `ldap`: the auth service binds against a configured LDAP / Active Directory server on every login. Accounts are provisioned just-in-time (`auth_source='ldap'`, no local hash) on first successful bind; `/register` returns 409. HERD role and group assignment still happen inside HERD; LDAP groups are not mirrored today (directory group mapping and sync is designed in ADR 0011, `docs/design/0011-ldap-group-sync.md`, and in delivery: phase 1, the directory group client, has landed).
 
 See [ROLES.md](ROLES.md) for the endpoint-level matrix and [USER_GUIDE.md](USER_GUIDE.md) for the user-facing view.
 
