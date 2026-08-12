@@ -30,6 +30,10 @@ services:
     volumes:
       - ./ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
     healthcheck:
+      # Probes the LAST entry of the LAST bootstrap LDIF file (they apply
+      # sequentially in filename order against a running slapd), so healthy
+      # means fully seeded, not merely that slapd answers or that an earlier
+      # file has landed.
       test:
         [
           "CMD",
@@ -38,12 +42,12 @@ services:
           "-H",
           "ldap://localhost",
           "-b",
-          "ou=people,dc=company,dc=local",
+          "ou=groups,dc=company,dc=local",
           "-D",
           "cn=admin,dc=company,dc=local",
           "-w",
           "admin",
-          "(uid=user1)",
+          "(cn=herd-stale)",
         ]
       interval: 3s
       timeout: 5s

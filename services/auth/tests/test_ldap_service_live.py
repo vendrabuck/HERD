@@ -68,12 +68,49 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _seed_is_current() -> bool:
+    """Probe the last-loaded fixture (cn=herd-stale from 60-seed-groups.ldif).
+
+    The stateless container reseeds only on `up`, so a container started
+    from an older checkout answers for user1 while lacking the group
+    fixtures; without this probe those runs fail with confusing dangling
+    None assertions instead of a clear remedy.
+    """
+    import ldap3
+
+    try:
+        server = ldap3.Server(LDAP_URL, get_info=ldap3.NONE, connect_timeout=5)
+        conn = ldap3.Connection(server, user=ADMIN_DN, password=ADMIN_PW, auto_bind=True)
+        try:
+            ok = conn.search(
+                f"cn=herd-stale,ou=groups,{BASE_DN}",
+                "(objectClass=*)",
+                search_scope=ldap3.BASE,
+                attributes=["cn"],
+            )
+            return bool(ok and conn.entries)
+        finally:
+            conn.unbind()
+    except Exception:
+        return False
+
+
 @pytest.fixture(autouse=True)
 def _fail_when_required_but_unreachable():
     if _LDAP_REQUIRED and not _LDAP_REACHABLE:
         pytest.fail(
             f"HERD_TEST_LDAP_REQUIRED is set but no LDAP server is reachable at {LDAP_URL}; "
             "run `make ldap-up` (infra/ldap-test) or unset HERD_TEST_LDAP_REQUIRED."
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fail_on_stale_seed():
+    if _LDAP_REACHABLE and not _seed_is_current():
+        pytest.fail(
+            f"LDAP server at {LDAP_URL} is reachable but missing the group fixtures "
+            "(60-seed-groups.ldif); it was seeded from an older checkout. "
+            "Run `make ldap-reset` to reseed."
         )
 
 
@@ -239,18 +276,62 @@ async def test_fetch_group_nonexistent_dn_is_dangling_none(ldap_settings):
 
 
 @pytest.mark.asyncio
-async def test_fetch_group_bad_service_account_raises(monkeypatch, ldap_settings):
+async def test_fetch_group_invalid_dn_syntax_is_proven_unresolvable(ldap_settings):
+    # invalidDNSyntax is a stable answer (the DN can never resolve), so it
+    # classifies as dangling None, not as a perpetual outage; phase 2
+    # mapping validation must 422 this, not 503.
+    assert await ldap_service.fetch_group("not-a-dn") is None
+
+
+_SYNC_CLIENT_CALLS = [
+    pytest.param(
+        lambda: ldap_service.fetch_group(f"cn=herd-eng,ou=groups,{BASE_DN}"),
+        id="fetch_group",
+    ),
+    pytest.param(
+        lambda: ldap_service.resolve_member(f"uid=user1,{PEOPLE_DN}"),
+        id="resolve_member",
+    ),
+    pytest.param(
+        lambda: ldap_service.resolve_members([f"uid=user1,{PEOPLE_DN}"]),
+        id="resolve_members",
+    ),
+    pytest.param(
+        lambda: ldap_service.user_present_by_email("user1@company.local"),
+        id="user_present_by_email",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", _SYNC_CLIENT_CALLS)
+async def test_sync_client_bad_service_account_raises(monkeypatch, ldap_settings, call):
     monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
     with pytest.raises(ldap_service.LdapUnavailableError):
-        await ldap_service.fetch_group(f"cn=herd-eng,{GROUPS_DN}")
+        await call()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", _SYNC_CLIENT_CALLS)
+async def test_sync_client_anonymous_bind_refused(monkeypatch, ldap_settings, call):
+    # An empty bind DN must raise, not silently fall back to an anonymous
+    # bind: ACL-denied anonymous reads answer noSuchObject, which would
+    # convert a credentials misconfiguration into false proven absence.
+    monkeypatch.setattr(settings, "ldap_bind_dn", "", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await call()
 
 
 @pytest.mark.asyncio
 async def test_fetch_group_unreachable_server_raises(monkeypatch, ldap_settings):
-    # A closed port refuses the connection; that is an outage, never a
-    # dangling mapping.
+    # A refused connection is an outage, never a dangling mapping. The port
+    # is allocated fresh (bound then released) so nothing else can be
+    # listening on it, unlike a hardcoded offset from LDAP_PORT.
+    with socket.socket() as probe:
+        probe.bind((LDAP_HOST, 0))
+        refused_port = probe.getsockname()[1]
     monkeypatch.setattr(
-        settings, "ldap_server_url", f"ldap://{LDAP_HOST}:{LDAP_PORT + 10000}", raising=False
+        settings, "ldap_server_url", f"ldap://{LDAP_HOST}:{refused_port}", raising=False
     )
     with pytest.raises(ldap_service.LdapUnavailableError):
         await ldap_service.fetch_group(f"cn=herd-eng,{GROUPS_DN}")
@@ -266,33 +347,38 @@ async def test_resolve_member_returns_identity(ldap_settings):
 
 
 @pytest.mark.asyncio
-async def test_resolve_member_nonexistent_dn_is_proven_not_found(ldap_settings):
-    # herd-stale lists this DN as a member even though no entry exists; the
-    # directory answers noSuchObject, which is proof, not an error.
-    resolution = await ldap_service.resolve_member(f"uid=ghost1,{PEOPLE_DN}")
+@pytest.mark.parametrize(
+    ("member_rdn", "expected_reason"),
+    [
+        pytest.param("uid=ghost1", ldap_service.MEMBER_SKIP_NOT_FOUND, id="nonexistent-dn"),
+        pytest.param("uid=nomail1", ldap_service.MEMBER_SKIP_MISSING_EMAIL, id="no-email"),
+        pytest.param("cn=nouid1", ldap_service.MEMBER_SKIP_MISSING_USERNAME, id="no-username"),
+    ],
+)
+async def test_resolve_member_skip_reasons(ldap_settings, member_rdn, expected_reason):
+    # ghost1 is listed as a herd-stale member with no entry: the directory
+    # answers noSuchObject, which is proof, not an error. The attribute
+    # cases are entries that exist but lack what JIT provisioning needs.
+    resolution = await ldap_service.resolve_member(f"{member_rdn},{PEOPLE_DN}")
     assert resolution.identity is None
-    assert resolution.skip_reason == ldap_service.MEMBER_SKIP_NOT_FOUND
+    assert resolution.skip_reason == expected_reason
 
 
 @pytest.mark.asyncio
-async def test_resolve_member_without_email_is_skipped(ldap_settings):
-    resolution = await ldap_service.resolve_member(f"uid=nomail1,{PEOPLE_DN}")
-    assert resolution.identity is None
-    assert resolution.skip_reason == ldap_service.MEMBER_SKIP_MISSING_EMAIL
-
-
-@pytest.mark.asyncio
-async def test_resolve_member_without_username_is_skipped(ldap_settings):
-    resolution = await ldap_service.resolve_member(f"cn=nouid1,{PEOPLE_DN}")
-    assert resolution.identity is None
-    assert resolution.skip_reason == ldap_service.MEMBER_SKIP_MISSING_USERNAME
-
-
-@pytest.mark.asyncio
-async def test_resolve_member_bad_service_account_raises(monkeypatch, ldap_settings):
-    monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
-    with pytest.raises(ldap_service.LdapUnavailableError):
-        await ldap_service.resolve_member(f"uid=user1,{PEOPLE_DN}")
+async def test_resolve_members_batch_over_one_connection(ldap_settings):
+    # The reconciler-facing batch: herd-mixed's membership resolves to one
+    # identity plus both attribute-skip cases.
+    group = await ldap_service.fetch_group(f"cn=herd-mixed,{GROUPS_DN}")
+    assert group is not None
+    resolutions = await ldap_service.resolve_members(group.member_dns)
+    assert len(resolutions) == 3
+    assert {r.skip_reason for r in resolutions} == {
+        None,
+        ldap_service.MEMBER_SKIP_MISSING_EMAIL,
+        ldap_service.MEMBER_SKIP_MISSING_USERNAME,
+    }
+    resolved = [r.identity for r in resolutions if r.identity is not None]
+    assert [i.email for i in resolved] == ["user6@company.local"]
 
 
 @pytest.mark.asyncio
@@ -310,13 +396,6 @@ async def test_user_present_by_email_escapes_filter_metacharacters(ldap_settings
     # Unescaped, the wildcard would match every seeded user and "prove"
     # presence for an email that belongs to no one.
     assert await ldap_service.user_present_by_email("user*@company.local") is False
-
-
-@pytest.mark.asyncio
-async def test_user_present_by_email_bad_service_account_raises(monkeypatch, ldap_settings):
-    monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
-    with pytest.raises(ldap_service.LdapUnavailableError):
-        await ldap_service.user_present_by_email("user1@company.local")
 
 
 @pytest.mark.asyncio
