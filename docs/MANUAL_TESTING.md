@@ -74,19 +74,23 @@ here.
 
 ## M5. LDAP login edge cases against a real directory
 
-- Why manual: the happy path and TLS are covered by `make test-auth-ldap`
-  against the local OpenLDAP container; referrals, nested groups, and
-  password-policy lockouts depend on directory-server behavior that the
-  seeded container does not exercise.
+- Why manual: the happy path is covered by `make test-auth-ldap` against
+  the checked-in OpenLDAP container (`infra/ldap-test/`) and StartTLS
+  ordering by the mocked unit suite; referrals, nested groups, TLS against
+  a real certificate chain, and password-policy lockouts depend on
+  directory-server behavior that the plain-LDAP seeded container does not
+  exercise.
 - Cadence: on change to auth LDAP code or before enabling a new customer
   directory.
-- Preconditions: AUTH_METHOD=ldap against the lab directory
-  (see docs and the ldap-up target); a user in a nested group; a user
-  near lockout.
+- Preconditions: AUTH_METHOD=ldap against a real lab directory (the
+  checked-in container has no nested groups, lockout policy, or TLS); a
+  user in a nested group; a user near lockout.
 - Steps: log in as the nested-group user; log in with a wrong password
   repeatedly to trip the directory's lockout; log in during a simulated
   referral.
-- Expected: nested-group membership grants the mapped role; a
+- Expected: the nested-group user logs in and is JIT-provisioned
+  (directory group membership is not mirrored into HERD groups today;
+  that mapping is issue #38); a
   directory-locked account fails with the generic auth error (no lockout
   detail leaked); referrals either work or fail closed with a clean 503,
   never a hang.
