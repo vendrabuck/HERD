@@ -1406,5 +1406,7 @@ When `AUTH_METHOD=ldap` (see [ENV_VARS.md](ENV_VARS.md#ldap--active-directory)):
 - Role assignment (`user`, `admin`, `superadmin`) and `UserGroup` membership
   are still managed entirely inside HERD. Promote LDAP-provisioned users to
   `admin` or add them to groups using the existing admin UI / endpoints.
-- LDAP group membership is **not** mirrored into HERD groups in this release;
-  that mapping is a deliberate follow-up.
+- LDAP group membership is **not** mirrored into HERD groups today; that
+  mapping is designed in ADR 0011 (`docs/design/0011-ldap-group-sync.md`,
+  issue #38) and in delivery: phase 1, the directory group client, has
+  landed, with the admin-facing mapping and sync arriving in later phases.

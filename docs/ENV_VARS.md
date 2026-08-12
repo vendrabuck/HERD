@@ -72,7 +72,11 @@ Read once at startup to create the seeded superadmin. Ignored on subsequent rest
 Only consulted when `AUTH_METHOD=ldap`. When enabled, `/register` returns 409 and
 user accounts are provisioned on first successful LDAP bind (no password hash
 is stored locally). HERD role and group membership remain managed inside HERD;
-LDAP groups are not mirrored automatically in v1.
+LDAP groups are not mirrored automatically today. Directory group mapping and
+sync is designed in ADR 0011 (`docs/design/0011-ldap-group-sync.md`, issue #38)
+and in delivery: phase 1 (the directory group client) has landed, and the two
+`LDAP_GROUP_*` keys below belong to it. The remaining sync keys arrive with the
+phases that consult them.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -83,6 +87,8 @@ LDAP groups are not mirrored automatically in v1.
 | `LDAP_USER_FILTER` | `(sAMAccountName={username})` | Search filter. `{username}` is substituted with the escaped login input. |
 | `LDAP_EMAIL_ATTRIBUTE` | `mail` | Directory attribute providing the user's email. Users without this attribute cannot log in. |
 | `LDAP_USERNAME_ATTRIBUTE` | `sAMAccountName` | Directory attribute used as the HERD username. |
+| `LDAP_GROUP_MEMBER_ATTRIBUTE` | `member` | Group entry attribute holding member DNs (Active Directory and `groupOfNames` use `member`; `posixGroup` `memberUid` is out of scope). Consulted by the ADR 0011 group sync. |
+| `LDAP_GROUP_NAME_ATTRIBUTE` | `cn` | Group entry attribute cached as a mapping's display name. Consulted by the ADR 0011 group sync. |
 | `LDAP_USE_TLS` | `true` | Require TLS. `ldaps://` URLs negotiate TLS implicitly; plain `ldap://` URLs use STARTTLS when this is true. |
 | `LDAP_TLS_VALIDATE` | `true` | Verify the directory server's TLS certificate. The bind transmits the service-account and every user's password, so leave this on: an unvalidated certificate lets an active network attacker MITM the connection and harvest credentials. Set `false` only for a lab directory behind a self-signed cert you cannot pin via `LDAP_CA_CERT`; this logs a startup warning. |
 | `LDAP_CA_CERT` | (empty) | Path (inside the container) to a CA bundle to verify the directory server against, e.g. a pinned internal CA. Used when `LDAP_TLS_VALIDATE=true`; when empty the system trust store is used. |

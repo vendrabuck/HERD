@@ -1,6 +1,10 @@
 # Decision: Directory Group Mapping and Sync, Issue #38
 
-Status: Accepted 2026-08-12. Seven decision points were
+Status: Accepted 2026-08-12. Phase 1 (directory client) delivered in
+PR #507, 2026-08-12; its adversarial review parked three design questions
+on that PR for phases 2 (mapping validation of non-group DNs), 3
+(out-of-base member policy), and 4 (presence-probe shape).
+Seven decision points were
 resolved with vendra on 2026-08-11: the original four (pre-provisioning,
 reactivation provenance, deactivation fail-safety, audit persistence) plus
 three raised by the same-day adversarial review of the first draft (mapping
