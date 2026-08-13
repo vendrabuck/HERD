@@ -276,3 +276,29 @@
 .hd-vrow .vn{font-family:var(--font-mono);font-weight:600;color:var(--gray-900);min-width:34px;}
 .hd-vrow .vmeta{color:var(--gray-500);flex:1;}
 .hd-vrow .vcur{font-size:11px;font-weight:600;color:var(--status-available-fg);background:var(--status-available-bg);padding:1px 7px;border-radius:var(--radius-sm);}
+
+/* ---- dynamic resources (hypervisor-backed) mockups ---- */
+/* placeholder node on the topology canvas */
+.hd-node.dyn{background:#faf5ff;border:2px dashed #c084fc;color:#581c87;}
+.hd-node.dyn .gl{background:#e9d5ff;}
+.hd-node.dyn .nm{color:#581c87;}
+.hd-node.dyn .dyntag{position:absolute;top:-9px;right:-9px;background:var(--proposal);color:#fff;font-size:9px;font-weight:700;letter-spacing:.05em;padding:2px 6px;border-radius:4px;box-shadow:var(--shadow-sm);}
+.hd-node.dyn .cnt{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#6b21a8;margin-top:6px;}
+.hd-node.dyn .cnt .box{width:44px;border:1px solid #d8b4fe;border-radius:4px;background:#fff;color:var(--gray-900);font-size:11px;padding:2px 6px;text-align:left;}
+
+/* collapsible dynamic-templates section at the bottom of the equipment palette */
+.hd-palette .pdyn{border-top:1px solid var(--gray-200);background:#fff;}
+.hd-palette .pdyn .pdh{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;font-size:12px;font-weight:600;color:var(--gray-700);cursor:default;}
+.hd-palette .pdyn .pdh .chev{width:14px;height:14px;color:var(--gray-400);transform:rotate(90deg);}
+.hd-palette .pdyn .pdb{padding:0 9px 9px;}
+.hd-pdev.dyn{border:1px dashed #d8b4fe;background:#faf5ff;}
+.hd-pdev.dyn .gl{background:#e9d5ff;}
+.hd-chip{display:inline-flex;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;flex:none;}
+.hd-chip.dyn{background:#e9d5ff;color:#6b21a8;}
+
+/* dynamic-instance entry rows in the create-reservation modal */
+.hd-dynrow{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.hd-dynrow .hd-select{flex:1;}
+.hd-dynrow .num{width:64px;border:1px solid var(--gray-300);border-radius:var(--radius-lg);padding:9px 10px;font-size:14px;background:#fff;color:var(--gray-900);}
+.hd-dynrow .rm{font-size:12px;color:#dc2626;flex:none;}
+.hd-addlink{display:inline-block;font-size:13px;font-weight:500;color:var(--blue-600);margin-top:2px;}

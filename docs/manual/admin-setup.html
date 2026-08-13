@@ -35,6 +35,7 @@
       <li><a href="#devices">3 · Create devices</a></li>
       <li><a href="#groups">4 · Device &amp; user groups</a></li>
       <li><a href="#perms">5 · Grant permissions</a></li>
+      <li><a href="#dynamic">6 · Hypervisors (optional)</a></li>
     </ul>
     <p class="eyebrow">Admin track</p>
     <ul>
@@ -199,6 +200,70 @@
     <div class="callout calm">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
       <div><p>To take access away, <strong>remove the permission from the device group</strong> &mdash; don't yank the user out of their user group. Admins always see every device regardless of groups.</p></div>
+    </div>
+
+    <p class="sectitle" id="dynamic">Step 6 &middot; Hypervisors &amp; dynamic templates (optional)</p>
+    <p>Everything so far is physical gear. If you also want users to book <strong>VMs created on demand</strong>, add one more chain: a <b>secret</b> (API credentials), a <b>hypervisor</b> that uses it, a <b>Hypervisor-type recipe driver</b> (step 1, with connection type <code>Hypervisor</code>), and a <b>dynamic template</b> tying the two together. Users then see the template in the topology palette and reserve instances from it.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>Register Hypervisor</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <div class="hd-field"><label class="hd-label">Name</label><div class="hd-input">pve-lab-1</div></div>
+                <div class="hd-field"><label class="hd-label">Endpoint</label><div class="hd-input" data-anno="1" data-anno-pin="r" data-anno-arrow style="font-family:var(--font-mono);font-size:13px;">https://proxmox.example.local:8006</div></div>
+                <div class="hd-row2">
+                  <div class="hd-field"><label class="hd-label">Hypervisor Type</label><div class="hd-input" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">proxmox</div></div>
+                  <div class="hd-field"><label class="hd-label">Secret</label><div class="hd-select" data-anno="3" data-anno-pin="b" data-anno-arrow>pve-api-token (api_key)</div></div>
+                </div>
+                <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--gray-700);"><span style="width:16px;height:16px;border-radius:4px;background:var(--blue-600);display:inline-flex;align-items:center;justify-content:center;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><path d="m5 13 4 4L19 7"/></svg></span> Enabled</label>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Register</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>Registering a hypervisor</b> (Administration &rarr; Hypervisors). It joins the table with its type, endpoint, and secret.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Endpoint.</b> The hypervisor's API URL. HERD's recipe driver talks to this, not to individual VMs.</li>
+      <li><b>Hypervisor Type.</b> Free text matched by the recipe driver: <code>proxmox</code>, <code>vsphere</code>, <code>libvirt</code>, and so on.</li>
+      <li><b>Secret.</b> Credentials, referenced from the secrets store &mdash; create the secret first or this list is empty.</li>
+      <li><b>Register.</b> Deleting later fails while any template references it, same as drivers.</li>
+    </ol>
+
+    <p>Then create the template. In the template editor, the third <b>Type</b> option is what makes it dynamic:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div style="padding:20px;background:var(--gray-100);">
+            <div class="hd-card" style="max-width:560px;margin:0 auto;padding:16px;">
+              <div class="hd-row2">
+                <div class="hd-field"><label class="hd-label">Name</label><div class="hd-input">client-vm</div></div>
+                <div class="hd-field"><label class="hd-label">Type</label><div class="hd-select" data-anno="1" data-anno-pin="r" data-anno-arrow>Dynamic (Hypervisor)</div></div>
+              </div>
+              <div class="hd-field"><label class="hd-label">Recipe Driver</label><div class="hd-select" data-anno="2" data-anno-pin="r" data-anno-arrow data-anno-color="blue">mock_hypervisor (Hypervisor)</div></div>
+              <div class="hd-field" style="margin-bottom:0;"><label class="hd-label">Hypervisor</label><div class="hd-select" data-anno="3" data-anno-pin="r" data-anno-arrow>pve-lab-1 (proxmox)</div></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>A dynamic template in the editor.</b> Type is locked after creation; driver and hypervisor stay editable.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Type: Dynamic (Hypervisor).</b> Chosen at creation and locked from then on. The Driver label switches to Recipe Driver and a Hypervisor field appears.</li>
+      <li><b>Recipe Driver.</b> Only <code>Hypervisor</code>-type drivers are listed here (device drivers are filtered out, and vice versa).</li>
+      <li><b>Hypervisor.</b> Which registered hypervisor the instances are created on. Both fields are required to save.</li>
+    </ol>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Dynamic templates skip the device step entirely: there is nothing to add to inventory. What users see and reserve is covered in <a href="user-topology.html#dynamic">Dynamic resources on the canvas</a>.</p></div>
     </div>
 
     <hr class="rule" />
