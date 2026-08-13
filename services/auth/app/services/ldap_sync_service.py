@@ -12,27 +12,42 @@ asymmetric; each tier acts on exactly what was proven:
 - Directory ANSWERS (a dangling group DN, a member resolved with a
   skip_reason) act only on what was answered about: a dangling group is
   skipped whole (its membership is unknowable), while a skipped member is
-  counted and excluded without failing the group's reconcile.
+  counted and excluded without failing the group's reconcile. The one
+  exception is the removal pass itself (see _reconcile_mapping): a member
+  the directory still lists but could not identify (missing_email or
+  missing_username) makes the whole group's removal set unprovable, since
+  that unresolvable entry could be any current row.
 - Apply failures are isolated per operation: one racing add or remove is
   counted and the loop continues; it never fails the run.
 
 Changes apply ONLY through group_service.add_member / remove_member so sync
 reproduces manual admin behavior (the "Not Grouped" auto-remove included),
-and only auth_source == "ldap" users are visible to the sync in either
-direction. Run rows are committed with status "running" before any
-directory work so a crashed pass leaves a visible corpse.
+and only auth_source == "ldap" AND is_active users are visible to the sync
+in either direction (an admin-deactivated user is invisible to membership
+sync just like a local account; phase 4's sweep owns is_active transitions).
+Run rows are committed with status "running" before any directory work so a
+crashed pass leaves a visible corpse.
+
+Run serialization (sync-now and any future scheduled trigger share ONE
+running-row invariant) also lives here: an in-process asyncio.Lock plus, on
+Postgres, a session-scoped advisory lock so scaled-out auth replicas cannot
+execute concurrent directory-wide writes. The advisory key is the single
+constant below; changing it would let two builds sync concurrently across a
+rolling deploy, so it is part of the cross-replica contract, not a tunable.
 """
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from app import database
 from app.models.group import GroupMember
-from app.models.ldap_group_mapping import LdapGroupMapping
+from app.models.ldap_group_mapping import DIRECTORY_NAME_MAX, LdapGroupMapping
 from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import User
 from app.services import auth_service, group_service, ldap_service
@@ -54,12 +69,18 @@ GROUP_SKIP_MEMBER_RESOLUTION_UNAVAILABLE = "member_resolution_unavailable"
 MEMBER_SKIP_USERNAME_TAKEN = "username_taken"
 MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT = "email_owned_by_local_account"
 MEMBER_SKIP_USERNAME_DRIFT_COLLISION = "username_drift_collision"
+MEMBER_SKIP_USER_INACTIVE = "user_inactive"
 # Not a skip: a provisioning IntegrityError whose retry-as-lookup found the
 # row (concurrent JIT login). Recorded in detail, member proceeds.
 PROVISION_RACE_RECOVERED = "provision_race_recovered"
 
-# Mirrors the column cap on LdapGroupMapping.directory_name (display cache).
-_DIRECTORY_NAME_MAX = 255
+# C4: a member the directory still lists but could not identify makes the
+# whole group's removal set unprovable, since the unresolvable entry could
+# be any current row. A proven not_found skip does NOT belong here: a
+# proven-absent DN shields nobody, so it never blocks removals.
+_REMOVAL_SUPPRESSING_REASONS = frozenset(
+    {ldap_service.MEMBER_SKIP_MISSING_EMAIL, ldap_service.MEMBER_SKIP_MISSING_USERNAME}
+)
 
 
 class _CappedCategory:
@@ -85,9 +106,11 @@ class _CappedCategory:
 class _Tally:
     """Counters and capped detail for one run.
 
-    degraded distinguishes "partial" from "success": any group skip, member
-    skip, or per-op failure degrades the run; a recovered provisioning race
-    does not (nothing was skipped, the member proceeded).
+    degraded distinguishes "partial" from "success" and is DERIVED: any
+    category other than provision_races holding a record or overflow makes
+    the run partial (a recovered provisioning race is not a skip, nothing
+    was skipped, the member proceeded). Categories are created lazily via
+    _category, so a new category needs no constructor edit.
     """
 
     def __init__(self) -> None:
@@ -95,20 +118,24 @@ class _Tally:
         self.members_added = 0
         self.members_removed = 0
         self.members_skipped = 0
-        self.degraded = False
-        self._categories: dict[str, _CappedCategory] = {
-            "skipped_groups": _CappedCategory(),
-            "skipped_members": _CappedCategory(),
-            "op_failures": _CappedCategory(),
-            "provision_races": _CappedCategory(),
-        }
+        self._categories: dict[str, _CappedCategory] = {}
+
+    def _category(self, name: str) -> _CappedCategory:
+        return self._categories.setdefault(name, _CappedCategory())
+
+    @property
+    def degraded(self) -> bool:
+        return any(
+            cat.records or cat.overflow
+            for name, cat in self._categories.items()
+            if name != "provision_races"
+        )
 
     def skip_group(self, group_dn: str, reason: str, error: str | None = None) -> None:
-        self.degraded = True
         record: dict = {"group_dn": group_dn, "reason": reason}
         if error is not None:
             record["error"] = error
-        self._categories["skipped_groups"].add(record)
+        self._category("skipped_groups").add(record)
         logger.warning(
             "LDAP sync skipped group %s: %s",
             group_dn,
@@ -117,15 +144,13 @@ class _Tally:
         )
 
     def skip_member(self, group_dn: str, member_dn: str, reason: str) -> None:
-        self.degraded = True
         self.members_skipped += 1
-        self._categories["skipped_members"].add(
+        self._category("skipped_members").add(
             {"group_dn": group_dn, "member_dn": member_dn, "reason": reason}
         )
 
     def op_failure(self, group_dn: str, op: str, user_id: uuid.UUID, error: str) -> None:
-        self.degraded = True
-        self._categories["op_failures"].add(
+        self._category("op_failures").add(
             {"group_dn": group_dn, "op": op, "user_id": str(user_id), "error": error}
         )
         logger.warning(
@@ -138,12 +163,36 @@ class _Tally:
         )
 
     def provision_race(self, group_dn: str, email: str) -> None:
-        self._categories["provision_races"].add(
+        self._category("provision_races").add(
             {"group_dn": group_dn, "email": email, "reason": PROVISION_RACE_RECOVERED}
+        )
+
+    def drift_collision(self, group_dn: str, member_dn: str, reason: str) -> None:
+        # C6: recorded apart from skip_member. A repair WAS skipped (the run
+        # is still partial via degraded), but the member is a proven
+        # directory answer and reconciles into the group regardless, so it
+        # must not double-count as both skipped and added.
+        self._category("drift_collisions").add(
+            {"group_dn": group_dn, "member_dn": member_dn, "reason": reason}
+        )
+
+    def suppress_removals(self, group_dn: str, unresolved: int, would_remove: int) -> None:
+        self._category("suppressed_removals").add(
+            {"group_dn": group_dn, "unresolved": unresolved, "would_remove": would_remove}
         )
 
     def detail(self) -> dict:
         return {name: cat.dump() for name, cat in self._categories.items() if cat.records}
+
+    def apply_to(self, run: LdapSyncRun) -> None:
+        """Write the four counters and detail onto the run row. Status,
+        error, and finished_at are run-level machinery outcomes, not tally
+        state, and stay the caller's responsibility."""
+        run.users_provisioned = self.users_provisioned
+        run.members_added = self.members_added
+        run.members_removed = self.members_removed
+        run.members_skipped = self.members_skipped
+        run.detail = self.detail()
 
 
 async def _ensure_ldap_user(
@@ -157,14 +206,24 @@ async def _ensure_ldap_user(
     the ORM instance: rollbacks below expire every instance in the session,
     and attribute access on an expired instance requires IO the async caller
     cannot perform implicitly.
+
+    Cross-reference (S5): auth_service._authenticate_ldap resolves the same
+    identity shape on login but never repairs username drift and never
+    retries a provisioning race as a lookup; it refuses instead. That
+    divergence is DESIGNED: this function runs inside a long-lived
+    reconcile pass whose job is to repair drift and recover races proactively,
+    while login is a narrow, latency-sensitive path that must fail closed
+    rather than silently mutate an account mid-authentication. Do not "fix"
+    one to match the other.
     """
     user = await auth_service.get_user_by_email(db, identity.email)
     if user is None:
         try:
             user = await auth_service.create_ldap_user(db, identity.email, identity.username)
             tally.users_provisioned += 1
-            # Freshly provisioned from this identity: source and username are
-            # correct by construction, no drift check needed.
+            # Freshly provisioned from this identity: source, username, and
+            # is_active (default True) are correct by construction, no
+            # further checks needed.
             return user.id
         except IntegrityError:
             # Either a concurrent JIT login provisioned this email (retry as
@@ -179,6 +238,14 @@ async def _ensure_ldap_user(
         # Mirrors _authenticate_ldap: an email owned by a local account is
         # refused, never silently converted.
         tally.skip_member(group_dn, identity.dn, MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT)
+        return None
+    if not user.is_active:
+        # C5: inactive users are invisible to membership sync in both
+        # directions, exactly like local accounts. Never re-added here; the
+        # current_ids query below excludes their existing rows too, so an
+        # admin deactivation is never undone by a later sync pass. Phase 4's
+        # sweep is the only sync writer of is_active.
+        tally.skip_member(group_dn, identity.dn, MEMBER_SKIP_USER_INACTIVE)
         return None
     user_id = user.id
     if user.username != identity.username:
@@ -198,7 +265,7 @@ async def _ensure_ldap_user(
             )
         except IntegrityError:
             await db.rollback()
-            tally.skip_member(group_dn, identity.dn, MEMBER_SKIP_USERNAME_DRIFT_COLLISION)
+            tally.drift_collision(group_dn, identity.dn, MEMBER_SKIP_USERNAME_DRIFT_COLLISION)
     return user_id
 
 
@@ -225,7 +292,7 @@ async def _reconcile_mapping(
         tally.skip_group(group_dn, GROUP_SKIP_DANGLING_DN)
         return
 
-    new_name = entry.name[:_DIRECTORY_NAME_MAX]
+    new_name = entry.name[:DIRECTORY_NAME_MAX]
     if new_name and new_name != directory_name:
         # Display-cache refresh on every successful fetch; a failed fetch
         # above kept the last cached value by returning early.
@@ -245,11 +312,15 @@ async def _reconcile_mapping(
         return
 
     desired_ids: set[uuid.UUID] = set()
+    unresolved_existing_count = 0
     for member_dn, resolution in zip(entry.member_dns, resolutions):
         if resolution.identity is None:
             # An answer the directory gave (entry gone, or present without
             # the attributes JIT needs): counted, does not fail the group.
-            tally.skip_member(group_dn, member_dn, resolution.skip_reason or "unknown")
+            reason = resolution.skip_reason or "unknown"
+            tally.skip_member(group_dn, member_dn, reason)
+            if reason in _REMOVAL_SUPPRESSING_REASONS:
+                unresolved_existing_count += 1
             continue
         user_id = await _ensure_ldap_user(db, group_dn, resolution.identity, tally)
         if user_id is not None:
@@ -260,7 +331,13 @@ async def _reconcile_mapping(
             await db.execute(
                 select(GroupMember.user_id)
                 .join(User, GroupMember.user_id == User.id)
-                .where(GroupMember.group_id == herd_group_id, User.auth_source == "ldap")
+                .where(
+                    GroupMember.group_id == herd_group_id,
+                    User.auth_source == "ldap",
+                    # C5: an inactive user's existing membership is invisible
+                    # to the diff, so it is never removed either.
+                    User.is_active.is_(True),
+                )
             )
         )
         .scalars()
@@ -272,19 +349,46 @@ async def _reconcile_mapping(
         try:
             await group_service.add_member(db, herd_group_id, user_id)
             tally.members_added += 1
-        except IntegrityError:
-            # Concurrent admin already added the row: benign no-op.
+        except IntegrityError as exc:
+            # C3: not every IntegrityError here is the benign concurrent
+            # duplicate. A commit-time FK violation (the user or group
+            # vanished mid-run) raises IntegrityError too, and silently
+            # treating it as a no-op would void the add while the run
+            # reports success. Disambiguate by proof: the row exists means
+            # a concurrent admin already added it (benign); absent means
+            # the add never landed (a genuine apply failure).
             await db.rollback()
+            exists = (
+                await db.execute(
+                    select(GroupMember.user_id).where(
+                        GroupMember.group_id == herd_group_id,
+                        GroupMember.user_id == user_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if exists is None:
+                tally.op_failure(group_dn, "add", user_id, str(exc))
         except Exception as exc:
             await db.rollback()
             tally.op_failure(group_dn, "add", user_id, str(exc))
-    for user_id in sorted(current_ids - desired_ids, key=str):
-        try:
-            if await group_service.remove_member(db, herd_group_id, user_id):
-                tally.members_removed += 1
-        except Exception as exc:
-            await db.rollback()
-            tally.op_failure(group_dn, "remove", user_id, str(exc))
+
+    removals = current_ids - desired_ids
+    if unresolved_existing_count:
+        # C4: the removal set for this group is unprovable this pass (an
+        # unresolvable existing entry could be any current row), so the
+        # remove pass does not run at all. Only record the suppression when
+        # it would have mattered (a nonempty removal set); the run is
+        # already degraded via the member skips above either way.
+        if removals:
+            tally.suppress_removals(group_dn, unresolved_existing_count, len(removals))
+    else:
+        for user_id in sorted(removals, key=str):
+            try:
+                if await group_service.remove_member(db, herd_group_id, user_id):
+                    tally.members_removed += 1
+            except Exception as exc:
+                await db.rollback()
+                tally.op_failure(group_dn, "remove", user_id, str(exc))
 
 
 async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
@@ -332,14 +436,10 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
             extra={"action": "ldap_sync_run_failed", "run_id": str(run_id)},
         )
     finally:
+        tally.apply_to(run)
         run.status = status
         run.error = error
         run.finished_at = datetime.now(timezone.utc)
-        run.users_provisioned = tally.users_provisioned
-        run.members_added = tally.members_added
-        run.members_removed = tally.members_removed
-        run.members_skipped = tally.members_skipped
-        run.detail = tally.detail()
         await db.commit()
         logger.info(
             "LDAP sync run finished: %s",
@@ -357,10 +457,209 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
     return run
 
 
-async def run_sync(db: AsyncSession, *, trigger: str = "manual") -> LdapSyncRun:
-    """Create a run row (committed first, so a crash leaves a visible
-    "running" corpse) and execute the reconcile pass against it."""
+async def create_run(db: AsyncSession, trigger: str) -> LdapSyncRun:
+    """Create and commit a run row with status "running" (the crash-corpse
+    invariant: a run row exists and is visible before any directory work
+    starts). Both start_background_run and run_sync go through this single
+    source so the guarantee cannot drift between the two callers."""
     run = LdapSyncRun(trigger=trigger, status="running")
     db.add(run)
     await db.commit()
-    return await execute_run(db, run)
+    return run
+
+
+# ---------------------------------------------------------------------------
+# Run serialization (S1). One invariant, ONE implementation: a run is a run
+# whether started from the router's sync-now endpoint, called directly
+# (run_sync, used by the live tests and any script), or (future) a phase 5
+# interval loop started from main.py's lifespan. Two layers: an in-process
+# asyncio.Lock (blocks a second call in THIS process) and, on Postgres only,
+# a session-scoped advisory lock (blocks a second call on ANOTHER replica).
+# SQLite (unit tests) has no advisory locks, so tests exercise only the
+# asyncio-lock layer.
+# ---------------------------------------------------------------------------
+
+_ADVISORY_LOCK_KEY = "herd_ldap_group_sync"
+_TRY_ADVISORY_LOCK_SQL = text(f"SELECT pg_try_advisory_lock(hashtext('{_ADVISORY_LOCK_KEY}'))")
+_ADVISORY_UNLOCK_SQL = text(f"SELECT pg_advisory_unlock(hashtext('{_ADVISORY_LOCK_KEY}'))")
+
+_sync_lock = asyncio.Lock()
+# Strong references so a scheduled run is never garbage-collected mid-flight.
+_background_tasks: set[asyncio.Task] = set()
+
+
+class SyncBusyError(Exception):
+    """Raised instead of acquiring the run-serialization slot when it is
+    already held. .reason is "in_process" (this process is already running
+    a sync) or "replica" (the Postgres advisory lock is held elsewhere);
+    callers map these to their own presentation (the router to a 409)."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"LDAP sync busy: {reason}")
+
+
+async def _release_sync_locks(lock_conn: AsyncConnection | None) -> None:
+    """Release the advisory lock (on the SAME connection that acquired it;
+    advisory locks are session-scoped) and then the in-process lock.
+
+    lock_conn is not None only when the advisory lock was acquired on it.
+    C2: a failed unlock invalidates the connection instead of politely
+    closing it. Pooled close() only rolls back and returns the connection to
+    the pool, and a session-scoped advisory lock survives rollback, so a
+    lock could ride an idle pooled connection until process restart.
+    invalidate() is a hard DBAPI close that drops server-side session state,
+    including the lock. The except is BaseException, not Exception, so a
+    task cancellation arriving mid-unlock still triggers the invalidate
+    before the cancellation propagates; anything that is not a plain
+    Exception (cancellation, SystemExit, ...) is re-raised after cleanup so
+    it is never swallowed. The asyncio lock release always happens in the
+    outermost finally, regardless of how this function exits.
+    """
+    try:
+        if lock_conn is not None:
+            try:
+                await lock_conn.execute(_ADVISORY_UNLOCK_SQL)
+                await lock_conn.close()
+            except BaseException as exc:
+                logger.exception(
+                    "advisory unlock failed; invalidating connection to drop the session lock",
+                    extra={"action": "ldap_sync_advisory_unlock_failed"},
+                )
+                try:
+                    await lock_conn.invalidate()
+                except Exception:
+                    logger.exception(
+                        "sync lock connection invalidate failed",
+                        extra={"action": "ldap_sync_lock_conn_invalidate_failed"},
+                    )
+                if not isinstance(exc, Exception):
+                    raise
+    finally:
+        _sync_lock.release()
+
+
+class _SyncSlot:
+    """Async context manager for the run-serialization slot.
+
+    __aenter__ raises SyncBusyError instead of acquiring when the slot is
+    held, and releases anything it already acquired before raising (the
+    in-process lock is only held between a successful asyncio.Lock.acquire
+    and either a raised SyncBusyError or a caller-driven release). By
+    default __aexit__ releases both locks; a caller handing the connection
+    off to a background task calls hand_off() first so __aexit__ becomes a
+    no-op and the background task's own finally owns the release instead.
+    """
+
+    def __init__(self) -> None:
+        self.lock_conn: AsyncConnection | None = None
+        self._handed_off = False
+
+    async def __aenter__(self) -> "_SyncSlot":
+        if _sync_lock.locked():
+            raise SyncBusyError("in_process")
+        # No await sits between the locked() check and this acquire, and an
+        # uncontended asyncio.Lock.acquire completes without suspending, so
+        # two rapid callers cannot both pass the check and both acquire.
+        await _sync_lock.acquire()
+        try:
+            # Cross-replica layer, on a dedicated connection held for the
+            # whole run because advisory locks are session-scoped: acquire
+            # and release must happen on one connection.
+            if database.engine.dialect.name == "postgresql":
+                self.lock_conn = await database.engine.connect()
+                acquired = (await self.lock_conn.execute(_TRY_ADVISORY_LOCK_SQL)).scalar_one()
+                if not acquired:
+                    # Invariant: lock_conn is not None only while the
+                    # advisory lock is held on it, so release paths can
+                    # unlock unconditionally. Not acquired: close and forget
+                    # it first.
+                    conn, self.lock_conn = self.lock_conn, None
+                    await conn.close()
+                    raise SyncBusyError("replica")
+                # C1: pg_try_advisory_lock autobegins a transaction on this
+                # connection; left open, it idles in transaction for the
+                # whole run and a server-side idle_in_transaction_session_
+                # timeout can kill it, silently dropping the cross-replica
+                # lock mid-run. Session-level advisory locks survive
+                # transaction end, so committing here is safe and required.
+                await self.lock_conn.commit()
+        except BaseException:
+            # Every early exit from here (replica busy, connect failure,
+            # cancellation) still owns the asyncio lock and must release
+            # exactly what was acquired.
+            await _release_sync_locks(self.lock_conn)
+            raise
+        return self
+
+    def hand_off(self) -> None:
+        self._handed_off = True
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if not self._handed_off:
+            await _release_sync_locks(self.lock_conn)
+
+
+async def _run_in_background(run_id: uuid.UUID, lock_conn: AsyncConnection | None) -> None:
+    """Background half of start_background_run: owns both locks from the
+    moment it is scheduled and must release them on every path.
+
+    The pass runs on its own session (database.AsyncSessionLocal), never the
+    caller's, which may already be closed by the time this executes.
+    execute_run finalizes the run row itself (finished_at, status) even on
+    failure; the except here is a belt for machinery outside it, so the task
+    never ends with an unretrieved exception.
+    """
+    try:
+        try:
+            async with database.AsyncSessionLocal() as session:
+                run = await session.get(LdapSyncRun, run_id)
+                if run is None:
+                    # The handler committed the row before scheduling; only
+                    # external deletion explains this.
+                    logger.error(
+                        "sync run row not found for background execution",
+                        extra={"action": "ldap_sync_run_missing", "run_id": str(run_id)},
+                    )
+                    return
+                await execute_run(session, run)
+        finally:
+            await _release_sync_locks(lock_conn)
+    except Exception:
+        logger.exception(
+            "LDAP sync background task failed",
+            extra={"action": "ldap_sync_task_failed", "run_id": str(run_id)},
+        )
+
+
+async def start_background_run(trigger: str) -> uuid.UUID:
+    """Acquire the run-serialization slot, create the run row, and schedule
+    the reconcile pass as a background task that owns the slot from here on.
+
+    Raises SyncBusyError (never an HTTP code; that mapping is the router's
+    job) when the slot is already held, either in this process or (fail-safe
+    fallback for the router) on another replica.
+    """
+    async with _SyncSlot() as slot:
+        async with database.AsyncSessionLocal() as session:
+            run = await create_run(session, trigger)
+            run_id = run.id
+        task = asyncio.create_task(_run_in_background(run_id, slot.lock_conn))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        # From here the task owns both locks and the lock connection.
+        slot.hand_off()
+        return run_id
+
+
+async def run_sync(db: AsyncSession, *, trigger: str = "manual") -> LdapSyncRun:
+    """Create a run row (committed first, so a crash leaves a visible
+    "running" corpse) and execute the reconcile pass against it, serialized
+    through the same run-invariant slot start_background_run uses (S1): the
+    obvious direct-call API (used by the live tests and any script) is
+    serialized exactly like the router's sync-now endpoint. On SQLite the
+    advisory-lock layer is dialect-gated out, so tests exercise only the
+    uncontended asyncio-lock layer and behave exactly as before."""
+    async with _SyncSlot():
+        run = await create_run(db, trigger)
+        return await execute_run(db, run)

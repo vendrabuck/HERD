@@ -23,6 +23,11 @@ from app.database import Base
 _schema = settings.db_schema or None
 _fk_prefix = f"{settings.db_schema}." if settings.db_schema else ""
 
+# S3: single-sourced here so the router and the reconciler both truncate
+# directory_name to the same length the column enforces, instead of each
+# carrying its own copy of the number that could drift out of sync with it.
+DIRECTORY_NAME_MAX = 255
+
 
 class LdapGroupMapping(Base):
     __tablename__ = "ldap_group_mappings"
@@ -39,7 +44,7 @@ class LdapGroupMapping(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     group_dn: Mapped[str] = mapped_column(Text, nullable=False)
-    directory_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    directory_name: Mapped[str] = mapped_column(String(DIRECTORY_NAME_MAX), nullable=False)
     herd_group_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey(f"{_fk_prefix}user_groups.id", ondelete="CASCADE"),

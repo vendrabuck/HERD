@@ -165,6 +165,33 @@ email-matched user, the sync updates the stored username
 (collision-guarded: a conflict with an existing username is skipped and
 counted).
 
+**Amendments (phase 3 review resolutions, 2026-08-13):**
+
+1. Removals for a group are driven only when no member skipped as
+   identity-unresolvable-but-existing (skip_reason `missing_email` or
+   `missing_username`: the directory still lists the entry but could not
+   answer who it is). Such an entry could be any current row, so the
+   group's whole removal set is unprovable that pass and the remove pass
+   does not run; a suppressed pass is recorded in the run detail
+   (`suppressed_removals`, `{group_dn, unresolved, would_remove}`) when it
+   would otherwise have removed someone. A proven `not_found` skip (the
+   directory affirmatively answered the DN is gone) does NOT block
+   removals: a proven-absent entry shields nobody, so it carries no
+   ambiguity about who else might be affected.
+2. `is_active=False` users are invisible to membership sync in both
+   directions, exactly like locally-created accounts: an inactive LDAP
+   user already in a mapped group is neither removed nor re-added by a
+   later pass, and one still listed in the directory is never (re)added.
+   The phase 4 deactivation sweep is the only sync-side writer of
+   `is_active`; this reconciler never flips it.
+3. A username-drift collision (the repaired username collides with an
+   existing account) degrades the run to "partial", but the member itself
+   still reconciles into the group: only the drift repair was skipped, and
+   the member is a proven directory answer. It is recorded in its own
+   detail category (`drift_collisions`) apart from the member-skip
+   counter, so the counters (an added-or-skipped member, never both) stay
+   reconcilable against the run's total membership delta.
+
 ### Pre-provisioning (decided: yes)
 
 A desired member with no HERD user row is provisioned during sync through

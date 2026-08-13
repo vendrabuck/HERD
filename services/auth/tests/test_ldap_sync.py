@@ -11,10 +11,10 @@ enforced by Postgres; SQLite runs without FK enforcement here, so that path
 is deliberately not asserted in this file.
 
 The phase 3 sync-now tests exercise only the in-process asyncio-lock layer
-of the run serialization: the Postgres advisory-lock layer is gated on
-dialect == "postgresql" and SQLite has no advisory locks. The background
-task's session factory is pointed at the test engine so the run it
-finalizes is the same one the GET endpoints read.
+of the run serialization (owned by ldap_sync_service, S1): the Postgres
+advisory-lock layer is gated on dialect == "postgresql" and SQLite has no
+advisory locks. The background task's session factory is pointed at the
+test engine so the run it finalizes is the same one the GET endpoints read.
 """
 
 import asyncio
@@ -29,7 +29,6 @@ from app.dependencies.auth import get_current_user
 from app.main import app
 from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import Role, User
-from app.routers import ldap_sync as ldap_sync_router
 from app.routers.ldap_sync import NO_MEMBERS_WARNING
 from app.services import ldap_service, ldap_sync_service
 from httpx import ASGITransport, AsyncClient
@@ -313,19 +312,22 @@ def background_session(monkeypatch):
     monkeypatch.setattr(database, "AsyncSessionLocal", TestSessionLocal)
 
 
+async def _await_background() -> None:
+    # S4: the single drain implementation, used by both the autouse fixture
+    # (teardown) and tests that need to await a scheduled run mid-test.
+    # _background_tasks and _sync_lock now live on ldap_sync_service (S1),
+    # not the router.
+    for task in list(ldap_sync_service._background_tasks):
+        await asyncio.wait_for(task, timeout=5)
+
+
 @pytest.fixture(autouse=True)
 async def drain_background_tasks():
     # Teardown ordering matters: this fixture is defined after setup_db, so
     # it finalizes first and no background task outlives the tables.
     yield
-    for task in list(ldap_sync_router._background_tasks):
-        await asyncio.wait_for(task, timeout=5)
-    assert not ldap_sync_router._sync_lock.locked()
-
-
-async def _await_background():
-    for task in list(ldap_sync_router._background_tasks):
-        await asyncio.wait_for(task, timeout=5)
+    await _await_background()
+    assert not ldap_sync_service._sync_lock.locked()
 
 
 @pytest.mark.asyncio
@@ -388,7 +390,7 @@ async def test_sync_run_refused_outside_ldap_mode_without_leaking_lock(monkeypat
     resp = await admin_client.post("/admin/ldap-sync/run")
     assert resp.status_code == 409
     assert "auth_method" in resp.json()["detail"]
-    assert not ldap_sync_router._sync_lock.locked()
+    assert not ldap_sync_service._sync_lock.locked()
 
 
 @pytest.mark.asyncio
