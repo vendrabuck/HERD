@@ -83,12 +83,21 @@ New table `ldap_group_mappings` in the `auth` schema (Alembic revision under
 `services/auth/migrations/versions/`):
 
 - id UUID PK
-- group_dn Text, unique: the directory group's DN, the mapping key
-- directory_name String, cached display name (the group's
-  `ldap_group_name_attribute`), refreshed on each successful group fetch; a
-  failed refresh keeps the last cached value
-- herd_group_id UUID FK to `user_groups.id` ON DELETE CASCADE: deleting the
-  HERD group deletes the mapping; the directory is never written
+- group_dn Text, unique: the directory group's CANONICAL DN as the
+  directory returned it (not the admin-typed form; DNs are
+  case-insensitive, so storing raw input would let case variants map one
+  directory group twice), the mapping key
+- directory_name String(255), cached display name (the group's
+  `ldap_group_name_attribute`, truncated to the column), refreshed by the
+  phase 3 reconciler on each successful group fetch; a failed refresh
+  keeps the last cached value
+- herd_group_id UUID FK to `user_groups.id` ON DELETE CASCADE, unique
+  (amendment, resolved in phase 2 review: one directory group per HERD
+  group, because per-mapping reconcile set arithmetic cannot converge
+  when two mappings with different memberships fight over one group;
+  deliberately revisitable by dropping the constraint if union semantics
+  are ever designed): deleting the HERD group deletes the mapping; the
+  directory is never written
 - created_by UUID, created_at timestamptz
 
 A DN is not a stable directory identity (it changes on rename or OU move).
@@ -187,8 +196,10 @@ attribute for every entry, checked by set membership locally, instead of
 one search per user; a failed or truncated page aborts the whole sweep
 deactivating no one, which is strictly more fail-closed than per-user
 probes racing an outage, and directory load stops scaling with user
-count. The per-user presence probe (phase 1's `user_present_by_email`)
-survives for the disabled-filter check only. Additionally, any user resolved as a member of any mapped group
+count. The disabled-account check still needs a per-user search that
+conjoins `ldap_disabled_filter`; phase 4 builds that variant alongside
+phase 1's presence-only `user_present_by_email`, whose hard-coded filter
+cannot serve it as-is. Additionally, any user resolved as a member of any mapped group
 in this run's reconcile pass counts as present without a second search.
 The original username-keyed design was disqualified in review: a directory
 username rename made the same run confirm the user as a group member and

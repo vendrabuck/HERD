@@ -25,7 +25,12 @@ def upgrade() -> None:
         sa.Column("directory_name", sa.String(length=255), nullable=False),
         sa.Column("herd_group_id", sa.Uuid(as_uuid=True), nullable=False),
         sa.Column("created_by", sa.Uuid(as_uuid=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
         sa.ForeignKeyConstraint(
             ["herd_group_id"],
             [f"{_schema}.user_groups.id" if _schema else "user_groups.id"],
@@ -38,6 +43,9 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("group_dn", name="uq_ldap_group_mappings_group_dn"),
+        # One directory group per HERD group: per-mapping reconcile set
+        # arithmetic cannot converge when two mappings share a target.
+        sa.UniqueConstraint("herd_group_id", name="uq_ldap_group_mappings_herd_group_id"),
         schema=_schema,
     )
 

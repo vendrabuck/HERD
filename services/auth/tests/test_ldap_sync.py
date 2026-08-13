@@ -19,7 +19,7 @@ from app.database import Base, get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
 from app.models.user import Role, User
-from app.routers.ldap_sync import MISSING_MEMBER_ATTRIBUTE_WARNING
+from app.routers.ldap_sync import NO_MEMBERS_WARNING
 from app.services import ldap_service
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -92,7 +92,6 @@ def _stub_fetch_group(monkeypatch, *, entry=..., error=None):
                 dn=group_dn,
                 name="herd-eng",
                 member_dns=("uid=user1,ou=people,dc=company,dc=local",),
-                member_attribute_present=True,
             )
         return entry
 
@@ -126,19 +125,59 @@ async def test_create_mapping_success_caches_directory_name(monkeypatch, admin_c
 
 
 @pytest.mark.asyncio
-async def test_create_mapping_without_member_attribute_warns_but_succeeds(
-    monkeypatch, admin_client
-):
+async def test_create_mapping_with_no_members_warns_but_succeeds(monkeypatch, admin_client):
     # The accept-with-warning decision: an AD-style empty group (or a typo'd
     # non-group entry) maps successfully and the response says why to look.
-    entry = ldap_service.LdapGroupEntry(
-        dn=_GROUP_DN, name="herd-eng", member_dns=(), member_attribute_present=False
-    )
+    # Emptiness of member_dns is the trigger; ldap3 back-fills missing
+    # attributes as empty, so attribute absence is not observable separately.
+    entry = ldap_service.LdapGroupEntry(dn=_GROUP_DN, name="herd-eng", member_dns=())
     _stub_fetch_group(monkeypatch, entry=entry)
     group_id = await _create_herd_group(admin_client)
     resp = await _create_mapping(admin_client, group_id)
     assert resp.status_code == 201, resp.text
-    assert resp.json()["warning"] == MISSING_MEMBER_ATTRIBUTE_WARNING
+    assert resp.json()["warning"] == NO_MEMBERS_WARNING
+
+
+@pytest.mark.asyncio
+async def test_create_mapping_stores_canonical_directory_dn(monkeypatch, admin_client):
+    # DNs are case-insensitive; persisting the admin-typed form would let
+    # case variants of one directory group bypass the unique constraint.
+    canonical = _GROUP_DN
+    entry = ldap_service.LdapGroupEntry(
+        dn=canonical, name="herd-eng", member_dns=("uid=user1,ou=people,dc=company,dc=local",)
+    )
+    _stub_fetch_group(monkeypatch, entry=entry)
+    group_id = await _create_herd_group(admin_client)
+    resp = await _create_mapping(admin_client, group_id, group_dn=canonical.upper())
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["group_dn"] == canonical
+
+
+@pytest.mark.asyncio
+async def test_create_mapping_herd_group_already_mapped_is_409(monkeypatch, admin_client):
+    # One directory group per HERD group: the reconciler's per-mapping set
+    # arithmetic cannot converge when two mappings fight over one group.
+    _stub_fetch_group(monkeypatch)
+    group_id = await _create_herd_group(admin_client)
+    first = await _create_mapping(admin_client, group_id)
+    assert first.status_code == 201
+    resp = await _create_mapping(
+        admin_client, group_id, group_dn="cn=other,ou=groups,dc=company,dc=local"
+    )
+    assert resp.status_code == 409
+    assert "already has a directory mapping" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_create_mapping_truncates_long_directory_name(monkeypatch, admin_client):
+    # directory_name is a display cache capped at 255; an unbounded directory
+    # value (or the DN fallback) must not 500 the insert.
+    entry = ldap_service.LdapGroupEntry(dn=_GROUP_DN, name="x" * 400, member_dns=("m",))
+    _stub_fetch_group(monkeypatch, entry=entry)
+    group_id = await _create_herd_group(admin_client)
+    resp = await _create_mapping(admin_client, group_id)
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()["directory_name"]) == 255
 
 
 @pytest.mark.asyncio
@@ -208,8 +247,8 @@ async def test_list_and_delete_work_outside_ldap_mode(monkeypatch, admin_client)
 @pytest.mark.asyncio
 async def test_list_mappings_paginates(monkeypatch, admin_client):
     _stub_fetch_group(monkeypatch)
-    group_id = await _create_herd_group(admin_client)
     for i in range(3):
+        group_id = await _create_herd_group(admin_client, name=f"Team {i}")
         resp = await _create_mapping(
             admin_client, group_id, group_dn=f"cn=g{i},ou=groups,dc=company,dc=local"
         )
@@ -242,9 +281,8 @@ async def test_non_admin_is_403_on_all_mapping_endpoints(monkeypatch, user_clien
 
 @pytest.mark.asyncio
 async def test_unauthenticated_is_401():
-    app.dependency_overrides[get_db] = override_get_db
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with _client_for(None) as ac:
             resp = await ac.get("/admin/ldap-sync/mappings")
         assert resp.status_code == 401
     finally:

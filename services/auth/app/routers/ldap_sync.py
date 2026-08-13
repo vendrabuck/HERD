@@ -43,11 +43,33 @@ router = APIRouter(prefix="/admin/ldap-sync", tags=["ldap-sync"])
 
 _admin_or_superadmin = Depends(require_role(Role.ADMIN, Role.SUPERADMIN))
 
-MISSING_MEMBER_ATTRIBUTE_WARNING = (
-    "The directory entry has no member attribute. If this is an empty group "
-    "that is expected; if not, the DN may point at a non-group entry and the "
-    "sync would treat it as having no members."
+NO_MEMBERS_WARNING = (
+    "The directory entry reports no members. If this is an empty group that "
+    "is expected; if not, the DN may point at a non-group entry and the sync "
+    "would treat it as having no members."
 )
+_DUPLICATE_DN_DETAIL = "A mapping for this group_dn already exists"
+_GROUP_ALREADY_MAPPED_DETAIL = "This HERD group already has a directory mapping"
+
+# directory_name is a display cache; the column caps it at 255.
+_DIRECTORY_NAME_MAX = 255
+
+
+async def _conflicting_mapping_detail(db: AsyncSession, group_dn: str, herd_group_id) -> str | None:
+    """Which unique constraint would (or did) a create violate, if any."""
+    dn_taken = (
+        await db.execute(select(LdapGroupMapping.id).where(LdapGroupMapping.group_dn == group_dn))
+    ).scalar_one_or_none()
+    if dn_taken is not None:
+        return _DUPLICATE_DN_DETAIL
+    group_taken = (
+        await db.execute(
+            select(LdapGroupMapping.id).where(LdapGroupMapping.herd_group_id == herd_group_id)
+        )
+    ).scalar_one_or_none()
+    if group_taken is not None:
+        return _GROUP_ALREADY_MAPPED_DETAIL
+    return None
 
 
 @router.post("/mappings", response_model=MappingCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -67,6 +89,13 @@ async def create_mapping(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="HERD group not found",
         )
+    # Answer the common conflicts from the indexed unique columns before
+    # paying the directory round-trip (a duplicate against a degraded
+    # directory would otherwise take the full connect+bind timeouts, or
+    # even 503). The unique constraints below remain the race backstop.
+    conflict = await _conflicting_mapping_detail(db, body.group_dn, body.herd_group_id)
+    if conflict is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=conflict)
     try:
         entry = await ldap_service.fetch_group(body.group_dn)
     except ldap_service.LdapUnavailableError as exc:
@@ -81,8 +110,12 @@ async def create_mapping(
             detail="group_dn does not resolve in the directory",
         )
     mapping = LdapGroupMapping(
-        group_dn=body.group_dn,
-        directory_name=entry.name,
+        # Store the canonical DN the directory returned, not the admin-typed
+        # form: DNs are case-insensitive, so persisting the raw input would
+        # let case variants of one directory group slip past the unique
+        # constraint and map it twice.
+        group_dn=entry.dn,
+        directory_name=entry.name[:_DIRECTORY_NAME_MAX],
         herd_group_id=body.herd_group_id,
         created_by=current_user.id,
     )
@@ -90,35 +123,38 @@ async def create_mapping(
     try:
         await db.commit()
     except IntegrityError:
+        # Disambiguate: the canonical DN or the group may have been claimed
+        # by a concurrent create, or the HERD group (or acting user) deleted
+        # while the directory round-trip ran. A blanket duplicate message
+        # would misreport those.
         await db.rollback()
+        if await get_group_by_id(db, body.herd_group_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="HERD group not found",
+            )
+        conflict = await _conflicting_mapping_detail(db, entry.dn, body.herd_group_id)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="A mapping for this group_dn already exists",
+            detail=conflict or "Mapping conflicts with concurrent changes; retry",
         )
-    await db.refresh(mapping)
-    warning = None if entry.member_attribute_present else MISSING_MEMBER_ATTRIBUTE_WARNING
+    warning = None if entry.member_dns else NO_MEMBERS_WARNING
     logger.info(
         "LDAP group mapping created: %s -> %s by %s",
-        body.group_dn,
+        entry.dn,
         group.name,
         current_user.username,
         extra={
             "action": "ldap_mapping_create",
             "mapping_id": str(mapping.id),
-            "group_dn": body.group_dn,
+            "group_dn": entry.dn,
             "herd_group_id": str(body.herd_group_id),
-            "member_attribute_present": entry.member_attribute_present,
+            "member_count": len(entry.member_dns),
         },
     )
-    return MappingCreateResponse(
-        id=mapping.id,
-        group_dn=mapping.group_dn,
-        directory_name=mapping.directory_name,
-        herd_group_id=mapping.herd_group_id,
-        created_by=mapping.created_by,
-        created_at=mapping.created_at,
-        warning=warning,
-    )
+    response = MappingCreateResponse.model_validate(mapping)
+    response.warning = warning
+    return response
 
 
 @router.get("/mappings", response_model=PaginatedMappingResponse)
@@ -133,7 +169,9 @@ async def list_mappings(
         (
             await db.execute(
                 select(LdapGroupMapping)
-                .order_by(LdapGroupMapping.created_at)
+                # id tiebreaker: equal timestamps otherwise make skip/limit
+                # pages nondeterministic (rows skipped or duplicated).
+                .order_by(LdapGroupMapping.created_at, LdapGroupMapping.id)
                 .offset(skip)
                 .limit(limit)
             )
