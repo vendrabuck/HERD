@@ -121,6 +121,10 @@
                   </div>
                   <p class="hd-help">You pick devices on the topology canvas (or the equipment browser) before opening this form; it just shows the count. There's no picker here, and no greyed-out rows.</p>
                 </div>
+                <div class="hd-field" style="margin-bottom:0;"><label class="hd-label">Dynamic instances</label>
+                  <p class="hd-help" style="margin-top:2px;" data-anno="5" data-anno-pin="l" data-anno-arrow data-anno-color="blue" data-anno-pad="4">Book hypervisor-backed instances from a dynamic template.</p>
+                  <span class="hd-addlink">Add dynamic instance</span>
+                </div>
               </div>
               <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Reserve</span></div>
             </div>
@@ -135,6 +139,7 @@
       <li><b>Start &amp; end.</b> Your time window. The reservation is dormant until the start time passes, then activates on its own.</li>
       <li><b>Devices.</b> Chosen beforehand on the <a href="user-topology.html">topology canvas</a>; this form just shows how many you picked. There's no separate device picker in the reservation form itself.</li>
       <li><b>Reserve.</b> Submit. The new reservation appears in your list immediately.</li>
+      <li><b>Dynamic instances.</b> Only useful if your admin has created dynamic templates: add rows to book hypervisor-backed instances alongside (or instead of) real devices. Coming from the topology canvas, placeholder nodes prefill this block &mdash; see <a href="user-topology.html#dynamic">Dynamic resources</a>.</li>
     </ol>
 
     <div class="callout tip">
@@ -205,6 +210,7 @@
                   <dt>Period</dt><dd>May 28 09:00 &rarr; Jun 04 18:00</dd>
                   <dt>Topology</dt><dd><span class="hd-badge physical">PHYSICAL</span> &middot; 9a81c0d2</dd>
                   <dt>Devices</dt><dd>4</dd>
+                  <dt>Dynamic instances</dt><dd data-anno="6" data-anno-pin="r" data-anno-arrow data-anno-pad="4">client-vm <span style="color:var(--gray-500);font-weight:400;">x3</span></dd>
                 </dl>
               </div>
               <div class="mfoot"><span class="hd-btn secondary">Edit Resources</span><span class="hd-btn danger">Cancel reservation</span></div>
@@ -221,6 +227,7 @@
       <li><b>Routes</b> &mdash; for DUT-to-DUT pairs, the hop-by-hop path through the L1 switches. Green = reachable, red = not.</li>
       <li><b>Wiring</b> &mdash; the per-connection status of the L1 wiring HERD applied to the hardware, with a <b>Retry failed</b> action while the reservation is active. Full walkthrough in <a href="user-live-editing.html#wiring">Live editing</a>.</li>
       <li><b>Schedule</b> &mdash; inline-edit the end time and purpose without rebooking.</li>
+      <li><b>Dynamic instances</b> &mdash; if the reservation carries dynamic requests, the Details tab lists them grouped by template with a count. The instances themselves appear once the reservation is <span class="badge active">ACTIVE</span>.</li>
     </ol>
 
     <div class="callout tip">

@@ -31,6 +31,7 @@
       <li><a href="#open">Opening the editor</a></li>
       <li><a href="#palette">The equipment palette</a></li>
       <li><a href="#drag">Adding devices</a></li>
+      <li><a href="#dynamic">Dynamic resources</a></li>
       <li><a href="#connect">Drawing connections</a></li>
       <li><a href="#edges">Red vs green edges</a></li>
       <li><a href="#save">Saving &amp; history</a></li>
@@ -154,6 +155,104 @@
     <div class="callout danger">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6M9 9l6 6"/></svg></span>
       <div><span class="ttl">"Cannot connect PHYSICAL and CLOUD devices"</span><p>You tried to draw an edge between a <span class="badge physical">PHYSICAL</span> device and a <span class="badge cloud">CLOUD</span> one. Dropping both onto the same canvas is allowed; connecting them is not &mdash; the edge is rejected with a toast and not created. Make a separate topology for each type.</p></div>
+    </div>
+
+    <h2 class="sec" id="dynamic">Gear that does not exist yet</h2>
+    <p class="sectitle">Dynamic resources on the canvas</p>
+    <p>A <strong>dynamic template</strong> is hypervisor-backed: there is no physical device behind it. If your admin has set any up, the palette grows a collapsible <b>Dynamic templates</b> section. Drag a card from it and it lands as a dashed <span class="badge cloud">purple</span> placeholder rather than a device node &mdash; it stands for instances that will be created when the reservation activates.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/topology</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-canvas-toolbar">
+              <span class="lab">Edge layer:</span>
+              <span class="hd-seg"><span>L1</span><span class="active">L2</span><span>L3</span></span>
+              <span style="flex:1"></span>
+              <span class="hd-btn ghost sm" data-anno="4" data-anno-pin="b" data-anno-arrow>Reserve Topology (1)</span>
+              <span class="hd-btn danger sm">Clear canvas</span>
+            </div>
+            <div class="hd-canvas" style="height:400px;">
+              <div class="hd-palette">
+                <div class="ph">Equipment <span class="min">&minus;</span></div>
+                <div class="pbody" style="padding-bottom:3px;">
+                  <div class="psearch">Search&hellip;</div>
+                  <div class="hd-pdev"><span class="gl"></span><div><div class="pn">traffic-gen-03</div><div class="pt">Ixia XGS12</div></div></div>
+                </div>
+                <div class="pdyn" data-anno="1" data-anno-pin="r" data-anno-arrow data-anno-color="blue" data-anno-pad="4">
+                  <div class="pdh">Dynamic templates (2) <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></div>
+                  <div class="pdb">
+                    <div class="hd-pdev dyn"><span class="gl"></span><div style="flex:1;min-width:0;"><div class="pn">client-vm</div><div class="pt">Hypervisor-backed</div></div><span class="hd-chip dyn">DYN</span></div>
+                    <div class="hd-pdev dyn" style="margin-bottom:0;"><span class="gl"></span><div style="flex:1;min-width:0;"><div class="pn">router-vm</div><div class="pt">Hypervisor-backed</div></div><span class="hd-chip dyn">DYN</span></div>
+                  </div>
+                </div>
+              </div>
+              <div class="hd-node" id="dyn-n1" style="left:320px;top:90px;">
+                <span class="handle r"></span><div class="gl"></div><div class="nm">dut-server-14</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Dell R760</div>
+              </div>
+              <div class="hd-node dyn" id="dyn-n2" style="left:600px;top:200px;" data-anno="2" data-anno-pin="t" data-anno-arrow>
+                <span class="dyntag">DYNAMIC</span>
+                <span class="handle l"></span>
+                <div class="gl"></div><div class="nm">client-vm</div>
+                <div class="cnt">Instances <span class="box" data-anno="3" data-anno-pin="r" data-anno-arrow>3</span></div>
+                <div class="sub">Created at activation</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>A dynamic placeholder on the canvas.</b> Dashed purple, a DYNAMIC tag, and an editable instance count.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Dynamic templates.</b> A collapsible section at the bottom of the palette. It only appears when at least one dynamic template exists; each card wears a <b>DYN</b> chip and drags like any device.</li>
+      <li><b>The placeholder node.</b> Dashed purple with a <b>DYNAMIC</b> tag. It has no inventory device behind it, takes no cabling, and is never saved with the topology.</li>
+      <li><b>Instances.</b> Edit the count right on the node &mdash; one placeholder can stand for up to 50 instances.</li>
+      <li><b>Reserve Topology.</b> The count in parentheses is real devices only; placeholders travel separately as dynamic requests, prefilled in the next dialog.</li>
+    </ol>
+
+    <p>Hit <b>Reserve Topology</b> and the reservation dialog opens with the placeholders already converted into a <b>Dynamic instances</b> block:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div class="hd-modal-bg">
+            <div class="hd-modal">
+              <div class="mhead"><h2>Create Reservation</h2><span class="x">&times;</span></div>
+              <div class="mbody">
+                <p style="font-size:13px;color:var(--gray-600);margin:0 0 14px;">1 device selected</p>
+                <div class="hd-field"><label class="hd-label">Dynamic instances</label>
+                  <div class="hd-dynrow" data-anno="1" data-anno-pin="l" data-anno-arrow>
+                    <div class="hd-select">client-vm</div>
+                    <div class="num" data-anno="2" data-anno-pin="b" data-anno-arrow>3</div>
+                    <span class="rm">Remove</span>
+                  </div>
+                  <span class="hd-addlink" data-anno="3" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Add dynamic instance</span>
+                </div>
+                <div class="hd-row2">
+                  <div class="hd-field"><label class="hd-label">Start time</label><div class="hd-input">2026-06-08 09:00</div></div>
+                  <div class="hd-field"><label class="hd-label">End time</label><div class="hd-input">2026-06-10 18:00</div></div>
+                </div>
+                <div class="hd-field" style="margin-bottom:0;"><label class="hd-label">Purpose (optional)</label><div class="hd-input" style="color:var(--gray-400);">Testing, deployment, etc.</div></div>
+              </div>
+              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary">Create</span></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>Reserve from the canvas.</b> Placeholders arrive as a prefilled dynamic block; adjust it before you create.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>A prefilled entry.</b> One row per template from the canvas, count carried over. Rows are editable &mdash; swap the template or remove the row.</li>
+      <li><b>Count.</b> The number of instances to create from this template.</li>
+      <li><b>Add dynamic instance.</b> Add more rows here even if you never touched a placeholder on the canvas.</li>
+    </ol>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>A reservation can carry at most <b>50 dynamic instances</b> across all rows. Placeholders don't count against the device total and can't be wired &mdash; the instances only exist once the reservation activates.</p></div>
     </div>
 
     <h2 class="sec" id="connect">Wiring it up</h2>
