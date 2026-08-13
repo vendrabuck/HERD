@@ -92,11 +92,20 @@ class LdapIdentity:
 
 @dataclass(frozen=True)
 class LdapGroupEntry:
-    """A directory group entry: its DN, display name, and member DNs."""
+    """A directory group entry: its DN, display name, and member DNs.
+
+    member_attribute_present distinguishes an entry whose member attribute is
+    absent (an AD-style empty group, or a non-group entry an admin typo'd a
+    mapping onto) from one that is present. fetch_group proves existence, not
+    group-ness, so mapping validation uses this flag to warn (decision with
+    vendra 2026-08-12: accept with warning, never refuse, since empty AD
+    groups legitimately lack the attribute).
+    """
 
     dn: str
     name: str
     member_dns: tuple[str, ...]
+    member_attribute_present: bool = True
 
 
 # skip_reason vocabulary for LdapMemberResolution; the reconciler persists
@@ -465,13 +474,13 @@ def _fetch_group_sync(group_dn: str) -> LdapGroupEntry | None:
         )
     # An entry lacking the member attribute yields an empty tuple: AD models
     # an empty group that way, so it cannot be refused outright. Note this
-    # also means fetch_group proves existence, not group-ness; a mapping
-    # typo'd to a non-group entry reads as an empty group (phase 2 mapping
-    # validation is the place to warn about that).
+    # also means fetch_group proves existence, not group-ness; mapping
+    # validation surfaces that via member_attribute_present.
     return LdapGroupEntry(
         dn=entry.entry_dn,
         name=str(name_values[0]) if name_values else group_dn,
         member_dns=tuple(str(v) for v in _attr_values(entry, member_attr)),
+        member_attribute_present=member_attr in entry,
     )
 
 
