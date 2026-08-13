@@ -1,10 +1,14 @@
 # Decision: Directory Group Mapping and Sync, Issue #38
 
 Status: Accepted 2026-08-12. Phase 1 (directory client) delivered in
-PR #507, 2026-08-12; its adversarial review parked three design questions
-on that PR for phases 2 (mapping validation of non-group DNs), 3
-(out-of-base member policy), and 4 (presence-probe shape).
-Seven decision points were
+PR #507, 2026-08-12. The three design questions its adversarial review
+parked were resolved with vendra on 2026-08-12 and are amended into the
+relevant sections below: mapping validation accepts a member-attribute-less
+entry with a warning (never refuses), pre-provisioning mirrors the
+directory exactly including members outside ldap_user_base_dn, and the
+deactivation sweep uses one paged enumeration instead of per-user
+presence probes (the per-user probe survives for the disabled-filter
+check). Seven decision points were
 resolved with vendra on 2026-08-11: the original four (pre-provisioning,
 reactivation provenance, deactivation fail-safety, audit persistence) plus
 three raised by the same-day adversarial review of the first draft (mapping
@@ -79,12 +83,21 @@ New table `ldap_group_mappings` in the `auth` schema (Alembic revision under
 `services/auth/migrations/versions/`):
 
 - id UUID PK
-- group_dn Text, unique: the directory group's DN, the mapping key
-- directory_name String, cached display name (the group's
-  `ldap_group_name_attribute`), refreshed on each successful group fetch; a
-  failed refresh keeps the last cached value
-- herd_group_id UUID FK to `user_groups.id` ON DELETE CASCADE: deleting the
-  HERD group deletes the mapping; the directory is never written
+- group_dn Text, unique: the directory group's CANONICAL DN as the
+  directory returned it (not the admin-typed form; DNs are
+  case-insensitive, so storing raw input would let case variants map one
+  directory group twice), the mapping key
+- directory_name String(255), cached display name (the group's
+  `ldap_group_name_attribute`, truncated to the column), refreshed by the
+  phase 3 reconciler on each successful group fetch; a failed refresh
+  keeps the last cached value
+- herd_group_id UUID FK to `user_groups.id` ON DELETE CASCADE, unique
+  (amendment, resolved in phase 2 review: one directory group per HERD
+  group, because per-mapping reconcile set arithmetic cannot converge
+  when two mappings with different memberships fight over one group;
+  deliberately revisitable by dropping the constraint if union semantics
+  are ever designed): deleting the HERD group deletes the mapping; the
+  directory is never written
 - created_by UUID, created_at timestamptz
 
 A DN is not a stable directory identity (it changes on rename or OU move).
@@ -97,9 +110,16 @@ follow-up if rename churn proves real.
 Mapping creation validates the DN against the live directory: a base-scope
 search that finds no entry refuses with 422; a directory that cannot be
 reached (bind failure, timeout, LDAP error) refuses with 503, the
-distinguishes-not-found-from-cannot-ask convention (#337/#456). Admin CRUD
+distinguishes-not-found-from-cannot-ask convention (#337/#456). Amendment
+(resolved 2026-08-12): a DN that resolves to an entry LACKING the member
+attribute is accepted WITH a warning in the validation response and admin
+UI, never refused; AD models empty groups that way, so refusal would block
+legitimate mappings, while the warning surfaces the typo'd-to-a-non-group
+case that would otherwise reconcile as an empty desired set. Admin CRUD
 lives in a new router (`services/auth/app/routers/ldap_sync.py`), gated
-admin-or-superadmin consistent with existing group management.
+admin-or-superadmin consistent with existing group management; creation
+requires `auth_method == "ldap"` (validation needs a directory to ask),
+while list and delete work in any mode so stale mappings stay cleanable.
 
 ### Member resolution: group-side DN attribute
 
@@ -149,7 +169,12 @@ counted).
 
 A desired member with no HERD user row is provisioned during sync through
 the existing `create_ldap_user` path (`auth_source="ldap"`, no password,
-callable outside the login flow), then added to the group. Directory and
+callable outside the login flow), then added to the group. Amendment
+(resolved 2026-08-12): this mirrors the directory exactly, INCLUDING
+members whose DN sits outside `ldap_user_base_dn`; such accounts cannot
+log in until the base is widened (login resolves under the base only),
+but directory layout is the admin's domain, and the group-presence credit
+keeps the sweep from touching them while they remain members. Directory and
 HERD membership mirror exactly, and a user's device visibility is correct
 at first login rather than one sync cycle later. Collisions are skipped,
 counted, and distinguished in the run detail: username taken by another
@@ -162,11 +187,19 @@ The sweep is a separate per-run pass over all `auth_source='ldap'` users,
 gated by its OWN setting `ldap_sync_deactivation_enabled` (default false):
 enabling group mirroring alone never opts a deployment into deactivation.
 
-Identity key (review-corrected): the sweep searches the directory by EMAIL
-(`({ldap_email_attribute}={email})` under `ldap_user_base_dn`), the same
-key JIT provisioning and login resolution trust, NOT the stored username
-(which is never refreshed by the login path and drifts on directory
-renames). Additionally, any user resolved as a member of any mapped group
+Identity key (review-corrected): the sweep proves presence by EMAIL, the
+same key JIT provisioning and login resolution trust, NOT the stored
+username (which is never refreshed by the login path and drifts on
+directory renames). Amendment (resolved 2026-08-12): presence is answered
+by ONE paged enumeration under `ldap_user_base_dn` fetching the email
+attribute for every entry, checked by set membership locally, instead of
+one search per user; a failed or truncated page aborts the whole sweep
+deactivating no one, which is strictly more fail-closed than per-user
+probes racing an outage, and directory load stops scaling with user
+count. The disabled-account check still needs a per-user search that
+conjoins `ldap_disabled_filter`; phase 4 builds that variant alongside
+phase 1's presence-only `user_present_by_email`, whose hard-coded filter
+cannot serve it as-is. Additionally, any user resolved as a member of any mapped group
 in this run's reconcile pass counts as present without a second search.
 The original username-keyed design was disqualified in review: a directory
 username rename made the same run confirm the user as a group member and

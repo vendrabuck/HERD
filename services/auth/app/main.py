@@ -11,11 +11,13 @@ from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.models.api_token import ApiToken  # noqa: F401
 from app.models.group import GroupMember, UserGroup  # noqa: F401
+from app.models.ldap_group_mapping import LdapGroupMapping  # noqa: F401
 from app.models.user import Role
 from app.routers.admin import router as admin_router
 from app.routers.auth import router as auth_router
 from app.routers.groups import router as groups_router
 from app.routers.internal import router as internal_router
+from app.routers.ldap_sync import router as ldap_sync_router
 from app.routers.tokens import router as tokens_router
 
 setup_logging("auth", level=settings.log_level)
@@ -113,6 +115,7 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(groups_router)
 app.include_router(internal_router)
+app.include_router(ldap_sync_router)
 app.include_router(tokens_router)
 
 

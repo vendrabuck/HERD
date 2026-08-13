@@ -276,6 +276,18 @@ async def test_fetch_group_nonexistent_dn_is_dangling_none(ldap_settings):
 
 
 @pytest.mark.asyncio
+async def test_fetch_group_on_non_group_entry_reports_no_members(ldap_settings):
+    # fetch_group proves existence, not group-ness: an OU resolves like a
+    # group with zero members (ldap3 back-fills the missing member attribute
+    # as empty, so emptiness is the only observable signal). This is the
+    # typo'd-mapping case phase 2's accept-with-warning rule exists for,
+    # pinned against a real directory.
+    group = await ldap_service.fetch_group(PEOPLE_DN)
+    assert group is not None
+    assert group.member_dns == ()
+
+
+@pytest.mark.asyncio
 async def test_fetch_group_invalid_dn_syntax_is_proven_unresolvable(ldap_settings):
     # invalidDNSyntax is a stable answer (the DN can never resolve), so it
     # classifies as dangling None, not as a perpetual outage; phase 2

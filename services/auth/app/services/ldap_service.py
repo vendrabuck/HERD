@@ -92,7 +92,16 @@ class LdapIdentity:
 
 @dataclass(frozen=True)
 class LdapGroupEntry:
-    """A directory group entry: its DN, display name, and member DNs."""
+    """A directory group entry: its DN, display name, and member DNs.
+
+    fetch_group proves existence, not group-ness: a non-group entry an admin
+    typo'd a mapping onto resolves with an empty member_dns, exactly like an
+    AD-style empty group. Attribute PRESENCE is deliberately not modeled:
+    ldap3 back-fills every requested-but-missing attribute as an empty list
+    (return_empty_attributes defaults to True), so emptiness of member_dns is
+    the only observable signal, and mapping validation warns on it (decision
+    with vendra 2026-08-12: accept with warning, never refuse).
+    """
 
     dn: str
     name: str
@@ -465,9 +474,8 @@ def _fetch_group_sync(group_dn: str) -> LdapGroupEntry | None:
         )
     # An entry lacking the member attribute yields an empty tuple: AD models
     # an empty group that way, so it cannot be refused outright. Note this
-    # also means fetch_group proves existence, not group-ness; a mapping
-    # typo'd to a non-group entry reads as an empty group (phase 2 mapping
-    # validation is the place to warn about that).
+    # also means fetch_group proves existence, not group-ness; mapping
+    # validation warns on an empty member_dns.
     return LdapGroupEntry(
         dn=entry.entry_dn,
         name=str(name_values[0]) if name_values else group_dn,
@@ -564,11 +572,13 @@ async def resolve_members(member_dns: Sequence[str]) -> list[LdapMemberResolutio
 
 
 async def user_present_by_email(email: str) -> bool:
-    """Email-keyed presence probe for the deactivation sweep; errors raise.
+    """Email-keyed presence probe; errors raise (never absence).
 
-    Deliberately per-user: the ADR's sweep isolates errors per user (an
-    errored search leaves that user untouched and marks the run partial).
-    Whether phase 4 also wants a batched or paged variant is a phase 4
-    design decision; do not fold one in here without settling that.
+    Resolved 2026-08-12: the deactivation sweep answers presence via ONE
+    paged enumeration under ldap_user_base_dn (phase 4 builds it), not
+    per-user calls to this probe. This function's remaining sweep role is
+    the disabled-account check, which needs a variant that conjoins
+    ldap_disabled_filter into the search filter; phase 4 adds that
+    alongside, since this filter is presence-only.
     """
     return await anyio.to_thread.run_sync(_user_present_by_email_sync, email)
