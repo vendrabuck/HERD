@@ -15,26 +15,32 @@ Listing and deletion work in any mode so stale mappings can always be
 cleaned up.
 """
 
+import asyncio
 import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from app import database
 from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import require_role
 from app.models.ldap_group_mapping import LdapGroupMapping
+from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import Role, User
 from app.schemas.ldap_sync import (
     MappingCreateRequest,
     MappingCreateResponse,
     MappingResponse,
     PaginatedMappingResponse,
+    PaginatedSyncRunResponse,
+    SyncRunResponse,
+    SyncRunStartResponse,
 )
-from app.services import ldap_service
+from app.services import ldap_service, ldap_sync_service
 from app.services.group_service import get_group_by_id
 
 logger = logging.getLogger(__name__)
@@ -207,3 +213,187 @@ async def delete_mapping(
         extra={"action": "ldap_mapping_delete", "mapping_id": str(mapping_id)},
     )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Sync-now (ADR 0011 phase 3). Runs are serialized two ways: an in-process
+# asyncio.Lock (sync-now 409s while a run holds it) and a Postgres advisory
+# lock so scaled-out auth replicas cannot execute concurrent directory-wide
+# writes. The advisory key is the single constant below; changing it would
+# let two builds sync concurrently across a rolling deploy, so it is part of
+# the cross-replica contract, not a tunable.
+# ---------------------------------------------------------------------------
+
+_ADVISORY_LOCK_KEY = "herd_ldap_group_sync"
+_TRY_ADVISORY_LOCK_SQL = text(f"SELECT pg_try_advisory_lock(hashtext('{_ADVISORY_LOCK_KEY}'))")
+_ADVISORY_UNLOCK_SQL = text(f"SELECT pg_advisory_unlock(hashtext('{_ADVISORY_LOCK_KEY}'))")
+
+_RUN_IN_PROGRESS_DETAIL = "A sync run is already in progress"
+
+_sync_lock = asyncio.Lock()
+# Strong references so a scheduled run is never garbage-collected mid-flight.
+_background_tasks: set[asyncio.Task] = set()
+
+
+async def _release_sync_locks(lock_conn: AsyncConnection | None) -> None:
+    """Release the advisory lock (on the SAME connection that acquired it;
+    advisory locks are session-scoped) and then the in-process lock.
+
+    lock_conn is not None only when the advisory lock was acquired on it.
+    Never lets a connection failure leak the asyncio lock: close() is
+    attempted regardless (a closed connection drops its session-scoped
+    advisory locks server-side, so the explicit unlock is the polite path,
+    not the only one), and the release sits in the outermost finally.
+    """
+    try:
+        if lock_conn is not None:
+            try:
+                await lock_conn.execute(_ADVISORY_UNLOCK_SQL)
+            except Exception:
+                logger.exception(
+                    "advisory unlock failed; relying on connection close",
+                    extra={"action": "ldap_sync_advisory_unlock_failed"},
+                )
+            try:
+                await lock_conn.close()
+            except Exception:
+                logger.exception(
+                    "sync lock connection close failed",
+                    extra={"action": "ldap_sync_lock_conn_close_failed"},
+                )
+    finally:
+        _sync_lock.release()
+
+
+async def _execute_sync_run(run_id: uuid.UUID, lock_conn: AsyncConnection | None) -> None:
+    """Background half of sync-now: owns both locks from the moment it is
+    scheduled and must release them on every path.
+
+    The pass runs on its own session (database.AsyncSessionLocal), never the
+    request's, which is closed by the time this executes. execute_run
+    finalizes the run row itself (finished_at, status) even on failure; the
+    except here is a belt for machinery outside it, so the task never ends
+    with an unretrieved exception.
+    """
+    try:
+        try:
+            async with database.AsyncSessionLocal() as session:
+                run = await session.get(LdapSyncRun, run_id)
+                if run is None:
+                    # The handler committed the row before scheduling; only
+                    # external deletion explains this.
+                    logger.error(
+                        "sync run row not found for background execution",
+                        extra={"action": "ldap_sync_run_missing", "run_id": str(run_id)},
+                    )
+                else:
+                    await ldap_sync_service.execute_run(session, run)
+        finally:
+            await _release_sync_locks(lock_conn)
+    except Exception:
+        logger.exception(
+            "LDAP sync background task failed",
+            extra={"action": "ldap_sync_task_failed", "run_id": str(run_id)},
+        )
+
+
+@router.post("/run", response_model=SyncRunStartResponse, status_code=status.HTTP_202_ACCEPTED)
+async def start_sync_run(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = _admin_or_superadmin,
+):
+    if settings.auth_method != "ldap":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Directory sync requires auth_method=ldap",
+        )
+    if _sync_lock.locked():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_RUN_IN_PROGRESS_DETAIL)
+    # No await sits between the locked() check and this acquire, and an
+    # uncontended asyncio.Lock.acquire completes without suspending, so two
+    # rapid POSTs cannot both pass the check and both 202.
+    await _sync_lock.acquire()
+    lock_conn: AsyncConnection | None = None
+    handed_off = False
+    try:
+        # Cross-replica layer, on a dedicated connection held for the whole
+        # run because advisory locks are session-scoped: acquire and release
+        # must happen on one connection. Gated on dialect: SQLite (unit
+        # tests) has no advisory locks, so tests exercise only the
+        # asyncio-lock layer.
+        if database.engine.dialect.name == "postgresql":
+            lock_conn = await database.engine.connect()
+            acquired = (await lock_conn.execute(_TRY_ADVISORY_LOCK_SQL)).scalar_one()
+            if not acquired:
+                # Invariant: lock_conn is not None only while the advisory
+                # lock is held on it, so release paths can unlock
+                # unconditionally. Not acquired: close and forget it first.
+                conn, lock_conn = lock_conn, None
+                await conn.close()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A sync run is already in progress on another replica",
+                )
+        run = LdapSyncRun(trigger="manual", status="running")
+        db.add(run)
+        await db.commit()
+        run_id = run.id
+        task = asyncio.create_task(_execute_sync_run(run_id, lock_conn))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        # From here the task owns both locks and the lock connection.
+        handed_off = True
+        logger.info(
+            "LDAP sync run accepted: %s by %s",
+            run_id,
+            current_user.username,
+            extra={"action": "ldap_sync_run_accepted", "run_id": str(run_id)},
+        )
+        return SyncRunStartResponse(run_id=run_id)
+    finally:
+        # Every early exit (replica 409, run-row creation failure, task
+        # scheduling failure) lands here still owning the locks.
+        if not handed_off:
+            await _release_sync_locks(lock_conn)
+
+
+@router.get("/runs", response_model=PaginatedSyncRunResponse)
+async def list_sync_runs(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    _: User = _admin_or_superadmin,
+):
+    total = (await db.execute(select(func.count()).select_from(LdapSyncRun))).scalar_one()
+    rows = (
+        (
+            await db.execute(
+                select(LdapSyncRun)
+                # Newest first; id tiebreaker keeps equal timestamps from
+                # making skip/limit pages nondeterministic.
+                .order_by(LdapSyncRun.started_at.desc(), LdapSyncRun.id.desc())
+                .offset(skip)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return PaginatedSyncRunResponse(
+        items=[SyncRunResponse.model_validate(r) for r in rows],
+        total=total,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/runs/{run_id}", response_model=SyncRunResponse)
+async def get_sync_run(
+    run_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = _admin_or_superadmin,
+):
+    run = await db.get(LdapSyncRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync run not found")
+    return SyncRunResponse.model_validate(run)

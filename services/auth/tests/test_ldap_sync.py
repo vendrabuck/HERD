@@ -1,4 +1,4 @@
-"""Unit tests for the ldap-sync mapping router (ADR 0011 phase 2).
+"""Unit tests for the ldap-sync router (ADR 0011 phases 2 and 3).
 
 The directory client is mocked at the ldap_service module boundary; its own
 behavior against a real directory is covered by test_ldap_service_live.py.
@@ -9,18 +9,29 @@ entries lacking the member attribute (decision 2026-08-12). The FK cascade
 (HERD group delete removes the mapping) is declared in migration 0006 and
 enforced by Postgres; SQLite runs without FK enforcement here, so that path
 is deliberately not asserted in this file.
+
+The phase 3 sync-now tests exercise only the in-process asyncio-lock layer
+of the run serialization: the Postgres advisory-lock layer is gated on
+dialect == "postgresql" and SQLite has no advisory locks. The background
+task's session factory is pointed at the test engine so the run it
+finalizes is the same one the GET endpoints read.
 """
 
+import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
+from app import database
 from app.config import settings
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
+from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import Role, User
+from app.routers import ldap_sync as ldap_sync_router
 from app.routers.ldap_sync import NO_MEMBERS_WARNING
-from app.services import ldap_service
+from app.services import ldap_service, ldap_sync_service
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -287,3 +298,137 @@ async def test_unauthenticated_is_401():
         assert resp.status_code == 401
     finally:
         app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Sync-now endpoint and run history (phase 3).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def background_session(monkeypatch):
+    # The background task opens its own session from database.AsyncSessionLocal
+    # (never the request's); point it at the test engine so it acts on the
+    # same database the request and GET sessions use.
+    monkeypatch.setattr(database, "AsyncSessionLocal", TestSessionLocal)
+
+
+@pytest.fixture(autouse=True)
+async def drain_background_tasks():
+    # Teardown ordering matters: this fixture is defined after setup_db, so
+    # it finalizes first and no background task outlives the tables.
+    yield
+    for task in list(ldap_sync_router._background_tasks):
+        await asyncio.wait_for(task, timeout=5)
+    assert not ldap_sync_router._sync_lock.locked()
+
+
+async def _await_background():
+    for task in list(ldap_sync_router._background_tasks):
+        await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_sync_run_202_then_run_visible_and_finalized(admin_client):
+    # Zero mappings: the REAL reconciler runs end to end through the
+    # background wiring without touching the directory client.
+    resp = await admin_client.post("/admin/ldap-sync/run")
+    assert resp.status_code == 202, resp.text
+    run_id = resp.json()["run_id"]
+    await _await_background()
+
+    single = await admin_client.get(f"/admin/ldap-sync/runs/{run_id}")
+    assert single.status_code == 200
+    body = single.json()
+    assert body["status"] == "success"
+    assert body["trigger"] == "manual"
+    assert body["finished_at"] is not None
+    assert (body["members_added"], body["members_removed"], body["users_provisioned"]) == (0, 0, 0)
+
+    listed = await admin_client.get("/admin/ldap-sync/runs")
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 1
+    assert listed.json()["items"][0]["id"] == run_id
+
+
+@pytest.mark.asyncio
+async def test_sync_run_409_while_in_progress_and_lock_released_after(monkeypatch, admin_client):
+    gate = asyncio.Event()
+
+    async def blocking_execute_run(session, run):
+        # Await the gate BEFORE any session use so the blocked task holds no
+        # open transaction on the shared SQLite connection.
+        await gate.wait()
+        run.status = "success"
+        run.finished_at = datetime.now(timezone.utc)
+        await session.commit()
+        return run
+
+    monkeypatch.setattr(ldap_sync_service, "execute_run", blocking_execute_run)
+    try:
+        first = await admin_client.post("/admin/ldap-sync/run")
+        assert first.status_code == 202
+        second = await admin_client.post("/admin/ldap-sync/run")
+        assert second.status_code == 409
+        assert "in progress" in second.json()["detail"]
+    finally:
+        gate.set()
+    await _await_background()
+
+    # The lock is released by the background task's finally, never leaked:
+    # a third run starts cleanly.
+    third = await admin_client.post("/admin/ldap-sync/run")
+    assert third.status_code == 202
+    assert third.json()["run_id"] != first.json()["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_sync_run_refused_outside_ldap_mode_without_leaking_lock(monkeypatch, admin_client):
+    monkeypatch.setattr(settings, "auth_method", "local", raising=False)
+    resp = await admin_client.post("/admin/ldap-sync/run")
+    assert resp.status_code == 409
+    assert "auth_method" in resp.json()["detail"]
+    assert not ldap_sync_router._sync_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_non_admin_is_403_on_all_run_endpoints(user_client):
+    post = await user_client.post("/admin/ldap-sync/run")
+    listed = await user_client.get("/admin/ldap-sync/runs")
+    single = await user_client.get(f"/admin/ldap-sync/runs/{uuid.uuid4()}")
+    assert (post.status_code, listed.status_code, single.status_code) == (403, 403, 403)
+
+
+@pytest.mark.asyncio
+async def test_list_runs_paginates_newest_first(admin_client):
+    base = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+    ids = []
+    async with TestSessionLocal() as session:
+        for i in range(3):
+            # Explicit id: the model's uuid4 default applies at flush, so
+            # reading run.id before commit would yield None.
+            run = LdapSyncRun(
+                id=uuid.uuid4(),
+                trigger="manual",
+                status="success",
+                started_at=base + timedelta(minutes=i),
+                finished_at=base + timedelta(minutes=i, seconds=30),
+            )
+            session.add(run)
+            ids.append(str(run.id))
+        await session.commit()
+
+    page = await admin_client.get("/admin/ldap-sync/runs", params={"skip": 0, "limit": 2})
+    assert page.status_code == 200
+    body = page.json()
+    assert body["total"] == 3
+    assert [item["id"] for item in body["items"]] == [ids[2], ids[1]]
+
+    rest = await admin_client.get("/admin/ldap-sync/runs", params={"skip": 2, "limit": 2})
+    assert [item["id"] for item in rest.json()["items"]] == [ids[0]]
+
+
+@pytest.mark.asyncio
+async def test_get_missing_run_is_404(admin_client):
+    resp = await admin_client.get(f"/admin/ldap-sync/runs/{uuid.uuid4()}")
+    assert resp.status_code == 404
