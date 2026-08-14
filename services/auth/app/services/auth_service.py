@@ -175,6 +175,23 @@ async def set_user_role(
     return user
 
 
+async def set_user_active(
+    db: AsyncSession, target_user_id: uuid.UUID, is_active: bool
+) -> User | None:
+    """Manual admin activate/deactivate (ADR 0011 phase 4, the non-sync
+    writer of is_active). Always clears deactivated_by_sync: admin intent
+    always outranks the directory, so a manually (de)activated user becomes
+    invisible to the sweep's automatic reactivation."""
+    user = await get_user_by_id(db, target_user_id)
+    if not user:
+        return None
+    user.is_active = is_active
+    user.deactivated_by_sync = False
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
 async def _authenticate_local(db: AsyncSession, email: str, password: str) -> User | None:
     user = await get_user_by_email(db, email)
     if not user:

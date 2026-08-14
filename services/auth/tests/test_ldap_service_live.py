@@ -32,6 +32,7 @@ import os
 import socket
 import uuid
 
+import ldap3
 import pytest
 from app.config import settings
 from app.database import Base, get_db
@@ -41,6 +42,7 @@ from app.models.ldap_group_mapping import LdapGroupMapping
 from app.models.user import User
 from app.services import auth_service, ldap_service, ldap_sync_service
 from httpx import ASGITransport, AsyncClient
+from ldap3.core.exceptions import LDAPNoSuchObjectResult
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -607,3 +609,176 @@ async def test_run_sync_dangling_mapping_applies_nothing(ldap_settings, db_sessi
 
     emails = await _member_emails(db_session, group_id)
     assert emails == {"user5@company.local"}
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 phase 4: paged presence enumeration and the deactivation and
+# reactivation sweep, against the real directory. Fixtures added at test
+# runtime through an admin ldap3 connection (never the checked-in LDIF),
+# always cleaned up in a finally so the directory ends exactly as seeded.
+# ---------------------------------------------------------------------------
+
+# All 25 seeded people (50-seed-people.ldif) plus nouid1 (mail but no uid,
+# 60-seed-groups.ldif) carry a mail attribute; nomail1 deliberately does not.
+_ALL_SEEDED_PRESENT_EMAILS = frozenset(
+    {f"user{n}@company.local" for n in range(1, 26)} | {"nouid1@company.local"}
+)
+
+
+@pytest.mark.asyncio
+async def test_present_emails_live_returns_all_seeded_emails(ldap_settings):
+    assert await ldap_service.present_emails() == _ALL_SEEDED_PRESENT_EMAILS
+
+
+@pytest.mark.asyncio
+async def test_disabled_emails_live_filter_matching_nothing_returns_empty(
+    monkeypatch, ldap_settings
+):
+    # A syntactically valid, always-false filter (a real attribute, an
+    # email no seeded entry has): proves the conjoined search runs cleanly
+    # against a real directory and correctly proves zero matches, distinct
+    # from an unreachable-directory raise.
+    monkeypatch.setattr(
+        settings,
+        "ldap_disabled_filter",
+        "(mail=nobody-matches-this@nowhere.invalid)",
+        raising=False,
+    )
+    assert await ldap_service.disabled_emails() == frozenset()
+
+
+def _admin_conn() -> ldap3.Connection:
+    server = ldap3.Server(LDAP_URL, get_info=ldap3.NONE, connect_timeout=5)
+    return ldap3.Connection(server, user=ADMIN_DN, password=ADMIN_PW, auto_bind=True)
+
+
+def _safe_delete(conn: ldap3.Connection, dn: str) -> None:
+    """Delete an entry, tolerating "already gone" so cleanup is idempotent
+    regardless of which phase of the test failed."""
+    try:
+        conn.delete(dn)
+    except LDAPNoSuchObjectResult:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_live_deactivation_and_reactivation_sweep(monkeypatch, ldap_settings, db_session):
+    """Full lifecycle against the real directory, in one test so each phase
+    builds on the last: (1) a temp person provisioned via a temp mapped
+    group, sweep deactivates no one; (2) the person is deleted from the
+    directory and removed from the group, a second run deactivates them
+    (deactivated_by_sync True); (3) the entry and membership are restored, a
+    third run reactivates them (provenance cleared). The temp group also
+    carries user1 as a second member throughout, both because groupOfNames
+    requires a nonempty member attribute (so removing the temp person alone
+    never leaves a schema-invalid zero-member group) and so the breaker's
+    "swept" denominator is not just the one row: with the default
+    min_count=3, one absence out of two candidates is still comfortably
+    under the floor, which is what "applies rather than aborts" is
+    demonstrating here (an artificially large candidate pool would not
+    change that outcome, since min_count, not percent, is the binding term
+    at this scale).
+    """
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+
+    temp_person_dn = f"uid=sweep-tmp-1,{PEOPLE_DN}"
+    temp_person_email = "sweep-tmp-1@company.local"
+    temp_group_dn = f"cn=sweep-tmp-group,{GROUPS_DN}"
+    user1_dn = f"uid=user1,{PEOPLE_DN}"
+
+    conn = _admin_conn()
+    try:
+        conn.add(
+            temp_person_dn,
+            attributes={
+                "objectClass": ["inetOrgPerson"],
+                "uid": "sweep-tmp-1",
+                "cn": "Sweep Tmp1",
+                "sn": "Tmp1",
+                "mail": temp_person_email,
+                "userPassword": "Password1",
+            },
+        )
+        assert conn.result["result"] == 0, conn.result
+        conn.add(
+            temp_group_dn,
+            attributes={
+                "objectClass": ["groupOfNames"],
+                "cn": "sweep-tmp-group",
+                "member": [temp_person_dn, user1_dn],
+            },
+        )
+        assert conn.result["result"] == 0, conn.result
+
+        group_id = await _mk_herd_group(db_session, "Sweep Tmp")
+        await _mk_mapping(
+            db_session,
+            group_dn=temp_group_dn,
+            herd_group_id=group_id,
+            directory_name="sweep-tmp-group",
+        )
+
+        # --- Phase 1: full run provisions the temp user via the group; the
+        # sweep (now enabled) deactivates no one, everyone is present. ---
+        run1 = await ldap_sync_service.run_sync(db_session)
+        assert run1.status == "success"
+        assert run1.users_deactivated == 0
+        assert run1.users_reactivated == 0
+        emails = await _member_emails(db_session, group_id)
+        assert emails == {temp_person_email, "user1@company.local"}
+
+        temp_user = await auth_service.get_user_by_email(db_session, temp_person_email)
+        assert temp_user is not None
+        assert temp_user.is_active is True
+
+        # --- Phase 2: drop the person from the group, then delete the
+        # entry (user1 stays, so the group keeps a valid nonempty member
+        # attribute); a second run proves absence and deactivates. The
+        # modify must precede the delete: this server's MDB backend
+        # answers "no such value" for a MODIFY_DELETE naming a member DN
+        # whose entry was already removed, even though a read-back of the
+        # group still lists that exact value (confirmed empirically against
+        # the live container; not a documented ldap3 or slapd behavior this
+        # test relies on beyond "the safe order is modify-then-delete"). ---
+        conn.modify(temp_group_dn, {"member": [(ldap3.MODIFY_DELETE, [temp_person_dn])]})
+        assert conn.result["result"] == 0, conn.result
+        _safe_delete(conn, temp_person_dn)
+
+        run2 = await ldap_sync_service.run_sync(db_session)
+        assert run2.status != "aborted"
+        assert run2.users_deactivated == 1
+        assert run2.users_reactivated == 0
+
+        await db_session.refresh(temp_user)
+        assert temp_user.is_active is False
+        assert temp_user.deactivated_by_sync is True
+
+        # --- Phase 3: restore the entry and re-add it to the group; a
+        # third run proves presence again and reactivates. ---
+        conn.add(
+            temp_person_dn,
+            attributes={
+                "objectClass": ["inetOrgPerson"],
+                "uid": "sweep-tmp-1",
+                "cn": "Sweep Tmp1",
+                "sn": "Tmp1",
+                "mail": temp_person_email,
+                "userPassword": "Password1",
+            },
+        )
+        assert conn.result["result"] == 0, conn.result
+        conn.modify(temp_group_dn, {"member": [(ldap3.MODIFY_ADD, [temp_person_dn])]})
+        assert conn.result["result"] == 0, conn.result
+
+        run3 = await ldap_sync_service.run_sync(db_session)
+        assert run3.users_reactivated == 1
+
+        await db_session.refresh(temp_user)
+        assert temp_user.is_active is True
+        assert temp_user.deactivated_by_sync is False
+    finally:
+        # The directory must end exactly as seeded regardless of which
+        # phase above failed.
+        _safe_delete(conn, temp_group_dn)
+        _safe_delete(conn, temp_person_dn)
+        conn.unbind()

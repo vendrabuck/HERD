@@ -47,6 +47,8 @@ class SyncRunResponse(BaseModel):
     members_added: int
     members_removed: int
     members_skipped: int
+    users_deactivated: int
+    users_reactivated: int
     detail: dict
     error: str | None
 

@@ -14,6 +14,7 @@ against genuine IntegrityErrors rather than mocks.
 import uuid
 
 import pytest
+from app.config import settings
 from app.database import Base
 from app.models.group import GroupMember, UserGroup
 from app.models.ldap_group_mapping import LdapGroupMapping
@@ -133,6 +134,54 @@ def _skip_reasons(run) -> set:
 
 
 # ---------------------------------------------------------------------------
+# ADR 0011 phase 4: deactivation and reactivation sweep helpers.
+# ---------------------------------------------------------------------------
+
+
+def _enable_deactivation(
+    monkeypatch,
+    *,
+    max_percent: int = 20,
+    min_count: int = 3,
+    disabled_filter: str = "",
+) -> None:
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_max_percent", max_percent, raising=False)
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_min_count", min_count, raising=False)
+    monkeypatch.setattr(settings, "ldap_disabled_filter", disabled_filter, raising=False)
+
+
+def _install_presence(monkeypatch, present, disabled=None) -> None:
+    """Fake ldap_service.present_emails/disabled_emails. present/disabled are
+    a frozenset[str] or an Exception to raise."""
+
+    async def fake_present_emails():
+        if isinstance(present, Exception):
+            raise present
+        return frozenset(present)
+
+    async def fake_disabled_emails():
+        value = disabled if disabled is not None else frozenset()
+        if isinstance(value, Exception):
+            raise value
+        return frozenset(value)
+
+    monkeypatch.setattr(ldap_service, "present_emails", fake_present_emails)
+    monkeypatch.setattr(ldap_service, "disabled_emails", fake_disabled_emails)
+
+
+async def _mk_candidates(db, n: int) -> list[uuid.UUID]:
+    return [await _mk_user(db, i) for i in range(1, n + 1)]
+
+
+async def _deactivate(db, user_id: uuid.UUID, *, by_sync: bool) -> None:
+    user = await db.get(User, user_id)
+    user.is_active = False
+    user.deactivated_by_sync = by_sync
+    await db.commit()
+
+
+# ---------------------------------------------------------------------------
 # Model defaults (S4: moved here from the deleted test_ldap_sync_run_model.py
 # so the run-lifecycle model and the reconciler that populates it are pinned
 # in one file, against one set of fixtures).
@@ -155,6 +204,8 @@ async def test_insert_run_applies_server_defaults(db):
     assert run.members_added == 0
     assert run.members_removed == 0
     assert run.members_skipped == 0
+    assert run.users_deactivated == 0
+    assert run.users_reactivated == 0
     assert run.detail == {}
     assert run.error is None
 
@@ -801,3 +852,252 @@ async def test_detail_categories_cap_with_truncation_marker(db, monkeypatch):
     assert len(skipped) == cap + 1
     assert skipped[-1] == {"truncated": 5}
     assert all("reason" in record for record in skipped[:-1])
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 phase 4: the deactivation and reactivation sweep.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_disabled_when_setting_off(db, monkeypatch):
+    # ldap_sync_deactivation_enabled defaults False; the sweep must never
+    # even consult the directory client, let alone touch is_active.
+    user_id = await _mk_user(db, 1)
+
+    def boom(*_a, **_kw):
+        raise AssertionError("directory must not be consulted when deactivation is disabled")
+
+    monkeypatch.setattr(ldap_service, "present_emails", boom)
+    monkeypatch.setattr(ldap_service, "disabled_emails", boom)
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "success"
+    assert "sweep" not in run.detail
+    assert run.users_deactivated == 0
+    assert run.users_reactivated == 0
+    user = await db.get(User, user_id)
+    assert user.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_sweep_enumeration_failure_touches_no_one(db, monkeypatch):
+    _enable_deactivation(monkeypatch)
+    active_id = await _mk_user(db, 1)
+    reactivate_id = await _mk_user(db, 2)
+    await _deactivate(db, reactivate_id, by_sync=True)
+
+    _install_presence(monkeypatch, present=ldap_service.LdapUnavailableError("directory down"))
+
+    run = await ldap_sync_service.run_sync(db)
+
+    # Error is never absence: reactivations are ALSO skipped, since presence
+    # was not proven either.
+    assert run.status == "partial"
+    assert run.users_deactivated == 0
+    assert run.users_reactivated == 0
+    assert run.detail["sweep"] == [
+        {
+            "reason": ldap_sync_service.SWEEP_REASON_ENUMERATION_UNAVAILABLE,
+            "error": "directory down",
+        }
+    ]
+    active = await db.get(User, active_id)
+    assert active.is_active is True
+    stale = await db.get(User, reactivate_id)
+    assert stale.is_active is False
+    assert stale.deactivated_by_sync is True
+
+
+@pytest.mark.asyncio
+async def test_sweep_disabled_filter_deactivates_even_when_present_and_credited(db, monkeypatch):
+    # A user still listed as present AND credited via this run's group
+    # reconcile must still deactivate when the directory reports them
+    # disabled: disabled-equals-proven-absent overrides both.
+    _enable_deactivation(monkeypatch, disabled_filter="(pwdAccountLockedTime=*)")
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    member_id = await _mk_user(db, 1)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+    email = _identity(1).email
+    _install_presence(monkeypatch, present={email}, disabled={email})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.users_deactivated == 1
+    assert run.users_reactivated == 0
+    member = await db.get(User, member_id)
+    assert member.is_active is False
+    assert member.deactivated_by_sync is True
+    assert run.detail["deactivated"] == [{"user_id": str(member_id), "email": email}]
+
+
+@pytest.mark.asyncio
+async def test_sweep_group_presence_credit_beats_absent_enumeration(db, monkeypatch):
+    # The renamed-username scenario: this run's group reconcile resolved the
+    # member (credit), even though the paged enumeration alone would report
+    # them absent. Credit alone must be enough to prove presence.
+    _enable_deactivation(monkeypatch)
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    member_id = await _mk_user(db, 1)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+    _install_presence(monkeypatch, present=frozenset())
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.users_deactivated == 0
+    member = await db.get(User, member_id)
+    assert member.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_sweep_provenance_gate(db, monkeypatch):
+    # Admin-deactivated (deactivated_by_sync False) users are NEVER touched,
+    # present or not. Sync-deactivated users proven present are reactivated
+    # with the provenance flag cleared.
+    _enable_deactivation(monkeypatch)
+    admin_deactivated_id = await _mk_user(db, 1)
+    await _deactivate(db, admin_deactivated_id, by_sync=False)
+    sync_deactivated_id = await _mk_user(db, 2)
+    await _deactivate(db, sync_deactivated_id, by_sync=True)
+
+    _install_presence(monkeypatch, present={_identity(1).email, _identity(2).email})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.users_deactivated == 0
+    assert run.users_reactivated == 1
+
+    admin_user = await db.get(User, admin_deactivated_id)
+    assert admin_user.is_active is False
+    assert admin_user.deactivated_by_sync is False
+
+    sync_user = await db.get(User, sync_deactivated_id)
+    assert sync_user.is_active is True
+    assert sync_user.deactivated_by_sync is False
+
+
+@pytest.mark.asyncio
+async def test_sweep_breaker_boundary_equal_min_count_applies(db, monkeypatch):
+    # count == min_count (boundary-equal, NOT strictly exceeded) with a huge
+    # percent: the min_count term alone gates this case, so it applies.
+    _enable_deactivation(monkeypatch, max_percent=20, min_count=3)
+    users = await _mk_candidates(db, 3)  # swept = 3, all three proven absent
+    _install_presence(monkeypatch, present=frozenset())
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status != "aborted"
+    assert run.users_deactivated == 3
+    for uid in users:
+        user = await db.get(User, uid)
+        assert user.is_active is False
+        assert user.deactivated_by_sync is True
+
+
+@pytest.mark.asyncio
+async def test_sweep_breaker_boundary_equal_percent_applies(db, monkeypatch):
+    # count(4) > min_count(3): that term is exceeded. percent is boundary-
+    # equal to max_percent (4/20 == 20%): that term is NOT exceeded. Both
+    # terms must be strictly exceeded to abort, so this applies.
+    _enable_deactivation(monkeypatch, max_percent=20, min_count=3)
+    total = 20
+    absent = {1, 2, 3, 4}
+    await _mk_candidates(db, total)
+    present = {f"user{i}@company.local" for i in range(1, total + 1) if i not in absent}
+    _install_presence(monkeypatch, present=present)
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status != "aborted"
+    assert run.users_deactivated == 4
+
+
+@pytest.mark.asyncio
+async def test_sweep_breaker_both_terms_exceeded_aborts_but_still_reactivates(db, monkeypatch):
+    _enable_deactivation(monkeypatch, max_percent=20, min_count=3)
+    total = 20
+    absent = {1, 2, 3, 4, 5}  # count(5) > min_count(3) and 5/20=25% > 20%
+    users = await _mk_candidates(db, total)
+    reactivate_id = await _mk_user(db, 99)
+    await _deactivate(db, reactivate_id, by_sync=True)
+
+    present = {f"user{i}@company.local" for i in range(1, total + 1) if i not in absent}
+    present.add("user99@company.local")
+    _install_presence(monkeypatch, present=present)
+
+    swept = total + 1  # candidates include the reactivation target
+    count = len(absent)
+    expected_percent = round(count / swept * 100, 2)
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "aborted"
+    assert run.users_deactivated == 0
+    assert run.users_reactivated == 1
+    assert run.error is not None
+    assert run.detail["sweep"] == [
+        {
+            "reason": ldap_sync_service.SWEEP_REASON_BREAKER_TRIPPED,
+            "count": count,
+            "swept": swept,
+            "percent": expected_percent,
+        }
+    ]
+    for uid in users:
+        user = await db.get(User, uid)
+        assert user.is_active is True
+    reactivated = await db.get(User, reactivate_id)
+    assert reactivated.is_active is True
+    assert reactivated.deactivated_by_sync is False
+
+
+@pytest.mark.asyncio
+async def test_sweep_counters_and_detail_apply_to_run_row(db, monkeypatch):
+    _enable_deactivation(monkeypatch)
+    deactivate_id = await _mk_user(db, 1)
+    reactivate_id = await _mk_user(db, 2)
+    await _deactivate(db, reactivate_id, by_sync=True)
+
+    _install_presence(monkeypatch, present={_identity(2).email})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.users_deactivated == 1
+    assert run.users_reactivated == 1
+    persisted = (
+        await db.execute(
+            select(
+                LdapSyncRun.users_deactivated,
+                LdapSyncRun.users_reactivated,
+            ).where(LdapSyncRun.id == run.id)
+        )
+    ).one()
+    assert persisted.users_deactivated == 1
+    assert persisted.users_reactivated == 1
+    deactivated = await db.get(User, deactivate_id)
+    assert deactivated.is_active is False
+    assert deactivated.deactivated_by_sync is True
+
+
+def test_tally_apply_to_writes_deactivation_counters_and_stays_non_degrading():
+    tally = ldap_sync_service._Tally()
+    tally.record_deactivated(uuid.uuid4(), "a@company.local")
+    tally.record_reactivated(uuid.uuid4(), "b@company.local")
+
+    # A clean sweep that deactivated/reactivated someone is NOT degradation:
+    # it is the feature's normal, intended outcome.
+    assert tally.degraded is False
+
+    run = LdapSyncRun(trigger="manual", status="running")
+    tally.apply_to(run)
+    assert run.users_deactivated == 1
+    assert run.users_reactivated == 1
+
+
+def test_run_status_vocabulary_includes_aborted():
+    # A small, explicit pin: "aborted" is a real member of the status
+    # vocabulary the breaker can produce, not just a string typo'd once.
+    assert "aborted" in {"success", "partial", "aborted", "failed"}

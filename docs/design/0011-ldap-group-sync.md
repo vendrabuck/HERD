@@ -8,7 +8,12 @@ entry with a warning (never refuses), pre-provisioning mirrors the
 directory exactly including members outside ldap_user_base_dn, and the
 deactivation sweep uses one paged enumeration instead of per-user
 presence probes (the per-user probe survives for the disabled-filter
-check). Seven decision points were
+check). Phase 4 (deactivation and reactivation sweep) delivered 2026-08-14:
+the circuit breaker requires STRICT exceeds on both terms (boundary-equal
+on max_percent or min_count never aborts), and the disabled filter
+overrides group-presence credit (checked last, so a disabled account still
+listed in a mapped group still deactivates); both are amended into the
+deactivation section below. Seven decision points were
 resolved with vendra on 2026-08-11: the original four (pre-provisioning,
 reactivation provenance, deactivation fail-safety, audit persistence) plus
 three raised by the same-day adversarial review of the first draft (mapping
@@ -254,6 +259,23 @@ deactivate them, with auto-reactivation unreachable.
   `deactivated_by_sync=True` (new column on `users`, migration). The
   existing `is_active` checks then block login and refresh with no new
   enforcement code; outstanding refresh tokens die at their next rotation.
+
+**Amendment (phase 4 delivery, 2026-08-14):** two clarifications the
+implementation needed that this section did not previously pin down:
+
+1. The breaker's two terms are STRICT exceeds, not exceeds-or-equal: a
+   proven-absent-or-disabled count exactly equal to either
+   `ldap_sync_deactivation_max_percent` (as a share of swept candidates) or
+   `ldap_sync_deactivation_min_count` does NOT abort. Both terms must be
+   strictly exceeded together for the breaker to trip; a count sitting
+   exactly on either boundary applies its deactivations.
+2. The disabled filter overrides group-presence credit, not the reverse: a
+   user resolved as a member of a mapped group this run (proven present via
+   credit, no second search) is still deactivated if their directory entry
+   also matches `ldap_disabled_filter`. The check order is credit-or-paged-
+   presence first, disabled-filter last, so disabled can veto either kind of
+   proven presence; this matches disabled-equals-proven-absent taking
+   precedence over any presence signal.
 
 Deactivation is a flag flip, never a delete: reservation references by UUID
 and audit history stay intact, per the issue.

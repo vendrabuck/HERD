@@ -1,4 +1,5 @@
-"""Directory group reconciler (ADR 0011 phase 3).
+"""Directory group reconciler (ADR 0011 phase 3) plus the deactivation and
+reactivation sweep (ADR 0011 phase 4).
 
 One pass mirrors every LdapGroupMapping's directory membership into its HERD
 group via fail-closed set arithmetic. The error taxonomy is deliberately
@@ -34,6 +35,18 @@ Postgres, a session-scoped advisory lock so scaled-out auth replicas cannot
 execute concurrent directory-wide writes. The advisory key is the single
 constant below; changing it would let two builds sync concurrently across a
 rolling deploy, so it is part of the cross-replica contract, not a tunable.
+
+_run_deactivation_sweep runs after the mapping loop, gated on its own
+settings.ldap_sync_deactivation_enabled: proves presence via ONE paged
+directory enumeration (ldap_service.present_emails) plus this run's
+group-presence credit set, deactivates every proven-absent-or-disabled
+auth_source=ldap user below a two-term circuit breaker (strict-exceeds on
+BOTH max_percent and min_count; boundary-equal never aborts), and reactivates
+every sync-deactivated user proven present regardless of the breaker
+(reactivation is the safe direction, exempt from abort). Provenance
+(deactivated_by_sync) gates reactivation: an admin-deactivated user is never
+auto-reactivated, and the manual endpoints (routers/admin.py) always write
+deactivated_by_sync=False, admin intent outranking the directory.
 """
 
 import asyncio
@@ -46,6 +59,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from app import database
+from app.config import settings
 from app.models.group import GroupMember
 from app.models.ldap_group_mapping import DIRECTORY_NAME_MAX, LdapGroupMapping
 from app.models.ldap_sync_run import LdapSyncRun
@@ -73,6 +87,10 @@ MEMBER_SKIP_USER_INACTIVE = "user_inactive"
 # Not a skip: a provisioning IntegrityError whose retry-as-lookup found the
 # row (concurrent JIT login). Recorded in detail, member proceeds.
 PROVISION_RACE_RECOVERED = "provision_race_recovered"
+
+# ADR 0011 phase 4: deactivation-sweep detail reasons (category "sweep").
+SWEEP_REASON_ENUMERATION_UNAVAILABLE = "enumeration_unavailable"
+SWEEP_REASON_BREAKER_TRIPPED = "breaker_tripped"
 
 # C4: a member the directory still lists but could not identify makes the
 # whole group's removal set unprovable, since the unresolvable entry could
@@ -109,15 +127,27 @@ class _Tally:
     degraded distinguishes "partial" from "success" and is DERIVED: any
     category other than provision_races holding a record or overflow makes
     the run partial (a recovered provisioning race is not a skip, nothing
-    was skipped, the member proceeded). Categories are created lazily via
-    _category, so a new category needs no constructor edit.
+    was skipped, the member proceeded). "deactivated" and "reactivated" are
+    likewise excluded: those are the deactivation sweep's normal, intended
+    outcome, not degradation, so a clean sweep that deactivated someone must
+    not read as "partial". Categories are created lazily via _category, so a
+    new category needs no constructor edit unless it also needs excluding
+    here.
     """
+
+    _NON_DEGRADING_CATEGORIES = frozenset({"provision_races", "deactivated", "reactivated"})
 
     def __init__(self) -> None:
         self.users_provisioned = 0
         self.members_added = 0
         self.members_removed = 0
         self.members_skipped = 0
+        self.users_deactivated = 0
+        self.users_reactivated = 0
+        # ADR 0011 phase 4: the circuit breaker overrides success/partial to
+        # "aborted" (execute_run reads these two after the sweep runs).
+        self.aborted = False
+        self.abort_error: str | None = None
         self._categories: dict[str, _CappedCategory] = {}
 
     def _category(self, name: str) -> _CappedCategory:
@@ -128,7 +158,7 @@ class _Tally:
         return any(
             cat.records or cat.overflow
             for name, cat in self._categories.items()
-            if name != "provision_races"
+            if name not in self._NON_DEGRADING_CATEGORIES
         )
 
     def skip_group(self, group_dn: str, reason: str, error: str | None = None) -> None:
@@ -181,17 +211,50 @@ class _Tally:
             {"group_dn": group_dn, "unresolved": unresolved, "would_remove": would_remove}
         )
 
+    def sweep_note(self, reason: str, **fields) -> None:
+        """A "sweep" detail record for the deactivation pass itself
+        (enumeration_unavailable, breaker_tripped): degrading events distinct
+        from any individual user's outcome."""
+        self._category("sweep").add({"reason": reason, **fields})
+        logger.warning(
+            "LDAP deactivation sweep note: %s",
+            reason,
+            extra={"action": "ldap_sync_sweep_note", "reason": reason, **fields},
+        )
+
+    def record_deactivated(self, user_id: uuid.UUID, email: str) -> None:
+        self.users_deactivated += 1
+        self._category("deactivated").add({"user_id": str(user_id), "email": email})
+        logger.info(
+            "LDAP sync deactivated user %s (%s): proven absent or disabled",
+            user_id,
+            email,
+            extra={"action": "ldap_sync_user_deactivated", "user_id": str(user_id)},
+        )
+
+    def record_reactivated(self, user_id: uuid.UUID, email: str) -> None:
+        self.users_reactivated += 1
+        self._category("reactivated").add({"user_id": str(user_id), "email": email})
+        logger.info(
+            "LDAP sync reactivated user %s (%s): proven present",
+            user_id,
+            email,
+            extra={"action": "ldap_sync_user_reactivated", "user_id": str(user_id)},
+        )
+
     def detail(self) -> dict:
         return {name: cat.dump() for name, cat in self._categories.items() if cat.records}
 
     def apply_to(self, run: LdapSyncRun) -> None:
-        """Write the four counters and detail onto the run row. Status,
-        error, and finished_at are run-level machinery outcomes, not tally
-        state, and stay the caller's responsibility."""
+        """Write the counters and detail onto the run row. Status, error,
+        and finished_at are run-level machinery outcomes, not tally state,
+        and stay the caller's responsibility."""
         run.users_provisioned = self.users_provisioned
         run.members_added = self.members_added
         run.members_removed = self.members_removed
         run.members_skipped = self.members_skipped
+        run.users_deactivated = self.users_deactivated
+        run.users_reactivated = self.users_reactivated
         run.detail = self.detail()
 
 
@@ -277,7 +340,13 @@ async def _reconcile_mapping(
     herd_group_id: uuid.UUID,
     directory_name: str,
     tally: _Tally,
-) -> None:
+) -> set[uuid.UUID]:
+    """Reconcile one mapped group; returns the desired_ids resolved this
+    pass (the ADR 0011 phase 4 group-presence credit set), empty on any
+    fail-closed skip. Accumulated by execute_run across all mappings so the
+    deactivation sweep can treat "resolved as a member this run" as proof of
+    presence without a second directory search.
+    """
     # Scalars, not the ORM instance: rollbacks in this pass expire every
     # instance in the session, and expired attribute access needs IO the
     # async path cannot perform implicitly (see _ensure_ldap_user).
@@ -285,12 +354,12 @@ async def _reconcile_mapping(
         entry = await ldap_service.fetch_group(group_dn)
     except ldap_service.LdapUnavailableError as exc:
         tally.skip_group(group_dn, GROUP_SKIP_DIRECTORY_UNAVAILABLE, str(exc))
-        return
+        return set()
     if entry is None:
         # The directory answered: the DN resolves nothing (rename or OU
         # move). Fail-closed; the admin re-creates the mapping.
         tally.skip_group(group_dn, GROUP_SKIP_DANGLING_DN)
-        return
+        return set()
 
     new_name = entry.name[:DIRECTORY_NAME_MAX]
     if new_name and new_name != directory_name:
@@ -309,7 +378,7 @@ async def _reconcile_mapping(
         # A raise mid-batch discarded the whole batch; a half-resolved
         # desired set must never drive removals.
         tally.skip_group(group_dn, GROUP_SKIP_MEMBER_RESOLUTION_UNAVAILABLE, str(exc))
-        return
+        return set()
 
     desired_ids: set[uuid.UUID] = set()
     unresolved_existing_count = 0
@@ -390,14 +459,106 @@ async def _reconcile_mapping(
                 await db.rollback()
                 tally.op_failure(group_dn, "remove", user_id, str(exc))
 
+    return desired_ids
+
+
+async def _run_deactivation_sweep(
+    db: AsyncSession, tally: _Tally, credited_user_ids: set[uuid.UUID]
+) -> None:
+    """ADR 0011 phase 4: absence-proof deactivation, disabled-filter, and the
+    two-term circuit breaker, with an abort-exempt reactivation pass.
+
+    Gated on settings.ldap_sync_deactivation_enabled: a disabled deployment
+    is an unconditional no-op with no detail record (recording a "sweep"
+    category here would mark every plain reconcile-only run "partial" for a
+    feature the deployment never opted into).
+    """
+    if not settings.ldap_sync_deactivation_enabled:
+        return
+
+    try:
+        present = await ldap_service.present_emails()
+        disabled = (
+            await ldap_service.disabled_emails() if settings.ldap_disabled_filter else frozenset()
+        )
+    except (ldap_service.LdapUnavailableError, ValueError) as exc:
+        # Error is never absence: reactivations are ALSO skipped here, since
+        # presence was not proven either. Zero user changes this pass.
+        tally.sweep_note(SWEEP_REASON_ENUMERATION_UNAVAILABLE, error=str(exc))
+        return
+
+    candidates = (await db.execute(select(User).where(User.auth_source == "ldap"))).scalars().all()
+    swept = len(candidates)
+
+    def present_for(user: User) -> bool:
+        email = user.email.lower()
+        # Group-presence credit counts as present but does NOT override the
+        # disabled filter (checked LAST, so it can veto a credit-based
+        # presence): a disabled account still listed in a mapped group must
+        # still deactivate, matching the ADR's disabled-equals-proven-absent
+        # rule. This ordering is load-bearing.
+        credited_or_seen = user.id in credited_user_ids or email in present
+        return credited_or_seen and email not in disabled
+
+    to_deactivate = sorted(
+        (u for u in candidates if u.is_active and not present_for(u)), key=lambda u: str(u.id)
+    )
+    to_reactivate = sorted(
+        (u for u in candidates if not u.is_active and u.deactivated_by_sync and present_for(u)),
+        key=lambda u: str(u.id),
+    )
+
+    # Breaker check BEFORE applying anything: neither list has been touched
+    # yet. STRICT exceeds on both terms; boundary-equal never aborts.
+    count = len(to_deactivate)
+    percent = (count / swept * 100) if swept else 0.0
+    aborted = count > (swept * settings.ldap_sync_deactivation_max_percent / 100) and (
+        count > settings.ldap_sync_deactivation_min_count
+    )
+
+    if aborted:
+        percent_display = round(percent, 2)
+        tally.aborted = True
+        tally.abort_error = (
+            f"LDAP deactivation sweep aborted: {count} of {swept} candidates proven "
+            f"absent or disabled ({percent_display}%), exceeding both "
+            f"max_percent={settings.ldap_sync_deactivation_max_percent} and "
+            f"min_count={settings.ldap_sync_deactivation_min_count}; no deactivations applied."
+        )
+        tally.sweep_note(
+            SWEEP_REASON_BREAKER_TRIPPED, count=count, swept=swept, percent=percent_display
+        )
+    else:
+        for user in to_deactivate:
+            user.is_active = False
+            user.deactivated_by_sync = True
+            tally.record_deactivated(user.id, user.email)
+
+    # Reactivations are EXEMPT from the breaker: an aborted deactivation
+    # pass still applies them (the safe direction). Users an admin
+    # deactivated (deactivated_by_sync False) were already excluded above
+    # and are never touched here.
+    for user in to_reactivate:
+        user.is_active = True
+        user.deactivated_by_sync = False
+        tally.record_reactivated(user.id, user.email)
+
+    if tally.users_deactivated or tally.users_reactivated:
+        # One commit for the whole sweep: simple column flips with no
+        # cross-row invariants, unlike the per-op membership applies above.
+        await db.commit()
+
 
 async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
     """Execute the reconcile pass against an already-committed run row.
 
     Finalizes the row in a finally (finished_at is always set): "success"
     when nothing was skipped or failed, "partial" on any skip or per-op
-    failure, "failed" only when the run-level machinery itself raised, in
-    which case the exception is recorded and NOT re-raised.
+    failure, "aborted" when the phase 4 circuit breaker tripped (overrides
+    success/partial), "failed" only when the run-level machinery itself
+    raised, in which case the exception is recorded and NOT re-raised (and
+    takes precedence over "aborted" too, since it means something broke
+    after the sweep already ran).
     """
     run_id = run.id
     logger.info(
@@ -418,8 +579,13 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
                 ).order_by(LdapGroupMapping.created_at, LdapGroupMapping.id)
             )
         ).all()
+        # ADR 0011 phase 4: accumulate every user id resolved as a member by
+        # any mapping this run, the group-presence credit set the
+        # deactivation sweep below treats as proven present without a
+        # second directory search.
+        credited_user_ids: set[uuid.UUID] = set()
         for mapping_id, group_dn, herd_group_id, directory_name in mappings:
-            await _reconcile_mapping(
+            desired_ids = await _reconcile_mapping(
                 db,
                 mapping_id=mapping_id,
                 group_dn=group_dn,
@@ -427,7 +593,15 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
                 directory_name=directory_name,
                 tally=tally,
             )
+            credited_user_ids |= desired_ids
+        await _run_deactivation_sweep(db, tally, credited_user_ids)
         status = "partial" if tally.degraded else "success"
+        if tally.aborted:
+            # Overrides success/partial; a later exception in this try block
+            # (none currently possible after this point, but kept as the
+            # documented ordering) would still win via the except branch.
+            status = "aborted"
+            error = tally.abort_error
     except Exception as exc:
         await db.rollback()
         error = str(exc)
@@ -452,6 +626,8 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
                 "members_added": tally.members_added,
                 "members_removed": tally.members_removed,
                 "members_skipped": tally.members_skipped,
+                "users_deactivated": tally.users_deactivated,
+                "users_reactivated": tally.users_reactivated,
             },
         )
     return run

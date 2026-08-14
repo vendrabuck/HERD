@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, Uuid, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, Uuid, false, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.config import settings
@@ -30,6 +30,14 @@ class User(Base):
         String(16), nullable=False, default="local", server_default="local"
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # ADR 0011 phase 4: True only when the LDAP deactivation sweep is the one
+    # that flipped is_active False. Gates reactivation eligibility: an
+    # admin-deactivated user (this stays False) is never touched by the
+    # sweep, since admin intent always outranks the directory. The manual
+    # activate/deactivate endpoints always write this False.
+    deactivated_by_sync: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     role: Mapped[Role] = mapped_column(
         Enum(Role, schema=_schema), nullable=False, default=Role.USER
     )

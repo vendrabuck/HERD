@@ -12,6 +12,8 @@ from contextlib import contextmanager
 import pytest
 from app.config import settings
 from app.services import ldap_service
+from ldap3.core.exceptions import LDAPException
+from ldap3.core.results import RESULT_NO_SUCH_OBJECT, RESULT_SUCCESS
 from ldap3.utils.conv import escape_filter_chars
 
 _USER_DN = "CN=alice,OU=Users,DC=example,DC=com"
@@ -293,3 +295,150 @@ def test_fetch_group_missing_member_attribute_is_empty_membership(monkeypatch):
     assert group is not None
     assert group.name == "eng"
     assert group.member_dns == ()
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 phase 4: present_emails/disabled_emails paged enumeration. The
+# load-bearing rule under test: a partial or errored page must never be
+# mistaken for a complete enumeration.
+# ---------------------------------------------------------------------------
+
+
+class _FakePagedConnection:
+    """Simulates ldap3's paged search across N scripted pages.
+
+    pages: a list of (entries, result_code, cookie) tuples consumed in
+    order, one per search() call. cookie is bytes for "more pages follow";
+    an empty/None cookie means the directory reports it exhausted; omitting
+    the controls key entirely (cookie=NO_CONTROL) simulates a server that
+    drops the paging control on its final page.
+    """
+
+    NO_CONTROL = object()
+
+    def __init__(self, pages):
+        self._pages = list(pages)
+        self.entries: list = []
+        self.result: dict = {}
+        self.search_filters: list[str] = []
+
+    def search(
+        self, *, search_base, search_filter, search_scope, attributes, paged_cookie=None, **_kw
+    ):
+        self.search_filters.append(search_filter)
+        entries, result_code, cookie = self._pages.pop(0)
+        self.entries = entries
+        if result_code != RESULT_SUCCESS:
+            self.result = {"result": result_code}
+            return False
+        controls = {}
+        if cookie is not self.NO_CONTROL:
+            controls = {ldap_service._PAGED_COOKIE_OID: {"value": {"cookie": cookie or b""}}}
+        self.result = {"result": RESULT_SUCCESS, "controls": controls}
+        return True
+
+
+class _RaisingConnection:
+    def search(self, **_kw):
+        raise LDAPException("connection reset")
+
+
+def _patch_paged_connection(monkeypatch, fake_conn):
+    @contextmanager
+    def fake_connection(require_service_account=False):
+        yield fake_conn
+
+    monkeypatch.setattr(ldap_service, "_service_connection", fake_connection)
+
+
+def _mail_entry(dn: str, email: str) -> _FakeEntry:
+    return _FakeEntry(dn, {settings.ldap_email_attribute: [email]})
+
+
+def test_present_emails_collects_across_multiple_pages_lowercased(monkeypatch):
+    fake_conn = _FakePagedConnection(
+        [
+            ([_mail_entry("uid=a", "A@example.com")], RESULT_SUCCESS, b"cookie-1"),
+            ([_mail_entry("uid=b", "b@example.com")], RESULT_SUCCESS, b""),
+        ]
+    )
+    _patch_paged_connection(monkeypatch, fake_conn)
+
+    emails = ldap_service._present_emails_sync()
+
+    assert emails == frozenset({"a@example.com", "b@example.com"})
+    # Two pages consumed; the second call carried the first page's cookie.
+    assert len(fake_conn.search_filters) == 2
+
+
+def test_present_emails_collects_multivalued_attribute(monkeypatch):
+    entry = _FakeEntry("uid=multi", {settings.ldap_email_attribute: ["a@x.com", "b@x.com"]})
+    fake_conn = _FakePagedConnection([([entry], RESULT_SUCCESS, b"")])
+    _patch_paged_connection(monkeypatch, fake_conn)
+
+    assert ldap_service._present_emails_sync() == frozenset({"a@x.com", "b@x.com"})
+
+
+def test_present_emails_missing_control_after_success_ends_pages(monkeypatch):
+    # A server that omits the paging control entirely on its only/last page:
+    # end-of-pages is inferred ONLY because the search already proved
+    # success, per the module contract.
+    fake_conn = _FakePagedConnection(
+        [([_mail_entry("uid=a", "a@x.com")], RESULT_SUCCESS, _FakePagedConnection.NO_CONTROL)]
+    )
+    _patch_paged_connection(monkeypatch, fake_conn)
+
+    assert ldap_service._present_emails_sync() == frozenset({"a@x.com"})
+
+
+def test_present_emails_raises_on_non_success_page(monkeypatch):
+    # A page mid-enumeration reports a non-success result: the whole
+    # enumeration must raise, never return the partial set collected so far.
+    fake_conn = _FakePagedConnection(
+        [
+            ([_mail_entry("uid=a", "a@x.com")], RESULT_SUCCESS, b"cookie-1"),
+            ([], RESULT_NO_SUCH_OBJECT, None),
+        ]
+    )
+    _patch_paged_connection(monkeypatch, fake_conn)
+
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        ldap_service._present_emails_sync()
+
+
+def test_present_emails_raises_on_ldap_exception(monkeypatch):
+    _patch_paged_connection(monkeypatch, _RaisingConnection())
+
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        ldap_service._present_emails_sync()
+
+
+def test_disabled_emails_conjoins_filter_with_presence(monkeypatch):
+    monkeypatch.setattr(settings, "ldap_disabled_filter", "(pwdAccountLockedTime=*)", raising=False)
+    fake_conn = _FakePagedConnection([([], RESULT_SUCCESS, b"")])
+    _patch_paged_connection(monkeypatch, fake_conn)
+
+    result = ldap_service._disabled_emails_sync()
+
+    assert result == frozenset()
+    assert fake_conn.search_filters == [
+        f"(&({settings.ldap_email_attribute}=*)(pwdAccountLockedTime=*))"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_disabled_emails_empty_filter_raises_value_error(monkeypatch):
+    monkeypatch.setattr(settings, "ldap_disabled_filter", "", raising=False)
+
+    with pytest.raises(ValueError):
+        await ldap_service.disabled_emails()
+
+
+@pytest.mark.asyncio
+async def test_disabled_emails_filter_not_starting_with_paren_raises_value_error(monkeypatch):
+    monkeypatch.setattr(
+        settings, "ldap_disabled_filter", "userAccountControl:1.2:=2", raising=False
+    )
+
+    with pytest.raises(ValueError):
+        await ldap_service.disabled_emails()
