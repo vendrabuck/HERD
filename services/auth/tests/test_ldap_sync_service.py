@@ -1201,7 +1201,9 @@ async def test_execute_run_cancelled_mid_reconcile_commits_failed_with_cancelled
     # attribute after the task has run needs IO this synchronous test body
     # cannot perform implicitly.
     group_id = group.id
-    mapping = LdapGroupMapping(group_dn=_GROUP_DN, directory_name="herd-eng", herd_group_id=group_id)
+    mapping = LdapGroupMapping(
+        group_dn=_GROUP_DN, directory_name="herd-eng", herd_group_id=group_id
+    )
     db.add(mapping)
     await db.commit()
     user_id = await _mk_user(db, 1)
