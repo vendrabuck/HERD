@@ -213,9 +213,10 @@ async def delete_mapping(
 # ---------------------------------------------------------------------------
 # Sync-now (ADR 0011 phase 3). Run serialization itself (the in-process
 # asyncio.Lock plus the Postgres advisory-lock cross-replica layer) lives in
-# ldap_sync_service (S1): it is a run invariant, not an HTTP concern, and a
-# future scheduled trigger (phase 5) needs it without a second lock. This
-# router only maps ldap_sync_service.SyncBusyError to the two existing 409s.
+# ldap_sync_service (S1): it is a run invariant, not an HTTP concern, and the
+# phase 5 interval loop (app/tasks/ldap_sync_loop.py) shares it without a
+# second lock. This router only maps ldap_sync_service.SyncBusyError to the
+# two existing 409s.
 # ---------------------------------------------------------------------------
 
 _RUN_IN_PROGRESS_DETAIL = "A sync run is already in progress"

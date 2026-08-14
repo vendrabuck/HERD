@@ -13,7 +13,9 @@ the circuit breaker requires STRICT exceeds on both terms (boundary-equal
 on max_percent or min_count never aborts), and the disabled filter
 overrides group-presence credit (checked last, so a disabled account still
 listed in a mapped group still deactivates); both are amended into the
-deactivation section below. Seven decision points were
+deactivation section below. Phase 5 (interval loop, config-service bootstrap
+schema keys, run-retention pruning) delivered 2026-08-14 with no open
+questions against this doc. Seven decision points were
 resolved with vendra on 2026-08-11: the original four (pre-provisioning,
 reactivation provenance, deactivation fail-safety, audit persistence) plus
 three raised by the same-day adversarial review of the first draft (mapping
@@ -370,7 +372,41 @@ authority for role, per the issue.
    two-term circuit breaker with reactivation exemption, manual admin
    activate/deactivate endpoints (the non-sync writer).
 5. Interval loop, config-service bootstrap schema keys, `docs/ROLES.md` and
-   `docs/ARCHITECTURE.md` updates, run-retention sweep.
+   `docs/ARCHITECTURE.md` updates, run-retention sweep. Delivered
+   2026-08-14: `services/auth/app/tasks/ldap_sync_loop.py` runs
+   `ldap_sync_service.run_sync(trigger="interval")` every
+   `ldap_sync_interval_seconds` (first tick sleeps a full interval before the
+   first sync, so a rolling restart across replicas does not burst-sync at
+   boot), started from `main.py`'s lifespan only when
+   `ldap_group_sync_enabled` AND `auth_method == "ldap"`, and serialized
+   through the existing `_SyncSlot` exactly like sync-now. A `SyncBusyError`
+   from an overlapping run is swallowed as a routine skip, never an error.
+   `ldap_sync_interval_seconds` is clamped to a 60-second floor at loop
+   startup (logged, not rejected: a bad tuning value must not block auth
+   from booting; no pydantic validator on the setting itself). The same loop
+   prunes `ldap_sync_runs` rows older than `ldap_sync_runs_retention_days`:
+   the FIRST due tick after a process starts prunes unconditionally (no
+   restart-dependent wait for a full day), then at most once per 24h after
+   that, checked at tick boundaries (the outbox relay's `last_prune`
+   pattern, amended here so a raising prune does NOT advance the cadence
+   timer, retrying on the very next tick instead of skipping a whole
+   window), and a "running" row is never removed regardless of age.
+   Retention is enforced ONLY by this loop, never by manual sync-now, so a
+   deployment that never enables the loop accumulates audit rows
+   indefinitely; a deliberate consequence of keeping pruning off the manual
+   path, not an oversight. No migration: the table is small enough that an
+   index was judged unnecessary for phase 5. Adversarial review (2026-08-14)
+   also caught and fixed a `docker-compose.yml` gap (the new settings were
+   undocumented-but-unwired: no compose environment block passed them
+   through, so `.env` could not reach the container) and an
+   `execute_run` defect where a task cancellation mid-run (the realistic
+   case: this loop's task cancelled during service shutdown) committed a
+   "failed" row with its cause silently lost, because `asyncio.CancelledError`
+   is a `BaseException` the existing `except Exception` never caught;
+   `execute_run` now has a dedicated `except asyncio.CancelledError` arm that
+   records a fixed cause string and re-raises, so cancellation still
+   propagates while the finalized row keeps recording its cause like every
+   other failure path.
 6. Frontend admin surface: mappings CRUD, run history, sync-now button
    (every backend feature keeps a frontend path, the #397/#398 precedent).
 

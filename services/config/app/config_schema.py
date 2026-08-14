@@ -173,6 +173,164 @@ CONFIG_SCHEMA = [
             "implicitly; plain ldap:// URLs use STARTTLS when this is true."
         ),
     },
+    {
+        "key": "LDAP_TLS_VALIDATE",
+        "label": "Validate TLS Certificate",
+        "type": "dropdown",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": "true",
+        "options": ["true", "false"],
+        "description": (
+            "Verify the directory server's TLS certificate. Leave true: the bind "
+            "transmits the service-account and every user's password, so an "
+            "unvalidated certificate lets an active network attacker MITM the "
+            "connection. Set false only for a lab directory behind a self-signed "
+            "cert you cannot pin via LDAP_CA_CERT; this logs a startup warning."
+        ),
+    },
+    {
+        "key": "LDAP_CA_CERT",
+        "label": "CA Certificate Path",
+        "type": "string",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "description": (
+            "Path (inside the container) to a CA bundle to verify the directory "
+            "server against, e.g. a pinned internal CA. Used when "
+            "LDAP_TLS_VALIDATE=true; when blank the system trust store is used."
+        ),
+    },
+    {
+        "key": "LDAP_GROUP_MEMBER_ATTRIBUTE",
+        "label": "Group Member Attribute",
+        "type": "string",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": "member",
+        "description": (
+            "Group entry attribute holding member DNs (Active Directory and "
+            "groupOfNames use 'member'; posixGroup memberUid is out of scope). "
+            "Consulted by the ADR 0011 group sync."
+        ),
+    },
+    {
+        "key": "LDAP_GROUP_NAME_ATTRIBUTE",
+        "label": "Group Name Attribute",
+        "type": "string",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": "cn",
+        "description": (
+            "Group entry attribute cached as a mapping's display name. "
+            "Consulted by the ADR 0011 group sync."
+        ),
+    },
+    {
+        "key": "LDAP_GROUP_SYNC_ENABLED",
+        "label": "Enable Group Sync Interval Loop",
+        "type": "dropdown",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": "false",
+        "options": ["true", "false"],
+        "description": (
+            "Start the background loop that runs the directory group reconcile "
+            "on an interval (ADR 0011 phase 5). Also requires AUTH_METHOD=ldap; "
+            "dark by default: admin-managed mappings and on-demand sync-now work "
+            "regardless of this setting."
+        ),
+    },
+    {
+        "key": "LDAP_SYNC_INTERVAL_SECONDS",
+        "label": "Group Sync Interval (seconds)",
+        "type": "number",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": 3600,
+        "description": (
+            "Seconds between interval-triggered LDAP group reconcile runs. "
+            "Values below 60 are clamped to a 60-second floor (with a startup "
+            "warning) rather than rejected, so a bad tuning value never blocks "
+            "auth from booting."
+        ),
+    },
+    {
+        "key": "LDAP_SYNC_RUNS_RETENTION_DAYS",
+        "label": "Sync Run Retention (days)",
+        "type": "number",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": 90,
+        "description": (
+            "Days to keep ldap_sync_runs audit rows before the interval loop "
+            "prunes them. A running row is never pruned regardless of age."
+        ),
+    },
+    {
+        "key": "LDAP_SYNC_DEACTIVATION_ENABLED",
+        "label": "Enable Deactivation Sweep",
+        "type": "dropdown",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": "false",
+        "options": ["true", "false"],
+        "description": (
+            "Opt-in for the deactivation/reactivation sweep. Independent of group "
+            "mirroring: enabling mappings alone never deactivates anyone."
+        ),
+    },
+    {
+        "key": "LDAP_DISABLED_FILTER",
+        "label": "Disabled Account Filter",
+        "type": "string",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "description": (
+            "A complete LDAP filter expression (not a value) identifying disabled "
+            "accounts, e.g. the AD userAccountControl lockout-bit filter "
+            "(userAccountControl:1.2.840.113556.1.4.803:=2). Blank means "
+            "absence-only detection."
+        ),
+    },
+    {
+        "key": "LDAP_SYNC_DEACTIVATION_MAX_PERCENT",
+        "label": "Deactivation Breaker: Max Percent",
+        "type": "number",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": 20,
+        "description": (
+            "Circuit-breaker percent term: the sweep aborts, deactivating no one, "
+            "only when the proven-absent-or-disabled count STRICTLY exceeds this "
+            "percent of swept users AND the count floor below. Reactivations "
+            "still apply on abort."
+        ),
+    },
+    {
+        "key": "LDAP_SYNC_DEACTIVATION_MIN_COUNT",
+        "label": "Deactivation Breaker: Min Count",
+        "type": "number",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": 3,
+        "description": (
+            "Circuit-breaker count floor, strictly exceeded together with the "
+            "percent term. Keeps small deployments functional: one leaver in a "
+            "four-user shop is 25 percent but under the floor, so it deactivates."
+        ),
+    },
     # Superadmin
     {
         "key": "SUPERADMIN_EMAIL",

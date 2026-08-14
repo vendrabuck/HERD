@@ -1,6 +1,7 @@
 """Tests for main.py: lifespan seeding functions."""
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.database import Base
@@ -225,6 +226,7 @@ async def test_lifespan_runs_seeding():
         patch("app.main.engine", engine),
         patch("app.main._seed_superadmin", mock_seed_sa),
         patch("app.main._seed_not_grouped", mock_seed_ng),
+        patch("app.main.ldap_group_sync_loop_enabled", return_value=False),
     ):
         mock_app = MagicMock()
         async with lifespan(mock_app):
@@ -232,3 +234,56 @@ async def test_lifespan_runs_seeding():
 
     assert seed_sa_called
     assert seed_ng_called
+
+
+# --- lifespan: ADR 0011 phase 5 interval-loop gating ---
+
+
+@pytest.mark.asyncio
+async def test_lifespan_starts_ldap_sync_loop_when_enabled():
+    """gate true: the lifespan starts the loop task and cancels it cleanly on
+    shutdown. ldap_sync_loop is stood in for by a fake that signals it ran
+    and then blocks until cancelled, so the assertion proves the task was
+    actually scheduled, not just that create_task would have been reachable.
+    """
+    from app.main import lifespan
+
+    started = asyncio.Event()
+
+    async def fake_loop(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    with (
+        patch("app.main.engine", engine),
+        patch("app.main._seed_superadmin", AsyncMock()),
+        patch("app.main._seed_not_grouped", AsyncMock()),
+        patch("app.main.ldap_group_sync_loop_enabled", return_value=True),
+        patch("app.main.ldap_sync_loop", fake_loop),
+    ):
+        mock_app = MagicMock()
+        async with lifespan(mock_app):
+            await asyncio.wait_for(started.wait(), timeout=5)
+
+    assert started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_skips_ldap_sync_loop_when_disabled():
+    """gate false (either auth_method != 'ldap' or the flag off, both
+    collapsed into the helper's return value here since the helper itself is
+    unit-tested directly in test_ldap_sync_loop.py): no task is created."""
+    from app.main import lifespan
+
+    with (
+        patch("app.main.engine", engine),
+        patch("app.main._seed_superadmin", AsyncMock()),
+        patch("app.main._seed_not_grouped", AsyncMock()),
+        patch("app.main.ldap_group_sync_loop_enabled", return_value=False),
+        patch("app.main.ldap_sync_loop") as mock_loop,
+    ):
+        mock_app = MagicMock()
+        async with lifespan(mock_app):
+            pass
+
+    mock_loop.assert_not_called()

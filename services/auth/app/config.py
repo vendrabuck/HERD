@@ -41,6 +41,15 @@ class Settings(HerdBaseSettings):
     # consult them.
     ldap_group_member_attribute: str = "member"
     ldap_group_name_attribute: str = "cn"
+    # Interval loop (ADR 0011 phase 5). Dark by default: enabling mapping
+    # CRUD and on-demand sync-now above never opts a deployment into the
+    # background loop. Both this flag and auth_method == "ldap" gate whether
+    # main.py's lifespan starts the loop task at all.
+    ldap_group_sync_enabled: bool = False
+    ldap_sync_interval_seconds: int = 3600
+    # Retention for the ldap_sync_runs audit table, pruned by the same
+    # interval loop (never by sync-now).
+    ldap_sync_runs_retention_days: int = 90
     # Deactivation sweep (ADR 0011 phase 4). Independent opt-in: enabling
     # group mirroring above never opts a deployment into deactivation.
     ldap_sync_deactivation_enabled: bool = False

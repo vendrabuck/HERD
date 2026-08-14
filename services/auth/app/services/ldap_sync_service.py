@@ -29,7 +29,7 @@ sync just like a local account; phase 4's sweep owns is_active transitions).
 Run rows are committed with status "running" before any directory work so a
 crashed pass leaves a visible corpse.
 
-Run serialization (sync-now and any future scheduled trigger share ONE
+Run serialization (sync-now and the phase 5 interval loop share ONE
 running-row invariant) also lives here: an in-process asyncio.Lock plus, on
 Postgres, a session-scoped advisory lock so scaled-out auth replicas cannot
 execute concurrent directory-wide writes. The advisory key is the single
@@ -604,6 +604,21 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
     raised, in which case the exception is recorded and NOT re-raised (and
     takes precedence over "aborted" too, since it means something broke
     after the sweep already ran).
+
+    A task cancellation (asyncio.CancelledError, e.g. the phase 5 interval
+    loop's task being cancelled mid-tick during service shutdown) is the one
+    exception to "not re-raised": CancelledError is a BaseException, not an
+    Exception, so the except Exception arm below never catches it, and
+    without a dedicated arm it would skip straight past this function's
+    "failed runs record their cause" contract, committing status "failed"
+    with error left None. The dedicated except records a fixed cause string
+    and RE-RAISES (cancellation must keep propagating so the caller's
+    task-cancel/await actually completes), while the finally below still
+    runs first and commits the row exactly like any other failure: status
+    "failed" (its default, since a mid-tick cancellation never reaches the
+    success/partial/aborted assignment), with that cause string as the
+    recorded error. No new status value: the five-valued vocabulary
+    (running/success/partial/aborted/failed) is unchanged.
     """
     run_id = run.id
     logger.info(
@@ -647,6 +662,16 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
             # documented ordering) would still win via the except branch.
             status = "aborted"
             error = tally.abort_error
+    except asyncio.CancelledError:
+        # Mirrors the Exception arm below: a cancel delivered between a
+        # per-op db.add and its commit (e.g. mid _reconcile_mapping) leaves a
+        # torn, uncommitted write on the session. Without this rollback the
+        # finally's commit would flush that partial write together with the
+        # run-row finalization, silently landing a half-applied membership
+        # change alongside a "failed" run.
+        await db.rollback()
+        error = "cancelled during service shutdown"
+        raise
     except Exception as exc:
         await db.rollback()
         error = str(exc)
@@ -692,8 +717,9 @@ async def create_run(db: AsyncSession, trigger: str) -> LdapSyncRun:
 # ---------------------------------------------------------------------------
 # Run serialization (S1). One invariant, ONE implementation: a run is a run
 # whether started from the router's sync-now endpoint, called directly
-# (run_sync, used by the live tests and any script), or (future) a phase 5
-# interval loop started from main.py's lifespan. Two layers: an in-process
+# (run_sync, used by the live tests and any script), or the phase 5 interval
+# loop (app/tasks/ldap_sync_loop.py, started from main.py's lifespan). Two
+# layers: an in-process
 # asyncio.Lock (blocks a second call in THIS process) and, on Postgres only,
 # a session-scoped advisory lock (blocks a second call on ANOTHER replica).
 # SQLite (unit tests) has no advisory locks, so tests exercise only the

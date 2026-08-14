@@ -28,19 +28,24 @@ Bind DN for the service account: cn=admin,dc=company,dc=local / admin.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import socket
 import uuid
 
 import ldap3
 import pytest
+from app import database
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.models.group import GroupMember, UserGroup
 from app.models.ldap_group_mapping import LdapGroupMapping
+from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import User
 from app.services import auth_service, ldap_service, ldap_sync_service
+from app.tasks import ldap_sync_loop as loop_module
 from httpx import ASGITransport, AsyncClient
 from ldap3.core.exceptions import LDAPNoSuchObjectResult
 from sqlalchemy import select
@@ -782,3 +787,112 @@ async def test_live_deactivation_and_reactivation_sweep(monkeypatch, ldap_settin
         _safe_delete(conn, temp_group_dn)
         _safe_delete(conn, temp_person_dn)
         conn.unbind()
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 phase 5: the interval loop (app/tasks/ldap_sync_loop.py) against
+# the REAL directory. Everything above proves ldap_sync_service.run_sync
+# itself is correct; what only a live run of the actual LOOP FUNCTION can
+# prove is that the phase 5 wiring around it, trigger="interval", the
+# sleep-before-first-tick ordering, and driving run_sync through the same
+# _SyncSlot serialization sync-now uses, works end-to-end and produces a
+# real audit row.
+#
+# database.AsyncSessionLocal is patched to a FILE-BACKED temp sqlite engine
+# (tmp_path, not the shared in-memory db_engine fixture used elsewhere in
+# this file): a first version of this test shared one :memory: engine
+# (single StaticPool connection) between the loop's own sessions and this
+# test's polling sessions, and that was empirically reproduced discarding
+# in-flight writes under concurrent access from the two coroutines. A
+# separate on-disk database file gives the loop and the poller independent
+# connections that both see the same committed data without contending for
+# one shared connection object. The interval is forced to a fraction of a
+# second (not an env var: passing interval_seconds directly is the cleaner
+# seam, since ldap_sync_loop already accepts it as a parameter for exactly
+# this reason) so the loop completes a real tick well inside the test's
+# timeout instead of the production default of an hour.
+#
+# Polling is EXISTENCE-based, not earliest-row-based: it waits for any
+# finished run with trigger "interval" and members_added == 3 (the group
+# build), rather than assuming the first chronological "interval" row is
+# that one. started_at is second-granularity, so a slow poll racing a second
+# (idempotent, members_added == 0) tick could tie or invert the visible
+# order; asserting on content instead of position sidesteps that entirely,
+# and idempotent no-op ticks are free to exist alongside without failing
+# anything.
+# ---------------------------------------------------------------------------
+
+
+async def _poll_for_run_with_members_added(
+    session_factory: async_sessionmaker, *, trigger: str, members_added: int, timeout: float = 5.0
+) -> LdapSyncRun:
+    """Poll for ANY finished (non-"running") ldap_sync_runs row matching
+    trigger and members_added, using a fresh session per attempt so each
+    poll sees the latest committed state rather than a stale snapshot from a
+    long-lived session."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with session_factory() as s:
+            row = (
+                (
+                    await s.execute(
+                        select(LdapSyncRun).where(
+                            LdapSyncRun.trigger == trigger,
+                            LdapSyncRun.status != "running",
+                            LdapSyncRun.members_added == members_added,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+        if row is not None:
+            return row
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"no finished '{trigger}' run with members_added == {members_added} "
+                f"appeared within {timeout}s"
+            )
+        await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_interval_loop_produces_a_run_row_against_live_directory(
+    monkeypatch, ldap_settings, tmp_path
+):
+    db_path = tmp_path / "ldap_sync_loop_live_test.db"
+    file_engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+    async with file_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    try:
+        session_factory = async_sessionmaker(file_engine, expire_on_commit=False)
+        monkeypatch.setattr(database, "AsyncSessionLocal", session_factory)
+
+        async with session_factory() as db:
+            group_id = await _mk_herd_group(db, "Interval Loop")
+            await _mk_mapping(
+                db,
+                group_dn=f"cn=herd-eng,{GROUPS_DN}",
+                herd_group_id=group_id,
+                directory_name="herd-eng",
+            )
+
+        loop_task = asyncio.create_task(loop_module.ldap_sync_loop(0.2))
+        try:
+            run = await _poll_for_run_with_members_added(
+                session_factory, trigger="interval", members_added=3
+            )
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+
+        assert run.status == "success"
+
+        async with session_factory() as db:
+            emails = await _member_emails(db, group_id)
+        assert emails == {f"user{n}@company.local" for n in (1, 2, 3)}
+    finally:
+        await file_engine.dispose()
