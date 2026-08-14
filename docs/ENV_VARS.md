@@ -72,11 +72,13 @@ Read once at startup to create the seeded superadmin. Ignored on subsequent rest
 Only consulted when `AUTH_METHOD=ldap`. When enabled, `/register` returns 409 and
 user accounts are provisioned on first successful LDAP bind (no password hash
 is stored locally). HERD role and group membership remain managed inside HERD;
-LDAP groups are not mirrored automatically today. Directory group mapping and
-sync is designed in ADR 0011 (`docs/design/0011-ldap-group-sync.md`, issue #38)
-and in delivery: phase 1 (the directory group client) has landed, and the two
-`LDAP_GROUP_*` keys below belong to it. The remaining sync keys arrive with the
-phases that consult them.
+Directory group mapping and sync (ADR 0011,
+`docs/design/0011-ldap-group-sync.md`, issue #38) is in delivery, phases 1-4
+of 6 landed: admin-managed mappings, an on-demand reconcile
+(`POST /api/auth/admin/ldap-sync/run`), and the opt-in deactivation sweep all
+work today; the interval loop and admin UI arrive in phases 5-6. The
+`LDAP_GROUP_*` and `LDAP_SYNC_*`/`LDAP_DISABLED_FILTER` keys below belong to
+this feature; the interval and retention keys arrive with phase 5.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -89,6 +91,10 @@ phases that consult them.
 | `LDAP_USERNAME_ATTRIBUTE` | `sAMAccountName` | Directory attribute used as the HERD username. |
 | `LDAP_GROUP_MEMBER_ATTRIBUTE` | `member` | Group entry attribute holding member DNs (Active Directory and `groupOfNames` use `member`; `posixGroup` `memberUid` is out of scope). Consulted by the ADR 0011 group sync. |
 | `LDAP_GROUP_NAME_ATTRIBUTE` | `cn` | Group entry attribute cached as a mapping's display name. Consulted by the ADR 0011 group sync. |
+| `LDAP_SYNC_DEACTIVATION_ENABLED` | `false` | Opt-in for the deactivation/reactivation sweep. Independent of group mirroring: enabling mappings alone never deactivates anyone. |
+| `LDAP_DISABLED_FILTER` | (empty) | A complete LDAP filter expression (not a value) identifying disabled accounts, e.g. the AD `userAccountControl` lockout-bit filter `(userAccountControl:1.2.840.113556.1.4.803:=2)`. Empty means absence-only detection. |
+| `LDAP_SYNC_DEACTIVATION_MAX_PERCENT` | `20` | Circuit-breaker percent term: the sweep aborts, deactivating no one, only when the proven-absent-or-disabled count STRICTLY exceeds this percent of swept users AND the count floor below. Reactivations still apply on abort. |
+| `LDAP_SYNC_DEACTIVATION_MIN_COUNT` | `3` | Circuit-breaker count floor (strictly exceeded together with the percent term). Keeps small deployments functional: one leaver in a four-user shop is 25 percent but under the floor, so it deactivates. |
 | `LDAP_USE_TLS` | `true` | Require TLS. `ldaps://` URLs negotiate TLS implicitly; plain `ldap://` URLs use STARTTLS when this is true. |
 | `LDAP_TLS_VALIDATE` | `true` | Verify the directory server's TLS certificate. The bind transmits the service-account and every user's password, so leave this on: an unvalidated certificate lets an active network attacker MITM the connection and harvest credentials. Set `false` only for a lab directory behind a self-signed cert you cannot pin via `LDAP_CA_CERT`; this logs a startup warning. |
 | `LDAP_CA_CERT` | (empty) | Path (inside the container) to a CA bundle to verify the directory server against, e.g. a pinned internal CA. Used when `LDAP_TLS_VALIDATE=true`; when empty the system trust store is used. |

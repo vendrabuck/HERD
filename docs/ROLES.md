@@ -1288,6 +1288,14 @@ Authorization: Bearer <admin-token>
 | `/api/auth/groups/users/groups` | POST | yes | yes | yes |
 | `/api/auth/users` | GET | | yes | yes |
 | `/api/auth/users/{id}/role` | PUT | | | yes |
+| `/api/auth/users/{id}/activate` | POST | | yes | yes |
+| `/api/auth/users/{id}/deactivate` | POST | | yes | yes |
+| `/api/auth/admin/ldap-sync/mappings` | POST | | yes | yes |
+| `/api/auth/admin/ldap-sync/mappings` | GET | | yes | yes |
+| `/api/auth/admin/ldap-sync/mappings/{id}` | DELETE | | yes | yes |
+| `/api/auth/admin/ldap-sync/run` | POST | | yes | yes |
+| `/api/auth/admin/ldap-sync/runs` | GET | | yes | yes |
+| `/api/auth/admin/ldap-sync/runs/{id}` | GET | | yes | yes |
 | `/api/inventory/templates` | GET | yes | yes | yes |
 | `/api/inventory/templates/{id}` | GET | yes | yes | yes |
 | `/api/inventory/templates` | POST | | yes | yes |
@@ -1406,7 +1414,15 @@ When `AUTH_METHOD=ldap` (see [ENV_VARS.md](ENV_VARS.md#ldap--active-directory)):
 - Role assignment (`user`, `admin`, `superadmin`) and `UserGroup` membership
   are still managed entirely inside HERD. Promote LDAP-provisioned users to
   `admin` or add them to groups using the existing admin UI / endpoints.
-- LDAP group membership is **not** mirrored into HERD groups today; that
-  mapping is designed in ADR 0011 (`docs/design/0011-ldap-group-sync.md`,
-  issue #38) and in delivery: phase 1, the directory group client, has
-  landed, with the admin-facing mapping and sync arriving in later phases.
+- Directory group sync (ADR 0011, `docs/design/0011-ldap-group-sync.md`,
+  issue #38) is in delivery, phases 1-4 of 6 landed: admins can map
+  directory groups to HERD groups (`/api/auth/admin/ldap-sync/mappings`),
+  trigger a reconcile with `POST /api/auth/admin/ldap-sync/run` (202; poll
+  `/runs`), and opt in to the deactivation/reactivation sweep
+  (`LDAP_SYNC_DEACTIVATION_ENABLED`, dark by default; a two-term circuit
+  breaker guards mass deactivation, and only sync-deactivated users are
+  ever auto-reactivated; admin intent via
+  `/api/auth/users/{id}/activate|deactivate` always outranks the
+  directory). Membership does NOT yet sync on an interval (the loop is
+  phase 5; today runs are manual), and there is no admin UI yet (phase 6).
+  Role assignment never syncs; HERD stays the authority for role.
