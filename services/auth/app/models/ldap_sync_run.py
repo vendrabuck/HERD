@@ -9,9 +9,10 @@ create_all schema in parity with migration 0007's raw DDL, so a row
 inserted by provenance other than this model (a raw-SQL insert, or any
 future writer) still lands at 0/{} instead of NULL. detail is a capped,
 categorized record of skips and failures; the cap constant lives with the
-reconciler (ldap_sync_service.py), not here. deactivation counters
-(users_deactivated, users_reactivated) and the "aborted" status arrive
-with phase 4's circuit breaker; do not add them yet.
+reconciler (ldap_sync_service.py), not here. users_deactivated and
+users_reactivated (ADR 0011 phase 4) follow the same C8 parity pattern;
+the "aborted" status they can drive is a plain string in the existing
+status column, no schema change needed for it.
 """
 
 import uuid
@@ -51,6 +52,12 @@ class LdapSyncRun(Base):
         Integer, nullable=False, default=0, server_default=text("0")
     )
     members_skipped: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    users_deactivated: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    users_reactivated: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
     detail: Mapped[dict] = mapped_column(

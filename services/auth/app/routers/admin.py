@@ -8,7 +8,12 @@ from app.database import get_db
 from app.dependencies.auth import require_role
 from app.models.user import Role, User
 from app.schemas.auth import PaginatedUserResponse, SetRoleRequest, UserResponse
-from app.services.auth_service import get_all_users, get_user_by_id, set_user_role
+from app.services.auth_service import (
+    get_all_users,
+    get_user_by_id,
+    set_user_active,
+    set_user_role,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,5 +88,61 @@ async def update_user_role(
             "user_id": str(user_id),
             "role": body.role.value,
         },
+    )
+    return updated
+
+
+@router.post("/{user_id}/activate", response_model=UserResponse)
+async def activate_user(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = _admin_or_superadmin,
+):
+    """Manually reactivate a user (ADR 0011 phase 4). Admin or superadmin.
+
+    Always clears deactivated_by_sync: this is the non-sync writer of
+    is_active, and admin intent outranks the directory.
+    """
+    target = await get_user_by_id(db, user_id)
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    updated = await set_user_active(db, user_id, True)
+    logger.info(
+        "User activated: %s by %s",
+        user_id,
+        current_user.username,
+        extra={"action": "user_activate", "user_id": str(user_id)},
+    )
+    return updated
+
+
+@router.post("/{user_id}/deactivate", response_model=UserResponse)
+async def deactivate_user(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = _admin_or_superadmin,
+):
+    """Manually deactivate a user (ADR 0011 phase 4). Admin or superadmin.
+
+    Always clears deactivated_by_sync: a manually deactivated user is
+    invisible to the sweep's automatic reactivation.
+    """
+    if user_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot deactivate your own account",
+        )
+
+    target = await get_user_by_id(db, user_id)
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    updated = await set_user_active(db, user_id, False)
+    logger.info(
+        "User deactivated: %s by %s",
+        user_id,
+        current_user.username,
+        extra={"action": "user_deactivate", "user_id": str(user_id)},
     )
     return updated

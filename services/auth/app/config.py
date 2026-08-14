@@ -41,6 +41,17 @@ class Settings(HerdBaseSettings):
     # consult them.
     ldap_group_member_attribute: str = "member"
     ldap_group_name_attribute: str = "cn"
+    # Deactivation sweep (ADR 0011 phase 4). Independent opt-in: enabling
+    # group mirroring above never opts a deployment into deactivation.
+    ldap_sync_deactivation_enabled: bool = False
+    # A complete filter expression (not a value) identifying disabled
+    # accounts, e.g. the AD userAccountControl lockout-bit filter. Empty
+    # means absence-only detection.
+    ldap_disabled_filter: str = ""
+    # Circuit breaker: the sweep aborts (deactivating no one) only when the
+    # proven-absent-or-disabled count STRICTLY exceeds BOTH terms.
+    ldap_sync_deactivation_max_percent: int = 20
+    ldap_sync_deactivation_min_count: int = 3
     ldap_use_tls: bool = True
     # Verify the directory server's TLS certificate. Defaults to True (the bind
     # transmits the service-account and every user's password, so an unvalidated

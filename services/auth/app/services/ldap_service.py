@@ -575,10 +575,124 @@ async def user_present_by_email(email: str) -> bool:
     """Email-keyed presence probe; errors raise (never absence).
 
     Resolved 2026-08-12: the deactivation sweep answers presence via ONE
-    paged enumeration under ldap_user_base_dn (phase 4 builds it), not
+    paged enumeration under ldap_user_base_dn (present_emails, below), not
     per-user calls to this probe. This function's remaining sweep role is
     the disabled-account check, which needs a variant that conjoins
-    ldap_disabled_filter into the search filter; phase 4 adds that
-    alongside, since this filter is presence-only.
+    ldap_disabled_filter into the search filter; disabled_emails is that
+    variant, built as a paged enumeration alongside it, since this filter is
+    presence-only.
     """
     return await anyio.to_thread.run_sync(_user_present_by_email_sync, email)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 phase 4: paged presence enumeration. present_emails/disabled_emails
+# replace a per-user presence probe for the deactivation sweep's main pass: a
+# single paged SUBTREE search under ldap_user_base_dn scales with directory
+# size instead of user count, and (the load-bearing rule) a failed or
+# truncated page raises LdapUnavailableError rather than returning whatever
+# was collected so far. A partial enumeration must never be read as a
+# complete one: the sweep would otherwise deactivate everyone the outage
+# happened to cut off before.
+# ---------------------------------------------------------------------------
+
+_PAGED_SEARCH_SIZE = 500
+_PAGED_COOKIE_OID = "1.2.840.113556.1.4.319"
+
+
+def _paged_user_emails_sync(search_filter: str, description: str) -> frozenset[str]:
+    """Paged SUBTREE enumeration under ldap_user_base_dn, collecting every
+    value of ldap_email_attribute (lowercased) across every matching entry
+    (an entry may be multi-valued; every value is included).
+
+    Loops the paged-results cookie, held on ONE connection for the whole
+    enumeration, until the directory reports it exhausted. A missing paging
+    control is treated as end-of-pages ONLY once this page's result has
+    already been proven success below; any other outcome (a failed search,
+    a non-success result code, an LDAP exception mid-page) raises
+    LdapUnavailableError instead of returning a partial set.
+    """
+    email_attr = settings.ldap_email_attribute
+    emails: set[str] = set()
+    with _service_connection(require_service_account=True) as conn:
+        cookie: bytes = b""
+        while True:
+            try:
+                # ldap3's boolean return is NOT a success signal: for a
+                # SUBTREE search it is True only when entries were found, so
+                # a legitimately successful page with zero matches (the last
+                # page, or a filter matching nothing) returns False. Proof
+                # of success is the result CODE (checked below), the same
+                # idiom _checked_search uses; the return value is ignored.
+                conn.search(
+                    search_base=settings.ldap_user_base_dn,
+                    search_filter=search_filter,
+                    search_scope=SUBTREE,
+                    attributes=[email_attr],
+                    paged_size=_PAGED_SEARCH_SIZE,
+                    paged_cookie=cookie or None,
+                )
+            except LDAPException as exc:
+                raise LdapUnavailableError(f"{description} failed: {exc}") from exc
+            result_code = (conn.result or {}).get("result")
+            if result_code != RESULT_SUCCESS:
+                raise LdapUnavailableError(f"{description} failed: {conn.result}")
+            for entry in conn.entries:
+                for value in _attr_values(entry, email_attr):
+                    emails.add(str(value).lower())
+            controls = (conn.result or {}).get("controls") or {}
+            page_control = controls.get(_PAGED_COOKIE_OID)
+            if not page_control:
+                # No paging control on an already-proven-successful page:
+                # the directory has nothing further to page through.
+                break
+            cookie = (page_control.get("value") or {}).get("cookie") or b""
+            if not cookie:
+                break
+    return frozenset(emails)
+
+
+def _present_emails_sync() -> frozenset[str]:
+    return _paged_user_emails_sync(
+        f"({settings.ldap_email_attribute}=*)", "present-emails enumeration"
+    )
+
+
+def _disabled_emails_sync() -> frozenset[str]:
+    return _paged_user_emails_sync(
+        f"(&({settings.ldap_email_attribute}=*){settings.ldap_disabled_filter})",
+        "disabled-emails enumeration",
+    )
+
+
+async def present_emails() -> frozenset[str]:
+    """Every email attribute value seen under ldap_user_base_dn, lowercased.
+
+    The deactivation sweep's absence proof: a candidate whose email is not
+    in this set (and was not group-presence-credited this run) is proven
+    absent. Raises LdapUnavailableError on any failure or truncated page;
+    never returns a partial enumeration.
+    """
+    return await anyio.to_thread.run_sync(_present_emails_sync)
+
+
+async def disabled_emails() -> frozenset[str]:
+    """Every email attribute value under ldap_user_base_dn matching the
+    ldap_disabled_filter setting, conjoined with the email-presence filter.
+
+    Only meaningful (and only ever called) when ldap_disabled_filter is
+    nonempty; raises ValueError otherwise (a caller bug, not a directory
+    outage). The setting is trusted admin configuration and is NOT escaped:
+    it is a filter expression, not a value. It is rejected early with
+    ValueError when it does not start with "(", to catch an obvious
+    misconfiguration (e.g. a bare attribute name) before it reaches the
+    directory as a malformed filter.
+    """
+    disabled_filter = settings.ldap_disabled_filter
+    if not disabled_filter:
+        raise ValueError("disabled_emails() called with ldap_disabled_filter unset")
+    if not disabled_filter.startswith("("):
+        raise ValueError(
+            "ldap_disabled_filter must be a complete filter expression starting with '('"
+        )
+    return await anyio.to_thread.run_sync(_disabled_emails_sync)

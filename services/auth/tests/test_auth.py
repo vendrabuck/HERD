@@ -660,3 +660,95 @@ async def test_refresh_with_already_used_token(client):
     # Second use of original token should fail
     retry_resp = await client.post("/refresh", json={"refresh_token": original_token})
     assert retry_resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 phase 4: manual admin activate/deactivate endpoints.
+# ---------------------------------------------------------------------------
+
+
+async def _register_and_get(client, email: str, username: str) -> dict:
+    await client.post(
+        "/register",
+        json={"email": email, "username": username, "password": "password123"},
+    )
+    users_resp = await client.get("/users")
+    return next(u for u in users_resp.json()["items"] if u["email"] == email)
+
+
+@pytest.mark.asyncio
+async def test_superadmin_can_deactivate_and_reactivate_user(superadmin_client):
+    target = await _register_and_get(superadmin_client, "flip@test.com", "flipuser")
+
+    deactivate_resp = await superadmin_client.post(f"/users/{target['id']}/deactivate")
+    assert deactivate_resp.status_code == 200
+    assert deactivate_resp.json()["is_active"] is False
+
+    activate_resp = await superadmin_client.post(f"/users/{target['id']}/activate")
+    assert activate_resp.status_code == 200
+    assert activate_resp.json()["is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_admin_can_deactivate_user(admin_client):
+    # admin-or-superadmin, not superadmin-only (unlike the role endpoint).
+    target = await _register_and_get(admin_client, "adminflip@test.com", "adminflipuser")
+    resp = await admin_client.post(f"/users/{target['id']}/deactivate")
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_deactivate_and_activate_clear_sync_provenance(superadmin_client):
+    target = await _register_and_get(superadmin_client, "prov@test.com", "provuser")
+
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uuid.UUID(target["id"]))
+        user.deactivated_by_sync = True
+        await session.commit()
+
+    resp = await superadmin_client.post(f"/users/{target['id']}/deactivate")
+    assert resp.status_code == 200
+
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uuid.UUID(target["id"]))
+        assert user.is_active is False
+        # Admin intent always outranks the directory: a manually
+        # deactivated user must be invisible to sync-side reactivation.
+        assert user.deactivated_by_sync is False
+
+    reactivate_resp = await superadmin_client.post(f"/users/{target['id']}/activate")
+    assert reactivate_resp.status_code == 200
+
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uuid.UUID(target["id"]))
+        assert user.is_active is True
+        assert user.deactivated_by_sync is False
+
+
+@pytest.mark.asyncio
+async def test_activate_nonexistent_user_404(superadmin_client):
+    resp = await superadmin_client.post(f"/users/{uuid.uuid4()}/activate")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_deactivate_nonexistent_user_404(superadmin_client):
+    resp = await superadmin_client.post(f"/users/{uuid.uuid4()}/deactivate")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cannot_deactivate_own_account(superadmin_client):
+    resp = await superadmin_client.post(f"/users/{_superadmin_id}/deactivate")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "Cannot deactivate your own account"
+
+
+@pytest.mark.asyncio
+async def test_regular_user_cannot_activate_or_deactivate(regular_client):
+    some_id = uuid.uuid4()
+    activate_resp = await regular_client.post(f"/users/{some_id}/activate")
+    assert activate_resp.status_code == 403
+    deactivate_resp = await regular_client.post(f"/users/{some_id}/deactivate")
+    assert deactivate_resp.status_code == 403
