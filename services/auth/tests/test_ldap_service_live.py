@@ -30,13 +30,16 @@ from __future__ import annotations
 
 import os
 import socket
+import uuid
 
 import pytest
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
+from app.models.group import GroupMember, UserGroup
+from app.models.ldap_group_mapping import LdapGroupMapping
 from app.models.user import User
-from app.services import auth_service, ldap_service
+from app.services import auth_service, ldap_service, ldap_sync_service
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -419,3 +422,188 @@ async def test_user_present_by_email_bad_base_dn_raises_not_absent(monkeypatch, 
     monkeypatch.setattr(settings, "ldap_user_base_dn", f"ou=nowhere,{BASE_DN}", raising=False)
     with pytest.raises(ldap_service.LdapUnavailableError):
         await ldap_service.user_present_by_email("user1@company.local")
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 phase 3: the reconciler (ldap_sync_service.run_sync) against the
+# REAL directory, not a faked one. The unit suite (test_ldap_sync_service.py)
+# pins the taxonomy against a fake client; what only a live run can prove is
+# that the real ldap_service.fetch_group/resolve_members answers plug into
+# that taxonomy correctly for the seeded groups (see the module docstring
+# above for the exact membership of herd-eng/qa/mixed/stale).
+# ---------------------------------------------------------------------------
+
+
+async def _mk_herd_group(db_session, name: str) -> uuid.UUID:
+    group = UserGroup(name=name)
+    db_session.add(group)
+    await db_session.commit()
+    return group.id
+
+
+async def _mk_mapping(
+    db_session, *, group_dn: str, herd_group_id: uuid.UUID, directory_name: str
+) -> LdapGroupMapping:
+    mapping = LdapGroupMapping(
+        group_dn=group_dn, directory_name=directory_name, herd_group_id=herd_group_id
+    )
+    db_session.add(mapping)
+    await db_session.commit()
+    return mapping
+
+
+async def _member_emails(db_session, group_id: uuid.UUID) -> set[str]:
+    rows = await db_session.execute(
+        select(User.email)
+        .join(GroupMember, GroupMember.user_id == User.id)
+        .where(GroupMember.group_id == group_id)
+    )
+    return set(rows.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_run_sync_herd_eng_builds_membership_from_live_directory(ldap_settings, db_session):
+    group_id = await _mk_herd_group(db_session, "Engineering")
+    await _mk_mapping(
+        db_session,
+        group_dn=f"cn=herd-eng,{GROUPS_DN}",
+        herd_group_id=group_id,
+        directory_name="herd-eng",
+    )
+
+    run = await ldap_sync_service.run_sync(db_session)
+
+    assert run.status == "success"
+    assert run.users_provisioned == 3
+    assert run.members_added == 3
+    assert run.members_removed == 0
+    assert run.members_skipped == 0
+
+    emails = await _member_emails(db_session, group_id)
+    assert emails == {f"user{n}@company.local" for n in (1, 2, 3)}
+
+    provisioned = (
+        (
+            await db_session.execute(
+                select(User).where(User.email.in_(f"user{n}@company.local" for n in (1, 2, 3)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(provisioned) == 3
+    for user in provisioned:
+        assert user.auth_source == "ldap"
+        assert user.hashed_password is None
+
+
+@pytest.mark.asyncio
+async def test_run_sync_second_run_is_idempotent(ldap_settings, db_session):
+    group_id = await _mk_herd_group(db_session, "Engineering")
+    await _mk_mapping(
+        db_session,
+        group_dn=f"cn=herd-eng,{GROUPS_DN}",
+        herd_group_id=group_id,
+        directory_name="herd-eng",
+    )
+
+    first = await ldap_sync_service.run_sync(db_session)
+    assert first.status == "success"
+    assert first.members_added == 3
+
+    second = await ldap_sync_service.run_sync(db_session)
+
+    assert second.status == "success"
+    assert second.users_provisioned == 0
+    assert second.members_added == 0
+    assert second.members_removed == 0
+    assert second.members_skipped == 0
+
+    emails = await _member_emails(db_session, group_id)
+    assert emails == {f"user{n}@company.local" for n in (1, 2, 3)}
+
+
+@pytest.mark.asyncio
+async def test_run_sync_herd_mixed_counts_exact_member_skips(ldap_settings, db_session):
+    group_id = await _mk_herd_group(db_session, "Mixed")
+    await _mk_mapping(
+        db_session,
+        group_dn=f"cn=herd-mixed,{GROUPS_DN}",
+        herd_group_id=group_id,
+        directory_name="herd-mixed",
+    )
+
+    run = await ldap_sync_service.run_sync(db_session)
+
+    assert run.status == "partial"
+    assert run.members_skipped == 2
+    assert run.users_provisioned == 1
+    assert run.members_added == 1
+
+    skip_reasons = {r["reason"] for r in run.detail.get("skipped_members", [])}
+    assert skip_reasons == {
+        ldap_service.MEMBER_SKIP_MISSING_EMAIL,
+        ldap_service.MEMBER_SKIP_MISSING_USERNAME,
+    }
+
+    emails = await _member_emails(db_session, group_id)
+    assert emails == {"user6@company.local"}
+
+
+@pytest.mark.asyncio
+async def test_run_sync_herd_stale_ghost_member_skipped_not_found(ldap_settings, db_session):
+    group_id = await _mk_herd_group(db_session, "Stale")
+    await _mk_mapping(
+        db_session,
+        group_dn=f"cn=herd-stale,{GROUPS_DN}",
+        herd_group_id=group_id,
+        directory_name="herd-stale",
+    )
+
+    run = await ldap_sync_service.run_sync(db_session)
+
+    assert run.status == "partial"
+    assert run.members_skipped == 1
+    assert run.users_provisioned == 1
+    assert run.members_added == 1
+
+    skipped = run.detail.get("skipped_members", [])
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == ldap_service.MEMBER_SKIP_NOT_FOUND
+
+    emails = await _member_emails(db_session, group_id)
+    assert emails == {"user6@company.local"}
+
+
+@pytest.mark.asyncio
+async def test_run_sync_dangling_mapping_applies_nothing(ldap_settings, db_session):
+    # A pre-existing member must survive untouched: a dangling group DN is
+    # unknowable membership, never an empty one, so the reconciler must
+    # never drive a removal against it.
+    group_id = await _mk_herd_group(db_session, "Ghosts")
+    survivor_user = await auth_service.create_ldap_user(db_session, "user5@company.local", "user5")
+    db_session.add(GroupMember(group_id=group_id, user_id=survivor_user.id))
+    await db_session.commit()
+
+    await _mk_mapping(
+        db_session,
+        group_dn=f"cn=renamed-away,{GROUPS_DN}",
+        herd_group_id=group_id,
+        directory_name="renamed-away",
+    )
+
+    run = await ldap_sync_service.run_sync(db_session)
+
+    assert run.status == "partial"
+    assert run.users_provisioned == 0
+    assert run.members_added == 0
+    assert run.members_removed == 0
+    assert run.members_skipped == 0
+
+    skipped_groups = run.detail.get("skipped_groups", [])
+    assert len(skipped_groups) == 1
+    assert skipped_groups[0]["reason"] == ldap_sync_service.GROUP_SKIP_DANGLING_DN
+    assert skipped_groups[0]["group_dn"] == f"cn=renamed-away,{GROUPS_DN}"
+
+    emails = await _member_emails(db_session, group_id)
+    assert emails == {"user5@company.local"}

@@ -1,0 +1,803 @@
+"""Unit tests for the directory group reconciler (ADR 0011 phase 3).
+
+The directory client is faked at the ldap_service module boundary; what is
+pinned here is the reconciler's asymmetric fail-closed taxonomy. Transport
+errors (LdapUnavailableError) skip the WHOLE group with zero changes and
+mark the run partial; directory answers (dangling DN, member skip_reasons)
+skip only what was answered about; per-op apply failures are isolated per
+operation. These are three distinct policies, not one, and the tests treat
+each distinction as load-bearing. SQLite enforces the real unique
+constraints on users.email and users.username, so the collision paths run
+against genuine IntegrityErrors rather than mocks.
+"""
+
+import uuid
+
+import pytest
+from app.database import Base
+from app.models.group import GroupMember, UserGroup
+from app.models.ldap_group_mapping import LdapGroupMapping
+from app.models.ldap_sync_run import LdapSyncRun
+from app.models.user import User
+from app.services import auth_service, group_service, ldap_service, ldap_sync_service
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+
+engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+_PEOPLE = "ou=people,dc=company,dc=local"
+_GROUP_DN = "cn=herd-eng,ou=groups,dc=company,dc=local"
+
+
+@pytest.fixture(autouse=True)
+async def setup_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.fixture
+async def db():
+    async with TestSessionLocal() as session:
+        yield session
+
+
+def _dn(n: int) -> str:
+    return f"uid=user{n},{_PEOPLE}"
+
+
+def _identity(n: int) -> ldap_service.LdapIdentity:
+    return ldap_service.LdapIdentity(username=f"user{n}", email=f"user{n}@company.local", dn=_dn(n))
+
+
+def _resolved(n: int) -> ldap_service.LdapMemberResolution:
+    return ldap_service.LdapMemberResolution(_identity(n))
+
+
+def _skipped(reason: str) -> ldap_service.LdapMemberResolution:
+    return ldap_service.LdapMemberResolution(None, reason)
+
+
+def _entry(member_dns, dn=_GROUP_DN, name="herd-eng") -> ldap_service.LdapGroupEntry:
+    return ldap_service.LdapGroupEntry(dn=dn, name=name, member_dns=tuple(member_dns))
+
+
+def _install_directory(monkeypatch, groups: dict, resolutions: dict) -> None:
+    """Fake the directory: groups maps dn to entry | None | Exception;
+    resolutions maps member dn to a resolution | Exception. An Exception in
+    the middle of a batch raises mid-batch, exactly like resolve_members."""
+
+    async def fake_fetch_group(group_dn: str):
+        value = groups[group_dn]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    async def fake_resolve_members(member_dns):
+        out = []
+        for member_dn in member_dns:
+            value = resolutions[member_dn]
+            if isinstance(value, Exception):
+                raise value
+            out.append(value)
+        return out
+
+    monkeypatch.setattr(ldap_service, "fetch_group", fake_fetch_group)
+    monkeypatch.setattr(ldap_service, "resolve_members", fake_resolve_members)
+
+
+async def _mk_group(db, name="Engineering") -> uuid.UUID:
+    group = UserGroup(name=name)
+    db.add(group)
+    await db.commit()
+    return group.id
+
+
+async def _mk_mapping(db, herd_group_id, group_dn=_GROUP_DN, name="herd-eng") -> uuid.UUID:
+    mapping = LdapGroupMapping(group_dn=group_dn, directory_name=name, herd_group_id=herd_group_id)
+    db.add(mapping)
+    await db.commit()
+    return mapping.id
+
+
+async def _mk_user(db, n=None, *, email=None, username=None, auth_source="ldap") -> uuid.UUID:
+    user = User(
+        email=email or f"user{n}@company.local",
+        username=username or f"user{n}",
+        hashed_password=None if auth_source == "ldap" else "fake",
+        auth_source=auth_source,
+    )
+    db.add(user)
+    await db.commit()
+    return user.id
+
+
+async def _put_in_group(db, group_id, user_id) -> None:
+    db.add(GroupMember(group_id=group_id, user_id=user_id))
+    await db.commit()
+
+
+async def _member_ids(db, group_id) -> set:
+    rows = await db.execute(select(GroupMember.user_id).where(GroupMember.group_id == group_id))
+    return set(rows.scalars().all())
+
+
+def _skip_reasons(run) -> set:
+    return {r["reason"] for r in run.detail.get("skipped_members", []) if "reason" in r}
+
+
+# ---------------------------------------------------------------------------
+# Model defaults (S4: moved here from the deleted test_ldap_sync_run_model.py
+# so the run-lifecycle model and the reconciler that populates it are pinned
+# in one file, against one set of fixtures).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_insert_run_applies_server_defaults(db):
+    run_id = uuid.uuid4()
+    run = LdapSyncRun(id=run_id, trigger="manual", status="running")
+    db.add(run)
+    await db.commit()
+
+    assert run.id == run_id
+    assert run.trigger == "manual"
+    assert run.status == "running"
+    assert run.started_at is not None
+    assert run.finished_at is None
+    assert run.users_provisioned == 0
+    assert run.members_added == 0
+    assert run.members_removed == 0
+    assert run.members_skipped == 0
+    assert run.detail == {}
+    assert run.error is None
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed group skips: each applies ZERO changes and marks the run partial.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_error_skips_whole_group_with_zero_changes(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    stale = await _mk_user(db, 1)
+    await _put_in_group(db, group_id, stale)
+    _install_directory(monkeypatch, {_GROUP_DN: ldap_service.LdapUnavailableError("down")}, {})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert (run.members_added, run.members_removed, run.users_provisioned) == (0, 0, 0)
+    # The stale member would have been removed by an applied reconcile; an
+    # unreachable directory must never strip membership.
+    assert await _member_ids(db, group_id) == {stale}
+    assert run.detail["skipped_groups"] == [
+        {
+            "group_dn": _GROUP_DN,
+            "reason": ldap_sync_service.GROUP_SKIP_DIRECTORY_UNAVAILABLE,
+            "error": "down",
+        }
+    ]
+    assert run.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_dangling_dn_skips_whole_group_with_zero_changes(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    stale = await _mk_user(db, 1)
+    await _put_in_group(db, group_id, stale)
+    _install_directory(monkeypatch, {_GROUP_DN: None}, {})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert (run.members_added, run.members_removed, run.users_provisioned) == (0, 0, 0)
+    assert await _member_ids(db, group_id) == {stale}
+    assert run.detail["skipped_groups"][0]["reason"] == ldap_sync_service.GROUP_SKIP_DANGLING_DN
+
+
+@pytest.mark.asyncio
+async def test_member_resolution_error_skips_whole_group(db, monkeypatch):
+    # One member resolves fine before the batch errors; the half-resolved
+    # desired set must be discarded whole, not applied partially.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    stale = await _mk_user(db, 9)
+    await _put_in_group(db, group_id, stale)
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry([_dn(1), _dn(2)])},
+        {_dn(1): _resolved(1), _dn(2): ldap_service.LdapUnavailableError("timeout")},
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert (run.members_added, run.members_removed, run.users_provisioned) == (0, 0, 0)
+    assert await _member_ids(db, group_id) == {stale}
+    assert (
+        run.detail["skipped_groups"][0]["reason"]
+        == ldap_sync_service.GROUP_SKIP_MEMBER_RESOLUTION_UNAVAILABLE
+    )
+
+
+# ---------------------------------------------------------------------------
+# Set-difference reconcile and pre-provisioning.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_difference_applies_exact_diff_through_group_service(db, monkeypatch):
+    group_id = await _mk_group(db)
+    not_grouped_id = await _mk_group(db, name="Not Grouped")
+    mapping_id = await _mk_mapping(db, group_id, name="stale-cached-name")
+    stale = await _mk_user(db, 1)
+    await _put_in_group(db, group_id, stale)
+    existing = await _mk_user(db, 2)
+    await _put_in_group(db, not_grouped_id, existing)
+    # Desired: user2 (exists, not yet a member) and user3 (no HERD row).
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry([_dn(2), _dn(3)], name="herd-eng")},
+        {_dn(2): _resolved(2), _dn(3): _resolved(3)},
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "success"
+    assert run.members_added == 2
+    assert run.members_removed == 1
+    assert run.users_provisioned == 1
+    provisioned = await auth_service.get_user_by_email(db, "user3@company.local")
+    assert provisioned is not None
+    assert await _member_ids(db, group_id) == {existing, provisioned.id}
+    # Applied through group_service.add_member: the "Not Grouped" auto-remove
+    # is the observable proof.
+    assert await _member_ids(db, not_grouped_id) == set()
+    # directory_name display cache refreshed on the successful fetch.
+    name = (
+        await db.execute(
+            select(LdapGroupMapping.directory_name).where(LdapGroupMapping.id == mapping_id)
+        )
+    ).scalar_one()
+    assert name == "herd-eng"
+
+
+@pytest.mark.asyncio
+async def test_preprovision_creates_ldap_user_without_password(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "success"
+    assert run.users_provisioned == 1
+    user = await auth_service.get_user_by_email(db, "user1@company.local")
+    assert user is not None
+    assert user.auth_source == "ldap"
+    assert user.hashed_password is None
+    assert user.username == "user1"
+    assert await _member_ids(db, group_id) == {user.id}
+
+
+@pytest.mark.asyncio
+async def test_member_skip_reasons_counted_without_failing_group(db, monkeypatch):
+    # Skips are answers the directory gave; the group still reconciles the
+    # members it did resolve (unlike transport errors, which skip the group).
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry([_dn(1), "uid=gone," + _PEOPLE, "uid=noemail," + _PEOPLE])},
+        {
+            _dn(1): _resolved(1),
+            "uid=gone," + _PEOPLE: _skipped(ldap_service.MEMBER_SKIP_NOT_FOUND),
+            "uid=noemail," + _PEOPLE: _skipped(ldap_service.MEMBER_SKIP_MISSING_EMAIL),
+        },
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_skipped == 2
+    assert run.members_added == 1
+    assert _skip_reasons(run) == {
+        ldap_service.MEMBER_SKIP_NOT_FOUND,
+        ldap_service.MEMBER_SKIP_MISSING_EMAIL,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Provisioning collision categories (three, distinct).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collision_username_taken_skips_member(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    # A local account owns the username but a different email: the insert
+    # hits the real unique constraint and the retry lookup finds nothing.
+    await _mk_user(db, email="other@company.local", username="user1", auth_source="local")
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.users_provisioned == 0
+    assert run.members_skipped == 1
+    assert _skip_reasons(run) == {ldap_sync_service.MEMBER_SKIP_USERNAME_TAKEN}
+    assert await auth_service.get_user_by_email(db, "user1@company.local") is None
+    assert await _member_ids(db, group_id) == set()
+
+
+@pytest.mark.asyncio
+async def test_collision_email_owned_by_local_account_skips_member(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    local = await _mk_user(db, email="user1@company.local", username="someone", auth_source="local")
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_skipped == 1
+    assert _skip_reasons(run) == {ldap_sync_service.MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT}
+    assert await _member_ids(db, group_id) == set()
+    # The local identity is never touched: no membership, no drift repair.
+    username = (await db.execute(select(User.username).where(User.id == local))).scalar_one()
+    assert username == "someone"
+
+
+@pytest.mark.asyncio
+async def test_provision_race_recovered_via_lookup_retry(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    real_create = auth_service.create_ldap_user
+
+    async def racing_create(session, email, username):
+        # A concurrent JIT login wins the insert; ours then raises. The
+        # retry-as-lookup must find the row and proceed.
+        await real_create(session, email, username)
+        raise IntegrityError("duplicate email", params=None, orig=Exception("race"))
+
+    monkeypatch.setattr(auth_service, "create_ldap_user", racing_create)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    # A recovered race is not a skip: the member proceeded, so the run is
+    # a success, and nothing was provisioned by THIS run.
+    assert run.status == "success"
+    assert run.users_provisioned == 0
+    assert run.members_skipped == 0
+    assert run.detail["provision_races"] == [
+        {
+            "group_dn": _GROUP_DN,
+            "email": "user1@company.local",
+            "reason": ldap_sync_service.PROVISION_RACE_RECOVERED,
+        }
+    ]
+    user = await auth_service.get_user_by_email(db, "user1@company.local")
+    assert await _member_ids(db, group_id) == {user.id}
+
+
+@pytest.mark.asyncio
+async def test_not_grouped_assignment_failure_rolls_back_and_run_continues(db, monkeypatch):
+    # C7: create_ldap_user's "Not Grouped" auto-assign
+    # (auth_service._auto_assign_not_grouped) can itself raise a genuine
+    # commit-time IntegrityError. Without a rollback there, the session is
+    # left pending-rollback and the NEXT statement in this long-lived run
+    # (the current_ids SELECT, or the target group's own add) raises
+    # PendingRollbackError, failing the whole run instead of just this one
+    # auto-assign. The row is inserted TWICE in one commit to force a
+    # genuine composite-PK IntegrityError, not a bare raise, so this pins
+    # the real recovery path.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    await _mk_group(db, name="Not Grouped")
+    real_add_member = group_service.add_member
+    calls = {"n": 0}
+
+    async def flaky_add_member(session, group_id_, user_id_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            session.add(GroupMember(group_id=group_id_, user_id=user_id_))
+            session.add(GroupMember(group_id=group_id_, user_id=user_id_))
+            return await session.commit()
+        return await real_add_member(session, group_id_, user_id_)
+
+    monkeypatch.setattr(group_service, "add_member", flaky_add_member)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "success"
+    assert run.users_provisioned == 1
+    assert run.members_added == 1
+    provisioned = await auth_service.get_user_by_email(db, "user1@company.local")
+    assert provisioned is not None
+    assert await _member_ids(db, group_id) == {provisioned.id}
+    # The session stayed usable past the failure: a follow-up write on it
+    # succeeds rather than raising PendingRollbackError.
+    another = await _mk_user(db, 2)
+    assert another is not None
+
+
+# ---------------------------------------------------------------------------
+# Username drift repair.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_username_drift_repaired(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    drifted = await _mk_user(db, email="user1@company.local", username="old-name")
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "success"
+    username = (await db.execute(select(User.username).where(User.id == drifted))).scalar_one()
+    assert username == "user1"
+    assert await _member_ids(db, group_id) == {drifted}
+
+
+@pytest.mark.asyncio
+async def test_username_drift_collision_skips_repair_not_membership(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    drifted = await _mk_user(db, email="user1@company.local", username="old-name")
+    await _mk_user(db, email="squatter@company.local", username="user1", auth_source="local")
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    # C6: a drift collision degrades the run (via its own detail category)
+    # but must NOT double-count as a member skip; the member still
+    # reconciles into the group, so counting it as skipped too would make
+    # the run's counters lie about what happened to this one person.
+    assert run.status == "partial"
+    assert run.members_skipped == 0
+    assert run.detail["drift_collisions"] == [
+        {
+            "group_dn": _GROUP_DN,
+            "member_dn": _dn(1),
+            "reason": ldap_sync_service.MEMBER_SKIP_USERNAME_DRIFT_COLLISION,
+        }
+    ]
+    # Only the repair is skipped: the member is still a proven directory
+    # answer, so membership still reconciles.
+    assert await _member_ids(db, group_id) == {drifted}
+    username = (await db.execute(select(User.username).where(User.id == drifted))).scalar_one()
+    assert username == "old-name"
+
+
+# ---------------------------------------------------------------------------
+# C4: removal suppression on an unresolvable-but-existing member. A member
+# the directory still lists but cannot identify (missing_email or
+# missing_username) makes the group's whole removal set unprovable, since
+# that unresolvable entry could be any current row. A proven not_found skip
+# carries no such ambiguity and never blocks removals.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_email_skip_suppresses_group_removals(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    existing = await _mk_user(db, 1)
+    await _put_in_group(db, group_id, existing)
+    # The directory still lists this exact member, but an attribute-level
+    # gap (e.g. an ACL change hiding mail) makes them unresolvable this
+    # pass; without suppression this existing member would be stripped.
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry([_dn(1)])},
+        {_dn(1): _skipped(ldap_service.MEMBER_SKIP_MISSING_EMAIL)},
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_removed == 0
+    assert await _member_ids(db, group_id) == {existing}
+    assert run.detail["suppressed_removals"] == [
+        {"group_dn": _GROUP_DN, "unresolved": 1, "would_remove": 1}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_not_found_skip_does_not_suppress_removal(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    stale = await _mk_user(db, 1)
+    await _put_in_group(db, group_id, stale)
+    # A DIFFERENT, unrelated DN resolves not_found: a proven-absent entry
+    # shields nobody, so the stale member's removal still proceeds.
+    gone_dn = "uid=gone," + _PEOPLE
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry([gone_dn])},
+        {gone_dn: _skipped(ldap_service.MEMBER_SKIP_NOT_FOUND)},
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_removed == 1
+    assert await _member_ids(db, group_id) == set()
+    assert "suppressed_removals" not in run.detail
+
+
+# ---------------------------------------------------------------------------
+# Local accounts and inactive users are invisible in both directions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_local_group_member_never_removed(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    local = await _mk_user(db, email="admin@company.local", username="admin", auth_source="local")
+    await _put_in_group(db, group_id, local)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "success"
+    assert run.members_removed == 0
+    ldap_user = await auth_service.get_user_by_email(db, "user1@company.local")
+    assert await _member_ids(db, group_id) == {local, ldap_user.id}
+
+
+@pytest.mark.asyncio
+async def test_inactive_ldap_member_survives_and_is_not_readded(db, monkeypatch):
+    # C5, direction 1: an existing member deactivated by an admin must not
+    # have their membership stripped by sync, even though they are still
+    # listed in the directory group.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    inactive = await _mk_user(db, 1)
+    user = await db.get(User, inactive)
+    user.is_active = False
+    await db.commit()
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_removed == 0
+    assert run.members_added == 0
+    assert _skip_reasons(run) == {ldap_sync_service.MEMBER_SKIP_USER_INACTIVE}
+    assert await _member_ids(db, group_id) == set()
+
+
+@pytest.mark.asyncio
+async def test_inactive_ldap_member_already_grouped_is_untouched(db, monkeypatch):
+    # C5, direction 1b: same as above but the inactive user is ALREADY a
+    # group member; current_ids must exclude them too, so the diff never
+    # even considers removing (or re-adding) them.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    inactive = await _mk_user(db, 1)
+    await _put_in_group(db, group_id, inactive)
+    user = await db.get(User, inactive)
+    user.is_active = False
+    await db.commit()
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_removed == 0
+    assert run.members_added == 0
+    assert await _member_ids(db, group_id) == {inactive}
+
+
+@pytest.mark.asyncio
+async def test_inactive_ldap_user_is_not_added(db, monkeypatch):
+    # C5, direction 2: an inactive user not yet a group member must never
+    # be added by sync, even though the directory lists them.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    inactive = await _mk_user(db, 1)
+    user = await db.get(User, inactive)
+    user.is_active = False
+    await db.commit()
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_added == 0
+    assert _skip_reasons(run) == {ldap_sync_service.MEMBER_SKIP_USER_INACTIVE}
+    assert await _member_ids(db, group_id) == set()
+
+
+# ---------------------------------------------------------------------------
+# Per-op apply fault isolation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_integrity_error_with_existing_row_is_benign_noop(db, monkeypatch):
+    # C3: a real concurrent duplicate. The mocked add_member models the
+    # race directly: a concurrent admin's insert lands FIRST (so the row
+    # genuinely exists by the time our except runs), then our own call
+    # raises exactly like a real racing insert would.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    await _mk_user(db, 1)
+
+    async def racing_add(session, group_id_, user_id_):
+        session.add(GroupMember(group_id=group_id_, user_id=user_id_))
+        await session.commit()
+        raise IntegrityError("Duplicate membership", params=None, orig=None)
+
+    monkeypatch.setattr(group_service, "add_member", racing_add)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    # A concurrent admin already added the row: not an add, not a failure.
+    assert run.status == "success"
+    assert run.members_added == 0
+    assert "op_failures" not in run.detail
+
+
+@pytest.mark.asyncio
+async def test_add_integrity_error_without_row_is_op_failure(db, monkeypatch):
+    # C3: an IntegrityError is not ALWAYS the benign concurrent duplicate.
+    # A commit-time FK violation (user or group deleted mid-run) raises
+    # IntegrityError too; here the row never lands, so it must degrade the
+    # run rather than being silently swallowed as a no-op.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    await _mk_user(db, 1)
+
+    async def phantom_add(session, group_id_, user_id_):
+        raise IntegrityError("Duplicate membership", params=None, orig=None)
+
+    monkeypatch.setattr(group_service, "add_member", phantom_add)
+    _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_added == 0
+    op_failures = run.detail["op_failures"]
+    assert len(op_failures) == 1
+    assert op_failures[0]["op"] == "add"
+    assert await _member_ids(db, group_id) == set()
+
+
+@pytest.mark.asyncio
+async def test_other_op_failure_is_isolated_and_loop_continues(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    bad = await _mk_user(db, 1)
+    good = await _mk_user(db, 2)
+    real_add = group_service.add_member
+
+    async def flaky_add(session, group_id_, user_id_):
+        if user_id_ == bad:
+            raise RuntimeError("db hiccup")
+        return await real_add(session, group_id_, user_id_)
+
+    monkeypatch.setattr(group_service, "add_member", flaky_add)
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry([_dn(1), _dn(2)])},
+        {_dn(1): _resolved(1), _dn(2): _resolved(2)},
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "partial"
+    assert run.members_added == 1
+    assert await _member_ids(db, group_id) == {good}
+    assert run.detail["op_failures"] == [
+        {"group_dn": _GROUP_DN, "op": "add", "user_id": str(bad), "error": "db hiccup"}
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Idempotency and run lifecycle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_second_run_against_unchanged_directory_is_noop(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    await _mk_user(db, 2)
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry([_dn(1), _dn(2)])},
+        {_dn(1): _resolved(1), _dn(2): _resolved(2)},
+    )
+
+    first = await ldap_sync_service.run_sync(db)
+    assert (first.users_provisioned, first.members_added) == (1, 2)
+
+    second = await ldap_sync_service.run_sync(db)
+    assert second.status == "success"
+    assert (second.users_provisioned, second.members_added, second.members_removed) == (0, 0, 0)
+    assert second.members_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_running_row_is_committed_before_directory_work(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    observed = {}
+
+    async def probing_fetch(group_dn):
+        # By the time the directory is first asked, the run row must already
+        # be committed with status "running" (the crash-corpse guarantee).
+        observed["status"] = (await db.execute(select(LdapSyncRun.status))).scalar_one()
+        raise ldap_service.LdapUnavailableError("down")
+
+    monkeypatch.setattr(ldap_service, "fetch_group", probing_fetch)
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert observed["status"] == "running"
+    assert run.status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_machinery_exception_yields_failed_run_with_error(db, monkeypatch):
+    # A non-LdapUnavailableError out of the directory client is machinery
+    # failure, not a directory answer: the run finalizes as "failed" with
+    # the error recorded, and run_sync re-raises nothing.
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    _install_directory(
+        monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): RuntimeError("client bug")}
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    assert run.status == "failed"
+    assert run.error == "client bug"
+    assert run.finished_at is not None
+    persisted = (
+        await db.execute(select(LdapSyncRun.status).where(LdapSyncRun.id == run.id))
+    ).scalar_one()
+    assert persisted == "failed"
+
+
+@pytest.mark.asyncio
+async def test_detail_categories_cap_with_truncation_marker(db, monkeypatch):
+    group_id = await _mk_group(db)
+    await _mk_mapping(db, group_id)
+    cap = ldap_sync_service.DETAIL_CAP
+    total = cap + 5
+    dns = [f"uid=gone{i},{_PEOPLE}" for i in range(total)]
+    _install_directory(
+        monkeypatch,
+        {_GROUP_DN: _entry(dns)},
+        {dn: _skipped(ldap_service.MEMBER_SKIP_NOT_FOUND) for dn in dns},
+    )
+
+    run = await ldap_sync_service.run_sync(db)
+
+    # The counter is exact; the detail list is capped with a marker.
+    assert run.members_skipped == total
+    skipped = run.detail["skipped_members"]
+    assert len(skipped) == cap + 1
+    assert skipped[-1] == {"truncated": 5}
+    assert all("reason" in record for record in skipped[:-1])

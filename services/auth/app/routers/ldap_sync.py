@@ -26,15 +26,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import require_role
-from app.models.ldap_group_mapping import LdapGroupMapping
+from app.models.ldap_group_mapping import DIRECTORY_NAME_MAX, LdapGroupMapping
+from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import Role, User
 from app.schemas.ldap_sync import (
     MappingCreateRequest,
     MappingCreateResponse,
     MappingResponse,
     PaginatedMappingResponse,
+    PaginatedSyncRunResponse,
+    SyncRunResponse,
+    SyncRunStartResponse,
 )
-from app.services import ldap_service
+from app.services import ldap_service, ldap_sync_service
 from app.services.group_service import get_group_by_id
 
 logger = logging.getLogger(__name__)
@@ -50,9 +54,6 @@ NO_MEMBERS_WARNING = (
 )
 _DUPLICATE_DN_DETAIL = "A mapping for this group_dn already exists"
 _GROUP_ALREADY_MAPPED_DETAIL = "This HERD group already has a directory mapping"
-
-# directory_name is a display cache; the column caps it at 255.
-_DIRECTORY_NAME_MAX = 255
 
 
 async def _conflicting_mapping_detail(db: AsyncSession, group_dn: str, herd_group_id) -> str | None:
@@ -115,7 +116,7 @@ async def create_mapping(
         # let case variants of one directory group slip past the unique
         # constraint and map it twice.
         group_dn=entry.dn,
-        directory_name=entry.name[:_DIRECTORY_NAME_MAX],
+        directory_name=entry.name[:DIRECTORY_NAME_MAX],
         herd_group_id=body.herd_group_id,
         created_by=current_user.id,
     )
@@ -207,3 +208,84 @@ async def delete_mapping(
         extra={"action": "ldap_mapping_delete", "mapping_id": str(mapping_id)},
     )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Sync-now (ADR 0011 phase 3). Run serialization itself (the in-process
+# asyncio.Lock plus the Postgres advisory-lock cross-replica layer) lives in
+# ldap_sync_service (S1): it is a run invariant, not an HTTP concern, and a
+# future scheduled trigger (phase 5) needs it without a second lock. This
+# router only maps ldap_sync_service.SyncBusyError to the two existing 409s.
+# ---------------------------------------------------------------------------
+
+_RUN_IN_PROGRESS_DETAIL = "A sync run is already in progress"
+_RUN_IN_PROGRESS_REPLICA_DETAIL = "A sync run is already in progress on another replica"
+
+
+@router.post("/run", response_model=SyncRunStartResponse, status_code=status.HTTP_202_ACCEPTED)
+async def start_sync_run(
+    current_user: User = _admin_or_superadmin,
+):
+    if settings.auth_method != "ldap":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Directory sync requires auth_method=ldap",
+        )
+    try:
+        run_id = await ldap_sync_service.start_background_run(trigger="manual")
+    except ldap_sync_service.SyncBusyError as exc:
+        detail = (
+            _RUN_IN_PROGRESS_DETAIL
+            if exc.reason == "in_process"
+            else _RUN_IN_PROGRESS_REPLICA_DETAIL
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+    logger.info(
+        "LDAP sync run accepted: %s by %s",
+        run_id,
+        current_user.username,
+        extra={"action": "ldap_sync_run_accepted", "run_id": str(run_id)},
+    )
+    return SyncRunStartResponse(run_id=run_id)
+
+
+@router.get("/runs", response_model=PaginatedSyncRunResponse)
+async def list_sync_runs(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    _: User = _admin_or_superadmin,
+):
+    total = (await db.execute(select(func.count()).select_from(LdapSyncRun))).scalar_one()
+    rows = (
+        (
+            await db.execute(
+                select(LdapSyncRun)
+                # Newest first; id tiebreaker keeps equal timestamps from
+                # making skip/limit pages nondeterministic.
+                .order_by(LdapSyncRun.started_at.desc(), LdapSyncRun.id.desc())
+                .offset(skip)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return PaginatedSyncRunResponse(
+        items=[SyncRunResponse.model_validate(r) for r in rows],
+        total=total,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/runs/{run_id}", response_model=SyncRunResponse)
+async def get_sync_run(
+    run_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = _admin_or_superadmin,
+):
+    run = await db.get(LdapSyncRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync run not found")
+    return SyncRunResponse.model_validate(run)

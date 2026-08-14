@@ -60,6 +60,10 @@ async def superadmin_exists(db: AsyncSession) -> bool:
 
 
 async def _auto_assign_not_grouped(db: AsyncSession, user: User) -> None:
+    # Captured before anything below can fail: a failed FLUSH (not just an
+    # explicit rollback) already expires every instance the session tracks,
+    # so username must be read now, before the try, or not safely at all.
+    username = user.username
     try:
         from app.services.group_service import add_member, get_group_by_name
 
@@ -67,7 +71,28 @@ async def _auto_assign_not_grouped(db: AsyncSession, user: User) -> None:
         if not_grouped:
             await add_member(db, not_grouped.id, user.id)
     except Exception:
-        logger.debug("Could not auto-assign user %s to 'Not Grouped'", user.username)
+        # C7: a failed add here (e.g. a real commit-time IntegrityError, not
+        # just a bare raise) leaves the session in SQLAlchemy's pending-
+        # rollback state. Left uncleared, the NEXT operation on this session
+        # raises PendingRollbackError instead of the caller's own error, and
+        # in a long-lived session (the sync reconciler's, see
+        # ldap_sync_service._ensure_ldap_user) that aborts the ENTIRE run
+        # over one Not-Grouped assignment. The rollback is correct here for
+        # the login/register path too, so it is unconditional, not gated by
+        # caller.
+        await db.rollback()
+        # Rollback expires every instance the session tracks, not just the
+        # ones touched by the failed add: it is a session-wide invalidation,
+        # not a targeted one. create_user/create_ldap_user already refresh
+        # user once before calling this function and hand it back to a
+        # caller that expects it loaded (e.g. building a login response
+        # immediately); refreshing again here restores that precondition
+        # instead of leaving an expired instance as a landmine for whichever
+        # caller touches it next (a bare attribute read on an expired async
+        # ORM instance outside an awaited call raises MissingGreenlet, not a
+        # clean reload).
+        await db.refresh(user)
+        logger.debug("Could not auto-assign user %s to 'Not Grouped'", username)
 
 
 async def create_user(
@@ -201,6 +226,17 @@ async def _authenticate_ldap(db: AsyncSession, email: str, password: str) -> Use
     # Clients still submit `email` in the login payload. For LDAP we treat it as
     # the short-form username (sAMAccountName) that gets injected into the
     # configured search filter.
+    #
+    # Cross-reference (S5): ldap_sync_service._ensure_ldap_user resolves the
+    # same identity shape during the reconciler's sync pass, but repairs
+    # username drift and retries a provisioning race as a lookup. This
+    # function deliberately does neither below: a username collision and a
+    # provisioning race are both refused outright. That divergence is
+    # DESIGNED, not a gap: login is a narrow, latency-sensitive path that
+    # must fail closed rather than silently mutate an account mid-
+    # authentication, while sync runs a long-lived pass whose job is to
+    # repair drift and recover races proactively. Do not "fix" one to match
+    # the other.
     identity = await ldap_service.bind_user(email, password)
     if identity is None:
         logger.warning(

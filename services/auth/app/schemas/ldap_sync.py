@@ -33,3 +33,30 @@ class PaginatedMappingResponse(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class SyncRunResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    started_at: datetime
+    finished_at: datetime | None
+    trigger: str
+    status: str
+    users_provisioned: int
+    members_added: int
+    members_removed: int
+    members_skipped: int
+    detail: dict
+    error: str | None
+
+
+class PaginatedSyncRunResponse(BaseModel):
+    items: list[SyncRunResponse]
+    total: int
+    skip: int
+    limit: int
+
+
+class SyncRunStartResponse(BaseModel):
+    run_id: uuid.UUID
