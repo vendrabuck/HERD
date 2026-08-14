@@ -528,25 +528,70 @@ async def _run_deactivation_sweep(
         tally.sweep_note(
             SWEEP_REASON_BREAKER_TRIPPED, count=count, swept=swept, percent=percent_display
         )
-    else:
-        for user in to_deactivate:
-            user.is_active = False
-            user.deactivated_by_sync = True
-            tally.record_deactivated(user.id, user.email)
+    # Both directions apply as GUARDED updates (the #412 discipline): the
+    # WHERE clause re-checks the gate at write time, so a concurrent admin
+    # activate/deactivate on another replica (which the run advisory lock
+    # does not cover) wins instead of being clobbered by this sweep's stale
+    # in-memory snapshot. In particular a reactivation re-checks the
+    # deactivated_by_sync provenance IN the update, making admin-outranks-
+    # directory DB-enforced, not just snapshot-derived. Rows are recorded
+    # in the tally only AFTER the commit succeeds and only when the
+    # database reports the row actually changed: a failed commit must
+    # never leave an audit row claiming flips that were rolled back.
+    applied_deactivated, applied_reactivated = await _apply_sweep_flips(
+        db,
+        to_deactivate=[] if aborted else to_deactivate,
+        to_reactivate=to_reactivate,
+    )
+    for user_id, email in applied_deactivated:
+        tally.record_deactivated(user_id, email)
+    for user_id, email in applied_reactivated:
+        tally.record_reactivated(user_id, email)
 
-    # Reactivations are EXEMPT from the breaker: an aborted deactivation
-    # pass still applies them (the safe direction). Users an admin
-    # deactivated (deactivated_by_sync False) were already excluded above
-    # and are never touched here.
+
+async def _apply_sweep_flips(
+    db: AsyncSession,
+    *,
+    to_deactivate: list[User],
+    to_reactivate: list[User],
+) -> tuple[list[tuple[uuid.UUID, str]], list[tuple[uuid.UUID, str]]]:
+    """Apply sweep flag flips as guarded updates; return what actually landed.
+
+    Reactivations are EXEMPT from the breaker (callers pass an empty
+    to_deactivate on abort; the safe direction still applies).
+    """
+    applied_deactivated: list[tuple[uuid.UUID, str]] = []
+    applied_reactivated: list[tuple[uuid.UUID, str]] = []
+    for user in to_deactivate:
+        result = await db.execute(
+            update(User)
+            .where(User.id == user.id, User.is_active.is_(True))
+            .values(is_active=False, deactivated_by_sync=True)
+        )
+        if result.rowcount == 1:
+            applied_deactivated.append((user.id, user.email))
+    # The guarded WHERE re-excludes admin-deactivated rows
+    # (deactivated_by_sync False) even if the row changed after this
+    # sweep's snapshot was taken.
     for user in to_reactivate:
-        user.is_active = True
-        user.deactivated_by_sync = False
-        tally.record_reactivated(user.id, user.email)
-
-    if tally.users_deactivated or tally.users_reactivated:
+        result = await db.execute(
+            update(User)
+            .where(
+                User.id == user.id,
+                User.is_active.is_(False),
+                User.deactivated_by_sync.is_(True),
+            )
+            .values(is_active=True, deactivated_by_sync=False)
+        )
+        if result.rowcount == 1:
+            applied_reactivated.append((user.id, user.email))
+    if applied_deactivated or applied_reactivated:
         # One commit for the whole sweep: simple column flips with no
         # cross-row invariants, unlike the per-op membership applies above.
+        # A commit failure propagates BEFORE anything is recorded, so the
+        # audit row can never claim flips that were rolled back.
         await db.commit()
+    return applied_deactivated, applied_reactivated
 
 
 async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:

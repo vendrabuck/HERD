@@ -21,7 +21,7 @@ from app.models.ldap_group_mapping import LdapGroupMapping
 from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import User
 from app.services import auth_service, group_service, ldap_service, ldap_sync_service
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -1101,3 +1101,61 @@ def test_run_status_vocabulary_includes_aborted():
     # A small, explicit pin: "aborted" is a real member of the status
     # vocabulary the breaker can produce, not just a string typo'd once.
     assert "aborted" in {"success", "partial", "aborted", "failed"}
+
+
+@pytest.mark.asyncio
+async def test_sweep_guarded_update_yields_to_concurrent_admin_write(db, monkeypatch):
+    # The clobber interleaving (another replica's admin write landing between
+    # the sweep's snapshot and its update) is pinned at the helper level
+    # because black-box interleaving is unforceable here: the snapshot User
+    # object says active, but the ROW was admin-deactivated after the
+    # snapshot. The guarded WHERE must not touch it, and a reactivation
+    # guard must re-check provenance the same way.
+    user_id = await _mk_user(db, 90)
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
+    await db.execute(
+        update(User).where(User.id == user_id).values(is_active=False, deactivated_by_sync=False)
+    )
+    await db.commit()
+    db.expunge_all()
+    applied_d, applied_r = await ldap_sync_service._apply_sweep_flips(
+        db, to_deactivate=[user], to_reactivate=[]
+    )
+    assert applied_d == [] and applied_r == []
+    row = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
+    assert row.is_active is False
+    assert row.deactivated_by_sync is False
+
+    applied_d, applied_r = await ldap_sync_service._apply_sweep_flips(
+        db, to_deactivate=[], to_reactivate=[row]
+    )
+    # deactivated_by_sync is False (admin intent): the guarded WHERE refuses.
+    assert applied_r == []
+    refreshed = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
+    assert refreshed.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_sweep_commit_failure_records_no_counters(db, monkeypatch):
+    # A failed sweep commit must never leave an audit row claiming flips
+    # that were rolled back: recording happens only after the commit.
+    ids = await _mk_candidates(db, 2)
+    _enable_deactivation(monkeypatch)
+    _install_presence(monkeypatch, present={"user2@company.local"})
+    real_commit = db.commit
+
+    async def failing_commit():
+        # Fail exactly once (the sweep's commit, the first after patching:
+        # no mappings exist so nothing commits earlier in the pass), then
+        # restore so the run-finalization commit in the finally succeeds.
+        monkeypatch.setattr(db, "commit", real_commit)
+        raise RuntimeError("connection lost at sweep commit")
+
+    run = await ldap_sync_service.create_run(db, "manual")
+    monkeypatch.setattr(db, "commit", failing_commit)
+    result = await ldap_sync_service.execute_run(db, run)
+    assert result.status == "failed"
+    assert result.users_deactivated == 0
+    assert result.detail.get("deactivated") is None
+    row = (await db.execute(select(User).where(User.id == ids[0]))).scalar_one()
+    assert row.is_active is True
