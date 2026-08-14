@@ -39,7 +39,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 # Self-documenting help is the default goal: a bare `make` prints the target list.
 .DEFAULT_GOAL := help
 
-.PHONY: help audit master master-quick master-clean clean-images everything everything-noload \
+.PHONY: help audit master master-quick master-clean everything everything-noload \
 	up dev prod down build logs restart \
 	migrate test coverage \
 	$(addprefix test-,$(SERVICES)) \
@@ -50,7 +50,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
-	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed
+	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images
 
 ## --- Meta ---
 
@@ -167,7 +167,11 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + epheme
 # BuildKit layer cache is reused. Unrelated Docker images and unrelated build
 # cache on the machine are untouched.
 
-clean-images:
+# Removes every HERD-tagged Docker image (dev and gate compose projects) and
+# prunes dangling layers, so the next `make up` or `make build` rebuilds from
+# scratch. Internal helper for master-clean; unrelated images on the host are
+# left untouched.
+_clean-images:
 	@echo ""
 	@echo "=== Removing HERD compose images ==="
 	-docker compose down --remove-orphans
@@ -182,7 +186,7 @@ clean-images:
 	@echo "=== Pruning dangling images ==="
 	-docker image prune -f
 
-master-clean: clean-images  ## master with all HERD compose images rebuilt --no-cache
+master-clean: _clean-images  ## master with all HERD compose images rebuilt --no-cache
 	@BUILD_NO_CACHE=1 $(MAKE) master
 
 # -- Everything (full prod-grade gate: master + coverage + stress + fail-on-dirty) --
