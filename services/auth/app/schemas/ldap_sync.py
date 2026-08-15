@@ -1,7 +1,20 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class LdapSyncStatusResponse(BaseModel):
+    # Drives the phase 6 admin UI's mode gating (ADR 0011): the page reads
+    # this once on load to decide whether mapping-create and sync-now should
+    # be enabled, and to show the configured interval when the background
+    # loop is on. Deliberately minimal: extends the ADR's ratified
+    # {auth_method} shape with the two settings the page needs for honest
+    # interval-loop context, nothing else.
+    auth_method: Literal["local", "ldap"]
+    group_sync_enabled: bool
+    sync_interval_seconds: int
 
 
 class MappingCreateRequest(BaseModel):

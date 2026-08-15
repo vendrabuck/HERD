@@ -29,6 +29,16 @@ const STATUS_COLORS: Record<string, string> = {
   DEGRADED: "bg-yellow-100 text-yellow-800",
   UNREACHABLE: "bg-red-100 text-red-800",
   UNKNOWN: "bg-gray-100 text-gray-600",
+
+  // LDAP sync run status (ADR 0011 phase 6). Lowercase keys: unlike the
+  // enums above, ldap_sync_runs.status is stored lowercase by the backend
+  // (services/auth/app/services/ldap_sync_service.py), so the badge is
+  // rendered verbatim rather than upper-cased.
+  success: "bg-green-100 text-green-800",
+  partial: "bg-yellow-100 text-yellow-800",
+  aborted: "bg-amber-100 text-amber-800",
+  failed: "bg-red-100 text-red-800",
+  running: "bg-gray-100 text-gray-600",
 };
 
 const FALLBACK = "bg-gray-100 text-gray-600";

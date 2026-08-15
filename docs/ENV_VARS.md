@@ -73,13 +73,13 @@ Only consulted when `AUTH_METHOD=ldap`. When enabled, `/register` returns 409 an
 user accounts are provisioned on first successful LDAP bind (no password hash
 is stored locally). HERD role and group membership remain managed inside HERD;
 Directory group mapping and sync (ADR 0011,
-`docs/design/0011-ldap-group-sync.md`, issue #38) is in delivery, phases 1-5
-of 6 landed: admin-managed mappings, an on-demand reconcile
-(`POST /api/auth/admin/ldap-sync/run`), the opt-in deactivation sweep, and a
+`docs/design/0011-ldap-group-sync.md`, issue #38) is fully delivered, all 6
+phases: admin-managed mappings, an on-demand reconcile
+(`POST /api/auth/admin/ldap-sync/run`), the opt-in deactivation sweep, a
 background interval loop (`LDAP_GROUP_SYNC_ENABLED`) that reconciles on
-`LDAP_SYNC_INTERVAL_SECONDS` all work today; only the admin UI remains
-(phase 6). The `LDAP_GROUP_*` and `LDAP_SYNC_*`/`LDAP_DISABLED_FILTER` keys
-below belong to this feature. Retention (`LDAP_SYNC_RUNS_RETENTION_DAYS`) is
+`LDAP_SYNC_INTERVAL_SECONDS`, and the admin UI (`/admin/ldap-sync`) for
+mapping CRUD, sync-now, and run history. The `LDAP_GROUP_*` and
+`LDAP_SYNC_*`/`LDAP_DISABLED_FILTER` keys below belong to this feature. Retention (`LDAP_SYNC_RUNS_RETENTION_DAYS`) is
 enforced ONLY by the interval loop, never by manual sync-now: the FIRST due
 tick after a process starts prunes unconditionally (so a rolling restart
 does not wait out a full day with nothing pruned), then at most once per 24

@@ -15,7 +15,13 @@ overrides group-presence credit (checked last, so a disabled account still
 listed in a mapped group still deactivates); both are amended into the
 deactivation section below. Phase 5 (interval loop, config-service bootstrap
 schema keys, run-retention pruning) delivered 2026-08-14 with no open
-questions against this doc. Seven decision points were
+questions against this doc. Phase 6 (admin UI: mappings CRUD, warning
+banner on the memberless-mapping accept-with-warning case, run history,
+sync-now) delivered 2026-08-15, closing the epic; the phase also added a
+status endpoint (`GET /api/auth/admin/ldap-sync/status`) beyond the
+mapping/run CRUD this doc specifies, so the page can gate on the current
+auth_method and show interval-loop context, and no design question was
+raised against this doc. Seven decision points were
 resolved with vendra on 2026-08-11: the original four (pre-provisioning,
 reactivation provenance, deactivation fail-safety, audit persistence) plus
 three raised by the same-day adversarial review of the first draft (mapping
@@ -409,6 +415,24 @@ authority for role, per the issue.
    other failure path.
 6. Frontend admin surface: mappings CRUD, run history, sync-now button
    (every backend feature keeps a frontend path, the #397/#398 precedent).
+   Delivered 2026-08-15: `frontend/src/pages/admin/LdapSyncPage.tsx` at
+   `/admin/ldap-sync`, gated by a new `GET /admin/ldap-sync/status`
+   endpoint (`auth_method`, `group_sync_enabled`, `sync_interval_seconds`)
+   this phase added to the router beyond what this doc's mapping/run CRUD
+   specifies; create/sync-now stay disabled until the status query has
+   positively confirmed `auth_method == "ldap"` (a load error or local mode
+   both read as disabled, fail-closed), while list and delete work in any
+   mode per the mapping-store section above. The memberless-mapping
+   accept-with-warning response renders as a persistent inline banner
+   naming the group DN rather than a toast. Sync-now polls the run list
+   (2s) while a run is `"running"`; a `"running"` row older than 30 minutes
+   stops holding polling open and renders as `"running (stale)"`, since
+   `execute_run`'s crash-only failure mode (a cancelled or killed process)
+   is the only way a row stays `"running"` that long. The two lock-busy
+   409 detail strings (`_RUN_IN_PROGRESS_DETAIL`,
+   `_RUN_IN_PROGRESS_REPLICA_DETAIL`) are matched verbatim to distinguish
+   the informational "already running" toast from the auth_method mode
+   refusal, which the same status code also carries.
 
 ## Testing
 
