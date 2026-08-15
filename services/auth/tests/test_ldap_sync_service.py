@@ -11,6 +11,7 @@ constraints on users.email and users.username, so the collision paths run
 against genuine IntegrityErrors rather than mocks.
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -1159,3 +1160,86 @@ async def test_sweep_commit_failure_records_no_counters(db, monkeypatch):
     assert result.detail.get("deactivated") is None
     row = (await db.execute(select(User).where(User.id == ids[0]))).scalar_one()
     assert row.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_execute_run_cancelled_mid_reconcile_commits_failed_with_cancelled_error(
+    db, monkeypatch
+):
+    """A task cancellation during execute_run (the realistic trigger: the
+    phase 5 interval loop's task cancelled mid-tick at service shutdown)
+    must still commit a "failed" row with its cause recorded, matching the
+    "failed runs record their cause" contract every other failure path
+    upholds.
+
+    Before the fix, execute_run's `except Exception` arm never caught
+    asyncio.CancelledError (a BaseException in Python 3.8+, not an
+    Exception), so a cancellation mid-try skipped straight to the finally
+    with error still None: the finally committed status "failed" (its
+    unchanged default) but with the cause silently lost.
+
+    The stalled reconcile also does a real `db.add` of a GroupMember row and
+    does NOT commit it before blocking, pinning the second hazard the
+    CancelledError arm's `db.rollback()` exists for: a cancel delivered
+    between a per-op db.add and its commit (the shape every real apply site
+    in _reconcile_mapping has) leaves a torn write on the session. Without
+    the rollback, the finally's own commit would flush that pending,
+    half-applied membership row together with the run-row finalization. This
+    test cancels the task while _reconcile_mapping is stalled mid-await
+    (write already added, not yet committed) and asserts, read back through
+    a FRESH session (not the one execute_run itself used): the run row is
+    "failed" with the recorded cause, AND the pending member row never
+    landed.
+    """
+    group = UserGroup(name="Cancel Test")
+    db.add(group)
+    await db.commit()
+    # Captured as a plain value, not read off `group` again after this
+    # point: execute_run's CancelledError rollback (on this SAME session,
+    # since execute_run(db, run) below reuses it) expires every object the
+    # session is tracking, `group` included, and touching an expired ORM
+    # attribute after the task has run needs IO this synchronous test body
+    # cannot perform implicitly.
+    group_id = group.id
+    mapping = LdapGroupMapping(
+        group_dn=_GROUP_DN, directory_name="herd-eng", herd_group_id=group_id
+    )
+    db.add(mapping)
+    await db.commit()
+    user_id = await _mk_user(db, 1)
+
+    entered = asyncio.Event()
+
+    async def stalled_reconcile(*args, **kwargs):
+        # The pending, uncommitted write: a real db.add with no db.commit
+        # before blocking, mirroring the per-op add/commit shape of the
+        # actual apply loop in _reconcile_mapping.
+        db.add(GroupMember(group_id=group_id, user_id=user_id))
+        entered.set()
+        # Blocks forever until the task is cancelled; a fresh, never-set
+        # Event (not `entered`) so this await point is the one interrupted.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ldap_sync_service, "_reconcile_mapping", stalled_reconcile)
+
+    run = await ldap_sync_service.create_run(db, "manual")
+    run_id = run.id
+
+    task = asyncio.create_task(ldap_sync_service.execute_run(db, run))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with TestSessionLocal() as check_db:
+        reloaded = await check_db.get(LdapSyncRun, run_id)
+        assert reloaded is not None
+        assert reloaded.status == "failed"
+        assert reloaded.error == "cancelled during service shutdown"
+
+        pending_member = await check_db.get(GroupMember, (group_id, user_id))
+        assert pending_member is None, (
+            "the pending GroupMember add must not survive a cancellation: "
+            "the CancelledError arm's db.rollback() exists to discard it "
+            "before the finally's commit"
+        )

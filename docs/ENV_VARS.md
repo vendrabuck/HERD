@@ -73,12 +73,21 @@ Only consulted when `AUTH_METHOD=ldap`. When enabled, `/register` returns 409 an
 user accounts are provisioned on first successful LDAP bind (no password hash
 is stored locally). HERD role and group membership remain managed inside HERD;
 Directory group mapping and sync (ADR 0011,
-`docs/design/0011-ldap-group-sync.md`, issue #38) is in delivery, phases 1-4
+`docs/design/0011-ldap-group-sync.md`, issue #38) is in delivery, phases 1-5
 of 6 landed: admin-managed mappings, an on-demand reconcile
-(`POST /api/auth/admin/ldap-sync/run`), and the opt-in deactivation sweep all
-work today; the interval loop and admin UI arrive in phases 5-6. The
-`LDAP_GROUP_*` and `LDAP_SYNC_*`/`LDAP_DISABLED_FILTER` keys below belong to
-this feature; the interval and retention keys arrive with phase 5.
+(`POST /api/auth/admin/ldap-sync/run`), the opt-in deactivation sweep, and a
+background interval loop (`LDAP_GROUP_SYNC_ENABLED`) that reconciles on
+`LDAP_SYNC_INTERVAL_SECONDS` all work today; only the admin UI remains
+(phase 6). The `LDAP_GROUP_*` and `LDAP_SYNC_*`/`LDAP_DISABLED_FILTER` keys
+below belong to this feature. Retention (`LDAP_SYNC_RUNS_RETENTION_DAYS`) is
+enforced ONLY by the interval loop, never by manual sync-now: the FIRST due
+tick after a process starts prunes unconditionally (so a rolling restart
+does not wait out a full day with nothing pruned), then at most once per 24
+hours after that, checked at each tick boundary (an interval configured
+above 24h therefore prunes once per tick, not once per day). A deployment
+that runs only manual sync-now and never enables the loop accumulates
+`ldap_sync_runs` rows indefinitely; that is a deliberate consequence of
+keeping pruning out of the manual path, not an oversight.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -91,6 +100,9 @@ this feature; the interval and retention keys arrive with phase 5.
 | `LDAP_USERNAME_ATTRIBUTE` | `sAMAccountName` | Directory attribute used as the HERD username. |
 | `LDAP_GROUP_MEMBER_ATTRIBUTE` | `member` | Group entry attribute holding member DNs (Active Directory and `groupOfNames` use `member`; `posixGroup` `memberUid` is out of scope). Consulted by the ADR 0011 group sync. |
 | `LDAP_GROUP_NAME_ATTRIBUTE` | `cn` | Group entry attribute cached as a mapping's display name. Consulted by the ADR 0011 group sync. |
+| `LDAP_GROUP_SYNC_ENABLED` | `false` | Start the background loop that reconciles directory groups on an interval (ADR 0011 phase 5). Dark by default: admin-managed mappings and on-demand sync-now work regardless of this setting. Also requires `AUTH_METHOD=ldap`. |
+| `LDAP_SYNC_INTERVAL_SECONDS` | `3600` | Seconds between interval-triggered reconcile runs. The first tick sleeps one full interval before syncing (no boot-time sync burst on a rolling restart). Values below 60 are clamped to a 60-second floor at loop startup (with a warning) rather than rejected, so a bad tuning value never blocks auth from booting. |
+| `LDAP_SYNC_RUNS_RETENTION_DAYS` | `90` | Days to keep `ldap_sync_runs` audit rows. Pruned only by the interval loop (never by manual sync-now): the first due tick after startup prunes unconditionally, then at most once per 24 hours after that, checked at tick boundaries. A `running` row is never pruned regardless of age. |
 | `LDAP_SYNC_DEACTIVATION_ENABLED` | `false` | Opt-in for the deactivation/reactivation sweep. Independent of group mirroring: enabling mappings alone never deactivates anyone. |
 | `LDAP_DISABLED_FILTER` | (empty) | A complete LDAP filter expression (not a value) identifying disabled accounts, e.g. the AD `userAccountControl` lockout-bit filter `(userAccountControl:1.2.840.113556.1.4.803:=2)`. Empty means absence-only detection. |
 | `LDAP_SYNC_DEACTIVATION_MAX_PERCENT` | `20` | Circuit-breaker percent term: the sweep aborts, deactivating no one, only when the proven-absent-or-disabled count STRICTLY exceeds this percent of swept users AND the count floor below. Reactivations still apply on abort. |

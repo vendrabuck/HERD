@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +21,11 @@ from app.routers.groups import router as groups_router
 from app.routers.internal import router as internal_router
 from app.routers.ldap_sync import router as ldap_sync_router
 from app.routers.tokens import router as tokens_router
+from app.tasks.ldap_sync_loop import (
+    effective_interval_seconds,
+    ldap_group_sync_loop_enabled,
+    ldap_sync_loop,
+)
 
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -92,7 +98,25 @@ async def lifespan(app: FastAPI):
     )
     await _seed_superadmin()
     await _seed_not_grouped()
+
+    # ADR 0011 phase 5: the LDAP group sync interval loop, started only when
+    # both auth_method == "ldap" and ldap_group_sync_enabled are true (dark
+    # by default even in LDAP mode, mirroring the sync-now and deactivation
+    # opt-ins). Cancelled and awaited on shutdown, mirroring
+    # services/reservations/app/main.py's expiration_task handling.
+    ldap_sync_task = None
+    if ldap_group_sync_loop_enabled():
+        interval = effective_interval_seconds(settings.ldap_sync_interval_seconds)
+        ldap_sync_task = asyncio.create_task(ldap_sync_loop(interval))
+
     yield
+
+    if ldap_sync_task is not None:
+        ldap_sync_task.cancel()
+        try:
+            await ldap_sync_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

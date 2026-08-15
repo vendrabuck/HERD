@@ -1415,14 +1415,17 @@ When `AUTH_METHOD=ldap` (see [ENV_VARS.md](ENV_VARS.md#ldap--active-directory)):
   are still managed entirely inside HERD. Promote LDAP-provisioned users to
   `admin` or add them to groups using the existing admin UI / endpoints.
 - Directory group sync (ADR 0011, `docs/design/0011-ldap-group-sync.md`,
-  issue #38) is in delivery, phases 1-4 of 6 landed: admins can map
+  issue #38) is in delivery, phases 1-5 of 6 landed: admins can map
   directory groups to HERD groups (`/api/auth/admin/ldap-sync/mappings`),
-  trigger a reconcile with `POST /api/auth/admin/ldap-sync/run` (202; poll
-  `/runs`), and opt in to the deactivation/reactivation sweep
+  trigger a reconcile on demand with `POST /api/auth/admin/ldap-sync/run`
+  (202; poll `/runs`), opt in to the deactivation/reactivation sweep
   (`LDAP_SYNC_DEACTIVATION_ENABLED`, dark by default; a two-term circuit
   breaker guards mass deactivation, and only sync-deactivated users are
   ever auto-reactivated; admin intent via
   `/api/auth/users/{id}/activate|deactivate` always outranks the
-  directory). Membership does NOT yet sync on an interval (the loop is
-  phase 5; today runs are manual), and there is no admin UI yet (phase 6).
-  Role assignment never syncs; HERD stays the authority for role.
+  directory), and opt in to a background loop that runs the same reconcile
+  on an interval (`LDAP_GROUP_SYNC_ENABLED`, also dark by default;
+  `LDAP_SYNC_INTERVAL_SECONDS` sets the cadence, and the loop also prunes
+  `ldap_sync_runs` rows older than `LDAP_SYNC_RUNS_RETENTION_DAYS`). There
+  is no admin UI yet (phase 6). Role assignment never syncs; HERD stays
+  the authority for role.
