@@ -19,6 +19,13 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **LDAP / Active Directory authentication** (Shipped): pluggable via `AUTH_METHOD=ldap`.
   Users JIT-provision on first successful bind; superadmin accounts remain local
   regardless of auth source.
+- **Directory group sync** (Shipped): admin-managed mappings from directory
+  groups to HERD groups, an on-demand or interval-scheduled fail-closed
+  reconcile of membership (with pre-provisioning of new users), and an opt-in
+  deactivation/reactivation sweep for users removed or disabled upstream,
+  guarded by a circuit breaker (ADR 0011, `docs/design/0011-ldap-group-sync.md`,
+  issue #38). Managed from the admin UI (`/admin/ldap-sync`): mapping CRUD, a
+  sync-now button, and run history.
 - **Three-role RBAC** (Shipped): user, admin, superadmin. See
   [docs/ROLES.md](docs/ROLES.md).
 - **User groups** (Shipped): organize users into teams with bulk member management.

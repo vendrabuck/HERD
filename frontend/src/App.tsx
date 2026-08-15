@@ -19,6 +19,7 @@ import { DriversPage } from "@/pages/admin/DriversPage";
 import { HypervisorsPage } from "@/pages/admin/HypervisorsPage";
 import { ConnectionsPage } from "@/pages/admin/ConnectionsPage";
 import { GrantsPage } from "@/pages/admin/GrantsPage";
+import { LdapSyncPage } from "@/pages/admin/LdapSyncPage";
 import { TemplatesPage } from "@/pages/TemplatesPage";
 import { TemplateEditorPage } from "@/pages/TemplateEditorPage";
 import { TopologyTemplatesPage } from "@/pages/TopologyTemplatesPage";
@@ -100,6 +101,7 @@ export default function App() {
           <Route path="/admin/drivers" element={<DriversPage />} />
           <Route path="/admin/grants" element={<GrantsPage />} />
           <Route path="/admin/hypervisors" element={<HypervisorsPage />} />
+          <Route path="/admin/ldap-sync" element={<LdapSyncPage />} />
         </Route>
         <Route path="/dashboard" element={<Navigate to="/topology" replace />} />
         <Route path="*" element={<Navigate to="/topology" replace />} />

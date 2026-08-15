@@ -289,12 +289,67 @@ async def test_non_admin_is_403_on_all_mapping_endpoints(monkeypatch, user_clien
     assert (create.status_code, listed.status_code, deleted.status_code) == (403, 403, 403)
 
 
+# ---------------------------------------------------------------------------
+# Status endpoint (phase 6): mode context the admin UI gates on.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_status_non_admin_is_403(user_client):
+    resp = await user_client.get("/admin/ldap-sync/status")
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_status_reports_ldap_mode(monkeypatch, admin_client):
+    monkeypatch.setattr(settings, "auth_method", "ldap", raising=False)
+    monkeypatch.setattr(settings, "ldap_group_sync_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_sync_interval_seconds", 1800, raising=False)
+    resp = await admin_client.get("/admin/ldap-sync/status")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "auth_method": "ldap",
+        "group_sync_enabled": True,
+        "sync_interval_seconds": 1800,
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_reports_local_mode(monkeypatch, admin_client):
+    monkeypatch.setattr(settings, "auth_method", "local", raising=False)
+    monkeypatch.setattr(settings, "ldap_group_sync_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "ldap_sync_interval_seconds", 3600, raising=False)
+    resp = await admin_client.get("/admin/ldap-sync/status")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "auth_method": "local",
+        "group_sync_enabled": False,
+        "sync_interval_seconds": 3600,
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_never_409s_under_local_mode(monkeypatch, admin_client):
+    # Unlike create_mapping and start_sync_run, GET /status carries NO
+    # auth_method == "ldap" gate: it is deliberately readable in any mode
+    # (an admin UI needs to be ABLE to ask "are we in ldap mode?" precisely
+    # when the answer might be "no", to render the local-mode banner and
+    # keep create/sync-now disabled). This pins that absence of a gate: the
+    # route must never 409 here the way its siblings do outside ldap mode.
+    monkeypatch.setattr(settings, "auth_method", "local", raising=False)
+    resp = await admin_client.get("/admin/ldap-sync/status")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["auth_method"] == "local"
+
+
 @pytest.mark.asyncio
 async def test_unauthenticated_is_401():
     try:
         async with _client_for(None) as ac:
-            resp = await ac.get("/admin/ldap-sync/mappings")
-        assert resp.status_code == 401
+            mappings = await ac.get("/admin/ldap-sync/mappings")
+            status_resp = await ac.get("/admin/ldap-sync/status")
+        assert mappings.status_code == 401
+        assert status_resp.status_code == 401
     finally:
         app.dependency_overrides.clear()
 

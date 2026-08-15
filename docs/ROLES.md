@@ -1290,6 +1290,7 @@ Authorization: Bearer <admin-token>
 | `/api/auth/users/{id}/role` | PUT | | | yes |
 | `/api/auth/users/{id}/activate` | POST | | yes | yes |
 | `/api/auth/users/{id}/deactivate` | POST | | yes | yes |
+| `/api/auth/admin/ldap-sync/status` | GET | | yes | yes |
 | `/api/auth/admin/ldap-sync/mappings` | POST | | yes | yes |
 | `/api/auth/admin/ldap-sync/mappings` | GET | | yes | yes |
 | `/api/auth/admin/ldap-sync/mappings/{id}` | DELETE | | yes | yes |
@@ -1415,7 +1416,7 @@ When `AUTH_METHOD=ldap` (see [ENV_VARS.md](ENV_VARS.md#ldap--active-directory)):
   are still managed entirely inside HERD. Promote LDAP-provisioned users to
   `admin` or add them to groups using the existing admin UI / endpoints.
 - Directory group sync (ADR 0011, `docs/design/0011-ldap-group-sync.md`,
-  issue #38) is in delivery, phases 1-5 of 6 landed: admins can map
+  issue #38) is fully delivered, all 6 phases: admins can map
   directory groups to HERD groups (`/api/auth/admin/ldap-sync/mappings`),
   trigger a reconcile on demand with `POST /api/auth/admin/ldap-sync/run`
   (202; poll `/runs`), opt in to the deactivation/reactivation sweep
@@ -1426,6 +1427,8 @@ When `AUTH_METHOD=ldap` (see [ENV_VARS.md](ENV_VARS.md#ldap--active-directory)):
   directory), and opt in to a background loop that runs the same reconcile
   on an interval (`LDAP_GROUP_SYNC_ENABLED`, also dark by default;
   `LDAP_SYNC_INTERVAL_SECONDS` sets the cadence, and the loop also prunes
-  `ldap_sync_runs` rows older than `LDAP_SYNC_RUNS_RETENTION_DAYS`). There
-  is no admin UI yet (phase 6). Role assignment never syncs; HERD stays
-  the authority for role.
+  `ldap_sync_runs` rows older than `LDAP_SYNC_RUNS_RETENTION_DAYS`). The
+  admin UI (`/admin/ldap-sync`, phase 6) covers mapping CRUD and sync-now
+  plus run history, reading mode context from
+  `GET /api/auth/admin/ldap-sync/status`. Role assignment never syncs;
+  HERD stays the authority for role.

@@ -30,6 +30,7 @@ from app.models.ldap_group_mapping import DIRECTORY_NAME_MAX, LdapGroupMapping
 from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import Role, User
 from app.schemas.ldap_sync import (
+    LdapSyncStatusResponse,
     MappingCreateRequest,
     MappingCreateResponse,
     MappingResponse,
@@ -71,6 +72,21 @@ async def _conflicting_mapping_detail(db: AsyncSession, group_dn: str, herd_grou
     if group_taken is not None:
         return _GROUP_ALREADY_MAPPED_DETAIL
     return None
+
+
+@router.get("/status", response_model=LdapSyncStatusResponse)
+async def get_sync_status(
+    _: User = _admin_or_superadmin,
+):
+    """Mode context for the phase 6 admin UI: current auth backend plus the
+    interval-loop settings, so the page can gate create/sync-now on
+    auth_method == "ldap" and show honest context when the loop is off.
+    """
+    return LdapSyncStatusResponse(
+        auth_method=settings.auth_method,
+        group_sync_enabled=settings.ldap_group_sync_enabled,
+        sync_interval_seconds=settings.ldap_sync_interval_seconds,
+    )
 
 
 @router.post("/mappings", response_model=MappingCreateResponse, status_code=status.HTTP_201_CREATED)
