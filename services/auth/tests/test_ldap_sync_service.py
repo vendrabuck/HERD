@@ -1243,3 +1243,80 @@ async def test_execute_run_cancelled_mid_reconcile_commits_failed_with_cancelled
             "the CancelledError arm's db.rollback() exists to discard it "
             "before the finally's commit"
         )
+
+
+@pytest.mark.asyncio
+async def test_execute_run_cancelled_with_broken_finalize_commit_still_raises_cancelled(
+    db, monkeypatch, caplog
+):
+    """Post-merge review batch item 3: a cancellation can leave the session
+    broken enough that the finally's OWN finalize commit also raises (the
+    scenario is a shutdown cancel interrupting an in-flight asyncpg call).
+    Before the fix, that new exception replaced the propagating
+    CancelledError (Python's finally-supersedes-try rule), so
+    main.py's `except asyncio.CancelledError: pass` never matched it and the
+    run row was stranded at status "running" forever.
+
+    This test stalls _reconcile_mapping exactly like the sibling
+    cancellation test above, but ALSO makes db.commit raise the one time it
+    is called after cancellation (the finally's finalize commit; nothing
+    else commits between task creation and cancellation, since the
+    CancelledError arm calls db.rollback(), not commit). The awaiting
+    caller must still observe CancelledError, not the commit's
+    RuntimeError, and the commit failure must be logged.
+    """
+    import logging
+
+    group = UserGroup(name="Cancel Commit Test")
+    db.add(group)
+    await db.commit()
+    group_id = group.id
+    mapping = LdapGroupMapping(
+        group_dn=_GROUP_DN, directory_name="herd-eng", herd_group_id=group_id
+    )
+    db.add(mapping)
+    await db.commit()
+
+    entered = asyncio.Event()
+
+    async def stalled_reconcile(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ldap_sync_service, "_reconcile_mapping", stalled_reconcile)
+
+    # create_run's own commit must succeed normally; only commits AFTER
+    # this point (i.e. only the finally's finalize commit, in this stalled
+    # scenario) should raise.
+    run = await ldap_sync_service.create_run(db, "manual")
+    run_id = run.id
+
+    commit_calls = {"n": 0}
+
+    async def failing_commit():
+        commit_calls["n"] += 1
+        raise RuntimeError("session broken by the cancelled await")
+
+    monkeypatch.setattr(db, "commit", failing_commit)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.ldap_sync_service"):
+        task = asyncio.create_task(ldap_sync_service.execute_run(db, run))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # The caller saw CancelledError (asserted above by pytest.raises), not
+    # the commit's RuntimeError, and the finalize commit was attempted
+    # exactly once and its failure was logged with exc_info.
+    assert commit_calls["n"] == 1
+    logged = [r for r in caplog.records if "LDAP sync run finalize commit failed" in r.getMessage()]
+    assert len(logged) == 1
+    assert logged[0].exc_info is not None
+
+    async with TestSessionLocal() as check_db:
+        reloaded = await check_db.get(LdapSyncRun, run_id)
+        assert reloaded is not None
+        # Never reached its terminal status: the finalize commit that would
+        # have written "failed" itself raised.
+        assert reloaded.status == "running"
