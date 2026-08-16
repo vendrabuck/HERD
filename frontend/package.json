@@ -23,6 +23,7 @@
     "react-dom": "^19.2.8",
     "react-hot-toast": "^2.4.1",
     "react-router-dom": "^7.18.2",
+    "react-window": "^2.3.0",
     "tailwind-merge": "^3.6.0",
     "zustand": "^5.0.14"
   },

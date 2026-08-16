@@ -257,37 +257,47 @@
 
     <h2 class="sec" id="connect">Wiring it up</h2>
     <p class="sectitle">Drawing connections</p>
-    <p>Drag from one device's handle (the little dot on its edge) to another's. A connection dialog opens.</p>
+    <p>Drag from one device's handle (the little dot on its edge) to another's. The <b>wiring dialog</b> opens: source ports in a column on the left, target ports in a column on the right, an open wiring area between them. Wire any number of port pairs in one session instead of one round trip per connection.</p>
 
     <figure class="shot">
       <div class="shot-frame">
         <div class="shot-stage">
           <div class="hd"><div class="hd-modal-bg">
-            <div class="hd-modal">
-              <div class="mhead"><h2>New connection</h2><span class="x">&times;</span></div>
-              <div class="mbody">
-                <div class="hd-field"><label class="hd-label">Layer</label>
-                  <div class="hd-seg" data-anno="1" data-anno-pin="r" data-anno-arrow style="display:flex;"><span>L1</span><span class="active">L2</span><span>L3</span></div>
-                  <p class="hd-help">L1 = physical cabling · L2 = Ethernet/VLAN · L3 = IP/routing.</p>
+            <div class="hd-modal" style="max-width:640px;">
+              <div class="mhead"><h2>Wire fw-edge-01 to l1-patch-mux</h2><span class="x">&times;</span></div>
+              <div class="mbody" style="display:flex; gap:12px;">
+                <div style="flex:1; min-width:0;">
+                  <div class="hd-label">fw-edge-01</div>
+                  <div class="hd-select" data-anno="1" data-anno-pin="t" data-anno-arrow>eth1/1</div>
+                  <div class="hd-select" style="opacity:.5;">eth1/2 <span class="badge active" style="font-size:10px;">WIRED</span></div>
                 </div>
-                <div class="hd-row2">
-                  <div class="hd-field"><label class="hd-label">Port on fw-edge-01</label><div class="hd-select" data-anno="2" data-anno-pin="b" data-anno-arrow>eth1/1</div></div>
-                  <div class="hd-field"><label class="hd-label">Port on l1-patch-mux</label><div class="hd-select">ge-0 <span style="color:var(--warn-fg)">(no cable)</span></div></div>
+                <div style="flex:1.1; min-width:0; text-align:center;">
+                  <div class="hd-seg" data-anno="2" data-anno-pin="t" data-anno-arrow style="display:inline-flex;"><span>L1</span><span class="active">L2</span><span>L3</span></div>
+                  <p class="hd-help">Drag from a source port to a target port, or click one then the other.</p>
+                </div>
+                <div style="flex:1; min-width:0;">
+                  <div class="hd-label">l1-patch-mux</div>
+                  <div class="hd-select">ge-0 <span style="color:var(--warn-fg)">no cable</span></div>
+                  <div class="hd-select" data-anno="3" data-anno-pin="t" data-anno-arrow>ge-1</div>
                 </div>
               </div>
-              <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="3" data-anno-pin="t" data-anno-arrow>Create</span></div>
+              <div class="mfoot"><span class="hd-btn secondary">Connect 1:1 in order</span><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Add 2 connections</span></div>
             </div>
           </div></div>
         </div>
       </div>
-      <p class="shotcap"><b>The connection dialog.</b> Pick a layer, a port on each end, and create.</p>
+      <p class="shotcap"><b>The wiring dialog.</b> Draw lines, tag each L1/L2/L3, then add them all at once.</p>
     </figure>
 
     <ol class="legend">
-      <li><b>Layer.</b> What kind of link this is. L2 and L3 are logical overlays; they still need a real physical path underneath to count.</li>
-      <li><b>Port on each device.</b> The dropdowns list every port. A <code>(no cable)</code> suffix warns that the port has no physical cabling recorded &mdash; pick another or it'll go red.</li>
-      <li><b>Create.</b> Adds the edge. HERD immediately checks it against the cabling graph and colours it.</li>
+      <li><b>Port columns.</b> A free port is fully selectable; one already used, either earlier in this session or by an existing canvas edge, is grayed and tagged <code>WIRED</code>. A port with a registered physical cable is tagged <code>CABLED</code> (informational, still selectable); an uncabled one is tagged <code>no cable</code> the same way.</li>
+      <li><b>Layer.</b> Sets the default for lines you draw next; each drawn line gets its own small L1/L2/L3 pill you can change or delete independently. L2 and L3 are logical overlays; they still need a real physical path underneath to count.</li>
+      <li><b>Connect 1:1 in order</b> pairs every remaining free port on both sides top to bottom in one click: the fast path for wiring two same-size switches straight across.</li>
+      <li><b>Add N connections.</b> Adds every drawn line to the canvas at once. HERD immediately checks each one against the cabling graph and colours it; two or more connections between the same device pair collapse into one bundled edge with a count badge on the canvas.</li>
     </ol>
+
+    <p class="sectitle">Quick connect</p>
+    <p>For a single connection, toggle <b>Quick connect</b> in the toolbar before drawing a line. It opens a compact popover instead: pick one port on each side and a layer, then <b>Connect</b>. Its <b>Open wiring dialog</b> link escalates to the full dialog for the same device pair without losing your place.</p>
 
     <h2 class="sec" id="edges">The part everyone asks about</h2>
     <p class="sectitle">Red vs green edges</p>
@@ -378,7 +388,7 @@
           <li><b>Pan:</b> drag empty canvas</li>
           <li><b>Select:</b> click a node · <b>Multi-select:</b> shift-click or drag a box</li>
           <li><b>Delete selected:</b> <kbd>Delete</kbd> (the editor binds only <kbd>Delete</kbd>; <kbd>Backspace</kbd> does not delete)</li>
-          <li><b>Connect:</b> drag from a node handle to another node</li>
+          <li><b>Connect:</b> drag from a node handle to another node, opening the wiring dialog; inside it, drag between the two port columns or click a port on each side in turn</li>
           <li><b>Zoom:</b> mouse wheel, or the <kbd>+</kbd> / <kbd>&minus;</kbd> controls in the bottom-left. The mini-map in the bottom-right is view-only.</li>
         </ul>
       </div>

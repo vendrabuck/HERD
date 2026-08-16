@@ -132,32 +132,20 @@ describe("topologyStore", () => {
     expect(edges[0].data).toMatchObject({ layer: "L1", pathValid: true, pathHopCount: 3 });
   });
 
-  it("updateEdgePathStatus sets pathValid/hopCount on the matching edge only", () => {
-    useTopologyStore.getState().loadCanvas({
-      nodes: [makeNode("a"), makeNode("b"), makeNode("c")],
-      edges: [makeEdge("e1", "a", "b"), makeEdge("e2", "b", "c")],
-      selectedEdgeLayer: "L2",
-    });
-    useTopologyStore.getState().updateEdgePathStatus("e1", true, 4);
-    const edges = useTopologyStore.getState().edges;
-    const e1 = edges.find((e) => e.id === "e1");
-    const e2 = edges.find((e) => e.id === "e2");
-    expect(e1?.data?.pathValid).toBe(true);
-    expect(e1?.data?.pathHopCount).toBe(4);
-    // The non-matching edge is untouched (no pathValid written).
-    expect(e2?.data?.pathValid).toBeUndefined();
-  });
+  it("addEnrichedEdge never dedupes: two same-pair, same-handle edges (e.g. an AI proposal with two role-pair edges) both land (review round 3 item 9)", () => {
+    useTopologyStore.getState().addDeviceNode(makeNode("a"));
+    useTopologyStore.getState().addDeviceNode(makeNode("b"));
+    const connection = { source: "a", target: "b", sourceHandle: null, targetHandle: null };
+    useTopologyStore.getState().addEnrichedEdge(connection, { layer: "L1", isProposal: true });
+    // addEdge's connectionExists guard (the old implementation) would refuse
+    // this second call outright, since it is identical source/target/handles.
+    useTopologyStore.getState().addEnrichedEdge(connection, { layer: "L2", isProposal: true });
 
-  it("updateEdgePathStatus accepts a null pathValid and omitted hopCount", () => {
-    useTopologyStore.getState().loadCanvas({
-      nodes: [makeNode("a"), makeNode("b")],
-      edges: [makeEdge("e1", "a", "b")],
-      selectedEdgeLayer: "L2",
-    });
-    useTopologyStore.getState().updateEdgePathStatus("e1", null);
-    const e1 = useTopologyStore.getState().edges[0];
-    expect(e1.data?.pathValid).toBeNull();
-    expect(e1.data?.pathHopCount).toBeUndefined();
+    const edges = useTopologyStore.getState().edges;
+    expect(edges).toHaveLength(2);
+    const ids = edges.map((e) => e.id);
+    expect(new Set(ids).size).toBe(2);
+    expect(edges.map((e) => e.data?.layer).sort()).toEqual(["L1", "L2"]);
   });
 
   it("acceptProposalNodes clears isProposal on proposal nodes and edges", () => {
@@ -183,6 +171,68 @@ describe("topologyStore", () => {
     expect(state.edges).toHaveLength(2);
     expect(state.nodes.every((n) => !n.data?.isProposal)).toBe(true);
     expect(state.edges.every((e) => !e.data?.isProposal)).toBe(true);
+  });
+
+  it("updateEdgePathStatuses commits every update in a single set() call (review item 10a)", () => {
+    useTopologyStore.getState().loadCanvas({
+      nodes: [makeNode("a"), makeNode("b"), makeNode("c")],
+      edges: [makeEdge("e1", "a", "b"), makeEdge("e2", "b", "c")],
+      selectedEdgeLayer: "L2",
+    });
+    const updates = new Map<string, { pathValid: boolean | null; hopCount?: number }>([
+      ["e1", { pathValid: true, hopCount: 2 }],
+      ["e2", { pathValid: false }],
+    ]);
+    useTopologyStore.getState().updateEdgePathStatuses(updates);
+    const edges = useTopologyStore.getState().edges;
+    const e1 = edges.find((e) => e.id === "e1");
+    const e2 = edges.find((e) => e.id === "e2");
+    expect(e1?.data?.pathValid).toBe(true);
+    expect(e1?.data?.pathHopCount).toBe(2);
+    expect(e2?.data?.pathValid).toBe(false);
+    expect(e2?.data?.pathHopCount).toBeUndefined();
+  });
+
+  it("updateEdgePathStatuses is a no-op for an empty update map", () => {
+    useTopologyStore.getState().loadCanvas({
+      nodes: [makeNode("a"), makeNode("b")],
+      edges: [makeEdge("e1", "a", "b")],
+      selectedEdgeLayer: "L2",
+    });
+    const before = useTopologyStore.getState().edges;
+    useTopologyStore.getState().updateEdgePathStatuses(new Map());
+    expect(useTopologyStore.getState().edges).toBe(before);
+  });
+
+  it("removeEdge removes exactly the one edge (review item 2)", () => {
+    useTopologyStore.getState().loadCanvas({
+      nodes: [makeNode("a"), makeNode("b"), makeNode("c")],
+      edges: [makeEdge("e1", "a", "b"), makeEdge("e2", "b", "c")],
+      selectedEdgeLayer: "L2",
+    });
+    useTopologyStore.getState().removeEdge("e1");
+    expect(useTopologyStore.getState().edges.map((e) => e.id)).toEqual(["e2"]);
+  });
+
+  it("removeEdgesIncidentToNodes removes every edge touching any given node id", () => {
+    useTopologyStore.getState().loadCanvas({
+      nodes: [makeNode("a"), makeNode("b"), makeNode("c")],
+      edges: [makeEdge("e1", "a", "b"), makeEdge("e2", "b", "c"), makeEdge("e3", "a", "c")],
+      selectedEdgeLayer: "L2",
+    });
+    useTopologyStore.getState().removeEdgesIncidentToNodes(["a"]);
+    expect(useTopologyStore.getState().edges.map((e) => e.id)).toEqual(["e2"]);
+  });
+
+  it("removeEdgesIncidentToNodes is a no-op for an empty node list", () => {
+    useTopologyStore.getState().loadCanvas({
+      nodes: [makeNode("a"), makeNode("b")],
+      edges: [makeEdge("e1", "a", "b")],
+      selectedEdgeLayer: "L2",
+    });
+    const before = useTopologyStore.getState();
+    useTopologyStore.getState().removeEdgesIncidentToNodes([]);
+    expect(useTopologyStore.getState()).toBe(before);
   });
 
   it("rejectProposalNodes drops proposal nodes and edges, keeping the rest", () => {

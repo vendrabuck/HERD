@@ -13,53 +13,9 @@ the test does not depend on exact seed data/order.
 
 import time
 
-import httpx
-import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_login
-
-
-def _token(page) -> str | None:
-    return page.evaluate("() => window.localStorage.getItem('access_token')")
-
-
-def _api(page, method, path, **kwargs):
-    """Authenticated host-side HERD API request, using the browser's own JWT."""
-    allow_errors = kwargs.pop("allow_errors", False)
-    token = _token(page)
-    headers = kwargs.pop("headers", {}) or {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    url = f"{HOST_BASE_URL}/api{path}"
-    with httpx.Client(verify=False, timeout=30.0) as client:
-        resp = client.request(method, url, headers=headers, **kwargs)
-    if not allow_errors:
-        resp.raise_for_status()
-    return resp
-
-
-def _two_devices_with_ports(page):
-    """Find two distinct seeded devices that each have at least one port.
-
-    Scans devices via the inventory API (same data the ConnectionsPage device
-    search hits) until two qualifying devices are found, capped so a slow or
-    empty inventory skips rather than hangs. Must be called after login: it
-    needs the browser's JWT to call the API.
-    """
-    devices = _api(page, "GET", "/inventory/devices", params={"skip": 0, "limit": 100}).json()[
-        "items"
-    ]
-    found = []
-    for d in devices:
-        ports = _api(page, "GET", f"/inventory/devices/{d['id']}/ports").json()
-        if ports:
-            found.append((d, ports[0]))
-        if len(found) == 2:
-            break
-    if len(found) < 2:
-        pytest.skip("fewer than two seeded devices with ports available")
-    return found[0], found[1]
+from .conftest import HOST_BASE_URL, pw_api, pw_login, pw_two_devices_with_ports
 
 
 def _select_device(page, device_name: str) -> None:
@@ -77,7 +33,8 @@ def _select_device(page, device_name: str) -> None:
 
 def test_connection_create_and_delete(pw_page):
     pw_login(pw_page)
-    (device_a, port_a), (device_b, port_b) = _two_devices_with_ports(pw_page)
+    (device_a, ports_a), (device_b, ports_b) = pw_two_devices_with_ports(pw_page)
+    port_a, port_b = ports_a[0], ports_b[0]
     connection_id = None
     notes = f"e2e-pw-connection-{int(time.time() * 1000)}"
 
@@ -112,7 +69,7 @@ def test_connection_create_and_delete(pw_page):
         expect(first_row).to_contain_text(device_b["name"])
 
         # --- Effect assertion via the cabling API ---
-        listing = _api(
+        listing = pw_api(
             pw_page, "GET", "/cabling/connections", params={"skip": 0, "limit": 10}
         ).json()["items"]
         match = next((c for c in listing if c.get("notes") == notes), None)
@@ -134,9 +91,9 @@ def test_connection_create_and_delete(pw_page):
         expect(pw_page.locator("tr", has_text=notes)).to_have_count(0)
 
         # --- Effect assertion: gone via the API ---
-        gone = _api(pw_page, "GET", f"/cabling/connections/{connection_id}", allow_errors=True)
+        gone = pw_api(pw_page, "GET", f"/cabling/connections/{connection_id}", allow_errors=True)
         assert gone.status_code == 404
         connection_id = None
     finally:
         if connection_id:
-            _api(pw_page, "DELETE", f"/cabling/connections/{connection_id}", allow_errors=True)
+            pw_api(pw_page, "DELETE", f"/cabling/connections/{connection_id}", allow_errors=True)
