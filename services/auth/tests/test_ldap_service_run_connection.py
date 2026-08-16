@@ -335,11 +335,20 @@ async def test_initial_bind_failure_attempts_exactly_one_connect_no_retry(monkey
 
 @pytest.mark.asyncio
 async def test_concurrent_caller_without_holder_never_touches_the_run_holder(monkeypatch):
-    run_entries = {_group_dn(1): _group_entry([_member_dn(1)]), _member_dn(1): _member_entry(1)}
-    outside_entries = {_group_dn(2): _group_entry([_member_dn(2)])}
-    run_conn = _FakeConnection(run_entries)
-    outside_conn = _FakeConnection(outside_entries)
-    constructed = _patch_connection_factory(monkeypatch, [run_conn, outside_conn])
+    # Both fakes serve the UNION of entries: asyncio.gather does not fix
+    # which task reaches the connection factory first, so under a slower
+    # scheduler (CI coverage tracer) the outside caller can be handed the
+    # first fake. Whichever fake each side receives must resolve its group,
+    # or the assert below misfires on ordering rather than on the invariant
+    # under test (two separate connections, never merged).
+    all_entries = {
+        _group_dn(1): _group_entry([_member_dn(1)]),
+        _member_dn(1): _member_entry(1),
+        _group_dn(2): _group_entry([_member_dn(2)]),
+    }
+    conn_a = _FakeConnection(dict(all_entries))
+    conn_b = _FakeConnection(dict(all_entries))
+    constructed = _patch_connection_factory(monkeypatch, [conn_a, conn_b])
 
     async def run_side():
         async with ldap_service.run_connection() as holder:
@@ -361,12 +370,13 @@ async def test_concurrent_caller_without_holder_never_touches_the_run_holder(mon
     await asyncio.gather(run_side(), outside_caller())
 
     # Two SEPARATE connections: the run's shared one (used twice) and the
-    # outside caller's own private one (used once), never merged.
+    # outside caller's own private one (used once), never merged. Which fake
+    # played which role depends on scheduling, so assert on the multiset of
+    # per-connection call counts rather than on a fixed assignment.
     assert len(constructed) == 2
-    assert run_conn.search_calls == 2
-    assert run_conn.bind_calls == 1
-    assert outside_conn.search_calls == 1
-    assert outside_conn.bind_calls == 1
+    assert conn_a.bind_calls == 1
+    assert conn_b.bind_calls == 1
+    assert sorted([conn_a.search_calls, conn_b.search_calls]) == [1, 2]
 
 
 @pytest.mark.asyncio
