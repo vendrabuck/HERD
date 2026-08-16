@@ -6,9 +6,12 @@ interface ModalProps {
   title: string;
   children: React.ReactNode;
   className?: string;
+  // Overrides the default "p-6" body padding; wider dialogs (e.g. the wiring
+  // dialog's three-column layout) need flush edges the default padding breaks.
+  bodyClassName?: string;
 }
 
-export function Modal({ open, onClose, title, children, className }: ModalProps) {
+export function Modal({ open, onClose, title, children, className, bodyClassName }: ModalProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   // Hold the latest onClose in a ref so the native 'cancel' listener below can
   // be installed once and still call the current callback on every invocation.
@@ -56,7 +59,7 @@ export function Modal({ open, onClose, title, children, className }: ModalProps)
           &times;
         </button>
       </div>
-      <div className="p-6">{children}</div>
+      <div className={bodyClassName ?? "p-6"}>{children}</div>
     </dialog>
   );
 }

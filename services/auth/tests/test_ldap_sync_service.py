@@ -75,13 +75,13 @@ def _install_directory(monkeypatch, groups: dict, resolutions: dict) -> None:
     resolutions maps member dn to a resolution | Exception. An Exception in
     the middle of a batch raises mid-batch, exactly like resolve_members."""
 
-    async def fake_fetch_group(group_dn: str):
+    async def fake_fetch_group(group_dn: str, *, run_holder=None):
         value = groups[group_dn]
         if isinstance(value, Exception):
             raise value
         return value
 
-    async def fake_resolve_members(member_dns):
+    async def fake_resolve_members(member_dns, *, run_holder=None):
         out = []
         for member_dn in member_dns:
             value = resolutions[member_dn]
@@ -156,12 +156,12 @@ def _install_presence(monkeypatch, present, disabled=None) -> None:
     """Fake ldap_service.present_emails/disabled_emails. present/disabled are
     a frozenset[str] or an Exception to raise."""
 
-    async def fake_present_emails():
+    async def fake_present_emails(*, run_holder=None):
         if isinstance(present, Exception):
             raise present
         return frozenset(present)
 
-    async def fake_disabled_emails():
+    async def fake_disabled_emails(*, run_holder=None):
         value = disabled if disabled is not None else frozenset()
         if isinstance(value, Exception):
             raise value
@@ -417,10 +417,10 @@ async def test_provision_race_recovered_via_lookup_retry(db, monkeypatch):
     await _mk_mapping(db, group_id)
     real_create = auth_service.create_ldap_user
 
-    async def racing_create(session, email, username):
+    async def racing_create(session, email, username, **kwargs):
         # A concurrent JIT login wins the insert; ours then raises. The
         # retry-as-lookup must find the row and proceed.
-        await real_create(session, email, username)
+        await real_create(session, email, username, **kwargs)
         raise IntegrityError("duplicate email", params=None, orig=Exception("race"))
 
     monkeypatch.setattr(auth_service, "create_ldap_user", racing_create)
@@ -458,18 +458,18 @@ async def test_not_grouped_assignment_failure_rolls_back_and_run_continues(db, m
     group_id = await _mk_group(db)
     await _mk_mapping(db, group_id)
     await _mk_group(db, name="Not Grouped")
-    real_add_member = group_service.add_member
+    real_add_member = group_service._add_member_resolved
     calls = {"n": 0}
 
-    async def flaky_add_member(session, group_id_, user_id_):
+    async def flaky_add_member(session, group_id_, user_id_, not_grouped_id_):
         calls["n"] += 1
         if calls["n"] == 1:
             session.add(GroupMember(group_id=group_id_, user_id=user_id_))
             session.add(GroupMember(group_id=group_id_, user_id=user_id_))
             return await session.commit()
-        return await real_add_member(session, group_id_, user_id_)
+        return await real_add_member(session, group_id_, user_id_, not_grouped_id_)
 
-    monkeypatch.setattr(group_service, "add_member", flaky_add_member)
+    monkeypatch.setattr(group_service, "_add_member_resolved", flaky_add_member)
     _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
 
     run = await ldap_sync_service.run_sync(db)
@@ -693,12 +693,12 @@ async def test_add_integrity_error_with_existing_row_is_benign_noop(db, monkeypa
     await _mk_mapping(db, group_id)
     await _mk_user(db, 1)
 
-    async def racing_add(session, group_id_, user_id_):
+    async def racing_add(session, group_id_, user_id_, not_grouped_id_):
         session.add(GroupMember(group_id=group_id_, user_id=user_id_))
         await session.commit()
         raise IntegrityError("Duplicate membership", params=None, orig=None)
 
-    monkeypatch.setattr(group_service, "add_member", racing_add)
+    monkeypatch.setattr(group_service, "_add_member_resolved", racing_add)
     _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
 
     run = await ldap_sync_service.run_sync(db)
@@ -719,10 +719,10 @@ async def test_add_integrity_error_without_row_is_op_failure(db, monkeypatch):
     await _mk_mapping(db, group_id)
     await _mk_user(db, 1)
 
-    async def phantom_add(session, group_id_, user_id_):
+    async def phantom_add(session, group_id_, user_id_, not_grouped_id_):
         raise IntegrityError("Duplicate membership", params=None, orig=None)
 
-    monkeypatch.setattr(group_service, "add_member", phantom_add)
+    monkeypatch.setattr(group_service, "_add_member_resolved", phantom_add)
     _install_directory(monkeypatch, {_GROUP_DN: _entry([_dn(1)])}, {_dn(1): _resolved(1)})
 
     run = await ldap_sync_service.run_sync(db)
@@ -741,14 +741,14 @@ async def test_other_op_failure_is_isolated_and_loop_continues(db, monkeypatch):
     await _mk_mapping(db, group_id)
     bad = await _mk_user(db, 1)
     good = await _mk_user(db, 2)
-    real_add = group_service.add_member
+    real_add = group_service._add_member_resolved
 
-    async def flaky_add(session, group_id_, user_id_):
+    async def flaky_add(session, group_id_, user_id_, not_grouped_id_):
         if user_id_ == bad:
             raise RuntimeError("db hiccup")
-        return await real_add(session, group_id_, user_id_)
+        return await real_add(session, group_id_, user_id_, not_grouped_id_)
 
-    monkeypatch.setattr(group_service, "add_member", flaky_add)
+    monkeypatch.setattr(group_service, "_add_member_resolved", flaky_add)
     _install_directory(
         monkeypatch,
         {_GROUP_DN: _entry([_dn(1), _dn(2)])},
@@ -796,7 +796,7 @@ async def test_running_row_is_committed_before_directory_work(db, monkeypatch):
     await _mk_mapping(db, group_id)
     observed = {}
 
-    async def probing_fetch(group_dn):
+    async def probing_fetch(group_dn, *, run_holder=None):
         # By the time the directory is first asked, the run row must already
         # be committed with status "running" (the crash-corpse guarantee).
         observed["status"] = (await db.execute(select(LdapSyncRun.status))).scalar_one()
@@ -1243,3 +1243,80 @@ async def test_execute_run_cancelled_mid_reconcile_commits_failed_with_cancelled
             "the CancelledError arm's db.rollback() exists to discard it "
             "before the finally's commit"
         )
+
+
+@pytest.mark.asyncio
+async def test_execute_run_cancelled_with_broken_finalize_commit_still_raises_cancelled(
+    db, monkeypatch, caplog
+):
+    """Post-merge review batch item 3: a cancellation can leave the session
+    broken enough that the finally's OWN finalize commit also raises (the
+    scenario is a shutdown cancel interrupting an in-flight asyncpg call).
+    Before the fix, that new exception replaced the propagating
+    CancelledError (Python's finally-supersedes-try rule), so
+    main.py's `except asyncio.CancelledError: pass` never matched it and the
+    run row was stranded at status "running" forever.
+
+    This test stalls _reconcile_mapping exactly like the sibling
+    cancellation test above, but ALSO makes db.commit raise the one time it
+    is called after cancellation (the finally's finalize commit; nothing
+    else commits between task creation and cancellation, since the
+    CancelledError arm calls db.rollback(), not commit). The awaiting
+    caller must still observe CancelledError, not the commit's
+    RuntimeError, and the commit failure must be logged.
+    """
+    import logging
+
+    group = UserGroup(name="Cancel Commit Test")
+    db.add(group)
+    await db.commit()
+    group_id = group.id
+    mapping = LdapGroupMapping(
+        group_dn=_GROUP_DN, directory_name="herd-eng", herd_group_id=group_id
+    )
+    db.add(mapping)
+    await db.commit()
+
+    entered = asyncio.Event()
+
+    async def stalled_reconcile(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ldap_sync_service, "_reconcile_mapping", stalled_reconcile)
+
+    # create_run's own commit must succeed normally; only commits AFTER
+    # this point (i.e. only the finally's finalize commit, in this stalled
+    # scenario) should raise.
+    run = await ldap_sync_service.create_run(db, "manual")
+    run_id = run.id
+
+    commit_calls = {"n": 0}
+
+    async def failing_commit():
+        commit_calls["n"] += 1
+        raise RuntimeError("session broken by the cancelled await")
+
+    monkeypatch.setattr(db, "commit", failing_commit)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.ldap_sync_service"):
+        task = asyncio.create_task(ldap_sync_service.execute_run(db, run))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # The caller saw CancelledError (asserted above by pytest.raises), not
+    # the commit's RuntimeError, and the finalize commit was attempted
+    # exactly once and its failure was logged with exc_info.
+    assert commit_calls["n"] == 1
+    logged = [r for r in caplog.records if "LDAP sync run finalize commit failed" in r.getMessage()]
+    assert len(logged) == 1
+    assert logged[0].exc_info is not None
+
+    async with TestSessionLocal() as check_db:
+        reloaded = await check_db.get(LdapSyncRun, run_id)
+        assert reloaded is not None
+        # Never reached its terminal status: the finalize commit that would
+        # have written "failed" itself raised.
+        assert reloaded.status == "running"

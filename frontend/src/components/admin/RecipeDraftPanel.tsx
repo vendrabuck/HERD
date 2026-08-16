@@ -4,12 +4,7 @@ import { useCreateDriver } from "@/api/drivers";
 import { recipePackageFile, useDraftRecipe, useRefineRecipeDraft } from "@/api/recipes";
 import { Modal } from "@/components/ui/Modal";
 import type { RecipeDraftResponse, RecipeValidationReport } from "@/types/ai.types";
-
-function errorDetail(err: unknown, fallback: string): string {
-  return (
-    (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? fallback
-  );
-}
+import { errorDetail } from "@/lib/errors";
 
 export function RecipeDraftPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [prompt, setPrompt] = useState("");

@@ -9,6 +9,8 @@ import {
   ConnectionMode,
   useReactFlow,
   type Connection,
+  type Edge,
+  type EdgeChange,
   type Node,
   type OnConnect,
 } from "@xyflow/react";
@@ -32,7 +34,8 @@ import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowse
 import { FloatingPanel } from "@/components/ui/FloatingPanel";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CreateReservationModal } from "@/components/reservations/CreateReservationModal";
-import { ConnectionModal } from "@/components/topology-editor/ConnectionModal";
+import { WiringDialog, type SessionConnection } from "@/components/topology-editor/WiringDialog";
+import { QuickConnectPopover } from "@/components/topology-editor/QuickConnectPopover";
 import { AIDialog } from "@/components/topology-editor/AIDialog";
 import { AICommitDialog } from "@/components/topology-editor/AICommitDialog";
 import { AIProposalBar } from "@/components/topology-editor/AIProposalBar";
@@ -50,7 +53,12 @@ import apiClient from "@/api/client";
 import { DeviceNode } from "@/components/topology-editor/nodes/DeviceNode";
 import { DynamicPlaceholderNode } from "@/components/topology-editor/nodes/DynamicPlaceholderNode";
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
-import type { Device } from "@/types/device.types";
+import { BundledEdge } from "@/components/topology-editor/edges/BundledEdge";
+import { groupEdgesForRender } from "@/components/topology-editor/edges/groupEdgesForRender";
+import { LAYER_OPTIONS } from "@/components/topology-editor/edges/layerStyles";
+import { resolveEdgeStroke } from "@/components/topology-editor/edges/edgeStatus";
+import { genId } from "@/lib/id";
+import type { Device, TopologyType } from "@/types/device.types";
 import type { AIGenerateResponse } from "@/types/ai.types";
 import type { ForkConflictDetail } from "@/types/reservation.types";
 import type {
@@ -68,19 +76,40 @@ interface PendingConnection {
   connection: Connection;
   sourceDeviceId: string;
   sourceDeviceName: string;
+  sourceTopologyType: TopologyType;
   targetDeviceId: string;
   targetDeviceName: string;
+  targetTopologyType: TopologyType;
+  // Which surface is currently showing for this pending connection (issue
+  // #517 review round 3 item 12.4). Replaces a separate popoverEscalated
+  // boolean plus its own four reset call sites: since this lives ON the
+  // pending connection itself, clearing pendingConnection to null (every
+  // confirm/cancel path already does that) resets it for free, with nothing
+  // extra to remember to reset.
+  surface: "quick" | "dialog";
 }
 
 const nodeTypes = { deviceNode: DeviceNode, dynamicPlaceholderNode: DynamicPlaceholderNode };
-const edgeTypes = { layerEdge: LayerEdge };
+const edgeTypes = { layerEdge: LayerEdge, bundledEdge: BundledEdge };
 
 // Placeholder nodes are canvas-local planning artifacts: no inventory device
 // id, no cabling, never persisted as devices or wiring.
 const isDynamicPlaceholder = (node: Node<CanvasNodeData>) =>
   node.type === "dynamicPlaceholderNode";
 
-const LAYER_OPTIONS: EdgeLayerType[] = ["L1", "L2", "L3"];
+// React Flow annotates edges it manages as a controlled component with its
+// own transient fields (selected, animated, style, zIndex); none of these
+// are application data HERD ever intentionally sets (LayerEdge computes its
+// own styling from `data`, never from `edge.style`). Persisting them is a
+// real bug, not a cosmetic one (issue #517 review item 1): a bundle that
+// picked up `selected: true` via a click has no way for React Flow to ever
+// ask for it to be cleared again (see groupEdgesForRender's doc comment), so
+// without this strip a save could bake a stale `selected: true` into
+// canvas_data and a later reload would render that edge pre-selected.
+function stripTransientEdgeFields(edge: Edge<LayerEdgeData>): Edge<LayerEdgeData> {
+  const { selected: _selected, animated: _animated, style: _style, zIndex: _zIndex, ...rest } = edge;
+  return rest;
+}
 
 const LAYER_DESCRIPTIONS: Record<EdgeLayerType, string> = {
   L1: "Physical / fiber",
@@ -127,10 +156,12 @@ function TopologyEditorInner() {
     onNodesChange,
     onEdgesChange,
     addEnrichedEdge,
+    addEnrichedEdges,
     addDeviceNode,
+    removeEdgesIncidentToNodes,
     selectedEdgeLayer,
     setSelectedEdgeLayer,
-    updateEdgePathStatus,
+    updateEdgePathStatuses,
     clearTopology,
     loadCanvas,
     acceptProposalNodes,
@@ -170,11 +201,83 @@ function TopologyEditorInner() {
 
   const { data: pathfindResults } = usePathfindPairs(pathfindPairs);
 
+  // Render-only view of the canvas edges (issue #517): two or more edges
+  // sharing a device pair collapse into one bundledEdge with a count badge.
+  // The underlying store (edges above) is untouched, still one object per
+  // connection with its own id; only what React Flow paints changes.
+  // bundleMembers maps a synthetic bundle id back to its real member edge
+  // ids, so selection/Delete on a bundle can be expanded before it reaches
+  // the store (review item 3: an unexpanded change against a bundle id is a
+  // no-op on the store, an undeletable, unselectable bundle).
+  const { renderEdges, bundleMembers } = useMemo(
+    () => groupEdgesForRender(edges, isReadOnly),
+    [edges, isReadOnly],
+  );
+
+  // A select or remove EdgeChange targeting a bundle id is expanded into the
+  // same change against every one of its member ids before forwarding to
+  // the store; changes targeting a real edge id (the common case, a single
+  // unbundled connection) pass through unchanged.
+  //
+  // A 'replace' change is deliberately NOT expanded (issue #517 review round
+  // 3 item 11): its `item` field is the edge React Flow wants written into
+  // that slot, and for a bundle change that item IS THE SYNTHETIC BUNDLE
+  // OBJECT (the `{ members: [...] }` shape from groupEdgesForRender), never
+  // a real per-member edge. Expanding it would write that synthetic shape
+  // into a real store edge's slot, corrupting it. Passed through untouched
+  // instead: applyEdgeChanges looks the change up by id, finds no matching
+  // store edge (bundle ids are synthetic and never appear in the store), and
+  // no-ops harmlessly.
+  const handleEdgesChange = useCallback(
+    (changes: EdgeChange[]) => {
+      const expanded = changes.flatMap((change) => {
+        if ("id" in change && bundleMembers.has(change.id)) {
+          if (change.type === "select" || change.type === "remove") {
+            return bundleMembers.get(change.id)!.map((id) => ({ ...change, id }));
+          }
+          return [change];
+        }
+        return [change];
+      });
+      onEdgesChange(expanded);
+    },
+    [onEdgesChange, bundleMembers],
+  );
+
+  // Belt-and-suspenders for node deletion (review item 3, re-examined in the
+  // item-1 follow-up review once bundle.selected became state-faithful):
+  // React Flow's own incident-edge computation for a deleted node runs
+  // against the CURRENT `edges` prop, which is the bundled render view
+  // here, so relying solely on it (even via handleEdgesChange above) to
+  // reach every real member edge is not something to trust blindly. Kept
+  // deliberately rather than removed: every vitest test in this codebase
+  // (including this file's own) mocks React Flow itself out entirely, so
+  // there is no test-level way to prove real React Flow's internal
+  // deleteElements/incident-edge logic would still reach bundle members
+  // correctly now that selection is faithful; that can only be live-gated
+  // against a real browser. Empirically removing this handler and rerunning
+  // the node-delete test does fail it (confirmed before restoring), which
+  // at minimum proves the mocked harness itself has no other path to the
+  // same guarantee. This explicit handler removes every store edge touching
+  // a deleted node directly, independent of whatever React Flow itself
+  // decided to emit, so the guarantee holds regardless of the answer to
+  // that untestable question.
+  const handleNodesDelete = useCallback(
+    (deleted: Node[]) => {
+      removeEdgesIncidentToNodes(deleted.map((n) => n.id));
+    },
+    [removeEdgesIncidentToNodes],
+  );
+
   // Reconcile pathfind results back onto each edge so LayerEdge renders the
   // right color and label. Treats persisted pathValid as a stale cache: every
-  // canvas load triggers a fresh resolution.
+  // canvas load triggers a fresh resolution. Batched into one store commit
+  // (issue #517 review item 10a): the previous per-edge updateEdgePathStatus
+  // call was one set() (and one re-render) per changed edge on every
+  // pathfind response, which scales badly with edge count.
   useEffect(() => {
     if (!pathfindResults) return;
+    const updates = new Map<string, { pathValid: boolean | null; hopCount?: number }>();
     for (const edge of edges) {
       if (edge.data?.isProposal) continue;
       const src = nodeIdToDeviceId.get(edge.source);
@@ -185,20 +288,20 @@ function TopologyEditorInner() {
       const reachable = result.reachable;
       const hops = result.hop_count;
       if (edge.data?.pathValid !== reachable || edge.data?.pathHopCount !== hops) {
-        updateEdgePathStatus(edge.id, reachable, hops);
+        updates.set(edge.id, { pathValid: reachable, hopCount: hops });
       }
     }
-  }, [pathfindResults, edges, nodeIdToDeviceId, updateEdgePathStatus]);
+    if (updates.size > 0) updateEdgePathStatuses(updates);
+  }, [pathfindResults, edges, nodeIdToDeviceId, updateEdgePathStatuses]);
 
   // Disable the Reserve button when any committed edge is invalid. The
-  // reservations service enforces the same rule server-side; this is UX only.
+  // reservations service enforces the same rule server-side; this is UX
+  // only. Uses resolveEdgeStroke's own isInvalid (issue #517 review round 3
+  // item 12.7) instead of re-deriving the same pathValid/portsCabled
+  // precedence inline, so this can never drift from what LayerEdge/
+  // BundledEdge actually render as red.
   const invalidEdges = useMemo(
-    () =>
-      edges.filter(
-        (e) =>
-          !e.data?.isProposal &&
-          (e.data?.pathValid === false || e.data?.portsCabled === false),
-      ),
+    () => edges.filter((e) => !e.data?.isProposal && resolveEdgeStroke(e.data).isInvalid),
     [edges],
   );
   const hasInvalidEdges = invalidEdges.length > 0;
@@ -208,6 +311,39 @@ function TopologyEditorInner() {
   const [showAIDialog, setShowAIDialog] = useState(false);
   const [showAICommit, setShowAICommit] = useState(false);
   const [pendingConnection, setPendingConnection] = useState<PendingConnection | null>(null);
+  // Entry-point resolution (issue #517 addendum decision 1 left the concrete
+  // trigger open): the full wiring dialog is the primary post-draw surface.
+  // "Quick connect" is a toolbar toggle that, while on, opens the compact
+  // popover instead for the next drawn line; the popover's own "Open wiring
+  // dialog" link escalates a single in-flight connection back to the full
+  // dialog without losing the device pair.
+  const [quickConnectMode, setQuickConnectMode] = useState(false);
+
+  // Cross-session duplicate prevention (issue #517 review item 8, scope
+  // corrected in review round 3 item 5): a port already used by ANY
+  // non-proposal canvas edge incident to a pending device is unavailable in
+  // a fresh dialog session, regardless of who the OTHER end of that edge
+  // is. A port used to wire the pending device to some THIRD device is just
+  // as physically spoken-for as one already wired to the current
+  // counterpart; scoping this to only edges between the exact pending pair
+  // (the original implementation) missed that case entirely.
+  const existingWiredPortIds = useMemo(() => {
+    const sourcePortIds = new Set<string>();
+    const targetPortIds = new Set<string>();
+    if (!pendingConnection) return { sourcePortIds, targetPortIds };
+    const { source: pendingSourceNode, target: pendingTargetNode } = pendingConnection.connection;
+    for (const e of edges) {
+      if (e.data?.isProposal) continue;
+      const srcPortId = e.data?.source_port_id;
+      const tgtPortId = e.data?.target_port_id;
+      if (e.source === pendingSourceNode && srcPortId) sourcePortIds.add(srcPortId);
+      if (e.target === pendingSourceNode && tgtPortId) sourcePortIds.add(tgtPortId);
+      if (e.source === pendingTargetNode && srcPortId) targetPortIds.add(srcPortId);
+      if (e.target === pendingTargetNode && tgtPortId) targetPortIds.add(tgtPortId);
+    }
+    return { sourcePortIds, targetPortIds };
+  }, [edges, pendingConnection]);
+
   const [pendingProposal, setPendingProposal] = useState<AIGenerateResponse | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [showSaveAsTemplate, setShowSaveAsTemplate] = useState(false);
@@ -272,15 +408,23 @@ function TopologyEditorInner() {
   // save, fork save, fork autosave): they are not devices or wiring, only a
   // reserve-time planning aid. Edges touching one are refused at draw time;
   // the edge filter here is belt and braces.
+  // Stripping is memoized separately, keyed on [edges] alone (issue #517
+  // review round 3 item 12.6): it does not depend on nodes or
+  // selectedEdgeLayer at all, so recomputing it whenever THOSE change (as a
+  // single combined memo below would) is wasted work.
+  const strippedEdges = useMemo(() => edges.map(stripTransientEdgeFields), [edges]);
+
   const persistableCanvas = useMemo<CanvasData>(() => {
     const placeholderIds = new Set(nodes.filter(isDynamicPlaceholder).map((n) => n.id));
-    if (placeholderIds.size === 0) return { nodes, edges, selectedEdgeLayer };
     return {
-      nodes: nodes.filter((n) => !placeholderIds.has(n.id)),
-      edges: edges.filter((e) => !placeholderIds.has(e.source) && !placeholderIds.has(e.target)),
+      nodes: placeholderIds.size === 0 ? nodes : nodes.filter((n) => !placeholderIds.has(n.id)),
+      edges:
+        placeholderIds.size === 0
+          ? strippedEdges
+          : strippedEdges.filter((e) => !placeholderIds.has(e.source) && !placeholderIds.has(e.target)),
       selectedEdgeLayer,
     };
-  }, [nodes, edges, selectedEdgeLayer]);
+  }, [nodes, strippedEdges, selectedEdgeLayer]);
 
   // Debounced fork-draft autosave: PUTs the loose canvas a couple of seconds
   // after edits pause and flushes on unmount. Enabled only for an editable
@@ -374,9 +518,7 @@ function TopologyEditorInner() {
 
         const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
         const placeholder: Node<DynamicPlaceholderNodeData> = {
-          id:
-            self.crypto?.randomUUID?.() ??
-            `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+          id: genId(),
           type: "dynamicPlaceholderNode",
           position,
           data: {
@@ -404,7 +546,7 @@ function TopologyEditorInner() {
       });
 
       const newNode: Node<DeviceNodeData> = {
-        id: self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+        id: genId(),
         type: "deviceNode",
         position,
         data: {
@@ -441,13 +583,23 @@ function TopologyEditorInner() {
         connection,
         sourceDeviceId: sourceDevice.id,
         sourceDeviceName: sourceDevice.name,
+        sourceTopologyType: sourceDevice.topology_type,
         targetDeviceId: targetDevice.id,
         targetDeviceName: targetDevice.name,
+        targetTopologyType: targetDevice.topology_type,
+        surface: quickConnectMode ? "quick" : "dialog",
       });
     },
-    [isReadOnly, nodes]
+    [isReadOnly, nodes, quickConnectMode]
   );
 
+  // Quick-connect popover confirm: one line, same shape as the AI proposal
+  // path and the wiring dialog's per-line data. Routed through
+  // addEnrichedEdges (the same bulk, always-appends path the wiring dialog
+  // uses) rather than addEnrichedEdge/addEdge, whose connectionExists guard
+  // silently refuses a second edge on identical source/target handles
+  // (review item 5): re-wiring an already-connected device pair from the
+  // popover would otherwise drop the second line with no error at all.
   const handleConnectionConfirm = useCallback(
     (data: LayerEdgeData) => {
       if (!pendingConnection) return;
@@ -458,14 +610,44 @@ function TopologyEditorInner() {
         ...data,
         pathValid: null,
       };
-      addEnrichedEdge(conn, edgeData);
+      addEnrichedEdges([{ connection: conn, data: edgeData }]);
       setPendingConnection(null);
     },
-    [pendingConnection, addEnrichedEdge]
+    [pendingConnection, addEnrichedEdges]
+  );
+
+  // Full wiring dialog confirm: every session line becomes its own enriched
+  // edge, added to the canvas store in a single commit (never collapsed into
+  // one stored object; see topologyStore.addEnrichedEdges).
+  const handleWiringConfirm = useCallback(
+    (connections: SessionConnection[]) => {
+      if (!pendingConnection) return;
+      const conn = pendingConnection.connection;
+      addEnrichedEdges(
+        connections.map((line) => ({
+          connection: conn,
+          data: {
+            layer: line.layer,
+            source_port_id: line.sourcePortId,
+            source_port_name: line.sourcePortName,
+            target_port_id: line.targetPortId,
+            target_port_name: line.targetPortName,
+            portsCabled: line.portsCabled,
+            pathValid: null,
+          } satisfies LayerEdgeData,
+        })),
+      );
+      setPendingConnection(null);
+    },
+    [pendingConnection, addEnrichedEdges]
   );
 
   const handleConnectionCancel = useCallback(() => {
     setPendingConnection(null);
+  }, []);
+
+  const handleEscalateToWiringDialog = useCallback(() => {
+    setPendingConnection((pc) => (pc ? { ...pc, surface: "dialog" } : pc));
   }, []);
 
   const handleAIProposal = useCallback(
@@ -505,8 +687,7 @@ function TopologyEditorInner() {
 
       response.devices.forEach((proposed, idx) => {
         const resolved = proposed.device as Device;
-        const nodeId =
-          self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+        const nodeId = genId();
         const node: Node<DeviceNodeData> = {
           id: nodeId,
           type: "deviceNode",
@@ -781,6 +962,19 @@ function TopologyEditorInner() {
               </button>
             ))}
           </div>
+          <div className="w-px h-5 bg-gray-300" />
+          <button
+            onClick={() => setQuickConnectMode((v) => !v)}
+            aria-pressed={quickConnectMode}
+            title="When on, drawing a line opens the compact quick-connect popover instead of the full wiring dialog"
+            className={`text-sm px-3 py-1 rounded font-medium transition-colors ${
+              quickConnectMode
+                ? "bg-blue-600 text-white"
+                : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+            }`}
+          >
+            Quick connect
+          </button>
           <div className="ml-auto flex items-center gap-2">
             {aiStatus?.enabled && (
               <button
@@ -895,9 +1089,10 @@ function TopologyEditorInner() {
             onDrop={onDrop}
             onDragOver={onDragOver}
             nodes={nodes}
-            edges={edges}
+            edges={renderEdges}
             onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
+            onEdgesChange={handleEdgesChange}
+            onNodesDelete={handleNodesDelete}
             onConnect={handleConnect}
             isValidConnection={isValidConnection}
             nodeTypes={nodeTypes}
@@ -961,15 +1156,35 @@ function TopologyEditorInner() {
           }}
         />
 
-        {pendingConnection && (
-          <ConnectionModal
+        {pendingConnection && pendingConnection.surface === "quick" && (
+          <QuickConnectPopover
             open={!!pendingConnection}
             sourceDeviceId={pendingConnection.sourceDeviceId}
             sourceDeviceName={pendingConnection.sourceDeviceName}
             targetDeviceId={pendingConnection.targetDeviceId}
             targetDeviceName={pendingConnection.targetDeviceName}
             defaultLayer={selectedEdgeLayer}
+            existingWiredSourcePortIds={existingWiredPortIds.sourcePortIds}
+            existingWiredTargetPortIds={existingWiredPortIds.targetPortIds}
             onConfirm={handleConnectionConfirm}
+            onCancel={handleConnectionCancel}
+            onEscalate={handleEscalateToWiringDialog}
+          />
+        )}
+
+        {pendingConnection && pendingConnection.surface === "dialog" && (
+          <WiringDialog
+            open={!!pendingConnection}
+            sourceDeviceId={pendingConnection.sourceDeviceId}
+            sourceDeviceName={pendingConnection.sourceDeviceName}
+            sourceTopologyType={pendingConnection.sourceTopologyType}
+            targetDeviceId={pendingConnection.targetDeviceId}
+            targetDeviceName={pendingConnection.targetDeviceName}
+            targetTopologyType={pendingConnection.targetTopologyType}
+            defaultLayer={selectedEdgeLayer}
+            existingWiredSourcePortIds={existingWiredPortIds.sourcePortIds}
+            existingWiredTargetPortIds={existingWiredPortIds.targetPortIds}
+            onConfirm={handleWiringConfirm}
             onCancel={handleConnectionCancel}
           />
         )}

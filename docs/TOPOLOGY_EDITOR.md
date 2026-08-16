@@ -37,15 +37,40 @@ Nodes can be repositioned by dragging. Positions are saved with the topology whe
 
 ## Drawing connections
 
-Click-and-drag from one device's handle to another's. A **Connection Modal** opens:
+Click-and-drag from one device's handle to another's to open the **wiring dialog**, titled
+"Wire {source} to {target}". It shows the source device's ports as a column on the left,
+the target device's ports as a column on the right, and an open wiring area between them,
+so you can wire any number of port pairs in one session instead of one round trip per
+connection.
 
-1. Pick the layer: `L1`, `L2`, or `L3`.
-   - `L1`: physical cabling.
-   - `L2`: Ethernet / VLAN link.
-   - `L3`: IP / routing.
-2. Pick a port on each device. The port dropdowns show all ports on the device.
-3. Each port is labeled with whether it has an upstream physical cable. Ports with no cable show a `(no cable)` suffix and a warning.
-4. Click **Connect** to add the edge.
+1. Draw a line between a port on each side: either drag from one port to the other, or
+   click a free port then click its counterpart (the click-to-connect path works
+   identically, useful without a mouse). Each drawn line gets a small `L1`/`L2`/`L3` pill
+   at its midpoint; click the pill to change that line's layer or delete it. A "New
+   lines" control in the header sets the default layer for lines you draw next.
+2. Ports already used, either by an earlier line in this session or by an existing canvas
+   edge, are grayed out and tagged `WIRED`; clicking one explains why instead of letting
+   you reuse it. A port with a registered physical cable is tagged `CABLED`
+   (informational only, still selectable); an uncabled port is tagged `no cable`
+   (informational too, mirroring the old `(no cable)` warning).
+3. **Connect 1:1 in order** pairs every remaining free port on both sides top to bottom in
+   one click, for the common case of wiring two same-size switches straight across.
+4. **Review (N)** expands a summary strip listing every line before you commit.
+5. Click **Add N connections** to add every drawn line to the canvas at once. **Cancel**
+   or the dialog's close button discards the whole session.
+
+When two or more connections end up between the same device pair, the canvas renders them
+as one bundled edge with a count badge (for example "3 connections"); click the badge to
+expand the per-connection list, which also shows each connection's own path/cabling
+status and its own delete control.
+
+### Quick connect
+
+For a single connection, toggle **Quick connect** in the toolbar before drawing a line. It
+opens a compact popover instead of the full dialog: pick one port on each side and a
+layer, then **Connect**. The popover's **Open wiring dialog** link escalates to the full
+dialog for the same device pair without losing your place, if you decide you want to wire
+more than one pair after all.
 
 ### Topology-type enforcement
 
@@ -121,7 +146,9 @@ If the AI orchestrator is configured, the toolbar includes a **Use AI** button. 
 - Select node: click
 - Multi-select: shift-click or drag-box
 - Delete selected: `Delete` (the editor binds only `Delete`; `Backspace` does not delete)
-- Connect: drag from node handle to another node
+- Connect: drag from node handle to another node, opening the wiring dialog; inside the
+  dialog, wire a port pair by dragging between the two columns or clicking a port on each
+  side in turn
 - Zoom: mouse wheel, or the `+`/`-` controls in the bottom-left of the canvas. The mini-map sits in the bottom-right and is view-only (no zoom buttons of its own).
 
 ## Common issues

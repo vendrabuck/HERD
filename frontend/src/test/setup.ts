@@ -13,6 +13,19 @@ if (typeof HTMLDialogElement !== "undefined") {
   };
 }
 
+// jsdom has no ResizeObserver. react-window (the wiring dialog's port-column
+// virtualization) references it unconditionally on mount; without a stub
+// every test that renders a virtualized list throws before assertions run.
+// A no-op is fine here: tests drive layout via each row's own defaultHeight
+// fallback, not real resize events.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class ResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
 beforeAll(() => server.listen({ onUnhandledRequest: "bypass" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());

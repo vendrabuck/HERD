@@ -15,11 +15,7 @@ import type {
 import type { CanvasData } from "@/types/topology.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
-
-function errorDetail(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  return typeof detail === "string" ? detail : fallback;
-}
+import { errorDetail } from "@/lib/errors";
 
 async function fetchPaginatedReservations(
   skip = 0,

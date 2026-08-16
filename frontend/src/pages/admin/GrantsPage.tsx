@@ -8,21 +8,12 @@ import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { Grant, GrantCreate } from "@/types/acl.types";
+import { errorDetail } from "@/lib/errors";
 
 const RESOURCE_TYPES: Grant["resource_type"][] = ["device", "topology", "reservation", "secret"];
 const PERMISSIONS: Grant["permission"][] = ["view", "manage"];
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-
-// The acl service returns error detail as either a string or, on a pydantic
-// validation failure (e.g. a non-UUID resource_id), a list of error objects.
-// Passing that list straight to toast.error renders raw objects as a React
-// child and throws inside the Toaster, which sits outside the ErrorBoundary
-// in App.tsx and blanks the app. Only ever surface a string.
-function errorDetail(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  return typeof detail === "string" ? detail : fallback;
-}
 
 export function GrantsPage() {
   const user = useAuthStore((s) => s.user);
