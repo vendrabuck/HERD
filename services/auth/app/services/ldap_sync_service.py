@@ -21,8 +21,10 @@ asymmetric; each tier acts on exactly what was proven:
 - Apply failures are isolated per operation: one racing add or remove is
   counted and the loop continues; it never fails the run.
 
-Changes apply ONLY through group_service.add_member / remove_member so sync
-reproduces manual admin behavior (the "Not Grouped" auto-remove included),
+Changes apply ONLY through group_service._add_member_resolved (the same
+core logic add_member's public wrapper delegates to, issue #513 item 9) /
+remove_member so sync reproduces manual admin behavior (the "Not Grouped"
+auto-remove included),
 and only auth_source == "ldap" AND is_active users are visible to the sync
 in either direction (an admin-deactivated user is invisible to membership
 sync just like a local account; phase 4's sweep owns is_active transitions).
@@ -52,9 +54,11 @@ deactivated_by_sync=False, admin intent outranking the directory.
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import select, text, update
+from herd_common import advisory_lock
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
@@ -99,6 +103,82 @@ SWEEP_REASON_BREAKER_TRIPPED = "breaker_tripped"
 _REMOVAL_SUPPRESSING_REASONS = frozenset(
     {ldap_service.MEMBER_SKIP_MISSING_EMAIL, ldap_service.MEMBER_SKIP_MISSING_USERNAME}
 )
+
+
+@dataclass(frozen=True)
+class _RunIdentityOutcome:
+    """One email's _ensure_ldap_user classification, memoized for the rest
+    of the run (issue #513 item 2): a user in N mapped groups is resolved
+    once, and every later group's occurrence replays this outcome against
+    ITS OWN group_dn/member_dn instead of repeating the DB round trip.
+
+    user_id is None for a skip (identity_cache holds skip_reason too).
+    Whether an outcome is safe to cache is NOT decided here or at each call
+    site: see _cache_outcome and _CACHEABLE_SKIP_REASONS below, the single
+    structural gate every write to identity_cache goes through (issue #513
+    round-3 item 1). A resolved success is always cached: the identity
+    email-to-user_id mapping is a structural fact (an email does not
+    change which row it names mid-run). A skip is cached only when its
+    reason names something this app treats as immutable once a user is
+    created (auth_source; verified by grep, no code path reassigns it).
+    MEMBER_SKIP_USER_INACTIVE and MEMBER_SKIP_USERNAME_TAKEN are both
+    EXCLUDED: is_active is flipped by a live, concurrent admin endpoint
+    this reconciler does not coordinate with, and a cached inactive skip
+    combined with _reconcile_mapping's LIVE current_ids query stretches
+    what was a millisecond-scale race at HEAD into a whole-run-scale one
+    (a reactivation mid-run could spuriously remove a member; see
+    _reconcile_mapping's stale-add/stale-remove re-verification for the
+    other half of that fix). USERNAME_TAKEN is not stable either: a later
+    member's drift repair can free the blocked username (round-2 item 5).
+    PROVISION_RACE_RECOVERED and a drift collision are not cached AS a
+    distinct outcome kind: both resolve to plain success (user_id set,
+    skip_reason None), exactly what an uncached second occurrence's own
+    independent lookup would have observed anyway (get_user_by_email finds
+    the already-settled row), so caching success for them costs nothing.
+    """
+
+    user_id: uuid.UUID | None
+    skip_reason: str | None = None
+
+
+# The ONLY skip reasons safe to memoize across the whole run (issue #513
+# round-3 item 1): each one names a fact this application treats as
+# immutable once a user row exists. auth_source is set once at creation
+# (create_user / create_ldap_user) and never reassigned by any router or
+# service in this codebase (verified by grep over services/auth/app);
+# MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT is therefore safe. Deliberately
+# NOT here: MEMBER_SKIP_USER_INACTIVE (is_active is admin-mutable live, see
+# _RunIdentityOutcome) and MEMBER_SKIP_USERNAME_TAKEN (not stable, round-2
+# item 5). A future skip reason is UNCACHED by default: it must be added
+# here deliberately, with the same immutability argument, not by
+# copy-pasting an existing cache-write call site.
+_CACHEABLE_SKIP_REASONS: frozenset[str] = frozenset({MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT})
+
+
+def _cache_outcome(
+    identity_cache: dict[str, _RunIdentityOutcome],
+    email: str,
+    user_id: uuid.UUID | None,
+    skip_reason: str | None = None,
+) -> None:
+    """The SINGLE point that writes into identity_cache. A success
+    (skip_reason None) is always cached; a skip is cached only when
+    skip_reason is in _CACHEABLE_SKIP_REASONS. Every classification branch
+    in this module (_ensure_ldap_user's snapshot path, _finalize_ldap_user,
+    _provision_or_recover) calls this instead of constructing
+    _RunIdentityOutcome and assigning into identity_cache directly, so the
+    cacheable set is enforced in ONE place, not re-decided (and
+    potentially miscopied) at each of what used to be seven call sites.
+    """
+    if skip_reason is None or skip_reason in _CACHEABLE_SKIP_REASONS:
+        identity_cache[email] = _RunIdentityOutcome(user_id, skip_reason)
+
+
+# NotGroupedResolver lives in auth_service (issue #513 round-3 item 3): it
+# is constructed here (once per run) but also consumed by
+# auth_service.create_ldap_user's internal auto-assign, so BOTH paths share
+# the SAME object and no sentinel value is needed anywhere. See its
+# docstring in auth_service.py for the full rationale.
 
 
 class _CappedCategory:
@@ -258,57 +338,71 @@ class _Tally:
         run.detail = self.detail()
 
 
-async def _ensure_ldap_user(
-    db: AsyncSession, group_dn: str, identity: ldap_service.LdapIdentity, tally: _Tally
-) -> uuid.UUID | None:
-    """Resolve one desired identity to a HERD user id, provisioning if needed.
+def _classify_auth_source_and_active(
+    group_dn: str,
+    identity: ldap_service.LdapIdentity,
+    tally: _Tally,
+    identity_cache: dict[str, _RunIdentityOutcome],
+    record,
+) -> bool:
+    """Check record.auth_source and record.is_active, recording and
+    caching (via _cache_outcome) a skip when either fails. Returns True
+    when record passed both checks (the caller should proceed: read
+    record.id/.username for a snapshot, or continue on to the username
+    drift check for a live ORM instance).
 
-    Lookup is by EMAIL, the key JIT provisioning and login resolution trust.
-    Returns None when the member must be skipped (collision categories per
-    ADR 0011); a recovered provisioning race proceeds. Returns scalars, not
-    the ORM instance: rollbacks below expire every instance in the session,
-    and attribute access on an expired instance requires IO the async caller
-    cannot perform implicitly.
-
-    Cross-reference (S5): auth_service._authenticate_ldap resolves the same
-    identity shape on login but never repairs username drift and never
-    retries a provisioning race as a lookup; it refuses instead. That
-    divergence is DESIGNED: this function runs inside a long-lived
-    reconcile pass whose job is to repair drift and recover races proactively,
-    while login is a narrow, latency-sensitive path that must fail closed
-    rather than silently mutate an account mid-authentication. Do not "fix"
-    one to match the other.
+    record is duck-typed: a plain auth_service.UserSnapshot (the batch
+    path, never mutated) or a live ORM User (the fresh-fetch/race-recovery
+    path, about to be possibly mutated by the caller's drift check) both
+    expose .auth_source/.is_active, and this function only READS them, so
+    one implementation serves _ensure_ldap_user's snapshot branch and
+    _finalize_ldap_user's live-instance branch identically (issue #513
+    round-3 item 6: these were two copies of the same two checks).
     """
-    user = await auth_service.get_user_by_email(db, identity.email)
-    if user is None:
-        try:
-            user = await auth_service.create_ldap_user(db, identity.email, identity.username)
-            tally.users_provisioned += 1
-            # Freshly provisioned from this identity: source, username, and
-            # is_active (default True) are correct by construction, no
-            # further checks needed.
-            return user.id
-        except IntegrityError:
-            # Either a concurrent JIT login provisioned this email (retry as
-            # a lookup and proceed) or the username belongs to another
-            # account (skip; never take over an existing identity).
-            user = await auth_service.get_user_by_email(db, identity.email)
-            if user is None:
-                tally.skip_member(group_dn, identity.dn, MEMBER_SKIP_USERNAME_TAKEN)
-                return None
-            tally.provision_race(group_dn, identity.email)
-    if user.auth_source != "ldap":
+    if record.auth_source != "ldap":
         # Mirrors _authenticate_ldap: an email owned by a local account is
         # refused, never silently converted.
         tally.skip_member(group_dn, identity.dn, MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT)
-        return None
-    if not user.is_active:
+        _cache_outcome(
+            identity_cache, identity.email, None, MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT
+        )
+        return False
+    if not record.is_active:
         # C5: inactive users are invisible to membership sync in both
         # directions, exactly like local accounts. Never re-added here; the
         # current_ids query below excludes their existing rows too, so an
         # admin deactivation is never undone by a later sync pass. Phase 4's
-        # sweep is the only sync writer of is_active.
+        # sweep is the only sync writer of is_active. NOT cached (round-3
+        # item 1): is_active can flip mid-run via a concurrent admin
+        # action, so every group's occurrence re-checks it fresh.
         tally.skip_member(group_dn, identity.dn, MEMBER_SKIP_USER_INACTIVE)
+        _cache_outcome(identity_cache, identity.email, None, MEMBER_SKIP_USER_INACTIVE)
+        return False
+    return True
+
+
+async def _finalize_ldap_user(
+    db: AsyncSession,
+    group_dn: str,
+    identity: ldap_service.LdapIdentity,
+    tally: _Tally,
+    identity_cache: dict[str, _RunIdentityOutcome],
+    user: User,
+) -> uuid.UUID | None:
+    """Given a FRESH, live ORM User row for identity.email (never a stale
+    batch snapshot), apply the auth_source/is_active checks and the
+    username drift repair, cache the outcome (via _cache_outcome), and
+    return the resolved id (or None for a skip).
+
+    Shared by _ensure_ldap_user's own-snapshot mutation path and
+    _provision_or_recover's race-recovery path: both end up holding a live
+    ORM instance at this point and need identical finishing logic (issue
+    #513 item 1's regression fix keeps this the ONLY place that reads
+    .auth_source/.is_active/.username off a live ORM instance and possibly
+    mutates one, so a rollback anywhere else in the run can never strand a
+    caller mid-attribute-access).
+    """
+    if not _classify_auth_source_and_active(group_dn, identity, tally, identity_cache, user):
         return None
     user_id = user.id
     if user.username != identity.username:
@@ -329,7 +423,150 @@ async def _ensure_ldap_user(
         except IntegrityError:
             await db.rollback()
             tally.drift_collision(group_dn, identity.dn, MEMBER_SKIP_USERNAME_DRIFT_COLLISION)
+    _cache_outcome(identity_cache, identity.email, user_id)
     return user_id
+
+
+async def _provision_or_recover(
+    db: AsyncSession,
+    group_dn: str,
+    identity: ldap_service.LdapIdentity,
+    tally: _Tally,
+    identity_cache: dict[str, _RunIdentityOutcome],
+    not_grouped: "auth_service.NotGroupedResolver",
+) -> uuid.UUID | None:
+    """Create a new HERD user for identity, or recover a concurrently
+    created one via IntegrityError-retry-as-lookup.
+
+    Shared by _ensure_ldap_user's "no existing row" path (a batch miss) and
+    its rare "existing row vanished between the batch snapshot and a drift
+    repair" path, so both go through identical provisioning/race logic.
+    not_grouped (item 6) is the run-level lazy resolver threaded all the
+    way into create_ldap_user, so this provisioning path and the
+    reconciler's own explicit add loop agree on the same resolved
+    "Not Grouped" id within one run.
+    """
+    try:
+        # not_grouped is the SAME resolver object create_ldap_user's
+        # internal auto-assign consults (issue #513 round-3 item 3): no
+        # separate .get(db) call is needed here, since the resolver caches
+        # its own result and create_ldap_user calls it exactly once.
+        user = await auth_service.create_ldap_user(
+            db, identity.email, identity.username, not_grouped=not_grouped
+        )
+        tally.users_provisioned += 1
+        # Freshly provisioned from this identity: source, username, and
+        # is_active (default True) are correct by construction, no further
+        # checks needed.
+        _cache_outcome(identity_cache, identity.email, user.id)
+        return user.id
+    except IntegrityError:
+        # Either a concurrent JIT login provisioned this email (retry as a
+        # lookup and proceed) or the username belongs to another account
+        # (skip; never take over an existing identity).
+        user = await auth_service.get_user_by_email(db, identity.email)
+        if user is None:
+            tally.skip_member(group_dn, identity.dn, MEMBER_SKIP_USERNAME_TAKEN)
+            # Round-2 item 5: deliberately NOT cacheable (see
+            # _CACHEABLE_SKIP_REASONS). Not stable within a run: a LATER
+            # member's drift repair can rename away the blocking account
+            # and free the username, so a repeat occurrence of this same
+            # email in a later group must re-attempt resolution from
+            # scratch rather than replay a skip that may no longer hold.
+            return None
+        tally.provision_race(group_dn, identity.email)
+    return await _finalize_ldap_user(db, group_dn, identity, tally, identity_cache, user)
+
+
+async def _ensure_ldap_user(
+    db: AsyncSession,
+    group_dn: str,
+    identity: ldap_service.LdapIdentity,
+    tally: _Tally,
+    known_users: "dict[str, auth_service.UserSnapshot]",
+    identity_cache: dict[str, _RunIdentityOutcome],
+    not_grouped: "auth_service.NotGroupedResolver",
+) -> uuid.UUID | None:
+    """Resolve one desired identity to a HERD user id, provisioning if needed.
+
+    Lookup is by EMAIL, the key JIT provisioning and login resolution trust.
+    Returns None when the member must be skipped (collision categories per
+    ADR 0011); a recovered provisioning race proceeds.
+
+    known_users (issue #513 item 1) is the caller's batched email-to-
+    UserSnapshot dict for this group's proven members (one WHERE email IN
+    (...) query per group instead of one SELECT per member), of plain
+    SNAPSHOTS, never ORM instances: a snapshot cannot be expired by a LATER
+    member's rollback elsewhere in this same loop (the regression the
+    original item-1 cut shipped: an ORM instance held here could be
+    expired by create_ldap_user's or the drift-repair's own rollback,
+    raising MissingGreenlet on the NEXT member's attribute read, outside
+    any per-op try, failing the WHOLE run). A batch miss, or a snapshot
+    that needs a MUTATING repair, falls back to a fresh, live ORM fetch via
+    _provision_or_recover / _finalize_ldap_user, since only a live instance
+    can be safely written to.
+
+    identity_cache (item 2) is the run-level memo: on a hit, this function
+    replays the CACHED classification against this call's own
+    group_dn/identity.dn (skip_member for a skip; a bare return for
+    success) without touching the DB again, and returns without falling
+    through to any of the branches below. See _RunIdentityOutcome and
+    _cache_outcome for exactly which outcomes are cacheable at all (round-3
+    item 1: MEMBER_SKIP_USER_INACTIVE is NOT, since is_active is
+    admin-mutable mid-run; _reconcile_mapping's add loop carries the other
+    half of that fix, a live re-verification right before an add so a
+    stale cache-hit success cannot add a since-deactivated user).
+
+    not_grouped (item 6) is threaded into the provisioning path so
+    create_ldap_user's internal "Not Grouped" auto-assign agrees with this
+    run's cached id, the same one _reconcile_mapping's explicit add loop
+    uses.
+
+    Cross-reference (S5): auth_service._authenticate_ldap resolves the same
+    identity shape on login but never repairs username drift and never
+    retries a provisioning race as a lookup; it refuses instead. That
+    divergence is DESIGNED: this function runs inside a long-lived
+    reconcile pass whose job is to repair drift and recover races proactively,
+    while login is a narrow, latency-sensitive path that must fail closed
+    rather than silently mutate an account mid-authentication. Do not "fix"
+    one to match the other.
+    """
+    cached = identity_cache.get(identity.email)
+    if cached is not None:
+        if cached.skip_reason is not None:
+            tally.skip_member(group_dn, identity.dn, cached.skip_reason)
+        return cached.user_id
+
+    snapshot = known_users.get(identity.email)
+    if snapshot is None:
+        return await _provision_or_recover(
+            db, group_dn, identity, tally, identity_cache, not_grouped
+        )
+
+    if not _classify_auth_source_and_active(group_dn, identity, tally, identity_cache, snapshot):
+        return None
+
+    if snapshot.username == identity.username:
+        # No mutation needed: the snapshot's fields are already final for
+        # this member, so no fresh ORM fetch is spent at all (the whole
+        # point of item 1's batching: most members need no per-member
+        # query beyond the group's one batched fetch).
+        _cache_outcome(identity_cache, identity.email, snapshot.id)
+        return snapshot.id
+
+    # Username differs: a mutating repair is needed. A snapshot cannot be
+    # re-attached to the session for a write, and reusing its (possibly
+    # now-stale) in-memory data for one risks clobbering a concurrent
+    # change, so a fresh, live ORM instance is loaded right here.
+    user = await auth_service.get_user_by_email(db, identity.email)
+    if user is None:
+        # Deleted between the batch snapshot and this repair attempt: a
+        # genuine concurrent race, not the expired-instance bug item 1
+        # fixes. Fall through to the same path a fresh batch miss takes.
+        return await _provision_or_recover(
+            db, group_dn, identity, tally, identity_cache, not_grouped
+        )
+    return await _finalize_ldap_user(db, group_dn, identity, tally, identity_cache, user)
 
 
 async def _reconcile_mapping(
@@ -340,18 +577,29 @@ async def _reconcile_mapping(
     herd_group_id: uuid.UUID,
     directory_name: str,
     tally: _Tally,
+    identity_cache: dict[str, _RunIdentityOutcome],
+    not_grouped: "auth_service.NotGroupedResolver",
+    run_holder: "ldap_service.RunConnection | None" = None,
 ) -> set[uuid.UUID]:
     """Reconcile one mapped group; returns the desired_ids resolved this
     pass (the ADR 0011 phase 4 group-presence credit set), empty on any
     fail-closed skip. Accumulated by execute_run across all mappings so the
     deactivation sweep can treat "resolved as a member this run" as proof of
     presence without a second directory search.
+
+    identity_cache and not_grouped are run-level state threaded through
+    from execute_run (issue #513 items 2, 4, 6): identity_cache lets a user
+    in multiple mapped groups resolve once for the whole run, and
+    not_grouped lazily resolves and caches the "Not Grouped" group id so
+    both this function's explicit adds and _ensure_ldap_user's provisioning
+    path (via create_ldap_user's own internal auto-assign) agree on one
+    value, resolved only once, on whichever of them needs it first.
+    run_holder (item 2/3) is the run-scoped shared connection to reuse for
+    fetch_group/resolve_members, explicitly passed rather than read from
+    any module state.
     """
-    # Scalars, not the ORM instance: rollbacks in this pass expire every
-    # instance in the session, and expired attribute access needs IO the
-    # async path cannot perform implicitly (see _ensure_ldap_user).
     try:
-        entry = await ldap_service.fetch_group(group_dn)
+        entry = await ldap_service.fetch_group(group_dn, run_holder=run_holder)
     except ldap_service.LdapUnavailableError as exc:
         tally.skip_group(group_dn, GROUP_SKIP_DIRECTORY_UNAVAILABLE, str(exc))
         return set()
@@ -373,7 +621,7 @@ async def _reconcile_mapping(
         await db.commit()
 
     try:
-        resolutions = await ldap_service.resolve_members(entry.member_dns)
+        resolutions = await ldap_service.resolve_members(entry.member_dns, run_holder=run_holder)
     except ldap_service.LdapUnavailableError as exc:
         # A raise mid-batch discarded the whole batch; a half-resolved
         # desired set must never drive removals.
@@ -382,6 +630,7 @@ async def _reconcile_mapping(
 
     desired_ids: set[uuid.UUID] = set()
     unresolved_existing_count = 0
+    proven_identities: list[ldap_service.LdapIdentity] = []
     for member_dn, resolution in zip(entry.member_dns, resolutions):
         if resolution.identity is None:
             # An answer the directory gave (entry gone, or present without
@@ -391,9 +640,29 @@ async def _reconcile_mapping(
             if reason in _REMOVAL_SUPPRESSING_REASONS:
                 unresolved_existing_count += 1
             continue
-        user_id = await _ensure_ldap_user(db, group_dn, resolution.identity, tally)
+        proven_identities.append(resolution.identity)
+
+    # Item 1: one batched WHERE email IN (...) per group instead of one
+    # get_user_by_email SELECT per member (of plain UserSnapshot rows, see
+    # auth_service.get_users_by_emails and _ensure_ldap_user's docstring
+    # for why: an ORM instance here would be exposed to expiry by a LATER
+    # member's rollback in this same loop). Emails already classified
+    # earlier THIS RUN (item 2's memo) are excluded: _ensure_ldap_user will
+    # hit the cache for them without ever consulting known_users, so
+    # fetching them again here would be pure waste.
+    emails_to_fetch = {
+        identity.email for identity in proven_identities if identity.email not in identity_cache
+    }
+    known_users = await auth_service.get_users_by_emails(db, emails_to_fetch)
+
+    member_dn_by_user_id: dict[uuid.UUID, str] = {}
+    for identity in proven_identities:
+        user_id = await _ensure_ldap_user(
+            db, group_dn, identity, tally, known_users, identity_cache, not_grouped
+        )
         if user_id is not None:
             desired_ids.add(user_id)
+            member_dn_by_user_id.setdefault(user_id, identity.dn)
 
     current_ids = set(
         (
@@ -413,10 +682,41 @@ async def _reconcile_mapping(
         .all()
     )
 
+    # Not_grouped resolved (or cache-hit) ONCE for the whole add loop
+    # (issue #513 round-3 item 6), not once per add.
+    not_grouped_id = await not_grouped.get(db)
+
     # Sorted for deterministic apply order (and deterministic detail).
-    for user_id in sorted(desired_ids - current_ids, key=str):
+    to_add = sorted(desired_ids - current_ids, key=str)
+    still_active_ids: set[uuid.UUID] = set()
+    if to_add:
+        # Round-3 item 1: a cache-hit SUCCESS in identity_cache can be
+        # stale by the time this specific group's add actually runs, if an
+        # admin deactivated the user between an EARLIER group's
+        # classification (which cached the success) and now; a fresh
+        # classification would catch a since-deactivated user, but a cache
+        # hit deliberately skips the DB round trip to avoid the very N+1
+        # items 1/2 exist to kill. One extra batched live check here,
+        # bounded by the number of ids actually about to be ADDED (never
+        # the whole membership), closes that gap without reintroducing it.
+        still_active_ids = set(
+            (await db.execute(select(User.id).where(User.id.in_(to_add), User.is_active.is_(True))))
+            .scalars()
+            .all()
+        )
+    for user_id in to_add:
+        if user_id not in still_active_ids:
+            # Proven active when classified, proven inactive now: record
+            # exactly like a fresh classification would have, but never
+            # cache it (this is a runtime re-check, not identity_cache).
+            tally.skip_member(
+                group_dn,
+                member_dn_by_user_id.get(user_id, str(user_id)),
+                MEMBER_SKIP_USER_INACTIVE,
+            )
+            continue
         try:
-            await group_service.add_member(db, herd_group_id, user_id)
+            await group_service._add_member_resolved(db, herd_group_id, user_id, not_grouped_id)
             tally.members_added += 1
         except IntegrityError as exc:
             # C3: not every IntegrityError here is the benign concurrent
@@ -463,7 +763,10 @@ async def _reconcile_mapping(
 
 
 async def _run_deactivation_sweep(
-    db: AsyncSession, tally: _Tally, credited_user_ids: set[uuid.UUID]
+    db: AsyncSession,
+    tally: _Tally,
+    credited_user_ids: set[uuid.UUID],
+    run_holder: "ldap_service.RunConnection | None" = None,
 ) -> None:
     """ADR 0011 phase 4: absence-proof deactivation, disabled-filter, and the
     two-term circuit breaker, with an abort-exempt reactivation pass.
@@ -472,14 +775,21 @@ async def _run_deactivation_sweep(
     is an unconditional no-op with no detail record (recording a "sweep"
     category here would mark every plain reconcile-only run "partial" for a
     feature the deployment never opted into).
+
+    run_holder (issue #513 item 7): shares the run's connection with
+    present_emails/disabled_emails exactly like _reconcile_mapping's
+    fetch_group/resolve_members calls, so a run with mappings AND an
+    enabled sweep pays only ONE connect+TLS+bind cycle for the whole run.
     """
     if not settings.ldap_sync_deactivation_enabled:
         return
 
     try:
-        present = await ldap_service.present_emails()
+        present = await ldap_service.present_emails(run_holder=run_holder)
         disabled = (
-            await ldap_service.disabled_emails() if settings.ldap_disabled_filter else frozenset()
+            await ldap_service.disabled_emails(run_holder=run_holder)
+            if settings.ldap_disabled_filter
+            else frozenset()
         )
     except (ldap_service.LdapUnavailableError, ValueError) as exc:
         # Error is never absence: reactivations are ALSO skipped here, since
@@ -644,17 +954,37 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
         # deactivation sweep below treats as proven present without a
         # second directory search.
         credited_user_ids: set[uuid.UUID] = set()
-        for mapping_id, group_dn, herd_group_id, directory_name in mappings:
-            desired_ids = await _reconcile_mapping(
-                db,
-                mapping_id=mapping_id,
-                group_dn=group_dn,
-                herd_group_id=herd_group_id,
-                directory_name=directory_name,
-                tally=tally,
-            )
-            credited_user_ids |= desired_ids
-        await _run_deactivation_sweep(db, tally, credited_user_ids)
+        # Item 2: memoizes _ensure_ldap_user's classification per email for
+        # the whole run. Items 4/6: auth_service.NotGroupedResolver resolves "Not
+        # Grouped" LAZILY, on whichever of _reconcile_mapping's explicit
+        # adds or _ensure_ldap_user's provisioning calls needs it first, so
+        # a run with zero adds and zero provisioning never queries for it
+        # at all, and both paths agree on the SAME resolved value.
+        identity_cache: dict[str, _RunIdentityOutcome] = {}
+        not_grouped = auth_service.NotGroupedResolver()
+        # Item 3/7: one shared connection for every fetch_group/
+        # resolve_members/present_emails/disabled_emails call this run
+        # instead of one connect+TLS+bind cycle per call, covering both the
+        # mapping loop and the sweep. run_connection() itself is a no-op
+        # (opens nothing, closes nothing) when neither ever gets called, so
+        # a mapping-less run with the sweep disabled costs nothing extra;
+        # no separate needs_connection branch is needed here (issue #513
+        # round-3 item 2).
+        async with ldap_service.run_connection() as run_holder:
+            for mapping_id, group_dn, herd_group_id, directory_name in mappings:
+                desired_ids = await _reconcile_mapping(
+                    db,
+                    mapping_id=mapping_id,
+                    group_dn=group_dn,
+                    herd_group_id=herd_group_id,
+                    directory_name=directory_name,
+                    tally=tally,
+                    identity_cache=identity_cache,
+                    not_grouped=not_grouped,
+                    run_holder=run_holder,
+                )
+                credited_user_ids |= desired_ids
+            await _run_deactivation_sweep(db, tally, credited_user_ids, run_holder=run_holder)
         status = "partial" if tally.degraded else "success"
         if tally.aborted:
             # Overrides success/partial; a later exception in this try block
@@ -726,9 +1056,13 @@ async def create_run(db: AsyncSession, trigger: str) -> LdapSyncRun:
 # asyncio-lock layer.
 # ---------------------------------------------------------------------------
 
+# Rolling-deploy invariant: this STRING constant, not the SQL used to send
+# it to Postgres, is what must stay byte-identical across every build.
+# Changing it would let two builds sync concurrently mid-rollout, since old
+# and new replicas would then hold different advisory locks for what is
+# meant to be one run invariant (see herd_common.advisory_lock's module
+# docstring, issue #513 item 5).
 _ADVISORY_LOCK_KEY = "herd_ldap_group_sync"
-_TRY_ADVISORY_LOCK_SQL = text(f"SELECT pg_try_advisory_lock(hashtext('{_ADVISORY_LOCK_KEY}'))")
-_ADVISORY_UNLOCK_SQL = text(f"SELECT pg_advisory_unlock(hashtext('{_ADVISORY_LOCK_KEY}'))")
 
 _sync_lock = asyncio.Lock()
 # Strong references so a scheduled run is never garbage-collected mid-flight.
@@ -766,7 +1100,7 @@ async def _release_sync_locks(lock_conn: AsyncConnection | None) -> None:
     try:
         if lock_conn is not None:
             try:
-                await lock_conn.execute(_ADVISORY_UNLOCK_SQL)
+                await advisory_lock.session_unlock(lock_conn, _ADVISORY_LOCK_KEY)
                 await lock_conn.close()
             except BaseException as exc:
                 logger.exception(
@@ -813,9 +1147,9 @@ class _SyncSlot:
             # Cross-replica layer, on a dedicated connection held for the
             # whole run because advisory locks are session-scoped: acquire
             # and release must happen on one connection.
-            if database.engine.dialect.name == "postgresql":
+            if advisory_lock.is_postgres_dialect(database.engine.dialect.name):
                 self.lock_conn = await database.engine.connect()
-                acquired = (await self.lock_conn.execute(_TRY_ADVISORY_LOCK_SQL)).scalar_one()
+                acquired = await advisory_lock.session_try_lock(self.lock_conn, _ADVISORY_LOCK_KEY)
                 if not acquired:
                     # Invariant: lock_conn is not None only while the
                     # advisory lock is held on it, so release paths can

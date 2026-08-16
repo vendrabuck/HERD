@@ -5,6 +5,7 @@ import uuid
 import pytest
 from app.database import Base
 from app.models.user import Role
+from app.services import auth_service
 from app.services.auth_service import (
     authenticate_user,
     create_tokens_for_user,
@@ -14,6 +15,7 @@ from app.services.auth_service import (
     get_user_by_email,
     get_user_by_id,
     get_user_by_username,
+    get_users_by_emails,
     revoke_refresh_token,
     rotate_refresh_token,
     set_user_role,
@@ -560,7 +562,96 @@ async def test_create_user_handles_not_grouped_failure():
         async def failing_add(*args, **kwargs):
             raise RuntimeError("Simulated failure")
 
-        with patch("app.services.group_service.add_member", side_effect=failing_add):
+        with patch("app.services.group_service._add_member_resolved", side_effect=failing_add):
             # Should not raise; user is still created
             user = await create_user(db, "failng@test.com", "failnguser", "password123")
             assert user.email == "failng@test.com"
+
+
+# ---------------------------------------------------------------------------
+# get_users_by_emails (issue #513 items 1 and 3): plain UserSnapshot rows,
+# never ORM instances, fetched via a chunked WHERE email IN (...).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_users_by_emails_empty_input_no_query():
+    async with TestSessionLocal() as db:
+        assert await get_users_by_emails(db, []) == {}
+
+
+@pytest.mark.asyncio
+async def test_get_users_by_emails_returns_snapshots_keyed_by_email():
+    async with TestSessionLocal() as db:
+        u1 = await create_user(db, "alice@example.com", "alice", "password123")
+        u2 = await create_user(db, "bob@example.com", "bob", "password123")
+
+        result = await get_users_by_emails(db, ["alice@example.com", "bob@example.com"])
+
+        assert set(result) == {"alice@example.com", "bob@example.com"}
+        assert result["alice@example.com"].id == u1.id
+        assert result["alice@example.com"].username == "alice"
+        assert result["alice@example.com"].auth_source == "local"
+        assert result["alice@example.com"].is_active is True
+        assert result["bob@example.com"].id == u2.id
+        # A plain dataclass, not the ORM class: no session-bound state to
+        # expire (issue #513 item 1's regression fix).
+        assert not hasattr(result["alice@example.com"], "_sa_instance_state")
+
+
+@pytest.mark.asyncio
+async def test_get_users_by_emails_miss_is_simply_absent():
+    async with TestSessionLocal() as db:
+        await create_user(db, "alice@example.com", "alice", "password123")
+        result = await get_users_by_emails(db, ["alice@example.com", "nobody@example.com"])
+        assert set(result) == {"alice@example.com"}
+
+
+@pytest.mark.asyncio
+async def test_get_users_by_emails_snapshot_survives_a_later_rollback():
+    # The exact issue #513 item 1 regression scenario at the auth_service
+    # layer: a snapshot fetched before a later rollback must still read
+    # correctly afterward (an ORM instance would raise MissingGreenlet on
+    # the next unawaited attribute access).
+    async with TestSessionLocal() as db:
+        user = await create_user(db, "alice@example.com", "alice", "password123")
+        snapshots = await get_users_by_emails(db, ["alice@example.com"])
+        snapshot = snapshots["alice@example.com"]
+
+        # Force a real rollback on this same session.
+        db.add(user.__class__(email="alice@example.com", username="dupe"))
+        with pytest.raises(IntegrityError):
+            await db.commit()
+        await db.rollback()
+
+        # The snapshot's fields are still readable with no IO at all.
+        assert snapshot.email == "alice@example.com"
+        assert snapshot.username == "alice"
+        assert snapshot.auth_source == "local"
+        assert snapshot.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_get_users_by_emails_chunks_the_in_list(monkeypatch):
+    # issue #513 item 3: chunk size mocked down to 3, 7 emails requested,
+    # must issue exactly 3 chunked queries (3 + 3 + 1) and still return
+    # every match.
+    monkeypatch.setattr(auth_service, "_EMAIL_LOOKUP_CHUNK_SIZE", 3)
+    async with TestSessionLocal() as db:
+        emails = [f"user{i}@example.com" for i in range(7)]
+        for i, email in enumerate(emails):
+            await create_user(db, email, f"user{i}", "password123")
+
+        calls: list[int] = []
+        real_execute = db.execute
+
+        async def counting_execute(*args, **kwargs):
+            calls.append(1)
+            return await real_execute(*args, **kwargs)
+
+        db.execute = counting_execute
+
+        result = await get_users_by_emails(db, emails)
+
+        assert len(calls) == 3
+        assert set(result) == set(emails)

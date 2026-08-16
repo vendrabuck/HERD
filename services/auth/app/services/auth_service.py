@@ -1,5 +1,7 @@
 import logging
 import uuid
+from collections.abc import Collection
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from passlib.context import CryptContext
@@ -34,6 +36,72 @@ async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
     return result.scalar_one_or_none()
 
 
+@dataclass(frozen=True)
+class UserSnapshot:
+    """A plain, session-independent snapshot of the User columns the LDAP
+    reconciler needs to classify a member (issue #513 item 1 regression
+    fix). Unlike an ORM User instance, a snapshot holds no session-bound
+    state, so it can never be expired by a LATER member's rollback within
+    the same batch dict: get_users_by_emails prefetches many of these
+    before any is read, and the reconciler's own provisioning path
+    deliberately rolls back on a race elsewhere in the same session. A
+    caller that needs to MUTATE a user (the username drift repair) must
+    load a fresh, live ORM instance at that point instead of reusing a
+    snapshot; see ldap_sync_service._ensure_ldap_user.
+    """
+
+    id: uuid.UUID
+    email: str
+    username: str
+    auth_source: str
+    is_active: bool
+
+
+# asyncpg's wire protocol caps a single prepared statement at 32767 bind
+# parameters; 5000 leaves headroom for any other parameters SQLAlchemy adds
+# to the same statement and keeps each chunk a reasonable size for the query
+# planner regardless of driver (issue #513 item 3).
+_EMAIL_LOOKUP_CHUNK_SIZE = 5000
+
+
+async def get_users_by_emails(db: AsyncSession, emails: Collection[str]) -> dict[str, UserSnapshot]:
+    """Batch form of get_user_by_email: one WHERE email IN (...) query per
+    chunk of up to _EMAIL_LOOKUP_CHUNK_SIZE emails (issue #513 item 3),
+    instead of one query per email (item 1, the LDAP reconciler's per-group
+    member lookup). Returns a dict keyed by email, of plain UserSnapshot
+    rows selected by COLUMN, never ORM User instances (item 1's regression
+    fix: an ORM instance in this dict can be silently expired by an
+    unrelated rollback elsewhere in the same session before it is read; a
+    snapshot cannot, since it carries no session-bound state at all). An
+    email with no matching row is simply absent from the result (mirrors
+    get_user_by_email returning None for a miss). A miss still needs the
+    single-email path for a provisioning miss (a create call and its
+    possible IntegrityError-retry lookup, which needs a real, mutable ORM
+    instance), which this function intentionally does not attempt on the
+    caller's behalf.
+    """
+    email_list = list(emails)
+    if not email_list:
+        return {}
+    out: dict[str, UserSnapshot] = {}
+    for start in range(0, len(email_list), _EMAIL_LOOKUP_CHUNK_SIZE):
+        chunk = email_list[start : start + _EMAIL_LOOKUP_CHUNK_SIZE]
+        result = await db.execute(
+            select(User.id, User.email, User.username, User.auth_source, User.is_active).where(
+                User.email.in_(chunk)
+            )
+        )
+        for row in result.all():
+            out[row.email] = UserSnapshot(
+                id=row.id,
+                email=row.email,
+                username=row.username,
+                auth_source=row.auth_source,
+                is_active=row.is_active,
+            )
+    return out
+
+
 async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
     result = await db.execute(select(User).where(User.username == username))
     return result.scalar_one_or_none()
@@ -59,17 +127,66 @@ async def superadmin_exists(db: AsyncSession) -> bool:
     return result.scalar_one_or_none() is not None
 
 
-async def _auto_assign_not_grouped(db: AsyncSession, user: User) -> None:
+class NotGroupedResolver:
+    """Lazily resolves and caches the "Not Grouped" group id for the whole
+    run (issue #513 items 4, 6; round-3 item 3).
+
+    Lives here, not in ldap_sync_service, so create_ldap_user's own
+    internal auto-assign and ldap_sync_service's explicit add loop can
+    share ONE instance and therefore one resolved value, with NO sentinel
+    anywhere: create_ldap_user's not_grouped parameter is simply
+    Optional, and None means "no resolver was supplied, look it up the
+    plain way" -- a real, distinct code path, not a stand-in for
+    "unresolved" masquerading as the type's own value space.
+
+    The FIRST actual need, whichever comes first (an explicit add in the
+    reconciler's add loop, or a fresh provisioning call that reaches
+    create_ldap_user's own internal auto-assign), resolves it once via a
+    single by-name lookup; every later need this run, from EITHER path,
+    reuses the cached value. None is a valid, cached answer (the group
+    does not exist): both consuming paths treat that as "skip the
+    auto-assign", exactly matching the behavior with no "Not Grouped"
+    group configured.
+    """
+
+    def __init__(self) -> None:
+        self._resolved = False
+        self._id: uuid.UUID | None = None
+
+    async def get(self, db: AsyncSession) -> uuid.UUID | None:
+        if not self._resolved:
+            from app.services.group_service import get_group_by_name
+
+            not_grouped = await get_group_by_name(db, "Not Grouped")
+            self._id = not_grouped.id if not_grouped else None
+            self._resolved = True
+        return self._id
+
+
+async def _auto_assign_not_grouped(
+    db: AsyncSession,
+    user: User,
+    not_grouped: NotGroupedResolver | None = None,
+) -> None:
     # Captured before anything below can fail: a failed FLUSH (not just an
     # explicit rollback) already expires every instance the session tracks,
     # so username must be read now, before the try, or not safely at all.
     username = user.username
     try:
-        from app.services.group_service import add_member, get_group_by_name
+        from app.services.group_service import _add_member_resolved, get_group_by_name
 
-        not_grouped = await get_group_by_name(db, "Not Grouped")
-        if not_grouped:
-            await add_member(db, not_grouped.id, user.id)
+        if not_grouped is None:
+            not_grouped_group = await get_group_by_name(db, "Not Grouped")
+            resolved_id = not_grouped_group.id if not_grouped_group else None
+        else:
+            resolved_id = await not_grouped.get(db)
+        if resolved_id is not None:
+            # Adding directly INTO "Not Grouped": pass resolved_id as both
+            # the target group and the not_grouped_id so
+            # _add_member_resolved's own group_id != not_grouped_id check
+            # correctly skips the (meaningless) self-removal, exactly like
+            # the original add_member(db, not_grouped.id, user.id) call did.
+            await _add_member_resolved(db, resolved_id, user.id, resolved_id)
     except Exception:
         # C7: a failed add here (e.g. a real commit-time IntegrityError, not
         # just a bare raise) leaves the session in SQLAlchemy's pending-
@@ -130,7 +247,21 @@ async def create_ldap_user(
     db: AsyncSession,
     email: str,
     username: str,
+    *,
+    not_grouped: NotGroupedResolver | None = None,
 ) -> User:
+    """Provision a new LDAP-sourced user.
+
+    not_grouped (issue #513 item 6; round-3 item 3): a caller can supply
+    its own NotGroupedResolver instance so the auto-assign below reuses
+    that SAME resolved (and cached) "Not Grouped" id instead of doing its
+    own independent by-name lookup. The LDAP reconciler passes its
+    run-level resolver here so this provisioning path and its own explicit
+    add loop agree on one resolved value, computed at most once per run,
+    on whichever of them needs it first. Omitted (None, the default): the
+    plain by-name lookup runs every call, exactly as before this
+    parameter existed.
+    """
     user = User(
         email=email,
         username=username,
@@ -154,7 +285,7 @@ async def create_ldap_user(
             "username": username,
         },
     )
-    await _auto_assign_not_grouped(db, user)
+    await _auto_assign_not_grouped(db, user, not_grouped)
     return user
 
 

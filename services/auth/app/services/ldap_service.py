@@ -26,12 +26,12 @@ from __future__ import annotations
 import logging
 import ssl
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 
 import anyio
 from ldap3 import BASE, NONE, SIMPLE, SUBTREE, Connection, Server, Tls
-from ldap3.core.exceptions import LDAPException, LDAPInvalidDnError
+from ldap3.core.exceptions import LDAPCommunicationError, LDAPException, LDAPInvalidDnError
 from ldap3.core.results import (
     RESULT_INVALID_DN_SYNTAX,
     RESULT_NO_SUCH_OBJECT,
@@ -176,13 +176,13 @@ def _close_connection(conn: Connection) -> None:
             pass
 
 
-@contextmanager
-def _service_connection(require_service_account: bool = False):
-    """Yield a service-account-bound read-only connection.
+def _open_service_connection(require_service_account: bool = False) -> Connection:
+    """Build, TLS-negotiate, and bind a service-account-bound read-only
+    connection; the caller owns closing it (via _close_connection).
 
     Raises LdapUnavailableError when the connection cannot be established
     (missing configuration, malformed server URL, TLS or transport failure,
-    service-account bind refused). The connection is unbound on exit.
+    service-account bind refused).
 
     require_service_account: the sync-facing callers set True so an empty
     ldap_bind_dn raises instead of silently falling back to an anonymous
@@ -190,6 +190,12 @@ def _service_connection(require_service_account: bool = False):
     surfaces as noSuchObject, which would convert a pure credentials
     misconfiguration into false "proven absence"; the login path keeps the
     anonymous fallback it has always had.
+
+    Extracted from _service_connection (issue #513 item 3) so the run-scoped
+    shared connection (RunConnection/run_connection below) can hold one
+    bound Connection open across many calls instead of only ever inside a
+    single `with` block; _service_connection itself is now a thin wrapper
+    that opens via this function and closes via _close_connection.
     """
     if not settings.ldap_server_url:
         raise LdapUnavailableError("LDAP is not configured (ldap_server_url is empty)")
@@ -228,9 +234,125 @@ def _service_connection(require_service_account: bool = False):
                 raise LdapUnavailableError("service-account bind failed")
         except LDAPException as exc:
             raise LdapUnavailableError(f"LDAP connection failed: {exc}") from exc
+    except BaseException:
+        # Bind/start_tls failed (or the caller was cancelled mid-bind): a
+        # partially-opened socket must never leak past this function,
+        # exactly matching _service_connection's original single try/finally
+        # that wrapped both the bind phase and the yield.
+        _close_connection(conn)
+        raise
+    return conn
+
+
+@contextmanager
+def _service_connection(require_service_account: bool = False):
+    """Yield a service-account-bound read-only connection.
+
+    Raises LdapUnavailableError when the connection cannot be established
+    (see _open_service_connection). The connection is unbound on exit.
+    """
+    conn = _open_service_connection(require_service_account)
+    try:
         yield conn
     finally:
         _close_connection(conn)
+
+
+class RunConnection:
+    """Holds one lazily-opened, service-account-bound connection shared by
+    every fetch_group/resolve_members/present_emails/disabled_emails call a
+    caller explicitly threads it into for the duration of one reconciler
+    run (issue #513 items 2/3/7): a run with N mapped groups plus a
+    deactivation sweep pays ONE connect+TLS+bind cycle instead of one per
+    call.
+
+    EXPLICIT, not global (issue #513 item 2, replacing the module-global
+    design its first cut used): the holder is created by run_connection()
+    and passed by the caller into each function's own optional keyword
+    parameter. A concurrent, unrelated caller (e.g. the mapping-validation
+    router's fetch_group call, running on its own asyncio task while a
+    reconciler run is in flight) simply never receives this object, so it
+    always gets a private, call-scoped connection and can never observe or
+    disturb the run's shared socket. This makes the safety argument
+    structural (an object reference must be deliberately passed) rather
+    than an invariant owned by another module (the old design's "the sole
+    caller already serializes every run" comment, which a second caller of
+    fetch_group could silently violate without either module noticing).
+
+    Not thread-safe against concurrent use of the SAME holder instance;
+    that is fine because a holder is used only by the single async task
+    that created it via run_connection(), which awaits each
+    fetch_group/resolve_members/etc. call sequentially, never concurrently.
+    """
+
+    def __init__(self) -> None:
+        self._conn: Connection | None = None
+
+    @property
+    def has_connection(self) -> bool:
+        """True once a connection has actually been opened. Lets a caller
+        skip a to_thread dispatch to close a holder that never opened
+        anything (issue #513 item 10), and lets the retry-scope check
+        (item 4) distinguish an already-live connection from an initial
+        open/bind attempt."""
+        return self._conn is not None
+
+    def get(self) -> Connection:
+        if self._conn is None:
+            self._conn = _open_service_connection(require_service_account=True)
+        return self._conn
+
+    def reconnect(self) -> Connection:
+        """Close whatever is open (if anything) and open fresh. Composed
+        from close() + get() (issue #513 item 10) rather than duplicating
+        the open call."""
+        self.close()
+        return self.get()
+
+    def close(self) -> None:
+        if self._conn is not None:
+            _close_connection(self._conn)
+            self._conn = None
+
+
+@asynccontextmanager
+async def run_connection():
+    """Open a run-scoped shared connection and yield its holder.
+
+    Pass the yielded holder explicitly into fetch_group / resolve_members /
+    present_emails / disabled_emails (each function's optional run_holder
+    keyword) to share it; a call that omits run_holder always opens its
+    own private, call-scoped connection, exactly as before item 3 existed
+    (issue #513 item 2: no module-global switch, so this is safe to use
+    concurrently with unrelated callers that never received this holder).
+
+    A connection that drops mid-run and is retried is scoped narrowly (see
+    _is_retryable_after_open below): only a transport-class failure
+    (ldap3's LDAPCommunicationError family: a socket open/send/receive/close
+    error) on a connection that was ALREADY live before the failing
+    operation triggers one reconnect-and-retry; an initial open/bind
+    failure, or a non-benign directory result code on a live connection,
+    never retries and raises LdapUnavailableError immediately, exactly like
+    the non-shared path always has. This keeps per-group skip behavior on a
+    genuine, persistent outage unchanged; the only observable difference is
+    a TRANSIENT communication drop, which sharing a connection across
+    mappings introduces as a new correlated-failure surface a private
+    per-call connection never had, and which the one-time reconnect
+    neutralizes (a mapping that would have failed only because an EARLIER
+    mapping's call happened to kill the shared socket now succeeds instead)
+    rather than needlessly skipping that group's reconcile.
+
+    The holder is always closed on exit, success or failure, off the event
+    loop thread UNLESS nothing was ever opened (issue #513 item 10: a
+    caller with no actual work, e.g. zero mappings and the deactivation
+    sweep disabled, pays no to_thread dispatch at all).
+    """
+    holder = RunConnection()
+    try:
+        yield holder
+    finally:
+        if holder.has_connection:
+            await anyio.to_thread.run_sync(holder.close)
 
 
 def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
@@ -456,11 +578,56 @@ def _attr_values(entry, attr: str) -> list:
     return list(entry[attr].values) if attr in entry else []
 
 
-def _fetch_group_sync(group_dn: str) -> LdapGroupEntry | None:
+def _is_transport_failure(exc: LdapUnavailableError) -> bool:
+    """True when exc's cause chain traces back to an ldap3 transport-class
+    error (LDAPCommunicationError: socket open/receive/send/close, or a
+    server-terminated session), as opposed to a non-benign directory result
+    code (raised with no __cause__ at all) or a non-transport LDAPException
+    (e.g. a malformed filter). Only this narrow class is worth a
+    reconnect-and-retry (issue #513 item 4): anything else would just fail
+    identically again on a fresh connection.
+    """
+    return isinstance(exc.__cause__, LDAPCommunicationError)
+
+
+def _call_with_connection(op, holder: "RunConnection | None"):
+    """Run op(conn): using holder's shared connection when holder is given,
+    or a private, call-scoped connection otherwise (issue #513 item 2: the
+    holder is always an EXPLICIT argument, never read from a module
+    global, so an unrelated concurrent caller that never received it can
+    never share or disturb it).
+
+    Retry scope (item 4): a retry is attempted ONLY when ALL of the
+    following hold: a holder was given, its connection was ALREADY live
+    before this call (so this op is reusing an established session rather
+    than performing the initial open/bind), and the failure is a
+    transport-class LdapUnavailableError (_is_transport_failure). Every
+    other case, no holder, an initial open/bind failure, or a non-benign
+    directory result code on a live connection, raises immediately with no
+    retry, exactly matching the non-shared path's single-attempt behavior:
+    a connection failure must never produce a novel failure mode, only a
+    possibly-recovered one.
+    """
+    if holder is None:
+        with _service_connection(require_service_account=True) as conn:
+            return op(conn)
+    had_live_connection = holder.has_connection
+    try:
+        return op(holder.get())
+    except LdapUnavailableError as exc:
+        if not had_live_connection or not _is_transport_failure(exc):
+            raise
+        return op(holder.reconnect())
+
+
+def _fetch_group_sync(
+    group_dn: str, holder: "RunConnection | None" = None
+) -> LdapGroupEntry | None:
     name_attr = settings.ldap_group_name_attribute
     member_attr = settings.ldap_group_member_attribute
-    with _service_connection(require_service_account=True) as conn:
-        entry = _base_entry(conn, group_dn, [name_attr, member_attr])
+    entry = _call_with_connection(
+        lambda conn: _base_entry(conn, group_dn, [name_attr, member_attr]), holder
+    )
     if entry is None:
         return None
     name_values = _attr_values(entry, name_attr)
@@ -510,12 +677,15 @@ def _resolve_member_sync(member_dn: str) -> LdapMemberResolution:
         return _resolution_for(conn, member_dn)
 
 
-def _resolve_members_sync(member_dns: tuple[str, ...]) -> list[LdapMemberResolution]:
-    with _service_connection(require_service_account=True) as conn:
-        return [_resolution_for(conn, dn) for dn in member_dns]
+def _resolve_members_sync(
+    member_dns: tuple[str, ...], holder: "RunConnection | None" = None
+) -> list[LdapMemberResolution]:
+    return _call_with_connection(
+        lambda conn: [_resolution_for(conn, dn) for dn in member_dns], holder
+    )
 
 
-def _user_present_by_email_sync(email: str) -> bool:
+def _user_present_by_email_sync(email: str, holder: "RunConnection | None" = None) -> bool:
     """SUBTREE-search ldap_user_base_dn for the email; True iff an entry matched.
 
     Asymmetric with _base_entry on purpose: here even noSuchObject raises,
@@ -523,7 +693,8 @@ def _user_present_by_email_sync(email: str) -> bool:
     user being searched for, and the deactivation sweep may only act on
     proven absence.
     """
-    with _service_connection(require_service_account=True) as conn:
+
+    def _do(conn: Connection) -> bool:
         safe_email = escape_filter_chars(email)
         return _checked_search(
             conn,
@@ -535,15 +706,24 @@ def _user_present_by_email_sync(email: str) -> bool:
             description=f"presence search for {email}",
         )
 
+    return _call_with_connection(_do, holder)
 
-async def fetch_group(group_dn: str) -> LdapGroupEntry | None:
+
+async def fetch_group(
+    group_dn: str, *, run_holder: "RunConnection | None" = None
+) -> LdapGroupEntry | None:
     """Fetch a mapped group's entry: None means the DN provably does not resolve.
 
     That None is the ADR 0011 dangling case (mapping validation 422s on it;
     the reconciler skips the group fail-closed). Directory errors raise
     LdapUnavailableError instead.
+
+    run_holder: pass the holder from `async with run_connection() as holder:`
+    to reuse its shared connection (issue #513 items 2/3); omitted
+    (default None), opens a private, call-scoped connection exactly as
+    before item 3 existed.
     """
-    return await anyio.to_thread.run_sync(_fetch_group_sync, group_dn)
+    return await anyio.to_thread.run_sync(_fetch_group_sync, group_dn, run_holder)
 
 
 async def resolve_member(member_dn: str) -> LdapMemberResolution:
@@ -555,23 +735,30 @@ async def resolve_member(member_dn: str) -> LdapMemberResolution:
     the tree; the login path and the presence probe are scoped to
     ldap_user_base_dn, so a member outside that base resolves here but
     cannot log in and is invisible to user_present_by_email (the ADR's
-    group-presence credit is what keeps such users from being swept).
+    group-presence credit is what keeps such users from being swept). Never
+    shares a run_connection() holder: this is the single-DN validation path,
+    outside any reconciler run.
     """
     return await anyio.to_thread.run_sync(_resolve_member_sync, member_dn)
 
 
-async def resolve_members(member_dns: Sequence[str]) -> list[LdapMemberResolution]:
+async def resolve_members(
+    member_dns: Sequence[str], *, run_holder: "RunConnection | None" = None
+) -> list[LdapMemberResolution]:
     """Resolve a group's member DNs over ONE shared service connection.
 
-    One connect+TLS+bind cycle per batch instead of per member. A raise
-    mid-batch discards the partial result, which is exactly ADR 0011's
+    One connect+TLS+bind cycle per batch instead of per member (and, when
+    the caller passes run_holder from an active run_connection(), the SAME
+    connection fetch_group and every other mapping's resolve_members in
+    that run already used: issue #513 items 2/3). A raise mid-batch
+    discards the partial result, which is exactly ADR 0011's
     any-error-skips-the-group rule: the reconciler must not apply a
     half-resolved desired set.
     """
-    return await anyio.to_thread.run_sync(_resolve_members_sync, tuple(member_dns))
+    return await anyio.to_thread.run_sync(_resolve_members_sync, tuple(member_dns), run_holder)
 
 
-async def user_present_by_email(email: str) -> bool:
+async def user_present_by_email(email: str, *, run_holder: "RunConnection | None" = None) -> bool:
     """Email-keyed presence probe; errors raise (never absence).
 
     Resolved 2026-08-12: the deactivation sweep answers presence via ONE
@@ -582,7 +769,7 @@ async def user_present_by_email(email: str) -> bool:
     variant, built as a paged enumeration alongside it, since this filter is
     presence-only.
     """
-    return await anyio.to_thread.run_sync(_user_present_by_email_sync, email)
+    return await anyio.to_thread.run_sync(_user_present_by_email_sync, email, run_holder)
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +787,9 @@ _PAGED_SEARCH_SIZE = 500
 _PAGED_COOKIE_OID = "1.2.840.113556.1.4.319"
 
 
-def _paged_user_emails_sync(search_filter: str, description: str) -> frozenset[str]:
+def _paged_user_emails_sync(
+    search_filter: str, description: str, holder: "RunConnection | None" = None
+) -> frozenset[str]:
     """Paged SUBTREE enumeration under ldap_user_base_dn, collecting every
     value of ldap_email_attribute (lowercased) across every matching entry
     (an entry may be multi-valued; every value is included).
@@ -611,10 +800,18 @@ def _paged_user_emails_sync(search_filter: str, description: str) -> frozenset[s
     already been proven success below; any other outcome (a failed search,
     a non-success result code, an LDAP exception mid-page) raises
     LdapUnavailableError instead of returning a partial set.
+
+    holder (issue #513 item 7): when given and its connection drops
+    mid-enumeration, _call_with_connection's retry-once restarts this WHOLE
+    function body (including the paging cookie, reset to empty) on a fresh
+    connection rather than resuming mid-page, since a paged-results cookie
+    is tied to the specific session that issued it and cannot be replayed
+    on a different connection.
     """
     email_attr = settings.ldap_email_attribute
-    emails: set[str] = set()
-    with _service_connection(require_service_account=True) as conn:
+
+    def _do(conn: Connection) -> frozenset[str]:
+        emails: set[str] = set()
         cookie: bytes = b""
         while True:
             try:
@@ -649,34 +846,38 @@ def _paged_user_emails_sync(search_filter: str, description: str) -> frozenset[s
             cookie = (page_control.get("value") or {}).get("cookie") or b""
             if not cookie:
                 break
-    return frozenset(emails)
+        return frozenset(emails)
+
+    return _call_with_connection(_do, holder)
 
 
-def _present_emails_sync() -> frozenset[str]:
+def _present_emails_sync(holder: "RunConnection | None" = None) -> frozenset[str]:
     return _paged_user_emails_sync(
-        f"({settings.ldap_email_attribute}=*)", "present-emails enumeration"
+        f"({settings.ldap_email_attribute}=*)", "present-emails enumeration", holder
     )
 
 
-def _disabled_emails_sync() -> frozenset[str]:
+def _disabled_emails_sync(holder: "RunConnection | None" = None) -> frozenset[str]:
     return _paged_user_emails_sync(
         f"(&({settings.ldap_email_attribute}=*){settings.ldap_disabled_filter})",
         "disabled-emails enumeration",
+        holder,
     )
 
 
-async def present_emails() -> frozenset[str]:
+async def present_emails(*, run_holder: "RunConnection | None" = None) -> frozenset[str]:
     """Every email attribute value seen under ldap_user_base_dn, lowercased.
 
     The deactivation sweep's absence proof: a candidate whose email is not
     in this set (and was not group-presence-credited this run) is proven
     absent. Raises LdapUnavailableError on any failure or truncated page;
-    never returns a partial enumeration.
+    never returns a partial enumeration. run_holder shares the run's
+    connection (issue #513 item 7) exactly like fetch_group/resolve_members.
     """
-    return await anyio.to_thread.run_sync(_present_emails_sync)
+    return await anyio.to_thread.run_sync(_present_emails_sync, run_holder)
 
 
-async def disabled_emails() -> frozenset[str]:
+async def disabled_emails(*, run_holder: "RunConnection | None" = None) -> frozenset[str]:
     """Every email attribute value under ldap_user_base_dn matching the
     ldap_disabled_filter setting, conjoined with the email-presence filter.
 
@@ -695,4 +896,4 @@ async def disabled_emails() -> frozenset[str]:
         raise ValueError(
             "ldap_disabled_filter must be a complete filter expression starting with '('"
         )
-    return await anyio.to_thread.run_sync(_disabled_emails_sync)
+    return await anyio.to_thread.run_sync(_disabled_emails_sync, run_holder)
