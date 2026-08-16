@@ -74,20 +74,44 @@ async def delete_group(db: AsyncSession, group: UserGroup) -> None:
     await db.commit()
 
 
-async def _remove_from_not_grouped(db: AsyncSession, user_ids: list[uuid.UUID]) -> None:
-    """Remove users from the 'Not Grouped' default group if they are in it."""
-    not_grouped = await get_group_by_name(db, "Not Grouped")
-    if not not_grouped:
+async def _remove_from_not_grouped(
+    db: AsyncSession, user_ids: list[uuid.UUID], not_grouped_id: uuid.UUID | None
+) -> None:
+    """Remove users from the 'Not Grouped' default group if they are in it.
+
+    not_grouped_id is the CALLER's already-resolved id (None if the group
+    does not exist): every call site resolves it itself (by name, or from a
+    run-level cache), so this function never performs its own lookup.
+    """
+    if not_grouped_id is None:
         return
     await db.execute(
         delete(GroupMember).where(
-            GroupMember.group_id == not_grouped.id,
+            GroupMember.group_id == not_grouped_id,
             GroupMember.user_id.in_(user_ids),
         )
     )
 
 
-async def add_member(db: AsyncSession, group_id: uuid.UUID, user_id: uuid.UUID) -> GroupMember:
+async def _add_member_resolved(
+    db: AsyncSession,
+    group_id: uuid.UUID,
+    user_id: uuid.UUID,
+    not_grouped_id: uuid.UUID | None,
+) -> GroupMember:
+    """Core add_member logic taking an ALREADY-RESOLVED "Not Grouped" id
+    (None if the group does not exist).
+
+    issue #513 items 4/6/9: this is the internal entry point a caller that
+    has already resolved "Not Grouped" once for a whole run uses directly,
+    bypassing the public add_member wrapper's own by-name lookup below.
+    ldap_sync_service calls this for both its explicit membership adds and
+    (via create_ldap_user's not_grouped_id passthrough to
+    auth_service._auto_assign_not_grouped) its provisioning path, so both
+    agree on the SAME resolved id within one run. The public add_member
+    keeps its original 3-arg signature and simply resolves-then-delegates,
+    so every other caller (routers, bulk_add_members, tests) is unaffected.
+    """
     existing = await db.execute(
         select(GroupMember).where(
             GroupMember.group_id == group_id,
@@ -99,12 +123,25 @@ async def add_member(db: AsyncSession, group_id: uuid.UUID, user_id: uuid.UUID) 
     member = GroupMember(group_id=group_id, user_id=user_id)
     db.add(member)
     # Auto-remove from "Not Grouped" when added to any other group
-    not_grouped = await get_group_by_name(db, "Not Grouped")
-    if not not_grouped or group_id != not_grouped.id:
-        await _remove_from_not_grouped(db, [user_id])
+    if not_grouped_id is None or group_id != not_grouped_id:
+        await _remove_from_not_grouped(db, [user_id], not_grouped_id)
     await db.commit()
     await db.refresh(member)
     return member
+
+
+async def add_member(db: AsyncSession, group_id: uuid.UUID, user_id: uuid.UUID) -> GroupMember:
+    """Add user_id to group_id, auto-removing it from "Not Grouped".
+
+    Original 3-arg public signature (issue #513 item 9): resolves "Not
+    Grouped" by name on every call, exactly as before #513. A caller
+    driving many adds within one run and wanting to resolve it once should
+    call _add_member_resolved directly with its own cached id.
+    """
+    not_grouped = await get_group_by_name(db, "Not Grouped")
+    return await _add_member_resolved(
+        db, group_id, user_id, not_grouped.id if not_grouped else None
+    )
 
 
 async def remove_member(db: AsyncSession, group_id: uuid.UUID, user_id: uuid.UUID) -> bool:
@@ -199,8 +236,9 @@ async def bulk_add_members(
     # Auto-remove from "Not Grouped" when added to any other group
     if added_ids:
         not_grouped = await get_group_by_name(db, "Not Grouped")
-        if not not_grouped or group_id != not_grouped.id:
-            await _remove_from_not_grouped(db, added_ids)
+        not_grouped_id = not_grouped.id if not_grouped else None
+        if not_grouped_id is None or group_id != not_grouped_id:
+            await _remove_from_not_grouped(db, added_ids, not_grouped_id)
     await db.commit()
     return added, skipped
 

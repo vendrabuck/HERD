@@ -314,6 +314,17 @@ New table `ldap_sync_runs` in the `auth` schema:
   truncation marker), including dangling DNs and skip reasons, and an
   error Text for aborted/failed runs
 
+Migration convention (recorded issue #513, phase 3 to phase 4 practice
+made explicit): a counter or status value this table can carry lands in
+the SAME migration as the phase that starts writing it, not
+pre-allocated speculatively by an earlier phase. Phase 3's migration
+(0007) deliberately omitted users_deactivated, users_reactivated, and
+the `aborted` status even though this section already named them,
+because phase 3 never writes them; phase 4's migration (0008) added the
+two counter columns when it became their writer (`aborted` needed no
+schema change, status is a plain string column). Columns land with
+their writer.
+
 `POST /admin/ldap-sync/run` (sync now) launches the run as a background
 task and returns 202 with the run id immediately (a full run does one
 directory search per member DN plus one per LDAP user and must not sit

@@ -10,15 +10,15 @@ Key rules enforced here:
 """
 
 import asyncio
-import hashlib
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from herd_common import advisory_lock
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, exists, false, func, select, text, update
+from sqlalchemy import and_, exists, false, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -934,14 +934,15 @@ async def _acquire_device_locks(db: AsyncSession, device_ids: list[uuid.UUID]) -
     commit. Advisory locks are sorted by stringified device_id (stable
     ordering) to prevent deadlocks between concurrent different device sets.
     Locks auto-release on transaction commit. No-op on SQLite (integration
-    tests run in-memory without advisory lock support).
+    tests run in-memory without advisory lock support): xact_lock's own
+    dialect gate covers it, so this loop needs no gate of its own (issue
+    #513 item 5, ported onto the herd_common.advisory_lock helper shared
+    with auth's session-scoped lock; key derivation is byte-identical to
+    the formula this replaces).
     """
-    dialect = db.bind.dialect.name if db.bind else ""
-    if dialect != "postgresql":
-        return
     for device_id_str in sorted(str(d) for d in device_ids):
-        lock_key = int(hashlib.sha256(device_id_str.encode()).hexdigest()[:15], 16)
-        await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
+        lock_key = advisory_lock.advisory_key_from_string(device_id_str)
+        await advisory_lock.xact_lock(db, lock_key)
 
 
 def _reservation_created_event(reservation: Reservation) -> dict:
