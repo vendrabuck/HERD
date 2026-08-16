@@ -41,6 +41,7 @@ from app.schemas.ldap_sync import (
 )
 from app.services import ldap_service, ldap_sync_service
 from app.services.group_service import get_group_by_id
+from app.tasks.ldap_sync_loop import effective_interval_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,18 @@ async def get_sync_status(
     """Mode context for the phase 6 admin UI: current auth backend plus the
     interval-loop settings, so the page can gate create/sync-now on
     auth_method == "ldap" and show honest context when the loop is off.
+
+    sync_interval_seconds is the EFFECTIVE interval, run through
+    tasks.ldap_sync_loop.effective_interval_seconds (the same 60s floor
+    main.py's production loop start-up applies), not the raw setting: a
+    sub-floor configured value is clamped at loop start, so reporting the
+    raw value here would show the admin page a number the loop never
+    actually uses.
     """
     return LdapSyncStatusResponse(
         auth_method=settings.auth_method,
         group_sync_enabled=settings.ldap_group_sync_enabled,
-        sync_interval_seconds=settings.ldap_sync_interval_seconds,
+        sync_interval_seconds=effective_interval_seconds(settings.ldap_sync_interval_seconds),
     )
 
 

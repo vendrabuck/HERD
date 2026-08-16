@@ -88,6 +88,14 @@ MEMBER_SKIP_USERNAME_TAKEN = "username_taken"
 MEMBER_SKIP_EMAIL_OWNED_BY_LOCAL_ACCOUNT = "email_owned_by_local_account"
 MEMBER_SKIP_USERNAME_DRIFT_COLLISION = "username_drift_collision"
 MEMBER_SKIP_USER_INACTIVE = "user_inactive"
+# Distinct from MEMBER_SKIP_USER_INACTIVE: that reason claims a real,
+# currently-inactive row; this one means the row itself is gone by the time
+# the add-loop's live re-verification ran (round-3 item 1's re-verify
+# query), most commonly a user deleted after an earlier mapped group's
+# cached success. See that re-verification block for why a missing row also
+# forfeits this pass's group-presence credit while a merely inactive one
+# does not.
+MEMBER_SKIP_USER_MISSING = "user_missing"
 # Not a skip: a provisioning IntegrityError whose retry-as-lookup found the
 # row (concurrent JIT login). Recorded in detail, member proceeds.
 PROVISION_RACE_RECOVERED = "provision_race_recovered"
@@ -569,6 +577,36 @@ async def _ensure_ldap_user(
     return await _finalize_ldap_user(db, group_dn, identity, tally, identity_cache, user)
 
 
+async def _reverify_still_present(
+    db: AsyncSession, user_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, bool]:
+    """Batch, chunked {user_id: is_active} re-fetch for ids about to be
+    added to a group (round-3 item 1's live re-verification of a
+    potentially-stale identity_cache hit; see _reconcile_mapping's to_add
+    loop). Mirrors auth_service.get_users_by_emails' own chunking (issue
+    #513 item 3, reusing its constant): asyncpg's wire protocol caps a
+    single prepared statement at 32767 bind parameters, and user_ids is a
+    caller-supplied add set with no size bound of its own.
+
+    An id absent from the returned dict has no row at all: the user was
+    deleted between an earlier mapped group's cached success and this
+    group's add. That is distinct from a present id mapped to False (a
+    real, currently-inactive row); see _reconcile_mapping for how the two
+    are recorded under different skip reasons and treated differently for
+    group-presence credit.
+    """
+    out: dict[uuid.UUID, bool] = {}
+    if not user_ids:
+        return out
+    chunk_size = auth_service._EMAIL_LOOKUP_CHUNK_SIZE
+    for start in range(0, len(user_ids), chunk_size):
+        chunk = user_ids[start : start + chunk_size]
+        rows = (await db.execute(select(User.id, User.is_active).where(User.id.in_(chunk)))).all()
+        for row in rows:
+            out[row.id] = row.is_active
+    return out
+
+
 async def _reconcile_mapping(
     db: AsyncSession,
     *,
@@ -688,27 +726,40 @@ async def _reconcile_mapping(
 
     # Sorted for deterministic apply order (and deterministic detail).
     to_add = sorted(desired_ids - current_ids, key=str)
-    still_active_ids: set[uuid.UUID] = set()
-    if to_add:
-        # Round-3 item 1: a cache-hit SUCCESS in identity_cache can be
-        # stale by the time this specific group's add actually runs, if an
-        # admin deactivated the user between an EARLIER group's
-        # classification (which cached the success) and now; a fresh
-        # classification would catch a since-deactivated user, but a cache
-        # hit deliberately skips the DB round trip to avoid the very N+1
-        # items 1/2 exist to kill. One extra batched live check here,
-        # bounded by the number of ids actually about to be ADDED (never
-        # the whole membership), closes that gap without reintroducing it.
-        still_active_ids = set(
-            (await db.execute(select(User.id).where(User.id.in_(to_add), User.is_active.is_(True))))
-            .scalars()
-            .all()
-        )
+    # Round-3 item 1: a cache-hit SUCCESS in identity_cache can be stale by
+    # the time this specific group's add actually runs, if an admin
+    # deactivated the user (or the row itself was deleted) between an
+    # EARLIER group's classification (which cached the success) and now; a
+    # fresh classification would catch a since-deactivated or
+    # since-deleted user, but a cache hit deliberately skips the DB round
+    # trip to avoid the very N+1 items 1/2 exist to kill. One extra
+    # batched, chunked live check here, bounded by the number of ids
+    # actually about to be ADDED (never the whole membership), closes that
+    # gap without reintroducing it.
+    presence = await _reverify_still_present(db, to_add)
     for user_id in to_add:
-        if user_id not in still_active_ids:
+        if user_id not in presence:
+            # The row itself is gone (e.g. deleted between an earlier
+            # group's cached success and this group's add): a distinct
+            # reason from MEMBER_SKIP_USER_INACTIVE, and this pass's
+            # group-presence credit is forfeited too (desired_ids, the
+            # returned set) since there is no row left for the
+            # deactivation sweep to reactivate.
+            tally.skip_member(
+                group_dn,
+                member_dn_by_user_id.get(user_id, str(user_id)),
+                MEMBER_SKIP_USER_MISSING,
+            )
+            desired_ids.discard(user_id)
+            continue
+        if not presence[user_id]:
             # Proven active when classified, proven inactive now: record
             # exactly like a fresh classification would have, but never
             # cache it (this is a runtime re-check, not identity_cache).
+            # The row still exists, so group-presence credit is kept
+            # (unlike the missing-row case above): a since-reactivated
+            # user must still be recognized present by the deactivation
+            # sweep.
             tally.skip_member(
                 group_dn,
                 member_dn_by_user_id.get(user_id, str(user_id)),
@@ -929,6 +980,17 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
     success/partial/aborted assignment), with that cause string as the
     recorded error. No new status value: the five-valued vocabulary
     (running/success/partial/aborted/failed) is unchanged.
+
+    A second cancellation edge case: the shutdown interruption that raised
+    CancelledError can leave the session broken enough that the finally's
+    own finalize commit ALSO raises. Left unguarded, that would replace the
+    propagating CancelledError with the commit's exception (an exception
+    raised in a finally always supersedes the try's active exception),
+    which main.py's shutdown handler does not match, stranding the run row
+    at status "running" forever. The finally wraps that commit in its own
+    try/except: it logs the failure and, if a cancellation was in flight,
+    re-raises that CancelledError explicitly so the caller still observes
+    it.
     """
     run_id = run.id
     logger.info(
@@ -938,6 +1000,11 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
     tally = _Tally()
     status = "failed"
     error: str | None = None
+    # Set only by the CancelledError arm below, and read only by the
+    # finally's commit-failure handler: captures the original cancellation
+    # so a finalize-commit failure during shutdown re-raises IT, not the
+    # commit's own exception (see the finally block for why).
+    pending_cancel: asyncio.CancelledError | None = None
     try:
         mappings = (
             await db.execute(
@@ -992,7 +1059,7 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
             # documented ordering) would still win via the except branch.
             status = "aborted"
             error = tally.abort_error
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
         # Mirrors the Exception arm below: a cancel delivered between a
         # per-op db.add and its commit (e.g. mid _reconcile_mapping) leaves a
         # torn, uncommitted write on the session. Without this rollback the
@@ -1001,6 +1068,7 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
         # change alongside a "failed" run.
         await db.rollback()
         error = "cancelled during service shutdown"
+        pending_cancel = exc
         raise
     except Exception as exc:
         await db.rollback()
@@ -1014,7 +1082,33 @@ async def execute_run(db: AsyncSession, run: LdapSyncRun) -> LdapSyncRun:
         run.status = status
         run.error = error
         run.finished_at = datetime.now(timezone.utc)
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception:
+            # The session can be broken by the very interruption that
+            # raised CancelledError above (e.g. a cancelled await mid
+            # asyncpg call), so this finalize commit can itself raise. Log
+            # it (it means the run row never reached its terminal status,
+            # left showing "running"): a silent swallow here would hide a
+            # corpse row with no trace. Then decide what propagates: raising
+            # bare from inside this except would normally REPLACE whichever
+            # exception was already active when the finally started
+            # (Python's finally-supersedes-try rule, not specific to any
+            # version) with this commit failure, which is exactly the bug
+            # this branch exists to close. When the try block was already
+            # unwinding for cancellation, the caller must still observe
+            # CancelledError (main.py's shutdown handling only matches on
+            # that type; anything else strands the row uncleaned AND misses
+            # shutdown's own except), so pending_cancel is re-raised
+            # explicitly instead. Any other path (no pending cancel) keeps
+            # today's behavior: the commit failure itself propagates.
+            logger.exception(
+                "LDAP sync run finalize commit failed",
+                extra={"action": "ldap_sync_run_finalize_commit_failed", "run_id": str(run_id)},
+            )
+            if pending_cancel is not None:
+                raise pending_cancel from None
+            raise
         logger.info(
             "LDAP sync run finished: %s",
             status,

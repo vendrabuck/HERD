@@ -801,3 +801,119 @@ def test_cache_outcome_only_caches_the_structural_frozenset():
     # deliberately, not inherited by copy-pasting a call site.
     ldap_sync_service._cache_outcome(identity_cache, "novel@company.local", None, "some_new_reason")
     assert "novel@company.local" not in identity_cache
+
+
+# ---------------------------------------------------------------------------
+# Post-merge review batch item 1/2: _reverify_still_present chunking, and
+# a deleted-mid-run user recording a distinct, credit-forfeiting reason.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reverify_still_present_chunks_the_in_list(db, monkeypatch):
+    # Chunk size mocked down to 3, 7 user ids requested: must issue exactly
+    # 3 chunked queries (3 + 3 + 1) and still return every row's is_active
+    # state. Mirrors
+    # test_auth_service_unit.test_get_users_by_emails_chunks_the_in_list,
+    # reusing the SAME constant this function chunks by.
+    monkeypatch.setattr(auth_service, "_EMAIL_LOOKUP_CHUNK_SIZE", 3)
+    user_ids = [
+        await _mk_named_user(db, email=f"user{i}@company.local", username=f"user{i}")
+        for i in range(7)
+    ]
+
+    calls: list[int] = []
+    real_execute = db.execute
+
+    async def counting_execute(*args, **kwargs):
+        calls.append(1)
+        return await real_execute(*args, **kwargs)
+
+    db.execute = counting_execute
+
+    result = await ldap_sync_service._reverify_still_present(db, user_ids)
+
+    assert len(calls) == 3
+    assert set(result) == set(user_ids)
+    assert all(result[uid] is True for uid in user_ids)
+
+
+@pytest.mark.asyncio
+async def test_reverify_still_present_empty_input_issues_no_query(db, monkeypatch):
+    calls: list[int] = []
+    real_execute = db.execute
+
+    async def counting_execute(*args, **kwargs):
+        calls.append(1)
+        return await real_execute(*args, **kwargs)
+
+    db.execute = counting_execute
+
+    result = await ldap_sync_service._reverify_still_present(db, [])
+
+    assert result == {}
+    assert len(calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_deleted_mid_run_records_missing_not_inactive_and_drops_credit(db, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import delete as sa_delete
+
+    group_a = await _mk_group(db, name="Engineering")
+    group_b = await _mk_group(db, name="QA")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await _mk_mapping_ordered(db, group_a, _GROUP_DN_A, "herd-eng", base)
+    await _mk_mapping_ordered(db, group_b, _GROUP_DN_B, "herd-qa", base + timedelta(seconds=1))
+
+    # Z starts ACTIVE, has NO existing membership in either group, and the
+    # directory lists Z as a member of BOTH groups in THIS run. Group A's
+    # add caches Z's success; Z's row is then DELETED (not merely
+    # deactivated) before group B's own add runs.
+    z_id = await _mk_named_user(db, email="z@company.local", username="z")
+    identity_z = ldap_service.LdapIdentity(username="z", email="z@company.local", dn=_dn(3))
+
+    group_dn_context = {"current": None}
+
+    async def fetch_group_tracking(group_dn, *, run_holder=None):
+        group_dn_context["current"] = group_dn
+        return _entry(
+            [_dn(3)], dn=group_dn, name="herd-eng" if group_dn == _GROUP_DN_A else "herd-qa"
+        )
+
+    async def fake_resolve_members(member_dns, *, run_holder=None):
+        if group_dn_context["current"] == _GROUP_DN_B:
+            # Deleted between group A's cached success and group B's own
+            # re-verification: the row itself is gone, not merely inactive.
+            await db.execute(sa_delete(User).where(User.id == z_id))
+            await db.commit()
+        return [ldap_service.LdapMemberResolution(identity_z) for _ in member_dns]
+
+    monkeypatch.setattr(ldap_service, "fetch_group", fetch_group_tracking)
+    monkeypatch.setattr(ldap_service, "resolve_members", fake_resolve_members)
+
+    run = await ldap_sync_service.run_sync(db)
+
+    member_ids_a = (
+        (await db.execute(select(GroupMember.user_id).where(GroupMember.group_id == group_a)))
+        .scalars()
+        .all()
+    )
+    member_ids_b = (
+        (await db.execute(select(GroupMember.user_id).where(GroupMember.group_id == group_b)))
+        .scalars()
+        .all()
+    )
+    assert z_id in member_ids_a
+    assert z_id not in member_ids_b
+    assert run.status == "partial"
+    skipped = run.detail.get("skipped_members", [])
+    assert any(
+        r["group_dn"] == _GROUP_DN_B and r["reason"] == ldap_sync_service.MEMBER_SKIP_USER_MISSING
+        for r in skipped
+    )
+    assert not any(
+        r["group_dn"] == _GROUP_DN_B and r["reason"] == ldap_sync_service.MEMBER_SKIP_USER_INACTIVE
+        for r in skipped
+    )
