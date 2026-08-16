@@ -271,14 +271,15 @@ make frontend-dev    # Run frontend dev server
 
 ### Port cable validation
 - Topology editor validates whether selected ports have physical cables before creating connections
-- Uncabled ports shown with "(no cable)" suffix and warning text in the connection modal
+- Uncabled ports shown with a quiet "no cable" tag in the wiring dialog's port columns
 - Edges with uncabled ports render red stroke with "uncabled port" badge
 
 ### Topology editor
 - Drag-and-drop device placement with floating equipment palette
 - Equipment palette filters: search, template, topology type, and reserved resource visibility toggle
 - Devices on canvas are hidden from the palette; removing restores them
-- Layer 1/2/3 connection creation with port selection modals
+- Drawing a connection opens a wiring dialog (two port columns, drag or click-to-connect, per-line L1/L2/L3, "Connect 1:1 in order" for wiring two same-size switches at once); a Quick connect toggle swaps in a compact single-pair popover, with an escalation link back to the full dialog
+- Connections between the same device pair collapse into one bundled edge on the canvas with a count badge and per-connection delete
 - Physical/cloud topology separation enforced at database, service, and UI levels
 
 ### Device health monitoring

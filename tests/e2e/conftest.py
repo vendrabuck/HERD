@@ -208,6 +208,68 @@ def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> 
     page.wait_for_url("**/topology**")
 
 
+def pw_token(page) -> str | None:
+    """The current access token from the browser's localStorage (Playwright)."""
+    return page.evaluate("() => window.localStorage.getItem('access_token')")
+
+
+def pw_api(page, method, path, **kwargs):
+    """Authenticated host-side HERD API request, using the browser's own JWT (Playwright).
+
+    Shared by every Playwright module that needs host-side API calls under
+    the browser's own session (issue #517 review item 10 moved this out of
+    test_connections_playwright.py, the original single owner, so
+    test_wiring_dialog_playwright.py does not duplicate it).
+    """
+    allow_errors = kwargs.pop("allow_errors", False)
+    token = pw_token(page)
+    headers = kwargs.pop("headers", {}) or {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    url = f"{HOST_BASE_URL}/api{path}"
+    with httpx.Client(verify=False, timeout=30.0) as client:
+        resp = client.request(method, url, headers=headers, **kwargs)
+    if not allow_errors:
+        resp.raise_for_status()
+    return resp
+
+
+def pw_two_devices_with_ports(page, min_ports: int = 1):
+    """Find two distinct seeded devices, of the SAME topology_type, that each
+    have at least min_ports ports.
+
+    Scans devices via the inventory API (the same data ConnectionsPage's
+    device search and the wiring dialog both hit) until two qualifying
+    devices are found, capped so a slow or empty inventory skips rather than
+    hangs. Must be called after login: it needs the browser's JWT to call the
+    API. Returns ((device_a, ports_a), (device_b, ports_b)); a caller that
+    only needs one port per device (min_ports=1, the default) indexes
+    ports_a[0]/ports_b[0].
+
+    Matching topology_type is required (issue #517 review round 3 item
+    12.10): TopologyEditorPage's isValidConnection refuses to even open the
+    wiring surface for a PHYSICAL-to-CLOUD draw ("topology types must
+    match"), so a mismatched pair would make any test built on this helper
+    fail before it reached the behavior under test.
+    """
+    devices = pw_api(page, "GET", "/inventory/devices", params={"skip": 0, "limit": 100}).json()[
+        "items"
+    ]
+    by_type: dict[str, list] = {}
+    for d in devices:
+        ports = pw_api(page, "GET", f"/inventory/devices/{d['id']}/ports").json()
+        if len(ports) < min_ports:
+            continue
+        bucket = by_type.setdefault(d["topology_type"], [])
+        bucket.append((d, ports))
+        if len(bucket) >= 2:
+            return bucket[0], bucket[1]
+    pytest.skip(
+        f"fewer than two seeded devices of the same topology_type with at least "
+        f"{min_ports} port(s) available"
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_config_seeded():
     """Seed the config service so LoginPage isn't gated on the setup wizard.

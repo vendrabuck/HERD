@@ -1,7 +1,7 @@
 import { forwardRef, type ButtonHTMLAttributes } from "react";
 import { cn } from "@/lib/cn";
 
-export type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
+export type ButtonVariant = "primary" | "secondary" | "danger" | "ghost" | "outline";
 export type ButtonSize = "md" | "sm";
 
 const BASE =
@@ -12,6 +12,7 @@ const VARIANTS: Record<ButtonVariant, string> = {
   secondary: "bg-gray-100 text-gray-700 hover:bg-gray-200",
   danger: "bg-red-600 text-white hover:bg-red-700",
   ghost: "text-blue-600 hover:bg-blue-50",
+  outline: "bg-white text-gray-700 border border-gray-300 hover:bg-gray-50",
 };
 
 const SIZES: Record<ButtonSize, string> = {

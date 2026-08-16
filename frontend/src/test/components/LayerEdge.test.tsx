@@ -18,7 +18,7 @@ vi.mock("@xyflow/react", () => ({
 
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
 
-function renderEdge(data: Record<string, unknown>) {
+function renderEdge(data: Record<string, unknown> | undefined) {
   const props = {
     id: "e1",
     sourceX: 0,
@@ -64,5 +64,11 @@ describe("LayerEdge", () => {
     renderEdge({ layer: "L2", pathValid: true, portsCabled: false });
     expect(screen.getByTestId("edge").getAttribute("data-stroke")).toBe("#ef4444");
     expect(screen.getByText("uncabled port")).toBeTruthy();
+  });
+
+  it("renders without throwing and defaults to L2 gray-blue when data is entirely missing (review item 3)", () => {
+    expect(() => renderEdge(undefined)).not.toThrow();
+    expect(screen.getByTestId("edge").getAttribute("data-stroke")).toBe("#3b82f6");
+    expect(screen.getByText("L2")).toBeInTheDocument();
   });
 });
