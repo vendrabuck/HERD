@@ -249,10 +249,13 @@ make frontend-dev    # Run frontend dev server
 - Used by device groups and ACL service for permission resolution
 
 ### Reservation detail and live editing
-- Reservation detail modal with five tabs: Details, Inventory, Routes, Schedule, and a
-  conditional AI Assistant tab (shown only when an AI provider is configured)
+- Reservation detail modal with five tabs plus a conditional sixth: Details,
+  Inventory, Routes, Wiring, Schedule, and an AI Assistant tab shown only when an AI
+  provider is configured
 - Inventory tab: expandable device rows with ports and connection information
 - Routes tab: hop-by-hop pathfinding visualization between all DUT pairs in the reservation
+- Wiring tab: per-connection status grouped by layer (L1/L2/L3), with manual retry for
+  failed rows
 - Schedule tab: inline editing of end time and purpose
 - Edit Resources: search, add, and remove devices with availability filtering
 - Backend PATCH endpoint validates topology uniformity, checks conflicts for added devices, and publishes NATS events for driver execution
@@ -476,7 +479,7 @@ at the point of use via secrets' internal, `X-Internal-Token`-gated endpoint.
 
 ## Testing
 
-Over 3,900 backend unit tests across the 13 services, around 600 frontend tests via vitest, and 185 cross-service integration tests (a handful self-skip: AI-config-dependent cases when no provider is configured, NATS-dependent cases when JetStream isn't reachable, and LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). 151 E2E browser tests, 122 via Selenium and 29 via Playwright (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against the checked-in `osixia/openldap` test directory (`infra/ldap-test/`, started with `make ldap-up`); `make master` and `make everything` run these hard-required, so they cannot silently skip in a gate (see `docs/ENV_VARS.md` LDAP section for runtime LDAP config).
+Over 3,950 backend unit tests across the 13 services, around 700 frontend tests via vitest, and 181 cross-service integration tests (a handful self-skip: AI-config-dependent cases when no provider is configured, NATS-dependent cases when JetStream isn't reachable, and LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). 155 E2E browser tests, 122 via Selenium and 33 via Playwright (most active, a few conditional skips). Locust load tests at `tests/load/` (5 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against the checked-in `osixia/openldap` test directory (`infra/ldap-test/`, started with `make ldap-up`); `make master` and `make everything` run these hard-required, so they cannot silently skip in a gate (see `docs/ENV_VARS.md` LDAP section for runtime LDAP config).
 
 Coverage targets 85%+ per backend service; run `make coverage` for the current per-service report (or `make coverage-<svc>` for one service with an HTML report). Outstanding test gaps are tracked in [docs/GAPS.md](docs/GAPS.md).
 

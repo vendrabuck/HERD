@@ -40,8 +40,8 @@ These must be set before the stack will run. The config service first-run flow w
 
 | Variable | Example / format | Used by | Purpose |
 |---|---|---|---|
-| `AUTH_SECRET_KEY` | 64-char hex string (`openssl rand -hex 32`) | auth, inventory, reservations, cabling, acl, execution, ai-orchestrator | HMAC secret used to sign and verify JWTs. MUST match across all services. Changing it invalidates every existing token. |
-| `INTERNAL_API_TOKEN` | 64-char hex string | reservations, inventory, execution, cabling, user-profile, notifications, integration, secrets, ai-orchestrator | Shared secret for service-to-service calls that use the `X-Internal-Token` header. Must match across all services that speak to each other. ai-orchestrator uses it only to call execution's internal validate-package endpoint for recipe drafting. |
+| `AUTH_SECRET_KEY` | 64-char hex string (`openssl rand -hex 32`) | every backend service (auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, integration, secrets) | HMAC secret used to sign and verify JWTs. MUST match across all services. Changing it invalidates every existing token. You set it once as `AUTH_SECRET_KEY`; `docker-compose.yml` passes it into every backend service as `SECRET_KEY` (the config service sees the `AUTH_SECRET_KEY` name, since that is the config-schema key). |
+| `INTERNAL_API_TOKEN` | 64-char hex string | auth, reservations, inventory, execution, cabling, user-profile, notifications, integration, secrets, ai-orchestrator (every service except acl) | Shared secret for service-to-service calls that use the `X-Internal-Token` header. Must match across all services that speak to each other. ai-orchestrator uses it only to call execution's internal validate-package endpoint for recipe drafting. |
 | `SECRETS_KEK` | base64-encoded 32 bytes (`python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`) | secrets | Key-encryption key for the credential store. No default: the secrets service refuses to boot without a valid value (the dev/test compose override supplies a dev-only key; production must set it). Losing it makes stored secrets unrecoverable. |
 | `SECRETS_KEK_PREVIOUS` | same format, normally unset | secrets | Set only during a KEK rotation window: at boot, stored keys that fail under `SECRETS_KEK` are unwrapped with this and re-wrapped under the new KEK. Unset it once a boot has completed with both present. |
 | `POSTGRES_USER` | `herd` | postgres, all backend services | Database owner. |
@@ -129,12 +129,12 @@ Read by services that need to call other services. The defaults assume the compo
 
 | Variable | Default | Read by |
 |---|---|---|
-| `AUTH_SERVICE_URL` | `http://auth:8000` | inventory, acl (forward user JWT to resolve groups) |
+| `AUTH_SERVICE_URL` | `http://auth:8000` | inventory, acl (forward user JWT to resolve groups), notifications (admin fan-out and contact lookup, see the notifications section) |
 | `INVENTORY_SERVICE_URL` | `http://inventory:8000` | reservations, execution, ai-orchestrator, cabling (device-group boundary check), secrets (delete-time hypervisor reference guard, issue #456) |
 | `CABLING_SERVICE_URL` | `http://cabling:8000` | execution, ai-orchestrator, reservations (connectivity validation via `/validate/internal`) |
-| `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | ai-orchestrator, inventory (apply scheduler checks reservation activity via `/internal/{id}`), execution (dynamic-resources provision-result callback, `/internal/{id}/provision-result`, ADR 0004) |
-| `EXECUTION_SERVICE_URL` | `http://execution:8000` | ai-orchestrator, inventory (apply scheduler dispatches configure runs) |
-| `ACL_SERVICE_URL` | `http://acl:8000` | inventory, execution (carve-out check for non-admin configure on managed devices) |
+| `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | ai-orchestrator, inventory (apply scheduler checks reservation activity via `/internal/{id}`), execution (dynamic-resources provision-result callback, `/internal/{id}/provision-result`, ADR 0004), cabling (bulk topology import guard via `/internal/by-topology/{id}`), integration (the `/api/v1` facade proxies to it), notifications (active-user lookup, see the notifications section) |
+| `EXECUTION_SERVICE_URL` | `http://execution:8000` | ai-orchestrator, inventory (apply scheduler dispatches configure runs), reservations (utilization report run counts, and the wiring-status / manual-retry proxies) |
+| `ACL_SERVICE_URL` | `http://acl:8000` | inventory, execution (carve-out check for non-admin configure on managed devices), secrets (grant checks on the credential store) |
 | `USER_PROFILE_SERVICE_URL` | `http://user-profile:8000` | notifications (read prefs via internal endpoint and proxy PUT/GET) |
 | `SECRETS_SERVICE_URL` | `http://secrets:8000` | inventory (validate a hypervisor's secret reference at registration/update), execution (resolve a hypervisor's secret value for a dynamic-resources recipe run, ADR 0004) |
 
@@ -179,6 +179,7 @@ The orchestrator supports two backends via `AI_PROVIDER`: `anthropic` (the Async
 | `AI_PROVIDER` | `anthropic` | Backend selector: `anthropic` or `openai_compat`. |
 | `AI_BASE_URL` | (empty) | Endpoint URL for a non-hosted backend. For `openai_compat`, include the `/v1` suffix, e.g. `http://vllm:8000/v1`. For `anthropic` pointed at a local Anthropic-compatible endpoint (e.g. a vLLM serving `/v1/messages`), use the server ROOT with no `/v1` suffix (the Anthropic SDK appends `/v1/messages` itself). Leave blank for the hosted Anthropic API. |
 | `AI_API_KEY` | (empty) | API key for the hosted Anthropic API. Leave blank for a local server (vLLM, Ollama, LM Studio) that ignores auth: the orchestrator sends an `EMPTY` placeholder when this is blank, for both `openai_compat` and `anthropic` pointed at a local `AI_BASE_URL`. |
+| `ANTHROPIC_API_KEY` | (empty) | Deprecated and never honored (issue #339). It is read only so the orchestrator can log a startup warning when it is set while `AI_API_KEY` is blank, instead of leaving AI features silently disabled. Set `AI_API_KEY`. |
 | `AI_MODEL` | `claude-sonnet-4-6` | Model identifier passed to the provider. Format is provider-specific: `claude-*` for `anthropic`; provider-and-deployment-specific for `openai_compat` (e.g. `Qwen/Qwen3-35B-Instruct` on vLLM, `gpt-4o-mini` on OpenAI proper). |
 | `AI_MAX_TOKENS` | `4096` | Per-call token cap. |
 | `AI_DAILY_TOKEN_QUOTA` | `0` | Per-user daily budget of AI tokens (input + output) across all AI features (topology generation, the reservation assistant, and template-identity suggestions). `0` (default) disables enforcement and writes no usage rows, so behavior is unchanged until an operator opts in. When positive, a caller whose accumulated tokens for the current UTC day already meet or exceed this value is rejected with HTTP 429 and a `{limit, used, remaining, reset_at}` body, without calling the provider; the boundary call that crosses the limit is allowed and the next one is blocked. Counts reset implicitly on the UTC day boundary. Provider-reported usage is used when present, with a chars/4 estimate as a fallback. `GET /api/ai/quota` returns the caller's current usage. |
@@ -278,13 +279,13 @@ The execution service also hosts the periodic health-poll scheduler (ROADMAP #13
 | `HEALTH_POLL_NOTIFY_ENABLED` | `true` | Publish a `device.health_transition` NATS event when a device crosses the failure threshold (bad_news) or recovers. Set to `false` to silence alerts without rolling back the publisher code. |
 | `TEMPLATE_CACHE_TTL_SECONDS` | `300` | How long the health-poll path caches a fetched template (keyed by template_id) before re-fetching from inventory (issue #316). A lab sharing a handful of templates across many devices otherwise re-fetches the same template on every poll; a hit within this window skips the inventory call. Scoped to the health scheduler only, not the on-demand executions router or the NATS consumer's own cache, so a just-edited template is still immediately visible there. A failed fetch is never cached. |
 
-The execution service also runs the per-connection wiring auto-retry channel (ADR 0007 Decision 6, issue #345 P3b). A hardware apply failure during a fork-save reconcile lands a `FAILED` `l1_connection_assignments` row rather than rolling back the durable save; a background sweep reattempts the hardware-retryable ones (a driver or login failure), with the pinned unresolvable and not-a-simple-chain rows left for a fork re-save. The channel is batch-capped per tick exactly like the health scheduler, and mirrors its run-mode posture: enabled by default so a poller-only replica runs it, set `false` on API replicas to keep the work on the poller fleet.
+The execution service also runs the per-connection wiring auto-retry channel (ADR 0007 Decision 6, issue #345 P3b). A hardware apply failure during a fork-save reconcile lands a `FAILED` row rather than rolling back the durable save; a background sweep reattempts the hardware-retryable ones (a driver or login failure), with the pinned unresolvable and not-a-simple-chain rows left for a fork re-save. Since ADR 0009 phases 4 and 5 the channel covers all three layers, sweeping `l1_connection_assignments`, `l2_port_assignments`, and `route_assignments`. The channel is batch-capped per tick exactly like the health scheduler, and mirrors its run-mode posture: enabled by default so a poller-only replica runs it, set `false` on API replicas to keep the work on the poller fleet.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `WIRING_RETRY_ENABLED` | `true` | Enable the in-process background wiring auto-retry channel. Set to `false` on API replicas (paired with `EXECUTION_POLLER_ONLY=false`) so the sweep runs only on the poller fleet, the same split `HEALTH_POLL_SCHEDULER_ENABLED` provides for the health scheduler. Disabling it leaves FAILED rows for manual retry only (the owner-gated `POST /reservations/{id}/wiring/retry` proxy). |
 | `WIRING_RETRY_INTERVAL_SECONDS` | `60` | Seconds between auto-retry ticks. A tick that raises backs off exponentially up to a cap, then resets on the next healthy tick, exactly like the health scheduler loop. |
-| `WIRING_RETRY_BATCH_SIZE` | `20` | Maximum FAILED rows one tick reattempts (issue #345). Rows past the batch stay `FAILED` and are swept on later ticks. Bounds the driver subprocesses one tick can spawn, the same role `HEALTH_POLL_BATCH_SIZE` plays for polls. |
+| `WIRING_RETRY_BATCH_SIZE` | `20` | Maximum FAILED rows one tick reattempts (issue #345), applied per layer: the tick claims up to this many L1, L2, and L3 rows each, so the worst case is three times this value. Rows past the batch stay `FAILED` and are swept on later ticks. Bounds the driver subprocesses one tick can spawn, the same role `HEALTH_POLL_BATCH_SIZE` plays for polls. |
 | `WIRING_RETRY_MAX_ATTEMPTS` | `10` | Cumulative driver-attempt cap for the auto-retry channel. `attempts` accumulates every driver call ever spent on a connection (the in-line apply plus each reattempt), so a row whose `attempts` reaches this cap is no longer auto-swept and is parked `FAILED` for manual retry only. The manual retry proxy ignores this cap by design, since it is the fallback for a parked row. |
 
 ## Inventory service (optional storage overrides)
@@ -296,8 +297,8 @@ Driver packages are stored locally by default. To use MinIO (or any S3-compatibl
 | `DRIVER_STORAGE_PATH` | `/data/drivers` | Local filesystem path for driver packages. Ignored when MinIO is configured. |
 | `DRIVER_MAX_SIZE_BYTES` | `10485760` | Maximum accepted size (in bytes) of an uploaded driver package. Default is 10 MB. |
 | `MINIO_ENDPOINT` | (empty) | Set to enable MinIO; endpoint like `minio:9000`. |
-| `MINIO_ACCESS_KEY` | - | Required when MinIO is configured. |
-| `MINIO_SECRET_KEY` | - | Required when MinIO is configured. |
+| `MINIO_ACCESS_KEY` | (empty) | Required when MinIO is configured. |
+| `MINIO_SECRET_KEY` | (empty) | Required when MinIO is configured. |
 | `MINIO_BUCKET` | `herd-drivers` | Bucket name. Must exist. |
 | `MINIO_USE_SSL` | `false` | TLS for MinIO connection. |
 
@@ -350,7 +351,7 @@ The notifications service runs two durable NATS consumers: one on `herd.reservat
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `EXPIRATION_INTERVAL_SECONDS` | `60` | How often the expiration loop wakes up to activate `PENDING` reservations, complete `ACTIVE` ones whose windows closed, and emit upcoming-expiry reminders. |
+| `EXPIRATION_INTERVAL_SECONDS` | `60` | How often the expiration loop wakes up to activate `PENDING` reservations, complete `ACTIVE` ones whose windows closed, and emit upcoming-expiry reminders. The same tick runs the reconcilers that ride the sweep: the stranded-provisioning backstops (`PROVISION_TIMEOUT_SECONDS` below), fork archiving for ended reservations, the wiring-heal staging check, the missing-fork backstop, and the pending device-prune retry. The dev/test `docker-compose.override.yml` pins this to `5` so sweep-dependent integration tests fit inside their timeout. |
 | `EXPIRY_REMINDER_LEAD_SECONDS` | `3600` | Lead window before `end_time` in which the expiration task publishes a `reservation.expiring_soon` event onto `HERD_RESERVATIONS` (ROADMAP #40). An ACTIVE reservation whose `end_time` is within this many seconds of now, and still in the future, gets exactly one reminder, deduped via `expiry_reminder_sent_at`. `0` disables the reminder. |
 | `RESERVATION_START_GRACE_SECONDS` | `300` | On create, a `start_time` earlier than now minus this grace is rejected (422), so a user cannot book a window that already passed. The grace tolerates clock skew and "start now". It also sets the scheduled-vs-immediate boundary: a `start_time` more than this grace in the future is created `PENDING` and provisioned by the expiration task at start_time, while a booking within the grace is provisioned immediately. The expiration loop activates `PENDING` reservations whose start has ticked past. |
 | `RESERVATION_MAX_DURATION_SECONDS` | `2592000` | On create, a window longer than this (default 30 days) is rejected (422), guarding against runaway or typo'd bookings. `0` disables the cap. |
@@ -387,6 +388,8 @@ These are baked into the bundle at build time (Vite reads `VITE_*` env vars duri
 ## Database URLs (auto-computed)
 
 Each service computes its own SQLAlchemy URL from `POSTGRES_*` vars. You do not normally set `DATABASE_URL` directly; it's derived. If you need to point a service at a different DB, override with `DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db`.
+
+Every DB-backed service also reads `DB_SCHEMA`, the Postgres schema it owns, defaulting to its own name: `auth`, `inventory`, `reservations`, `cabling`, `acl`, `execution`, `ai_orchestrator`, `user_profile`, `notifications`, `integration`, `secrets`. `docker-compose.yml` pins each one explicitly except ai-orchestrator's, which takes the in-code default. Changing a value means the matching `CREATE SCHEMA` in `infra/postgres/init.sql` has to change too, and that file runs only on a fresh Postgres volume, so this is not a knob to turn on a live stack. The `config` service has no database and no `DB_SCHEMA`.
 
 ## Adding a new env var
 

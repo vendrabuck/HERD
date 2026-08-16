@@ -88,9 +88,11 @@ here.
 - Steps: log in as the nested-group user; log in with a wrong password
   repeatedly to trip the directory's lockout; log in during a simulated
   referral.
-- Expected: the nested-group user logs in and is JIT-provisioned
-  (directory group membership is not mirrored into HERD groups today;
-  that mapping is issue #38); a
+- Expected: the nested-group user logs in and is JIT-provisioned; directory
+  group membership mirrors into the matching HERD group only if an admin
+  has mapped that directory group at `/admin/ldap-sync` (ADR 0011, issue
+  #38), either via sync-now or the background interval loop, and an
+  unmapped group still needs manual HERD group assignment; a
   directory-locked account fails with the generic auth error (no lockout
   detail leaked); referrals either work or fail closed with a clean 503,
   never a hang.

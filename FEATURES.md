@@ -65,8 +65,16 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Drag-and-drop topology editor** (Shipped): floating equipment palette with search,
   template, and topology-type filters, plus a dynamic-templates section whose entries
   drop onto the canvas as count-carrying placeholder nodes that prefill a
-  reservation's dynamic requests (issue #472); Layer 1/2/3 connection creation with
-  port selection modals.
+  reservation's dynamic requests (issue #472). Drawing a line between two device nodes
+  opens a multi-port wiring dialog (issue #517): source ports in a left column, target
+  ports in a right column, drag or click-to-connect, per-line L1/L2/L3 tagging, and a
+  "Connect 1:1 in order" fast path for wiring two same-size switches at once; a
+  toolbar "Quick connect" toggle swaps in a compact single-pair popover for the common
+  one-connection case, with an escalation link back to the full dialog. Multiple
+  connections between the same device pair collapse into one bundled edge on the
+  canvas with a count badge and a per-connection delete. Known caveat: provisioning
+  still keeps one connection per device pair, so per-line ports and layers are
+  recorded on the canvas but not yet applied to wiring (issue #531).
 - **Physical and cloud topology separation** (Shipped): physical and cloud devices
   cannot be mixed in a single topology, enforced at database, service, and UI
   layers.
