@@ -413,7 +413,9 @@ Returns resource IDs the user can access with the given permission level.
 
 ### Reservation-owner widening for device-config writes
 
-Inventory's config-version and apply-job endpoints (`POST /devices/{id}/config-versions`,
+Inventory's config-version and apply-job write endpoints (`POST /devices/{id}/config-versions`,
+`POST /devices/{id}/config-versions/{vid}/restore`,
+`POST /devices/{id}/config-versions/{vid}/apply`,
 `POST /devices/{id}/config-versions/{vid}/schedule`, `POST /apply-jobs/{id}/confirm`)
 require `manage` on the target device. As of iter 3, this check is widened: a caller
 who owns a currently-active reservation that includes the device also passes. The
@@ -786,6 +788,18 @@ Service-to-service read used by the execution service's dynamic-resources create
 teardown flows to resolve a hypervisor's endpoint, type, and secret reference.
 Internal-token only.
 
+### List hypervisors referencing a secret (internal)
+
+```
+GET /api/inventory/hypervisors/by-secret/{secret_id}/internal
+X-Internal-Token: <internal-api-token>
+```
+
+Reverse lookup returning the id and name of every hypervisor that references the
+given secret. Used by the secrets service's delete guard (issue #456), which refuses
+with 409 `{"error": "secret_in_use", ...}` while any hypervisor still points at the
+secret, and fails closed with 503 when inventory is unreachable. Internal-token only.
+
 ---
 
 ## Port Management (Admin Operations)
@@ -921,12 +935,14 @@ Authorization: Bearer <token>
 When the reservation ends the fork is archived to an immutable as-built record:
 the read endpoint still returns it, but the two mutations are refused.
 
-Read the reservation's per-connection L1 wiring status, and reattempt its
-hardware-retryable FAILED cross-connects. After a fork save reconciles the
-intended wiring, the execution service applies each L1 cross-connect
-connection-by-connection and records the applied state; these owner-or-admin
-gated endpoints proxy that per-connection state (ADR 0007). The status read is
-allowed for any reservation status, so the applied and FAILED rows stay
+Read the reservation's per-connection wiring status, and reattempt its
+hardware-retryable FAILED rows. After a fork save reconciles the intended
+wiring, the execution service applies each row connection-by-connection and
+records the applied state; these owner-or-admin gated endpoints proxy that
+per-connection state (ADR 0007). Since ADR 0009 phase 8 the relayed rows span
+all three layers, each tagged `layer`: L1 cross-connects, L2 VLAN memberships,
+and L3 route pins, and the retry outcomes are tagged the same way. The status
+read is allowed for any reservation status, so the applied and FAILED rows stay
 readable after the reservation ends. Retry is permitted for `ACTIVE` and the
 terminal statuses `COMPLETED`/`CANCELLED`/`FAILED`, and returns `409` only for
 `PENDING`/`PENDING_PROVISION` (there is no provisioned wiring to reattempt yet).
@@ -1325,6 +1341,7 @@ Authorization: Bearer <admin-token>
 | `/api/inventory/hypervisors/{id}` | PUT | | yes | yes |
 | `/api/inventory/hypervisors/{id}` | DELETE | | yes | yes |
 | `/api/inventory/hypervisors/{id}/internal` | GET | internal | internal | internal |
+| `/api/inventory/hypervisors/by-secret/{id}/internal` | GET | internal | internal | internal |
 | `/api/inventory/devices/{id}/ports` | GET | yes | yes | yes |
 | `/api/inventory/devices/{id}/ports` | POST | | yes | yes |
 | `/api/inventory/devices/{id}/ports/bulk` | POST | | yes | yes |

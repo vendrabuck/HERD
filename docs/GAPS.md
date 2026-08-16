@@ -3,7 +3,7 @@
 Tracking doc for test coverage not yet implemented. Shipped work lives under
 the usual service test directories; this file is the backlog.
 
-Last audit: 2026-05-04, refreshed 2026-07-12. When you close a gap, delete the
+Last audit: 2026-05-04, refreshed 2026-08-16. When you close a gap, delete the
 entry. When a new one surfaces, add it with a severity tag (CRITICAL, HIGH,
 MEDIUM, LOW) and a concrete target file path.
 
@@ -50,46 +50,46 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Frontend: pages and components
 
-**17 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
+**19 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
 `DeviceGroupDetailPage`, `DevicePage`, `DriversPage`, `GrantsPage`, `HypervisorsPage`,
-`InventoryPage`, `LoginPage`, `RegisterPage`, `ReportingPage`, `ReservationsPage`,
-`SettingsPage`, `TemplateEditorPage`, `TemplatesPage`, plus two TopologyEditorPage
-suites: `TopologyEditorForkMode` and `TopologyEditorDynamicPlaceholders`).
+`InventoryPage`, `LdapSyncPage`, `LoginPage`, `RegisterPage`, `ReportingPage`,
+`ReservationsPage`, `SettingsPage`, `TemplateEditorPage`, `TemplatesPage`, plus three
+TopologyEditorPage suites: `TopologyEditorForkMode`, `TopologyEditorDynamicPlaceholders`,
+and `TopologyEditorWiring`).
 
 - [HIGH] Page smoke tests (render, key interactions):
   - `frontend/src/pages/ReservationCalendarPage.tsx`
-  - `frontend/src/pages/TopologyEditorPage.tsx` beyond the fork-mode and
-    dynamic-placeholder suites: the base editor flows (device drop, edge draw,
-    parent save) still lack direct page-level coverage.
-- [MEDIUM] Remaining pages: Dashboard, Topology, TopologyTemplates, and the
-  admin-only AddDevice, DeviceGroups, GroupDetail, Groups, and Users pages.
+  - `frontend/src/pages/TopologyEditorPage.tsx` beyond the fork-mode,
+    dynamic-placeholder, and wiring-dialog suites: the base editor flows (device drop,
+    edge draw, parent save) still lack direct page-level coverage.
+- [MEDIUM] Remaining pages: `TopologyPage`, `TopologyTemplatesPage`, and the
+  admin-only `AddDevicePage`, `DeviceGroupsPage`, `GroupDetailPage`, `GroupsPage`, and
+  `UsersPage`.
 
-**Component coverage priorities** (`CreateReservationModal` and
-`ReservationDetailModal` now carry targeted suites, incl. the dynamic-requests
-paths; the dead `TopologyEditor` component was deleted in issue #489):
+**Component coverage priorities** (`CreateReservationModal`, `ReservationDetailModal`,
+`AIDialog`, `AIProposalBar`, `AICommitDialog`, `EditDevicesModal`, `DeviceDetailModal`,
+and `PortsSection` now all carry targeted suites; the dead `TopologyEditor` component
+was deleted in issue #489):
 
-- [HIGH] `AIDialog`, `AIProposalBar`, `AICommitDialog` (complex logic paths,
-  state machines).
-- [MEDIUM] `EditDevicesModal`, `DeviceDetailModal`, `PortsSection`.
-- [LOW] `AppLayout`, `FloatingPanel`, `FieldRow` (lower-complexity presentation).
+- [LOW] `AppLayout`, `FloatingPanel`, `FieldRow` (lower-complexity presentation, still
+  untested).
 
-## Frontend: API clients (8 still untested)
+## Frontend: API clients (1 still untested)
 
-Tests live under `frontend/src/test/api/`. Currently covered after this round:
-`client`, `ai`, `notifications`, `reporting`, `auth`, `reservations`, `inventory`,
-`config`, `userProfile`. Remaining:
+Tests live under `frontend/src/test/api/`. Every client under `frontend/src/api/` is
+covered except:
 
-- [MEDIUM] `acl.ts`, `admin.ts`, `connections.ts`, `deviceGroups.ts`,
-  `drivers.ts`, `groups.ts`, `ports.ts`, `templates.ts`, `topologies.ts`.
+- [MEDIUM] `recipes.ts`.
 
 ## Frontend: stores and hooks
 
-- [MEDIUM] `frontend/src/stores/configStore.ts` is the only untested store.
+- All four stores under `frontend/src/stores/` (`authStore`, `configStore`,
+  `preferencesStore`, `topologyStore`) now carry tests; no gap.
 - `frontend/src/hooks/` does not exist; no gap.
 
 ## E2E
 
-`tests/e2e/` has 39 files and 130 tests (123 Selenium, 7 Playwright). Remaining UI gaps:
+`tests/e2e/` has 49 files and 155 tests (122 Selenium, 33 Playwright). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
@@ -103,18 +103,20 @@ Tests live under `frontend/src/test/api/`. Currently covered after this round:
   (`tests/e2e/test_device_config_apply.py` covers the device-detail page, the
   config section, and the apply-jobs panel rendering, but the schedule submit is
   a deferred E2E gap).
-- [MEDIUM] LDAP login E2E (depends on stack configured for LDAP + live directory).
 - [MEDIUM] Pathfind UI: "Find Path" button, result rendering, dedup display.
 - [MEDIUM] Device detail modal edit workflows (not the passive view already tested).
 
 ## Load tests
 
 `tests/load/locustfile.py` covers auth login, reservations, inventory list/detail,
-templates list, and ACL check. Missing coverage (~56% of API surface):
+templates list, ACL check, bulk export (devices/templates/topologies, JSON and CSV,
+plus a dry-run import), and notifications (unread-count, list, preferences write).
+Missing coverage:
 
-- [MEDIUM] `topology_*` endpoints (read and write).
+- [MEDIUM] Topology write endpoints (create, update, canvas save, versions) beyond
+  the bulk export path.
 - [MEDIUM] Drivers: list, upload, download.
-- [LOW] Reporting, pathfinding, AI, notifications, config, user-profile.
+- [LOW] Reporting, pathfinding, AI, config.
 
 ## Notes
 

@@ -64,6 +64,13 @@ as one bundled edge with a count badge (for example "3 connections"); click the 
 expand the per-connection list, which also shows each connection's own path/cabling
 status and its own delete control.
 
+**Known caveat (issue #531):** provisioning currently keeps one connection per device
+pair. Per-line ports and layers are recorded on the canvas but not yet applied to
+wiring, so cabling's fork-save resolver collapses N connections between the same device
+pair to a single provisioned path every time. The dialog shows a provisioning notice
+whenever a session has more than one connection, as a reminder that the extra lines
+are canvas-only for now.
+
 ### Quick connect
 
 For a single connection, toggle **Quick connect** in the toolbar before drawing a line. It
