@@ -129,13 +129,43 @@ describe("ConnectionsPage", () => {
     expect(screen.getByText("uplink")).toBeInTheDocument();
   });
 
+  it("defaults to the multi-connection dialog", async () => {
+    server.use(connectionsHandler([CONNECTION]));
+    renderWithProviders(<ConnectionsPage />);
+    await screen.findByText("spine-1");
+
+    expect(screen.getByRole("button", { name: "Multi" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Create Connection" }));
+
+    expect(
+      await screen.findByRole("dialog", { name: /Create multiple connections/i }),
+    ).toBeInTheDocument();
+    // The single-pair form is not mounted at all in multi mode.
+    expect(screen.queryByText("Port A")).not.toBeInTheDocument();
+  });
+
+  it("the Single toggle switches the create button back to the single-pair modal", async () => {
+    server.use(connectionsHandler([CONNECTION]));
+    renderWithProviders(<ConnectionsPage />);
+    await screen.findByText("spine-1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Single" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create Connection" }));
+
+    // The original two-select form, not the port columns.
+    expect(screen.getByText("Port A")).toBeInTheDocument();
+    expect(document.querySelectorAll("select")).toHaveLength(2);
+    expect(screen.queryByText("Create multiple connections")).not.toBeInTheDocument();
+  });
+
   it("blocks create and shows a validation toast when no device is selected", async () => {
     server.use(connectionsHandler([CONNECTION]));
     renderWithProviders(<ConnectionsPage />);
     await screen.findByText("spine-1");
 
-    // Open the create modal, then submit with nothing selected. handleCreate
-    // short-circuits on the first missing field (device A) and toasts it.
+    // Open the single-pair modal, then submit with nothing selected.
+    // handleCreate short-circuits on the first missing field (device A).
+    fireEvent.click(screen.getByRole("button", { name: "Single" }));
     fireEvent.click(screen.getByRole("button", { name: "Create Connection" }));
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
 

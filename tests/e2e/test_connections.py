@@ -22,6 +22,17 @@ def _open_connections(driver, base_url):
     )
 
 
+def _open_single_create_modal(driver):
+    """Open the ORIGINAL single-pair create modal.
+
+    The multi-connection dialog is the default create surface, so the
+    single-pair flow these tests drive is reachable only after flipping the
+    Multi/Single toggle in the page header.
+    """
+    driver.find_element(By.XPATH, "//button[normalize-space()='Single']").click()
+    driver.find_element(By.XPATH, "//button[contains(., 'Create Connection')]").click()
+
+
 def test_connections_page_has_create_button(admin_browser, base_url):
     """Connections page shows the Create Connection button."""
     _open_connections(admin_browser, base_url)
@@ -31,12 +42,33 @@ def test_connections_page_has_create_button(admin_browser, base_url):
     assert btn.is_displayed()
 
 
-def test_connections_create_modal_opens(admin_browser, base_url):
-    """Create Connection opens a modal with the expected fields."""
+def test_connections_multi_dialog_is_the_default(admin_browser, base_url):
+    """Create Connection opens the multi-connection dialog by default."""
     _open_connections(admin_browser, base_url)
     admin_browser.find_element(
         By.XPATH, "//button[contains(., 'Create Connection')]"
     ).click()
+
+    WebDriverWait(admin_browser, WAIT).until(
+        EC.visibility_of_element_located(
+            (By.XPATH, "//h2[normalize-space()='Create multiple connections']")
+        )
+    )
+    # One device search box per side; ports list only once a device is picked.
+    for label in ("Device A", "Device B"):
+        assert admin_browser.find_element(
+            By.CSS_SELECTOR, f"input[aria-label='Search {label}']"
+        ).is_displayed()
+
+    admin_browser.find_element(
+        By.XPATH, "//button[normalize-space()='Cancel']"
+    ).click()
+
+
+def test_connections_create_modal_opens(admin_browser, base_url):
+    """Single mode opens the single-pair modal with the expected fields."""
+    _open_connections(admin_browser, base_url)
+    _open_single_create_modal(admin_browser)
 
     wait = WebDriverWait(admin_browser, WAIT)
     wait.until(
@@ -60,11 +92,9 @@ def test_connections_create_modal_opens(admin_browser, base_url):
 
 
 def test_connections_port_select_disabled_until_device_picked(admin_browser, base_url):
-    """Port A select is disabled until a device is chosen."""
+    """Port A select is disabled until a device is chosen (single mode)."""
     _open_connections(admin_browser, base_url)
-    admin_browser.find_element(
-        By.XPATH, "//button[contains(., 'Create Connection')]"
-    ).click()
+    _open_single_create_modal(admin_browser)
     wait = WebDriverWait(admin_browser, WAIT)
     wait.until(
         EC.visibility_of_element_located((By.CSS_SELECTOR, "select"))
@@ -83,9 +113,7 @@ def test_connections_port_select_disabled_until_device_picked(admin_browser, bas
 def test_connections_create_requires_device(admin_browser, base_url):
     """Clicking Create without selecting devices triggers a validation toast."""
     _open_connections(admin_browser, base_url)
-    admin_browser.find_element(
-        By.XPATH, "//button[contains(., 'Create Connection')]"
-    ).click()
+    _open_single_create_modal(admin_browser)
     wait = WebDriverWait(admin_browser, WAIT)
     wait.until(
         EC.visibility_of_element_located(

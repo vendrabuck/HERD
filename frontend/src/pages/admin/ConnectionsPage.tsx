@@ -5,6 +5,7 @@ import { useAuthStore } from "@/stores/authStore";
 import {
   usePaginatedConnections,
   useCreateConnection,
+  useCreateConnectionsBulk,
   useDeleteConnection,
 } from "@/api/connections";
 import { usePaginatedDevices, useAllDeviceNames } from "@/api/inventory";
@@ -12,7 +13,14 @@ import { usePorts } from "@/api/ports";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
+import { MultiConnectDialog } from "@/components/admin/connections/MultiConnectDialog";
+import { cn } from "@/lib/cn";
 import type { ConnectionCreate } from "@/types/connection.types";
+
+// The multi-connection dialog is the default create surface; the original
+// single-pair modal survives behind this toggle, the same way the topology
+// editor keeps QuickConnectPopover alongside its wiring dialog.
+type CreateMode = "multi" | "single";
 
 export function ConnectionsPage() {
   const user = useAuthStore((s) => s.user);
@@ -40,10 +48,13 @@ export function ConnectionsPage() {
   );
 
   const createConnection = useCreateConnection();
+  const createConnectionsBulk = useCreateConnectionsBulk();
   const deleteConnection = useDeleteConnection();
 
   // Create modal state
+  const [createMode, setCreateMode] = useState<CreateMode>("multi");
   const [showCreate, setShowCreate] = useState(false);
+  const [showMulti, setShowMulti] = useState(false);
   const [deleteId, setDeleteId] = useState<string | null>(null);
 
   // Create form state
@@ -119,6 +130,19 @@ export function ConnectionsPage() {
     }
   };
 
+  const openCreate = () => {
+    if (createMode === "multi") setShowMulti(true);
+    else setShowCreate(true);
+  };
+
+  // Fires only when every row of the batch was created; a partially rejected
+  // batch keeps the dialog open with its failures flagged, so this must never
+  // be reached for one.
+  const handleBulkSuccess = (created: number) => {
+    toast.success(created === 1 ? "Created 1 connection" : `Created ${created} connections`);
+    setShowMulti(false);
+  };
+
   const handleDelete = async () => {
     if (!deleteId) return;
     try {
@@ -182,12 +206,37 @@ export function ConnectionsPage() {
       <div className="px-6 xl:px-12 2xl:px-16 py-8">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-gray-900">Connections</h2>
-          <button
-            onClick={() => setShowCreate(true)}
-            className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
-          >
-            Create Connection
-          </button>
+          <div className="flex items-center gap-3">
+            <div className="flex gap-1" role="group" aria-label="Create mode">
+              {(["multi", "single"] as CreateMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setCreateMode(mode)}
+                  aria-pressed={createMode === mode}
+                  title={
+                    mode === "multi"
+                      ? "Stage many cables between two devices and register them in one batch"
+                      : "Register a single cable, one pair of ports at a time"
+                  }
+                  className={cn(
+                    "px-3 py-1.5 text-sm font-medium rounded transition-colors",
+                    createMode === mode
+                      ? "bg-gray-900 text-white"
+                      : "bg-gray-100 text-gray-700 hover:bg-gray-200",
+                  )}
+                >
+                  {mode === "multi" ? "Multi" : "Single"}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={openCreate}
+              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
+            >
+              Create Connection
+            </button>
+          </div>
         </div>
 
         {/* Device filter */}
@@ -285,8 +334,12 @@ export function ConnectionsPage() {
         </div>
       </div>
 
+      {/* Both create surfaces mount only while open: Modal hardcodes
+          id="modal-title", so two mounted Modals would put duplicate ids in the
+          document and every aria-labelledby would resolve to the first one. */}
+      {showCreate && (
       <Modal
-        open={showCreate}
+        open
         onClose={closeCreateModal}
         title="Create Connection"
         className="max-w-lg"
@@ -451,6 +504,18 @@ export function ConnectionsPage() {
           </div>
         </div>
       </Modal>
+      )}
+
+      {/* Mounted only while open so its device/port queries never run in the
+          background behind the single-pair modal. */}
+      {showMulti && (
+        <MultiConnectDialog
+          open
+          onSubmit={(items) => createConnectionsBulk.mutateAsync(items)}
+          onSuccess={handleBulkSuccess}
+          onCancel={() => setShowMulti(false)}
+        />
+      )}
 
       <ConfirmDialog
         open={deleteId !== null}

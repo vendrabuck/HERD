@@ -9,6 +9,7 @@ import {
   usePaginatedConnections,
   useDeviceConnections,
   useCreateConnection,
+  useCreateConnectionsBulk,
   useDeleteConnection,
   usePathfind,
   usePathfindPairs,
@@ -77,6 +78,56 @@ describe("connections api hooks", () => {
       });
     });
     expect((captured as { device_a_id: string }).device_a_id).toBe("d1");
+  });
+
+  it("useCreateConnectionsBulk POSTs the items under an items key", async () => {
+    let captured: unknown = null;
+    server.use(
+      http.post("/api/cabling/connections/bulk", async ({ request }) => {
+        captured = await request.json();
+        return HttpResponse.json({
+          created: 1,
+          rejected: 0,
+          rows: [{ index: 0, status: "created", connection_id: "c1", error: null }],
+        });
+      }),
+    );
+    const { result } = renderHook(() => useCreateConnectionsBulk(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync([
+        { device_a_id: "d1", port_a: "p1", device_b_id: "d2", port_b: "p2" },
+      ]);
+    });
+    expect(captured).toEqual({
+      items: [{ device_a_id: "d1", port_a: "p1", device_b_id: "d2", port_b: "p2" }],
+    });
+  });
+
+  it("useCreateConnectionsBulk resolves (not rejects) a 200 carrying rejected rows", async () => {
+    // Row-level rejections ride inside a 200 body. A caller that only watched
+    // the promise settling would report unqualified success here.
+    server.use(
+      http.post("/api/cabling/connections/bulk", () =>
+        HttpResponse.json({
+          created: 1,
+          rejected: 1,
+          rows: [
+            { index: 0, status: "created", connection_id: "c1", error: null },
+            { index: 1, status: "rejected", connection_id: null, error: "Port not found" },
+          ],
+        }),
+      ),
+    );
+    const { result } = renderHook(() => useCreateConnectionsBulk(), { wrapper });
+    let response;
+    await act(async () => {
+      response = await result.current.mutateAsync([
+        { device_a_id: "d1", port_a: "p1", device_b_id: "d2", port_b: "p2" },
+        { device_a_id: "d1", port_a: "p3", device_b_id: "d2", port_b: "p4" },
+      ]);
+    });
+    expect(response).toMatchObject({ created: 1, rejected: 1 });
+    expect(result.current.isSuccess).toBe(true);
   });
 
   it("useDeleteConnection DELETEs by id", async () => {

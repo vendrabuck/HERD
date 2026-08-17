@@ -41,3 +41,28 @@ export interface ConnectionCreate {
   connection_type?: string;
   notes?: string;
 }
+
+export type BulkConnectionRowStatus = "created" | "rejected";
+
+/**
+ * One row of a POST /cabling/connections/bulk response, positionally keyed to
+ * the request's `items` array by `index`.
+ */
+export interface BulkConnectionRow {
+  index: number;
+  status: BulkConnectionRowStatus;
+  connection_id: string | null;
+  error: string | null;
+}
+
+/**
+ * The bulk create result. A row-level rejection is NOT an HTTP error: the
+ * endpoint answers 200 even when `rejected` is non-zero, so a caller that
+ * only checks the HTTP status will report success for a batch that partly
+ * failed. Always read `created`, `rejected`, and `rows`.
+ */
+export interface BulkConnectionResult {
+  created: number;
+  rejected: number;
+  rows: BulkConnectionRow[];
+}
