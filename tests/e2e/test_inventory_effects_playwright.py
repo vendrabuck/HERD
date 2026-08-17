@@ -240,6 +240,13 @@ def test_connection_create_and_delete_own_devices(pw_page):
         # --- Create the connection through the UI ---
         pw_page.goto(f"{HOST_BASE_URL}/admin/connections")
         expect(pw_page.get_by_role("button", name="Create Connection")).to_be_visible()
+        # The multi-connection dialog is the default create surface (PR
+        # #538); flip to Single mode first so Create Connection opens the
+        # single-pair modal this test drives, matching the sibling
+        # test_connections_playwright.py pattern. This also keeps the bare
+        # `select` locators below unambiguous, since only the single modal
+        # is mounted in that mode.
+        pw_page.get_by_role("button", name="Single", exact=True).click()
         pw_page.get_by_role("button", name="Create Connection").click()
         dialog = pw_page.locator("dialog[open]")
         expect(dialog.locator("#modal-title")).to_have_text("Create Connection")
