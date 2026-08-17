@@ -4,6 +4,7 @@ Fixtures mirror test_connections.py's local (non-conftest) pattern: this repo
 keeps HTTP client fixtures file-local rather than centralizing them.
 """
 
+import logging
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -13,8 +14,9 @@ from app.database import Base, get_db
 from app.dependencies import get_current_user_payload, require_admin
 from app.main import app
 from app.schemas.connection import ConnectionCreate
-from app.services.connection_service import create_connections_bulk
+from app.services.connection_service import create_connections_bulk, list_connections
 from app.services.device_group_guard import DeviceNotFoundError
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -234,6 +236,47 @@ async def test_bulk_unauthenticated_401(unauthenticated_client):
     assert resp.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_bulk_route_forwards_bearer_token_to_group_guard(admin_client, monkeypatch):
+    """Regression test for the route's bearer-token extraction (review Finding
+    3): the extraction is duplicated from the single-create endpoint and
+    nothing else in this suite drives it through the real route, since every
+    other HTTP-level test here runs with enforcement disabled and the
+    memoization tests below call create_connections_bulk directly, bypassing
+    the route entirely. A regression here degrades to a silent fail-open (or,
+    post fail-closed change, an unwarranted 503) with the rest of the suite
+    still green."""
+    monkeypatch.setattr(settings, "enforce_device_group_boundaries", True)
+    fetch = AsyncMock(return_value=set())
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        resp = await admin_client.post(
+            "/connections/bulk",
+            json={"items": [_row()]},
+            headers={"Authorization": "Bearer my-real-token"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["created"] == 1
+    assert fetch.await_args_list
+    for call in fetch.await_args_list:
+        assert call.args[1] == "my-real-token"
+
+
+@pytest.mark.asyncio
+async def test_bulk_unverifiable_device_503_creates_nothing_http(admin_client, monkeypatch):
+    """A device whose group membership cannot be determined aborts the whole
+    HTTP request with 503 and creates nothing, verified end to end through
+    the real route and a real read-back."""
+    monkeypatch.setattr(settings, "enforce_device_group_boundaries", True)
+    fetch = AsyncMock(return_value=None)
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        resp = await admin_client.post("/connections/bulk", json={"items": [_row(), _row()]})
+    assert resp.status_code == 503
+    assert "Could not verify device-group membership" in resp.json()["detail"]
+
+    list_resp = await admin_client.get("/connections")
+    assert list_resp.json()["total"] == 0
+
+
 # --- Service-level tests: memoization and cache semantics ---
 
 
@@ -273,20 +316,27 @@ async def test_bulk_memoizes_group_lookups_across_batch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bulk_cached_none_fails_open_for_every_row(monkeypatch):
-    """A device whose membership cannot be determined (None) fails open for
-    every row that references it, and the None result is itself memoized."""
+async def test_bulk_unverifiable_device_fails_closed_creates_nothing(monkeypatch):
+    """A device whose membership cannot be determined (None) now aborts the
+    WHOLE batch with 503 and creates nothing, unlike the single-create path,
+    which still fails open (see test_allows_when_inventory_unavailable_fail_open
+    in test_service_unit.py). Before this fix a cached None silently
+    suppressed the boundary check for every remaining row in the batch
+    instead of refusing the write (review Finding 1/2)."""
     monkeypatch.setattr(settings, "enforce_device_group_boundaries", True)
     dev1, dev2 = uuid.uuid4(), uuid.uuid4()
     items = [_cc(dev1, dev2, i) for i in range(6)]
     fetch = AsyncMock(return_value=None)
     with patch("app.services.connection_service.fetch_device_group_ids", fetch):
         async with TestSessionLocal() as db:
-            report = await create_connections_bulk(db, items, "admin")
-    assert report.created == 6
-    assert report.rejected == 0
-    assert all(row.status == "created" for row in report.rows)
-    assert fetch.call_count == 2  # memoized: one lookup per device, not per row
+            with pytest.raises(HTTPException) as exc:
+                await create_connections_bulk(db, items, "admin")
+    assert exc.value.status_code == 503
+    assert fetch.call_count == 2  # resolved once per distinct device id, still
+
+    async with TestSessionLocal() as db:
+        _, total = await list_connections(db)
+    assert total == 0
 
 
 @pytest.mark.asyncio
@@ -313,9 +363,64 @@ async def test_bulk_cached_device_not_found_rejects_every_row(monkeypatch):
         assert row.status == "rejected"
         assert row.connection_id is None
         assert row.error == f"Device {missing} does not exist"
-    # device_a_id is always the missing device, so the boundary check raises
-    # before ever looking at device_b; only one real fetch call happens.
-    assert fetch.call_count == 1
+    # Both distinct device ids (missing and other) are resolved concurrently
+    # in the batch pre-pass before any row is validated, so this is 2 calls
+    # now, not 1: the old "only look at device_a" short-circuit no longer
+    # applies once the whole cache is pre-resolved up front.
+    assert fetch.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_confirmed_not_found_rejects_only_its_rows_siblings_created(monkeypatch):
+    """A confirmed-404 device rejects only the rows that reference it; sibling
+    rows referencing unrelated, valid devices are still created."""
+    monkeypatch.setattr(settings, "enforce_device_group_boundaries", True)
+    missing = uuid.uuid4()
+    other = uuid.uuid4()
+    sib_a, sib_b = uuid.uuid4(), uuid.uuid4()
+
+    async def fake_fetch(device_id, _token):
+        if device_id == missing:
+            raise DeviceNotFoundError(missing)
+        return set()
+
+    fetch = AsyncMock(side_effect=fake_fetch)
+    items = [
+        _cc(missing, other, 0),
+        _cc(sib_a, sib_b, 1),
+        _cc(missing, other, 2),
+        _cc(sib_a, sib_b, 3),
+    ]
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        async with TestSessionLocal() as db:
+            report = await create_connections_bulk(db, items, "admin")
+    assert report.created == 2
+    assert report.rejected == 2
+    assert [row.status for row in report.rows] == ["rejected", "created", "rejected", "created"]
+    for row in report.rows:
+        if row.status == "rejected":
+            assert row.error == f"Device {missing} does not exist"
+        else:
+            assert row.connection_id is not None
+
+
+@pytest.mark.asyncio
+async def test_bulk_resolves_group_ids_once_per_distinct_device_id(monkeypatch):
+    """N distinct devices across the batch means exactly N fetch_device_group_ids
+    calls, one per distinct id, regardless of how many rows reference them:
+    the concurrency invariant the batch pre-pass exists to preserve."""
+    monkeypatch.setattr(settings, "enforce_device_group_boundaries", True)
+    device_ids = [uuid.uuid4() for _ in range(9)]
+    items = [_cc(device_ids[i % 9], device_ids[(i + 1) % 9], i) for i in range(30)]
+    distinct = {d for it in items for d in (it.device_a_id, it.device_b_id)}
+    assert len(distinct) == 9
+
+    fetch = AsyncMock(return_value=set())
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        async with TestSessionLocal() as db:
+            report = await create_connections_bulk(db, items, "admin")
+    assert report.created == 30
+    assert fetch.call_count == len(distinct)
 
 
 @pytest.mark.asyncio
@@ -360,3 +465,27 @@ async def test_bulk_all_rejected_no_commit(monkeypatch):
     assert report.created == 0
     assert report.rejected == 3
     assert commit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_emits_per_connection_audit_log(caplog):
+    """Bulk-created cables get a per-connection audit log line, matching the
+    single-create route's fields plus both ports, not just the aggregate
+    summary line (review Finding 5)."""
+    dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
+    items = [_cc(dev_a, dev_b, 0), _cc(dev_a, dev_b, 1)]
+    with caplog.at_level(logging.INFO, logger="app.services.connection_service"):
+        async with TestSessionLocal() as db:
+            report = await create_connections_bulk(db, items, "admin-user")
+    assert report.created == 2
+
+    audit_records = [r for r in caplog.records if r.message == "Bulk connection created"]
+    assert len(audit_records) == 2
+    logged_ids = {r.connection_id for r in audit_records}
+    assert logged_ids == {str(row.connection_id) for row in report.rows}
+    for record in audit_records:
+        assert record.device_a_id == str(dev_a)
+        assert record.device_b_id == str(dev_b)
+        assert record.port_a.startswith("a")
+        assert record.port_b.startswith("b")
+        assert record.created_by == "admin-user"
