@@ -6,6 +6,11 @@ Creates a backend connection end to end through the admin Connections UI
 Create Connection modal), verifies it via the cabling service API, deletes it
 through the same page's row action, and confirms it is gone via the API.
 
+This drives the SINGLE-pair modal, which is no longer the default create
+surface: the multi-connection dialog is, so the flow starts by flipping the
+Multi/Single toggle in the page header. Only the single modal is mounted in
+that mode, which is what keeps the bare `select` locators below unambiguous.
+
 Two seeded devices with at least one port each are discovered dynamically
 through the inventory API (host-side, not the UI) rather than hardcoded, so
 the test does not depend on exact seed data/order.
@@ -41,6 +46,7 @@ def test_connection_create_and_delete(pw_page):
     try:
         pw_page.goto(f"{HOST_BASE_URL}/admin/connections")
         expect(pw_page.get_by_role("button", name="Create Connection")).to_be_visible()
+        pw_page.get_by_role("button", name="Single", exact=True).click()
         pw_page.get_by_role("button", name="Create Connection").click()
         dialog = pw_page.locator("dialog[open]")
         expect(dialog.locator("#modal-title")).to_have_text("Create Connection")

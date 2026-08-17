@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tansta
 import type {
   PathfindResponse,
   PathfindBatchResponse,
+  BulkConnectionResult,
   Connection,
   ConnectionCreate,
 } from "@/types/connection.types";
@@ -21,6 +22,15 @@ async function fetchPaginatedConnections(
 
 async function createConnection(data: ConnectionCreate): Promise<Connection> {
   const resp = await apiClient.post<Connection>("/cabling/connections", data);
+  return resp.data;
+}
+
+// Server-side cap on items per bulk request; the UI refuses to submit past it
+// rather than letting the whole batch 422 on the boundary.
+export const BULK_CONNECTION_LIMIT = 200;
+
+async function createConnectionsBulk(items: ConnectionCreate[]): Promise<BulkConnectionResult> {
+  const resp = await apiClient.post<BulkConnectionResult>("/cabling/connections/bulk", { items });
   return resp.data;
 }
 
@@ -70,6 +80,23 @@ export function useCreateConnection() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: createConnection,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["connections"] });
+    },
+  });
+}
+
+/**
+ * Bulk create, invalidating the same ["connections"] key as useCreateConnection.
+ *
+ * The invalidation is unconditional on a settled request: a partially rejected
+ * batch still returns 200 and still created its accepted rows, so skipping the
+ * refetch when `rejected > 0` would leave the connections table stale.
+ */
+export function useCreateConnectionsBulk() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createConnectionsBulk,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["connections"] });
     },
