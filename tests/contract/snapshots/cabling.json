@@ -9,6 +9,10 @@
       "/connections"
     ],
     [
+      "POST",
+      "/connections/bulk"
+    ],
+    [
       "GET",
       "/connections/internal"
     ],
@@ -205,6 +209,43 @@
         "skipped",
         "total",
         "updated"
+      ],
+      "type": "object"
+    },
+    "ConnectionBulkCreate": {
+      "properties": {
+        "items": "array"
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "ConnectionBulkReport": {
+      "properties": {
+        "created": "integer",
+        "rejected": "integer",
+        "rows": "array"
+      },
+      "required": [
+        "created",
+        "rejected",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "ConnectionBulkRowResult": {
+      "properties": {
+        "connection_id": "anyOf",
+        "error": "anyOf",
+        "index": "integer",
+        "status": "string"
+      },
+      "required": [
+        "connection_id",
+        "error",
+        "index",
+        "status"
       ],
       "type": "object"
     },
