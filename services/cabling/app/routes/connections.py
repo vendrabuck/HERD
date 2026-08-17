@@ -9,12 +9,15 @@ from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user_payload, require_admin
 from app.schemas.connection import (
+    ConnectionBulkCreate,
+    ConnectionBulkReport,
     ConnectionCreate,
     ConnectionResponse,
     PaginatedConnectionResponse,
 )
 from app.services.connection_service import (
     create_connection,
+    create_connections_bulk,
     delete_connection,
     get_connection,
     list_connections,
@@ -92,6 +95,40 @@ async def create_connection_endpoint(
         },
     )
     return conn
+
+
+@router.post("/bulk", response_model=ConnectionBulkReport)
+async def create_connections_bulk_endpoint(
+    body: ConnectionBulkCreate,
+    payload: dict = Depends(require_admin),
+    authorization: str | None = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create up to 200 backend connections in one request. Admin or superadmin
+    only, same gate and per-row rules (self-loop, device-group boundary) as
+    the single-create endpoint above.
+
+    Every row is validated before anything is inserted, and all valid rows
+    are inserted together in one commit. A rejected row never blocks its
+    siblings: this always returns 200 with a per-row report, even when some
+    or every row is rejected. 422 is reserved for schema-level failures (an
+    empty or over-cap items list, a malformed row), which Pydantic handles
+    before this function runs.
+    """
+    created_by = payload.get("username", "unknown")
+    bearer_token = authorization.removeprefix("Bearer ").strip() if authorization else None
+    report = await create_connections_bulk(db, body.items, created_by, bearer_token=bearer_token)
+    logger.info(
+        "Bulk connections processed",
+        extra={
+            "connections_created": report.created,
+            "connections_rejected": report.rejected,
+            "total": len(body.items),
+            "created_by": created_by,
+        },
+    )
+    return report
 
 
 @router.delete("/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -40,3 +40,25 @@ class PaginatedConnectionResponse(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class ConnectionBulkCreate(BaseModel):
+    # The 200 cap mirrors inventory's BulkPortCreate.instances.
+    items: list[ConnectionCreate] = Field(min_length=1, max_length=200)
+
+
+class ConnectionBulkRowResult(BaseModel):
+    index: int  # position in the submitted items list
+    status: str  # "created" or "rejected"
+    connection_id: uuid.UUID | None
+    error: str | None  # human-readable reason when rejected
+
+    @field_serializer("connection_id")
+    def serialize_connection_id(self, value: uuid.UUID | None) -> str | None:
+        return str(value) if value is not None else None
+
+
+class ConnectionBulkReport(BaseModel):
+    created: int
+    rejected: int
+    rows: list[ConnectionBulkRowResult]
