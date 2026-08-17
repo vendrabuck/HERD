@@ -9,12 +9,15 @@ from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user_payload, require_admin
 from app.schemas.connection import (
+    ConnectionBulkCreate,
+    ConnectionBulkReport,
     ConnectionCreate,
     ConnectionResponse,
     PaginatedConnectionResponse,
 )
 from app.services.connection_service import (
     create_connection,
+    create_connections_bulk,
     delete_connection,
     get_connection,
     list_connections,
@@ -23,6 +26,18 @@ from app.services.connection_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/connections", tags=["connections"])
+
+
+def _extract_bearer_token(authorization: str | None) -> str | None:
+    """Pull the raw token out of an ``Authorization: Bearer <token>`` header.
+
+    Shared by the single-create and bulk endpoints below so there is one
+    place to fix if the extraction ever regresses. A dropped or mis-extracted
+    token degrades silently: the device-group boundary check just fails open
+    (or, for bulk since the fail-closed change, aborts the batch) as if
+    inventory were unreachable, with no loud error to catch it.
+    """
+    return authorization.removeprefix("Bearer ").strip() if authorization else None
 
 
 @router.get("", response_model=PaginatedConnectionResponse)
@@ -80,7 +95,7 @@ async def create_connection_endpoint(
     created_by = payload.get("username", "unknown")
     # Forward the caller's JWT so the device-group boundary check can read each
     # device's group membership from inventory as the real user.
-    bearer_token = authorization.removeprefix("Bearer ").strip() if authorization else None
+    bearer_token = _extract_bearer_token(authorization)
     conn = await create_connection(db, body, created_by, bearer_token=bearer_token)
     logger.info(
         "Connection created",
@@ -92,6 +107,42 @@ async def create_connection_endpoint(
         },
     )
     return conn
+
+
+@router.post("/bulk", response_model=ConnectionBulkReport)
+async def create_connections_bulk_endpoint(
+    body: ConnectionBulkCreate,
+    payload: dict = Depends(require_admin),
+    authorization: str | None = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create up to 200 backend connections in one request. Admin or superadmin
+    only, same gate and per-row rules (self-loop, device-group boundary) as
+    the single-create endpoint above.
+
+    Every row is validated before anything is inserted, and all valid rows
+    are inserted together in one commit. A rejected row never blocks its
+    siblings: this always returns 200 with a per-row report, even when some
+    or every row is rejected. 422 is reserved for schema-level failures (an
+    empty or over-cap items list, a malformed row), which Pydantic handles
+    before this function runs. 503 is reserved for a batch-wide failure: if
+    device-group membership could not be verified for some device in the
+    batch, nothing is created at all (see create_connections_bulk).
+    """
+    created_by = payload.get("username", "unknown")
+    bearer_token = _extract_bearer_token(authorization)
+    report = await create_connections_bulk(db, body.items, created_by, bearer_token=bearer_token)
+    logger.info(
+        "Bulk connections processed",
+        extra={
+            "connections_created": report.created,
+            "connections_rejected": report.rejected,
+            "total": len(body.items),
+            "created_by": created_by,
+        },
+    )
+    return report
 
 
 @router.delete("/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
