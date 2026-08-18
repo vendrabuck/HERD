@@ -139,6 +139,10 @@
     <p class="sectitle">Cabling things up</p>
     <p>Cabling is the physical-layer truth HERD reasons over. A connection record says "port A on device A is physically connected to port B on device B." You record one per real cable in your rack. Go to <b>Administration &rarr; Connections</b> and click <b>Create Connection</b>.</p>
 
+    <p>The dialog opens in <b>Multi</b> mode, built for the common case of patching several cables between the same two devices in one pass. Pick a device on each side, then stage one line per cable: drag from a port on the left to a port on the right, or click one port on each side. <b>Connect 1:1 in order</b> pairs every remaining free port down the two columns at once. A port you have already staged a line from in this dialog is locked so you cannot double-book it by accident; a port that merely has an existing cable elsewhere is tagged <b>CABLED</b> but stays selectable, since a second cable on it may be exactly what you are recording. Confirming sends the whole batch in a single request.</p>
+
+    <p>If the server accepts some lines and rejects others, the created cables drop out of the dialog and every rejected line stays on screen with the reason the server gave, so you can correct just those and retry. Switch the header toggle to <b>Single</b> for the one-pair-at-a-time dialog described below, which is also what the screenshot shows.</p>
+
     <figure class="shot">
       <div class="shot-frame">
         <div class="shot-stage">
@@ -169,7 +173,7 @@
       <li><b>Device A.</b> Type at least two characters to search, click the match. Picked devices show with a <b>Change</b> link.</li>
       <li><b>Port A.</b> The dropdown unlocks once Device A is chosen, and lists that device's ports.</li>
       <li><b>Connection Type.</b> Free text, defaults to <code>ethernet</code> &mdash; label the medium (e.g. <code>fiber</code>, <code>dac</code>) if it helps your records. <b>Notes</b> is optional free text.</li>
-      <li><b>Create.</b> The pathfinder picks it up immediately &mdash; any topology edge that needed this hop revalidates on the spot.</li>
+      <li><b>Create.</b> The pathfinder picks it up immediately &mdash; any topology edge that needed this hop revalidates on the spot. This applies to batches created in Multi mode too: every cable in the batch becomes visible to the pathfinder as soon as the batch commits.</li>
     </ol>
 
     <div class="callout tip">
