@@ -16,6 +16,17 @@ connection. The set arithmetic is:
 - ``to_build   = new MINUS old`` (inserted second),
 - ``unchanged  = old INTERSECT new`` (left untouched).
 
+``resolve_canvas_wiring`` (issue #531) resolves each canvas edge to a physical path
+constrained to that edge's own ``data.source_port_name``/``data.target_port_name``
+when the canvas carries them, so N canvas edges between the same device pair with
+distinct ports resolve to N distinct hops instead of collapsing to one. It does NOT
+read ``data.layer``: every resolved hop stays a hardcoded L1 ``WireSpec`` by design,
+because the execution service derives L2 membership and L3 adjacency from the
+recorded L1 hops (ADR 0009 option C) and filters fork rows to layer "L1"
+(``_fetch_fork_intended_wires``); writing "L2"/"L3" into the row layer would make
+execution drop those rows from every reconcile. The per-line layer question is
+tracked separately on issue #531 and is out of scope here.
+
 Cross-reservation port-claim enforcement (Decision 4) runs after computing
 ``to_build``: a physical (device, port) endpoint wired by another ACTIVE fork may
 not be claimed here, and a hit fails the save with 409. Both the reconcile staging
@@ -24,6 +35,7 @@ risk 2), so a save that lost the version race recomputes against the winner's
 now-committed rows rather than half-applying.
 """
 
+import logging
 import uuid
 from dataclasses import dataclass
 
@@ -35,6 +47,8 @@ from app.models.connection import Connection
 from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
 from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
 from app.services.version_service import commit_fork_with_new_version
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -101,12 +115,25 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[W
 
     The shared resolver behind both fork-on-activation snapshotting and save-reconcile
     (issue #25 P3a). For each committed (non-proposal) canvas edge between two
-    resolvable devices it picks the first shortest physical path and records every hop
-    as an L1 WireSpec carrying its backing physical connection id. Multi-hop paths
-    (an off-canvas patch panel between the endpoints) yield one WireSpec per cable, and
-    two edges sharing a hop de-duplicate on the path-orientation key so the same cable
-    is not emitted twice. Save-time normalization (see connection_identity) collapses
-    any remaining opposite-orientation duplicates.
+    resolvable devices it picks a shortest physical path and records every hop as an L1
+    WireSpec carrying its backing physical connection id. Multi-hop paths (an
+    off-canvas patch panel between the endpoints) yield one WireSpec per cable, and two
+    edges sharing a hop de-duplicate on the path-orientation key so the same cable is
+    not emitted twice. Save-time normalization (see connection_identity) collapses any
+    remaining opposite-orientation duplicates.
+
+    Port-aware resolution (issue #531): when an edge carries
+    ``data.source_port_name``/``data.target_port_name`` (the multi-port wiring dialog,
+    PR #530; empty string is treated as absent), the path search is constrained to
+    leave the source device on that exact port and arrive at the target device on that
+    exact port, so N canvas edges between the same device pair with distinct ports
+    resolve to N distinct hop sets instead of the second-and-later edges hitting
+    ``seen`` and contributing nothing. An edge with no port data keeps today's
+    unconstrained device-pair search (older exports, bulk import, the /api/v1 facade).
+    An edge whose constrained search finds no path contributes nothing for that edge
+    and is logged at INFO; it NEVER falls back to the unconstrained device-pair search,
+    since a fallback would silently wire different ports than the user chose. Layer is
+    deliberately not read from the canvas here; see the module docstring.
     """
     if not canvas:
         return []
@@ -162,8 +189,32 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[W
         raw_edge_id = edge.get("id")
         edge_key = str(raw_edge_id) if raw_edge_id is not None else None
 
-        paths = await find_all_shortest_paths_async(graph, source_device, target_device)
+        # Per-edge port constraints (issue #531). A blank string from the canvas is
+        # treated as absent, same as a missing key.
+        raw_source_port = edge_data.get("source_port_name")
+        raw_target_port = edge_data.get("target_port_name")
+        source_port = str(raw_source_port) if raw_source_port else None
+        target_port = str(raw_target_port) if raw_target_port else None
+
+        paths = await find_all_shortest_paths_async(
+            graph,
+            source_device,
+            target_device,
+            source_port=source_port,
+            target_port=target_port,
+        )
         if not paths:
+            if source_port is not None or target_port is not None:
+                logger.info(
+                    "resolve_canvas_wiring: unresolvable port-constrained edge "
+                    "edge_id=%s source_device=%s source_port=%s target_device=%s "
+                    "target_port=%s",
+                    edge.get("id"),
+                    source_device,
+                    source_port,
+                    target_device,
+                    target_port,
+                )
             continue
 
         path = paths[0]

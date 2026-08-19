@@ -105,6 +105,9 @@ async def find_all_shortest_paths_async(
     graph: dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]],
     source_id: uuid.UUID,
     target_id: uuid.UUID,
+    *,
+    source_port: str | None = None,
+    target_port: str | None = None,
 ) -> list[list[PathHop]]:
     """Offload the CPU-bound BFS + path enumeration to a worker thread.
 
@@ -112,8 +115,18 @@ async def find_all_shortest_paths_async(
     be expensive on large or dense graphs; running them on the event loop would
     stall every other cabling request. This wrapper keeps the sync functions
     sync and pushes the work to ``asyncio.to_thread`` so the loop stays free.
+    ``source_port``/``target_port`` are threaded straight through to
+    ``find_all_shortest_paths`` (issue #531); both default to None so every
+    existing caller is unaffected.
     """
-    return await asyncio.to_thread(find_all_shortest_paths, graph, source_id, target_id)
+    return await asyncio.to_thread(
+        find_all_shortest_paths,
+        graph,
+        source_id,
+        target_id,
+        source_port=source_port,
+        target_port=target_port,
+    )
 
 
 async def find_all_shortest_paths_batch_async(
@@ -141,6 +154,9 @@ def find_all_shortest_paths(
     graph: dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]],
     source_id: uuid.UUID,
     target_id: uuid.UUID,
+    *,
+    source_port: str | None = None,
+    target_port: str | None = None,
 ) -> list[list[PathHop]]:
     """Find all shortest-hop paths from source to target.
 
@@ -156,6 +172,18 @@ def find_all_shortest_paths(
     is capped at MAX_ENUMERATED_PATHS per-sequence to prevent exponential
     explosion on dense fabrics (many equal-cost routes through distinct
     intermediate device sequences).
+
+    ``source_port``/``target_port`` (issue #531) constrain the search to paths
+    that leave ``source_id`` on that exact port and arrive at ``target_id`` on
+    that exact port. Either may be given alone or both together; both default
+    to None, which is today's unconstrained device-pair search. The invariant:
+    the result is exactly the all-shortest-paths answer over the graph with
+    the non-matching source-side and target-side edges removed, computed by
+    two BFS-time edge filters rather than a post-hoc filter of the unconstrained
+    answer, so a port constraint can select a LONGER route than the
+    unconstrained shortest path when the direct edge does not carry the
+    requested port. ``source_id == target_id`` keeps its current single-hop
+    return regardless of either port, since there is no edge to filter.
     """
     if source_id == target_id:
         return [[PathHop(device_id=source_id)]]
@@ -176,6 +204,17 @@ def find_all_shortest_paths(
             # equal-cost predecessors, but no further BFS expansion is needed.
             continue
         for neighbor_id, local_port, remote_port in graph.get(current, []):
+            # Source-side filter: an edge leaving source_id must depart on
+            # source_port when one is requested. ``current == source_id`` is the
+            # only place this edge can be traversed (distance already pins
+            # source_id at 0, so it is never re-queued as a neighbor).
+            if current == source_id and source_port is not None and local_port != source_port:
+                continue
+            # Target-side filter: an edge arriving at target_id must arrive on
+            # target_port when one is requested. target_id is only ever seen
+            # here, as a neighbor, since the loop above never expands it.
+            if neighbor_id == target_id and target_port is not None and remote_port != target_port:
+                continue
             new_cost = distance[current] + 1
             if neighbor_id not in distance:
                 distance[neighbor_id] = new_cost

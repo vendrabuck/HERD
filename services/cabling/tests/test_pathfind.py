@@ -781,3 +781,169 @@ async def test_batch_unauthenticated(admin_client):
             },
         )
     assert resp.status_code in (401, 403)
+
+
+# ---- Port-constrained resolution (issue #531) ----
+
+
+def test_port_constraint_selects_between_two_direct_cables():
+    """Two direct cables between A and B: each port pair resolves its own cable.
+
+    Unconstrained, the two direct cables collapse to one route (the existing
+    parallel-cable dedupe, keyed on intermediate-device sequence only); a port
+    constraint must still pick out the specific cable the user chose.
+    """
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(b, "p1", "q1"), (b, "p2", "q2")],
+        b: [(a, "q1", "p1"), (a, "q2", "p2")],
+    }
+
+    unconstrained = find_all_shortest_paths(graph, a, b)
+    assert len(unconstrained) == 1
+
+    via_p1 = find_all_shortest_paths(graph, a, b, source_port="p1", target_port="q1")
+    assert len(via_p1) == 1
+    assert via_p1[0][0].port_out == "p1"
+    assert via_p1[0][1].port_in == "q1"
+
+    via_p2 = find_all_shortest_paths(graph, a, b, source_port="p2", target_port="q2")
+    assert len(via_p2) == 1
+    assert via_p2[0][0].port_out == "p2"
+    assert via_p2[0][1].port_in == "q2"
+
+
+def test_port_constraint_selects_between_two_panel_routes():
+    """Two 2-hop routes through the same patch panel: the constraint picks one.
+
+    A is patched to the panel on two ports, and the panel is patched to B on two
+    ports; a (source_port, target_port) pair picks exactly the route wired
+    through those two ports, not an arbitrary one of the two.
+    """
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a, panel, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(panel, "p1", "panel_in1"), (panel, "p2", "panel_in2")],
+        panel: [
+            (a, "panel_in1", "p1"),
+            (a, "panel_in2", "p2"),
+            (b, "panel_out1", "x1"),
+            (b, "panel_out2", "x2"),
+        ],
+        b: [(panel, "x1", "panel_out1"), (panel, "x2", "panel_out2")],
+    }
+
+    via_1 = find_all_shortest_paths(graph, a, b, source_port="p1", target_port="x1")
+    assert len(via_1) == 1
+    assert [h.device_id for h in via_1[0]] == [a, panel, b]
+    assert via_1[0][0].port_out == "p1"
+    assert via_1[0][1].port_in == "panel_in1"
+    assert via_1[0][1].port_out == "panel_out1"
+    assert via_1[0][2].port_in == "x1"
+
+    via_2 = find_all_shortest_paths(graph, a, b, source_port="p2", target_port="x2")
+    assert len(via_2) == 1
+    assert via_2[0][0].port_out == "p2"
+    assert via_2[0][1].port_in == "panel_in2"
+    assert via_2[0][1].port_out == "panel_out2"
+    assert via_2[0][2].port_in == "x2"
+
+
+def test_port_constraint_no_match_on_source_returns_empty():
+    """A source_port that matches no cable leaving the source returns []."""
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(b, "p1", "q1"), (b, "p2", "q2")],
+        b: [(a, "q1", "p1"), (a, "q2", "p2")],
+    }
+    assert find_all_shortest_paths(graph, a, b, source_port="p99") == []
+
+
+def test_port_constraint_no_match_on_target_returns_empty():
+    """A target_port that matches no cable arriving at the target returns []."""
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(b, "p1", "q1"), (b, "p2", "q2")],
+        b: [(a, "q1", "p1"), (a, "q2", "p2")],
+    }
+    assert find_all_shortest_paths(graph, a, b, target_port="q99") == []
+
+
+def test_port_constraint_source_only():
+    """A source_port alone (no target_port) narrows to cables leaving that port."""
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(b, "p1", "q1"), (b, "p2", "q2")],
+        b: [(a, "q1", "p1"), (a, "q2", "p2")],
+    }
+    paths = find_all_shortest_paths(graph, a, b, source_port="p1")
+    assert len(paths) == 1
+    assert paths[0][0].port_out == "p1"
+    assert paths[0][1].port_in == "q1"
+
+
+def test_port_constraint_target_only():
+    """A target_port alone (no source_port) narrows to cables arriving at that port."""
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(b, "p1", "q1"), (b, "p2", "q2")],
+        b: [(a, "q1", "p1"), (a, "q2", "p2")],
+    }
+    paths = find_all_shortest_paths(graph, a, b, target_port="q2")
+    assert len(paths) == 1
+    assert paths[0][0].port_out == "p2"
+    assert paths[0][1].port_in == "q2"
+
+
+def test_port_constraint_can_select_longer_than_unconstrained_shortest():
+    """A constrained route may be strictly longer than the unconstrained shortest.
+
+    A-B has a direct cable (1 hop) AND a 2-hop route via a panel on different
+    ports. The unconstrained shortest is the direct cable; constraining to the
+    panel-route ports must still return the 2-hop route, proving the filter
+    removes edges from the BFS rather than post-filtering the unconstrained
+    shortest-path answer (which would incorrectly return []).
+    """
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a, b, panel = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    graph = {
+        a: [(b, "p1", "q1"), (panel, "p2", "panel_in")],
+        b: [(a, "q1", "p1"), (panel, "q2", "panel_out")],
+        panel: [(a, "panel_in", "p2"), (b, "panel_out", "q2")],
+    }
+
+    unconstrained = find_all_shortest_paths(graph, a, b)
+    assert len(unconstrained) == 1
+    assert len(unconstrained[0]) == 2  # the direct 1-hop cable wins unconstrained
+
+    constrained = find_all_shortest_paths(graph, a, b, source_port="p2", target_port="q2")
+    assert len(constrained) == 1
+    assert [h.device_id for h in constrained[0]] == [a, panel, b]
+    assert constrained[0][0].port_out == "p2"
+    assert constrained[0][1].port_in == "panel_in"
+    assert constrained[0][1].port_out == "panel_out"
+    assert constrained[0][2].port_in == "q2"
+
+
+def test_port_constraint_same_device_ignores_ports():
+    """source_id == target_id keeps the trivial single-hop return regardless of ports."""
+    from app.services.pathfind_service import find_all_shortest_paths
+
+    a = uuid.uuid4()
+    graph = {a: []}
+    paths = find_all_shortest_paths(graph, a, a, source_port="nonexistent", target_port="also-none")
+    assert len(paths) == 1
+    assert len(paths[0]) == 1
+    assert paths[0][0].device_id == a

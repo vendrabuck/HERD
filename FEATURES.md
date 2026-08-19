@@ -72,9 +72,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   toolbar "Quick connect" toggle swaps in a compact single-pair popover for the common
   one-connection case, with an escalation link back to the full dialog. Multiple
   connections between the same device pair collapse into one bundled edge on the
-  canvas with a count badge and a per-connection delete. Known caveat: provisioning
-  still keeps one connection per device pair, so per-line ports and layers are
-  recorded on the canvas but not yet applied to wiring (issue #531).
+  canvas with a count badge and a per-connection delete. Provisioning now honors each
+  line's own ports, so N connections between the same device pair provision as N
+  distinct wires; the per-line layer is still recorded on the canvas only and every
+  provisioned hop stays L1 until the layer half lands (issue #531).
 - **Physical and cloud topology separation** (Shipped): physical and cloud devices
   cannot be mixed in a single topology, enforced at database, service, and UI
   layers.

@@ -64,12 +64,13 @@ as one bundled edge with a count badge (for example "3 connections"); click the 
 expand the per-connection list, which also shows each connection's own path/cabling
 status and its own delete control.
 
-**Known caveat (issue #531):** provisioning currently keeps one connection per device
-pair. Per-line ports and layers are recorded on the canvas but not yet applied to
-wiring, so cabling's fork-save resolver collapses N connections between the same device
-pair to a single provisioned path every time. The dialog shows a provisioning notice
-whenever a session has more than one connection, as a reminder that the extra lines
-are canvas-only for now.
+**Known caveat (issue #531, ports half fixed):** provisioning now honors each line's own
+ports: cabling's fork-save resolver resolves every canvas edge against that edge's
+`source_port_name`/`target_port_name` when present, so N connections between the same
+device pair provision as N distinct wires, not one. The per-line **layer** is still
+recorded on the canvas only; every provisioned hop stays L1 until the layer half of
+issue #531 lands, because the execution service derives L2 membership and L3 adjacency
+from the recorded L1 hops rather than reading a layer off the fork row.
 
 ### Quick connect
 

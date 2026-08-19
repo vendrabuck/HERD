@@ -526,14 +526,12 @@ export function WiringDialog({
 
   const confirmLabel = useMemo(() => {
     if (sessionConnections.length === 0) return "Add connections";
-    const base =
-      sessionConnections.length === 1 ? "Add 1 connection" : `Add ${sessionConnections.length} connections`;
-    // The caveat is unmissable at the moment it matters (issue #517 review
-    // item 4, wording corrected in round 3: resolve_canvas_wiring serves
-    // BOTH fork-save and fork-on-activation, so this applies to every save
-    // path, not just live-edit): only once it would actually bite (more
-    // than one line staged for the same pair).
-    return sessionConnections.length > 1 ? `${base} (keeps 1 per pair)` : base;
+    // The "(keeps 1 per pair)" caveat (issue #517 review item 4) is gone: issue
+    // #531 made resolve_canvas_wiring honor each staged line's own ports, so
+    // provisioning no longer collapses same-pair lines to one wire.
+    return sessionConnections.length === 1
+      ? "Add 1 connection"
+      : `Add ${sessionConnections.length} connections`;
   }, [sessionConnections.length]);
 
   // Data-only column props (issue #517 review item 10's collapse), kept
@@ -734,12 +732,6 @@ export function WiringDialog({
             <p className="text-xs text-gray-500">
               Free ports: {freeCounts.source} source, {freeCounts.target} target
             </p>
-            {sessionConnections.length > 1 && (
-              <p data-testid="provisioning-notice" className="text-[11px] text-gray-500 mt-0.5">
-                Provisioning currently keeps one connection per device pair; per-line ports and
-                layers are recorded on the canvas but not yet applied to wiring.
-              </p>
-            )}
             {errorMessage && <p className="text-xs text-red-600 mt-0.5">{errorMessage}</p>}
           </div>
           <Button variant="ghost" size="sm" onClick={() => setReviewOpen((v) => !v)}>
