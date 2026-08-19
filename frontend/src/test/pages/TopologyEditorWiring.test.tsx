@@ -221,7 +221,7 @@ describe("TopologyEditorPage wiring entry point", () => {
     clickPort("eth2");
     clickPort("0/0/2");
 
-    fireEvent.click(screen.getByRole("button", { name: "Add 2 connections (keeps 1 per pair)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add 2 connections" }));
 
     await waitFor(() => {
       expect(useTopologyStore.getState().edges).toHaveLength(2);

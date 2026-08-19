@@ -1091,6 +1091,21 @@ def _canvas(nodes: list[uuid.UUID], edges: list[tuple[int, int]]) -> dict:
     }
 
 
+def _canvas_with_edge_data(nodes: list[uuid.UUID], edges: list[tuple[int, int, dict]]) -> dict:
+    """Like ``_canvas``, but each edge tuple also carries a ``data`` dict.
+
+    Used for the per-edge port-name tests (issue #531): ``data`` is where the
+    multi-port wiring dialog stamps ``source_port_name``/``target_port_name``.
+    """
+    return {
+        "nodes": [{"id": f"n{i}", "data": {"device": {"id": str(d)}}} for i, d in enumerate(nodes)],
+        "edges": [
+            {"id": f"e{k}", "source": f"n{s}", "target": f"n{t}", "data": data}
+            for k, (s, t, data) in enumerate(edges)
+        ],
+    }
+
+
 def _endpoint_set(delta: dict) -> frozenset:
     return frozenset(
         {
@@ -1312,6 +1327,217 @@ async def test_save_fork_dedups_shared_hop(client):
     assert len(built) == 3
     shared = frozenset({(str(a), "a0"), (str(p), "p1")})
     assert sum(1 for d in built if _endpoint_set(d) == shared) == 1
+
+
+# --- Per-edge port-name resolution (issue #531 ports half) ---
+
+
+@pytest.mark.asyncio
+async def test_save_fork_two_same_pair_edges_with_ports_resolve_to_two_wires(client):
+    """Two canvas edges between the same devices, distinct ports, build two wires.
+
+    This is the regression the issue reports: before the fix, both edges called
+    the pathfinder with identical (device_a, device_b) arguments, took the same
+    ``paths[0]``, and the second edge's hop hit the ``seen`` dedupe and
+    contributed nothing. With per-edge ports threaded into the pathfind call,
+    each edge resolves its own cable and its own edge_key.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    await _make_physical(a, "a1", b, "b1")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    canvas = _canvas_with_edge_data(
+        [a, b],
+        [
+            (0, 1, {"source_port_name": "a0", "target_port_name": "b0"}),
+            (0, 1, {"source_port_name": "a1", "target_port_name": "b1"}),
+        ],
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 2
+    by_key = {w["edge_key"]: w for w in built}
+    assert set(by_key) == {"e0", "e1"}
+    assert _endpoint_set(by_key["e0"]) == frozenset({(str(a), "a0"), (str(b), "b0")})
+    assert _endpoint_set(by_key["e1"]) == frozenset({(str(a), "a1"), (str(b), "b1")})
+
+    conns = await _fork_connections(uuid.UUID(resp.json()["fork_id"]))
+    assert len(conns) == 2
+
+
+@pytest.mark.asyncio
+async def test_save_fork_two_same_pair_edges_without_ports_resolve_to_one_wire(client):
+    """Same physical setup, but neither edge carries port data: today's behavior.
+
+    Pinned as the compatibility contract (older exports, bulk import, the
+    /api/v1 facade never send port names): with no port constraint both edges
+    resolve to the same device-pair path and the second hits the ``seen``
+    dedupe, exactly as before this fix.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    await _make_physical(a, "a1", b, "b1")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, b], [(0, 1), (0, 1)])},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fork_unresolvable_port_pair_does_not_fall_back(client):
+    """An edge whose port pair has no cable contributes nothing; no fallback.
+
+    A resolvable sibling edge between the same devices still resolves. The
+    unresolvable edge must NOT fall back to the unconstrained device-pair
+    path, which would silently wire a different port than the user chose.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    canvas = _canvas_with_edge_data(
+        [a, b],
+        [
+            (0, 1, {"source_port_name": "a0", "target_port_name": "b0"}),
+            (0, 1, {"source_port_name": "a9", "target_port_name": "b9"}),
+        ],
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 1
+    assert built[0]["edge_key"] == "e0"
+    assert _endpoint_set(built[0]) == frozenset({(str(a), "a0"), (str(b), "b0")})
+
+
+@pytest.mark.asyncio
+async def test_save_fork_distinct_source_ports_share_common_final_hop(client):
+    """Two edges with distinct source ports but the same target port share a hop.
+
+    Both edges route through a shared patch panel to the same final cable
+    (panel to B on port b0); the dedupe must still collapse that shared final
+    hop to one WireSpec even though the two edges are now port-constrained.
+    """
+    a, panel, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", panel, "pin0")
+    await _make_physical(a, "a1", panel, "pin1")
+    await _make_physical(panel, "pout", b, "b0")  # shared final hop
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    canvas = _canvas_with_edge_data(
+        [a, b],
+        [
+            (0, 1, {"source_port_name": "a0", "target_port_name": "b0"}),
+            (0, 1, {"source_port_name": "a1", "target_port_name": "b0"}),
+        ],
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    # cable1 (A-panel via a0), cable2 (A-panel via a1), and the shared final hop
+    # (panel-B) once, not twice.
+    assert len(built) == 3
+    shared_hop = frozenset({(str(panel), "pout"), (str(b), "b0")})
+    assert sum(1 for d in built if _endpoint_set(d) == shared_hop) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fork_empty_string_port_names_treated_as_absent(client):
+    """Blank port-name strings behave exactly like missing keys: collapse as before."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    canvas = _canvas_with_edge_data(
+        [a, b],
+        [
+            (0, 1, {"source_port_name": "", "target_port_name": ""}),
+            (0, 1, {}),
+        ],
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fork_port_distinct_edges_resave_with_new_edge_ids_unchanged(client):
+    """Two port-distinct same-pair wires persist; changing only edge ids no-ops.
+
+    First save with edges e0/e1 builds two fork_connections rows. A re-save
+    carrying the same devices and ports under DIFFERENT edge ids reconciles as
+    fully unchanged, pinning that edge_key stays outside connection identity
+    even in the two-wires-per-pair case this issue fixes.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    await _make_physical(a, "a1", b, "b1")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    first_canvas = _canvas_with_edge_data(
+        [a, b],
+        [
+            (0, 1, {"source_port_name": "a0", "target_port_name": "b0"}),
+            (0, 1, {"source_port_name": "a1", "target_port_name": "b1"}),
+        ],
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": first_canvas}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["built"]) == 2
+    fork_id = uuid.UUID(resp.json()["fork_id"])
+    assert len(await _fork_connections(fork_id)) == 2
+
+    renamed_canvas = {
+        "nodes": first_canvas["nodes"],
+        "edges": [
+            {
+                "id": "renamed-0",
+                "source": "n0",
+                "target": "n1",
+                "data": {"source_port_name": "a0", "target_port_name": "b0"},
+            },
+            {
+                "id": "renamed-1",
+                "source": "n0",
+                "target": "n1",
+                "data": {"source_port_name": "a1", "target_port_name": "b1"},
+            },
+        ],
+    }
+    resp2 = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": renamed_canvas}, headers=_hdr()
+    )
+    assert resp2.status_code == 200, resp2.text
+    body2 = resp2.json()
+    assert body2["released"] == []
+    assert body2["built"] == []
+    assert body2["unchanged_count"] == 2
+    assert len(await _fork_connections(fork_id)) == 2
 
 
 # --- Transactional rollback: no half-apply, no orphan version ---

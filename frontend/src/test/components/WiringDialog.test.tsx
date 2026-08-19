@@ -316,7 +316,7 @@ describe("WiringDialog", () => {
     render(<WiringDialog {...baseProps()} />);
     connectViaClick("eth1", "0/0/1");
     fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
-    expect(screen.getByRole("button", { name: "Add 3 connections (keeps 1 per pair)" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Add 3 connections" })).toBeEnabled();
   });
 
   it("connect 1:1 in order shows the blunt error when nothing can pair", () => {
@@ -355,7 +355,7 @@ describe("WiringDialog", () => {
     // 1:1 in order wires everything free, including eth1; the stale arm
     // must not linger as if nothing happened.
     fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
-    expect(screen.getByRole("button", { name: "Add 3 connections (keeps 1 per pair)" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Add 3 connections" })).toBeEnabled();
     expect(
       screen.queryByText("eth1 selected. Click a target port to connect"),
     ).not.toBeInTheDocument();
@@ -404,7 +404,7 @@ describe("WiringDialog", () => {
     render(<WiringDialog {...baseProps({ existingWiredSourcePortIds: new Set(["sp1"]) })} />);
     fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
     // eth1 is canvas-wired: only eth2/eth3 (2 free) pair, not 3.
-    expect(screen.getByRole("button", { name: "Add 2 connections (keeps 1 per pair)" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Add 2 connections" })).toBeEnabled();
   });
 
   it("a device with no ports shows the empty state, not a blank list (review item 9)", () => {
@@ -425,30 +425,28 @@ describe("WiringDialog", () => {
     expect(screen.getByRole("button", { name: "Add connections" })).toBeDisabled();
   });
 
-  it("the provisioning notice appears in the footer once more than one line is staged, mode-independent (review round 3 item 4)", () => {
+  it("the provisioning notice is gone now that per-edge ports are honored (issue #531)", () => {
+    // Issue #531 made resolve_canvas_wiring honor each staged line's own ports,
+    // so provisioning no longer collapses same-pair lines to one wire; the
+    // stopgap notice from PR #530 must stay absent at any number of lines.
     render(<WiringDialog {...baseProps()} />);
     expect(screen.queryByTestId("provisioning-notice")).not.toBeInTheDocument();
 
     connectViaClick("eth1", "0/0/1");
-    // Still absent at exactly one line.
     expect(screen.queryByTestId("provisioning-notice")).not.toBeInTheDocument();
 
     connectViaClick("eth3", "0/0/2");
-    expect(screen.getByTestId("provisioning-notice")).toHaveTextContent(
-      "Provisioning currently keeps one connection per device pair",
-    );
-    // Visible without ever opening Review.
-    expect(screen.queryByTestId("review-strip")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("provisioning-notice")).not.toBeInTheDocument();
   });
 
-  it("staging more than one line puts the caveat in the confirm button label itself (review round 3 item 4)", () => {
+  it("staging more than one line no longer adds a caveat to the confirm button label (issue #531)", () => {
     render(<WiringDialog {...baseProps()} />);
     connectViaClick("eth1", "0/0/1");
     expect(screen.getByRole("button", { name: "Add 1 connection" })).toBeInTheDocument();
 
     connectViaClick("eth3", "0/0/2");
     expect(
-      screen.getByRole("button", { name: "Add 2 connections (keeps 1 per pair)" }),
+      screen.getByRole("button", { name: "Add 2 connections" }),
     ).toBeInTheDocument();
   });
 
@@ -460,7 +458,7 @@ describe("WiringDialog", () => {
     expect(screen.getByRole("button", { name: "Add 1 connection" })).toBeEnabled();
 
     connectViaClick("eth3", "0/0/2");
-    expect(screen.getByRole("button", { name: "Add 2 connections (keeps 1 per pair)" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Add 2 connections" })).toBeEnabled();
   });
 
   it("confirm calls onConfirm once with every session line's port ids, names, and layer", () => {
@@ -469,7 +467,7 @@ describe("WiringDialog", () => {
     connectViaClick("eth1", "0/0/1");
     connectViaClick("eth3", "0/0/2");
 
-    fireEvent.click(screen.getByRole("button", { name: "Add 2 connections (keeps 1 per pair)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add 2 connections" }));
 
     expect(onConfirm).toHaveBeenCalledTimes(1);
     const lines = onConfirm.mock.calls[0][0];
