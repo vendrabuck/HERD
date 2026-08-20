@@ -50,6 +50,13 @@ class Settings(HerdBaseSettings):
     # Retention for the ldap_sync_runs audit table, pruned by the same
     # interval loop (never by sync-now).
     ldap_sync_runs_retention_days: int = 90
+    # Stale-run reaper (issue #528): a row stuck in status "running" older
+    # than this many seconds is flipped to "failed", the crash-corpse case
+    # where a hard process death (OOM kill, container crash, power loss)
+    # never reached execute_run's finally block. Reaped from the interval
+    # loop's retention tick and, best-effort, at the start of every
+    # sync-now run, so a sync-now-only deployment is covered too.
+    ldap_sync_run_stale_seconds: int = 3600
     # Deactivation sweep (ADR 0011 phase 4). Independent opt-in: enabling
     # group mirroring above never opts a deployment into deactivation.
     ldap_sync_deactivation_enabled: bool = False

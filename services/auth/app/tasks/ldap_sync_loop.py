@@ -35,6 +35,18 @@ live audit state, not history. Because retention is enforced by this loop and
 not by sync-now, a deployment that only ever runs sync-now accumulates
 ldap_sync_runs rows indefinitely; that is a deliberate consequence of the ADR
 decision to keep pruning out of the manual path, not an oversight.
+
+Stale-run reap (issue #528) runs on the SAME cadence gate as the retention
+prune, just before it: a hard process death mid-run (OOM kill, container
+crash, power loss) never reaches ldap_sync_service.execute_run's finally
+block, so its row is stuck at status "running" forever, exactly the row the
+prune above refuses to touch. ldap_sync_service.reap_stale_running_runs owns
+the actual compare-and-swap UPDATE; this loop only calls it on a cadence and
+isolates its failures, matching the prune's own try/except shape. Unlike the
+prune, the reap is ALSO called (best-effort) at the start of every sync-now
+run (ldap_sync_service.run_sync / start_background_run), so a
+sync-now-only deployment still reaps corpses even though it never prunes
+them.
 """
 
 import asyncio
@@ -124,6 +136,18 @@ async def _run_interval_tick() -> None:
             )
 
 
+async def _reap_stale_runs() -> int:
+    """Reap ldap_sync_runs rows stranded in status "running" by a hard
+    process death (issue #528), on the same cadence as the retention prune
+    below (both are housekeeping over the same table, and neither needs a
+    tighter cadence than the other). ldap_sync_service owns the actual
+    compare-and-swap UPDATE; this is a thin per-tick session wrapper so the
+    loop's shape matches _prune_old_runs's.
+    """
+    async with database.AsyncSessionLocal() as db:
+        return await ldap_sync_service.reap_stale_running_runs(db)
+
+
 async def _prune_old_runs() -> int:
     """Delete ldap_sync_runs rows started before the retention cutoff.
 
@@ -178,6 +202,17 @@ async def ldap_sync_loop(interval_seconds: float) -> None:
 
         now = _utcnow()
         if last_prune is None or now - last_prune >= _PRUNE_INTERVAL:
+            try:
+                await _reap_stale_runs()
+            except Exception:
+                # Reap failures must never block the prune below or fail
+                # the tick (issue #528): log and continue, retried on the
+                # next due cadence like the prune's own failure handling.
+                logger.error(
+                    "LDAP sync stale-run reap failed",
+                    exc_info=True,
+                    extra={"action": "ldap_sync_stale_run_reap_tick_failed"},
+                )
             try:
                 removed = await _prune_old_runs()
             except Exception:

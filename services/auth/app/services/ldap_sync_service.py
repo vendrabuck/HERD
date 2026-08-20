@@ -55,7 +55,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from herd_common import advisory_lock
 from sqlalchemy import select, update
@@ -1139,6 +1139,84 @@ async def create_run(db: AsyncSession, trigger: str) -> LdapSyncRun:
 
 
 # ---------------------------------------------------------------------------
+# Stale-run reaper (issue #528). A hard process death mid-run (OOM kill,
+# container crash, power loss) never reaches execute_run's finally block, so
+# the row it created via create_run is left at status "running" with
+# finished_at null forever: the retention prune in ldap_sync_loop.py
+# deliberately never touches running rows (they may be genuinely in flight),
+# and nothing else flips them. This function is the reap: it is called from
+# two places (the phase 5 interval loop's retention tick, and the start of
+# every sync-now run, see run_sync) through this one shared implementation,
+# so a sync-now-only deployment that never runs the loop still gets corpses
+# reaped.
+# ---------------------------------------------------------------------------
+
+STALE_RUN_ERROR = "run did not finalize (process died mid-run)"
+
+
+async def reap_stale_running_runs(db: AsyncSession) -> int:
+    """Flip ldap_sync_runs rows stuck in status "running" past
+    settings.ldap_sync_run_stale_seconds to "failed" (issue #528).
+
+    The frontend already renders a "running" row as stale after 30 minutes
+    (PR #526) well before the backend's default 3600-second threshold here
+    flips it; that ordering is intentional defense in depth, not a bug: the
+    UI mitigation covers the common case immediately, while this reaper is
+    the backstop that eventually corrects the audit record itself, on a
+    longer, more conservative timer so it never races a merely slow (but
+    still alive) run.
+
+    Mirrors reservations' PENDING_PROVISION timeout backstop (issue #276,
+    services/reservations/app/services/reservation_service.py's
+    _claim_provision_transition): a single conditional
+    UPDATE ... WHERE status = 'running' AND started_at < cutoff is a
+    compare-and-swap, so a run whose finally block finalizes it (success,
+    partial, aborted, or a genuine failure) between this function's cutoff
+    computation and its UPDATE keeps that legitimate outcome, since the
+    UPDATE simply matches zero rows for it. Returns the number of rows
+    reaped.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.ldap_sync_run_stale_seconds)
+    result = await db.execute(
+        update(LdapSyncRun)
+        .where(
+            LdapSyncRun.status == "running",
+            LdapSyncRun.started_at < cutoff,
+        )
+        .values(
+            status="failed",
+            error=STALE_RUN_ERROR,
+            finished_at=datetime.now(timezone.utc),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    reaped = result.rowcount or 0
+    if reaped:
+        logger.warning(
+            "Reaped %d stale ldap_sync_runs row(s) stuck in running",
+            reaped,
+            extra={"action": "ldap_sync_stale_run_reaped", "count": reaped},
+        )
+    return reaped
+
+
+async def reap_stale_running_runs_best_effort(db: AsyncSession) -> int:
+    """reap_stale_running_runs, but a failure is logged and swallowed rather
+    than propagated: the reaper is housekeeping, and its callers (the
+    interval loop's retention tick, and the start of every sync-now run)
+    must never let a reap failure fail the sync run itself."""
+    try:
+        return await reap_stale_running_runs(db)
+    except Exception:
+        logger.exception(
+            "LDAP sync stale-run reap failed",
+            extra={"action": "ldap_sync_stale_run_reap_failed"},
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Run serialization (S1). One invariant, ONE implementation: a run is a run
 # whether started from the router's sync-now endpoint, called directly
 # (run_sync, used by the live tests and any script), or the phase 5 interval
@@ -1314,7 +1392,14 @@ async def start_background_run(trigger: str) -> uuid.UUID:
     Raises SyncBusyError (never an HTTP code; that mapping is the router's
     job) when the slot is already held, either in this process or (fail-safe
     fallback for the router) on another replica.
+
+    Also reaps stale "running" corpses (issue #528) before creating this
+    run's row, best-effort: this is the router's actual sync-now entry
+    point, so a sync-now-only deployment (never running the phase 5
+    interval loop) still gets corpses reaped on every manual trigger.
     """
+    async with database.AsyncSessionLocal() as session:
+        await reap_stale_running_runs_best_effort(session)
     async with _SyncSlot() as slot:
         async with database.AsyncSessionLocal() as session:
             run = await create_run(session, trigger)
@@ -1334,7 +1419,16 @@ async def run_sync(db: AsyncSession, *, trigger: str = "manual") -> LdapSyncRun:
     obvious direct-call API (used by the live tests and any script) is
     serialized exactly like the router's sync-now endpoint. On SQLite the
     advisory-lock layer is dialect-gated out, so tests exercise only the
-    uncontended asyncio-lock layer and behave exactly as before."""
+    uncontended asyncio-lock layer and behave exactly as before.
+
+    Also reaps stale "running" corpses (issue #528) at the start of every
+    run, best-effort: a sync-now-only deployment never runs the phase 5
+    interval loop's retention tick, so without this call here it would
+    never reap a stranded row at all. A reap failure is logged and
+    swallowed (reap_stale_running_runs_best_effort), never allowed to fail
+    this sync run.
+    """
+    await reap_stale_running_runs_best_effort(db)
     async with _SyncSlot():
         run = await create_run(db, trigger)
         return await execute_run(db, run)
