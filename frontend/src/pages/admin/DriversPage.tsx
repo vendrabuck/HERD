@@ -1,7 +1,5 @@
-import { useState, useEffect, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useRef } from "react";
 import toast from "react-hot-toast";
-import { useAuthStore } from "@/stores/authStore";
 import {
   usePaginatedDrivers,
   useCreateDriver,
@@ -30,8 +28,6 @@ function formatBytes(bytes: number): string {
 }
 
 export function DriversPage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
   const [skip, setSkip] = useState(0);
   const limit = 50;
   const { data, isLoading } = usePaginatedDrivers(skip, limit);
@@ -40,8 +36,6 @@ export function DriversPage() {
   const createDriver = useCreateDriver();
   const deleteDriver = useDeleteDriver();
   const downloadDriver = useDownloadDriver();
-
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
 
   const aiStatus = useAIStatus();
   const recipeAuthoringOn = Boolean(
@@ -56,14 +50,6 @@ export function DriversPage() {
   const [uploadConnectionType, setUploadConnectionType] = useState("");
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
-  if (!user || !isAdmin) return null;
 
   const handleUpload = async () => {
     if (!uploadName.trim()) {

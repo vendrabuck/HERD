@@ -1,7 +1,5 @@
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState } from "react";
 import toast from "react-hot-toast";
-import { useAuthStore } from "@/stores/authStore";
 import {
   usePaginatedHypervisors,
   useCreateHypervisor,
@@ -34,10 +32,6 @@ const EMPTY_FORM: FormState = {
 };
 
 export function HypervisorsPage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
-
   const [skip, setSkip] = useState(0);
   const limit = 50;
   const { data, isLoading } = usePaginatedHypervisors(skip, limit);
@@ -53,14 +47,6 @@ export function HypervisorsPage() {
   const [editTarget, setEditTarget] = useState<Hypervisor | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Hypervisor | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
-  if (!user || !isAdmin) return null;
 
   const closeCreateModal = () => {
     setShowCreate(false);

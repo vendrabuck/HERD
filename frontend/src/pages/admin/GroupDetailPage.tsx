@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useAuthStore } from "@/stores/authStore";
@@ -24,12 +24,6 @@ export function GroupDetailPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [trackedGroupId, setTrackedGroupId] = useState<string | undefined>(undefined);
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
 
   // Adjusting state during render: sync form fields when group data arrives
   if (group && group.id !== trackedGroupId) {
@@ -61,7 +55,6 @@ export function GroupDetailPage() {
     [group?.members]
   );
 
-  if (!user || !isAdmin) return null;
   if (!isNew && isLoading) {
     return (
       <div className="h-full overflow-y-auto">

@@ -1,7 +1,5 @@
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState } from "react";
 import toast from "react-hot-toast";
-import { useAuthStore } from "@/stores/authStore";
 import {
   usePaginatedConnections,
   useCreateConnection,
@@ -23,10 +21,6 @@ import type { ConnectionCreate } from "@/types/connection.types";
 type CreateMode = "multi" | "single";
 
 export function ConnectionsPage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
-
   const [skip, setSkip] = useState(0);
   const limit = 50;
   const [filterDeviceSearch, setFilterDeviceSearch] = useState("");
@@ -84,14 +78,6 @@ export function ConnectionsPage() {
   // Port fetching for selected devices
   const { data: portsA = [] } = usePorts(deviceAId || undefined);
   const { data: portsB = [] } = usePorts(deviceBId || undefined);
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
-  if (!user || !isAdmin) return null;
 
   const handleCreate = async () => {
     if (!deviceAId) {

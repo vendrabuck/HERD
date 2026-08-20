@@ -1,21 +1,11 @@
-import { useEffect } from "react";
-import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/authStore";
 import { UserManagementTable } from "@/components/admin/UserManagementTable";
 
 export function UsersPage() {
   const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
   const isSuperadmin = user?.role === "superadmin";
 
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
-  if (!user || !isAdmin) {
+  if (!user) {
     return null;
   }
 

@@ -116,7 +116,8 @@ beforeEach(() => {
   navigateSpy.mockClear();
   toast.success.mockClear();
   toast.error.mockClear();
-  // Admin user so the page does not redirect away.
+  // The page assumes an admin user; the redirect for non-admins now lives
+  // in AdminGuard (App.tsx), tested in AdminGuard.test.tsx.
   useAuthStore.setState({
     user: { id: "1", username: "admin", email: "a@b.c", role: "admin" },
   } as never);
@@ -257,14 +258,7 @@ describe("DeviceGroupDetailPage", () => {
     );
   });
 
-  it("redirects non-admin users away from the page", async () => {
-    useAuthStore.setState({
-      user: { id: "2", username: "bob", email: "b@b.c", role: "user" },
-    } as never);
-    renderWithProviders(<DeviceGroupDetailPage />);
-
-    await waitFor(() =>
-      expect(navigateSpy).toHaveBeenCalledWith("/topology"),
-    );
-  });
+  // Non-admin redirect coverage moved to AdminGuard.test.tsx: the guard now
+  // lives in App.tsx's route wrapper (issue #527), and this page no longer
+  // performs its own redirect check.
 });

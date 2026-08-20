@@ -1,13 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
-import { useAuthStore } from "@/stores/authStore";
 import { usePaginatedDeviceGroups, useDeleteDeviceGroup } from "@/api/deviceGroups";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 
 export function DeviceGroupsPage() {
-  const user = useAuthStore((s) => s.user);
   const navigate = useNavigate();
   const [skip, setSkip] = useState(0);
   const limit = 50;
@@ -16,16 +14,6 @@ export function DeviceGroupsPage() {
   const total = data?.total ?? 0;
   const deleteGroup = useDeleteDeviceGroup();
   const [deleteId, setDeleteId] = useState<string | null>(null);
-
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
-  if (!user || !isAdmin) return null;
 
   const handleDelete = async () => {
     if (!deleteId) return;

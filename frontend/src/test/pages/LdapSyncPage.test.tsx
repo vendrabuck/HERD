@@ -7,12 +7,6 @@ beforeAll(() => {
   HTMLDialogElement.prototype.close = vi.fn();
 });
 
-// Mock react-router-dom, capturing navigate calls for the redirect-guard test.
-const mockNavigate = vi.fn();
-vi.mock("react-router-dom", () => ({
-  useNavigate: () => mockNavigate,
-}));
-
 // Mock react-hot-toast. The page uses both toast.error/toast.success AND the
 // bare callable form (`toast(message)`) for the informational 409-busy case,
 // so the mock default export must be callable as well as carry .error/.success.
@@ -30,8 +24,7 @@ vi.mock("react-hot-toast", () => ({
 }));
 
 const ADMIN_USER = { id: "1", email: "admin@test.com", role: "admin", username: "admin" };
-const REGULAR_USER = { id: "2", email: "user@test.com", role: "user", username: "regular" };
-let currentUser: typeof ADMIN_USER | typeof REGULAR_USER | null = ADMIN_USER;
+let currentUser: typeof ADMIN_USER | null = ADMIN_USER;
 vi.mock("@/stores/authStore", () => ({
   useAuthStore: (selector: (s: { user: typeof ADMIN_USER | null }) => unknown) =>
     selector({ user: currentUser }),
@@ -197,12 +190,9 @@ describe("LdapSyncPage", () => {
     mockUseGroups.mockReturnValue({ data: SAMPLE_GROUPS });
   });
 
-  it("redirects a non-admin user and renders nothing", () => {
-    currentUser = REGULAR_USER;
-    render(<LdapSyncPage />);
-    expect(mockNavigate).toHaveBeenCalledWith("/topology");
-    expect(screen.queryByText("LDAP Directory Sync")).not.toBeInTheDocument();
-  });
+  // Non-admin redirect coverage moved to AdminGuard.test.tsx: the guard now
+  // lives in App.tsx's route wrapper (issue #527), and this page no longer
+  // performs its own redirect check.
 
   // --- Item 1: status fetch error ---
 

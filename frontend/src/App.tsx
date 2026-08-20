@@ -1,4 +1,5 @@
-import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { useEffect } from "react";
+import { BrowserRouter, Navigate, Outlet, Route, Routes, useNavigate } from "react-router-dom";
 import { Toaster } from "react-hot-toast";
 import { LoginPage } from "@/pages/LoginPage";
 import { RegisterPage } from "@/pages/RegisterPage";
@@ -41,6 +42,23 @@ function GuestGuard({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   if (isAuthenticated) {
     return <Navigate to="/topology" replace />;
+  }
+  return <>{children}</>;
+}
+
+export function AdminGuard({ children }: { children: React.ReactNode }) {
+  const user = useAuthStore((s) => s.user);
+  const navigate = useNavigate();
+  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+
+  useEffect(() => {
+    if (user && !isAdmin) {
+      navigate("/topology");
+    }
+  }, [user, isAdmin, navigate]);
+
+  if (!user || !isAdmin) {
+    return null;
   }
   return <>{children}</>;
 }
@@ -89,19 +107,27 @@ export default function App() {
           <Route path="/reporting" element={<ReportingPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/admin" element={<Navigate to="/admin/add-device" replace />} />
-          <Route path="/admin/add-device" element={<AddDevicePage />} />
-          <Route path="/admin/users" element={<UsersPage />} />
-          <Route path="/admin/groups" element={<GroupsPage />} />
-          <Route path="/admin/groups/new" element={<GroupDetailPage />} />
-          <Route path="/admin/groups/:id" element={<GroupDetailPage />} />
-          <Route path="/admin/device-groups" element={<DeviceGroupsPage />} />
-          <Route path="/admin/device-groups/new" element={<DeviceGroupDetailPage />} />
-          <Route path="/admin/device-groups/:id" element={<DeviceGroupDetailPage />} />
-          <Route path="/admin/connections" element={<ConnectionsPage />} />
-          <Route path="/admin/drivers" element={<DriversPage />} />
-          <Route path="/admin/grants" element={<GrantsPage />} />
-          <Route path="/admin/hypervisors" element={<HypervisorsPage />} />
-          <Route path="/admin/ldap-sync" element={<LdapSyncPage />} />
+          <Route
+            element={
+              <AdminGuard>
+                <Outlet />
+              </AdminGuard>
+            }
+          >
+            <Route path="/admin/add-device" element={<AddDevicePage />} />
+            <Route path="/admin/users" element={<UsersPage />} />
+            <Route path="/admin/groups" element={<GroupsPage />} />
+            <Route path="/admin/groups/new" element={<GroupDetailPage />} />
+            <Route path="/admin/groups/:id" element={<GroupDetailPage />} />
+            <Route path="/admin/device-groups" element={<DeviceGroupsPage />} />
+            <Route path="/admin/device-groups/new" element={<DeviceGroupDetailPage />} />
+            <Route path="/admin/device-groups/:id" element={<DeviceGroupDetailPage />} />
+            <Route path="/admin/connections" element={<ConnectionsPage />} />
+            <Route path="/admin/drivers" element={<DriversPage />} />
+            <Route path="/admin/grants" element={<GrantsPage />} />
+            <Route path="/admin/hypervisors" element={<HypervisorsPage />} />
+            <Route path="/admin/ldap-sync" element={<LdapSyncPage />} />
+          </Route>
         </Route>
         <Route path="/dashboard" element={<Navigate to="/topology" replace />} />
         <Route path="*" element={<Navigate to="/topology" replace />} />
