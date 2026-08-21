@@ -1,6 +1,19 @@
+import logging
 from typing import Literal
 
 from herd_common.base_settings import HerdBaseSettings
+
+logger = logging.getLogger(__name__)
+
+# Production floor for the LDAP sync interval. Both clamps that need it live
+# in this module (effective_ldap_sync_interval_seconds and
+# effective_ldap_sync_run_stale_seconds, which floors at twice the effective
+# interval), so there is ONE implementation of the interval clamp and the two
+# cannot drift; app/tasks/ldap_sync_loop.py's effective_interval_seconds is a
+# thin delegate. They live HERE rather than in the loop because
+# app.tasks.ldap_sync_loop imports app.services.ldap_sync_service, which
+# imports this module: importing the other way would be a cycle.
+MIN_LDAP_SYNC_INTERVAL_SECONDS = 60
 
 
 class Settings(HerdBaseSettings):
@@ -50,6 +63,17 @@ class Settings(HerdBaseSettings):
     # Retention for the ldap_sync_runs audit table, pruned by the same
     # interval loop (never by sync-now).
     ldap_sync_runs_retention_days: int = 90
+    # Stale-run reaper (issue #528): a row stuck in status "running" older
+    # than this many seconds is flipped to "failed", the crash-corpse case
+    # where a hard process death (OOM kill, container crash, power loss)
+    # never reached execute_run's finally block. Reaped at the START of
+    # every sync run (interval tick or sync-now), inside the sync lock.
+    # Read through effective_ldap_sync_run_stale_seconds() below, never
+    # raw: the default is deliberately TWICE the default interval, and the
+    # accessor enforces that 2x relationship as a floor, so a run that is
+    # merely slow (or an interval tuned longer than this) is never mistaken
+    # for a corpse.
+    ldap_sync_run_stale_seconds: int = 7200
     # Deactivation sweep (ADR 0011 phase 4). Independent opt-in: enabling
     # group mirroring above never opts a deployment into deactivation.
     ldap_sync_deactivation_enabled: bool = False
@@ -77,3 +101,92 @@ class Settings(HerdBaseSettings):
 
 
 settings = Settings()
+
+
+def effective_ldap_sync_interval_seconds(raw: int, *, warn: bool = True) -> int:
+    """Clamp a configured LDAP sync interval to a sane floor.
+
+    A misconfigured ldap_sync_interval_seconds (0, a typo like 3, or any
+    value well under a minute) must not turn the interval loop into a
+    directory-hammering busy loop. Deliberately NOT a pydantic ge= validator
+    on the setting itself: a bad tuning knob must never prevent auth from
+    booting, since login availability outranks strictness here. Clamping
+    (and logging that it happened) keeps the service up with a safe interval
+    instead.
+
+    The single implementation of that clamp. Two callers reach it:
+    app.tasks.ldap_sync_loop.effective_interval_seconds (which delegates
+    here, so the production loop, main.py's lifespan, and the status
+    endpoint keep their existing entry point) and
+    effective_ldap_sync_run_stale_seconds below, whose floor is twice the
+    EFFECTIVE interval and so must clamp the interval exactly the same way.
+    That second caller passes warn=False: it runs on EVERY sync run (the
+    reaper reads its threshold there), so warning from it would repeat a
+    misconfiguration the loop's own call already logged at startup, once per
+    run, forever.
+    """
+    if raw < MIN_LDAP_SYNC_INTERVAL_SECONDS:
+        if not warn:
+            return MIN_LDAP_SYNC_INTERVAL_SECONDS
+        logger.warning(
+            "ldap_sync_interval_seconds=%s is below the %ds floor; clamping",
+            raw,
+            MIN_LDAP_SYNC_INTERVAL_SECONDS,
+            extra={
+                "action": "ldap_sync_interval_clamped",
+                "configured_seconds": raw,
+                "floor_seconds": MIN_LDAP_SYNC_INTERVAL_SECONDS,
+            },
+        )
+        return MIN_LDAP_SYNC_INTERVAL_SECONDS
+    return raw
+
+
+def effective_ldap_sync_run_stale_seconds() -> int:
+    """Clamp ldap_sync_run_stale_seconds to a safe floor before the stale-run
+    reaper uses it (issue #528).
+
+    Two terms, whichever is larger:
+
+    - MIN_LDAP_SYNC_INTERVAL_SECONDS (60), the same absolute floor the
+      interval clamp uses, so a 0 or a typo like 3 can never turn the reaper
+      into something that fails every run it sees.
+    - twice the EFFECTIVE interval, since the interval loop starts a run
+      every interval and a healthy run may legitimately outlast one tick.
+      A threshold at or below the interval would let the reaper fail a run
+      that is merely slow but still alive: the reaper's CAS keeps the row's
+      real outcome only if the run finalizes FIRST, and this floor is what
+      makes that the overwhelmingly likely order.
+
+    The effective interval comes from effective_ldap_sync_interval_seconds
+    above, the same function the production loop clamps with, so this floor
+    is computed against the interval the loop will ACTUALLY use rather than
+    against a re-derived copy of it.
+
+    Shares that function's reasoning for clamping instead of validating: a
+    bad tuning value must never prevent auth from booting, so it is
+    corrected (with a warning) at the point of use rather than rejected by a
+    pydantic ge= constraint.
+    """
+    effective_interval = effective_ldap_sync_interval_seconds(
+        settings.ldap_sync_interval_seconds, warn=False
+    )
+    floor = max(MIN_LDAP_SYNC_INTERVAL_SECONDS, 2 * effective_interval)
+    raw = settings.ldap_sync_run_stale_seconds
+    if raw < floor:
+        logger.warning(
+            "ldap_sync_run_stale_seconds=%s is below the %ds floor "
+            "(max of %ds and twice the %ds effective sync interval); clamping",
+            raw,
+            floor,
+            MIN_LDAP_SYNC_INTERVAL_SECONDS,
+            effective_interval,
+            extra={
+                "action": "ldap_sync_run_stale_seconds_clamped",
+                "configured_seconds": raw,
+                "floor_seconds": floor,
+                "effective_interval_seconds": effective_interval,
+            },
+        )
+        return floor
+    return raw

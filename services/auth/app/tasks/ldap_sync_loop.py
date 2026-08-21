@@ -35,6 +35,17 @@ live audit state, not history. Because retention is enforced by this loop and
 not by sync-now, a deployment that only ever runs sync-now accumulates
 ldap_sync_runs rows indefinitely; that is a deliberate consequence of the ADR
 decision to keep pruning out of the manual path, not an oversight.
+
+Stale-run reap (issue #528) is NOT this loop's job and has no cadence gate
+here: a hard process death mid-run (OOM kill, container crash, power loss)
+never reaches ldap_sync_service.execute_run's finally block, so its row is
+stuck at status "running" forever, exactly the row the prune above refuses
+to touch. ldap_sync_service reaps those corpses at the START of every sync
+run, whether triggered by this loop's tick or by sync-now, and does it
+INSIDE the run-serialization slot (see run_sync / start_background_run), so
+it can never fire against a run that is concurrently alive and holding the
+slot. That covers both the interval deployment and a sync-now-only one,
+which is why this loop has no reap call of its own.
 """
 
 import asyncio
@@ -44,7 +55,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete
 
 from app import database
-from app.config import settings
+from app.config import effective_ldap_sync_interval_seconds, settings
 from app.models.ldap_sync_run import LdapSyncRun
 from app.services import ldap_sync_service
 
@@ -55,10 +66,13 @@ logger = logging.getLogger(__name__)
 # prune into a per-tick DELETE scan.
 _PRUNE_INTERVAL = timedelta(hours=24)
 
-# Floor for the PRODUCTION interval only (see effective_interval_seconds); the
-# loop function itself stays unclamped so tests and the live-LDAP test can
-# pass sub-second intervals directly.
-_MIN_PRODUCTION_INTERVAL_SECONDS = 60
+# The PRODUCTION interval floor and the clamp that applies it both live in
+# app.config (MIN_LDAP_SYNC_INTERVAL_SECONDS,
+# effective_ldap_sync_interval_seconds), alongside the stale-run clamp built
+# on top of them (effective_ldap_sync_run_stale_seconds, whose floor is twice
+# the EFFECTIVE interval). ldap_group_sync_loop below stays unclamped so tests
+# and the live-LDAP test can pass sub-second intervals directly; only the
+# production call sites go through effective_interval_seconds.
 
 
 def ldap_group_sync_loop_enabled() -> bool:
@@ -74,29 +88,20 @@ def ldap_group_sync_loop_enabled() -> bool:
 
 def effective_interval_seconds(raw: int) -> int:
     """Clamp a configured interval to a sane floor before starting the
-    PRODUCTION loop (main.py's only caller).
+    PRODUCTION loop (main.py's caller; the status endpoint reports the same
+    number through this function).
 
-    A misconfigured ldap_sync_interval_seconds (0, a typo like 3, or any
-    value well under a minute) must not turn the interval loop into a
-    directory-hammering busy loop. Deliberately NOT a pydantic ge= validator
-    on the setting itself: a bad tuning knob must never prevent auth from
-    booting, since login availability outranks strictness here. Clamping
-    (and logging that it happened) keeps the service up with a safe interval
-    instead.
+    Delegates to app.config.effective_ldap_sync_interval_seconds, which owns
+    the ONE implementation of this clamp, because the stale-run clamp
+    (effective_ldap_sync_run_stale_seconds) floors at twice the EFFECTIVE
+    interval and so has to apply the identical rule. Sharing the 60-second
+    constant alone would not have been enough: two copies of "if raw < floor"
+    can drift in what they do with it. This wrapper survives so the lifespan
+    and the status router keep their existing entry point; the clamp warning
+    is now emitted by app.config's logger, which is why the loop tests assert
+    on the message rather than on the logger name.
     """
-    if raw < _MIN_PRODUCTION_INTERVAL_SECONDS:
-        logger.warning(
-            "ldap_sync_interval_seconds=%s is below the %ds floor; clamping",
-            raw,
-            _MIN_PRODUCTION_INTERVAL_SECONDS,
-            extra={
-                "action": "ldap_sync_interval_clamped",
-                "configured_seconds": raw,
-                "floor_seconds": _MIN_PRODUCTION_INTERVAL_SECONDS,
-            },
-        )
-        return _MIN_PRODUCTION_INTERVAL_SECONDS
-    return raw
+    return effective_ldap_sync_interval_seconds(raw)
 
 
 def _utcnow() -> datetime:

@@ -55,15 +55,15 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from herd_common import advisory_lock
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from app import database
-from app.config import settings
+from app.config import effective_ldap_sync_run_stale_seconds, settings
 from app.models.group import GroupMember
 from app.models.ldap_group_mapping import DIRECTORY_NAME_MAX, LdapGroupMapping
 from app.models.ldap_sync_run import LdapSyncRun
@@ -1139,6 +1139,138 @@ async def create_run(db: AsyncSession, trigger: str) -> LdapSyncRun:
 
 
 # ---------------------------------------------------------------------------
+# Stale-run reaper (issue #528). A hard process death mid-run (OOM kill,
+# container crash, power loss) never reaches execute_run's finally block, so
+# the row it created via create_run is left at status "running" with
+# finished_at null forever: the retention prune in ldap_sync_loop.py
+# deliberately never touches running rows (they may be genuinely in flight),
+# and nothing else flips them. This function is the reap. It has ONE cadence:
+# the start of every sync run, whether triggered by the phase 5 interval loop
+# or by sync-now, so an interval deployment and a sync-now-only one are both
+# covered without the loop needing a reap call of its own.
+#
+# It runs INSIDE the run-serialization slot (see run_sync and
+# start_background_run), never before it. Outside the slot the reap would
+# also fire on a call that is about to raise SyncBusyError, which is exactly
+# the moment another run is provably alive and holding the slot: the one
+# case where a table-wide "flip every old running row" UPDATE could reach a
+# live run's row rather than a corpse. Inside the slot, this process holds
+# the only run in flight, so every other running row is either this
+# replica's corpse or (on Postgres, where the advisory lock is
+# cross-replica) another replica's corpse.
+# ---------------------------------------------------------------------------
+
+STALE_RUN_ERROR = "run did not finalize (process died mid-run)"
+
+
+async def reap_stale_running_runs(db: AsyncSession) -> int:
+    """Flip ldap_sync_runs rows stuck in status "running" past the effective
+    stale threshold to "failed" (issue #528).
+
+    The threshold is read through
+    config.effective_ldap_sync_run_stale_seconds(), never from the raw
+    setting: the accessor floors it at the larger of 60 seconds and twice
+    the effective sync interval, so a value tuned at or below the interval
+    (the default 7200 sits at exactly twice the default 3600 interval)
+    cannot make the reaper fail runs that are merely slow.
+
+    The frontend already renders a "running" row as stale after 30 minutes
+    (PR #526) well before the backend's default 7200-second threshold here
+    flips it; that ordering is intentional defense in depth, not a bug: the
+    UI mitigation covers the common case immediately, while this reaper is
+    the backstop that eventually corrects the audit record itself, on a
+    longer, more conservative timer so it never races a merely slow (but
+    still alive) run.
+
+    Takes an AsyncSession and COMMITS it: callers hand it a session they own
+    (see _reap_stale_running_runs_on_own_session, the only production call
+    path) rather than one carrying uncommitted work of their own.
+
+    Mirrors reservations' PENDING_PROVISION timeout backstop (issue #276,
+    services/reservations/app/services/reservation_service.py's
+    _claim_provision_transition): a single conditional
+    UPDATE ... WHERE status = 'running' AND started_at < cutoff is a
+    compare-and-swap, so a run whose finally block finalizes it (success,
+    partial, aborted, or a genuine failure) between this function's cutoff
+    computation and its UPDATE keeps that legitimate outcome, since the
+    UPDATE simply matches zero rows for it. Returns the number of rows
+    reaped.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=effective_ldap_sync_run_stale_seconds())
+    result = await db.execute(
+        update(LdapSyncRun)
+        .where(
+            LdapSyncRun.status == "running",
+            LdapSyncRun.started_at < cutoff,
+        )
+        .values(
+            status="failed",
+            error=STALE_RUN_ERROR,
+            finished_at=datetime.now(timezone.utc),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    reaped = result.rowcount or 0
+    if reaped:
+        logger.warning(
+            "Reaped %d stale ldap_sync_runs row(s) stuck in running",
+            reaped,
+            extra={"action": "ldap_sync_stale_run_reaped", "count": reaped},
+        )
+    return reaped
+
+
+# Session factory the reaper opens its OWN session from. None means the
+# application factory (database.AsyncSessionLocal), resolved at CALL time
+# rather than captured at import, so a caller that rebinds
+# database.AsyncSessionLocal (the live-LDAP loop test does exactly that) is
+# still followed. Tests that build a private engine point this at that
+# engine's sessionmaker instead, via the use_reap_session_factory fixture
+# in tests/conftest.py: without it the reap looks at a database whose
+# ldap_sync_runs table does not exist, and the corpse it is supposed to flip
+# is invisible to it.
+_reap_session_factory: async_sessionmaker[AsyncSession] | None = None
+
+
+def reap_session_factory() -> async_sessionmaker[AsyncSession]:
+    """The sessionmaker the reaper's own session comes from."""
+    return _reap_session_factory or database.AsyncSessionLocal
+
+
+async def _reap_stale_running_runs_on_own_session() -> int:
+    """Best-effort reap on a FRESH session, never the caller's.
+
+    run_sync takes the caller's session (a request session, or the interval
+    loop's tick session) and hands it to create_run and execute_run, which
+    own its transaction boundaries. The reap ends in a commit, so running it
+    on that same session would commit whatever the caller had pending before
+    the run row even exists, and its UPDATE ... synchronize_session=False
+    would leave any LdapSyncRun the caller already had loaded stale in that
+    session's identity map. A separate session keeps the reap's commit to
+    the reap, matching how _run_in_background and the retention prune each
+    take their own session from the same factory.
+
+    NEVER fails the sync run that called it: the reaper is housekeeping, so
+    every failure is logged and swallowed. The try deliberately wraps the
+    WHOLE async with, not just the reap call inside it, so a factory that
+    raises on open and a session whose __aexit__ raises on close are covered
+    too; with the try inside the block, a raising teardown would escape into
+    run_sync and take a healthy sync run down with it.
+    """
+    try:
+        factory = reap_session_factory()
+        async with factory() as session:
+            return await reap_stale_running_runs(session)
+    except Exception:
+        logger.exception(
+            "LDAP sync stale-run reap failed",
+            extra={"action": "ldap_sync_stale_run_reap_failed"},
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Run serialization (S1). One invariant, ONE implementation: a run is a run
 # whether started from the router's sync-now endpoint, called directly
 # (run_sync, used by the live tests and any script), or the phase 5 interval
@@ -1314,8 +1446,17 @@ async def start_background_run(trigger: str) -> uuid.UUID:
     Raises SyncBusyError (never an HTTP code; that mapping is the router's
     job) when the slot is already held, either in this process or (fail-safe
     fallback for the router) on another replica.
+
+    Also reaps stale "running" corpses (issue #528), best-effort, INSIDE the
+    slot and before creating this run's row: this is the router's actual
+    sync-now entry point, so a sync-now-only deployment (never running the
+    phase 5 interval loop) still gets corpses reaped on every manual
+    trigger. Inside the slot, not before it, so a call that ends in
+    SyncBusyError reaps nothing: that path is precisely when another run is
+    alive and its row must not be touched.
     """
     async with _SyncSlot() as slot:
+        await _reap_stale_running_runs_on_own_session()
         async with database.AsyncSessionLocal() as session:
             run = await create_run(session, trigger)
             run_id = run.id
@@ -1334,7 +1475,20 @@ async def run_sync(db: AsyncSession, *, trigger: str = "manual") -> LdapSyncRun:
     obvious direct-call API (used by the live tests and any script) is
     serialized exactly like the router's sync-now endpoint. On SQLite the
     advisory-lock layer is dialect-gated out, so tests exercise only the
-    uncontended asyncio-lock layer and behave exactly as before."""
+    uncontended asyncio-lock layer and behave exactly as before.
+
+    Also reaps stale "running" corpses (issue #528) at the start of every
+    run, best-effort and on its own session
+    (_reap_stale_running_runs_on_own_session), so this is the single reap
+    cadence for both the interval loop's ticks and sync-now. It runs INSIDE
+    the slot: outside it, a call about to raise SyncBusyError would still
+    have fired a table-wide UPDATE at the exact moment a concurrent run is
+    alive, and it would have committed the caller's session as a side
+    effect before the run row existed. A reap failure is logged and
+    swallowed by _reap_stale_running_runs_on_own_session itself, never
+    allowed to fail this sync run.
+    """
     async with _SyncSlot():
+        await _reap_stale_running_runs_on_own_session()
         run = await create_run(db, trigger)
         return await execute_run(db, run)
