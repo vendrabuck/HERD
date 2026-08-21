@@ -22,9 +22,18 @@ way the reaper could damage live audit state rather than repair dead state:
   SyncBusyError (the one moment another run is provably alive) reaps
   nothing.
 
+Two tests then drive the WHOLE path, one per production entry point
+(run_sync and start_background_run): a corpse seeded in the same database
+the reaper will open, the real entry point called with nothing about the
+reaper stubbed, and the corpse asserted flipped afterwards. They run against
+app.database, the DEFAULT session factory, precisely because that default is
+what production depends on: unlike the other LDAP sync test files, this one
+installs NO module-wide use_reap_session_factory override (only two isolated
+tests below opt into one), so a broken default cannot hide behind it here.
+
 Follows test_ldap_sync_service.py's engine/session fixture pattern (a
 dedicated in-memory SQLite engine, autouse create_all/drop_all, a plain `db`
-fixture yielding one session).
+fixture yielding one session) for everything that calls the reaper directly.
 """
 
 import asyncio
@@ -76,6 +85,20 @@ def stale_seconds(monkeypatch):
     monkeypatch.setattr(settings, "ldap_sync_interval_seconds", INTERVAL_SECONDS, raising=False)
     monkeypatch.setattr(settings, "ldap_sync_run_stale_seconds", STALE_SECONDS, raising=False)
     return STALE_SECONDS
+
+
+def _records(caplog, logger_name: str, action: str) -> list[logging.LogRecord]:
+    """Caplog records from ONE logger carrying ONE structured action.
+
+    Filtering on the `extra` attribute alone would AttributeError the moment
+    any other library logs a record during the block, and filtering on the
+    logger alone would pick up unrelated records from the same module: both
+    are read for attributes (.count, .floor_seconds) that only these records
+    carry, so the filter has to be the narrow one.
+    """
+    return [
+        r for r in caplog.records if r.name == logger_name and getattr(r, "action", None) == action
+    ]
 
 
 def _now() -> datetime:
@@ -178,10 +201,12 @@ async def test_multiple_stale_rows_are_all_reaped_in_one_pass(db, caplog):
         assert row.finished_at is not None
     assert (await _fetch(db, fresh_id)).status == "running"
 
-    reaped_records = [r for r in caplog.records if r.message.startswith("Reaped")]
+    reaped_records = _records(
+        caplog, "app.services.ldap_sync_service", "ldap_sync_stale_run_reaped"
+    )
     assert len(reaped_records) == 1
     assert reaped_records[0].count == 3
-    assert reaped_records[0].action == "ldap_sync_stale_run_reaped"
+    assert reaped_records[0].getMessage().startswith("Reaped")
 
 
 @pytest.mark.asyncio
@@ -243,8 +268,8 @@ async def test_cas_leaves_a_row_a_racing_finalize_claimed_between_cutoff_and_upd
 
 
 @pytest.mark.asyncio
-async def test_best_effort_wrapper_swallows_a_raising_reaper(db, monkeypatch):
-    """reap_stale_running_runs_best_effort in isolation: the reaper is
+async def test_own_session_reap_swallows_a_raising_reaper(monkeypatch, use_reap_session_factory):
+    """_reap_stale_running_runs_on_own_session in isolation: the reaper is
     housekeeping, so a raise from it becomes a logged 0, never an exception
     its caller (a sync run) has to survive."""
 
@@ -252,9 +277,69 @@ async def test_best_effort_wrapper_swallows_a_raising_reaper(db, monkeypatch):
         raise RuntimeError("boom: reaper machinery broke")
 
     monkeypatch.setattr(ldap_sync_service, "reap_stale_running_runs", boom)
+    use_reap_session_factory(TestSessionLocal)
 
-    result = await ldap_sync_service.reap_stale_running_runs_best_effort(db)
+    result = await ldap_sync_service._reap_stale_running_runs_on_own_session()
     assert result == 0
+
+
+def test_reap_session_factory_defaults_to_the_application_factory():
+    """The production default, asserted rather than assumed: this file's
+    end-to-end tests below seed their corpse into app.database on the strength
+    of it, and nothing in this module overrides it."""
+    from app import database
+
+    assert ldap_sync_service._reap_session_factory is None
+    assert ldap_sync_service.reap_session_factory() is database.AsyncSessionLocal
+
+
+class _TeardownRaisingSession:
+    """A session context manager that does its job and then explodes on
+    CLOSE: the shape of a connection handed back to a broken pool. Nothing
+    inside the reap fails, so only a try that wraps the whole `async with`
+    catches this."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def __aenter__(self):
+        return await self._inner.__aenter__()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self._inner.__aexit__(exc_type, exc, tb)
+        raise RuntimeError("session teardown exploded")
+
+
+@pytest.mark.asyncio
+async def test_run_sync_survives_a_reap_session_whose_teardown_raises(
+    db, use_reap_session_factory, caplog
+):
+    """The reaper's "never fails the sync run" contract covers the session's
+    own teardown, not just the UPDATE: with the try inside the `async with`,
+    a raising __aexit__ escapes into run_sync and takes a healthy sync run
+    down with it.
+
+    The reap still COMMITS before the explosion, so the corpse is flipped and
+    the run finalizes normally: exactly one swallowed-failure record, and no
+    exception out of run_sync.
+    """
+    old_started = _now() - timedelta(seconds=STALE_SECONDS * 2)
+    async with TestSessionLocal() as seed:
+        corpse_id = await _mk_run(seed, status="running", started_at=old_started)
+
+    use_reap_session_factory(lambda: _TeardownRaisingSession(TestSessionLocal()))
+
+    with caplog.at_level(logging.ERROR, logger="app.services.ldap_sync_service"):
+        run = await ldap_sync_service.run_sync(db, trigger="manual")
+
+    assert run.status in ("success", "partial")
+    assert run.finished_at is not None
+    async with TestSessionLocal() as check:
+        corpse = await _fetch(check, corpse_id)
+        assert corpse.status == "failed"
+        assert corpse.error == ldap_sync_service.STALE_RUN_ERROR
+    failures = _records(caplog, "app.services.ldap_sync_service", "ldap_sync_stale_run_reap_failed")
+    assert len(failures) == 1
 
 
 @pytest.mark.asyncio
@@ -378,6 +463,87 @@ async def test_start_background_run_on_a_busy_slot_does_not_reap(monkeypatch):
     assert calls["count"] == 0
 
 
+# ---------------------------------------------------------------------------
+# End to end, one per production entry point. Everything above stubs some
+# part of the reap to isolate a property; these two stub NOTHING about it.
+# The corpse is seeded into app.database, the entry point is the real one,
+# and the assertion is that the row came out flipped. That is the only shape
+# that proves the wiring: an entry point could call a reaper that quietly
+# looks at the wrong database and every isolated test above would still pass.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_sync_end_to_end_flips_a_corpse_in_the_default_database():
+    """run_sync, called for real against app.database (the reaper's default
+    session factory), flips a corpse that was already sitting there."""
+    from app import database
+
+    async with database.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        old_started = _now() - timedelta(seconds=STALE_SECONDS * 2)
+        async with database.AsyncSessionLocal() as session:
+            corpse_id = await _mk_run(session, status="running", started_at=old_started)
+
+        async with database.AsyncSessionLocal() as session:
+            run = await ldap_sync_service.run_sync(session, trigger="manual")
+            run_id = run.id
+            run_status = run.status
+
+        assert run_id != corpse_id
+        assert run_status in ("success", "partial")
+
+        async with database.AsyncSessionLocal() as session:
+            corpse = await _fetch(session, corpse_id)
+            assert corpse.status == "failed"
+            assert corpse.error == ldap_sync_service.STALE_RUN_ERROR
+            assert corpse.error == "run did not finalize (process died mid-run)"
+            assert corpse.finished_at is not None
+            # This run's OWN row was created after the reap and is far too
+            # young for it: the reaper must never touch the run reaping it.
+            live = await _fetch(session, run_id)
+            assert live.status == run_status
+            assert live.error != ldap_sync_service.STALE_RUN_ERROR
+    finally:
+        async with database.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.mark.asyncio
+async def test_start_background_run_end_to_end_flips_a_corpse_in_the_default_database():
+    """Same proof on the router's entry point, including its real background
+    half (awaited here so the run finalizes before the assertions)."""
+    from app import database
+
+    async with database.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        old_started = _now() - timedelta(seconds=STALE_SECONDS * 2)
+        async with database.AsyncSessionLocal() as session:
+            corpse_id = await _mk_run(session, status="running", started_at=old_started)
+
+        run_id = await ldap_sync_service.start_background_run("manual")
+        if ldap_sync_service._background_tasks:
+            await asyncio.gather(*list(ldap_sync_service._background_tasks))
+
+        assert run_id != corpse_id
+        assert not ldap_sync_service._sync_lock.locked()
+
+        async with database.AsyncSessionLocal() as session:
+            corpse = await _fetch(session, corpse_id)
+            assert corpse.status == "failed"
+            assert corpse.error == ldap_sync_service.STALE_RUN_ERROR
+            assert corpse.error == "run did not finalize (process died mid-run)"
+            assert corpse.finished_at is not None
+            live = await _fetch(session, run_id)
+            assert live.status in ("success", "partial")
+            assert live.error != ldap_sync_service.STALE_RUN_ERROR
+    finally:
+        async with database.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+
+
 # --- the effective-threshold clamp (config.effective_ldap_sync_run_stale_seconds) ---
 
 
@@ -400,7 +566,7 @@ def test_effective_stale_seconds_clamps_below_the_absolute_floor_and_warns(monke
 
     # The interval clamps to its own 60s floor first, so 2x it is 120.
     assert result == 120
-    clamp_records = [r for r in caplog.records if r.action == "ldap_sync_run_stale_seconds_clamped"]
+    clamp_records = _records(caplog, "app.config", "ldap_sync_run_stale_seconds_clamped")
     assert len(clamp_records) == 1
     assert clamp_records[0].configured_seconds == 0
     assert clamp_records[0].floor_seconds == 120
@@ -417,7 +583,8 @@ def test_effective_stale_seconds_clamps_a_value_under_twice_the_interval(monkeyp
         result = effective_ldap_sync_run_stale_seconds()
 
     assert result == 7200
-    assert [r.floor_seconds for r in caplog.records if r.name == "app.config"] == [7200]
+    clamp_records = _records(caplog, "app.config", "ldap_sync_run_stale_seconds_clamped")
+    assert [r.floor_seconds for r in clamp_records] == [7200]
 
 
 def test_production_default_stale_seconds_is_twice_the_default_interval():

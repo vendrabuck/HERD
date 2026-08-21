@@ -5,10 +5,12 @@ from herd_common.base_settings import HerdBaseSettings
 
 logger = logging.getLogger(__name__)
 
-# Production floor for the LDAP sync interval, shared by the interval loop's
-# clamp (app/tasks/ldap_sync_loop.py's effective_interval_seconds, which
-# aliases this constant) and the stale-run clamp below, so the two can never
-# drift apart. Defined HERE rather than imported from the loop because
+# Production floor for the LDAP sync interval. Both clamps that need it live
+# in this module (effective_ldap_sync_interval_seconds and
+# effective_ldap_sync_run_stale_seconds, which floors at twice the effective
+# interval), so there is ONE implementation of the interval clamp and the two
+# cannot drift; app/tasks/ldap_sync_loop.py's effective_interval_seconds is a
+# thin delegate. They live HERE rather than in the loop because
 # app.tasks.ldap_sync_loop imports app.services.ldap_sync_service, which
 # imports this module: importing the other way would be a cycle.
 MIN_LDAP_SYNC_INTERVAL_SECONDS = 60
@@ -101,6 +103,45 @@ class Settings(HerdBaseSettings):
 settings = Settings()
 
 
+def effective_ldap_sync_interval_seconds(raw: int, *, warn: bool = True) -> int:
+    """Clamp a configured LDAP sync interval to a sane floor.
+
+    A misconfigured ldap_sync_interval_seconds (0, a typo like 3, or any
+    value well under a minute) must not turn the interval loop into a
+    directory-hammering busy loop. Deliberately NOT a pydantic ge= validator
+    on the setting itself: a bad tuning knob must never prevent auth from
+    booting, since login availability outranks strictness here. Clamping
+    (and logging that it happened) keeps the service up with a safe interval
+    instead.
+
+    The single implementation of that clamp. Two callers reach it:
+    app.tasks.ldap_sync_loop.effective_interval_seconds (which delegates
+    here, so the production loop, main.py's lifespan, and the status
+    endpoint keep their existing entry point) and
+    effective_ldap_sync_run_stale_seconds below, whose floor is twice the
+    EFFECTIVE interval and so must clamp the interval exactly the same way.
+    That second caller passes warn=False: it runs on EVERY sync run (the
+    reaper reads its threshold there), so warning from it would repeat a
+    misconfiguration the loop's own call already logged at startup, once per
+    run, forever.
+    """
+    if raw < MIN_LDAP_SYNC_INTERVAL_SECONDS:
+        if not warn:
+            return MIN_LDAP_SYNC_INTERVAL_SECONDS
+        logger.warning(
+            "ldap_sync_interval_seconds=%s is below the %ds floor; clamping",
+            raw,
+            MIN_LDAP_SYNC_INTERVAL_SECONDS,
+            extra={
+                "action": "ldap_sync_interval_clamped",
+                "configured_seconds": raw,
+                "floor_seconds": MIN_LDAP_SYNC_INTERVAL_SECONDS,
+            },
+        )
+        return MIN_LDAP_SYNC_INTERVAL_SECONDS
+    return raw
+
+
 def effective_ldap_sync_run_stale_seconds() -> int:
     """Clamp ldap_sync_run_stale_seconds to a safe floor before the stale-run
     reaper uses it (issue #528).
@@ -117,20 +158,28 @@ def effective_ldap_sync_run_stale_seconds() -> int:
       real outcome only if the run finalizes FIRST, and this floor is what
       makes that the overwhelmingly likely order.
 
-    Mirrors ldap_sync_loop.effective_interval_seconds deliberately, including
-    its reasoning for clamping instead of validating: a bad tuning value must
-    never prevent auth from booting, so it is corrected (with a warning) at
-    the point of use rather than rejected by a pydantic ge= constraint.
+    The effective interval comes from effective_ldap_sync_interval_seconds
+    above, the same function the production loop clamps with, so this floor
+    is computed against the interval the loop will ACTUALLY use rather than
+    against a re-derived copy of it.
+
+    Shares that function's reasoning for clamping instead of validating: a
+    bad tuning value must never prevent auth from booting, so it is
+    corrected (with a warning) at the point of use rather than rejected by a
+    pydantic ge= constraint.
     """
-    effective_interval = max(settings.ldap_sync_interval_seconds, MIN_LDAP_SYNC_INTERVAL_SECONDS)
+    effective_interval = effective_ldap_sync_interval_seconds(
+        settings.ldap_sync_interval_seconds, warn=False
+    )
     floor = max(MIN_LDAP_SYNC_INTERVAL_SECONDS, 2 * effective_interval)
     raw = settings.ldap_sync_run_stale_seconds
     if raw < floor:
         logger.warning(
             "ldap_sync_run_stale_seconds=%s is below the %ds floor "
-            "(max of 60s and twice the %ds effective sync interval); clamping",
+            "(max of %ds and twice the %ds effective sync interval); clamping",
             raw,
             floor,
+            MIN_LDAP_SYNC_INTERVAL_SECONDS,
             effective_interval,
             extra={
                 "action": "ldap_sync_run_stale_seconds_clamped",

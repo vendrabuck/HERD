@@ -495,7 +495,9 @@ class _FakeGroupSyncConnection:
 
 
 @pytest.mark.asyncio
-async def test_run_with_mapping_and_sweep_shares_one_connection(monkeypatch):
+async def test_run_with_mapping_and_sweep_shares_one_connection(
+    monkeypatch, use_reap_session_factory
+):
     from app.database import Base
     from app.models.group import UserGroup
     from app.models.ldap_group_mapping import LdapGroupMapping
@@ -515,6 +517,13 @@ async def test_run_with_mapping_and_sweep_shares_one_connection(monkeypatch):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    # run_sync opens the run with the stale-run reap (issue #528), which
+    # deliberately runs on its OWN session; by default that comes from
+    # app.database, a different in-memory database than the engine above, so
+    # the reap would find no ldap_sync_runs table. Point it at this test's
+    # engine. What this test pins is the directory CONNECTION count, which
+    # the reap never touches.
+    use_reap_session_factory(session_factory)
 
     async with session_factory() as db:
         group = UserGroup(name="Engineering")
@@ -532,18 +541,6 @@ async def test_run_with_mapping_and_sweep_shares_one_connection(monkeypatch):
         member_entries = {_member_dn(1): _member_entry(1)}
         conn_fake = _FakeGroupSyncConnection(group_entries, member_entries, ["user1@company.local"])
         constructed = _patch_connection_factory(monkeypatch, [conn_fake])
-
-        # run_sync opens the run with the stale-run reap (issue #528), which
-        # deliberately runs on its OWN session from app.database. That points
-        # at a different in-memory SQLite database than the engine built
-        # above, so the reap would find no ldap_sync_runs table; it is
-        # best-effort and swallows that, but stubbing it keeps a red-herring
-        # traceback out of this test's captured log. What this test pins is
-        # the directory CONNECTION count, which the reap never touches.
-        async def _no_reap() -> int:
-            return 0
-
-        monkeypatch.setattr(ldap_sync_service, "_reap_stale_running_runs_on_own_session", _no_reap)
 
         run = await ldap_sync_service.run_sync(db)
 

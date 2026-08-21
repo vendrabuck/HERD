@@ -36,6 +36,15 @@ _GROUP_DN = "cn=herd-eng,ou=groups,dc=company,dc=local"
 
 
 @pytest.fixture(autouse=True)
+def _reap_on_this_modules_engine(use_reap_session_factory):
+    """run_sync reaps stale runs on its OWN session (issue #528), which by
+    default comes from app.database, not this module's private engine. Point
+    it here so the reap sees the rows these tests create instead of a
+    database with no ldap_sync_runs table at all."""
+    use_reap_session_factory(TestSessionLocal)
+
+
+@pytest.fixture(autouse=True)
 async def setup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

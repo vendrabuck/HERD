@@ -184,10 +184,15 @@ async def test_bad_service_account_returns_none(monkeypatch, ldap_settings):
 
 
 @pytest.fixture
-async def db_engine():
+async def db_engine(use_reap_session_factory):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # run_sync reaps stale runs on its OWN session (issue #528), which by
+    # default comes from app.database rather than this private engine. Point
+    # it here so the reap sees the rows these tests create instead of a
+    # database with no ldap_sync_runs table at all.
+    use_reap_session_factory(async_sessionmaker(engine, expire_on_commit=False))
     yield engine
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)

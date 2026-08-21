@@ -275,6 +275,23 @@ CONFIG_SCHEMA = [
         ),
     },
     {
+        "key": "LDAP_SYNC_RUN_STALE_SECONDS",
+        "label": "Stale Run Threshold (seconds)",
+        "type": "number",
+        "required": False,
+        "group": "LDAP",
+        "secret": False,
+        "default": 7200,
+        "description": (
+            "Seconds an ldap_sync_runs row may sit at status running before the "
+            "stale-run reaper flips it to failed, the backstop for a hard process "
+            "death mid-run. Floored at the point of use (with a warning, never a "
+            "boot failure) to the larger of 60 seconds and TWICE the effective "
+            "sync interval, so a value at or below the interval cannot fail a run "
+            "that is merely slow."
+        ),
+    },
+    {
         "key": "LDAP_SYNC_DEACTIVATION_ENABLED",
         "label": "Enable Deactivation Sweep",
         "type": "dropdown",

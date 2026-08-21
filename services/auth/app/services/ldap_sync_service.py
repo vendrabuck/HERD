@@ -60,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 from herd_common import advisory_lock
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from app import database
 from app.config import effective_ldap_sync_run_stale_seconds, settings
@@ -1221,19 +1221,21 @@ async def reap_stale_running_runs(db: AsyncSession) -> int:
     return reaped
 
 
-async def reap_stale_running_runs_best_effort(db: AsyncSession) -> int:
-    """reap_stale_running_runs, but a failure is logged and swallowed rather
-    than propagated: the reaper is housekeeping, and its caller (the start of
-    every sync run, interval or sync-now) must never let a reap failure fail
-    the sync run itself."""
-    try:
-        return await reap_stale_running_runs(db)
-    except Exception:
-        logger.exception(
-            "LDAP sync stale-run reap failed",
-            extra={"action": "ldap_sync_stale_run_reap_failed"},
-        )
-        return 0
+# Session factory the reaper opens its OWN session from. None means the
+# application factory (database.AsyncSessionLocal), resolved at CALL time
+# rather than captured at import, so a caller that rebinds
+# database.AsyncSessionLocal (the live-LDAP loop test does exactly that) is
+# still followed. Tests that build a private engine point this at that
+# engine's sessionmaker instead, via the use_reap_session_factory fixture
+# in tests/conftest.py: without it the reap looks at a database whose
+# ldap_sync_runs table does not exist, and the corpse it is supposed to flip
+# is invisible to it.
+_reap_session_factory: async_sessionmaker[AsyncSession] | None = None
+
+
+def reap_session_factory() -> async_sessionmaker[AsyncSession]:
+    """The sessionmaker the reaper's own session comes from."""
+    return _reap_session_factory or database.AsyncSessionLocal
 
 
 async def _reap_stale_running_runs_on_own_session() -> int:
@@ -1248,9 +1250,24 @@ async def _reap_stale_running_runs_on_own_session() -> int:
     session's identity map. A separate session keeps the reap's commit to
     the reap, matching how _run_in_background and the retention prune each
     take their own session from the same factory.
+
+    NEVER fails the sync run that called it: the reaper is housekeeping, so
+    every failure is logged and swallowed. The try deliberately wraps the
+    WHOLE async with, not just the reap call inside it, so a factory that
+    raises on open and a session whose __aexit__ raises on close are covered
+    too; with the try inside the block, a raising teardown would escape into
+    run_sync and take a healthy sync run down with it.
     """
-    async with database.AsyncSessionLocal() as session:
-        return await reap_stale_running_runs_best_effort(session)
+    try:
+        factory = reap_session_factory()
+        async with factory() as session:
+            return await reap_stale_running_runs(session)
+    except Exception:
+        logger.exception(
+            "LDAP sync stale-run reap failed",
+            extra={"action": "ldap_sync_stale_run_reap_failed"},
+        )
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1468,8 +1485,8 @@ async def run_sync(db: AsyncSession, *, trigger: str = "manual") -> LdapSyncRun:
     have fired a table-wide UPDATE at the exact moment a concurrent run is
     alive, and it would have committed the caller's session as a side
     effect before the run row existed. A reap failure is logged and
-    swallowed (reap_stale_running_runs_best_effort), never allowed to fail
-    this sync run.
+    swallowed by _reap_stale_running_runs_on_own_session itself, never
+    allowed to fail this sync run.
     """
     async with _SyncSlot():
         await _reap_stale_running_runs_on_own_session()
