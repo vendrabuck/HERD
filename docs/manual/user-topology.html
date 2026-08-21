@@ -291,7 +291,7 @@
 
     <ol class="legend">
       <li><b>Port columns.</b> A free port is fully selectable; one already used, either earlier in this session or by an existing canvas edge, is grayed and tagged <code>WIRED</code>. A port with a registered physical cable is tagged <code>CABLED</code> (informational, still selectable); an uncabled one is tagged <code>no cable</code> the same way.</li>
-      <li><b>Layer.</b> Sets the default for lines you draw next; each drawn line gets its own small L1/L2/L3 pill you can change or delete independently. L2 and L3 are logical overlays; they still need a real physical path underneath to count.</li>
+      <li><b>Layer.</b> Sets the default for lines you draw next; each drawn line gets its own small L1/L2/L3 pill you can change or delete independently. L2 and L3 are logical overlays; they still need a real physical path underneath to count. The layer is recorded on the canvas as that line's intended layer; provisioning derives L2 membership and L3 routes from the resolved path itself, not from this pill.</li>
       <li><b>Connect 1:1 in order</b> pairs every remaining free port on both sides top to bottom in one click: the fast path for wiring two same-size switches straight across.</li>
       <li><b>Add N connections.</b> Adds every drawn line to the canvas at once. HERD immediately checks each one against the cabling graph and colours it; two or more connections between the same device pair collapse into one bundled edge with a count badge on the canvas.</li>
     </ol>
