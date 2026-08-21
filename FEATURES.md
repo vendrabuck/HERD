@@ -74,8 +74,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   connections between the same device pair collapse into one bundled edge on the
   canvas with a count badge and a per-connection delete. Provisioning now honors each
   line's own ports, so N connections between the same device pair provision as N
-  distinct wires; the per-line layer is still recorded on the canvas only and every
-  provisioned hop stays L1 until the layer half lands (issue #531).
+  distinct wires (issue #531). The per-line layer is a canvas annotation only, by
+  decision (ADR 0009 option C): provisioning derives L2 VLAN membership and L3 route
+  adjacency from the resolved path hops, not from the layer recorded on the line.
 - **Physical and cloud topology separation** (Shipped): physical and cloud devices
   cannot be mixed in a single topology, enforced at database, service, and UI
   layers.

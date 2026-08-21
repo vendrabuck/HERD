@@ -286,3 +286,24 @@ accepted over a free-after-delete state). create_vlan against an
 already-defined VLAN is a documented driver idempotency requirement
 (docs/DRIVERS.md). The phase 6/7 test pins asserting the absence of
 delete_vlan and create_vlan were deliberately flipped with this change.
+
+## Decision 2026-08-21: per-line canvas layer stays annotation-only (issue #531)
+
+Issue #531's ports half (PR #545) made cabling's fork-save resolver honor
+each canvas edge's own `source_port_name`/`target_port_name`, so N lines
+between the same device pair resolve as N distinct wires. The layer half
+asked whether the wiring dialog's per-line L1/L2/L3 pill (issue #517)
+should also drive `WireSpec.layer`, replacing the resolver's hardcoded
+`L1`. Decided (vendra, 2026-08-21): no. Decision 1 above already commits
+this ADR to option C, deriving L2 membership and L3 route adjacency from
+the resolved L1 path hops rather than from a layer carried on the fork
+row; carrying the canvas pill's layer into `WireSpec.layer` would filter
+those rows out of `_fetch_fork_intended_wires` (which reads only
+`layer == "L1"`) and drop them from every reconcile. The per-line layer
+therefore remains a canvas annotation: it changes how a line is drawn,
+grouped, and colored on the canvas, and nothing about what provisioning
+configures. No backend or provisioning code changed; the frontend gained
+a hover tooltip and a short dialog note stating the annotation-only
+behavior, and docs (TOPOLOGY_EDITOR.md, the manual, FEATURES.md,
+PLANNED_FEATURES.md) were corrected to stop describing it as a pending
+gap.

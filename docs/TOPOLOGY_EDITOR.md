@@ -47,7 +47,9 @@ connection.
    click a free port then click its counterpart (the click-to-connect path works
    identically, useful without a mouse). Each drawn line gets a small `L1`/`L2`/`L3` pill
    at its midpoint; click the pill to change that line's layer or delete it. A "New
-   lines" control in the header sets the default layer for lines you draw next.
+   lines" control in the header sets the default layer for lines you draw next. The
+   layer is recorded on the canvas as the line's intended layer; provisioning derives
+   L2 and L3 from the resolved path instead of reading it (see below).
 2. Ports already used, either by an earlier line in this session or by an existing canvas
    edge, are grayed out and tagged `WIRED`; clicking one explains why instead of letting
    you reuse it. A port with a registered physical cable is tagged `CABLED`
@@ -64,13 +66,15 @@ as one bundled edge with a count badge (for example "3 connections"); click the 
 expand the per-connection list, which also shows each connection's own path/cabling
 status and its own delete control.
 
-**Known caveat (issue #531, ports half fixed):** provisioning now honors each line's own
-ports: cabling's fork-save resolver resolves every canvas edge against that edge's
+**Issue #531 resolution:** provisioning honors each line's own ports: cabling's
+fork-save resolver resolves every canvas edge against that edge's
 `source_port_name`/`target_port_name` when present, so N connections between the same
-device pair provision as N distinct wires, not one. The per-line **layer** is still
-recorded on the canvas only; every provisioned hop stays L1 until the layer half of
-issue #531 lands, because the execution service derives L2 membership and L3 adjacency
-from the recorded L1 hops rather than reading a layer off the fork row.
+device pair provision as N distinct wires, not one. The per-line **layer** is a canvas
+annotation only, by decision (ADR 0009 option C): every provisioned hop is recorded as
+L1, and the execution service derives L2 VLAN membership and L3 route adjacency from
+the resolved path hops rather than from a layer read off the fork row. Picking `L2` or
+`L3` for a line changes how it is drawn and grouped on the canvas; it does not change
+what provisioning configures.
 
 ### Quick connect
 

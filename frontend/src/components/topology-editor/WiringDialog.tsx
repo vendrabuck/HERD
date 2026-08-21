@@ -79,6 +79,17 @@ interface LineGeom {
 // item 2's gesture rework).
 const MOVE_THRESHOLD = 4;
 
+// Issue #531 (layer half, decided as canvas-annotation-only, ADR 0009 option
+// C): the per-line layer is recorded on the canvas edge but provisioning
+// derives L2 membership and L3 route adjacency from the resolved path hops,
+// not from this field. Surfaced as a hover tooltip on both layer controls
+// below so the annotation-only behavior is discoverable without another
+// permanent line of dialog text.
+const LAYER_TOOLTIP =
+  "Recorded on the canvas as the intended layer for this line. Provisioning derives L2 VLAN " +
+  "membership and L3 routes from the resolved path, so this selection does not change what is " +
+  "configured.";
+
 function buildVisuals(
   ports: Port[],
   cabled: Set<string>,
@@ -603,6 +614,7 @@ export function WiringDialog({
                   onChange={setNewLineLayer}
                   size="sm"
                   testIdPrefix="new-line-layer"
+                  title={LAYER_TOOLTIP}
                 />
               </div>
               <p className="text-[11px] text-gray-500">{hint}</p>
@@ -658,6 +670,7 @@ export function WiringDialog({
                           onChange={(l) => handleLayerChange(c.id, l)}
                           size="xs"
                           testIdPrefix={`line-layer-${c.id}`}
+                          title={LAYER_TOOLTIP}
                         />
                         <div className="w-px h-4 bg-gray-200 mx-0.5" />
                         <button
@@ -731,6 +744,10 @@ export function WiringDialog({
           <div className="flex-1 min-w-0">
             <p className="text-xs text-gray-500">
               Free ports: {freeCounts.source} source, {freeCounts.target} target
+            </p>
+            <p data-testid="layer-annotation-note" className="text-[11px] text-gray-500 mt-0.5">
+              Layer is recorded on the canvas per line; provisioning derives L2 and L3 from the
+              resolved path.
             </p>
             {errorMessage && <p className="text-xs text-red-600 mt-0.5">{errorMessage}</p>}
           </div>

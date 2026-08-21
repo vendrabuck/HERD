@@ -124,9 +124,10 @@
   edge per line through a shared `addEnrichedEdges` append path. Many same-pair
   edges render as one `BundledEdge` with a count badge, a render-only projection
   over N distinct stored edges (member selection, per-member delete, and
-  read-gating all fan out to the underlying edges). A known caveat (issue #531) is
-  that cabling's fork-save resolver still collapses N same-pair edges to one path on
-  every provisioning path; the dialog shows a provisioning notice when N > 1.
+  read-gating all fan out to the underlying edges). Issue #531 (both halves now
+  closed, see below) originally noted that cabling's fork-save resolver collapsed N
+  same-pair edges to one path on every provisioning path; the dialog showed a
+  provisioning notice when N > 1 until the ports half shipped.
 - Admin multi-connect dialog (PR #538): `MultiConnectDialog.tsx` brings the same
   staged-lines interaction to the admin Connections page, committing through
   `POST /connections/bulk`, and is the default create surface on
@@ -148,6 +149,20 @@
 - Dead-code removal (issue #489, PR #490): the unused
   `components/topology-editor/TopologyEditor.tsx` was deleted;
   `pages/TopologyEditorPage.tsx` is and remains the live editor.
+- Issue #531 closed, both halves (PR #545 ports, this PR layer): the ports half made
+  cabling's `resolve_canvas_wiring` resolve each canvas edge against its own
+  `data.source_port_name`/`data.target_port_name` instead of only the device pair, so
+  N same-pair lines from `WiringDialog.tsx` provision as N distinct wires; edges with
+  no port names keep the old device-pair behavior. The layer half was decided as
+  canvas-annotation-only rather than implemented: ADR 0009 option C already commits
+  execution to deriving L2 VLAN membership and L3 route adjacency from the resolved
+  L1 path hops, and `_fetch_fork_intended_wires` filters fork rows to `layer == "L1"`,
+  so carrying the dialog's per-line layer into `WireSpec.layer` would drop those rows
+  from every reconcile; no backend or provisioning code changed. `WiringDialog.tsx`
+  gained a hover tooltip on both layer controls and a short note above the confirm
+  button stating that the layer is recorded on the canvas and provisioning derives
+  L2/L3 from the resolved path; `TOPOLOGY_EDITOR.md`, the manual, `FEATURES.md`, and
+  `PLANNED_FEATURES.md` were corrected to stop describing it as a pending gap.
 
 #### Developer platform and CI
 

@@ -15,6 +15,11 @@ export interface LayerSegmentedControlProps {
   onChange: (layer: EdgeLayerType) => void;
   size?: LayerSegmentedControlSize;
   testIdPrefix?: string;
+  // Optional hover tooltip on the whole control (issue #531 layer half): the
+  // caller decides whether this instance needs the canvas-annotation-only
+  // caveat spelled out. Undefined omits the title attribute entirely, so
+  // existing callers are unaffected.
+  title?: string;
 }
 
 /**
@@ -28,9 +33,10 @@ export function LayerSegmentedControl({
   onChange,
   size = "sm",
   testIdPrefix,
+  title,
 }: LayerSegmentedControlProps) {
   return (
-    <div className="flex gap-1">
+    <div className="flex gap-1" title={title}>
       {LAYER_OPTIONS.map((l) => (
         <button
           key={l}
