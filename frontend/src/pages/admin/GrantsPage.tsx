@@ -1,7 +1,5 @@
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState } from "react";
 import toast from "react-hot-toast";
-import { useAuthStore } from "@/stores/authStore";
 import { useGrants, useCreateGrant, useDeleteGrant } from "@/api/acl";
 import { useGroups } from "@/api/groups";
 import { Modal } from "@/components/ui/Modal";
@@ -16,10 +14,6 @@ const PERMISSIONS: Grant["permission"][] = ["view", "manage"];
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 export function GrantsPage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
-
   const [skip, setSkip] = useState(0);
   const limit = 50;
   const [filterGroupId, setFilterGroupId] = useState("");
@@ -60,14 +54,6 @@ export function GrantsPage() {
   const [newResourceType, setNewResourceType] = useState<Grant["resource_type"]>("device");
   const [newResourceId, setNewResourceId] = useState("");
   const [newPermission, setNewPermission] = useState<Grant["permission"]>("view");
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
-  if (!user || !isAdmin) return null;
 
   const closeCreateModal = () => {
     setShowCreate(false);

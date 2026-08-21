@@ -1,22 +1,8 @@
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { useAuthStore } from "@/stores/authStore";
+import { useState } from "react";
 import { CreateDeviceForm } from "@/components/admin/CreateDeviceForm";
 
 export function AddDevicePage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
   const [showAddDevice, setShowAddDevice] = useState(false);
-
-  useEffect(() => {
-    if (user && user.role !== "admin" && user.role !== "superadmin") {
-      navigate("/topology");
-    }
-  }, [user, navigate]);
-
-  if (!user || (user.role !== "admin" && user.role !== "superadmin")) {
-    return null;
-  }
 
   return (
     <div className="h-full overflow-y-auto">

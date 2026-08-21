@@ -16,11 +16,11 @@ vi.mock("react-hot-toast", () => ({
   default: { success: (m: string) => toastSuccess(m), error: (m: string) => toastError(m) },
 }));
 
-// The page is admin-only and navigates non-admins to /topology. Pin an admin
-// user so the page body renders. apiClient's request interceptor reads
-// useAuthStore.getState().accessToken on every call, so the mock must expose
-// getState as well as the selector hook, or every axios request throws and no
-// network calls ever reach MSW.
+// The page is reached only through AdminGuard (App.tsx), so admin-ness is
+// not this page's concern; pin an admin user anyway since apiClient's
+// request interceptor reads useAuthStore.getState().accessToken on every
+// call, so the mock must expose getState as well as the selector hook, or
+// every axios request throws and no network calls ever reach MSW.
 const AUTH_STATE = {
   user: { id: "1", role: "admin", username: "admin", email: "a@b.c" },
   accessToken: "t",

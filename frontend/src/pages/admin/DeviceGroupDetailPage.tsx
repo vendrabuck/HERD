@@ -1,7 +1,6 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
-import { useAuthStore } from "@/stores/authStore";
 import {
   useDeviceGroup,
   useCreateDeviceGroup,
@@ -22,7 +21,6 @@ import type { TransferItem } from "@/components/ui/TransferList";
 export function DeviceGroupDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const user = useAuthStore((s) => s.user);
   const isNew = !id;
 
   const { data: group, isLoading } = useDeviceGroup(id);
@@ -42,14 +40,6 @@ export function DeviceGroupDetailPage() {
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [showPermissionModal, setShowPermissionModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
 
   // Adjusting state during render
   if (group && group.id !== trackedGroupId) {
@@ -115,7 +105,6 @@ export function DeviceGroupDetailPage() {
     [group?.user_groups, allUserGroups]
   );
 
-  if (!user || !isAdmin) return null;
   if (!isNew && isLoading) {
     return (
       <div className="h-full overflow-y-auto">

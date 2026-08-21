@@ -1,7 +1,5 @@
-import { Fragment, useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Fragment, useState } from "react";
 import toast from "react-hot-toast";
-import { useAuthStore } from "@/stores/authStore";
 import {
   RUN_IN_PROGRESS_DETAIL,
   RUN_IN_PROGRESS_REPLICA_DETAIL,
@@ -43,10 +41,6 @@ const STALE_RUNNING_TITLE =
 const limit = 50;
 
 export function LdapSyncPage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
-
   const { data: status, isLoading: statusLoading, isError: statusError, refetch: refetchStatus } =
     useLdapSyncStatus();
   // Fail-closed default: create/sync-now stay disabled unless the status
@@ -91,12 +85,6 @@ export function LdapSyncPage() {
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
   const startSyncRun = useStartSyncRun();
 
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
   // Pagination clamp: if the page we're viewing just emptied out from under
   // us (a delete removed the last row on this page) while earlier pages
   // still hold rows, land back on the last page that actually has data
@@ -116,8 +104,6 @@ export function LdapSyncPage() {
       setMappingsSkip(lastPageSkip);
     }
   }
-
-  if (!user || !isAdmin) return null;
 
   const closeCreateModal = () => {
     setShowCreate(false);
