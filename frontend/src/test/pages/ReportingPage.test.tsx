@@ -10,18 +10,14 @@ beforeAll(() => {
   HTMLDialogElement.prototype.close = vi.fn();
 });
 
-// Auth role drives the admin gate on this page. Default to an admin; individual
-// tests override the role to exercise the non-admin redirect branch.
-let mockRole: "admin" | "superadmin" | "user" = "admin";
-const mockNavigate = vi.fn();
-
-// The page reads the store via the hook selector, while the shared axios client
-// reaches for the static useAuthStore.getState() in its request interceptor to
-// attach the bearer token. Both code paths must see the same admin snapshot, so
-// the mock exposes a callable selector hook plus a getState method.
+// The page itself no longer reads the auth store (the admin gate now lives
+// in App.tsx's AdminGuard route wrapper; see AdminGuard.test.tsx), but the
+// shared axios client still reaches for the static useAuthStore.getState()
+// in its request interceptor to attach the bearer token, so an admin
+// snapshot is still needed here.
 function authSnapshot() {
   return {
-    user: { id: "1", role: mockRole, username: "admin", email: "a@b.c" },
+    user: { id: "1", role: "admin", username: "admin", email: "a@b.c" },
     accessToken: "test-token",
     refreshToken: "test-refresh",
     setTokens: vi.fn(),
@@ -33,12 +29,6 @@ vi.mock("@/stores/authStore", () => {
   const useAuthStore = (sel: (s: unknown) => unknown) => sel(authSnapshot());
   useAuthStore.getState = () => authSnapshot();
   return { useAuthStore };
-});
-
-vi.mock("react-router-dom", async () => {
-  const actual =
-    await vi.importActual<typeof import("react-router-dom")>("react-router-dom");
-  return { ...actual, useNavigate: () => mockNavigate };
 });
 
 import { server } from "../mocks/server";
@@ -135,8 +125,6 @@ function mockDevices() {
 }
 
 beforeEach(() => {
-  mockRole = "admin";
-  mockNavigate.mockReset();
   mockDevices();
 });
 
@@ -145,12 +133,9 @@ afterEach(() => {
 });
 
 describe("ReportingPage", () => {
-  it("redirects a non-admin user away and renders nothing", async () => {
-    mockRole = "user";
-    const { container } = renderWithProviders(<ReportingPage />);
-    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith("/topology"));
-    expect(container).toBeEmptyDOMElement();
-  });
+  // Non-admin redirect coverage moved to AdminGuard.test.tsx: the guard now
+  // lives in App.tsx's route wrapper (issue #527, issue #548), and this page
+  // no longer performs its own redirect check.
 
   it("renders the heading and range selector for an admin", async () => {
     server.use(
