@@ -25,7 +25,7 @@
     "react-router-dom": "^7.18.2",
     "react-window": "^2.3.0",
     "tailwind-merge": "^3.6.0",
-    "zustand": "^5.0.14"
+    "zustand": "^5.0.15"
   },
   "overrides": {
     "@babel/core": "^7.29.6",
