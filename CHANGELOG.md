@@ -169,7 +169,7 @@
 - `AdminGuard` route wrapper (issue #527, PR #547; issue #548, PR #550): the eleven
   separate per-page admin guards under `pages/admin/` plus `ReportingPage`'s own
   guard are replaced by one exported `AdminGuard` in `App.tsx` wrapping a pathless
-  parent route: all 13 admin-gated routes (`/reporting` plus the 12 `/admin/*`
+  parent route: all 14 admin-gated routes (`/reporting` plus the 13 `/admin/*`
   routes) now redirect a non-admin to `/topology` through the single component.
   Behavior is unchanged; this is a structural consolidation, not a feature or
   permission change.
