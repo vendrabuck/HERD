@@ -66,6 +66,23 @@
   replacing the old external `HERD_LDAP_DIR`/home-directory setup; `make master` and
   `make everything` gained a `_gate-ldap-tests` phase that runs the live-LDAP auth
   suite as a hard requirement.
+- Stale-run reaper for `ldap_sync_runs` (issue #528, PR #546): a hard process death
+  mid-run (OOM kill, container crash, power loss) never reaches the run's finalize
+  step, leaving the row stuck at `running` forever, since the retention prune
+  deliberately never touches a `running` row. `reap_stale_running_runs` flips a
+  `running` row past `LDAP_SYNC_RUN_STALE_SECONDS` (default `7200`) to `failed`
+  with `error="run did not finalize (process died mid-run)"`, via a compare-and-swap
+  `UPDATE ... WHERE status = 'running'` so a run that finalizes between the cutoff
+  computation and the update keeps its real outcome. It runs at the start of every
+  sync run, inside the run-serialization slot (never before it, so a call about to
+  raise `SyncBusyError` can never reach a live run's row), covering both the
+  interval loop and sync-now. The threshold is read through the new
+  `effective_ldap_sync_run_stale_seconds()`, which clamps to the larger of 60
+  seconds and twice the effective sync interval (with a warning, never a boot
+  failure), so a tuning value at or below the interval cannot fail a run that is
+  merely slow. The admin UI's 30-minute stale-row display (PR #526) is an
+  independent, shorter client-side hint; this reaper is what corrects the audit
+  record itself.
 
 #### Reconcile and provisioning
 
@@ -149,6 +166,13 @@
 - Dead-code removal (issue #489, PR #490): the unused
   `components/topology-editor/TopologyEditor.tsx` was deleted;
   `pages/TopologyEditorPage.tsx` is and remains the live editor.
+- `AdminGuard` route wrapper (issue #527, PR #547; issue #548, PR #550): the eleven
+  separate per-page admin guards under `pages/admin/` plus `ReportingPage`'s own
+  guard are replaced by one exported `AdminGuard` in `App.tsx` wrapping a pathless
+  parent route: all 13 admin-gated routes (`/reporting` plus the 12 `/admin/*`
+  routes) now redirect a non-admin to `/topology` through the single component.
+  Behavior is unchanged; this is a structural consolidation, not a feature or
+  permission change.
 - Issue #531 closed, both halves (PR #545 ports, this PR layer): the ports half made
   cabling's `resolve_canvas_wiring` resolve each canvas edge against its own
   `data.source_port_name`/`data.target_port_name` instead of only the device pair, so
