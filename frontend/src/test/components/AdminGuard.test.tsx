@@ -14,7 +14,7 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
-import { AdminGuard } from "@/App";
+import { AdminGuard } from "@/components/guards";
 import { useAuthStore } from "@/stores/authStore";
 
 function renderGuard() {
@@ -83,7 +83,7 @@ describe("AdminGuard", () => {
   });
 
   // Issue #548: /reporting sits outside pages/admin/ but is routed through
-  // the same AdminGuard-wrapped route group in App.tsx as the admin pages.
+  // the same AdminGuard route group in routes.tsx as the admin pages.
   // This mirrors that exact nesting (an AdminGuard-wrapped pathless Route
   // with an Outlet, holding a /reporting child) rather than re-rendering the
   // full App tree: App's default export hardcodes BrowserRouter (so it

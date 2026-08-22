@@ -168,8 +168,9 @@
   `pages/TopologyEditorPage.tsx` is and remains the live editor.
 - `AdminGuard` route wrapper (issue #527, PR #547; issue #548, PR #550): the eleven
   separate per-page admin guards under `pages/admin/` plus `ReportingPage`'s own
-  guard are replaced by one exported `AdminGuard` in `App.tsx` wrapping a pathless
-  parent route: all 14 admin-gated routes (`/reporting` plus the 13 `/admin/*`
+  guard are replaced by one exported `AdminGuard`, at the time in `App.tsx`
+  (moved to `components/guards.tsx` by issue #551, see below), wrapping a
+  pathless parent route: all 14 admin-gated routes (`/reporting` plus the 13 `/admin/*`
   routes) now redirect a non-admin to `/topology` through the single component.
   Behavior is unchanged; this is a structural consolidation, not a feature or
   permission change.
@@ -187,6 +188,22 @@
   button stating that the layer is recorded on the canvas and provisioning derives
   L2/L3 from the resolved path; `TOPOLOGY_EDITOR.md`, the manual, `FEATURES.md`, and
   `PLANNED_FEATURES.md` were corrected to stop describing it as a pending gap.
+- Route table extracted for testability (issue #551, PR #560): `AuthGuard`, `GuestGuard`, and
+  `AdminGuard` moved out of `App.tsx` into `components/guards.tsx`, and the
+  `<Routes>` children moved into an exported `appRouteElements` constant in the new
+  `routes.tsx`, leaving `App.tsx` as just `BrowserRouter` plus `Toaster` plus
+  `ErrorBoundary` plus `<Routes>{appRouteElements}</Routes>`. A new
+  `test/routes.test.tsx` runs `createRoutesFromElements` over `appRouteElements`
+  with no rendering involved, walks the resulting tree via a subtree search (so a
+  future wrapper around a guard does not false-red the test), and pins: the exact
+  set of 14 paths (`/reporting` plus the 13 `/admin/*` routes) that carry an
+  `AdminGuard` ancestor; that every one of those paths also sits under `AuthGuard`;
+  that the route table has no duplicate paths; and that the `AdminGuard` group
+  still renders an `Outlet` for its children. This closes the gap a PR #550
+  reviewer found by mutation testing: before this change, moving a route out of
+  the `AdminGuard` group left the full vitest suite green. `AdminGuard.test.tsx`
+  still pins the guard's own redirect/render behavior; this test only pins route
+  membership and structure.
 
 #### Developer platform and CI
 

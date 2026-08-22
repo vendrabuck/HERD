@@ -191,8 +191,8 @@ describe("LdapSyncPage", () => {
   });
 
   // Non-admin redirect coverage moved to AdminGuard.test.tsx: the guard now
-  // lives in App.tsx's route wrapper (issue #527), and this page no longer
-  // performs its own redirect check.
+  // lives in the AdminGuard route group in routes.tsx (issue #527), and this
+  // page no longer performs its own redirect check.
 
   // --- Item 1: status fetch error ---
 
