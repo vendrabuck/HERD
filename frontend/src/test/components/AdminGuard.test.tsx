@@ -14,7 +14,7 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
-import { AdminGuard } from "@/App";
+import { AdminGuard } from "@/components/guards";
 import { useAuthStore } from "@/stores/authStore";
 
 function renderGuard() {
