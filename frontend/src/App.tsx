@@ -104,7 +104,6 @@ export default function App() {
           <Route path="/topology/:id" element={<TopologyEditorPage />} />
           <Route path="/reservations/calendar" element={<ReservationCalendarPage />} />
           <Route path="/reservations" element={<ReservationsPage />} />
-          <Route path="/reporting" element={<ReportingPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/admin" element={<Navigate to="/admin/add-device" replace />} />
           <Route
@@ -114,6 +113,7 @@ export default function App() {
               </AdminGuard>
             }
           >
+            <Route path="/reporting" element={<ReportingPage />} />
             <Route path="/admin/add-device" element={<AddDevicePage />} />
             <Route path="/admin/users" element={<UsersPage />} />
             <Route path="/admin/groups" element={<GroupsPage />} />

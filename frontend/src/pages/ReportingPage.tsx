@@ -1,6 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { useAuthStore } from "@/stores/authStore";
+import { useMemo, useState } from "react";
 import {
   downloadUtilizationCsv,
   useUtilizationReport,
@@ -63,16 +61,6 @@ function formatHours(h: number): string {
 }
 
 export function ReportingPage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
-
-  useEffect(() => {
-    if (user && !isAdmin) {
-      navigate("/topology");
-    }
-  }, [user, isAdmin, navigate]);
-
   const [preset, setPreset] = useState<RangePreset>("30d");
   const defaultWindow = presetWindow("30d");
   const [customStart, setCustomStart] = useState<string>(toDateInputValue(defaultWindow.start));
@@ -92,7 +80,7 @@ export function ReportingPage() {
 
   const report = useUtilizationReport(
     { start: toIso(window.start), end: toIso(window.end) },
-    Boolean(user) && isAdmin && windowValid,
+    windowValid,
   );
   const devices = useDevices();
 
@@ -138,10 +126,6 @@ export function ReportingPage() {
     const endDate = toDateInputValue(window.end);
     triggerCsvDownload(`utilization-template-${startDate}-to-${endDate}.csv`, body);
   };
-
-  if (!user || !isAdmin) {
-    return null;
-  }
 
   return (
     <div className="h-full overflow-y-auto">

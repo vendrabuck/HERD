@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // useNavigate is a side effect we want to observe directly, so keep the real
@@ -79,6 +79,54 @@ describe("AdminGuard", () => {
     renderGuard();
 
     expect(screen.queryByText("Admin-only content")).not.toBeInTheDocument();
+    expect(navigateSpy).not.toHaveBeenCalled();
+  });
+
+  // Issue #548: /reporting sits outside pages/admin/ but is routed through
+  // the same AdminGuard-wrapped route group in App.tsx as the admin pages.
+  // This mirrors that exact nesting (an AdminGuard-wrapped pathless Route
+  // with an Outlet, holding a /reporting child) rather than re-rendering the
+  // full App tree: App's default export hardcodes BrowserRouter (so it
+  // cannot be seeded with initialEntries) and pulls in AppLayout plus every
+  // other page's own API calls, none of which are mocked in this file.
+  function renderReportingRoute() {
+    return render(
+      <MemoryRouter initialEntries={["/reporting"]}>
+        <Routes>
+          <Route
+            element={
+              <AdminGuard>
+                <Outlet />
+              </AdminGuard>
+            }
+          >
+            <Route path="/reporting" element={<p>Reporting content</p>} />
+          </Route>
+          <Route path="/topology" element={<p>Topology content</p>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("guards the /reporting route and redirects a non-admin to /topology", async () => {
+    useAuthStore.setState({
+      user: { id: "1", username: "bob", email: "b@b.c", role: "user", is_active: true, created_at: "" },
+    });
+
+    renderReportingRoute();
+
+    await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith("/topology"));
+    expect(screen.queryByText("Reporting content")).not.toBeInTheDocument();
+  });
+
+  it("renders the /reporting route for an admin", () => {
+    useAuthStore.setState({
+      user: { id: "1", username: "admin", email: "a@b.c", role: "admin", is_active: true, created_at: "" },
+    });
+
+    renderReportingRoute();
+
+    expect(screen.getByText("Reporting content")).toBeInTheDocument();
     expect(navigateSpy).not.toHaveBeenCalled();
   });
 });
