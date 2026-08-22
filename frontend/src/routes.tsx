@@ -1,8 +1,6 @@
-// This file exports exactly one constant, `appRouteElements`, on purpose: it
-// is the route table lifted out of App.tsx (issue #551) so a test can inspect
-// it with `createRoutesFromElements` without rendering the app. Keeping it to
-// a single non-component export sidesteps react-refresh/only-export-components
-// entirely (there is no component here to mix with a helper export).
+// Route table lifted out of App.tsx so tests can inspect it via
+// createRoutesFromElements (issue #551); this JSX-constant shape is an
+// interim bridge, not a pattern to copy for other element trees.
 import { Navigate, Outlet, Route } from "react-router-dom";
 import { LoginPage } from "@/pages/LoginPage";
 import { RegisterPage } from "@/pages/RegisterPage";
@@ -55,7 +53,7 @@ export const appRouteElements = (
     <Route
       element={
         <AuthGuard>
-            <AppLayout />
+          <AppLayout />
         </AuthGuard>
       }
     >

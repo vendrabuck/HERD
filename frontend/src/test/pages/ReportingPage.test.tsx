@@ -11,7 +11,7 @@ beforeAll(() => {
 });
 
 // The page itself no longer reads the auth store (the admin gate now lives
-// in App.tsx's AdminGuard route wrapper; see AdminGuard.test.tsx), but the
+// in the AdminGuard route group in routes.tsx; see AdminGuard.test.tsx), but the
 // shared axios client still reaches for the static useAuthStore.getState()
 // in its request interceptor to attach the bearer token, so an admin
 // snapshot is still needed here.
@@ -134,8 +134,8 @@ afterEach(() => {
 
 describe("ReportingPage", () => {
   // Non-admin redirect coverage moved to AdminGuard.test.tsx: the guard now
-  // lives in App.tsx's route wrapper (issue #527, issue #548), and this page
-  // no longer performs its own redirect check.
+  // lives in the AdminGuard route group in routes.tsx (issue #527, issue #548),
+  // and this page no longer performs its own redirect check.
 
   it("renders the heading and range selector for an admin", async () => {
     server.use(

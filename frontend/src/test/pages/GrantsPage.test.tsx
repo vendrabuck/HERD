@@ -16,7 +16,8 @@ vi.mock("react-hot-toast", () => ({
   default: { success: (m: string) => toastSuccess(m), error: (m: string) => toastError(m) },
 }));
 
-// The page is reached only through AdminGuard (App.tsx), so admin-ness is
+// The page is reached only through the AdminGuard route group in routes.tsx,
+// so admin-ness is
 // not this page's concern; pin an admin user anyway since apiClient's
 // request interceptor reads useAuthStore.getState().accessToken on every
 // call, so the mock must expose getState as well as the selector hook, or

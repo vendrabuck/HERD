@@ -188,18 +188,22 @@
   button stating that the layer is recorded on the canvas and provisioning derives
   L2/L3 from the resolved path; `TOPOLOGY_EDITOR.md`, the manual, `FEATURES.md`, and
   `PLANNED_FEATURES.md` were corrected to stop describing it as a pending gap.
-- Route table extracted for testability (issue #551): `AuthGuard`, `GuestGuard`, and
+- Route table extracted for testability (issue #551, PR #560): `AuthGuard`, `GuestGuard`, and
   `AdminGuard` moved out of `App.tsx` into `components/guards.tsx`, and the
   `<Routes>` children moved into an exported `appRouteElements` constant in the new
   `routes.tsx`, leaving `App.tsx` as just `BrowserRouter` plus `Toaster` plus
   `ErrorBoundary` plus `<Routes>{appRouteElements}</Routes>`. A new
   `test/routes.test.tsx` runs `createRoutesFromElements` over `appRouteElements`
-  with no rendering involved, walks the resulting tree, and pins the exact set of
-  14 paths (`/reporting` plus the 13 `/admin/*` routes) that carry an `AdminGuard`
-  ancestor. This closes the gap a PR #550 reviewer found by mutation testing:
-  before this change, moving a route out of the `AdminGuard` group left the full
-  vitest suite green. `AdminGuard.test.tsx` still pins the guard's own
-  redirect/render behavior; this test only pins route membership.
+  with no rendering involved, walks the resulting tree via a subtree search (so a
+  future wrapper around a guard does not false-red the test), and pins: the exact
+  set of 14 paths (`/reporting` plus the 13 `/admin/*` routes) that carry an
+  `AdminGuard` ancestor; that every one of those paths also sits under `AuthGuard`;
+  that the route table has no duplicate paths; and that the `AdminGuard` group
+  still renders an `Outlet` for its children. This closes the gap a PR #550
+  reviewer found by mutation testing: before this change, moving a route out of
+  the `AdminGuard` group left the full vitest suite green. `AdminGuard.test.tsx`
+  still pins the guard's own redirect/render behavior; this test only pins route
+  membership and structure.
 
 #### Developer platform and CI
 

@@ -1,26 +1,14 @@
-import { isValidElement } from "react";
-import { createRoutesFromElements, type RouteObject } from "react-router-dom";
+import { isValidElement, type ReactNode } from "react";
+import { createRoutesFromElements, Outlet, type RouteObject } from "react-router-dom";
 import { describe, it, expect } from "vitest";
 import { appRouteElements } from "@/routes";
-import { AdminGuard } from "@/components/guards";
+import { AuthGuard, AdminGuard } from "@/components/guards";
 
-// Issue #551: AdminGuard.test.tsx pins AdminGuard's own redirect/render
-// behavior against a hand-built route tree, but it never renders App.tsx, so
-// it cannot catch the route table itself placing a route outside the
-// AdminGuard-wrapped group (a PR #550 reviewer demonstrated this by moving
-// the /reporting Route out of the group and getting a green 757/757 suite).
-//
-// This test pins route MEMBERSHIP structurally instead of by rendering:
-// `createRoutesFromElements` (public react-router-dom API) turns the real
-// `appRouteElements` JSX into a plain `RouteObject[]` tree with no rendering
-// involved, so we never mount `AppLayout` or the 20+ unmocked pages that a
-// real render of `App`'s default export would require. We then walk that
-// tree and record, for every route with a `path`, whether an ancestor
-// route's `element` is an `AdminGuard` (by React element `type` identity).
-//
-// AdminGuard's own behavior (redirect a non-admin, render children for an
-// admin/superadmin, render nothing while unauthenticated) stays pinned by
-// AdminGuard.test.tsx; this file only pins which paths sit under it.
+// Issue #551: structural walk via createRoutesFromElements (public API), no
+// render, so AppLayout and the pages never mount. AdminGuard.test.tsx pins
+// the guard's own redirect/render behavior; this file pins route
+// membership: which paths sit under AdminGuard, and that AdminGuard itself
+// sits under AuthGuard.
 
 const EXPECTED_ADMIN_GUARDED_PATHS = [
   "/reporting",
@@ -39,65 +27,112 @@ const EXPECTED_ADMIN_GUARDED_PATHS = [
   "/admin/ldap-sync",
 ];
 
-interface PathGuardEntry {
-  path: string;
-  guarded: boolean;
+interface GuardAncestry {
+  adminGuarded: boolean;
+  authGuarded: boolean;
 }
 
-function isAdminGuardElement(element: RouteObject["element"]): boolean {
-  return isValidElement(element) && element.type === AdminGuard;
+// Searches the route element's whole subtree for componentType, not just
+// its top-level type, so a future wrapper (e.g. an ErrorBoundary placed
+// around AdminGuard) does not false-red this test.
+function elementTreeContains(node: ReactNode, componentType: unknown): boolean {
+  if (Array.isArray(node)) {
+    return node.some((child) => elementTreeContains(child, componentType));
+  }
+  if (!isValidElement(node)) {
+    return false;
+  }
+  if (node.type === componentType) {
+    return true;
+  }
+  const children = (node.props as { children?: ReactNode }).children;
+  return elementTreeContains(children, componentType);
 }
 
-function collectPathGuards(routes: RouteObject[], inheritedGuarded: boolean): PathGuardEntry[] {
-  const entries: PathGuardEntry[] = [];
-
+function walkRoutes(
+  routes: RouteObject[],
+  inherited: GuardAncestry,
+  guardsByPath: Map<string, GuardAncestry>,
+  duplicatePaths: string[],
+): void {
   for (const route of routes) {
-    const guarded = inheritedGuarded || isAdminGuardElement(route.element);
+    const guards: GuardAncestry = {
+      adminGuarded: inherited.adminGuarded || elementTreeContains(route.element, AdminGuard),
+      authGuarded: inherited.authGuarded || elementTreeContains(route.element, AuthGuard),
+    };
 
     if (typeof route.path === "string") {
-      entries.push({ path: route.path, guarded });
+      if (guardsByPath.has(route.path)) {
+        duplicatePaths.push(route.path);
+      }
+      guardsByPath.set(route.path, guards);
     }
 
     if (route.children) {
-      entries.push(...collectPathGuards(route.children, guarded));
+      walkRoutes(route.children, guards, guardsByPath, duplicatePaths);
     }
   }
+}
 
-  return entries;
+function flattenRoutes(routes: RouteObject[]): RouteObject[] {
+  const flat: RouteObject[] = [];
+  for (const route of routes) {
+    flat.push(route);
+    if (route.children) {
+      flat.push(...flattenRoutes(route.children));
+    }
+  }
+  return flat;
 }
 
 const routeObjects = createRoutesFromElements(appRouteElements);
-const pathGuards = collectPathGuards(routeObjects, false);
-
-function guardedFor(path: string): boolean | undefined {
-  return pathGuards.find((entry) => entry.path === path)?.guarded;
-}
+const guardsByPath = new Map<string, GuardAncestry>();
+const duplicatePaths: string[] = [];
+walkRoutes(routeObjects, { adminGuarded: false, authGuarded: false }, guardsByPath, duplicatePaths);
 
 describe("App route table: AdminGuard membership (issue #551)", () => {
-  it.each(EXPECTED_ADMIN_GUARDED_PATHS)(
-    "%s has an AdminGuard ancestor",
-    (path) => {
-      const guarded = guardedFor(path);
-      expect(guarded, `expected route "${path}" to be found in the tree`).toBeDefined();
-      expect(guarded).toBe(true);
-    },
-  );
-
   it("the set of AdminGuard-guarded paths equals the expected list exactly", () => {
-    const actualGuardedPaths = pathGuards
-      .filter((entry) => entry.guarded)
-      .map((entry) => entry.path)
+    const actualGuardedPaths = [...guardsByPath.entries()]
+      .filter(([, guards]) => guards.adminGuarded)
+      .map(([path]) => path)
       .sort();
 
     expect(actualGuardedPaths).toEqual([...EXPECTED_ADMIN_GUARDED_PATHS].sort());
   });
 
-  it("every /admin/-prefixed path is guarded, and the only unguarded /admin path is the bare redirect", () => {
-    const adminPrefixed = pathGuards.filter(
-      (entry) => entry.path === "/admin" || entry.path.startsWith("/admin/"),
+  it("every AdminGuard-guarded path also sits under AuthGuard", () => {
+    // AdminGuard returns null rather than redirecting when there is no
+    // user (see components/guards.tsx), so losing the AuthGuard parent
+    // would blank-page an anonymous visitor instead of sending them to
+    // /login.
+    for (const path of EXPECTED_ADMIN_GUARDED_PATHS) {
+      expect(guardsByPath.get(path)?.authGuarded, path).toBe(true);
+    }
+  });
+
+  it("the only unguarded /admin-prefixed path is the bare /admin redirect", () => {
+    const adminPrefixed = [...guardsByPath.entries()].filter(
+      ([path]) => path === "/admin" || path.startsWith("/admin/"),
     );
-    const unguarded = adminPrefixed.filter((entry) => !entry.guarded).map((entry) => entry.path);
+    const unguarded = adminPrefixed
+      .filter(([, guards]) => !guards.adminGuarded)
+      .map(([path]) => path);
 
     expect(unguarded).toEqual(["/admin"]);
+  });
+
+  it("the route table has no duplicate paths", () => {
+    expect(duplicatePaths).toEqual([]);
+  });
+
+  it("the AdminGuard group renders an Outlet for its children", () => {
+    const adminGuardGroups = flattenRoutes(routeObjects).filter(
+      (route) => typeof route.path !== "string" && elementTreeContains(route.element, AdminGuard),
+    );
+
+    expect(adminGuardGroups.length).toBeGreaterThan(0);
+    for (const group of adminGuardGroups) {
+      expect(elementTreeContains(group.element, Outlet)).toBe(true);
+    }
   });
 });

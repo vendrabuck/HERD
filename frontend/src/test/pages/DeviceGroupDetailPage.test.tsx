@@ -117,7 +117,7 @@ beforeEach(() => {
   toast.success.mockClear();
   toast.error.mockClear();
   // The page assumes an admin user; the redirect for non-admins now lives
-  // in AdminGuard (App.tsx), tested in AdminGuard.test.tsx.
+  // in the AdminGuard route group in routes.tsx, tested in AdminGuard.test.tsx.
   useAuthStore.setState({
     user: { id: "1", username: "admin", email: "a@b.c", role: "admin" },
   } as never);
@@ -259,6 +259,6 @@ describe("DeviceGroupDetailPage", () => {
   });
 
   // Non-admin redirect coverage moved to AdminGuard.test.tsx: the guard now
-  // lives in App.tsx's route wrapper (issue #527), and this page no longer
-  // performs its own redirect check.
+  // lives in the AdminGuard route group in routes.tsx (issue #527), and this
+  // page no longer performs its own redirect check.
 });
