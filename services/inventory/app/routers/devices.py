@@ -530,6 +530,14 @@ async def delete_dynamic_device_internal(
 
     404 if the device is absent; 409 if it is not a dynamic instance, since this
     surface only manages dynamic instances (physical devices are admin-managed).
+
+    Deliberately runs no find_blocking_reservations_for_device check, unlike the
+    admin DELETE above: execution calls this only from its own dynamic-teardown
+    flow (a reservation's terminal transition, or a device removed from a still
+    non-terminal one via PATCH), and in both cases the owning reservation is
+    itself the caller driving this delete, so it would always show up as the
+    blocker; the admin route's guard would be circular here rather than
+    protective.
     """
     if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")

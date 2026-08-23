@@ -101,6 +101,12 @@ def enqueue_event(
     iff that transition did. The id is injected into the payload under
     `event_id` so consumers can dedupe on a stable key that survives a relay
     republish under a new stream sequence. Returns the event id.
+
+    This is the only sanctioned way for request/handler code to raise a
+    state-change event: publishing straight to NATS from that code path
+    reopens the dual-write gap this module exists to close (see the module
+    docstring), since a process death or broker outage after the state commit
+    would then lose the event with no row recording it was ever owed.
     """
     eid = event_id or uuid.uuid4()
     body = {**payload, EVENT_ID_FIELD: str(eid)}
