@@ -973,7 +973,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "alembic", specifier = ">=1.13.0" },
-    { name = "anthropic", specifier = ">=0.39.0" },
+    { name = "anthropic", specifier = ">=0.39.0,<1" },
     { name = "anyio", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "asyncpg", specifier = ">=0.29.0" },
     { name = "fastapi", specifier = ">=0.111.0" },
