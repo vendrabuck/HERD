@@ -16,17 +16,25 @@ route param resolution and any data fetch (frontend/src/components/guards.tsx
 useEffect fires on mount before the page component does anything with the
 param), so the redirect fires before an invalid id could matter.
 
-Uses the same seeded non-admin credentials as tests/load/locustfile.py
-(`user{i}@herd.dev` / `user{i}user{i}xx`, from seed_devices_public.py's
-generate_users) rather than registering a throwaway account: cheaper, and
-this stack is always seeded before e2e runs. Nothing is mutated, so there is
-no baseline to restore.
+Self-provisions its non-admin account via POST /api/auth/register rather
+than using a seed_devices_public.py account: in the make everything gate the
+stack is seeded only AFTER the test phases (the seed exists to leave a demo
+behind), so during e2e no seeded users exist and tests must create what they
+need (the standing self-seed convention; this file learned that the hard way
+on 2026-08-24). The account is marker-named like the Selenium suite's
+e2e-roles accounts and persists, since auth exposes no user-delete endpoint
+(see test_register_and_roles.py's module docstring for that precedent). A
+409 from /auth/register means AUTH_METHOD=ldap (local registration disabled;
+the uuid suffix makes a name collision impossible), mirroring the Selenium
+suite's LDAP note, so the test skips there.
 """
 
-from .conftest import HOST_BASE_URL, pw_login
+import uuid
 
-NON_ADMIN_EMAIL = "user1@herd.dev"
-NON_ADMIN_PASSWORD = "user1user1xx"
+import httpx
+import pytest
+
+from .conftest import HOST_BASE_URL, pw_login
 
 # The 14 AdminGuard-guarded paths pinned in frontend/src/test/routes.test.tsx's
 # EXPECTED_ADMIN_GUARDED_PATHS, minus the 2 already covered live by the
@@ -49,10 +57,29 @@ REMAINING_GUARDED_PATHS = [
 ]
 
 
+def _register_non_admin() -> tuple[str, str]:
+    """Create a fresh role="user" account through the public register API and
+    return its (email, password). Skips the test in LDAP mode, where local
+    registration is disabled by design."""
+    suffix = uuid.uuid4().hex[:8]
+    email = f"e2e-adminguard-{suffix}@example.com"
+    password = f"e2e-adminguard-{suffix}-pw1!"
+    with httpx.Client(verify=False, timeout=30.0) as client:
+        resp = client.post(
+            f"{HOST_BASE_URL}/api/auth/register",
+            json={"email": email, "username": f"e2e-adminguard-{suffix}", "password": password},
+        )
+    if resp.status_code == 409:
+        pytest.skip("local registration disabled (AUTH_METHOD=ldap); cannot provision a user")
+    assert resp.status_code == 201, resp.text
+    return email, password
+
+
 def test_non_admin_redirected_from_remaining_admin_guarded_paths(pw_page):
     """A role="user" account visiting any of the 12 remaining guarded paths
     lands on /topology, never on the admin path it requested."""
-    pw_login(pw_page, NON_ADMIN_EMAIL, NON_ADMIN_PASSWORD)
+    email, password = _register_non_admin()
+    pw_login(pw_page, email, password)
 
     for path in REMAINING_GUARDED_PATHS:
         pw_page.goto(f"{HOST_BASE_URL}{path}")
