@@ -110,15 +110,6 @@ async def mark_destroyed(db: AsyncSession, request_id) -> None:
     await db.commit()
 
 
-async def record_error(db: AsyncSession, request_id, error: str | None) -> None:
-    """Store the latest error string on a row without changing its status."""
-    row = await get_by_request_id(db, request_id)
-    if row is None:
-        return
-    row.error = error
-    await db.commit()
-
-
 async def list_teardown_candidates(db: AsyncSession, reservation_id) -> list[DynamicInstance]:
     """Return the reservation's rows still in CREATING or ACTIVE.
 

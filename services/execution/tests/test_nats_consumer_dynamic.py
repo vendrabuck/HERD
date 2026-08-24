@@ -26,6 +26,7 @@ import pytest
 from app.database import Base
 from app.models.dynamic_instance import DynamicInstance
 from app.models.execution_run import ExecutionRun
+from app.services import dynamic_instance_service as dynamic_instance_service_module
 from app.services import nats_consumer
 from app.services.driver_loader import (
     DriverPackageError,
@@ -56,6 +57,7 @@ from app.services.nats_consumer import (
     process_reservation_message,
 )
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -300,6 +302,109 @@ async def test_ledger_insert_is_idempotent_on_request_id():
     assert len(await _rows()) == 1
 
 
+async def test_insert_or_get_creating_concurrent_race_returns_winner_row():
+    """A genuine two-session duplicate insert trips the IntegrityError recovery
+    branch (lines 67-74): the loser rolls back and re-reads the winner's row
+    instead of raising or double-inserting.
+
+    The interleaving is real, not a mocked exception: `get_by_request_id` is
+    wrapped so that, on the loser's FIRST read (a miss, matching the real race
+    window), a second session inserts and commits the same request_id before
+    the loser's own commit runs. SQLite's unique constraint on request_id then
+    raises IntegrityError on the loser's real `db.commit()` call.
+    """
+    real_get_by_request_id = dynamic_instance_service_module.get_by_request_id
+    call_count = {"n": 0}
+
+    async def _interleave_winner_before_first_read(db, request_id):
+        call_count["n"] += 1
+        result = await real_get_by_request_id(db, request_id)
+        if call_count["n"] == 1:
+            # Simulate the concurrent redelivery: a second session wins the
+            # race and commits its row between the loser's read and insert.
+            # Built directly (not via insert_or_get_creating) so the winner's
+            # own read does not also go through the patched function below.
+            async with TestSessionLocal() as db_winner:
+                winner_row = DynamicInstance(
+                    request_id=uuid.UUID(REQUEST_ID),
+                    reservation_id=uuid.UUID(RES_ID),
+                    template_id=uuid.UUID(TEMPLATE_ID),
+                    hypervisor_id=uuid.UUID(HYPERVISOR_ID),
+                    status="CREATING",
+                )
+                db_winner.add(winner_row)
+                await db_winner.commit()
+                await db_winner.refresh(winner_row)
+                call_count["winner_id"] = winner_row.id
+        return result
+
+    async with TestSessionLocal() as db_loser:
+        with patch.object(
+            dynamic_instance_service_module,
+            "get_by_request_id",
+            side_effect=_interleave_winner_before_first_read,
+        ):
+            loser_row = await insert_or_get_creating(
+                db_loser, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID
+            )
+
+    # The loser recovered the winner's row rather than raising or duplicating.
+    assert loser_row.id == call_count["winner_id"]
+    assert loser_row.status == "CREATING"
+    # The wrapper was called twice: the initial miss, then the post-rollback
+    # re-read inside the except IntegrityError branch.
+    assert call_count["n"] == 2
+    assert len(await _rows()) == 1
+
+
+async def test_insert_or_get_creating_reraises_when_no_row_found_after_integrity_error():
+    """The documented real-anomaly path: IntegrityError fires, but the
+    post-rollback re-read finds nothing. That combination should never happen
+    from a legitimate unique-constraint race, so the function re-raises
+    instead of silently retrying forever.
+    """
+    real_get_by_request_id = dynamic_instance_service_module.get_by_request_id
+    call_count = {"n": 0}
+
+    async def _integrity_error_then_missing_row(db, request_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First read: a real miss, plus a concurrent winner commits so the
+            # loser's own commit below genuinely raises IntegrityError. Built
+            # directly (not via insert_or_get_creating) so the winner's own
+            # read does not also go through the patched function below.
+            result = await real_get_by_request_id(db, request_id)
+            async with TestSessionLocal() as db_winner:
+                winner_row = DynamicInstance(
+                    request_id=uuid.UUID(REQUEST_ID),
+                    reservation_id=uuid.UUID(RES_ID),
+                    template_id=uuid.UUID(TEMPLATE_ID),
+                    hypervisor_id=uuid.UUID(HYPERVISOR_ID),
+                    status="CREATING",
+                )
+                db_winner.add(winner_row)
+                await db_winner.commit()
+            return result
+        # Second read (the post-rollback recovery re-read): report the real
+        # anomaly by returning None even though a row now exists.
+        return None
+
+    async with TestSessionLocal() as db_loser:
+        with patch.object(
+            dynamic_instance_service_module,
+            "get_by_request_id",
+            side_effect=_integrity_error_then_missing_row,
+        ):
+            with pytest.raises(IntegrityError):
+                await insert_or_get_creating(
+                    db_loser, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID
+                )
+
+    assert call_count["n"] == 2
+    # The winner's row still exists; only the loser's redundant insert failed.
+    assert len(await _rows()) == 1
+
+
 async def test_ledger_active_then_destroyed_transition():
     async with TestSessionLocal() as db:
         await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
@@ -325,6 +430,36 @@ async def test_list_teardown_candidates_excludes_destroyed():
     async with TestSessionLocal() as db:
         candidates = await list_teardown_candidates(db, RES_ID)
     assert {str(c.request_id) for c in candidates} == {REQUEST_ID}
+
+
+# --- row-absent no-op guards -------------------------------------------------
+#
+# set_instance_ref / mark_active / mark_destroyed each re-read the row by
+# request_id and no-op if it is missing (a redelivery racing a row that was
+# never inserted, or was inserted under a different request_id). None of the
+# existing tests call these against an unknown request_id, so the `if row is
+# None: return` guards were never exercised.
+
+
+async def test_set_instance_ref_is_noop_for_unknown_request_id():
+    unknown = str(uuid.uuid4())
+    async with TestSessionLocal() as db:
+        await set_instance_ref(db, unknown, "vm-999")
+    assert await _rows() == []
+
+
+async def test_mark_active_is_noop_for_unknown_request_id():
+    unknown = str(uuid.uuid4())
+    async with TestSessionLocal() as db:
+        await mark_active(db, unknown, DEVICE_ID, "vm-999")
+    assert await _rows() == []
+
+
+async def test_mark_destroyed_is_noop_for_unknown_request_id():
+    unknown = str(uuid.uuid4())
+    async with TestSessionLocal() as db:
+        await mark_destroyed(db, unknown)
+    assert await _rows() == []
 
 
 # --- create flow happy path -------------------------------------------------
