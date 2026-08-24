@@ -204,6 +204,34 @@ describe("topologyStore", () => {
     expect(useTopologyStore.getState().edges).toBe(before);
   });
 
+  it("updateEdgePathStatuses leaves an edge with no matching update completely untouched", () => {
+    useTopologyStore.getState().loadCanvas({
+      nodes: [makeNode("a"), makeNode("b"), makeNode("c")],
+      edges: [makeEdge("e1", "a", "b"), makeEdge("e2", "b", "c")],
+      selectedEdgeLayer: "L2",
+    });
+    const edgesBefore = useTopologyStore.getState().edges;
+    const e2Before = edgesBefore.find((e) => e.id === "e2");
+    // Only e1 is updated; e2 has no entry in the map at all (the `!update`
+    // passthrough branch), not merely an update that happens to match its
+    // current values.
+    const updates = new Map<string, { pathValid: boolean | null; hopCount?: number }>([
+      ["e1", { pathValid: true, hopCount: 5 }],
+    ]);
+
+    useTopologyStore.getState().updateEdgePathStatuses(updates);
+
+    const edgesAfter = useTopologyStore.getState().edges;
+    const e1After = edgesAfter.find((e) => e.id === "e1");
+    const e2After = edgesAfter.find((e) => e.id === "e2");
+    expect(e1After?.data?.pathValid).toBe(true);
+    expect(e1After?.data?.pathHopCount).toBe(5);
+    // The untouched edge is the SAME object reference, not just equal data:
+    // the map() passthrough returns `e` itself for a non-matching id.
+    expect(e2After).toBe(e2Before);
+    expect(e2After?.data).toBe(e2Before?.data);
+  });
+
   it("removeEdge removes exactly the one edge (review item 2)", () => {
     useTopologyStore.getState().loadCanvas({
       nodes: [makeNode("a"), makeNode("b"), makeNode("c")],

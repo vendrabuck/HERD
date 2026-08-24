@@ -382,6 +382,49 @@ describe("MultiConnectDialog", () => {
     expect(screen.getByRole("button", { name: "Create connections" })).toBeDisabled();
   });
 
+  it("Connect 1:1 in order never stages a self-pair when the same device is picked on both sides", () => {
+    // freeSource and freeTarget are built from the identical `ports` array (one
+    // usePorts(deviceId) call, same TanStack Query cache entry for both sides),
+    // filtered by the identical usedPortKeys set, so they are the SAME list in
+    // the SAME order at every index: freeSource[i].id === freeTarget[i].id for
+    // every i, and the self-pair-skip branch (lines ~454-457) continues past
+    // EVERY index. Net effect: zero lines get staged, not a shifted pairing
+    // over the remaining ports. This pins that actual behavior; no staged line
+    // ever has sourcePortId === targetPortId, but "pairing proceeds over the
+    // remaining ports" does not hold for a fully-identical device pick with
+    // this positional algorithm (see issue #575 item 6 follow-up note).
+    render(<MultiConnectDialog {...baseProps()} />);
+    pickBothDevices(DEVICE_A_NAME, DEVICE_A_NAME);
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
+
+    expect(screen.getByText("No free ports left to pair")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review (0)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create connections" })).toBeDisabled();
+  });
+
+  it("Connect 1:1 in order still cannot pair the same device's remaining free port after an asymmetric manual line", () => {
+    // Stage eth1(source) <-> eth2(target) manually first, leaving eth3 free on
+    // BOTH sides. Even with only one free port left on each side, the two free
+    // lists are still index-identical ([eth3] === [eth3]), so the bulk pairing
+    // still skips it rather than connecting eth3 to itself or leaving it
+    // otherwise unstaged: confirms the gap is structural (identical free
+    // lists), not a matter of how many free ports remain.
+    render(<MultiConnectDialog {...baseProps()} />);
+    pickBothDevices(DEVICE_A_NAME, DEVICE_A_NAME);
+    const [sourceEth1] = screen.getAllByTestId("port-row-sp1");
+    const [, targetEth2] = screen.getAllByTestId("port-row-sp2");
+    clickRow(sourceEth1);
+    clickRow(targetEth2);
+    expect(screen.getByRole("button", { name: "Review (1)" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
+
+    // No new line staged, and the one manually-staged line never self-pairs.
+    expect(screen.getByText("No free ports left to pair")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review (1)" })).toBeInTheDocument();
+  });
+
   it("stamps the batch connection type and notes onto every submitted item", async () => {
     const onSubmit = vi.fn().mockResolvedValue(createdResult(2));
     render(<MultiConnectDialog {...baseProps({ onSubmit })} />);

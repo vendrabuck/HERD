@@ -394,6 +394,49 @@ async def test_deliveries_endpoint_lists_ledger(session_factory):
     assert data[0]["event_id"] == "evt-x"
 
 
+async def test_deliveries_endpoint_404_for_missing_webhook(session_factory):
+    async with _client(session_factory) as c:
+        resp = await c.get(f"/webhooks/{uuid.uuid4()}/deliveries", headers=_auth(_token()))
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Webhook not found"}
+
+
+async def test_deliveries_endpoint_clamps_limit(session_factory):
+    """`limit = max(1, min(limit, 500))` must clamp rather than pass 0/negative
+    straight to SQL's LIMIT (which for limit=0 would return zero rows, not the
+    newest one)."""
+    async with _client(session_factory) as c:
+        created = await c.post(
+            "/webhooks",
+            json={"target_url": "https://x.example/h", "event_types": ["reservation.created"]},
+            headers=_auth(_token()),
+        )
+        wid = created.json()["id"]
+
+    async with session_factory() as s:
+        for i in range(3):
+            s.add(
+                WebhookDelivery(
+                    subscription_id=uuid.UUID(wid),
+                    event_id=f"evt-{i}",
+                    event_type="reservation.created",
+                    status="delivered",
+                    attempts=1,
+                    response_status=200,
+                )
+            )
+        await s.commit()
+
+    async with _client(session_factory) as c:
+        clamped = await c.get(f"/webhooks/{wid}/deliveries?limit=0", headers=_auth(_token()))
+        assert clamped.status_code == 200
+        assert len(clamped.json()) == 1
+
+        huge = await c.get(f"/webhooks/{wid}/deliveries?limit=999999", headers=_auth(_token()))
+        assert huge.status_code == 200
+        assert len(huge.json()) == 3
+
+
 def test_known_event_types_are_the_documented_six():
     assert KNOWN_EVENT_TYPES == {
         "reservation.created",
