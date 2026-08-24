@@ -19,6 +19,16 @@ End-to-end over a running HERD stack with the checked-in mock L1 driver:
   GET /reservations/{id}/wiring-status; clearing the knob and hitting
   POST /reservations/{id}/wiring/retry flips that connection ACTIVE. This closes the
   ADR's integration test-plan item on the manual retry path.
+- The delta-less wiring HEAL backstop (issue #573): reservations' fault-injection seam
+  (HERD_FAULT_INJECTION plus the __herd_fault_stage_wiring__ purpose sentinel) forces
+  the activation-time reservation.wiring_changed staging to fail, leaving the
+  fork_wiring_ledger un-advanced behind cabling's fork version. The expiration sweep's
+  _heal_wiring_staging reconciler (5s interval, dev/test override) notices the gap and
+  stages a delta-less heal event (released/built both None), which routes execution's
+  consumer to a FULL reconcile against cabling's current intended set. This is the only
+  tier that can observe the cross-service invariant: reservations-side unit coverage
+  (test_wiring_changed_staging.py) mocks the staging call and cannot see what execution
+  does with the resulting event.
 
 The phase-1/3 tests assert the driver's observable execution runs (the wiring-status
 endpoint did not exist before phase 4); the phase-4 test asserts the assignment-row
@@ -44,6 +54,9 @@ pytestmark = pytest.mark.asyncio
 
 _MOCK_L1_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l1"
 _WIRING_CHANGED_SUBJECT = "herd.reservations.wiring_changed"
+# Mirrors services/reservations/app/services/reservation_service.py:
+# _FAULT_STAGE_WIRING_SENTINEL.
+_FAULT_STAGE_WIRING_SENTINEL = "__herd_fault_stage_wiring__"
 
 
 def _mock_l1_tarball() -> bytes:
@@ -170,11 +183,13 @@ async def _create_topology(client, canvas: dict) -> str:
     return topology_id
 
 
-async def _reserve(client, device_ids: list[str], topology_id: str | None = None) -> dict:
+async def _reserve(
+    client, device_ids: list[str], topology_id: str | None = None, purpose: str | None = None
+) -> dict:
     now = datetime.now(timezone.utc)
     body: dict = {
         "device_ids": device_ids,
-        "purpose": "wiring_changed integration test",
+        "purpose": purpose or "wiring_changed integration test",
         "start_time": now.isoformat(),
         "end_time": (now + timedelta(hours=1)).isoformat(),
     }
@@ -183,6 +198,16 @@ async def _reserve(client, device_ids: list[str], topology_id: str | None = None
     resp = await client.post("/reservations/", json=body)
     resp.raise_for_status()
     return resp.json()
+
+
+async def _fork_version(client, reservation_id: str) -> int:
+    """The fork's latest version_number, from its versions list (ForkDetailResponse
+    has no top-level version_number; the save endpoint does, but that is a different
+    response shape)."""
+    resp = await client.get(f"/reservations/{reservation_id}/fork")
+    resp.raise_for_status()
+    versions = resp.json()["versions"]
+    return max(v["version_number"] for v in versions)
 
 
 async def _count_success_runs(client, reservation_id: str, action: str) -> int:
@@ -739,6 +764,152 @@ async def test_wiring_changed_stale_replay_no_double_apply(
         assert disconnect_after == disconnect_before, "stale replay must not re-disconnect"
         # Exactly the one activation connect; the stale event drives no rebuild.
         assert connect_after == 1, "stale replay must not reconnect"
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        for conn in connections:
+            await admin_client.delete(f"/cabling/connections/{conn['id']}")
+        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+async def test_delta_less_heal_converges_after_initial_staging_failure(
+    admin_client, l1_template, fresh_devices
+):
+    """Issue #573: force the activation-time wiring_changed staging to fail via
+    reservations' fault-injection seam, prove the reservation activates genuinely
+    unwired (vacuity guard), then poll until the sweep's delta-less heal stages the
+    reconcile and execution converges the intended L1 cross-connect to ACTIVE.
+
+    The reservation's purpose carries __herd_fault_stage_wiring__, so with
+    HERD_FAULT_INJECTION set (dev/test compose override) reservations'
+    _create_reservation_fork_best_effort raises before staging. The router's
+    existing except-and-log path swallows it (ADR 0009 phase 7): the reservation
+    still lands ACTIVE, the fork is created cabling-side (fork creation happens
+    before the staging call and is unaffected by the seam), but the
+    fork_wiring_ledger is never advanced and execution never sees a reconcile
+    event. Only the expiration sweep's _heal_wiring_staging (5s interval here)
+    notices cabling's fork version has outrun the ledger and stages the
+    delta-less (released/built both None) heal that execution full-reconciles.
+    """
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(f"NATS not reachable from host: {nats_err}")
+
+    switch = await _create_switch(admin_client, l1_template["id"])
+    dut_a, dut_b = await fresh_devices(2)
+    connections = []
+    reservation_id = None
+    topology_id = None
+    try:
+        connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
+        connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
+        topology_id = await _create_topology(admin_client, _canvas_edge(dut_a["id"], dut_b["id"]))
+
+        suffix = uuid.uuid4().hex[:8]
+        purpose = f"int-heal-{_FAULT_STAGE_WIRING_SENTINEL}-{suffix}"
+        reservation = await _reserve(admin_client, [dut_a["id"], dut_b["id"]], topology_id, purpose)
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        # --- Vacuity guard ---------------------------------------------------
+        # Prove the fault actually fired before waiting on the heal: the fork was
+        # created (cabling-side create precedes the staging call, so the seam
+        # never touches it) at version 1, but execution's wiring ledger never
+        # received a reconcile for it, so there must be no ACTIVE L1 assignment
+        # row and last_applied_fork_version must still be null. A short settle
+        # window gives the (unfired) activation staging every chance to have
+        # landed if the seam had NOT fired, so this assertion is a genuine
+        # negative, not a race won by asserting too early.
+        fork_version = await _fork_version(admin_client, reservation_id)
+        assert fork_version >= 1, "fork was never created"
+
+        await asyncio.sleep(1.0)
+        pre_heal_status = await _wiring_status(admin_client, reservation_id)
+        pre_heal_active = [
+            c for c in pre_heal_status.get("connections", []) if c["status"] == "ACTIVE"
+        ]
+        assert pre_heal_active == [], (
+            "the initial wiring_changed staging was NOT actually blocked by the fault "
+            f"seam: found ACTIVE rows before the heal ran: {pre_heal_status}"
+        )
+        assert pre_heal_status.get("last_applied_fork_version") is None, (
+            "execution's ledger already reflects a fork version before any heal ran; "
+            f"the fault seam did not fire: {pre_heal_status}"
+        )
+        # --- end vacuity guard -------------------------------------------------
+
+        # Poll until the 5s sweep's _heal_wiring_staging notices the ledger is
+        # behind cabling's fork version, stages the delta-less heal event, and
+        # execution's consumer full-reconciles: the L1 cross-connect converges to
+        # ACTIVE with last_applied_fork_version catching up to the fork.
+        active = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "ACTIVE", timeout=25.0
+        )
+        assert active is not None, "the delta-less heal never converged the wiring to ACTIVE"
+
+        post_heal_status = await _wiring_status(admin_client, reservation_id)
+        assert post_heal_status.get("last_applied_fork_version") == fork_version, (
+            f"execution's ledger did not catch up to the fork version: {post_heal_status}"
+        )
+        active_rows = [c for c in post_heal_status["connections"] if c["status"] == "ACTIVE"]
+        assert len(active_rows) == 1, (
+            f"expected exactly one converged L1 cross-connect, got: {active_rows}"
+        )
+    finally:
+        # Restore baseline: cancel the reservation and confirm the terminal
+        # transition landed.
+        if reservation_id:
+            cancelled = await admin_client.delete(f"/reservations/{reservation_id}")
+            assert cancelled.status_code in (204, 404), cancelled.text
+            final = await admin_client.get(f"/reservations/{reservation_id}")
+            if final.status_code == 200:
+                assert final.json()["status"] in ("CANCELLED", "COMPLETED", "FAILED")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        for conn in connections:
+            await admin_client.delete(f"/cabling/connections/{conn['id']}")
+        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
+    admin_client, l1_template, fresh_devices
+):
+    """Negative control alongside the fault-seam test above: a reservation with NO
+    sentinel in its purpose wires on normal activation without waiting for the
+    sweep heal, pinning that the seam's exact-substring gate does not misfire
+    on an unrelated reservation sharing the stack during the same run. The seam
+    being inert with HERD_FAULT_INJECTION unset entirely is covered by the
+    reservations unit suite (test_reservation_service_unit.py), which
+    monkeypatches the env var directly; this stack has the var set stack-wide.
+    """
+    switch = await _create_switch(admin_client, l1_template["id"])
+    dut_a, dut_b = await fresh_devices(2)
+    connections = []
+    reservation_id = None
+    topology_id = None
+    try:
+        connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
+        connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
+        topology_id = await _create_topology(admin_client, _canvas_edge(dut_a["id"], dut_b["id"]))
+
+        reservation = await _reserve(
+            admin_client,
+            [dut_a["id"], dut_b["id"]],
+            topology_id,
+            f"int-heal-control-{uuid.uuid4().hex[:8]}",
+        )
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        active = await _poll_wiring_conn(
+            admin_client, reservation_id, lambda c: c["status"] == "ACTIVE", timeout=15.0
+        )
+        assert active is not None, (
+            "a reservation with no fault sentinel must wire on normal activation, "
+            "without waiting for the sweep heal"
+        )
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
