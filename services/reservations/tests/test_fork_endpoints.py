@@ -274,6 +274,19 @@ async def test_put_canvas_archived_409_passthrough():
     assert resp.json()["detail"] == "Fork is archived and cannot be edited"
 
 
+@pytest.mark.asyncio
+async def test_put_canvas_cabling_unreachable_503():
+    """Mirrors the GET and save siblings: a transport failure maps to 503."""
+    rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service")),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.put(f"/{rid}/fork/canvas", json={"canvas_data": {}})
+    assert resp.status_code == 503
+
+
 # --- POST /{id}/fork/save ------------------------------------------------------------
 
 
@@ -336,3 +349,42 @@ async def test_save_cabling_unreachable_503():
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.post(f"/{rid}/fork/save", json={"canvas_data": {}})
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_save_stage_wiring_changed_failure_still_returns_200():
+    """A staging failure must never turn a durable cabling save into a user error.
+
+    Patches stage_wiring_changed in the ROUTER module namespace (the actual
+    save-handler call site), not the service module: the existing staging-failure
+    coverage patches app.services.reservation_service.stage_wiring_changed, which
+    pins a different call site (_prune_removed_devices_from_fork), not this one.
+    """
+    rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
+    result = {
+        "fork_id": str(uuid.uuid4()),
+        "version_number": 3,
+        "released": [],
+        "built": [],
+    }
+    with (
+        patch(
+            "app.routers.reservations._cabling_fork_call",
+            new=AsyncMock(return_value=_resp(200, result)),
+        ),
+        patch(
+            "app.routers.reservations.stage_wiring_changed",
+            new=AsyncMock(side_effect=RuntimeError("staging boom")),
+        ) as staged,
+        patch(
+            "app.database.AsyncSession.rollback",
+            new=AsyncMock(),
+        ) as rollback,
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.post(f"/{rid}/fork/save", json={"canvas_data": {"nodes": []}})
+
+    assert resp.status_code == 200
+    assert resp.json() == result
+    staged.assert_awaited_once()
+    rollback.assert_awaited_once()

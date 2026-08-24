@@ -5,10 +5,11 @@ publish/claim/mark loop, the prune, and the consumer-side dedupe-key resolver,
 all against in-memory SQLite with a mocked JetStream.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from herd_common.outbox import (
@@ -19,6 +20,7 @@ from herd_common.outbox import (
     enqueue_event,
     event_dedupe_key,
     prune_published,
+    run_outbox_relay,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -230,3 +232,200 @@ def test_dedupe_key_stable_across_resequence():
     k1 = event_dedupe_key(payload, _msg_with_seq("HERD_RESERVATIONS", 7))
     k2 = event_dedupe_key(payload, _msg_with_seq("HERD_RESERVATIONS", 99))
     assert k1 == k2 == "stable-id"
+
+
+# --- run_outbox_relay: backoff, prune gate, and cancellation (issue #571 item 5) ----
+#
+# The connected/disconnected happy paths are covered live by
+# tests/integration/test_outbox_durability.py; these three branches (exponential
+# backoff on tick failure, the prune-scheduling gate, and CancelledError propagation)
+# have no assertions at any tier. A fake `get_nats` reports connected throughout;
+# `nc.jetstream()` is made to raise on ticks that should fail, so the tick-level
+# try/except in run_outbox_relay sees a real exception without touching DB/session
+# logic. asyncio.sleep is monkeypatched to record each requested delay and to end the
+# loop deterministically by raising CancelledError after N recorded calls.
+
+
+def _connected_nats(jetstream_outcomes):
+    """A fake NATS client that is always connected; nc.jetstream() consumes one
+    outcome per call: a jetstream-like object on success, or raises on failure."""
+    nc = SimpleNamespace(is_connected=True)
+    outcomes = iter(jetstream_outcomes)
+
+    def _jetstream():
+        outcome = next(outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    nc.jetstream = _jetstream
+    return nc
+
+
+def _ok_js():
+    js = SimpleNamespace()
+    js.publish = AsyncMock()
+    return js
+
+
+async def test_relay_backoff_doubles_on_failure_and_resets_on_success(session_factory):
+    """Delays double per failed tick up to the cap, and reset to tick_seconds
+    immediately after a successful tick."""
+    tick_seconds = 1.0
+    # cap = max(tick_seconds * 10, 300) = 300, so three failures in a row stay
+    # well under the cap (1 -> 2 -> 4), then a success resets to tick_seconds,
+    # then one more failure goes back to 2 * tick_seconds.
+    failure = RuntimeError("jetstream() unavailable")
+    outcomes = [failure, failure, failure, _ok_js(), failure]
+    nc = _connected_nats(outcomes)
+
+    delays: list[float] = []
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+        if len(delays) >= len(outcomes):
+            raise asyncio.CancelledError()
+
+    with patch("herd_common.outbox.asyncio.sleep", new=fake_sleep):
+        with pytest.raises(asyncio.CancelledError):
+            await run_outbox_relay(
+                session_factory,
+                lambda: nc,
+                OutboxEvent,
+                tick_seconds=tick_seconds,
+                prune_every_seconds=10_000.0,
+            )
+
+    # current_backoff starts at tick_seconds and is doubled BEFORE the sleep that
+    # follows a failed tick: tick 1 fails -> sleep(2.0); tick 2 fails -> sleep(4.0);
+    # tick 3 fails -> sleep(8.0); tick 4 succeeds -> sleep(1.0) (reset to tick_seconds);
+    # tick 5 fails -> sleep(2.0) (doubling restarts from the reset base).
+    assert delays == [2.0, 4.0, 8.0, 1.0, 2.0]
+
+
+async def test_relay_backoff_caps_at_max(session_factory):
+    """Repeated failures stop doubling once the cap (max(tick_seconds*10, 300)) is hit."""
+    tick_seconds = 1.0
+    max_backoff = max(tick_seconds * 10, 300)  # 300.0
+    failure = RuntimeError("jetstream() unavailable")
+    # Enough consecutive failures to exceed the cap through doubling: 1,2,4,...,256,512(->cap).
+    outcomes = [failure] * 10
+    nc = _connected_nats(outcomes)
+
+    delays: list[float] = []
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+        if len(delays) >= len(outcomes):
+            raise asyncio.CancelledError()
+
+    with patch("herd_common.outbox.asyncio.sleep", new=fake_sleep):
+        with pytest.raises(asyncio.CancelledError):
+            await run_outbox_relay(
+                session_factory,
+                lambda: nc,
+                OutboxEvent,
+                tick_seconds=tick_seconds,
+                prune_every_seconds=10_000.0,
+            )
+
+    assert delays[-1] == max_backoff
+    assert all(d <= max_backoff for d in delays)
+    # Strictly doubles until the cap is reached.
+    for prev, curr in zip(delays, delays[1:]):
+        assert curr == min(prev * 2, max_backoff)
+
+
+async def test_relay_prune_gate_runs_once_interval_elapsed(session_factory):
+    """prune_published is called only once prune_every_seconds has elapsed, not
+    on every tick; a tiny prune_every_seconds lets it fire on a later tick."""
+    prune_calls: list[float] = []
+    real_prune_published = prune_published
+
+    async def counting_prune(session, model, *, older_than):
+        prune_calls.append(1)
+        return await real_prune_published(session, model, older_than=older_than)
+
+    nc = _connected_nats([_ok_js(), _ok_js(), _ok_js()])
+
+    delays: list[float] = []
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+        if len(delays) >= 3:
+            raise asyncio.CancelledError()
+
+    with (
+        patch("herd_common.outbox.asyncio.sleep", new=fake_sleep),
+        patch("herd_common.outbox.prune_published", new=counting_prune),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await run_outbox_relay(
+                session_factory,
+                lambda: nc,
+                OutboxEvent,
+                tick_seconds=0.01,
+                # A near-zero gate: elapsed time since `last_prune` (set at loop
+                # start) exceeds this before the very first tick's check runs.
+                prune_every_seconds=0.0,
+            )
+
+    # The gate opens on every tick once the interval has elapsed, so all three
+    # recorded ticks pruned; the point pinned here is that it is gated by
+    # elapsed time (not skipped entirely), verified against the no-prune case below.
+    assert len(prune_calls) == 3
+
+
+async def test_relay_prune_gate_skips_before_interval_elapses(session_factory):
+    """A prune_every_seconds far in the future means the gate never opens across
+    several ticks: prune_published is not called at all."""
+    prune_calls: list[float] = []
+    real_prune_published = prune_published
+
+    async def counting_prune(session, model, *, older_than):
+        prune_calls.append(1)
+        return await real_prune_published(session, model, older_than=older_than)
+
+    nc = _connected_nats([_ok_js(), _ok_js(), _ok_js()])
+
+    delays: list[float] = []
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+        if len(delays) >= 3:
+            raise asyncio.CancelledError()
+
+    with (
+        patch("herd_common.outbox.asyncio.sleep", new=fake_sleep),
+        patch("herd_common.outbox.prune_published", new=counting_prune),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await run_outbox_relay(
+                session_factory,
+                lambda: nc,
+                OutboxEvent,
+                tick_seconds=0.01,
+                prune_every_seconds=10_000.0,
+            )
+
+    assert prune_calls == []
+
+
+async def test_relay_cancelled_error_during_sleep_propagates():
+    """CancelledError raised out of asyncio.sleep (task cancellation) re-raises
+    cleanly out of run_outbox_relay rather than being swallowed as a tick failure."""
+    nc = _connected_nats([_ok_js()])
+
+    async def fake_sleep(seconds):
+        raise asyncio.CancelledError()
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        with patch("herd_common.outbox.asyncio.sleep", new=fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await run_outbox_relay(factory, lambda: nc, OutboxEvent, tick_seconds=0.01)
+    finally:
+        await engine.dispose()

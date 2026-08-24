@@ -25,6 +25,7 @@ from app.schemas.reservation import ReservationUpdate, _as_utc
 from app.services.reservation_service import (
     _acquire_device_locks,
     _fetch_devices_best_effort,
+    _release_exclusive_devices_best_effort,
     _validate_topology_connectivity,
     cancel_reservation,
     release_reservation,
@@ -604,6 +605,78 @@ async def test_cancel_reservation_all_non_exclusive_skips_inventory():
             cancelled = await cancel_reservation(db, res.id, USER_ID, "token")
         assert cancelled.status == ReservationStatus.CANCELLED
         update_mock.assert_not_called()
+
+
+# --- _release_exclusive_devices_best_effort retry-exhaustion parity (issue #571 item 4) --
+#
+# The exclusivity filtering itself is exercised above (via cancel/release); this pins
+# the retry-exhaustion logging branch, which the sibling cancel/release paths pin at
+# test_reservation_service_unit.py:1194 and :1257 (await_count == 3 plus a structured
+# log). _release_exclusive_devices_best_effort is the shared helper both the
+# provision-result-failed path (reservation_service.py, log_action=
+# "reservation_provision_failed_release") and the expiration sweep's timeout backstop
+# (expiration.py, log_action="provision_timeout_release") call; it swallows after
+# retries rather than raising, so the caller's already-committed FAILED transition is
+# never revisited.
+
+
+@pytest.mark.asyncio
+async def test_release_exclusive_devices_best_effort_retries_and_swallows_on_exhaustion(
+    caplog,
+):
+    """A persistently failing inventory release retries 3 times, swallows the
+    final exception, and emits the structured failure log the caller passes in
+    as log_action."""
+    reservation_id = uuid.uuid4()
+    update_mock = AsyncMock(side_effect=RuntimeError("inventory 503"))
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[_make_device(DEVICE_A, exclusive=True)]),
+        ),
+        patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+        caplog.at_level("ERROR", logger="app.services.reservation_service"),
+    ):
+        await _release_exclusive_devices_best_effort(
+            reservation_id, [DEVICE_A], "reservation_provision_failed_release"
+        )
+
+    assert update_mock.await_count == 3, "expected retry_with_backoff(attempts=3)"
+    failed = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "action", None) == "reservation_provision_failed_release"
+    ]
+    assert failed, "expected structured log action=reservation_provision_failed_release"
+    assert str(reservation_id) in failed[0].getMessage() or getattr(
+        failed[0], "reservation_id", None
+    ) == str(reservation_id)
+
+
+@pytest.mark.asyncio
+async def test_release_exclusive_devices_best_effort_honors_caller_log_action(caplog):
+    """The log_action string is caller-supplied, not hardcoded: the expiration
+    sweep's timeout backstop passes "provision_timeout_release" through the same
+    helper, and that action name (not the provision-result sibling's) is what
+    lands in the structured log."""
+    reservation_id = uuid.uuid4()
+    update_mock = AsyncMock(side_effect=RuntimeError("inventory 503"))
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[_make_device(DEVICE_A, exclusive=True)]),
+        ),
+        patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+        caplog.at_level("ERROR", logger="app.services.reservation_service"),
+    ):
+        await _release_exclusive_devices_best_effort(
+            reservation_id, [DEVICE_A], "provision_timeout_release"
+        )
+
+    assert update_mock.await_count == 3
+    actions = {getattr(rec, "action", None) for rec in caplog.records}
+    assert "provision_timeout_release" in actions
+    assert "reservation_provision_failed_release" not in actions
 
 
 # --- expiration_loop one-iteration exception handling ---
