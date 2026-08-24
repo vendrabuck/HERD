@@ -268,10 +268,30 @@ async def test_wiring_status_requires_jwt(monkeypatch):
 
 
 async def test_missing_jwt_is_rejected(monkeypatch):
-    # Auth rejects before any upstream call.
+    # Auth rejects before any upstream call. FastAPI's HTTPBearer (auto_error=True,
+    # the router's default) emits exactly this status, body, and header; pin it so a
+    # regression to a different auth dependency (or auto_error=False) is caught.
     async with _client() as c:
         resp = await c.get("/reservations")
-    assert resp.status_code in (401, 403)
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "Not authenticated"}
+    assert resp.headers["www-authenticate"] == "Bearer"
+
+
+async def test_validation_error_envelope_shape(monkeypatch):
+    """A 422 from the facade's own request validation (never reaching the upstream)
+    matches FastAPI's default envelope: this is an external contract per
+    docs/EXTERNAL_API.md, so pin its shape structurally rather than by example."""
+    async with _client() as c:
+        resp = await c.post("/reservations", json={}, headers=_auth(_token()))
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert set(body.keys()) == {"detail"}
+    assert isinstance(body["detail"], list)
+    assert len(body["detail"]) > 0
+    for item in body["detail"]:
+        assert set(item.keys()) == {"type", "loc", "msg", "input"}
 
 
 async def test_invalid_jwt_is_401(monkeypatch):

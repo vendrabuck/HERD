@@ -8,7 +8,6 @@ class Settings(HerdBaseSettings):
     algorithm: str = "HS256"
     cors_origins: str = ""
     reservations_service_url: str = "http://reservations:8000"
-    internal_api_token: str = ""
 
     # Outbound webhook delivery (issue #33, phase 4).
     nats_url: str = "nats://nats:4222"
