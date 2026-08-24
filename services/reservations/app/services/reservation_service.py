@@ -11,6 +11,7 @@ Key rules enforced here:
 
 import asyncio
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -35,6 +36,24 @@ from app.models.reservation import (
 from app.schemas.reservation import ReservationCreate, ReservationUpdate
 
 logger = logging.getLogger(__name__)
+
+# Test-only fault-injection seam (issue #573), mirroring inventory's
+# HERD_FAULT_INJECTION convention (services/inventory/app/routers/devices.py).
+# Double-gated: active only when HERD_FAULT_INJECTION is set (dev/test compose
+# override; never in `make prod`) AND the reservation's purpose carries the
+# sentinel. Lets integration tests force the initial activation-time
+# reservation.wiring_changed staging to fail on demand, so the delta-less sweep
+# heal (_heal_wiring_staging) is the only path that ever wires the reservation.
+_FAULT_STAGE_WIRING_SENTINEL = "__herd_fault_stage_wiring__"
+
+
+def _fault_injection_enabled() -> bool:
+    return os.environ.get("HERD_FAULT_INJECTION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 async def _fetch_devices(device_ids: list[uuid.UUID], token: str) -> list[dict]:
@@ -338,6 +357,19 @@ async def _create_reservation_fork_best_effort(
             ledger = await db.get(ForkWiringLedger, reservation_id)
             if ledger is not None and ledger.last_staged_fork_version >= fork_version:
                 return True
+            # Test-only fault-injection seam (issue #573): with HERD_FAULT_INJECTION
+            # set and this reservation's purpose carrying the sentinel, raise before
+            # staging so the except branch below runs exactly as a real staging
+            # failure would, leaving the reservation ACTIVE with the ledger
+            # un-advanced for the sweep's delta-less heal to cover.
+            if _fault_injection_enabled():
+                reservation = await db.get(Reservation, reservation_id)
+                if reservation is not None and _FAULT_STAGE_WIRING_SENTINEL in (
+                    reservation.purpose or ""
+                ):
+                    raise RuntimeError(
+                        "fault injection: simulated initial wiring_changed staging failure"
+                    )
             await stage_wiring_changed(
                 db,
                 reservation_id,

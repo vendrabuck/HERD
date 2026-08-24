@@ -42,6 +42,12 @@ services:
       # Mirrors the WEBHOOK_TEST_SINK_ENABLED test-knob pattern below; make prod
       # excludes this override.
       EXPIRATION_INTERVAL_SECONDS: "5"
+      # Dev/test-only fault-injection seam (issue #573), mirroring inventory's
+      # HERD_FAULT_INJECTION seam above. Enables the double-gated hook in
+      # _create_reservation_fork_best_effort's initial wiring_changed staging;
+      # harmless unless a reservation's purpose also carries the
+      # __herd_fault_stage_wiring__ sentinel. Excluded by `make prod`.
+      HERD_FAULT_INJECTION: "1"
     volumes:
       - ./services/reservations/app:/app/app
       - ./services/common/herd_common:/app/common/herd_common

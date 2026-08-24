@@ -12,6 +12,11 @@ ADR 0007 Decision 2 and 3. Covers, at the reservations boundary:
   (including a missing ledger row, treated as 0), stages nothing when in sync, and
   isolates a cabling fetch failure from the rest of the sweep.
 - The save handler stages on a successful relay and stages nothing on the ARCHIVED 409.
+- The issue #573 fault-injection seam gates: it fires only with BOTH
+  HERD_FAULT_INJECTION set AND the reservation's purpose carrying the
+  __herd_fault_stage_wiring__ sentinel; the closed-loop live proof that the sweep
+  heal then converges the wiring lives in
+  tests/integration/test_wiring_changed_reconcile.py.
 
 The expiration sweep and stage_wiring_changed open their own AsyncSessionLocal against
 the app engine, so this suite shares that engine (mirrors test_fork_archive_reconcile).
@@ -32,6 +37,7 @@ from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import bearer_scheme
 from app.services import reservation_service
 from app.services.reservation_service import (
+    _FAULT_STAGE_WIRING_SENTINEL,
     _PRUNE_OUTCOME_CONVERGED,
     _PRUNE_OUTCOME_NO_FORK,
     WIRING_CHANGED_SUBJECT,
@@ -65,6 +71,7 @@ async def _insert(
     *,
     user_id: uuid.UUID = USER_ID,
     topology_id: uuid.UUID | None = None,
+    purpose: str = "t",
 ) -> uuid.UUID:
     res = Reservation(
         user_id=user_id,
@@ -72,7 +79,7 @@ async def _insert(
         device_ids=[str(uuid.uuid4())],
         topology_id=topology_id,
         topology_type=TopologyType.PHYSICAL,
-        purpose="t",
+        purpose=purpose,
         start_time=NOW - timedelta(hours=1),
         end_time=NOW + timedelta(hours=2),
         status=status,
@@ -399,6 +406,83 @@ async def test_activation_staging_is_ledger_guarded():
     assert (await _ledger(rid)).last_staged_fork_version == 1
     # The fork create itself succeeded (the ledger guard only skips the staging
     # sub-step), so the bool contract still reports True (issue #448 item 1).
+    assert result is True
+
+
+# --- Issue #573 fault-injection seam gates --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fault_seam_stages_nothing_when_both_gates_open(monkeypatch):
+    """With HERD_FAULT_INJECTION set and the sentinel in the reservation's purpose,
+    the activation staging call raises before it reaches stage_wiring_changed, so the
+    existing except-and-log path swallows it exactly as a real staging failure would:
+    the outbox gains no row, the ledger is left un-advanced, and the bool contract
+    still reports True (fork creation itself succeeded; only the staging sub-step
+    failed, mirroring the ledger-guard case above).
+    """
+    monkeypatch.setenv("HERD_FAULT_INJECTION", "1")
+    rid = await _insert(
+        ReservationStatus.ACTIVE,
+        topology_id=uuid.uuid4(),
+        purpose=f"x-{_FAULT_STAGE_WIRING_SENTINEL}-x",
+    )
+    topology_id = uuid.uuid4()
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(return_value=1),
+    ):
+        result = await _create_reservation_fork_best_effort(
+            rid, topology_id, created_by=str(USER_ID)
+        )
+
+    assert await _wiring_rows() == []
+    assert await _ledger(rid) is None
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_fault_seam_inert_without_env_var(monkeypatch):
+    """The sentinel alone, with HERD_FAULT_INJECTION unset, does not trip the seam:
+    staging proceeds normally. This is the negative half of the double gate."""
+    monkeypatch.delenv("HERD_FAULT_INJECTION", raising=False)
+    rid = await _insert(
+        ReservationStatus.ACTIVE,
+        topology_id=uuid.uuid4(),
+        purpose=f"x-{_FAULT_STAGE_WIRING_SENTINEL}-x",
+    )
+    topology_id = uuid.uuid4()
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(return_value=1),
+    ):
+        result = await _create_reservation_fork_best_effort(
+            rid, topology_id, created_by=str(USER_ID)
+        )
+
+    assert len(await _wiring_rows()) == 1
+    assert (await _ledger(rid)).last_staged_fork_version == 1
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_fault_seam_inert_without_sentinel(monkeypatch):
+    """HERD_FAULT_INJECTION set but no sentinel in the purpose: also inert, so the
+    seam never affects an ordinary reservation on a stack where fault injection is
+    enabled stack-wide (the dev/test compose override)."""
+    monkeypatch.setenv("HERD_FAULT_INJECTION", "1")
+    rid = await _insert(ReservationStatus.ACTIVE, topology_id=uuid.uuid4())
+    topology_id = uuid.uuid4()
+    with patch(
+        "app.services.reservation_service._create_reservation_fork",
+        new=AsyncMock(return_value=1),
+    ):
+        result = await _create_reservation_fork_best_effort(
+            rid, topology_id, created_by=str(USER_ID)
+        )
+
+    assert len(await _wiring_rows()) == 1
+    assert (await _ledger(rid)).last_staged_fork_version == 1
     assert result is True
 
 
