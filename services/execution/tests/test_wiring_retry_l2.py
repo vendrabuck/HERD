@@ -3,7 +3,8 @@
 Covers direction-aware reattempt (an ACTIVE-intended FAILED membership retries add_to_vlan,
 a RELEASED-intended one retries remove_from_vlan), the direction-scoped freeze (a build is
 refused on a frozen reservation, a release still runs), the cross-reservation supersession
-guard, the last-release allocation free, and per-layer labeling in a mixed L1+L2 batch.
+guard, the last-release allocation free, per-layer labeling in a mixed L1+L2 batch, and the
+non-retryable pinned-reason classification (no driver call, issue #564).
 """
 
 import uuid
@@ -15,6 +16,7 @@ from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.l2_port_assignment import L2PortAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.models.vlan_assignment import VlanAssignment
+from app.services.nats_consumer import WIRING_UNRESOLVABLE_REASON
 from app.services.wiring_retry_service import (
     WiringReservationFrozen,
     reattempt_reservation,
@@ -254,6 +256,33 @@ async def test_release_retry_repeat_failure_stays_failed_released():
     assert row.intended == "RELEASED"
     assert row.attempts > 2, "attempts accumulate on repeat failure"
     assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_retry_non_retryable_pinned_reason_makes_no_driver_call():
+    """A FAILED L2 membership with a pinned reason is reported not_retryable without a
+    driver call (issue #564, mirroring the L1 coverage in test_wiring_retry_service.py)."""
+    va = await _seed_alloc()
+    rid = await _seed_l2_failed("0/0/1", "ACTIVE", va, attempts=0, err=WIRING_UNRESOLVABLE_REASON)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert calls == [], "no driver call for a non-retryable intent"
+    row = await _l2_row(rid)
+    assert row.status == "FAILED"
+    assert result["results"] == [
+        {
+            "id": str(rid),
+            "switch_device_id": SW_L2,
+            "port": "0/0/1",
+            "vlan_assignment_id": str(va),
+            "outcome": "not_retryable",
+            "status": "FAILED",
+            "attempts": 0,
+            "last_error": WIRING_UNRESOLVABLE_REASON,
+            "layer": "l2",
+            "vlan": None,
+        }
+    ]
 
 
 # --- frozen direction scoping ---

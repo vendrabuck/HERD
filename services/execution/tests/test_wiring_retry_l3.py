@@ -3,9 +3,10 @@
 Covers direction-aware reattempt (an ACTIVE-intended FAILED pin re-provisions the pinned
 set via configure_route, a RELEASED-intended one re-removes it via remove_route), the
 verbatim-pinned-set discipline (issue #20: the retry drives the STORED routes, never a
-re-derived config), the direction-scoped freeze, per-layer labeling in a mixed batch, and
-the absence of an L3 supersession guard (a per-reservation route set is non-exclusive, so a
-stale release cannot harm another reservation).
+re-derived config), the direction-scoped freeze, per-layer labeling in a mixed batch, the
+absence of an L3 supersession guard (a per-reservation route set is non-exclusive, so a
+stale release cannot harm another reservation), and the non-retryable pinned-reason
+classification (no driver call, issue #564).
 """
 
 import uuid
@@ -17,6 +18,7 @@ from app.database import Base
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.models.route_assignment import RouteAssignment
+from app.services.nats_consumer import WIRING_UNRESOLVABLE_REASON
 from app.services.wiring_retry_service import (
     WiringReservationFrozen,
     reattempt_reservation,
@@ -236,6 +238,30 @@ async def test_build_retry_repeat_failure_accumulates_attempts():
     assert row.intended == "ACTIVE"
     assert row.attempts > 3, "attempts accumulate on repeat failure"
     assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_retry_non_retryable_pinned_reason_makes_no_driver_call():
+    """A FAILED L3 route pin with a pinned reason is reported not_retryable without a
+    driver call (issue #564, mirroring the L1 coverage in test_wiring_retry_service.py)."""
+    rid = await _seed_l3_failed("ACTIVE", attempts=0, err=WIRING_UNRESOLVABLE_REASON)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert calls == [], "no driver call for a non-retryable intent"
+    row = await _l3_row(rid)
+    assert row.status == "FAILED"
+    assert result["results"] == [
+        {
+            "id": str(rid),
+            "switch_device_id": SW_L3,
+            "route_count": 2,
+            "outcome": "not_retryable",
+            "status": "FAILED",
+            "attempts": 0,
+            "last_error": WIRING_UNRESOLVABLE_REASON,
+            "layer": "l3",
+        }
+    ]
 
 
 # --- frozen direction scoping ---
