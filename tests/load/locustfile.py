@@ -1,11 +1,13 @@
 """Locust load test definitions for HERD.
 
-Five user classes simulating different usage patterns:
+Six user classes simulating different usage patterns:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices and templates
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
 - ACLChecker: batch checks permissions
 - NotificationUser: polls notifications and updates channel/event preferences
+- BulkConnectionAdmin: posts small POST /connections/bulk batches, then deletes
+  what it created
 
 Note on the outbound notification channels and expiry reminder (ROADMAP #40):
 the dispatch side is a NATS consumer with no synchronous request surface, so it
@@ -337,3 +339,88 @@ class ACLChecker(HerdUser):
                 "permission": "view",
             },
         )
+
+
+class BulkConnectionAdmin(HerdUser):
+    """Exercises POST /connections/bulk, the admin-only bulk cable-create path.
+
+    Every iteration posts a small batch (2-5 pairs) built from a cached pool
+    of seeded device ids, then deletes every row the batch actually created
+    (one DELETE /connections/{id} per row) so the stack's connection count
+    stays flat instead of growing without bound across a run. Port names are
+    generated fresh per call (cabling has no port-existence check and rows
+    are not deduplicated, see services/cabling/app/services/connection_service.py),
+    so this never collides with real cabling nor with a previous iteration's
+    rows still in flight.
+
+    The endpoint validates every row before inserting anything and always
+    returns 200 with a per-row report; a rejected row (e.g. the self-loop
+    guard, or a 503 batch-wide abort if inventory's device-group check is
+    momentarily unreachable) is a legitimate outcome under concurrency, not a
+    load-test failure, matching create_and_release's treatment of 409/422
+    above. Only a transport error or an unexpected status is a real problem.
+    """
+
+    weight = 1
+    wait_time = between(2, 5)
+
+    def on_start(self):
+        self._login(ADMIN_EMAIL, ADMIN_PASSWORD)
+        self._device_ids = []
+        resp = self._auth_get("/api/inventory/devices", params={"limit": 50})
+        if resp.status_code == 200:
+            self._device_ids = [d["id"] for d in resp.json()["items"]]
+
+    @task
+    def bulk_create_and_cleanup(self):
+        if len(self._device_ids) < 2:
+            return
+        batch_size = random.randint(2, 5)
+        items = []
+        for _ in range(batch_size):
+            device_a, device_b = random.sample(self._device_ids, 2)
+            suffix = uuid.uuid4().hex[:8]
+            items.append(
+                {
+                    "device_a_id": device_a,
+                    "port_a": f"load-{suffix}-a",
+                    "device_b_id": device_b,
+                    "port_b": f"load-{suffix}-b",
+                    "connection_type": "ethernet",
+                }
+            )
+        with self._auth_post(
+            "/api/cabling/connections/bulk",
+            name="/api/cabling/connections/bulk",
+            catch_response=True,
+            json={"items": items},
+        ) as resp:
+            # 503 is the documented batch-wide fail-closed outcome when
+            # inventory's device-group boundary check is momentarily
+            # unreachable (see create_connections_bulk's docstring); count it
+            # as load, not failure, same as the 409/422 contention above.
+            if resp.status_code not in (200, 503):
+                resp.failure(f"unexpected {resp.status_code}: {resp.text[:200]}")
+                return
+            if resp.status_code != 200:
+                resp.success()
+                return
+            body = resp.json()
+            if not {"created", "rejected", "rows"} <= body.keys():
+                resp.failure(f"malformed ConnectionBulkReport: {body}")
+                return
+            if body["created"] + body["rejected"] != len(items):
+                resp.failure(
+                    f"created+rejected ({body['created']}+{body['rejected']}) "
+                    f"!= submitted ({len(items)})"
+                )
+                return
+            resp.success()
+            created_ids = [
+                row["connection_id"] for row in body["rows"] if row["status"] == "created"
+            ]
+        for connection_id in created_ids:
+            self._auth_delete(
+                f"/api/cabling/connections/{connection_id}",
+                name="/api/cabling/connections/[id]",
+            )
