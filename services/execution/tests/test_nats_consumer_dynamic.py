@@ -40,6 +40,7 @@ from app.services.dynamic_instance_service import (
     mark_destroyed,
     set_instance_ref,
 )
+from app.services.execution_service import driver_result_failed
 from app.services.nats_consumer import (
     NATS_DLQ_SUBJECT,
     PermanentEventError,
@@ -50,6 +51,7 @@ from app.services.nats_consumer import (
     _execute_dynamic_teardown,
     _handle_provision_requested,
     _post_provision_result_best_effort,
+    _recipe_reported_success,
     handle_reservation_event,
     process_reservation_message,
 )
@@ -904,3 +906,58 @@ async def test_callback_persistent_failure_is_swallowed():
         await _post_provision_result_best_effort(
             RES_ID, succeeded=True, device_ids=[DEVICE_ID], error=None
         )
+
+
+# --- driver_result_failed vs _recipe_reported_success missing-key divergence ---
+#
+# The two helpers deliberately disagree on a missing output "success" key:
+# driver_result_failed treats it as a bare-data return and stays SUCCESS, while
+# _recipe_reported_success layers a stricter missing-key-is-failure rule on top
+# (nats_consumer.py, _recipe_reported_success docstring). Each pair below drives
+# both helpers on the SAME input so the opposite defaults are pinned together.
+
+
+def test_bare_data_output_diverges_on_missing_success_key():
+    result = {
+        "success": True,
+        "output": {"instance_ref": "vm-9"},
+        "error": None,
+        "duration_ms": 1,
+    }
+    assert driver_result_failed(result) == (False, None)
+    assert _recipe_reported_success(result) is False
+
+
+def test_output_none_diverges_on_missing_success_key():
+    result = {"success": True, "output": None, "error": None, "duration_ms": 1}
+    assert driver_result_failed(result) == (False, None)
+    assert _recipe_reported_success(result) is False
+
+
+def test_explicit_output_failure_agrees_on_both_helpers():
+    result = {
+        "success": True,
+        "output": {"success": False, "error": "hypervisor rejected"},
+        "error": None,
+        "duration_ms": 1,
+    }
+    assert driver_result_failed(result) == (True, "hypervisor rejected")
+    assert _recipe_reported_success(result) is False
+
+
+def test_explicit_output_success_agrees_on_both_helpers():
+    result = {
+        "success": True,
+        "output": {"success": True, "instance_ref": "vm-9"},
+        "error": None,
+        "duration_ms": 1,
+    }
+    assert driver_result_failed(result) == (False, None)
+    assert _recipe_reported_success(result) is True
+
+
+def test_transport_failure_agrees_on_both_helpers():
+    """A sandbox-level failure (transport flag False) fails both helpers alike."""
+    result = {"success": False, "output": None, "error": "driver crashed", "duration_ms": 1}
+    assert driver_result_failed(result) == (True, "driver crashed")
+    assert _recipe_reported_success(result) is False
