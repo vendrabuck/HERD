@@ -1,8 +1,8 @@
 """Orchestration tests for AIClient.
 
 Targets the AIClient public surface (propose_topology,
-suggest_template_identity, answer_reservation_question_with_tools) through a
-_FakeProvider that satisfies the LLMProvider Protocol. SDK-translation
+suggest_template_identity, draft_recipe, answer_reservation_question_with_tools)
+through a _FakeProvider that satisfies the LLMProvider Protocol. SDK-translation
 correctness lives in test_anthropic_provider.py.
 """
 
@@ -545,6 +545,103 @@ async def test_suggest_template_identity_forces_tool_choice():
     tc = provider.calls[0]["tool_choice"]
     assert isinstance(tc, ToolChoiceTool)
     assert tc.name == "suggest_identity"
+
+
+# --- draft_recipe ---
+
+
+@pytest.mark.asyncio
+async def test_draft_recipe_returns_parsed_tool_input():
+    draft = {
+        "driver_py": "class Driver:\n    pass\n",
+        "metadata": {"name": "acme_switch", "version": "0.1.0", "notes": "initial draft"},
+        "explanation": "A minimal driver stub.",
+    }
+    provider = _FakeProvider(
+        responses=[_resp([_tool_use("draft_recipe", draft)], input_tokens=30, output_tokens=50)]
+    )
+    client = _make_client(provider)
+    out, usage = await client.draft_recipe(prompt="Write a driver for an Acme switch.")
+    assert out == draft
+    assert (usage.input_tokens, usage.output_tokens) == (30, 50)
+
+
+@pytest.mark.asyncio
+async def test_draft_recipe_forces_tool_choice():
+    draft = {"driver_py": "x", "metadata": {}, "explanation": "e"}
+    provider = _FakeProvider(responses=[_resp([_tool_use("draft_recipe", draft)])])
+    client = _make_client(provider)
+    await client.draft_recipe(prompt="Write a driver.")
+    tc = provider.calls[0]["tool_choice"]
+    assert isinstance(tc, ToolChoiceTool)
+    assert tc.name == "draft_recipe"
+
+
+@pytest.mark.asyncio
+async def test_draft_recipe_assembles_optional_context_sections():
+    """Each optional context argument must land in the assembled user message
+    under its own real section header (ai_client.py:571-614), not just be
+    silently accepted and dropped."""
+    draft = {"driver_py": "x", "metadata": {}, "explanation": "e"}
+    provider = _FakeProvider(responses=[_resp([_tool_use("draft_recipe", draft)])])
+    client = _make_client(provider)
+    await client.draft_recipe(
+        prompt="Write a driver for an Acme switch.",
+        hypervisor_type="acme_hv",
+        previous_driver_py="class Driver:\n    pass\n",
+        previous_metadata_json='{"name": "acme_switch"}',
+        repair_feedback="dry_run must not raise.",
+    )
+    sent_messages = provider.calls[0]["messages"]
+    user_text = sent_messages[0].content[0].text
+
+    assert "=== TASK ===\nWrite a driver for an Acme switch." in user_text
+    assert "=== TARGET HYPERVISOR TYPE ===\nacme_hv" in user_text
+    assert (
+        "=== CURRENT DRAFT driver.py (revise this, do not start over) ===\n"
+        "class Driver:\n    pass\n" in user_text
+    )
+    assert '=== CURRENT DRAFT driver_metadata.json ===\n{"name": "acme_switch"}' in user_text
+    assert "=== CORRECTION ===\n" in user_text
+    assert "dry_run must not raise." in user_text
+
+
+@pytest.mark.asyncio
+async def test_draft_recipe_omits_optional_sections_when_absent():
+    """The inverse of the assembly test: with no optional args passed, none of
+    the optional section headers appear (repair_feedback defaults to "", the
+    others to None)."""
+    draft = {"driver_py": "x", "metadata": {}, "explanation": "e"}
+    provider = _FakeProvider(responses=[_resp([_tool_use("draft_recipe", draft)])])
+    client = _make_client(provider)
+    await client.draft_recipe(prompt="Write a driver.")
+    sent_messages = provider.calls[0]["messages"]
+    user_text = sent_messages[0].content[0].text
+
+    assert user_text == "=== TASK ===\nWrite a driver."
+    assert "=== TARGET HYPERVISOR TYPE ===" not in user_text
+    assert "=== CURRENT DRAFT driver.py" not in user_text
+    assert "=== CURRENT DRAFT driver_metadata.json ===" not in user_text
+    assert "=== CORRECTION ===" not in user_text
+
+
+@pytest.mark.asyncio
+async def test_draft_recipe_raises_when_no_tool_use():
+    provider = _FakeProvider(responses=[_resp([TextBlock(text="Just text, no tool call.")])])
+    client = _make_client(provider)
+    with pytest.raises(AIError, match="AI did not return a draft_recipe tool_use block"):
+        await client.draft_recipe(prompt="Write a driver.")
+
+
+@pytest.mark.asyncio
+async def test_draft_recipe_skips_tool_use_block_with_wrong_name():
+    """A tool_use block present under a different name (e.g. a stale/mismatched
+    tool call) must not be mistaken for the draft_recipe result; the loop
+    skips it and still raises the pinned AIError."""
+    provider = _FakeProvider(responses=[_resp([_tool_use("suggest_identity", {"vendor": "Acme"})])])
+    client = _make_client(provider)
+    with pytest.raises(AIError, match="AI did not return a draft_recipe tool_use block"):
+        await client.draft_recipe(prompt="Write a driver.")
 
 
 # --- ToolChoiceNone smoke (consumed only by the post-cap branch indirectly) ---
