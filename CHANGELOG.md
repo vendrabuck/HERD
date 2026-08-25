@@ -221,6 +221,28 @@
   surface requires grepping `tests/e2e/` for every test that opens it.
 - Bulk-connection e2e coverage (issue #540, PR #542): Playwright coverage for the
   bulk connection create flow.
+- Dead-code cleanup from a QA sweep (PR #600): removed backend and frontend code
+  superseded by ADR 0009's L3/L2 reconcile ledgers and otherwise unreferenced,
+  each item independently verified before removal. Backend: execution's
+  `route_service.py` lost `assign_routes`, `get_pinned_routes`, `release_routes`,
+  `release_routes_for_device`, and `is_route_active` (superseded by
+  `record_route_active`/`record_route_failed`/`release_route_membership`, which
+  `nats_consumer.py` actually calls); `vlan_service.py` lost `release_vlan` and
+  `get_vlan_assignments` (superseded by `l2_membership_service.release_l2_membership`
+  and the last-free `delete_vlan` allocation-coupling path); auth's unused
+  `AccessTokenResponse` schema, user-profile's unused `auth_service_url` setting
+  (it validates JWTs locally and never calls auth over HTTP), config's unused
+  `GROUPS` constant, and cabling's dead `require_admin` re-export in
+  `routes/templates.py` were all removed; a copy-paste logging bug in acl's
+  grant-create log line (`body.resource_type` passed twice instead of a distinct
+  4th field) was fixed and pinned with a regression test; a dead `bearer_token`
+  parameter was dropped from cabling's `find_blocking_reservations`. Frontend:
+  deleted the never-imported `DeviceDetailModal` component (device detail renders
+  as a full page via `DevicePage.tsx`, not a modal) and its test, the zero-caller
+  `useMultiDeviceConnections` hook, the unreferenced `AssistantRequest` type in
+  `types/ai.types.ts`, and the unused `class-variance-authority` dependency.
+  Duplication-reduction follow-ups from the same sweep are tracked separately in
+  issues #595 to #599 and were deliberately left out of this PR's scope.
 
 ## [0.2.0] - 2026-08-03
 
