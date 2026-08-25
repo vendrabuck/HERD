@@ -131,7 +131,6 @@ export interface IdentitySuggestion {
   reasoning: string;
 }
 
-
 // Branch 3: one rendered bubble in the chat thread. id is local-only (uuid
 // generated at append time) for React keys; the backend's per-message uuids
 // are not exposed to the client. The pendingApply piggybacks on the
