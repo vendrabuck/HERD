@@ -131,12 +131,6 @@ export interface IdentitySuggestion {
   reasoning: string;
 }
 
-export interface AssistantRequest {
-  question: string;
-  // Branch 3: when null the backend creates a new conversation, when set it
-  // appends this question as the next user turn on the existing one.
-  conversation_id?: string | null;
-}
 
 // Branch 3: one rendered bubble in the chat thread. id is local-only (uuid
 // generated at append time) for React keys; the backend's per-message uuids

@@ -113,7 +113,7 @@ async def update_topology(
         authorization = request.headers.get("authorization", "")
         token = authorization.removeprefix("Bearer ").strip() if authorization else ""
         if token and not is_admin:
-            blocking = await find_blocking_reservations(topology_id, token)
+            blocking = await find_blocking_reservations(topology_id)
             others = [b for b in blocking if str(b.get("user_id") or "") != payload["sub"]]
             if others:
                 raise HTTPException(

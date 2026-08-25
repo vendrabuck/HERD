@@ -13,7 +13,7 @@ configure_route / remove_route operations on the switch via GET /execution/runs.
 
 There is no REST endpoint for RouteAssignment rows, so we assert the observable
 downstream effect instead: the driver actually ran the route ops with the
-config's routes. A SUCCESS configure_route run only exists after assign_routes
+config's routes. A SUCCESS configure_route run only exists after record_route_active
 pinned the set, so it is end-to-end proof the assignment was made; a SUCCESS
 remove_route run after cancel is proof it was released. The config-edit test
 pins the core invariant: deprovision removes the PINNED set, not the edited

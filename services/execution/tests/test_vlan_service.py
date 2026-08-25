@@ -10,8 +10,6 @@ from app.services.vlan_service import (
     VLAN_MIN,
     _derive_vlan_id,
     find_or_assign_vlan,
-    get_vlan_assignments,
-    release_vlan,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -141,88 +139,6 @@ async def test_assign_vlan_idempotent(db):
     vlan1 = await find_or_assign_vlan(db, rid, FABRIC_A, [SWITCH_1])
     vlan2 = await find_or_assign_vlan(db, rid, FABRIC_A, [SWITCH_1])
     assert vlan1 == vlan2
-
-
-# --- release_vlan ---
-
-
-@pytest.mark.asyncio
-async def test_release_vlan(db):
-    """release_vlan marks assignments as RELEASED and returns them."""
-    rid = str(uuid.uuid4())
-    vlan = await find_or_assign_vlan(db, rid, FABRIC_A, [SWITCH_1])
-
-    released = await release_vlan(db, rid)
-    assert len(released) == 1
-    assert released[0].vlan_id == vlan
-    assert released[0].status == "RELEASED"
-    assert released[0].released_at is not None
-
-
-@pytest.mark.asyncio
-async def test_release_vlan_frees_id(db):
-    """After release, the VLAN can be reassigned in the same fabric."""
-    rid1 = str(uuid.uuid4())
-    vlan1 = await find_or_assign_vlan(db, rid1, FABRIC_A, [SWITCH_1])
-
-    await release_vlan(db, rid1)
-
-    # A new reservation that derives the same VLAN should get it
-    rid2 = None
-    for i in range(100000):
-        candidate = str(uuid.UUID(int=i))
-        if _derive_vlan_id(candidate) == vlan1 and candidate != rid1:
-            rid2 = candidate
-            break
-    assert rid2 is not None
-
-    vlan2 = await find_or_assign_vlan(db, rid2, FABRIC_A, [SWITCH_1])
-    assert vlan2 == vlan1
-
-
-@pytest.mark.asyncio
-async def test_release_vlan_no_assignments(db):
-    """Releasing a reservation with no assignments returns empty list."""
-    released = await release_vlan(db, str(uuid.uuid4()))
-    assert released == []
-
-
-@pytest.mark.asyncio
-async def test_release_vlan_multiple_fabrics(db):
-    """A reservation spanning two fabrics releases both assignments."""
-    rid = str(uuid.uuid4())
-    await find_or_assign_vlan(db, rid, FABRIC_A, [SWITCH_1])
-    await find_or_assign_vlan(db, rid, FABRIC_B, [SWITCH_2])
-
-    released = await release_vlan(db, rid)
-    assert len(released) == 2
-    fabrics = {r.fabric_id for r in released}
-    assert fabrics == {FABRIC_A, FABRIC_B}
-
-
-# --- get_vlan_assignments ---
-
-
-@pytest.mark.asyncio
-async def test_get_vlan_assignments(db):
-    """get_vlan_assignments returns active assignments for a reservation."""
-    rid = str(uuid.uuid4())
-    await find_or_assign_vlan(db, rid, FABRIC_A, [SWITCH_1])
-
-    assignments = await get_vlan_assignments(db, rid)
-    assert len(assignments) == 1
-    assert assignments[0].fabric_id == FABRIC_A
-
-
-@pytest.mark.asyncio
-async def test_get_vlan_assignments_excludes_released(db):
-    """get_vlan_assignments does not return released assignments."""
-    rid = str(uuid.uuid4())
-    await find_or_assign_vlan(db, rid, FABRIC_A, [SWITCH_1])
-    await release_vlan(db, rid)
-
-    assignments = await get_vlan_assignments(db, rid)
-    assert len(assignments) == 0
 
 
 # --- concurrency (TOCTOU race) ---

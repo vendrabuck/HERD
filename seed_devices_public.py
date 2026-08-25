@@ -211,7 +211,6 @@ L2_SWITCHES_PER_LAB = 10
 NUM_L2_SWITCHES = L2_SWITCHES_PER_LAB * 3  # 30
 NUM_L2_HUB_SWITCHES = 2
 L2_PORTS_TOTAL = 48
-L2_HUB_PORTS_TOTAL = 48
 L2_DUT_PORTS_MAX = 46  # reserve eth47, eth48 on edges for hub uplinks
 L2_PORTS_PER_PA = 6  # eth6, eth7 (after L1 ports eth1-eth5)
 L2_PORTS_PER_CLIENT = 2  # eth3 (after L1 ports eth1-eth2)

@@ -129,7 +129,7 @@ async def restore_version(
     authorization = request.headers.get("authorization", "")
     token = authorization.removeprefix("Bearer ").strip() if authorization else ""
     if token:
-        blocking = await find_blocking_reservations(topology_id, token)
+        blocking = await find_blocking_reservations(topology_id)
         if blocking:
             raise HTTPException(
                 status_code=409,

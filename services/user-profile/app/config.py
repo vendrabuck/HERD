@@ -7,7 +7,6 @@ class Settings(HerdBaseSettings):
     secret_key: str
     algorithm: str = "HS256"
     cors_origins: str = ""
-    auth_service_url: str = "http://auth:8000"
     internal_api_token: str = ""
 
     log_level: str = "INFO"

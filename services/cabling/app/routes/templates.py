@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user_payload, require_admin
+from app.dependencies import get_current_user_payload
 from app.models.template import TopologyTemplate
 from app.models.topology import Topology, TopologyVersion
 from app.schemas.template import (
@@ -265,8 +265,3 @@ async def instantiate_template(
     await db.commit()
     await db.refresh(topology)
     return topology
-
-
-# require_admin is referenced for symmetry with other routers but the manage-
-# permission check above already covers admin/owner via _can_manage.
-__all__ = ["router", "require_admin"]

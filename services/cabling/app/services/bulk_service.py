@@ -417,7 +417,7 @@ async def import_topologies(
                 # Reservation-scoped lock, mirroring PUT /topologies/{id}: a
                 # topology held by another user's active reservation must not be
                 # rewired. The guard fails open if reservations is unreachable.
-                blocking = await find_blocking_reservations(existing.id, "")
+                blocking = await find_blocking_reservations(existing.id)
                 others = [b for b in blocking if str(b.get("user_id") or "") != str(actor_id)]
                 if others:
                     report.rows.append(

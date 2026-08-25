@@ -12,7 +12,7 @@ _schema = settings.db_schema or None
 # Partial-unique index: at most one ACTIVE route assignment per
 # (reservation, L3 switch). The predicate is ACTIVE-only so RELEASED rows from
 # earlier reservations on the same switch never block a new assignment. This is
-# the DB-level guard that makes assign_routes idempotent under concurrent NATS
+# the DB-level guard that makes record_route_active idempotent under concurrent NATS
 # redelivery: the second insert trips IntegrityError and the service re-reads
 # the winner's row, so one reservation can never pin two route sets for one
 # switch. Declared here (not only in the migration) so Base.metadata.create_all
