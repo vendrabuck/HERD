@@ -18,7 +18,7 @@ PostgreSQL 16 (a schema per service, no cross-schema joins) and NATS JetStream f
 | reservations | Time-window reservations, conflict detection, auto-expire |
 | cabling | Connections, topology persistence, pathfinding |
 | acl | Resource-level grants (topology, reservation) |
-| execution | Driver execution subprocess, NATS consumer (DLQ) |
+| execution | Driver execution subprocess, NATS consumer and outbox producer (DLQ) |
 | ai-orchestrator | LLM topology generation, reservation assistant, recipe drafting (feature-gated) |
 | user-profile | Per-user preferences (saved filters, page sizes, extras) |
 | notifications | NATS consumer + in-app notifications + prefs proxy |
@@ -373,7 +373,7 @@ HERD is built as 12 independent services rather than a modular monolith. This se
 
 ### What that costs
 
-- **Cross-service queries are HTTP, not SQL.** The reservations service's reporting `by_group` rollup is N+1 (one call per distinct user) where a modular monolith would JOIN a single `auth.users` table once. The cross-service cost is paid in latency and code complexity.
+- **Cross-service queries are HTTP, not SQL.** The reservations service's reporting `by_group` rollup batches its auth lookup into one `POST /groups/users/groups` call carrying every distinct user id (`reporting_service.fetch_user_groups_map`, issues #140/#131) rather than issuing it per-user, but a modular monolith would JOIN a single `auth.users` table in-process with no network hop at all. The cross-service cost here is one auth round trip per report plus building the per-user group index in memory from that response, versus a query planner doing the join.
 - **Eleven Alembic migration trees, twelve Dockerfiles, eleven service configurations.** The eleven DB-backed services each own a migration tree and an `app/config.py`; `config` ships a Dockerfile but has no database or Alembic tree, and `common` is a shared library with neither a Dockerfile nor a config. Cross-cutting changes (a new common field, a logging format change, a dependency bump) touch multiple services. Integration tests are the only end-to-end validation path for cross-service flows.
 - **Operational surface.** A first-time deployer brings up a Postgres with 11 schemas, NATS with the `HERD_RESERVATIONS` and `HERD_HEALTH` streams plus four DLQ subjects, and 12 service containers behind Traefik. The `config` service mitigates this by handling first-start setup through the UI, but the surface itself is real.
 - **For a single-deployer adoption, a modular monolith would have lower operational overhead.** That is a fair criticism and acknowledged here.

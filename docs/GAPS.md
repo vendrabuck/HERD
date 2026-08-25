@@ -67,9 +67,10 @@ and `TopologyEditorWiring`).
   `UsersPage`.
 
 **Component coverage priorities** (`CreateReservationModal`, `ReservationDetailModal`,
-`AIDialog`, `AIProposalBar`, `AICommitDialog`, `EditDevicesModal`, `DeviceDetailModal`,
+`AIDialog`, `AIProposalBar`, `AICommitDialog`, `EditDevicesModal`,
 and `PortsSection` now all carry targeted suites; the dead `TopologyEditor` component
-was deleted in issue #489):
+was deleted in issue #489, and the dead `DeviceDetailModal` component was deleted in
+PR #600; device detail is rendered by `DevicePage.tsx` as a full page, not a modal):
 
 - [LOW] `AppLayout`, `FloatingPanel`, `FieldRow` (lower-complexity presentation, still
   untested).
