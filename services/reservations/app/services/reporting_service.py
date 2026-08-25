@@ -38,15 +38,15 @@ def _split_hours_per_day(start: datetime, end: datetime) -> list[tuple[str, floa
 
     Returns a list of (YYYY-MM-DD, hours) tuples. The caller sums across these.
     """
-    from datetime import timedelta as _td
-
     if end <= start:
         return []
     out: list[tuple[str, float]] = []
     cursor = start
     while cursor < end:
         # Next midnight UTC strictly after cursor.
-        day_end = datetime(cursor.year, cursor.month, cursor.day, tzinfo=timezone.utc) + _td(days=1)
+        day_end = datetime(cursor.year, cursor.month, cursor.day, tzinfo=timezone.utc) + timedelta(
+            days=1
+        )
         slice_end = min(day_end, end)
         hours = (slice_end - cursor).total_seconds() / 3600.0
         if hours > 0:

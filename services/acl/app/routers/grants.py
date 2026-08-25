@@ -80,10 +80,9 @@ async def create_grant_endpoint(
             detail="This grant already exists",
         )
     logger.info(
-        "Grant created: group %s, %s %s on %s %s",
+        "Grant created: group %s, %s on %s %s",
         body.group_id,
         body.permission,
-        body.resource_type,
         body.resource_type,
         body.resource_id,
         extra={

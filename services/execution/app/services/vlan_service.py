@@ -7,7 +7,6 @@ same L2 fabric share the same VLAN ID.  Reservations in isolated fabrics
 
 import logging
 import uuid
-from datetime import datetime, timezone
 
 import httpx
 from sqlalchemy import select
@@ -149,50 +148,3 @@ async def find_or_assign_vlan(
         f"Could not assign a VLAN in fabric {fabric_id} after {_MAX_ASSIGN_RETRIES} "
         "attempts due to persistent contention"
     )
-
-
-async def release_vlan(
-    db: AsyncSession,
-    reservation_id: str,
-) -> list[VlanAssignment]:
-    """Release all active VLAN assignments for a reservation.
-
-    Returns the list of released assignments so the caller knows
-    the actual VLAN IDs to deprovision on each fabric's switches.
-    """
-    result = await db.execute(
-        select(VlanAssignment).where(
-            VlanAssignment.reservation_id == uuid.UUID(reservation_id),
-            VlanAssignment.status == "ACTIVE",
-        )
-    )
-    assignments = list(result.scalars().all())
-
-    now = datetime.now(timezone.utc)
-    for a in assignments:
-        a.status = "RELEASED"
-        a.released_at = now
-
-    if assignments:
-        await db.commit()
-        logger.info(
-            "Released %d VLAN assignment(s) for reservation %s",
-            len(assignments),
-            reservation_id,
-        )
-
-    return assignments
-
-
-async def get_vlan_assignments(
-    db: AsyncSession,
-    reservation_id: str,
-) -> list[VlanAssignment]:
-    """Look up active VLAN assignments for a reservation."""
-    result = await db.execute(
-        select(VlanAssignment).where(
-            VlanAssignment.reservation_id == uuid.UUID(reservation_id),
-            VlanAssignment.status == "ACTIVE",
-        )
-    )
-    return list(result.scalars().all())

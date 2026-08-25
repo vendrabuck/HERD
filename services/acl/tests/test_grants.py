@@ -136,6 +136,22 @@ async def test_create_grant_admin(admin_client):
 
 
 @pytest.mark.asyncio
+async def test_create_grant_logs_distinct_fields(admin_client, caplog):
+    """The grant-created log line renders each placeholder from a distinct
+    field: group_id, permission, resource_type, resource_id, not
+    resource_type twice (regression check for a copy-paste log bug)."""
+    with caplog.at_level("INFO", logger="app.routers.grants"):
+        resp = await _create_grant(admin_client)
+    assert resp.status_code == 201
+
+    [record] = [r for r in caplog.records if r.message.startswith("Grant created:")]
+    assert record.message == (f"Grant created: group {_group_id_1}, view on device {_device_id_1}")
+    assert record.message.count(str(_group_id_1)) == 1
+    assert record.message.count(str(_device_id_1)) == 1
+    assert record.message.count("device") == 1
+
+
+@pytest.mark.asyncio
 async def test_create_grant_manage(admin_client):
     resp = await _create_grant(admin_client, permission="manage")
     assert resp.status_code == 201

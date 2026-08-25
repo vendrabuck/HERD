@@ -93,7 +93,7 @@ async def test_reservation_guard_filters_blocking_status():
     ]
     factory, _, _ = _mock_httpx_client(status_code=200, json_data=items)
     with patch.object(reservation_guard.httpx, "AsyncClient", factory):
-        result = await reservation_guard.find_blocking_reservations(topology_id, "tok")
+        result = await reservation_guard.find_blocking_reservations(topology_id)
     ids = {r["id"] for r in result}
     # Only ACTIVE/PENDING/PENDING_PROVISION rows for THIS topology are blocking.
     assert ids == {"r1", "r2"}
@@ -106,7 +106,7 @@ async def test_reservation_guard_bad_response_returns_empty():
     topology_id = uuid.uuid4()
     factory, _, _ = _mock_httpx_client(status_code=503, json_data=[])
     with patch.object(reservation_guard.httpx, "AsyncClient", factory):
-        result = await reservation_guard.find_blocking_reservations(topology_id, "tok")
+        result = await reservation_guard.find_blocking_reservations(topology_id)
     assert result == []
 
 
@@ -117,7 +117,7 @@ async def test_reservation_guard_unreachable_fails_open():
     topology_id = uuid.uuid4()
     factory, _, _ = _mock_httpx_client(raise_exc=RuntimeError("connection refused"))
     with patch.object(reservation_guard.httpx, "AsyncClient", factory):
-        result = await reservation_guard.find_blocking_reservations(topology_id, "tok")
+        result = await reservation_guard.find_blocking_reservations(topology_id)
     assert result == []
 
 

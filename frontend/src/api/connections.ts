@@ -54,28 +54,6 @@ export function useDeviceConnections(deviceId: string | undefined) {
   });
 }
 
-export function useMultiDeviceConnections(deviceIds: string[]) {
-  const key = deviceIds.slice().sort().join(",");
-  return useQuery({
-    queryKey: ["connections", "multi-device", key],
-    queryFn: async () => {
-      const all: Connection[] = [];
-      const seen = new Set<string>();
-      for (const id of deviceIds) {
-        const resp = await fetchPaginatedConnections(0, 500, id);
-        for (const conn of resp.items) {
-          if (!seen.has(conn.id)) {
-            seen.add(conn.id);
-            all.push(conn);
-          }
-        }
-      }
-      return all;
-    },
-    enabled: deviceIds.length > 0,
-  });
-}
-
 export function useCreateConnection() {
   const queryClient = useQueryClient();
   return useMutation({

@@ -494,5 +494,3 @@ CONFIG_SCHEMA = [
 ]
 
 REQUIRED_KEYS = [f["key"] for f in CONFIG_SCHEMA if f["required"]]
-
-GROUPS = list(dict.fromkeys(f["group"] for f in CONFIG_SCHEMA))
