@@ -679,6 +679,67 @@ async def test_release_exclusive_devices_best_effort_honors_caller_log_action(ca
     assert "reservation_provision_failed_release" not in actions
 
 
+@pytest.mark.asyncio
+async def test_release_exclusive_devices_best_effort_includes_user_id_when_supplied(caplog):
+    """When a caller passes user_id, it lands in the retry-exhausted error
+    log's extra (issue #599 part 1, gap 3: cancel/release both include the
+    acting user, which the helper did not carry before)."""
+    reservation_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    update_mock = AsyncMock(side_effect=RuntimeError("inventory 503"))
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[_make_device(DEVICE_A, exclusive=True)]),
+        ),
+        patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+        caplog.at_level("ERROR", logger="app.services.reservation_service"),
+    ):
+        await _release_exclusive_devices_best_effort(
+            reservation_id,
+            [DEVICE_A],
+            "reservation_cancel_release_failed",
+            user_id=user_id,
+        )
+
+    failed = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "action", None) == "reservation_cancel_release_failed"
+    ]
+    assert failed, "expected structured log action=reservation_cancel_release_failed"
+    assert getattr(failed[0], "user_id", None) == str(user_id)
+
+
+@pytest.mark.asyncio
+async def test_release_exclusive_devices_best_effort_omits_user_id_by_default(caplog):
+    """Without a user_id argument, the retry-exhausted error log's extra has no
+    user_id key at all, byte-for-byte matching the helper's behavior before
+    this parameter existed (the provision-result and expiration-timeout
+    callers have no acting user in scope and must keep passing none)."""
+    reservation_id = uuid.uuid4()
+    update_mock = AsyncMock(side_effect=RuntimeError("inventory 503"))
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices_best_effort",
+            new=AsyncMock(return_value=[_make_device(DEVICE_A, exclusive=True)]),
+        ),
+        patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+        caplog.at_level("ERROR", logger="app.services.reservation_service"),
+    ):
+        await _release_exclusive_devices_best_effort(
+            reservation_id, [DEVICE_A], "reservation_provision_failed_release"
+        )
+
+    failed = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "action", None) == "reservation_provision_failed_release"
+    ]
+    assert failed, "expected structured log action=reservation_provision_failed_release"
+    assert not hasattr(failed[0], "user_id")
+
+
 # --- expiration_loop one-iteration exception handling ---
 
 

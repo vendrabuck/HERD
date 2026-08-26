@@ -1036,7 +1036,12 @@ def _reservation_failed_event(reservation: Reservation) -> dict:
 
 
 async def _release_exclusive_devices_best_effort(
-    reservation_id: uuid.UUID, device_ids: list[uuid.UUID], log_action: str
+    reservation_id: uuid.UUID,
+    device_ids: list[uuid.UUID],
+    log_action: str,
+    *,
+    context_label: str = "provision failure",
+    user_id: uuid.UUID | None = None,
 ) -> None:
     """Release a FAILED reservation's exclusive devices back to AVAILABLE.
 
@@ -1044,11 +1049,28 @@ async def _release_exclusive_devices_best_effort(
     excluded from the conflict status set, so devices left RESERVED would be
     orphaned (unbookable, nothing referencing them). Best-effort with bounded
     retry; the FAILED transition is already committed and is never reverted.
+
+    `context_label` names the caller's operation for the per-device fetch-
+    failure warning and the retry-exhausted error message (e.g. "cancel" or
+    "release"); it defaults to "provision failure" for the provision-result
+    and expiration-timeout callers, which pass none. `user_id` is optional:
+    when supplied it is added to the retry-exhausted error log's `extra`;
+    when omitted (the provision-result and expiration-timeout callers have no
+    acting user in scope) `extra` is unchanged from before this parameter
+    existed.
     """
     fetch_results = await _fetch_devices_best_effort(device_ids)
     exclusive_ids: list[uuid.UUID] = []
     for did, result in zip(device_ids, fetch_results):
-        if isinstance(result, BaseException) or result.get("exclusive", True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Could not fetch device %s during %s; assuming exclusive",
+                did,
+                context_label,
+                exc_info=result,
+            )
+            exclusive_ids.append(did)
+        elif result.get("exclusive", True):
             exclusive_ids.append(did)
     if not exclusive_ids:
         return
@@ -1061,14 +1083,18 @@ async def _release_exclusive_devices_best_effort(
             max_delay=5.0,
         )
     except Exception as exc:
+        extra = {
+            "action": log_action,
+            "reservation_id": str(reservation_id),
+            "device_ids": [str(d) for d in exclusive_ids],
+        }
+        if user_id is not None:
+            extra["user_id"] = str(user_id)
         logger.error(
-            "Inventory release failed after retries for failed reservation %s",
+            "Reservation %s: inventory release failed after retries for %s",
+            context_label,
             reservation_id,
-            extra={
-                "action": log_action,
-                "reservation_id": str(reservation_id),
-                "device_ids": [str(d) for d in exclusive_ids],
-            },
+            extra=extra,
             exc_info=exc,
         )
 
@@ -1914,41 +1940,13 @@ async def cancel_reservation(
     # booking is already CANCELLED at this point; if the inventory release
     # fails after retries we log it structured but do NOT revert the cancel
     # (a future reconciliation sweeper handles orphaned RESERVED rows).
-    device_ids = list(reservation.device_ids)
-    fetch_results = await _fetch_devices_best_effort(device_ids)
-    exclusive_ids: list[uuid.UUID] = []
-    for did, result in zip(device_ids, fetch_results):
-        if isinstance(result, BaseException):
-            logger.warning(
-                "Could not fetch device %s during cancel; assuming exclusive",
-                did,
-                exc_info=result,
-            )
-            exclusive_ids.append(did)
-        elif result.get("exclusive", True):
-            exclusive_ids.append(did)
-
-    if exclusive_ids:
-        try:
-            await retry_with_backoff(
-                lambda: _update_device_statuses(exclusive_ids, "AVAILABLE", raise_on_failure=True),
-                attempts=3,
-                initial_delay=0.5,
-                factor=2.0,
-                max_delay=5.0,
-            )
-        except Exception as exc:
-            logger.error(
-                "Reservation cancel: inventory release failed after retries for %s",
-                reservation_id,
-                extra={
-                    "action": "reservation_cancel_release_failed",
-                    "reservation_id": str(reservation_id),
-                    "user_id": str(user_id),
-                    "device_ids": [str(d) for d in exclusive_ids],
-                },
-                exc_info=exc,
-            )
+    await _release_exclusive_devices_best_effort(
+        reservation.id,
+        list(reservation.device_ids),
+        "reservation_cancel_release_failed",
+        context_label="cancel",
+        user_id=user_id,
+    )
 
     # Freeze the fork as the as-built record now that the reservation is CANCELLED
     # (ADR 0006 Decision 5). Best-effort: the cancel already committed and its
@@ -2003,41 +2001,13 @@ async def release_reservation(
     # Release exclusive devices back to AVAILABLE with bounded retry. Same
     # contract as cancel: reservation stays COMPLETED even if release fails;
     # the failure is structured-logged for a reconciliation sweeper to pick up.
-    device_ids = list(reservation.device_ids)
-    fetch_results = await _fetch_devices_best_effort(device_ids)
-    exclusive_ids: list[uuid.UUID] = []
-    for did, result in zip(device_ids, fetch_results):
-        if isinstance(result, BaseException):
-            logger.warning(
-                "Could not fetch device %s during release; assuming exclusive",
-                did,
-                exc_info=result,
-            )
-            exclusive_ids.append(did)
-        elif result.get("exclusive", True):
-            exclusive_ids.append(did)
-
-    if exclusive_ids:
-        try:
-            await retry_with_backoff(
-                lambda: _update_device_statuses(exclusive_ids, "AVAILABLE", raise_on_failure=True),
-                attempts=3,
-                initial_delay=0.5,
-                factor=2.0,
-                max_delay=5.0,
-            )
-        except Exception as exc:
-            logger.error(
-                "Reservation release: inventory release failed after retries for %s",
-                reservation_id,
-                extra={
-                    "action": "reservation_release_inventory_failed",
-                    "reservation_id": str(reservation_id),
-                    "user_id": str(user_id),
-                    "device_ids": [str(d) for d in exclusive_ids],
-                },
-                exc_info=exc,
-            )
+    await _release_exclusive_devices_best_effort(
+        reservation.id,
+        list(reservation.device_ids),
+        "reservation_release_inventory_failed",
+        context_label="release",
+        user_id=user_id,
+    )
 
     # Freeze the fork as the as-built record now that the reservation is COMPLETED
     # (ADR 0006 Decision 5). Best-effort, mirroring cancel: COMPLETED already
