@@ -10,11 +10,12 @@ This is the ONLY file in the orchestrator that imports `anthropic`.
 from __future__ import annotations
 
 import asyncio
+import ssl
 from collections.abc import AsyncIterator
 from typing import Any
 
-import httpx
-from anthropic import APIConnectionError, AsyncAnthropic
+import httpx2 as httpx
+from anthropic import APIConnectionError, AsyncAnthropic, DefaultAsyncHttpxClient
 
 from app.services.llm_provider import (
     AIError,
@@ -36,7 +37,30 @@ from app.services.llm_provider import (
     ToolUseBlock,
     Usage,
 )
-from app.services.providers.openai_provider import _build_http_client
+
+
+def _build_anthropic_http_client(
+    *, verify_tls: bool, ca_cert: str | None
+) -> DefaultAsyncHttpxClient | None:
+    """Build the httpx2 client for the Anthropic SDK based on the endpoint's TLS needs.
+
+    Precedence (mirrors openai_provider._build_http_client, kept separate per SDK
+    since anthropic 1.x is built on httpx2 and rejects a plain httpx.AsyncClient):
+      ca_cert set      -> verify against that CA bundle (e.g. a pinned self-signed
+                          on-prem cert); verification stays ON and fails closed.
+      verify_tls False -> skip verification (self-signed endpoint, no pinned cert).
+      otherwise        -> None, letting the SDK use default system-CA verification.
+
+    anthropic.DefaultAsyncHttpxClient subclasses httpx2's AsyncClient and preserves
+    the SDK's own default timeouts and connection limits, so it is used here instead
+    of a bare httpx2.AsyncClient.
+    """
+    if ca_cert:
+        ctx = ssl.create_default_context(cafile=ca_cert)
+        return DefaultAsyncHttpxClient(verify=ctx)
+    if not verify_tls:
+        return DefaultAsyncHttpxClient(verify=False)
+    return None
 
 
 class AnthropicProvider:
@@ -62,7 +86,7 @@ class AnthropicProvider:
         # per-call bound is enforced upstream by asyncio.wait_for(timeout_s) in call(),
         # so a generous SDK timeout here just clears that pre-flight guard without
         # changing the effective deadline.
-        http_client = _build_http_client(verify_tls=verify_tls, ca_cert=ca_cert)
+        http_client = _build_anthropic_http_client(verify_tls=verify_tls, ca_cert=ca_cert)
         self._client = AsyncAnthropic(
             api_key=api_key or "EMPTY",
             base_url=base_url,

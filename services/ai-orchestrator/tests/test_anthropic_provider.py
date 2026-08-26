@@ -6,7 +6,7 @@ test_ai_client.py.
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.services.llm_provider import (
@@ -24,6 +24,7 @@ from app.services.llm_provider import (
 from app.services.providers.anthropic_provider import (
     AnthropicProvider,
     _block_to_anthropic,
+    _build_anthropic_http_client,
     _message_to_anthropic,
     _response_from_anthropic,
     _stop_reason_from_anthropic,
@@ -63,6 +64,64 @@ def test_init_sets_explicit_client_timeout():
     call(). Pin the timeout so the guard fix does not silently regress."""
     provider = AnthropicProvider(api_key="sk-ant-fake", model="claude-test")
     assert provider._client.timeout == 1800.0
+
+
+def test_init_with_verify_tls_false_does_not_raise():
+    """Regression test for the anthropic SDK 1.x migration (issue #592): under
+    0.x, AsyncAnthropic accepted a plain httpx.AsyncClient as http_client=; under
+    1.x (built on httpx2) that raised TypeError: Expected an instance of
+    httpx2.AsyncClient. Constructing with verify_tls=False builds a real
+    non-verifying httpx2 client and must not raise."""
+    provider = AnthropicProvider(
+        api_key="",
+        base_url="https://self-signed.test:8443",
+        model="claude-test",
+        verify_tls=False,
+    )
+    assert provider._model == "claude-test"
+
+
+# --- _build_anthropic_http_client (verify_tls / ca_cert precedence) ---
+
+
+def test_build_http_client_default_returns_none():
+    """verify_tls=True (the default) with no ca_cert returns None, so the SDK
+    falls back to its own default client and default system-CA verification."""
+    assert _build_anthropic_http_client(verify_tls=True, ca_cert=None) is None
+
+
+def test_build_http_client_verify_tls_false_returns_non_verifying_client():
+    """verify_tls=False builds an anthropic.DefaultAsyncHttpxClient with
+    verification off (self-signed on-prem endpoint, no pinned cert)."""
+    sentinel = object()
+    with patch(
+        "app.services.providers.anthropic_provider.DefaultAsyncHttpxClient",
+        return_value=sentinel,
+    ) as mock_client:
+        result = _build_anthropic_http_client(verify_tls=False, ca_cert=None)
+    mock_client.assert_called_once_with(verify=False)
+    assert result is sentinel
+
+
+def test_build_http_client_ca_cert_verifies_against_bundle_and_takes_precedence():
+    """ca_cert builds an SSL context from the bundle and verifies against it
+    (fail-closed), overriding verify_tls."""
+    client_sentinel = object()
+    ctx_sentinel = object()
+    with (
+        patch(
+            "app.services.providers.anthropic_provider.ssl.create_default_context",
+            return_value=ctx_sentinel,
+        ) as mock_ctx,
+        patch(
+            "app.services.providers.anthropic_provider.DefaultAsyncHttpxClient",
+            return_value=client_sentinel,
+        ) as mock_client,
+    ):
+        result = _build_anthropic_http_client(verify_tls=True, ca_cert="/certs/spark-ca.pem")
+    mock_ctx.assert_called_once_with(cafile="/certs/spark-ca.pem")
+    mock_client.assert_called_once_with(verify=ctx_sentinel)
+    assert result is client_sentinel
 
 
 def _sdk_tool_use(name="t", args=None, block_id="toolu_001"):
@@ -306,6 +365,35 @@ async def test_call_maps_connection_error_to_unavailable():
     req = httpx.Request("POST", "https://api.anthropic.test/v1/messages")
     provider._client = SimpleNamespace(
         messages=SimpleNamespace(create=AsyncMock(side_effect=APIConnectionError(request=req)))
+    )
+    with pytest.raises(AIProviderUnavailableError):
+        await provider.call(
+            system="sys",
+            messages=[Message(role="user", content=[TextBlock(text="hi")])],
+            tools=None,
+            tool_choice=ToolChoiceAuto(),
+            max_tokens=100,
+            timeout_s=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_call_maps_raw_httpx2_transport_error_to_unavailable():
+    """A raw httpx2.ConnectError that reaches the call boundary unwrapped (rather
+    than the SDK's own APIConnectionError) is also classified as unreachable
+    (belt-and-suspenders for the SDK connection type; mirrors
+    test_openai_provider.test_call_maps_raw_httpx_transport_error_to_unavailable).
+    This is the exception-type match the anthropic SDK 1.x migration (issue #592)
+    depends on: the except clause catches httpx2.TransportError, so it must match
+    what the 1.x SDK actually raises."""
+    import httpx2
+    from app.services.llm_provider import AIProviderUnavailableError
+
+    provider = AnthropicProvider(api_key="sk-ant-fake", model="claude-opus-4-7")
+    provider._client = SimpleNamespace(
+        messages=SimpleNamespace(
+            create=AsyncMock(side_effect=httpx2.ConnectError("connection refused"))
+        )
     )
     with pytest.raises(AIProviderUnavailableError):
         await provider.call(
