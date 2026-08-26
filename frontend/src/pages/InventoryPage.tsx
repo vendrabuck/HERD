@@ -8,6 +8,7 @@ import { exportDevices, importDevices } from "@/api/bulk";
 import { fetchPorts, useCreatePort, usePorts } from "@/api/ports";
 import { useDeviceConnections } from "@/api/connections";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
@@ -199,7 +200,7 @@ export function InventoryPage() {
   const createPort = useCreatePort();
   const deleteDevice = useDeleteDevice();
   const user = useAuthStore((s) => s.user);
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
   const queryClient = useQueryClient();
 
   const storedSearch = usePreferencesStore((s) =>

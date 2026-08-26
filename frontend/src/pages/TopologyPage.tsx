@@ -8,6 +8,7 @@ import {
   useCloneTopology,
 } from "@/api/topologies";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
@@ -89,7 +90,7 @@ export function TopologyPage() {
   const [cloneSource, setCloneSource] = useState<Topology | null>(null);
   const [cloneName, setCloneName] = useState("");
 
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();

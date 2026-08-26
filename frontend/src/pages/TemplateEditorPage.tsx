@@ -10,6 +10,7 @@ import { useDrivers } from "@/api/drivers";
 import { useHypervisors } from "@/api/hypervisors";
 import { useAIStatus, useSuggestTemplateIdentity } from "@/api/ai";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { FieldRow } from "@/components/templates/FieldRow";
 import type {
   FieldDefinition,
@@ -48,7 +49,7 @@ export function TemplateEditorPage() {
   const { data: aiStatus } = useAIStatus();
   const suggestIdentity = useSuggestTemplateIdentity();
   const user = useAuthStore((s) => s.user);
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
 
   const [editing, setEditing] = useState(isNew);
   const [name, setName] = useState("");

@@ -9,6 +9,7 @@ import {
 import type { TopologyTemplate } from "@/api/topologyTemplates";
 import { useDevices } from "@/api/inventory";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
@@ -16,7 +17,7 @@ import toast from "react-hot-toast";
 
 export function TopologyTemplatesPage() {
   const user = useAuthStore((s) => s.user);
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
   const navigate = useNavigate();
 
   const [skip, setSkip] = useState(0);

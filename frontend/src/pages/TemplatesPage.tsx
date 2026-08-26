@@ -4,6 +4,7 @@ import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedTemplates, useDeleteTemplate, useCreateTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import { BulkImportExport } from "@/components/ui/BulkImportExport";
@@ -45,7 +46,7 @@ export function TemplatesPage() {
   const deleteTemplate = useDeleteTemplate();
   const createTemplate = useCreateTemplate();
   const user = useAuthStore((s) => s.user);
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
   const queryClient = useQueryClient();
 
   const [deleteTarget, setDeleteTarget] = useState<DeviceTemplate | null>(null);

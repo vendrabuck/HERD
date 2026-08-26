@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 
 export function AuthGuard({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -21,7 +22,7 @@ export function GuestGuard({ children }: { children: React.ReactNode }) {
 export function AdminGuard({ children }: { children: React.ReactNode }) {
   const user = useAuthStore((s) => s.user);
   const navigate = useNavigate();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
 
   useEffect(() => {
     if (user && !isAdmin) {
