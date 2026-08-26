@@ -445,21 +445,31 @@ export function MultiConnectDialog({ open, onSubmit, onSuccess, onCancel }: Mult
     }
     const freeSource = filteredSourcePorts.filter((p) => sourceVisuals.get(p.id)?.status === "free");
     const freeTarget = filteredTargetPorts.filter((p) => targetVisuals.get(p.id)?.status === "free");
-    const n = Math.min(freeSource.length, freeTarget.length);
-    if (n === 0) {
-      setErrorMessage("No free ports left to pair");
-      return;
-    }
     const added: StagedLine[] = [];
-    for (let i = 0; i < n; i++) {
-      // Same-device selection lines both columns up identically, so pairing in
-      // order would connect every port to itself; skip those rows.
-      if (freeSource[i].id === freeTarget[i].id) continue;
-      added.push(buildLine(freeSource[i], freeTarget[i]));
-    }
-    if (added.length === 0) {
-      setErrorMessage("No free ports left to pair");
-      return;
+    if (deviceA.id === deviceB.id) {
+      // Both columns list the same device's ports (loopback cabling), so
+      // index-aligned pairing would connect every port to itself. Instead,
+      // intersect the two independently-filtered free-port lists by id (in
+      // source-column order) and pair adjacent entries: (p1,p2), (p3,p4), ...
+      // An odd port left over stays unpaired, and no port appears twice.
+      const freeTargetIds = new Set(freeTarget.map((p) => p.id));
+      const pairable = freeSource.filter((p) => freeTargetIds.has(p.id));
+      if (pairable.length < 2) {
+        setErrorMessage("Need at least two free ports to pair");
+        return;
+      }
+      for (let i = 0; i + 1 < pairable.length; i += 2) {
+        added.push(buildLine(pairable[i], pairable[i + 1]));
+      }
+    } else {
+      const n = Math.min(freeSource.length, freeTarget.length);
+      if (n === 0) {
+        setErrorMessage("No free ports left to pair");
+        return;
+      }
+      for (let i = 0; i < n; i++) {
+        added.push(buildLine(freeSource[i], freeTarget[i]));
+      }
     }
     setLines((prev) => [...prev, ...added]);
     setPendingSource(null);

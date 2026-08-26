@@ -131,6 +131,28 @@ function ports(count: number, deviceId: string, prefix: string): Port[] {
   }));
 }
 
+// Five ports on ONE device, for the same-device ("loopback") 1:1 pairing
+// tests below: enough ports to exercise adjacency, an odd leftover, and a
+// manual line that consumes non-adjacent ports first.
+const LOOPBACK_PORTS = ports(5, SOURCE_DEVICE, "lb");
+
+// A single free port on one device: never enough to form one pair.
+const SOLO_LOOPBACK_PORT = ports(1, SOURCE_DEVICE, "solo");
+
+// Three ports on one device, named so a substring filter can hide exactly
+// one of them (the renamed "bb-3") from a single column.
+const FILTER_LOOPBACK_PORTS: Port[] = ports(3, SOURCE_DEVICE, "aa").map((p, i) =>
+  i === 2 ? { ...p, name: "bb-3" } : p,
+);
+
+function mockLoopbackPorts(list: Port[]) {
+  mockUsePorts.mockImplementation((deviceId: string) =>
+    deviceId === SOURCE_DEVICE
+      ? { data: list, isLoading: false }
+      : { data: EMPTY_PORTS, isLoading: false },
+  );
+}
+
 describe("MultiConnectDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -382,47 +404,94 @@ describe("MultiConnectDialog", () => {
     expect(screen.getByRole("button", { name: "Create connections" })).toBeDisabled();
   });
 
-  it("Connect 1:1 in order never stages a self-pair when the same device is picked on both sides", () => {
-    // freeSource and freeTarget are built from the identical `ports` array (one
-    // usePorts(deviceId) call, same TanStack Query cache entry for both sides),
-    // filtered by the identical usedPortKeys set, so they are the SAME list in
-    // the SAME order at every index: freeSource[i].id === freeTarget[i].id for
-    // every i, and the self-pair-skip branch (lines ~454-457) continues past
-    // EVERY index. Net effect: zero lines get staged, not a shifted pairing
-    // over the remaining ports. This pins that actual behavior; no staged line
-    // ever has sourcePortId === targetPortId, but "pairing proceeds over the
-    // remaining ports" does not hold for a fully-identical device pick with
-    // this positional algorithm (see issue #575 item 6 follow-up note).
+  it("Connect 1:1 in order pairs adjacent free ports when the same device is picked on both sides", () => {
+    // Both columns list the same device's ports (loopback cabling): pairing
+    // by column index would connect every port to itself (issue #585), so
+    // instead the free ports are paired ADJACENTLY: (eth1, eth2), with the
+    // odd eth3 left over.
     render(<MultiConnectDialog {...baseProps()} />);
     pickBothDevices(DEVICE_A_NAME, DEVICE_A_NAME);
 
     fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
 
-    expect(screen.getByText("No free ports left to pair")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Review (0)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create 1 connection" })).toBeEnabled();
+    expect(screen.getByLabelText("Select line eth1 to eth2")).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^Select line /)).toHaveLength(1);
+    // eth3 is the odd leftover: still free, in neither staged line.
+    const [eth3Row] = screen.getAllByTestId("port-row-sp3");
+    expect(eth3Row.getAttribute("data-status")).toBe("free");
+  });
+
+  it("Connect 1:1 in order leaves an odd free port unpaired on a same-device pick", () => {
+    mockLoopbackPorts(LOOPBACK_PORTS);
+    render(<MultiConnectDialog {...baseProps()} />);
+    pickBothDevices(DEVICE_A_NAME, DEVICE_A_NAME);
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
+
+    expect(screen.getByRole("button", { name: "Create 2 connections" })).toBeEnabled();
+    expect(screen.getByLabelText("Select line lb-0 to lb-1")).toBeInTheDocument();
+    expect(screen.getByLabelText("Select line lb-2 to lb-3")).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^Select line /)).toHaveLength(2);
+    // lb-4 is the odd leftover: still free, in neither staged line.
+    const [lb4Row] = screen.getAllByTestId("port-row-lb4");
+    expect(lb4Row.getAttribute("data-status")).toBe("free");
+  });
+
+  it("Connect 1:1 in order pairs the remaining free ports adjacently after a manual asymmetric line, never reusing a used port", () => {
+    // Stage lb0(source) <-> lb2(target) manually first (a non-adjacent pair,
+    // so the remaining free ports are lb1, lb3, lb4, not a clean prefix).
+    // Both lb0 and lb2 become unavailable on BOTH sides (same device), so the
+    // bulk pairing must skip them entirely rather than reusing either, and
+    // pair what remains ADJACENTLY: (lb1, lb3), with lb4 left over.
+    mockLoopbackPorts(LOOPBACK_PORTS);
+    render(<MultiConnectDialog {...baseProps()} />);
+    pickBothDevices(DEVICE_A_NAME, DEVICE_A_NAME);
+    const [sourceLb0] = screen.getAllByTestId("port-row-lb0");
+    const [, targetLb2] = screen.getAllByTestId("port-row-lb2");
+    clickRow(sourceLb0);
+    clickRow(targetLb2);
+    expect(screen.getByRole("button", { name: "Review (1)" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
+
+    expect(screen.getByRole("button", { name: "Create 2 connections" })).toBeEnabled();
+    expect(screen.getByLabelText("Select line lb-0 to lb-2")).toBeInTheDocument();
+    expect(screen.getByLabelText("Select line lb-1 to lb-3")).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^Select line /)).toHaveLength(2);
+    const [lb4Row] = screen.getAllByTestId("port-row-lb4");
+    expect(lb4Row.getAttribute("data-status")).toBe("free");
+  });
+
+  it("Connect 1:1 in order requires at least two free ports on a same-device pick", () => {
+    mockLoopbackPorts(SOLO_LOOPBACK_PORT);
+    render(<MultiConnectDialog {...baseProps()} />);
+    pickBothDevices(DEVICE_A_NAME, DEVICE_A_NAME);
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
+
+    expect(screen.getByText("Need at least two free ports to pair")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create connections" })).toBeDisabled();
   });
 
-  it("Connect 1:1 in order still cannot pair the same device's remaining free port after an asymmetric manual line", () => {
-    // Stage eth1(source) <-> eth2(target) manually first, leaving eth3 free on
-    // BOTH sides. Even with only one free port left on each side, the two free
-    // lists are still index-identical ([eth3] === [eth3]), so the bulk pairing
-    // still skips it rather than connecting eth3 to itself or leaving it
-    // otherwise unstaged: confirms the gap is structural (identical free
-    // lists), not a matter of how many free ports remain.
+  it("Connect 1:1 in order intersects the two columns' filters before pairing on a same-device pick", () => {
+    // FILTER_LOOPBACK_PORTS is aa-0, aa-1, bb-3. Filtering the target column
+    // to "aa" hides bb-3 there while it stays visible (and free) in the
+    // unfiltered source column: bb-3 must NOT be paired, since a port only
+    // visible in one column is not pairable in either direction.
+    mockLoopbackPorts(FILTER_LOOPBACK_PORTS);
     render(<MultiConnectDialog {...baseProps()} />);
     pickBothDevices(DEVICE_A_NAME, DEVICE_A_NAME);
-    const [sourceEth1] = screen.getAllByTestId("port-row-sp1");
-    const [, targetEth2] = screen.getAllByTestId("port-row-sp2");
-    clickRow(sourceEth1);
-    clickRow(targetEth2);
-    expect(screen.getByRole("button", { name: "Review (1)" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Filter target ports"), { target: { value: "aa" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Connect 1:1 in order" }));
 
-    // No new line staged, and the one manually-staged line never self-pairs.
-    expect(screen.getByText("No free ports left to pair")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Review (1)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create 1 connection" })).toBeEnabled();
+    expect(screen.getByLabelText("Select line aa-0 to aa-1")).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^Select line /)).toHaveLength(1);
+    // bb-3 only renders in the (unfiltered) source column now.
+    const bb3Row = screen.getByTestId("port-row-aa2");
+    expect(bb3Row.getAttribute("data-status")).toBe("free");
   });
 
   it("stamps the batch connection type and notes onto every submitted item", async () => {
