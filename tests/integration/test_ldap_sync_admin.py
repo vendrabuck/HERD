@@ -47,10 +47,13 @@ processes contending for the same advisory lock and is covered directly
 against real Postgres by services/auth/tests/test_ldap_sync_service_live_pg.py
 (run by the Makefile's sibling _gate-pg-live-tests phase, not from here).
 
-Cleanup: the mapping and group this file creates are deleted via the API, and
-the promoted user's row is deleted directly in Postgres, in a module-scoped
-fixture teardown, so a re-run of this file (or a later gate phase: seeding,
-load tests) sees the stack's baseline state again.
+Cleanup: the mapping and group this file creates are deleted via the API
+first (mapped_group's teardown), then every ldapit-% row in auth.users is
+deleted directly in Postgres (superadmin_token's teardown, which runs after,
+per fixture reverse-dependency order): this covers both the promoted
+ldapit-admin row and the ldapit-eng1..3 rows the sync run JIT-provisions
+while reconciling group membership, so a re-run of this file (or a later
+gate phase: seeding, load tests) sees the stack's baseline state again.
 """
 
 from __future__ import annotations
@@ -58,13 +61,12 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-import subprocess
 import time
 import uuid
-from pathlib import Path
 
 import httpx
 import pytest
+from conftest import _psql
 
 LDAP_HOST = os.getenv("HERD_TEST_LDAP_HOST", "127.0.0.1")
 LDAP_PORT = int(os.getenv("HERD_TEST_LDAP_PORT", "389"))
@@ -76,7 +78,6 @@ LDAP_SYNC_ADMIN_USER = os.getenv("HERD_TEST_LDAP_SYNC_ADMIN_USER", "ldapit-admin
 LDAP_PASSWORD = os.getenv("HERD_TEST_LDAP_PASSWORD", "Password1")
 
 BASE_URL = os.getenv("HERD_BASE_URL", "https://localhost/api")
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The herd-it-eng directory group (infra/ldap-test/ldif/70-seed-integration.ldif):
 # a fully-resolvable groupOfNames with three dedicated ldapit-eng members (see
@@ -120,48 +121,14 @@ async def _login(email: str, password: str) -> dict:
         return resp.json()
 
 
-def _psql(sql: str) -> "subprocess.CompletedProcess[str]":
-    """Run one statement inside the running stack's postgres container.
-
-    Bare `docker compose` (no -p), so COMPOSE_PROJECT_NAME from the calling
-    environment picks the target project, matching the outbox durability
-    test's `_run_compose` helper and the Makefile's gate-phase convention
-    (make exports command-line variable overrides into recipe environments).
-    """
-    pguser = os.getenv("POSTGRES_USER", "herd")
-    pgdb = os.getenv("POSTGRES_DB", "herd")
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        pguser,
-        "-d",
-        pgdb,
-        "-c",
-        sql,
-    ]
-    try:
-        return subprocess.run(
-            cmd,
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
-        pytest.skip(f"docker compose exec not usable from this host: {exc}")
-
-
 async def _poll_run(client: httpx.AsyncClient, run_id: str, timeout: float = 60.0) -> dict:
-    """Poll GET /admin/ldap-sync/runs/{id} until it leaves status 'running'."""
+    """Poll GET /auth/admin/ldap-sync/runs/{id} until it leaves status 'running'."""
     deadline = time.monotonic() + timeout
     while True:
-        resp = await client.get(f"/admin/ldap-sync/runs/{run_id}")
-        resp.raise_for_status()
+        resp = await client.get(f"/auth/admin/ldap-sync/runs/{run_id}")
+        assert resp.status_code == 200, (
+            f"GET admin/ldap-sync/runs/{run_id} failed: {resp.status_code} {resp.text}"
+        )
         run = resp.json()
         if run["status"] != "running":
             return run
@@ -173,10 +140,18 @@ async def _poll_run(client: httpx.AsyncClient, run_id: str, timeout: float = 60.
 @pytest.fixture(scope="module")
 def superadmin_token():
     """Promote LDAP_SYNC_ADMIN_USER (ldapit-admin) to superadmin out-of-band
-    (see module docstring) and return a fresh JWT for it. Deletes the row at
-    module teardown, after mapped_group's own teardown has removed the
-    mapping and group (fixture teardown runs in reverse dependency order, so
-    that happens first).
+    (see module docstring) and return a fresh JWT for it.
+
+    Module teardown sweeps every ldapit-% row in auth.users, not just this
+    one: the sync run in test_sync_run_reconciles_group_membership_from_
+    directory JIT-provisions ldapit-eng1..3 too (auth_source='ldap', since
+    they resolve as new local rows the first time the reconciler adds them
+    to the mapped HERD group), and those would otherwise linger. This runs
+    after mapped_group's own teardown has removed the mapping and group
+    (fixture teardown runs in reverse dependency order, so that happens
+    first; the FKs from group_members/refresh_tokens to users.id are all
+    ON DELETE CASCADE or SET NULL per the models, so the wildcard delete
+    below needs no separate dependent-row cleanup either way).
     """
     asyncio.run(_login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD))  # JIT-provisions the row
 
@@ -189,7 +164,7 @@ def superadmin_token():
     tokens = asyncio.run(_login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD))
     yield tokens["access_token"]
 
-    _psql(f"DELETE FROM auth.users WHERE username='{LDAP_SYNC_ADMIN_USER}'")
+    _psql("DELETE FROM auth.users WHERE username LIKE 'ldapit-%'")
 
 
 @pytest.fixture(scope="module")

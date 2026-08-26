@@ -7,6 +7,7 @@ demand. Integration tests do NOT rely on `seed_devices.py` having been run.
 
 import io
 import os
+import subprocess
 import sys
 import tarfile
 import uuid
@@ -19,6 +20,8 @@ import pytest
 # from the repo root, which is not in sys.path for this directory.
 sys.path.insert(0, str(Path(__file__).parent))
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _load_repo_env() -> None:
     """Populate os.environ from the repo-root .env, matching docker-compose.
@@ -28,7 +31,7 @@ def _load_repo_env() -> None:
     wiring-check tests flap. Existing env vars win so callers can still
     override per-run.
     """
-    env_path = Path(__file__).resolve().parents[2] / ".env"
+    env_path = REPO_ROOT / ".env"
     if not env_path.is_file():
         return
     for raw in env_path.read_text().splitlines():
@@ -42,6 +45,39 @@ def _load_repo_env() -> None:
 
 
 _load_repo_env()
+
+
+def _psql(sql: str, *, tuples_only: bool = False) -> "subprocess.CompletedProcess[str]":
+    """Run one statement inside the running stack's postgres container.
+
+    Bare `docker compose` (no -p), so COMPOSE_PROJECT_NAME from the calling
+    environment picks the target project, matching
+    tests/integration/test_outbox_durability.py's `_run_compose` helper and
+    the Makefile gate-phase convention (make exports command-line variable
+    overrides into recipe environments). Shared here (rather than duplicated
+    per-file) by tests/integration/test_ldap_auth.py and
+    test_ldap_sync_admin.py, both of which need a Postgres read/write with
+    no API path in LDAP mode (see their module docstrings).
+
+    tuples_only adds psql's `-tA` (tuples-only, unaligned), for a bare value
+    with no header/row-count noise, e.g. a single-column SELECT read-back.
+    """
+    pguser = os.getenv("POSTGRES_USER", "herd")
+    pgdb = os.getenv("POSTGRES_DB", "herd")
+    cmd = ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", pguser, "-d", pgdb]
+    if tuples_only:
+        cmd.append("-tA")
+    cmd += ["-c", sql]
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker compose exec not usable from this host: {exc}")
 
 
 BASE_URL = os.getenv("HERD_BASE_URL", "https://localhost/api")
