@@ -3,6 +3,25 @@
 # second pass of contract + integration without -x so a regression reports the
 # full failure set instead of stopping at the first one. workflow_dispatch
 # lets a reviewer run this on any branch before merging a frontend-heavy PR.
+#
+# Also runs the LDAP-mode stack coverage the master/everything gates run
+# (issue #572): infra/ldap-test boots alongside the stack, and after e2e the
+# stack's auth service is switched to LDAP mode, tests/integration/
+# test_ldap_auth.py and test_ldap_sync_admin.py run against it, and the
+# Postgres-live LDAP sync suites run against the stack's own Postgres, via
+# `make _gate-ldap-stack-tests` / `make _gate-pg-live-tests` (the same
+# internal targets master/everything use, see the Makefile's LDAP comment
+# block). Unlike those gates, this job never passes -p to `docker compose`
+# (`docker compose build` / `up -d` above use the plain default project), so
+# COMPOSE_PROJECT_NAME is set explicitly to match: actions/checkout@v7 checks
+# this repository out into $GITHUB_WORKSPACE, which the runner sets to
+# <work>/<repo-name>/<repo-name>; this repository's GitHub name is "HERD"
+# (`gh repo view` on this remote reports name "HERD", nameWithOwner
+# "vendrabuck/HERD", independent of the local clone directory's own name), so
+# the checkout directory basename is "HERD" and `docker compose`'s default
+# project-name derivation (lowercase, invalid characters stripped; "HERD" has
+# none) resolves to "herd" -- the same project docker compose itself already
+# uses for every other step in this job.
 name: Nightly
 
 on:
@@ -53,6 +72,9 @@ jobs:
       - name: Build images
         run: docker compose build
 
+      - name: Start LDAP test server
+        run: make ldap-up
+
       - name: Start stack
         run: docker compose up -d
 
@@ -72,6 +94,16 @@ jobs:
 
       - name: E2E tests (Selenium + Playwright)
         run: make test-e2e
+
+      - name: LDAP-mode stack tests
+        run: make _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=herd
+
+      - name: Postgres-live LDAP sync tests
+        run: make _gate-pg-live-tests
+
+      - name: Stop LDAP test server
+        if: always()
+        run: make ldap-down
 
       - name: Seed stack for load test
         run: make seed

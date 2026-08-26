@@ -6,8 +6,11 @@
 # LDAP_DOMAIN and the cn=admin bind account from LDAP_ADMIN_PASSWORD; the
 # mounted LDIF in ./ldif adds ou=people and the fixture users the tests
 # assert (user1..user25 / Password1), plus the ou=groups fixtures for the
-# ADR 0011 group-sync tests (60-seed-groups.ldif). --copy-service is
-# required for the bootstrap LDIF mount to be picked up.
+# ADR 0011 group-sync tests (60-seed-groups.ldif), plus dedicated ldapit-*
+# identities and their own directory group for the stack-level integration
+# tests (70-seed-integration.ldif, issue #572: the seeded userN/herd-eng
+# fixtures collide with a `make seed`-seeded stack's local users).
+# --copy-service is required for the bootstrap LDIF mount to be picked up.
 #
 # Deliberately stateless: no named volumes, so `docker compose down` discards
 # the directory and the next `up` reseeds it from the LDIF. Plain LDAP on
@@ -33,7 +36,9 @@ services:
       # Probes the LAST entry of the LAST bootstrap LDIF file (they apply
       # sequentially in filename order against a running slapd), so healthy
       # means fully seeded, not merely that slapd answers or that an earlier
-      # file has landed.
+      # file has landed. That entry is cn=herd-it-eng, the last group in
+      # 70-seed-integration.ldif (issue #572); it was cn=herd-stale, from
+      # 60-seed-groups.ldif, before that file existed.
       test:
         [
           "CMD",
@@ -47,7 +52,7 @@ services:
           "cn=admin,dc=company,dc=local",
           "-w",
           "admin",
-          "(cn=herd-stale)",
+          "(cn=herd-it-eng)",
         ]
       interval: 3s
       timeout: 5s

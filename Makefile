@@ -50,6 +50,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
+	_gate-ldap-stack-tests _gate-pg-live-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images
 
 ## --- Meta ---
@@ -156,7 +157,11 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + epheme
 		echo "" && echo "=== Integration tests ===" && \
 		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
-		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
+		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
+		$(MAKE) _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== Postgres-live LDAP sync tests ===" && \
+		$(MAKE) _gate-pg-live-tests
 	@echo ""
 	@echo "=== master complete ==="
 
@@ -248,6 +253,10 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
+		$(MAKE) _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== Postgres-live LDAP sync tests ===" && \
+		$(MAKE) _gate-pg-live-tests && \
 		echo "" && echo "=== Seeding gate stack ===" && \
 		$(MAKE) _everything-seed && \
 		if [ "$(EVERYTHING_LOAD)" != "0" ]; then \
@@ -428,17 +437,60 @@ test-e2e-stop:  ## Stop and remove the e2e Selenium container
 #
 # A checked-in osixia/openldap compose file under infra/ldap-test seeds the
 # exact fixtures the live-LDAP auth tests assert (user1..user25, Password1,
-# dc=company,dc=local). It is stateless: down discards the directory, up
-# reseeds it from the bundled LDIF. The compose healthcheck searches for
-# uid=user1 as cn=admin, so `up --wait` returns only once the seed is
-# actually queryable, not merely once slapd answers.
+# dc=company,dc=local), plus dedicated ldapit-* identities for the
+# stack-level integration tests (70-seed-integration.ldif, issue #572). It is
+# stateless: down discards the directory, up reseeds it from the bundled
+# LDIF. The compose healthcheck, bound as cn=admin, searches for
+# cn=herd-it-eng (the last entry of the last LDIF file), so `up --wait`
+# returns only once the seed is actually fully queryable, not merely once
+# slapd answers.
 #
 # The master and everything gates run these tests through _gate-ldap-tests,
 # which hard-requires the server (HERD_TEST_LDAP_REQUIRED=1 turns the
 # unreachable-server skip into a failure) and stops it afterward only if the
 # gate started it; a server you started yourself is left running.
+#
+# _gate-ldap-tests only proves the directory itself answers correctly
+# (services/auth/tests/test_ldap_service_live.py, no HERD stack involved). Two
+# later, sibling phases close the rest of the gap (issue #572), both run
+# after test-e2e in both master and everything:
+#
+#   _gate-ldap-stack-tests proves the STACK can actually authenticate
+#   against the directory: the ephemeral gate stack always boots with
+#   AUTH_METHOD=local, so tests/integration/test_ldap_auth.py and the new
+#   tests/integration/test_ldap_sync_admin.py were never exercised by any
+#   gate before this. It connects ldap-test onto the gate project's network,
+#   recreates ONLY the gate's auth service in LDAP mode (--no-deps
+#   --force-recreate, so postgres/nats/etc keep running), runs those two
+#   integration files, then ALWAYS restores auth to local mode and
+#   disconnects the network before any later phase (seeding, load tests)
+#   runs, so master/everything still end on a local-auth stack. Its recipe
+#   deliberately never calls $(MAKE) (see the target's own comment) so
+#   `make -n` stays a genuine dry run.
+#
+#   _gate-pg-live-tests runs right after it: the Postgres-live LDAP sync
+#   suites (services/auth/tests/test_ldap_sync_service_live_pg.py and
+#   services/common/tests/test_advisory_lock_live_pg.py, hard-required via
+#   HERD_TEST_PG_REQUIRED=1) against the gate stack's own Postgres. It needs
+#   no LDAP mode, so it is a separate step rather than nested inside
+#   _gate-ldap-stack-tests.
 
-LDAP_COMPOSE := docker compose -f infra/ldap-test/docker-compose.yml
+# Pinned with -p (not left to the compose file's own `name: herd-ldap-test`)
+# after an incident on 2026-08-26: COMPOSE_PROJECT_NAME is exported into
+# _gate-ldap-stack-tests' recipe environment (that is how the gate targets
+# pass it along), and a COMPOSE_PROJECT_NAME env var outranks a compose
+# file's `name:` attribute in project-name resolution, so every bare
+# $(LDAP_COMPOSE) call was silently resolving to the GATE project instead of
+# herd-ldap-test. A `down -v --remove-orphans` run that way treats every
+# gate-stack container as an orphan of a project whose compose file only
+# defines one service, ldap, and removes them all: it turned a routine
+# LDAP-test-server teardown into a full gate-stack teardown. -p is the only
+# project-name source docker compose never lets an environment variable
+# override, so it is pinned explicitly here even though the file also
+# carries the same name via `name:` (kept for standalone `docker compose`
+# invocations against this file with no -p, e.g. a developer running it by
+# hand from infra/ldap-test/).
+LDAP_COMPOSE := docker compose -p herd-ldap-test -f infra/ldap-test/docker-compose.yml
 HERD_TEST_LDAP_HOST ?= 127.0.0.1
 HERD_TEST_LDAP_PORT ?= 389
 
@@ -446,6 +498,11 @@ ldap-up:  ## Start the checked-in LDAP test server (infra/ldap-test), wait until
 	HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) $(LDAP_COMPOSE) up -d --wait
 	@echo "LDAP test server up on ldap://$(HERD_TEST_LDAP_HOST):$(HERD_TEST_LDAP_PORT)"
 
+# --remove-orphans is safe here (unlike the calls _gate-ldap-stack-tests used
+# to make before 2026-08-26): $(LDAP_COMPOSE) is pinned to project
+# herd-ldap-test via -p, exclusively owned by this one compose file, so an
+# orphan can only ever be a leftover container from a past version of that
+# file's own service list, never another project's containers.
 ldap-down:  ## Stop and remove the LDAP test server
 	$(LDAP_COMPOSE) down -v --remove-orphans
 
@@ -480,6 +537,146 @@ _gate-ldap-tests:
 	fi; \
 	trap 'if [ "$$started" = 1 ]; then $(MAKE) ldap-down; fi' EXIT INT TERM; \
 	$(MAKE) test-auth-ldap
+
+# Postgres-live coverage for the ADR 0011 sync surface (issue #572): the
+# advisory-lock SQL and _SyncSlot's cross-replica branch never run on the
+# SQLite engine every other sync test uses. Any reachable Postgres works
+# (these tests create no application schema), so this target just needs a
+# DSN: it is built from .env's POSTGRES_USER/PASSWORD/DB plus the gate
+# stack's published Postgres host port (POSTGRES_PORT, default 5433, the
+# same default docker-compose.yml's postgres service publishes on), NOT a
+# COMPOSE_PROJECT_NAME lookup, since the host port is fixed regardless of
+# compose project and gate-clean already guarantees the dev stack is stopped
+# (so port 5433 unambiguously belongs to the gate's postgres) before either
+# gate boots. HERD_TEST_PG_REQUIRED=1 turns "Postgres unreachable" into a
+# hard failure instead of the tests' normal skip, matching _gate-ldap-tests'
+# HERD_TEST_LDAP_REQUIRED=1 discipline.
+_gate-pg-live-tests:
+	@pguser=$$(grep -E '^POSTGRES_USER=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
+	pgpass=$$(grep -E '^POSTGRES_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
+	pgdb=$$(grep -E '^POSTGRES_DB=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
+	pgport=$$(grep -E '^POSTGRES_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
+	pgport=$${pgport:-5433}; \
+	dsn="postgresql+asyncpg://$${pguser:-herd}:$${pgpass:-herd}@127.0.0.1:$${pgport}/$${pgdb:-herd}"; \
+	echo "Postgres-live LDAP sync tests against 127.0.0.1:$${pgport}/$${pgdb:-herd}"; \
+	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_ldap_sync_service_live_pg.py -v) && \
+	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_advisory_lock_live_pg.py -v)
+
+# Gate phase used by master and everything, run after test-e2e (issue #572):
+# proves the STACK, not just the directory, can authenticate against LDAP.
+# Ensures infra/ldap-test is running (started-here-so-torn-down-here, same
+# pattern as _gate-ldap-tests, and self-sufficient: this phase never assumes
+# _gate-ldap-tests left the server up), connects it onto the gate compose
+# project's network so the gate's auth container can resolve it by name, then
+# recreates ONLY the auth service (--no-deps, so postgres/nats/other services
+# keep running undisturbed) with AUTH_METHOD=ldap and the matching LDAP_*
+# settings for infra/ldap-test's fixtures (see infra/ldap-test/ldif). Shell
+# env beats the .env file in compose interpolation, so this override is
+# scoped to this one `docker compose up` call and never touches the repo's
+# .env. The restore step (trap, so a failing test still runs it) recreates
+# auth back to its default (local) env, waits for it to report healthy again,
+# disconnects the network, and tears down ldap-test only if this phase
+# started it, so master/everything end on a local-auth stack exactly as
+# before this phase existed.
+# Deliberately calls neither `$(MAKE) ldap-up` nor `$(MAKE) ldap-down` (unlike
+# _gate-ldap-tests above): a recipe line containing a literal $(MAKE) reference
+# is executed for real even under `make -n` (GNU Make's documented escape
+# hatch for accurate recursive dry-run reporting), and this recipe already
+# mixes in real docker network/compose mutation, so keeping it $(MAKE)-free
+# keeps `make -n master` / `make -n everything` (and `make -n
+# _gate-ldap-stack-tests` on its own) genuine dry runs that print without
+# touching any container. It inlines the same $(LDAP_COMPOSE) commands
+# ldap-up/ldap-down wrap instead.
+#
+# Also deliberately uses BARE `docker compose` throughout (never
+# $(GATE_COMPOSE)'s explicit -p), so this target works against whichever
+# compose project COMPOSE_PROJECT_NAME names, not only the master/everything
+# gate project: master/everything pass COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
+# (see the "make exports command-line variables to recipe environments" note
+# near GATE_PROJECT's definition), while nightly.yml's plain `docker compose
+# up -d` stack has no such override, so this target resolves the SAME default
+# project docker compose itself would (falls back to $(GATE_PROJECT) only
+# when COMPOSE_PROJECT_NAME is entirely unset, e.g. a standalone local run).
+_gate-ldap-stack-tests:
+	@net=$${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)}_herd-net; \
+	auth_cid=$$(docker compose ps -q auth 2>/dev/null); \
+	if [ -z "$$auth_cid" ]; then \
+		echo "No running auth container for project $${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)} (docker compose ps -q auth returned nothing)."; \
+		echo "This target recreates an ALREADY-RUNNING gate stack's auth service; it does not start one."; \
+		echo "Bring the target stack up first (e.g. make _master-stack-up / make up), or check COMPOSE_PROJECT_NAME."; \
+		exit 1; \
+	fi; \
+	config_cid=$$(docker compose ps -q config 2>/dev/null); \
+	if [ -n "$$config_cid" ] && \
+		docker compose exec -T config test -f /data/herd-config/config.json 2>/dev/null && \
+		! docker compose exec -T config test -f /data/herd-config/config.bootstrapped 2>/dev/null; then \
+		echo "This stack's config.json was saved through the config UI (no config.bootstrapped marker)."; \
+		echo "Per herd_common.config_loader precedence it now outranks environment variables, so this target's AUTH_METHOD=ldap / LDAP_* overrides would be silently ignored."; \
+		echo "Restore config.bootstrapped, or clear the relevant keys via the config UI, then retry."; \
+		exit 1; \
+	fi; \
+	ldap_started=0; \
+	if ! docker ps --format '{{.Names}}' | grep -q '^ldap-test$$'; then \
+		echo "Starting infra/ldap-test (LDAP test server)..."; \
+		HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) $(LDAP_COMPOSE) up -d --wait; \
+		ldap_started=1; \
+	else \
+		echo "LDAP test server already running; leaving it up afterward."; \
+	fi; \
+	connect_out=$$(docker network connect "$$net" ldap-test 2>&1); \
+	rc=$$?; \
+	if [ $$rc -ne 0 ] && ! echo "$$connect_out" | grep -qi "already"; then \
+		echo "$$connect_out"; \
+		echo "Failed to connect ldap-test to $$net"; \
+		if [ "$$ldap_started" = 1 ]; then $(LDAP_COMPOSE) down -v; fi; \
+		exit 1; \
+	fi; \
+	wait_auth_healthy() { \
+		to=$$1; s=$$(date +%s); \
+		cid=$$(docker compose ps -q auth); \
+		until [ "$$(docker inspect -f '{{.State.Health.Status}}' "$$cid" 2>/dev/null)" = "healthy" ]; do \
+			n=$$(date +%s); \
+			if [ $$((n - s)) -gt $$to ]; then \
+				echo "Timed out after $${to}s waiting for gate auth to report healthy"; \
+				return 1; \
+			fi; \
+			sleep 2; \
+		done; \
+		echo "Gate auth healthy after $$(( $$(date +%s) - s ))s"; \
+	}; \
+	restore() { \
+		rc=$$?; \
+		echo ""; \
+		echo "=== Restoring gate auth to local mode ==="; \
+		docker compose up -d --no-deps --force-recreate auth; \
+		wait_auth_healthy 90 || true; \
+		docker network disconnect "$$net" ldap-test 2>/dev/null || true; \
+		if [ "$$ldap_started" = 1 ]; then $(LDAP_COMPOSE) down -v; fi; \
+		exit $$rc; \
+	}; \
+	trap restore EXIT INT TERM; \
+	echo "" && echo "=== Recreating gate auth in LDAP mode ===" && \
+	AUTH_METHOD=ldap \
+		LDAP_SERVER_URL=ldap://ldap-test:389 \
+		LDAP_BIND_DN=cn=admin,dc=company,dc=local \
+		LDAP_BIND_PASSWORD=admin \
+		LDAP_USER_BASE_DN=ou=people,dc=company,dc=local \
+		LDAP_USER_FILTER='(uid={username})' \
+		LDAP_USERNAME_ATTRIBUTE=uid \
+		LDAP_EMAIL_ATTRIBUTE=mail \
+		LDAP_USE_TLS=false \
+		LDAP_GROUP_MEMBER_ATTRIBUTE=member \
+		LDAP_GROUP_NAME_ATTRIBUTE=cn \
+		docker compose up -d --no-deps --force-recreate auth && \
+	wait_auth_healthy 90 && \
+	echo "" && echo "=== LDAP integration tests against the gate stack ===" && \
+	HERD_INTEGRATION_LDAP=1 \
+		HERD_TEST_LDAP_HOST=$(HERD_TEST_LDAP_HOST) \
+		HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) \
+		uv run pytest tests/integration/test_ldap_auth.py tests/integration/test_ldap_sync_admin.py \
+			-v --timeout=60
 
 # -- Coverage -----------------------------------------------------------------
 #

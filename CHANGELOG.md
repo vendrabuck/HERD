@@ -83,6 +83,63 @@
   merely slow. The admin UI's 30-minute stale-row display (PR #526) is an
   independent, shorter client-side hint; this reaper is what corrects the audit
   record itself.
+- LDAP integration suite and Postgres-live sync coverage wired into the gates and
+  nightly (issue #572): `tests/integration/test_ldap_auth.py` was gated on
+  `HERD_INTEGRATION_LDAP=1`, a variable no Makefile target, CI workflow, or compose
+  file ever set, so it (and the sync-admin surface) self-skipped in `make master`,
+  `make everything`, PR CI, and nightly alike. PR #582 first closed the
+  real-Postgres half of the gap: `services/auth/tests/test_ldap_sync_service_live_pg.py`
+  and `services/common/tests/test_advisory_lock_live_pg.py` exercise `_SyncSlot`'s
+  cross-replica advisory-lock branch and the underlying `session_try_lock`/
+  `session_unlock`/`xact_lock` SQL against a real server for the first time (every
+  prior test ran on SQLite, which no-ops that whole code path). This delivery closes
+  the rest: a new Makefile phase, `_gate-ldap-stack-tests`, runs after `test-e2e` in
+  `master`, `everything`, and the nightly workflow, connects the checked-in
+  `infra/ldap-test` server onto the ephemeral stack's compose network, recreates
+  ONLY the stack's auth service (`--no-deps --force-recreate`) in LDAP mode, runs
+  `test_ldap_auth.py` plus the new `tests/integration/test_ldap_sync_admin.py`
+  (mapping create, sync-now, run polling, group-membership reconcile against a real
+  directory, and a concurrent-sync-now race proving the loser gets the in-process
+  busy 409), then always restores auth to local mode before any later phase (seeding,
+  load tests) runs. `test_ldap_sync_admin.py` works around the resulting
+  chicken-and-egg problem (in LDAP mode `authenticate_user` consults ONLY the
+  directory, so the stack's seeded local superadmin cannot log in and there is no API
+  path to an admin token) by promoting a JIT-provisioned directory user directly in
+  Postgres via `docker compose exec postgres psql`, then re-logging in. A sibling
+  `_gate-pg-live-tests` phase runs the two PR #582 files hard-required
+  (`HERD_TEST_PG_REQUIRED=1`) against the gate stack's own Postgres, since they need
+  no LDAP mode. Both new targets are deliberately free of `$(MAKE)` references in
+  their own recipes (unlike the pre-existing `_gate-ldap-tests`), since a recipe line
+  containing one executes for real even under `make -n`, and these mix in real
+  docker network/compose mutation.
+  Two follow-up fixes landed the same day from a live-gate rerun. First, a
+  `COMPOSE_PROJECT_NAME` leak: `LDAP_COMPOSE` had no `-p`, and that env var (which
+  `_gate-ldap-stack-tests` inherits from the gate targets) outranks a compose file's
+  own `name:` in project resolution, so every bare `$(LDAP_COMPOSE)` call, including
+  `down -v --remove-orphans`, silently targeted the GATE project instead of
+  `herd-ldap-test`; a `down --remove-orphans` there reads every real gate container as
+  an orphan of a project whose compose file defines one service, and removes them
+  all, turning a routine LDAP-test-server teardown into a full gate-stack teardown.
+  Fixed by pinning `LDAP_COMPOSE` with `-p herd-ldap-test` (the one project-name
+  source no environment variable can override), dropping `--remove-orphans` from
+  `_gate-ldap-stack-tests`' own `down` calls as a second layer, and adding two
+  pre-flight guards: the target compose project must already have a running `auth`
+  container, and its `config.json` must not have been promoted above the environment
+  (no `config.bootstrapped` marker) by a prior config-UI save, since either would
+  otherwise fail confusingly deep into the phase instead of failing fast with a clear
+  message. Second, a seeded-stack collision: `tests/integration/test_ldap_auth.py`
+  and `test_ldap_sync_admin.py` defaulted to the `user1..user25`/`herd-eng` fixtures,
+  which collide by username with a `make seed`-seeded stack's local `user1..user1000`
+  rows (JIT-provisioning refuses with `username_collision`), and separately are
+  invisible to `ldap_sync_service`'s reconciler, which only ever touches LDAP-sourced
+  users, so a mapped `herd-eng` group's membership assertion would silently lose its
+  seeded members too. `infra/ldap-test/ldif/70-seed-integration.ldif` adds dedicated
+  `ldapit-admin` and `ldapit-eng1..3` identities (uids that can never match the seed
+  script's `user[0-9]+`/`admin[0-9]+` patterns) plus their own `cn=herd-it-eng` group,
+  which both integration test files now use instead; the compose healthcheck (probes
+  the last entry of the last bootstrap LDIF file to prove the seed is complete) and
+  `test_ldap_service_live.py`'s `_seed_is_current` stale-seed guard were both
+  retargeted/extended to the new file so an older checkout is still caught.
 
 #### Reconcile and provisioning
 

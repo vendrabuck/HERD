@@ -14,14 +14,21 @@ Expected directory layout:
 
     dc=company,dc=local
         ou=people
-            uid=user1..user6   (mail=userN@company.local, password=Password1)
-            uid=nomail1        (no mail attribute)
-            cn=nouid1          (mail but no uid attribute)
+            uid=user1..user6      (mail=userN@company.local, password=Password1)
+            uid=nomail1           (no mail attribute)
+            cn=nouid1             (mail but no uid attribute)
+            uid=ldapit-admin      (see 70-seed-integration.ldif)
+            uid=ldapit-eng1..3    (see 70-seed-integration.ldif)
         ou=groups              (groupOfNames; see 60-seed-groups.ldif)
             cn=herd-eng        (user1..user3)
             cn=herd-qa         (user4, user5)
             cn=herd-mixed      (user6, nomail1, nouid1)
             cn=herd-stale      (user6 plus a nonexistent member DN)
+            cn=herd-it-eng     (ldapit-eng1..3; see 70-seed-integration.ldif,
+                                issue #572, the dedicated identities
+                                tests/integration/test_ldap_sync_admin.py
+                                uses so it never collides with a seeded
+                                stack's local user1..user1000 rows)
 
 Bind DN for the service account: cn=admin,dc=company,dc=local / admin.
 """
@@ -79,12 +86,18 @@ pytestmark = pytest.mark.skipif(
 
 
 def _seed_is_current() -> bool:
-    """Probe the last-loaded fixture (cn=herd-stale from 60-seed-groups.ldif).
+    """Probe the last-loaded fixture of each fixture-adding LDIF file:
+    cn=herd-stale (60-seed-groups.ldif) and cn=herd-it-eng
+    (70-seed-integration.ldif, issue #572, added after herd-stale).
 
     The stateless container reseeds only on `up`, so a container started
-    from an older checkout answers for user1 while lacking the group
-    fixtures; without this probe those runs fail with confusing dangling
-    None assertions instead of a clear remedy.
+    from an older checkout answers for user1 while lacking one or both sets
+    of group fixtures; without this probe those runs fail with confusing
+    dangling None assertions (or a silently-wrong membership assertion)
+    instead of a clear remedy. Checking only the single newest file would
+    miss a checkout stale relative to 60-seed-groups.ldif but current as of
+    an even older commit that already had 70-seed-integration.ldif; checking
+    both catches either gap.
     """
     import ldap3
 
@@ -92,13 +105,16 @@ def _seed_is_current() -> bool:
         server = ldap3.Server(LDAP_URL, get_info=ldap3.NONE, connect_timeout=5)
         conn = ldap3.Connection(server, user=ADMIN_DN, password=ADMIN_PW, auto_bind=True)
         try:
-            ok = conn.search(
-                f"cn=herd-stale,ou=groups,{BASE_DN}",
-                "(objectClass=*)",
-                search_scope=ldap3.BASE,
-                attributes=["cn"],
-            )
-            return bool(ok and conn.entries)
+            for cn in ("herd-stale", "herd-it-eng"):
+                ok = conn.search(
+                    f"cn={cn},ou=groups,{BASE_DN}",
+                    "(objectClass=*)",
+                    search_scope=ldap3.BASE,
+                    attributes=["cn"],
+                )
+                if not (ok and conn.entries):
+                    return False
+            return True
         finally:
             conn.unbind()
     except Exception:
@@ -119,8 +135,8 @@ def _fail_on_stale_seed():
     if _LDAP_REACHABLE and not _seed_is_current():
         pytest.fail(
             f"LDAP server at {LDAP_URL} is reachable but missing the group fixtures "
-            "(60-seed-groups.ldif); it was seeded from an older checkout. "
-            "Run `make ldap-reset` to reseed."
+            "(60-seed-groups.ldif and/or 70-seed-integration.ldif); it was seeded "
+            "from an older checkout. Run `make ldap-reset` to reseed."
         )
 
 
@@ -629,9 +645,18 @@ async def test_run_sync_dangling_mapping_applies_nothing(ldap_settings, db_sessi
 # ---------------------------------------------------------------------------
 
 # All 25 seeded people (50-seed-people.ldif) plus nouid1 (mail but no uid,
-# 60-seed-groups.ldif) carry a mail attribute; nomail1 deliberately does not.
+# 60-seed-groups.ldif) plus the four ldapit-* identities (mail but no uid
+# quirk does not apply to them, 70-seed-integration.ldif, issue #572) carry a
+# mail attribute; nomail1 deliberately does not.
 _ALL_SEEDED_PRESENT_EMAILS = frozenset(
-    {f"user{n}@company.local" for n in range(1, 26)} | {"nouid1@company.local"}
+    {f"user{n}@company.local" for n in range(1, 26)}
+    | {"nouid1@company.local"}
+    | {
+        "ldapit-admin@company.local",
+        "ldapit-eng1@company.local",
+        "ldapit-eng2@company.local",
+        "ldapit-eng3@company.local",
+    }
 )
 
 
