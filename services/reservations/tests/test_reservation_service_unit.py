@@ -1264,6 +1264,81 @@ async def test_release_reservation_retries_and_logs_when_inventory_fails(caplog)
 
 
 @pytest.mark.asyncio
+async def test_cancel_reservation_logs_per_device_fetch_failure_warning(caplog):
+    """When the best-effort device fetch raises for one device, cancel logs a
+    per-device warning naming that device and the "cancel" context, and the
+    device is still counted exclusive (its release is attempted)."""
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, device_ids=[DEVICE_A, DEVICE_B])
+        order = [uuid.UUID(str(d)) for d in res.device_ids]
+        fetch_results = [
+            RuntimeError("inventory unreachable")
+            if d == DEVICE_A
+            else _make_device(d, exclusive=False)
+            for d in order
+        ]
+        update_mock = AsyncMock()
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices_best_effort",
+                new=AsyncMock(return_value=fetch_results),
+            ),
+            patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+            caplog.at_level("WARNING", logger="app.services.reservation_service"),
+        ):
+            cancelled = await cancel_reservation(db, res.id, USER_ID, "token")
+
+    assert cancelled.status == ReservationStatus.CANCELLED
+    warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING" and str(DEVICE_A) in rec.getMessage()
+    ]
+    assert warnings, "expected a per-device fetch-failure warning naming the device"
+    assert "cancel" in warnings[0].getMessage()
+    # The device whose fetch failed is still counted exclusive, so its release
+    # is attempted.
+    assert update_mock.await_count == 1
+    assert update_mock.call_args[0][0] == [DEVICE_A]
+
+
+@pytest.mark.asyncio
+async def test_release_reservation_logs_per_device_fetch_failure_warning(caplog):
+    """Same shape as the cancel test, applied to release_reservation: the
+    warning names the "release" context instead."""
+    async with TestSessionLocal() as db:
+        res = await _insert_reservation(db, device_ids=[DEVICE_A, DEVICE_B])
+        order = [uuid.UUID(str(d)) for d in res.device_ids]
+        fetch_results = [
+            RuntimeError("inventory unreachable")
+            if d == DEVICE_B
+            else _make_device(d, exclusive=False)
+            for d in order
+        ]
+        update_mock = AsyncMock()
+        with (
+            patch(
+                "app.services.reservation_service._fetch_devices_best_effort",
+                new=AsyncMock(return_value=fetch_results),
+            ),
+            patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+            caplog.at_level("WARNING", logger="app.services.reservation_service"),
+        ):
+            released = await release_reservation(db, res.id, USER_ID, "token")
+
+    assert released.status == ReservationStatus.COMPLETED
+    warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING" and str(DEVICE_B) in rec.getMessage()
+    ]
+    assert warnings, "expected a per-device fetch-failure warning naming the device"
+    assert "release" in warnings[0].getMessage()
+    assert update_mock.await_count == 1
+    assert update_mock.call_args[0][0] == [DEVICE_B]
+
+
+@pytest.mark.asyncio
 async def test_fetch_devices_best_effort_returns_mixed_results():
     """One device fetch failing should not cause the whole list to be treated as
     a hard error on the cancel/release path. The best-effort helper returns
