@@ -12,6 +12,15 @@ Skipped unless:
 Expected directory layout (see services/auth/tests/test_ldap_service_live.py):
   dc=company,dc=local -> ou=people -> uid=user1..user25, password=Password1
 
+Default login identity is ldapit-eng1 (infra/ldap-test/ldif/70-seed-integration.ldif),
+not one of the userN fixtures: a gate stack seeded via `make seed`
+(seed_devices_public.py) already holds LOCAL users user1..user1000 in the same
+users table (auth_source="local"), so JIT-provisioning uid=userN over LDAP
+would collide on username (auth_service.py's username_collision path) on any
+seeded stack. The ldapit-* uids can never match the seed script's
+`user[0-9]+` / `admin[0-9]+` patterns, so this file's login coverage works
+whether or not the stack has been seeded.
+
 Runs in the Makefile's _gate-ldap-stack-tests phase (master, everything, and
 nightly), which switches the ephemeral gate stack's auth service to LDAP mode
 after e2e and restores it to local mode afterward, then in
@@ -33,7 +42,7 @@ pytestmark = pytest.mark.asyncio
 
 LDAP_HOST = os.getenv("HERD_TEST_LDAP_HOST", "127.0.0.1")
 LDAP_PORT = int(os.getenv("HERD_TEST_LDAP_PORT", "389"))
-LDAP_USER = os.getenv("HERD_TEST_LDAP_USER", "user10")
+LDAP_USER = os.getenv("HERD_TEST_LDAP_USER", "ldapit-eng1")
 LDAP_PASSWORD = os.getenv("HERD_TEST_LDAP_PASSWORD", "Password1")
 LDAP_EXPECTED_EMAIL = os.getenv(
     "HERD_TEST_LDAP_EMAIL", f"{LDAP_USER}@company.local"

@@ -437,10 +437,13 @@ test-e2e-stop:  ## Stop and remove the e2e Selenium container
 #
 # A checked-in osixia/openldap compose file under infra/ldap-test seeds the
 # exact fixtures the live-LDAP auth tests assert (user1..user25, Password1,
-# dc=company,dc=local). It is stateless: down discards the directory, up
-# reseeds it from the bundled LDIF. The compose healthcheck searches for
-# uid=user1 as cn=admin, so `up --wait` returns only once the seed is
-# actually queryable, not merely once slapd answers.
+# dc=company,dc=local), plus dedicated ldapit-* identities for the
+# stack-level integration tests (70-seed-integration.ldif, issue #572). It is
+# stateless: down discards the directory, up reseeds it from the bundled
+# LDIF. The compose healthcheck, bound as cn=admin, searches for
+# cn=herd-it-eng (the last entry of the last LDIF file), so `up --wait`
+# returns only once the seed is actually fully queryable, not merely once
+# slapd answers.
 #
 # The master and everything gates run these tests through _gate-ldap-tests,
 # which hard-requires the server (HERD_TEST_LDAP_REQUIRED=1 turns the
@@ -609,14 +612,9 @@ _gate-ldap-stack-tests:
 	if [ -n "$$config_cid" ] && \
 		docker compose exec -T config test -f /data/herd-config/config.json 2>/dev/null && \
 		! docker compose exec -T config test -f /data/herd-config/config.bootstrapped 2>/dev/null; then \
-		echo "This stack's config.json was saved through the config UI (no config.bootstrapped"; \
-		echo "marker), so per herd_common.config_loader precedence it now outranks environment"; \
-		echo "variables for every service, auth included. The AUTH_METHOD=ldap / LDAP_* overrides"; \
-		echo "this target passes to docker compose up would be silently ignored, and auth would"; \
-		echo "stay in local mode: the login tests would then fail with 401s instead of skipping."; \
-		echo "This is a real, currently-unresolved gap (a config-UI save during test-e2e's config"; \
-		echo "round-trip test promotes config.json above env on every master/everything run,"; \
-		echo "before this phase ever runs), flagged rather than silently worked around here."; \
+		echo "This stack's config.json was saved through the config UI (no config.bootstrapped marker)."; \
+		echo "Per herd_common.config_loader precedence it now outranks environment variables, so this target's AUTH_METHOD=ldap / LDAP_* overrides would be silently ignored."; \
+		echo "Restore config.bootstrapped, or clear the relevant keys via the config UI, then retry."; \
 		exit 1; \
 	fi; \
 	ldap_started=0; \

@@ -1,0 +1,60 @@
+# Dedicated identities for the HERD stack integration tests
+# (tests/integration/test_ldap_auth.py, test_ldap_sync_admin.py), added
+# 2026-08-26 (issue #572 follow-up).
+#
+# A gate stack seeded via seed_devices_public.py (`make seed`) already holds
+# LOCAL users user1..user1000 and admin1..admin50 in the same users table
+# (auth_source="local"). JIT-provisioning an LDAP login for uid=user10 or
+# similar collides on username (auth_service.py's username_collision path),
+# and separately, ldap_sync_service's reconciler only ever touches
+# LDAP-sourced users, so a mapped group whose directory members are seeded
+# userN uids would silently skip them in a membership assertion too. The
+# uid values here, ldapit-admin and ldapit-eng1..3, can never match the seed
+# script's `user[0-9]+` / `admin[0-9]+` patterns, so these identities work
+# whether or not the stack has been seeded.
+#
+# This is also the LAST file the bootstrap LDIF loads (files apply in
+# filename order against a running slapd), so its last entry, cn=herd-it-eng,
+# is what infra/ldap-test/docker-compose.yml's healthcheck probes to prove
+# the directory is fully seeded; see
+# services/auth/tests/test_ldap_service_live.py's _seed_is_current for the
+# matching stale-seed detection.
+
+dn: uid=ldapit-admin,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: ldapit-admin
+cn: Integration Admin
+sn: Admin
+mail: ldapit-admin@company.local
+userPassword: Password1
+
+dn: uid=ldapit-eng1,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: ldapit-eng1
+cn: Integration Eng1
+sn: Eng1
+mail: ldapit-eng1@company.local
+userPassword: Password1
+
+dn: uid=ldapit-eng2,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: ldapit-eng2
+cn: Integration Eng2
+sn: Eng2
+mail: ldapit-eng2@company.local
+userPassword: Password1
+
+dn: uid=ldapit-eng3,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: ldapit-eng3
+cn: Integration Eng3
+sn: Eng3
+mail: ldapit-eng3@company.local
+userPassword: Password1
+
+dn: cn=herd-it-eng,ou=groups,dc=company,dc=local
+objectClass: groupOfNames
+cn: herd-it-eng
+member: uid=ldapit-eng1,ou=people,dc=company,dc=local
+member: uid=ldapit-eng2,ou=people,dc=company,dc=local
+member: uid=ldapit-eng3,ou=people,dc=company,dc=local

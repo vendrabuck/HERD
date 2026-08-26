@@ -8,12 +8,25 @@ proves LOGIN works against the directory; this one proves the admin sync
 surface (mapping create, sync-now, run polling, group-membership reconcile)
 works too, coverage no gate exercised before _gate-ldap-stack-tests existed.
 
+Dedicated ldapit-* identities, not the userN/herd-eng fixtures: a gate stack
+seeded via `make seed` (seed_devices_public.py) already holds LOCAL users
+user1..user1000 and admin1..admin50 in the same users table (auth_source=
+"local"). JIT-provisioning an LDAP login for one of those usernames collides
+(auth_service.py's username_collision path refuses it), and separately,
+ldap_sync_service's reconciler only ever touches LDAP-sourced users, so the
+seeded local user1..user3 rows would silently be skipped from a
+sync-driven membership assertion even where provisioning did not collide.
+infra/ldap-test/ldif/70-seed-integration.ldif adds ldapit-admin and
+ldapit-eng1..3 (uids that can never match the seed script's `user[0-9]+` /
+`admin[0-9]+` patterns) plus their own directory group, cn=herd-it-eng, so
+this file's assertions hold whether or not the stack has been seeded.
+
 Bootstrapping problem this file works around: in LDAP mode, authenticate_user
 (services/auth/app/services/auth_service.py) consults ONLY the directory, so
 the stack's seeded local superadmin cannot log in, and there is therefore no
 way to obtain an admin-role JWT through the public API. This file instead:
-  1. Logs in as an ordinary directory user (JIT-provisioned on first login,
-     auth_source="ldap", role defaults to "user").
+  1. Logs in as ldapit-admin (JIT-provisioned on first login, auth_source=
+     "ldap", role defaults to "user").
   2. Promotes that ONE row directly in Postgres via `docker compose exec
      postgres psql` (subprocess; honors COMPOSE_PROJECT_NAME from the calling
      environment exactly like tests/integration/test_outbox_durability.py's
@@ -55,17 +68,23 @@ import pytest
 
 LDAP_HOST = os.getenv("HERD_TEST_LDAP_HOST", "127.0.0.1")
 LDAP_PORT = int(os.getenv("HERD_TEST_LDAP_PORT", "389"))
-LDAP_USER = os.getenv("HERD_TEST_LDAP_USER", "user10")
+# Dedicated admin identity, distinct from test_ldap_auth.py's HERD_TEST_LDAP_USER
+# (ldapit-eng1): this file promotes whoever it logs in as to superadmin (see
+# the module docstring), so it gets its own env override rather than sharing
+# one knob for two different roles.
+LDAP_SYNC_ADMIN_USER = os.getenv("HERD_TEST_LDAP_SYNC_ADMIN_USER", "ldapit-admin")
 LDAP_PASSWORD = os.getenv("HERD_TEST_LDAP_PASSWORD", "Password1")
 
 BASE_URL = os.getenv("HERD_BASE_URL", "https://localhost/api")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The herd-eng directory group (infra/ldap-test/ldif/60-seed-groups.ldif):
-# a fully-resolvable groupOfNames with three members, none of the per-member
-# skip cases the mixed/stale fixture groups exercise.
-HERD_ENG_DN = "cn=herd-eng,ou=groups,dc=company,dc=local"
-HERD_ENG_MEMBERS = {"user1", "user2", "user3"}
+# The herd-it-eng directory group (infra/ldap-test/ldif/70-seed-integration.ldif):
+# a fully-resolvable groupOfNames with three dedicated ldapit-eng members (see
+# the module docstring for why these, and not the seeded userN/herd-eng
+# fixtures), none of the per-member skip cases the mixed/stale fixture groups
+# exercise.
+HERD_IT_ENG_DN = "cn=herd-it-eng,ou=groups,dc=company,dc=local"
+HERD_IT_ENG_MEMBERS = {"ldapit-eng1", "ldapit-eng2", "ldapit-eng3"}
 
 _RUN_IN_PROGRESS_DETAIL = "A sync run is already in progress"
 
@@ -153,26 +172,29 @@ async def _poll_run(client: httpx.AsyncClient, run_id: str, timeout: float = 60.
 
 @pytest.fixture(scope="module")
 def superadmin_token():
-    """Promote LDAP_USER to superadmin out-of-band (see module docstring) and
-    return a fresh JWT for it. Deletes the row at module teardown, after
-    mapped_group's own teardown has removed the mapping and group (fixture
-    teardown runs in reverse dependency order, so that happens first).
+    """Promote LDAP_SYNC_ADMIN_USER (ldapit-admin) to superadmin out-of-band
+    (see module docstring) and return a fresh JWT for it. Deletes the row at
+    module teardown, after mapped_group's own teardown has removed the
+    mapping and group (fixture teardown runs in reverse dependency order, so
+    that happens first).
     """
-    asyncio.run(_login(LDAP_USER, LDAP_PASSWORD))  # JIT-provisions the row
+    asyncio.run(_login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD))  # JIT-provisions the row
 
-    result = _psql(f"UPDATE auth.users SET role='SUPERADMIN' WHERE username='{LDAP_USER}'")
+    result = _psql(
+        f"UPDATE auth.users SET role='SUPERADMIN' WHERE username='{LDAP_SYNC_ADMIN_USER}'"
+    )
     assert result.returncode == 0, f"promote failed: {result.stdout} {result.stderr}"
     assert "UPDATE 1" in result.stdout, f"expected exactly one row updated: {result.stdout!r}"
 
-    tokens = asyncio.run(_login(LDAP_USER, LDAP_PASSWORD))
+    tokens = asyncio.run(_login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD))
     yield tokens["access_token"]
 
-    _psql(f"DELETE FROM auth.users WHERE username='{LDAP_USER}'")
+    _psql(f"DELETE FROM auth.users WHERE username='{LDAP_SYNC_ADMIN_USER}'")
 
 
 @pytest.fixture(scope="module")
 def mapped_group(superadmin_token):
-    """Create a throwaway HERD group mapped to the herd-eng directory group.
+    """Create a throwaway HERD group mapped to the herd-it-eng directory group.
 
     Yields (group, mapping) dicts from their respective create responses.
     """
@@ -193,7 +215,7 @@ def mapped_group(superadmin_token):
             group = group_resp.json()
             mapping_resp = await client.post(
                 "/auth/admin/ldap-sync/mappings",
-                json={"group_dn": HERD_ENG_DN, "herd_group_id": group["id"]},
+                json={"group_dn": HERD_IT_ENG_DN, "herd_group_id": group["id"]},
             )
             mapping_resp.raise_for_status()
             return group, mapping_resp.json()
@@ -219,8 +241,8 @@ def mapped_group(superadmin_token):
 
 async def test_sync_run_reconciles_group_membership_from_directory(superadmin_token, mapped_group):
     """POST /admin/ldap-sync/run reconciles the mapped HERD group's members
-    to match the herd-eng directory group, read back through GET /groups/{id}
-    (not just the run's own success status).
+    to match the herd-it-eng directory group, read back through
+    GET /groups/{id} (not just the run's own success status).
     """
     group, _mapping = mapped_group
     headers = {"Authorization": f"Bearer {superadmin_token}"}
@@ -238,7 +260,7 @@ async def test_sync_run_reconciles_group_membership_from_directory(superadmin_to
         detail_resp = await client.get(f"/auth/groups/{group['id']}")
         detail_resp.raise_for_status()
         members = {m["username"] for m in detail_resp.json()["members"]}
-        assert members == HERD_ENG_MEMBERS, members
+        assert members == HERD_IT_ENG_MEMBERS, members
 
 
 async def test_concurrent_sync_now_one_wins(superadmin_token):
