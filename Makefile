@@ -472,7 +472,22 @@ test-e2e-stop:  ## Stop and remove the e2e Selenium container
 #   no LDAP mode, so it is a separate step rather than nested inside
 #   _gate-ldap-stack-tests.
 
-LDAP_COMPOSE := docker compose -f infra/ldap-test/docker-compose.yml
+# Pinned with -p (not left to the compose file's own `name: herd-ldap-test`)
+# after an incident on 2026-08-26: COMPOSE_PROJECT_NAME is exported into
+# _gate-ldap-stack-tests' recipe environment (that is how the gate targets
+# pass it along), and a COMPOSE_PROJECT_NAME env var outranks a compose
+# file's `name:` attribute in project-name resolution, so every bare
+# $(LDAP_COMPOSE) call was silently resolving to the GATE project instead of
+# herd-ldap-test. A `down -v --remove-orphans` run that way treats every
+# gate-stack container as an orphan of a project whose compose file only
+# defines one service, ldap, and removes them all: it turned a routine
+# LDAP-test-server teardown into a full gate-stack teardown. -p is the only
+# project-name source docker compose never lets an environment variable
+# override, so it is pinned explicitly here even though the file also
+# carries the same name via `name:` (kept for standalone `docker compose`
+# invocations against this file with no -p, e.g. a developer running it by
+# hand from infra/ldap-test/).
+LDAP_COMPOSE := docker compose -p herd-ldap-test -f infra/ldap-test/docker-compose.yml
 HERD_TEST_LDAP_HOST ?= 127.0.0.1
 HERD_TEST_LDAP_PORT ?= 389
 
@@ -480,6 +495,11 @@ ldap-up:  ## Start the checked-in LDAP test server (infra/ldap-test), wait until
 	HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) $(LDAP_COMPOSE) up -d --wait
 	@echo "LDAP test server up on ldap://$(HERD_TEST_LDAP_HOST):$(HERD_TEST_LDAP_PORT)"
 
+# --remove-orphans is safe here (unlike the calls _gate-ldap-stack-tests used
+# to make before 2026-08-26): $(LDAP_COMPOSE) is pinned to project
+# herd-ldap-test via -p, exclusively owned by this one compose file, so an
+# orphan can only ever be a leftover container from a past version of that
+# file's own service list, never another project's containers.
 ldap-down:  ## Stop and remove the LDAP test server
 	$(LDAP_COMPOSE) down -v --remove-orphans
 
@@ -577,7 +597,29 @@ _gate-pg-live-tests:
 # project docker compose itself would (falls back to $(GATE_PROJECT) only
 # when COMPOSE_PROJECT_NAME is entirely unset, e.g. a standalone local run).
 _gate-ldap-stack-tests:
-	@ldap_started=0; \
+	@net=$${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)}_herd-net; \
+	auth_cid=$$(docker compose ps -q auth 2>/dev/null); \
+	if [ -z "$$auth_cid" ]; then \
+		echo "No running auth container for project $${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)} (docker compose ps -q auth returned nothing)."; \
+		echo "This target recreates an ALREADY-RUNNING gate stack's auth service; it does not start one."; \
+		echo "Bring the target stack up first (e.g. make _master-stack-up / make up), or check COMPOSE_PROJECT_NAME."; \
+		exit 1; \
+	fi; \
+	config_cid=$$(docker compose ps -q config 2>/dev/null); \
+	if [ -n "$$config_cid" ] && \
+		docker compose exec -T config test -f /data/herd-config/config.json 2>/dev/null && \
+		! docker compose exec -T config test -f /data/herd-config/config.bootstrapped 2>/dev/null; then \
+		echo "This stack's config.json was saved through the config UI (no config.bootstrapped"; \
+		echo "marker), so per herd_common.config_loader precedence it now outranks environment"; \
+		echo "variables for every service, auth included. The AUTH_METHOD=ldap / LDAP_* overrides"; \
+		echo "this target passes to docker compose up would be silently ignored, and auth would"; \
+		echo "stay in local mode: the login tests would then fail with 401s instead of skipping."; \
+		echo "This is a real, currently-unresolved gap (a config-UI save during test-e2e's config"; \
+		echo "round-trip test promotes config.json above env on every master/everything run,"; \
+		echo "before this phase ever runs), flagged rather than silently worked around here."; \
+		exit 1; \
+	fi; \
+	ldap_started=0; \
 	if ! docker ps --format '{{.Names}}' | grep -q '^ldap-test$$'; then \
 		echo "Starting infra/ldap-test (LDAP test server)..."; \
 		HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) $(LDAP_COMPOSE) up -d --wait; \
@@ -585,13 +627,12 @@ _gate-ldap-stack-tests:
 	else \
 		echo "LDAP test server already running; leaving it up afterward."; \
 	fi; \
-	net=$${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)}_herd-net; \
 	connect_out=$$(docker network connect "$$net" ldap-test 2>&1); \
 	rc=$$?; \
 	if [ $$rc -ne 0 ] && ! echo "$$connect_out" | grep -qi "already"; then \
 		echo "$$connect_out"; \
 		echo "Failed to connect ldap-test to $$net"; \
-		if [ "$$ldap_started" = 1 ]; then $(LDAP_COMPOSE) down -v --remove-orphans; fi; \
+		if [ "$$ldap_started" = 1 ]; then $(LDAP_COMPOSE) down -v; fi; \
 		exit 1; \
 	fi; \
 	wait_auth_healthy() { \
@@ -614,7 +655,7 @@ _gate-ldap-stack-tests:
 		docker compose up -d --no-deps --force-recreate auth; \
 		wait_auth_healthy 90 || true; \
 		docker network disconnect "$$net" ldap-test 2>/dev/null || true; \
-		if [ "$$ldap_started" = 1 ]; then $(LDAP_COMPOSE) down -v --remove-orphans; fi; \
+		if [ "$$ldap_started" = 1 ]; then $(LDAP_COMPOSE) down -v; fi; \
 		exit $$rc; \
 	}; \
 	trap restore EXIT INT TERM; \
