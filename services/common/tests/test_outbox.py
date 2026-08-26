@@ -255,7 +255,14 @@ def _connected_nats(jetstream_outcomes):
     def _jetstream():
         outcome = next(outcomes)
         if isinstance(outcome, BaseException):
-            raise outcome
+            # Raise a fresh instance each time rather than re-raising the same
+            # exception object: re-raising one instance across many ticks
+            # chains a new traceback frame onto it on every call (each tick's
+            # locals, including the outbox session, stay reachable from the
+            # growing chain until the whole exception is released), which is
+            # unnecessary here since the tests only assert on the outcome
+            # sequence and delay values, never on exception identity.
+            raise type(outcome)(*outcome.args)
         return outcome
 
     nc.jetstream = _jetstream

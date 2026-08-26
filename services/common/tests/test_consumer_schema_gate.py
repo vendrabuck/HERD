@@ -9,6 +9,7 @@ a period, and shutdown cancels a still-waiting gate cleanly.
 """
 
 import asyncio
+import gc
 import logging
 from types import SimpleNamespace
 
@@ -33,8 +34,21 @@ def metadata():
 
 
 @pytest.fixture
-async def engine():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+async def engine(tmp_path):
+    # File-backed, not `:memory:` (issue #534): an in-memory SQLite engine
+    # uses SQLAlchemy's StaticPool, a single raw connection shared by every
+    # checkout. These tests overlap a readiness-poll `engine.connect()` with
+    # the test body's own `engine.begin()` (create_all), and under a slow
+    # enough DB op the pool can discard one of the two concurrently-checked-
+    # out raw connections without closing it. A file-backed database lets
+    # SQLAlchemy's default pool for a file DSN open a real connection per
+    # checkout instead of sharing the single StaticPool connection, so
+    # concurrent checkouts no longer race over the same underlying
+    # aiosqlite.core.Connection. See tests/test_schema_init.py's
+    # `test_upgrade_in_place_unguarded_migration_applies_cleanly` for the
+    # same file-backed pattern.
+    db_path = tmp_path / "consumer_schema_gate.sqlite"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
     yield engine
     await engine.dispose()
 
@@ -139,7 +153,26 @@ async def test_gated_warns_periodically_while_waiting(engine, metadata, caplog):
             poll_interval_seconds=0.02,
             warn_interval_seconds=0.0,
         )
-        await asyncio.sleep(0.1)
+
+        # Poll for the warning instead of sleeping a fixed budget (issue
+        # #534 follow-up): a fixed sleep(0.1) is exactly five 0.02s poll
+        # periods, so it only has margin for a "still waiting" warning to
+        # land if every poll's readiness query is fast. Under real DB
+        # latency (slow disk, CI's coverage load, or the shielded
+        # cancellation wait added for #534, which makes shutdown wait for
+        # an in-flight query to finish rather than abandoning it) a single
+        # poll can outlast that whole budget, and the fixed sleep would
+        # then stop the gate before it ever logs, flaking this assertion
+        # for a reason that has nothing to do with what the test checks.
+        # Polling up to a generous ceiling waits only as long as actually
+        # needed and still fails deterministically if the warning never
+        # comes.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not any("still waiting" in r.getMessage() for r in caplog.records):
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.01)
+
         await stop_consumer_schema_gate(app)
 
     assert starter.calls == 0
@@ -195,3 +228,50 @@ async def test_readiness_check_failure_is_retried(engine, metadata, caplog, monk
     assert starter.calls == 1
     retried = [r for r in caplog.records if "could not check readiness" in r.getMessage()]
     assert len(retried) == 2
+
+
+async def test_cancel_mid_query_does_not_leak_the_connection(engine, metadata, monkeypatch):
+    """Regression for issue #534: a cancel mid-query must not leak the connection.
+
+    Patches `aiosqlite.core.Connection._execute` (scoped via monkeypatch) to
+    signal an asyncio.Event and yield before running the real op, pinning
+    the moment a query is genuinely in flight so the cancel below lands
+    there deterministically, with no real-time sleep budget needed.
+
+    Relies on the project's `filterwarnings = ["error"]` rather than a
+    manual `catch_warnings`: `Connection.__del__` warns through pytest's
+    unraisable-exception hook, not the normal `warnings` call path, so
+    `catch_warnings` around `gc.collect()` would not observe it, while
+    `filterwarnings = ["error"]` is the same mechanism that produced the
+    original failure, so a reintroduced leak fails this test directly.
+    """
+    import aiosqlite.core as aiosqlite_core
+
+    query_in_flight = asyncio.Event()
+    real_execute = aiosqlite_core.Connection._execute
+
+    async def _slow_execute(self, fn, *args, **kwargs):
+        query_in_flight.set()
+        # Yield back to the event loop so stop_consumer_schema_gate's cancel
+        # has a chance to be delivered while this op is still in flight on
+        # the worker thread, exactly as in the original leak.
+        await asyncio.sleep(0.05)
+        return await real_execute(self, fn, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite_core.Connection, "_execute", _slow_execute)
+
+    app = _app()
+    starter = _Starter()
+
+    await _start(app, GATED, engine, metadata, starter, poll_interval_seconds=0.001)
+    await asyncio.wait_for(query_in_flight.wait(), timeout=2.0)
+
+    # Cancel immediately, while the readiness query is suspended mid-flight.
+    await stop_consumer_schema_gate(app)
+
+    # No connection may still be open past this point: dispose the engine,
+    # then force collection so a leaked connection's __del__ fires here, in
+    # this test, under the project's filterwarnings = ["error"], rather than
+    # at an arbitrary later point.
+    await engine.dispose()
+    gc.collect()
