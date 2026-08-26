@@ -19,6 +19,8 @@ import { EmptyRow } from "@/components/ui/EmptyState";
 import { SkeletonRows } from "@/components/ui/Skeleton";
 import type { Device } from "@/types/device.types";
 
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
+
 function SelectAllCheckbox({ checked, indeterminate, onChange }: { checked: boolean; indeterminate: boolean; onChange: () => void }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -206,16 +208,19 @@ export function InventoryPage() {
   const storedSearch = usePreferencesStore((s) =>
     (s.savedFilters.inventory as { search?: string } | undefined)?.search ?? "",
   );
-  const storedLimit = usePreferencesStore((s) =>
-    typeof s.pageSizes.inventory === "number" ? s.pageSizes.inventory : 50,
-  );
+  const limit = usePreferencesStore((s) => s.getPageSize("inventory", 50));
   const setSavedFilter = usePreferencesStore((s) => s.setSavedFilter);
+  const setPageSize = usePreferencesStore((s) => s.setPageSize);
 
   const [skip, setSkip] = useState(0);
   const [userSearch, setUserSearch] = useState<string | null>(null);
   const searchInput = userSearch ?? storedSearch;
   const [debouncedSearch, setDebouncedSearch] = useState(storedSearch);
-  const limit = storedLimit;
+
+  const handlePageSizeChange = (size: number) => {
+    setPageSize("inventory", size);
+    setSkip(0);
+  };
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -434,7 +439,14 @@ export function InventoryPage() {
               </table>
               </div>
             )}
-            <Pagination total={total} skip={skip} limit={limit} onPageChange={setSkip} />
+            <Pagination
+              total={total}
+              skip={skip}
+              limit={limit}
+              onPageChange={setSkip}
+              pageSizeOptions={PAGE_SIZE_OPTIONS}
+              onPageSizeChange={handlePageSizeChange}
+            />
           </div>
         </section>
       </div>
