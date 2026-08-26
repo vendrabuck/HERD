@@ -167,9 +167,9 @@ async def test_gated_warns_periodically_while_waiting(engine, metadata, caplog):
         # Polling up to a generous ceiling waits only as long as actually
         # needed and still fails deterministically if the warning never
         # comes.
-        deadline = asyncio.get_event_loop().time() + 5.0
+        deadline = asyncio.get_running_loop().time() + 5.0
         while not any("still waiting" in r.getMessage() for r in caplog.records):
-            if asyncio.get_event_loop().time() >= deadline:
+            if asyncio.get_running_loop().time() >= deadline:
                 break
             await asyncio.sleep(0.01)
 
@@ -231,42 +231,19 @@ async def test_readiness_check_failure_is_retried(engine, metadata, caplog, monk
 
 
 async def test_cancel_mid_query_does_not_leak_the_connection(engine, metadata, monkeypatch):
-    """Regression for issue #534's cancellation-mid-query leak.
+    """Regression for issue #534: a cancel mid-query must not leak the connection.
 
-    stop_consumer_schema_gate cancels the poll task at shutdown. Before the
-    fix, a cancel delivered while `missing_model_tables` was mid-query
-    (suspended inside SQLAlchemy's async adapter, actually executing SQL on
-    the aiosqlite worker thread) dropped the raw aiosqlite connection
-    without closing it: the adapter's terminate() path re-raises
-    CancelledError rather than closing, so the connection object survived
-    only to have its __del__ warn once garbage-collected, and that warning
-    could land on whatever unrelated test happened to run after this one
-    (exactly what made #534's failures look random). The fix wraps the
-    readiness query in its own task, shields that task from cancellation,
-    and on a CancelledError waits for the shielded task to actually finish
-    before re-raising, so shutdown always waits for at most one in-flight
-    query to close its connection cleanly.
+    Patches `aiosqlite.core.Connection._execute` (scoped via monkeypatch) to
+    signal an asyncio.Event and yield before running the real op, pinning
+    the moment a query is genuinely in flight so the cancel below lands
+    there deterministically, with no real-time sleep budget needed.
 
-    Deterministic without any real-time sleep budget: `aiosqlite.core.
-    Connection._execute` (the call that hands work to the aiosqlite worker
-    thread for every actual SQL operation, including the one inside
-    `missing_model_tables`'s `conn.run_sync`) is patched, scoped to this
-    test via monkeypatch, to set an asyncio.Event and then briefly yield
-    before running the real op. That pins the moment a query is genuinely
-    in flight (a live connection, mid-op) so the cancel lands there on
-    every run, rather than merely before or after the DB call.
-
-    Deliberately does NOT try to catch the leaked connection's warning with
-    `warnings.catch_warnings`: `Connection.__del__` only warns once the
-    garbage collector actually finalizes the object, which pytest observes
-    through its own unraisable-exception hook (not the normal `warnings`
-    call path), so a manual `catch_warnings` block around the `gc.collect()`
-    call does not see it. Instead this test relies on the project's own
-    `filterwarnings = ["error"]` (root pyproject.toml), the exact mechanism
-    that turned the original leak into a failure: if `engine.dispose()` and
-    `gc.collect()` below finalize a connection that was never closed, pytest
-    fails THIS test outright with a PytestUnraisableExceptionWarning, which
-    is the desired, and only reliable, way to observe this class of leak.
+    Relies on the project's `filterwarnings = ["error"]` rather than a
+    manual `catch_warnings`: `Connection.__del__` warns through pytest's
+    unraisable-exception hook, not the normal `warnings` call path, so
+    `catch_warnings` around `gc.collect()` would not observe it, while
+    `filterwarnings = ["error"]` is the same mechanism that produced the
+    original failure, so a reintroduced leak fails this test directly.
     """
     import aiosqlite.core as aiosqlite_core
 
