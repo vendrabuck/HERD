@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useCancelReservation, useReleaseReservation, usePaginatedReservations } from "@/api/reservations";
 import { useAllDeviceNames } from "@/api/inventory";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { Pagination } from "@/components/ui/Pagination";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
@@ -91,7 +92,7 @@ export function ReservationsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const user = useAuthStore((s) => s.user);
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
   const limit = 50;
   // `showAll` is admin-only; a non-admin never sets it, so the query stays
   // scoped to the caller's own reservations (issue #340).

@@ -4,6 +4,7 @@ import toast from "react-hot-toast";
 import { useDevice, useUpdateDevice, useDeleteDevice, deleteDeviceErrorMessage } from "@/api/inventory";
 import { useTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer";
 import { PortsSection } from "@/components/devices/PortsSection";
 import { DeviceConfigSection } from "@/components/device-config/DeviceConfigSection";
@@ -31,7 +32,7 @@ export function DevicePage() {
   const updateDevice = useUpdateDevice();
   const deleteDevice = useDeleteDevice();
   const user = useAuthStore((s) => s.user);
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
 
   const [editing, setEditing] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);

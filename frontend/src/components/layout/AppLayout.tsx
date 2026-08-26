@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useCurrentUser, useLogout } from "@/api/auth";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
@@ -32,7 +33,7 @@ export function AppLayout() {
     navigate("/login");
   };
 
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
   const adminActive = location.pathname.startsWith("/admin");
 
   return (

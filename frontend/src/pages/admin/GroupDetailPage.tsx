@@ -2,6 +2,7 @@ import { useState, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useAuthStore } from "@/stores/authStore";
+import { isAdminRole } from "@/lib/roles";
 import { useGroup, useCreateGroup, useUpdateGroup, useBulkAddMembers, useBulkRemoveMembers } from "@/api/groups";
 import { useAllUsers } from "@/api/admin";
 import { TransferList } from "@/components/ui/TransferList";
@@ -18,7 +19,7 @@ export function GroupDetailPage() {
   const updateGroup = useUpdateGroup();
   const bulkAdd = useBulkAddMembers();
   const bulkRemove = useBulkRemoveMembers();
-  const isAdmin = user?.role === "admin" || user?.role === "superadmin";
+  const isAdmin = isAdminRole(user?.role);
   const { data: allUsers } = useAllUsers(isAdmin);
 
   const [name, setName] = useState("");
