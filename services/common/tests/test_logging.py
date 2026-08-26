@@ -74,13 +74,31 @@ def test_json_formatter_includes_exception():
 
 
 def test_setup_logging_configures_root_logger():
-    setup_logging("test-svc")
     root = logging.getLogger()
-    assert len(root.handlers) == 1
-    assert isinstance(root.handlers[0].formatter, JSONFormatter)
-    # Noisy loggers suppressed
-    assert logging.getLogger("uvicorn.access").level == logging.WARNING
-    assert logging.getLogger("sqlalchemy.engine").level == logging.WARNING
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    original_noisy_levels = {
+        name: logging.getLogger(name).level
+        for name in ("uvicorn.access", "uvicorn.error", "sqlalchemy.engine")
+    }
+    try:
+        setup_logging("test-svc")
+        assert len(root.handlers) == 1
+        assert isinstance(root.handlers[0].formatter, JSONFormatter)
+        # Noisy loggers suppressed
+        assert logging.getLogger("uvicorn.access").level == logging.WARNING
+        assert logging.getLogger("sqlalchemy.engine").level == logging.WARNING
+    finally:
+        # setup_logging replaces the root logger's handlers wholesale (issue
+        # #534 test-isolation follow-up): restore them so later tests in this
+        # process see the same root logger they would have without this test
+        # running (in particular, so pytest's own log-capture handler is not
+        # left removed for the rest of the session).
+        root.handlers.clear()
+        root.handlers.extend(original_handlers)
+        root.setLevel(original_level)
+        for name, level in original_noisy_levels.items():
+            logging.getLogger(name).setLevel(level)
 
 
 @pytest.mark.asyncio
