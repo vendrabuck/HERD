@@ -16,9 +16,17 @@ vi.mock("react-hot-toast", () => ({
   default: { success: vi.fn(), error: vi.fn() },
 }));
 
+const { patchPreferencesMock } = vi.hoisted(() => ({ patchPreferencesMock: vi.fn() }));
+vi.mock("@/api/userProfile", () => ({
+  getPreferences: vi.fn(),
+  patchPreferences: patchPreferencesMock,
+  resetPreferences: vi.fn(),
+}));
+
 import { server } from "../mocks/server";
 import { InventoryPage } from "@/pages/InventoryPage";
 import { useAuthStore } from "@/stores/authStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -79,6 +87,15 @@ function setAuthRole(role: string | null) {
 beforeEach(() => {
   setAuthRole("admin");
   server.use(defaultDeviceNamesHandler());
+  patchPreferencesMock.mockReset();
+  patchPreferencesMock.mockResolvedValue({
+    user_id: "u",
+    saved_filters: {},
+    page_sizes: {},
+    extras: {},
+    updated_at: "",
+  });
+  usePreferencesStore.getState().clear();
 });
 
 describe("InventoryPage", () => {
@@ -187,5 +204,59 @@ describe("InventoryPage", () => {
     // Non-admin: no Actions column header and no per-row selection checkboxes.
     expect(screen.queryByText("Actions")).not.toBeInTheDocument();
     expect(screen.queryAllByRole("checkbox")).toHaveLength(0);
+  });
+
+  it("changing the page-size selector updates the store, resets to the first page, and debounces a preferences patch", async () => {
+    const requests: { skip: string | null; limit: string | null }[] = [];
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        const url = new URL(request.url);
+        const skip = url.searchParams.get("skip");
+        const limit = url.searchParams.get("limit");
+        requests.push({ skip, limit });
+        return HttpResponse.json({
+          items: [makeDevice()],
+          total: 150,
+          skip: Number(skip ?? 0),
+          limit: Number(limit ?? 50),
+        });
+      }),
+    );
+    renderWithProviders(<InventoryPage />);
+    await waitFor(() =>
+      expect(screen.getByText("fw-edge-01")).toBeInTheDocument(),
+    );
+
+    // Move off the first page so the reset-to-first-page behavior is
+    // actually observable, rather than trivially true at skip=0.
+    const nextButton = screen.getByText("Next");
+    fireEvent.click(nextButton);
+    await waitFor(() =>
+      expect(requests.some((r) => r.skip === "50")).toBe(true),
+    );
+
+    const select = screen.getByLabelText("Rows per page") as HTMLSelectElement;
+    expect(select.value).toBe("50");
+
+    vi.useFakeTimers();
+    fireEvent.change(select, { target: { value: "100" } });
+
+    // The store updates synchronously; the debounced PATCH does not.
+    expect(usePreferencesStore.getState().pageSizes.inventory).toBe(100);
+    expect(patchPreferencesMock).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(250);
+    expect(patchPreferencesMock).toHaveBeenCalledTimes(1);
+    expect(patchPreferencesMock.mock.calls[0][0].page_sizes).toEqual({
+      inventory: 100,
+    });
+    vi.useRealTimers();
+
+    // Selecting a new page size also resets pagination to the first page.
+    await waitFor(() =>
+      expect(
+        requests.some((r) => r.skip === "0" && r.limit === "100"),
+      ).toBe(true),
+    );
   });
 });

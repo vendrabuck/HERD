@@ -68,12 +68,6 @@ describe("preferencesStore", () => {
     expect(mockedPatch.mock.calls[0][0].page_sizes).toEqual({ inventory: 25 });
   });
 
-  it("getSavedFilter falls back when missing", () => {
-    const fallback = { search: "" };
-    const got = usePreferencesStore.getState().getSavedFilter("inventory", fallback);
-    expect(got).toBe(fallback);
-  });
-
   it("rapid updates coalesce into one patch", () => {
     const s = usePreferencesStore.getState();
     s.setSavedFilter("inventory", { search: "a" });

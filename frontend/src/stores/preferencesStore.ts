@@ -8,7 +8,6 @@ interface PreferencesState {
   extras: Record<string, unknown>;
   loaded: boolean;
   load: () => Promise<void>;
-  getSavedFilter: <T = unknown>(page: string, fallback: T) => T;
   setSavedFilter: (page: string, filter: unknown) => void;
   getPageSize: (page: string, fallback: number) => number;
   setPageSize: (page: string, size: number) => void;
@@ -63,11 +62,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       // If the service is unavailable or returns an error, fall back to defaults.
       set({ loaded: true });
     }
-  },
-
-  getSavedFilter: <T = unknown>(page: string, fallback: T): T => {
-    const stored = get().savedFilters[page];
-    return (stored === undefined ? fallback : (stored as T));
   },
 
   setSavedFilter: (page, filter) => {
