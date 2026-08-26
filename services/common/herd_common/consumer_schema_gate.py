@@ -82,7 +82,42 @@ async def start_consumer_when_schema_ready(
         while True:
             await asyncio.sleep(poll_interval_seconds)
             try:
-                still_missing = await missing_model_tables(engine, metadata, schema=schema)
+                # Shielded (issue #534): stop_consumer_schema_gate cancels this
+                # task at shutdown, and a cancel delivered while this await is
+                # suspended mid-query inside SQLAlchemy's async adapter drops
+                # the raw aiosqlite connection without closing it (the
+                # adapter's terminate() re-raises CancelledError rather than
+                # closing on that path), which later surfaces as an unraisable
+                # Connection.__del__ warning on an unrelated test.
+                #
+                # asyncio.shield() alone is NOT enough here: it stops the
+                # inner query from being cancelled, but the outer `await`
+                # still raises CancelledError immediately, the moment this
+                # task is cancelled, regardless of whether the shielded query
+                # has finished. Left at that, the query keeps running fully
+                # detached in the background with nothing awaiting it, so a
+                # caller that tears down the event loop right after
+                # `stop_consumer_schema_gate` returns (exactly what a test
+                # fixture's teardown does) can close the loop out from under
+                # the still-running query; aiosqlite's worker thread then
+                # fails trying to hand its result back to a closed loop
+                # instead of leaking a connection.
+                #
+                # So: run the query as its own task, shield THAT task from
+                # cancellation, and on a CancelledError here, wait for the
+                # shielded task to actually finish (success or failure)
+                # before re-raising. This makes shutdown wait for at most one
+                # in-flight readiness query to truly complete, rather than
+                # merely surviving cancellation while nothing waits on it.
+                query_task = asyncio.ensure_future(
+                    missing_model_tables(engine, metadata, schema=schema)
+                )
+                try:
+                    still_missing = await asyncio.shield(query_task)
+                except asyncio.CancelledError:
+                    if not query_task.done():
+                        await asyncio.wait([query_task])
+                    raise
             except Exception as exc:  # transient DB trouble must not kill the gate
                 log.warning(
                     "Service '%s': consumer schema gate could not check readiness "
@@ -127,7 +162,13 @@ async def start_consumer_when_schema_ready(
 
 
 async def stop_consumer_schema_gate(app: Any) -> None:
-    """Cancel a pending schema gate task at shutdown. Safe when none was started."""
+    """Cancel a pending schema gate task at shutdown. Safe when none was started.
+
+    The poll loop shields its readiness query (issue #534), so this can take
+    up to one in-flight ``missing_model_tables`` call to actually finish
+    before the cancellation is observed here; that is deliberate; see
+    ``_poll_until_ready``.
+    """
     task = getattr(app.state, _GATE_TASK_ATTR, None)
     if task is None:
         return
