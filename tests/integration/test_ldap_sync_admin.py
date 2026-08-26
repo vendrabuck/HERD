@@ -111,9 +111,11 @@ pytestmark = [
 ]
 
 
-async def _login(email: str, password: str) -> dict:
-    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-        resp = await client.post(
+def _login(email: str, password: str) -> dict:
+    """Sync login helper for fixture setup/teardown (see the module note by
+    the fixtures below on why fixtures never use asyncio.run)."""
+    with httpx.Client(verify=False, timeout=15.0) as client:
+        resp = client.post(
             f"{BASE_URL}/auth/login",
             json={"email": email, "password": password},
         )
@@ -137,6 +139,20 @@ async def _poll_run(client: httpx.AsyncClient, run_id: str, timeout: float = 60.
         await asyncio.sleep(1.0)
 
 
+# Fixture setup/teardown below is deliberately SYNC (httpx.Client, no
+# asyncio.run), never AsyncClient: these calls are sequential anyway (login,
+# then promote, then re-login; create group, then create mapping; delete
+# mapping, then delete group), so async buys nothing here, and a raw
+# asyncio.run() inside a sync fixture used by a pytest-asyncio async test
+# creates and tears down its own throwaway event loop alongside
+# pytest-asyncio's own per-test loop, an interaction the live gate saw
+# leave behind unclosed AF_UNIX event-loop self-pipe sockets (issue #572
+# follow-up, 2026-08-26): every test still passed, but pytest exited 1 on
+# an ExceptionGroup of PytestUnraisableExceptionWarning at session end.
+# httpx.AsyncClient stays reserved for the async test bodies themselves,
+# which run under pytest-asyncio's own properly-managed loop.
+
+
 @pytest.fixture(scope="module")
 def superadmin_token():
     """Promote LDAP_SYNC_ADMIN_USER (ldapit-admin) to superadmin out-of-band
@@ -153,7 +169,7 @@ def superadmin_token():
     ON DELETE CASCADE or SET NULL per the models, so the wildcard delete
     below needs no separate dependent-row cleanup either way).
     """
-    asyncio.run(_login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD))  # JIT-provisions the row
+    _login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD)  # JIT-provisions the row
 
     result = _psql(
         f"UPDATE auth.users SET role='SUPERADMIN' WHERE username='{LDAP_SYNC_ADMIN_USER}'"
@@ -161,7 +177,7 @@ def superadmin_token():
     assert result.returncode == 0, f"promote failed: {result.stdout} {result.stderr}"
     assert "UPDATE 1" in result.stdout, f"expected exactly one row updated: {result.stdout!r}"
 
-    tokens = asyncio.run(_login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD))
+    tokens = _login(LDAP_SYNC_ADMIN_USER, LDAP_PASSWORD)
     yield tokens["access_token"]
 
     _psql("DELETE FROM auth.users WHERE username LIKE 'ldapit-%'")
@@ -175,43 +191,34 @@ def mapped_group(superadmin_token):
     """
     headers = {"Authorization": f"Bearer {superadmin_token}"}
 
-    async def _create():
-        async with httpx.AsyncClient(
-            base_url=BASE_URL, verify=False, timeout=30.0, headers=headers
-        ) as client:
-            group_resp = await client.post(
-                "/auth/groups",
-                json={
-                    "name": f"int-ldap-sync-{uuid.uuid4().hex[:8]}",
-                    "description": "issue #572 integration test",
-                },
-            )
-            group_resp.raise_for_status()
-            group = group_resp.json()
-            mapping_resp = await client.post(
-                "/auth/admin/ldap-sync/mappings",
-                json={"group_dn": HERD_IT_ENG_DN, "herd_group_id": group["id"]},
-            )
-            mapping_resp.raise_for_status()
-            return group, mapping_resp.json()
+    with httpx.Client(base_url=BASE_URL, verify=False, timeout=30.0, headers=headers) as client:
+        group_resp = client.post(
+            "/auth/groups",
+            json={
+                "name": f"int-ldap-sync-{uuid.uuid4().hex[:8]}",
+                "description": "issue #572 integration test",
+            },
+        )
+        group_resp.raise_for_status()
+        group = group_resp.json()
+        mapping_resp = client.post(
+            "/auth/admin/ldap-sync/mappings",
+            json={"group_dn": HERD_IT_ENG_DN, "herd_group_id": group["id"]},
+        )
+        mapping_resp.raise_for_status()
+        mapping = mapping_resp.json()
 
-    group, mapping = asyncio.run(_create())
     yield group, mapping
 
-    async def _cleanup():
-        async with httpx.AsyncClient(
-            base_url=BASE_URL, verify=False, timeout=30.0, headers=headers
-        ) as client:
-            try:
-                await client.delete(f"/auth/admin/ldap-sync/mappings/{mapping['id']}")
-            except httpx.HTTPError:
-                pass
-            try:
-                await client.delete(f"/auth/groups/{group['id']}")
-            except httpx.HTTPError:
-                pass
-
-    asyncio.run(_cleanup())
+    with httpx.Client(base_url=BASE_URL, verify=False, timeout=30.0, headers=headers) as client:
+        try:
+            client.delete(f"/auth/admin/ldap-sync/mappings/{mapping['id']}")
+        except httpx.HTTPError:
+            pass
+        try:
+            client.delete(f"/auth/groups/{group['id']}")
+        except httpx.HTTPError:
+            pass
 
 
 async def test_sync_run_reconciles_group_membership_from_directory(superadmin_token, mapped_group):
