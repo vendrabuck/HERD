@@ -11,6 +11,14 @@ Skipped unless:
 
 Expected directory layout (see services/auth/tests/test_ldap_service_live.py):
   dc=company,dc=local -> ou=people -> uid=user1..user25, password=Password1
+
+Runs in the Makefile's _gate-ldap-stack-tests phase (master, everything, and
+nightly), which switches the ephemeral gate stack's auth service to LDAP mode
+after e2e and restores it to local mode afterward, then in
+tests/integration/test_ldap_sync_admin.py (the sync-admin-surface companion
+to this file's login coverage); before that phase existed the stack always
+booted AUTH_METHOD=local, so this whole file self-skipped everywhere,
+including in every gate (issue #572).
 """
 
 from __future__ import annotations

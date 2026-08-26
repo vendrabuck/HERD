@@ -4,18 +4,23 @@ Follows the effect-assertion discipline established by test_config_playwright.py
 and test_acl_grants_playwright.py: UI state is checked against the backend's own
 API read-back, not just what rendered.
 
-The e2e stack always boots with AUTH_METHOD=local (there is no LDAP server in
-the ephemeral gate stack), so every scenario this file can exercise is the
-LOCAL-MODE surface: the mode banner, the create-mapping and sync-now buttons
-disabled, and the mappings/runs lists (history-proofed against the API's own
-totals rather than assumed empty). The ldap-mode UI flows (enabled buttons,
-interval text, create-with-warning banner, sync-now polling, run status
-badges, staleness handling) are covered at vitest level only
-(frontend/src/test/pages/LdapSyncPage.test.tsx and
-frontend/src/test/api/ldapSync.test.ts), because this stack has no reachable
-directory to flip auth_method to "ldap" against. Live-LDAP coverage of the
-sync mechanics themselves lives in services/auth/tests (gate-required, per
-ADR 0011's phase 1-5 testing section).
+The e2e stack always boots with AUTH_METHOD=local, and this file's own e2e
+phase (`make test-e2e`) runs BEFORE the gate ever switches auth to LDAP mode
+(see the Makefile's _gate-ldap-stack-tests, issue #572, which runs after e2e
+and restores local mode before any later phase), so within this file's own
+phase there is no reachable LDAP-mode stack to test against: every scenario
+here is the LOCAL-MODE surface: the mode banner, the create-mapping and
+sync-now buttons disabled, and the mappings/runs lists (history-proofed
+against the API's own totals rather than assumed empty). The ldap-mode UI
+flows (enabled buttons, interval text, create-with-warning banner, sync-now
+polling, run status badges, staleness handling) are covered at vitest level
+only (frontend/src/test/pages/LdapSyncPage.test.tsx and
+frontend/src/test/api/ldapSync.test.ts), not by Playwright anywhere: the
+_gate-ldap-stack-tests phase that does put the stack in LDAP mode exercises
+the sync ADMIN surface through tests/integration/test_ldap_sync_admin.py
+(the public API directly), not through this UI. Live-LDAP coverage of the
+sync mechanics themselves also lives in services/auth/tests (gate-required,
+per ADR 0011's phase 1-5 testing section).
 
 Uses the pw_page fixture (plain playwright sync API) and the shared pw_login
 helper for the main-app login form.

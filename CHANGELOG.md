@@ -83,6 +83,35 @@
   merely slow. The admin UI's 30-minute stale-row display (PR #526) is an
   independent, shorter client-side hint; this reaper is what corrects the audit
   record itself.
+- LDAP integration suite and Postgres-live sync coverage wired into the gates and
+  nightly (issue #572): `tests/integration/test_ldap_auth.py` was gated on
+  `HERD_INTEGRATION_LDAP=1`, a variable no Makefile target, CI workflow, or compose
+  file ever set, so it (and the sync-admin surface) self-skipped in `make master`,
+  `make everything`, PR CI, and nightly alike. PR #582 first closed the
+  real-Postgres half of the gap: `services/auth/tests/test_ldap_sync_service_live_pg.py`
+  and `services/common/tests/test_advisory_lock_live_pg.py` exercise `_SyncSlot`'s
+  cross-replica advisory-lock branch and the underlying `session_try_lock`/
+  `session_unlock`/`xact_lock` SQL against a real server for the first time (every
+  prior test ran on SQLite, which no-ops that whole code path). This delivery closes
+  the rest: a new Makefile phase, `_gate-ldap-stack-tests`, runs after `test-e2e` in
+  `master`, `everything`, and the nightly workflow, connects the checked-in
+  `infra/ldap-test` server onto the ephemeral stack's compose network, recreates
+  ONLY the stack's auth service (`--no-deps --force-recreate`) in LDAP mode, runs
+  `test_ldap_auth.py` plus the new `tests/integration/test_ldap_sync_admin.py`
+  (mapping create, sync-now, run polling, group-membership reconcile against a real
+  directory, and a concurrent-sync-now race proving the loser gets the in-process
+  busy 409), then always restores auth to local mode before any later phase (seeding,
+  load tests) runs. `test_ldap_sync_admin.py` works around the resulting
+  chicken-and-egg problem (in LDAP mode `authenticate_user` consults ONLY the
+  directory, so the stack's seeded local superadmin cannot log in and there is no API
+  path to an admin token) by promoting a JIT-provisioned directory user directly in
+  Postgres via `docker compose exec postgres psql`, then re-logging in. A sibling
+  `_gate-pg-live-tests` phase runs the two PR #582 files hard-required
+  (`HERD_TEST_PG_REQUIRED=1`) against the gate stack's own Postgres, since they need
+  no LDAP mode. Both new targets are deliberately free of `$(MAKE)` references in
+  their own recipes (unlike the pre-existing `_gate-ldap-tests`), since a recipe line
+  containing one executes for real even under `make -n`, and these mix in real
+  docker network/compose mutation.
 
 #### Reconcile and provisioning
 

@@ -463,10 +463,24 @@ authority for role, per the issue.
   dangling mapping applies nothing and marks the run partial; second run
   is a no-op. Fixtures ride `infra/ldap-test`.
 - Contract: new admin endpoints land in the auth OpenAPI snapshot.
-- Integration/e2e: the existing `HERD_INTEGRATION_LDAP`-gated stack suite
-  gains a sync path only if the stack-mode LDAP flow is extended; otherwise
-  live coverage stays in the auth suite by design (the gate runs it
-  hard-required).
+- Integration/e2e (issue #572): the `HERD_INTEGRATION_LDAP`-gated stack suite
+  now has a sync path, `tests/integration/test_ldap_sync_admin.py`: mapping
+  create, sync-now, run polling, and group-membership reconcile, all
+  asserted through the public API against a real running stack, plus a
+  concurrent-sync-now race proving the loser gets the in-process busy 409.
+  It runs in the Makefile's `_gate-ldap-stack-tests` phase (master,
+  everything, and nightly), which switches the gate stack's auth service to
+  LDAP mode after e2e and restores it afterward; before that phase existed,
+  the stack always booted `AUTH_METHOD=local`, so `HERD_INTEGRATION_LDAP=1`
+  was set nowhere and this suite never actually ran. A sibling
+  `_gate-pg-live-tests` phase runs the Postgres-live advisory-lock and
+  `_SyncSlot` replica-branch coverage
+  (`services/auth/tests/test_ldap_sync_service_live_pg.py`,
+  `services/common/tests/test_advisory_lock_live_pg.py`) against the gate
+  stack's own Postgres. The e2e suite itself
+  (`tests/e2e/test_ldap_sync_admin_playwright.py`) still only exercises the
+  local-mode refused state, since the e2e phase runs before the stack
+  switches to LDAP mode.
 
 ## Out of scope
 
