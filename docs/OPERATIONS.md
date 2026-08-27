@@ -79,7 +79,7 @@ Three durable consumers feed off two source streams (`HERD_RESERVATIONS` for `he
 - `notifications` consumer (`notifications-consumer`), DLQ `herd.reservations.dlq.notifications`
 - `notifications` health consumer (`notifications-health-consumer`), DLQ `herd.health.dlq.notifications`
 
-Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ`. Inspect with the `nats` CLI (install via `brew install nats-io/nats-tools/nats` or the binary from github.com/nats-io/natscli):
+Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate. Inspect with the `nats` CLI (install via `brew install nats-io/nats-tools/nats` or the binary from github.com/nats-io/natscli):
 
 ```bash
 # List the DLQ stream and its retained messages
@@ -118,6 +118,16 @@ docker compose exec nats nats stream purge HERD_DLQ \
 docker compose exec nats nats stream purge HERD_DLQ \
   --subject 'herd.health.dlq.notifications'
 ```
+
+### JetStream durability
+
+Under `make up` and the gate stack, JetStream state (streams, unconsumed events, DLQ contents, consumer positions) is ephemeral by design: it lives in a directory the dev compose override points at instead of a mounted volume, so it is lost on a container recreate (image bump, `up -d --build`, `--force-recreate`, `gate-down`). A plain `docker restart` keeps it, since the container filesystem is untouched; only a recreate wipes it. This is deliberate, for clean-start test isolation: a volume there would let stale events from a previous run outlive a wiped Postgres, and a consumer pulling one would NAK it into the DLQ as unresolvable state.
+
+Under `make prod`, JetStream state persists in the `nats-data` named volume, mounted at `/data`; a recreate (`docker compose -f docker-compose.yml up -d --force-recreate nats`, an image bump, a host reboot) keeps stream contents. The volume is purged only by `make clean-data`, not by a normal `make down`.
+
+The transactional-outbox relay (`herd_common.outbox`) marks an event published once JetStream acks the publish, and does not replay it. So on the ephemeral dev/test path, an event a lagging or down consumer had not yet pulled before a recreate is gone; the expiration-sweep backstops (dynamic-provisioning timeout, physical-only stranded-`PENDING_PROVISION` revert) cover some of the resulting gaps, not all. This is the accepted tradeoff for the ephemeral path; `make prod`'s durable store does not have this gap.
+
+Each stream's retention is capped by `max_age`, applied through `herd_common.jetstream.ensure_stream` (an add-or-update helper: plain `add_stream` against a stream that already exists with a different configuration errors instead of returning it, which would break boot on an upgraded-in-place stack). The cap is configurable via `NATS_STREAM_MAX_AGE_SECONDS` (see `docs/ENV_VARS.md`), read by the reservations service (`HERD_RESERVATIONS`) and the execution service (`HERD_HEALTH`, `HERD_DLQ`); 0 disables the cap. Without a cap, a durable `make prod` volume would grow unbounded.
 
 ## TLS certificate rotation
 

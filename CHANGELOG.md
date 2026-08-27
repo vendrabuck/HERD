@@ -417,6 +417,29 @@
   installed packages against the same `uv export --frozen` output via
   `scripts/check_image_matches_lock.py`, tolerating only the two editable
   workspace packages and pip's own bootstrap package.
+- JetStream durability for `make prod`, with retention caps (issue #620): base
+  `docker-compose.yml`'s `nats` service now mounts a `nats-data` volume at
+  `/data` and runs `-js -sd /data -m 8222`, so stream contents survive a
+  container recreate; `docker-compose.override.yml` replaces `command` with an
+  ephemeral store dir, so `make up` and the gate stack keep starting every
+  stream empty (test isolation; a volume there would let stale events survive
+  a wiped Postgres and NAK into the DLQ). `herd_common/jetstream.py`'s
+  `ensure_stream(js, *, name, subjects, max_age_seconds)` is a shared
+  add-or-update helper: it tries `add_stream` first and falls back to
+  `update_stream` only on the JetStream "stream name already in use with a
+  different configuration" error (`err_code` 10058), since plain `add_stream`
+  against an existing stream with a different config raises instead of
+  returning it, which would otherwise break boot on an upgraded-in-place
+  stack. Adopted by the three stream-owning lifespans (reservations'
+  `HERD_RESERVATIONS`, execution's `HERD_HEALTH` and `HERD_DLQ`) with a new
+  `NATS_STREAM_MAX_AGE_SECONDS` setting (default 7 days, 0 disables the cap)
+  on both services. The integration-test NATS helpers
+  (`tests/integration/_nats_helpers.py`, `test_health_alerting_flow.py`,
+  `test_dlq_and_idempotency.py`, `test_failed_teardown.py`) stopped
+  re-declaring streams they don't own via `add_stream` and instead confirm
+  existence with `stream_info`, so they no longer race a configured `max_age`
+  into an in-use error. `docs/OPERATIONS.md` documents the ephemeral-vs-durable
+  split and `docs/ENV_VARS.md` documents the new knob.
 
 ## [0.2.0] - 2026-08-03
 
