@@ -4,6 +4,7 @@ import uuid
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.auth import ADMIN_ROLES
+from herd_common.internal_client import ForwardedAuth, call_service
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -386,12 +387,13 @@ async def _fetch_user_group_ids(user_id: uuid.UUID, authorization: str | None) -
             detail="internal: missing Authorization header while resolving user groups",
         )
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{_auth_base()}/groups/user/{user_id}",
-                headers={"Authorization": authorization},
-                timeout=10.0,
-            )
+        resp = await call_service(
+            _auth_base(),
+            "GET",
+            f"/groups/user/{user_id}",
+            timeout=10.0,
+            auth=ForwardedAuth(authorization=authorization),
+        )
     except httpx.HTTPError as exc:
         logger.error("auth service unreachable while fetching groups for user %s: %s", user_id, exc)
         raise HTTPException(
@@ -431,12 +433,13 @@ async def _fetch_user_group_names(
             detail="internal: missing Authorization header while resolving group names",
         )
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{_auth_base()}/groups",
-                headers={"Authorization": authorization},
-                timeout=10.0,
-            )
+        resp = await call_service(
+            _auth_base(),
+            "GET",
+            "/groups",
+            timeout=10.0,
+            auth=ForwardedAuth(authorization=authorization),
+        )
     except httpx.HTTPError as exc:
         logger.error("auth service unreachable while fetching group names: %s", exc)
         raise HTTPException(
