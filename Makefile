@@ -9,8 +9,9 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # Root-level Python helper scripts. These live outside services/ so they are not
 # covered by the workspace ruff config's default discovery, so lint/format target
 # them explicitly. Add new repo-root scripts here so they are linted and
-# format-checked locally and in CI. Today this is just the seed script.
-ROOT_PY := seed_devices_public.py
+# format-checked locally and in CI. Today this is the seed script and the
+# CI image-vs-lock guard script (issue #593).
+ROOT_PY := seed_devices_public.py scripts/check_image_matches_lock.py
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh

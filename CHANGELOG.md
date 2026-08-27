@@ -317,6 +317,25 @@
   `types/ai.types.ts`, and the unused `class-variance-authority` dependency.
   Duplication-reduction follow-ups from the same sweep are tracked separately in
   issues #595 to #599 and were deliberately left out of this PR's scope.
+- Lock-faithful service images (issue #593): every service Dockerfile installs
+  third-party dependencies from the workspace `uv.lock` instead of resolving
+  fresh at build time. Each Dockerfile now runs
+  `uv export --frozen --package <svc> --no-hashes --no-emit-workspace
+  --no-default-groups -o requirements.txt` and installs that file verbatim,
+  then registers `services/common` and the service package themselves with
+  `--no-deps` editable installs (no dependency resolution happens on that
+  second pass). The build context is unchanged (repo root for every backend
+  service); each Dockerfile now also copies the root `pyproject.toml` and
+  `uv.lock` into a dedicated `/lock` layer, ordered before the service source
+  so the dependency layer still caches across code-only edits. This closes
+  the gap that let a freshly built image resolve `anthropic` 1.0.0 while
+  `uv.lock` pinned 0.96.0 (the incident this issue tracks): a Dependabot PR
+  that bumps a `pyproject.toml` specifier without regenerating the lock now
+  fails both `uv lock --check` and every affected image build. A new CI step
+  in the `backend` job builds the ai-orchestrator image and diffs its
+  installed packages against the same `uv export --frozen` output via
+  `scripts/check_image_matches_lock.py`, tolerating only the two editable
+  workspace packages and pip's own bootstrap package.
 
 ## [0.2.0] - 2026-08-03
 
