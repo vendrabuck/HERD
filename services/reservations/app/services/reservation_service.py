@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from herd_common import advisory_lock
+from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import and_, exists, false, func, select, update
@@ -615,17 +616,20 @@ async def _cabling_fork_call(
     booking owner does not necessarily own the parent topology, so a JWT-forward
     would 403 against cabling's fork routes.
     """
-    if not settings.internal_api_token:
-        raise RuntimeError("internal_api_token not configured; cannot reach cabling forks")
     try:
-        async with httpx.AsyncClient() as client:
-            return await client.request(
-                method,
-                f"{settings.cabling_service_url}{path}",
-                headers={"X-Internal-Token": settings.internal_api_token},
-                json=json_body,
-                timeout=10.0,
-            )
+        return await call_service(
+            settings.cabling_service_url,
+            method,
+            path,
+            json_body=json_body,
+            timeout=10.0,
+            auth=InternalTokenAuth(
+                token=settings.internal_api_token,
+                missing_token_message=(
+                    "internal_api_token not configured; cannot reach cabling forks"
+                ),
+            ),
+        )
     except httpx.HTTPError as exc:
         raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
 
@@ -645,17 +649,18 @@ async def _execution_wiring_call(
     convention), and returns execution's own Response so a 4xx/409 (frozen refusal) or
     a structured 200 relays to the user verbatim.
     """
-    if not settings.internal_api_token:
-        raise RuntimeError("internal_api_token not configured; cannot reach execution")
     try:
-        async with httpx.AsyncClient() as client:
-            return await client.request(
-                method,
-                f"{settings.execution_service_url}{path}",
-                headers={"X-Internal-Token": settings.internal_api_token},
-                json=json_body,
-                timeout=30.0,
-            )
+        return await call_service(
+            settings.execution_service_url,
+            method,
+            path,
+            json_body=json_body,
+            timeout=30.0,
+            auth=InternalTokenAuth(
+                token=settings.internal_api_token,
+                missing_token_message=("internal_api_token not configured; cannot reach execution"),
+            ),
+        )
     except httpx.HTTPError as exc:
         raise RuntimeError(f"Failed to contact execution service: {exc}") from exc
 
