@@ -154,6 +154,7 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 | Variable | Default | Purpose |
 |---|---|---|
 | `NATS_URL` | `nats://nats:4222` | Connection string. Absence is non-fatal at startup; services log a warning and run without event-driven features. |
+| `NATS_STREAM_MAX_AGE_SECONDS` | `604800` (7 days) | JetStream retention cap (issue #620), applied via `herd_common.jetstream.ensure_stream` to `HERD_RESERVATIONS`, `HERD_HEALTH`, and `HERD_DLQ`. Read by the reservations and execution services (each applies it to the streams it owns). 0 disables the cap. Only matters where JetStream state is durable (`make prod`, the `nats-data` volume); under `make up` and the gate stack every stream starts empty on each recreate regardless of this setting. See [OPERATIONS.md](OPERATIONS.md#jetstream-durability). |
 
 ## Logging
 

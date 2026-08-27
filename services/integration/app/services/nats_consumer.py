@@ -14,6 +14,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 
+from herd_common.jetstream import ensure_stream_exists
 from herd_common.outbox import event_dedupe_key
 
 from app.config import settings
@@ -164,7 +165,7 @@ async def start_nats_consumer(app) -> None:
         from app.database import AsyncSessionLocal
 
         try:
-            await js.add_stream(name=NATS_STREAM, subjects=[NATS_SUBJECT_PATTERN])
+            await ensure_stream_exists(js, name=NATS_STREAM, subjects=[NATS_SUBJECT_PATTERN])
         except Exception:
             logger.warning("Could not create/update NATS stream %s", NATS_STREAM, exc_info=True)
 

@@ -5,6 +5,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 
+from herd_common.jetstream import ensure_stream_exists
 from herd_common.outbox import event_dedupe_key
 
 from app.config import settings
@@ -190,7 +191,7 @@ async def start_nats_consumer(app) -> None:
             dlq_subject: str,
         ):
             try:
-                await js.add_stream(name=stream, subjects=[subject_pattern])
+                await ensure_stream_exists(js, name=stream, subjects=[subject_pattern])
             except Exception:
                 logger.warning(
                     "Could not create/update NATS stream %s",

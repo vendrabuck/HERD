@@ -517,6 +517,16 @@ class _FakeSubscription:
         raise _FakeNatsTimeout()
 
 
+async def _fake_ensure_stream_exists(js, *, name, subjects):
+    """Stand-in for herd_common.jetstream.ensure_stream_exists in these tests:
+    calls straight through to the fake JetStream's add_stream(name, subjects),
+    so existing assertions on _FakeJetStream.added_streams / add_stream_error
+    keep exercising the same call site without depending on the real helper's
+    stream_info-first internals.
+    """
+    await js.add_stream(name, subjects)
+
+
 class _FakeJetStream:
     def __init__(self, subs_by_subject=None, add_stream_error=False):
         self._subs = subs_by_subject or {}
@@ -584,6 +594,7 @@ async def test_start_nats_consumer_wires_both_subscriptions(monkeypatch):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
 
     app = _FakeApp()
     await nats_consumer.start_nats_consumer(app)
@@ -631,6 +642,7 @@ async def test_start_nats_consumer_loop_processes_a_message(monkeypatch):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
 
     # The session factory built inside start_nats_consumer imports
     # AsyncSessionLocal from app.database; point it at this suite's in-memory
@@ -677,6 +689,7 @@ async def test_start_nats_consumer_loop_swallows_unexpected_errors(monkeypatch):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("unexpected")
@@ -707,6 +720,7 @@ async def test_start_nats_consumer_tolerates_add_stream_failure(monkeypatch):
         return conn
 
     _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
 
     app = _FakeApp()
     await nats_consumer.start_nats_consumer(app)
@@ -725,6 +739,7 @@ async def test_start_nats_consumer_swallows_connect_failure(monkeypatch):
         raise RuntimeError("connection refused")
 
     _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
 
     app = _FakeApp()
     # Must not raise: notifications degrades to no event-driven delivery.

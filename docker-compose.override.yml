@@ -112,6 +112,15 @@ services:
     profiles:
       - e2e
 
+  # Ephemeral by design (issue #620): make up and the gate stack start every
+  # JetStream stream empty on each recreate, for test isolation (stale events
+  # against a wiped Postgres would NAK into the DLQ). command is a scalar, so
+  # it REPLACES the base file's command rather than merging; the base file's
+  # nats-data volume mount stays declared (volumes merge as lists) but goes
+  # unused here, since -sd points at a different, unmounted directory.
+  nats:
+    command: ["-js", "-sd", "/tmp/nats-ephemeral", "-m", "8222"]
+
 volumes:
   driver-storage:
   driver-cache:

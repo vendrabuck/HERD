@@ -200,6 +200,10 @@ The notifications service consumes the same `herd.reservations.*` events on its 
 
 Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on `herd.reservations.<event-type>`. Check both `herd.reservations.dlq.execution` (execution) and `herd.reservations.dlq.notifications` so you don't miss the half of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 
+### DLQ messages disappeared after a rebuild
+
+Expected under `make up` and the gate stack: JetStream state is ephemeral there by design and is lost on a container recreate. See [OPERATIONS.md](OPERATIONS.md#jetstream-durability) for what is and isn't durable, and what `make prod` does instead.
+
 ## Secrets service
 
 ### Secrets container restarts in a loop or exits at boot

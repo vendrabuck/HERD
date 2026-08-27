@@ -9,6 +9,7 @@ from herd_common.consumer_schema_gate import (
     stop_consumer_schema_gate,
 )
 from herd_common.cors import add_cors_middleware
+from herd_common.jetstream import ensure_stream
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.outbox import run_outbox_relay
 from herd_common.schema_init import create_all_and_stamp
@@ -32,18 +33,25 @@ logger = logging.getLogger(__name__)
 
 
 async def _ensure_health_stream(app: FastAPI) -> None:
-    """Create HERD_HEALTH stream if NATS is up.
+    """Create or update the HERD_HEALTH stream if NATS is up.
 
-    Idempotent: add_stream returns the existing stream if it already
-    exists. Non-fatal if NATS is down so the service still boots; the
-    health scheduler simply drops publish attempts in that case.
+    Idempotent: ensure_stream creates the stream if it does not exist, or
+    updates it in place if it exists with a different configuration (e.g. a
+    changed max_age on an upgraded-in-place stack); a matching existing
+    config is a no-op. Non-fatal if NATS is down so the service still boots;
+    the health scheduler simply drops publish attempts in that case.
     """
     nc = getattr(app.state, "nats", None)
     if nc is None:
         return
     try:
         js = nc.jetstream()
-        await js.add_stream(name="HERD_HEALTH", subjects=["herd.health.*"])
+        await ensure_stream(
+            js,
+            name="HERD_HEALTH",
+            subjects=["herd.health.*"],
+            max_age_seconds=settings.nats_stream_max_age_seconds,
+        )
         logger.info("JetStream stream HERD_HEALTH ready")
     except Exception:
         logger.warning("Could not create HERD_HEALTH stream", exc_info=True)
@@ -61,16 +69,23 @@ async def _ensure_dlq_stream(app: FastAPI) -> None:
     publishes into the void and the message is lost. The "herd.*.dlq.>" pattern
     binds all current and future DLQ subjects into one inspectable stream.
 
-    Idempotent: add_stream returns the existing stream if it already exists.
-    Non-fatal if NATS is down so the service still boots; DLQ publishes are
-    best-effort and swallow their own errors in that case.
+    Idempotent: ensure_stream creates the stream if it does not exist, or
+    updates it in place if it exists with a different configuration (e.g. a
+    changed max_age on an upgraded-in-place stack); a matching existing
+    config is a no-op. Non-fatal if NATS is down so the service still boots;
+    DLQ publishes are best-effort and swallow their own errors in that case.
     """
     nc = getattr(app.state, "nats", None)
     if nc is None:
         return
     try:
         js = nc.jetstream()
-        await js.add_stream(name="HERD_DLQ", subjects=["herd.*.dlq.>"])
+        await ensure_stream(
+            js,
+            name="HERD_DLQ",
+            subjects=["herd.*.dlq.>"],
+            max_age_seconds=settings.nats_stream_max_age_seconds,
+        )
         logger.info("JetStream stream HERD_DLQ ready")
     except Exception:
         logger.warning("Could not create HERD_DLQ stream", exc_info=True)

@@ -64,9 +64,13 @@ async def _publish_health_event(payload: dict) -> None:
     nc = await nats.connect(nats_url, connect_timeout=5)
     try:
         js = nc.jetstream()
-        # Idempotent: stream is created by execution's lifespan, but if
-        # this test runs before execution boots we want a clean fail.
-        await js.add_stream(name="HERD_HEALTH", subjects=["herd.health.*"])
+        # Confirm the stream exists rather than re-declaring it: the stream is
+        # created by execution's lifespan, and add_stream against an existing
+        # stream with a different config (e.g. a configured max_age, issue
+        # #620) raises instead of returning it. stream_info raises
+        # nats.js.errors.NotFoundError if this test runs before execution
+        # boots, which is still the clean fail we want.
+        await js.stream_info("HERD_HEALTH")
         await js.publish(
             HEALTH_NATS_SUBJECT,
             json.dumps(payload).encode(),

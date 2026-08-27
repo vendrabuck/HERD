@@ -43,8 +43,13 @@ async def publish_raw(subject: str, payload: bytes) -> None:
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
-        # Idempotent: the stream is created by the reservations/execution lifespan.
-        await js.add_stream(name=_RESERVATIONS_STREAM, subjects=_RESERVATIONS_SUBJECTS)
+        # The stream is created by the reservations/execution lifespan; confirm it
+        # exists rather than re-declaring it, since add_stream against a stream
+        # that already exists with a different config (e.g. a configured max_age,
+        # issue #620) raises instead of returning it. stream_info raises
+        # nats.js.errors.NotFoundError if the stream is genuinely missing, which
+        # fails this helper clean rather than silently mismatching config.
+        await js.stream_info(_RESERVATIONS_STREAM)
         await js.publish(subject, payload)
     finally:
         await nc.close()
@@ -58,7 +63,8 @@ async def fetch_reservation_event(
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
-        await js.add_stream(name=_RESERVATIONS_STREAM, subjects=_RESERVATIONS_SUBJECTS)
+        # Confirm the stream exists rather than re-declaring it (see publish_raw).
+        await js.stream_info(_RESERVATIONS_STREAM)
         sub = await js.pull_subscribe("herd.reservations.*", stream=_RESERVATIONS_STREAM)
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
@@ -86,7 +92,8 @@ async def find_in_execution_dlq(marker: bytes, *, timeout: float = 15.0) -> byte
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
-        await js.add_stream(name=_DLQ_STREAM, subjects=_DLQ_SUBJECTS)  # idempotent
+        # Confirm the stream exists rather than re-declaring it (see publish_raw).
+        await js.stream_info(_DLQ_STREAM)
         sub = await js.pull_subscribe(_EXECUTION_DLQ_SUBJECT, stream=_DLQ_STREAM)
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
