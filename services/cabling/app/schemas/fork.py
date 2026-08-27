@@ -2,8 +2,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from app.schemas._types import OptionalUUIDStr, UUIDStr, UUIDStrList
 from app.schemas.topology import InvalidEdge
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel
 
 
 class ForkCreate(BaseModel):
@@ -16,24 +17,20 @@ class ForkCreate(BaseModel):
 
 
 class ForkCreateResponse(BaseModel):
-    fork_id: uuid.UUID
+    fork_id: UUIDStr
     version_number: int
-
-    @field_serializer("fork_id")
-    def serialize_fork_id(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class ForkConnectionResponse(BaseModel):
     """One row of the fork's wiring (issue #25 P3a, fork GET)."""
 
-    id: uuid.UUID
-    device_a_id: uuid.UUID
+    id: UUIDStr
+    device_a_id: UUIDStr
     port_a: str
-    device_b_id: uuid.UUID
+    device_b_id: UUIDStr
     port_b: str
     layer: str
-    physical_connection_id: uuid.UUID | None = None
+    physical_connection_id: OptionalUUIDStr = None
     # The canvas edge id this hop was resolved from (issue #345 P3b); NULL when unknown
     # (rows predating the column, or a hop resolved without a known edge id). Additive.
     edge_key: str | None = None
@@ -42,56 +39,32 @@ class ForkConnectionResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
-    @field_serializer("id", "device_a_id", "device_b_id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
-
-    @field_serializer("physical_connection_id")
-    def _serialize_optional_uuid(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value else None
-
 
 class ForkVersionSummary(BaseModel):
     """A fork_versions row without its canvas payload (the version list)."""
 
-    id: uuid.UUID
-    fork_id: uuid.UUID
+    id: UUIDStr
+    fork_id: UUIDStr
     version_number: int
-    restored_from_id: uuid.UUID | None = None
+    restored_from_id: OptionalUUIDStr = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
-
-    @field_serializer("id", "fork_id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
-
-    @field_serializer("restored_from_id")
-    def _serialize_optional_uuid(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value else None
 
 
 class ForkDetailResponse(BaseModel):
     """GET /internal/forks/{reservation_id}: fork metadata, canvas, wiring, versions."""
 
-    id: uuid.UUID
-    reservation_id: uuid.UUID
-    parent_topology_id: uuid.UUID | None = None
-    parent_version_id: uuid.UUID | None = None
+    id: UUIDStr
+    reservation_id: UUIDStr
+    parent_topology_id: OptionalUUIDStr = None
+    parent_version_id: OptionalUUIDStr = None
     status: str
     canvas_data: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
     connections: list[ForkConnectionResponse]
     versions: list[ForkVersionSummary]
-
-    @field_serializer("id", "reservation_id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
-
-    @field_serializer("parent_topology_id", "parent_version_id")
-    def _serialize_optional_uuid(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value else None
 
 
 class ForkCanvasUpdate(BaseModel):
@@ -103,13 +76,9 @@ class ForkCanvasUpdate(BaseModel):
 class ForkCanvasUpdateResponse(BaseModel):
     """Loose-edit result: the stored draft's route validation, no reconcile."""
 
-    id: uuid.UUID
+    id: UUIDStr
     valid: bool
     invalid_edges: list[InvalidEdge]
-
-    @field_serializer("id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class ForkSaveRequest(BaseModel):
@@ -129,37 +98,25 @@ class ForkConnectionDelta(BaseModel):
     that only reads the five identity fields is unaffected.
     """
 
-    device_a_id: uuid.UUID
+    device_a_id: UUIDStr
     port_a: str
-    device_b_id: uuid.UUID
+    device_b_id: UUIDStr
     port_b: str
     layer: str
-    physical_connection_id: uuid.UUID | None = None
+    physical_connection_id: OptionalUUIDStr = None
     # The canvas edge id this hop was resolved from (issue #345 P3b); NULL means
     # ungrouped. Relayed verbatim so the consumer can group the hops of one edge.
     edge_key: str | None = None
-
-    @field_serializer("device_a_id", "device_b_id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
-
-    @field_serializer("physical_connection_id")
-    def _serialize_optional_uuid(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value else None
 
 
 class ForkSaveResponse(BaseModel):
     """POST .../save result: the version appended and the release/build delta."""
 
-    fork_id: uuid.UUID
+    fork_id: UUIDStr
     version_number: int
     released: list[ForkConnectionDelta]
     built: list[ForkConnectionDelta]
     unchanged_count: int
-
-    @field_serializer("fork_id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class ForkPruneRequest(BaseModel):
@@ -179,26 +136,18 @@ class ForkPruneResponse(BaseModel):
     version, unbumped, and the caller must stage no wiring_changed for it.
     """
 
-    fork_id: uuid.UUID
+    fork_id: UUIDStr
     version_number: int
     changed: bool
     released: list[ForkConnectionDelta]
-
-    @field_serializer("fork_id")
-    def serialize_fork_id(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class ForkArchiveResponse(BaseModel):
     """POST .../archive result: the frozen fork's identity and ARCHIVED status."""
 
-    fork_id: uuid.UUID
-    reservation_id: uuid.UUID
+    fork_id: UUIDStr
+    reservation_id: UUIDStr
     status: str
-
-    @field_serializer("fork_id", "reservation_id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class ActiveForkEntry(BaseModel):
@@ -210,12 +159,8 @@ class ActiveForkEntry(BaseModel):
     existing reservation_ids list, which the archive reconciler still reads.
     """
 
-    reservation_id: uuid.UUID
+    reservation_id: UUIDStr
     latest_fork_version: int
-
-    @field_serializer("reservation_id")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class ActiveForkListResponse(BaseModel):
@@ -228,12 +173,8 @@ class ActiveForkListResponse(BaseModel):
     unpaginated total.
     """
 
-    reservation_ids: list[uuid.UUID]
+    reservation_ids: UUIDStrList
     forks: list[ActiveForkEntry]
     total: int
     skip: int
     limit: int
-
-    @field_serializer("reservation_ids")
-    def _serialize_ids(self, value: list[uuid.UUID]) -> list[str]:
-        return [str(v) for v in value]

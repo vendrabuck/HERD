@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_serializer
+from app.schemas._types import OptionalUUIDStr, UUIDStr
+from pydantic import BaseModel, Field
 
 
 class ConnectionCreate(BaseModel):
@@ -16,10 +17,10 @@ class ConnectionCreate(BaseModel):
 
 
 class ConnectionResponse(BaseModel):
-    id: uuid.UUID
-    device_a_id: uuid.UUID
+    id: UUIDStr
+    device_a_id: UUIDStr
     port_a: str
-    device_b_id: uuid.UUID
+    device_b_id: UUIDStr
     port_b: str
     connection_type: str
     notes: str | None
@@ -29,10 +30,6 @@ class ConnectionResponse(BaseModel):
     updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
-
-    @field_serializer("id", "device_a_id", "device_b_id")
-    def serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class PaginatedConnectionResponse(BaseModel):
@@ -50,12 +47,8 @@ class ConnectionBulkCreate(BaseModel):
 class ConnectionBulkRowResult(BaseModel):
     index: int  # position in the submitted items list
     status: str  # "created" or "rejected"
-    connection_id: uuid.UUID | None
+    connection_id: OptionalUUIDStr
     error: str | None  # human-readable reason when rejected
-
-    @field_serializer("connection_id")
-    def serialize_connection_id(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value is not None else None
 
 
 class ConnectionBulkReport(BaseModel):
