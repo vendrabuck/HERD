@@ -12,6 +12,18 @@ services.
 
 Assumes a running HERD stack (make up) with NATS, notifications, auth,
 reservations, and inventory services reachable through Traefik.
+
+Every published payload carries a fresh event_id, and the publish sets
+the matching Nats-Msg-Id header (issue #611). The notifications consumer
+dedupes on herd_common.outbox.event_dedupe_key, which falls back to
+`<stream>:<sequence>` when a payload has no event_id. The dev/test NATS
+container has no volume, so a container recreate resets stream sequences
+to 1 while Postgres keeps the notification rows a prior run persisted
+under those same `<stream>:<sequence>` keys; on a reused stack the next
+run's inserts then collide on the (user_id, dedupe_key) unique constraint
+and are silently dropped as redeliveries, and the test flickers with no
+code-level cause. Stamping event_id (and the header) mirrors what the real
+outbox producer always does and gives every run its own dedupe key.
 """
 
 import asyncio
@@ -29,6 +41,13 @@ pytestmark = pytest.mark.asyncio
 
 HEALTH_NATS_SUBJECT = "herd.health.status_changed"
 
+# herd_common is not on the integration test environment's import path (no
+# tests/integration file imports it), so these mirror
+# herd_common.outbox.NATS_MSG_ID_HEADER and herd_common.outbox.EVENT_ID_FIELD
+# rather than importing them.
+_NATS_MSG_ID_HEADER = "Nats-Msg-Id"
+_EVENT_ID_FIELD = "event_id"
+
 
 async def _publish_health_event(payload: dict) -> None:
     """Connect to NATS, publish to herd.health.status_changed, close.
@@ -36,6 +55,12 @@ async def _publish_health_event(payload: dict) -> None:
     NATS_URL defaults to the docker-compose-internal hostname; override
     via env to talk to a host-mapped port (`make up` does not expose 4222
     by default). Tests that can't reach NATS skip rather than fail.
+
+    The caller must have stamped payload["event_id"]; this sets the matching
+    Nats-Msg-Id header so a real producer's dedup contract is mirrored,
+    rather than falling back to the stream:sequence key that a NATS
+    container recreate on a reused stack (dev/test has no volume) resets
+    to values Postgres already holds notification rows for (issue #611).
     """
     nats_url = os.getenv("NATS_URL_HOST", "nats://localhost:4222")
     nc = await nats.connect(nats_url, connect_timeout=5)
@@ -44,7 +69,11 @@ async def _publish_health_event(payload: dict) -> None:
         # Idempotent: stream is created by execution's lifespan, but if
         # this test runs before execution boots we want a clean fail.
         await js.add_stream(name="HERD_HEALTH", subjects=["herd.health.*"])
-        await js.publish(HEALTH_NATS_SUBJECT, json.dumps(payload).encode())
+        await js.publish(
+            HEALTH_NATS_SUBJECT,
+            json.dumps(payload).encode(),
+            headers={_NATS_MSG_ID_HEADER: payload[_EVENT_ID_FIELD]},
+        )
     finally:
         await nc.close()
 
@@ -75,6 +104,7 @@ async def _poll_for_notification(
 def _bad_news_event(device_id: str, device_name: str = "int-device") -> dict:
     return {
         "event": "device.health_transition",
+        "event_id": str(uuid.uuid4()),
         "device_id": device_id,
         "device_name": device_name,
         "old_status": "HEALTHY",
@@ -89,6 +119,7 @@ def _bad_news_event(device_id: str, device_name: str = "int-device") -> dict:
 def _recovery_event(device_id: str, device_name: str = "int-device") -> dict:
     return {
         "event": "device.health_transition",
+        "event_id": str(uuid.uuid4()),
         "device_id": device_id,
         "device_name": device_name,
         "old_status": "UNREACHABLE",
