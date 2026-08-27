@@ -1,6 +1,7 @@
 import uuid
 
-from pydantic import BaseModel, Field, field_serializer
+from app.schemas._types import UUIDStr
+from pydantic import BaseModel, Field
 
 # Upper bound on pairs accepted by a single batch pathfind request. A full
 # mesh over 63 devices is 1953 pairs, so 2000 covers the Routes tab's
@@ -14,13 +15,9 @@ class PathfindRequest(BaseModel):
 
 
 class PathHop(BaseModel):
-    device_id: uuid.UUID
+    device_id: UUIDStr
     port_in: str | None = None
     port_out: str | None = None
-
-    @field_serializer("device_id")
-    def serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class PathfindResponse(BaseModel):
@@ -38,12 +35,8 @@ class PathfindBatchResult(PathfindResponse):
     plus an echo of the requested pair so clients can correlate without
     relying on order alone."""
 
-    source_device_id: uuid.UUID
-    target_device_id: uuid.UUID
-
-    @field_serializer("source_device_id", "target_device_id")
-    def serialize_device_ids(self, value: uuid.UUID) -> str:
-        return str(value)
+    source_device_id: UUIDStr
+    target_device_id: UUIDStr
 
 
 class PathfindBatchResponse(BaseModel):

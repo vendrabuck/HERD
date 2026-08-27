@@ -1,8 +1,8 @@
-import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_serializer
+from app.schemas._types import OptionalUUIDStr, UUIDStr
+from pydantic import BaseModel, Field
 
 
 class TopologyCreate(BaseModel):
@@ -20,23 +20,15 @@ class TopologyUpdate(BaseModel):
 
 
 class TopologyResponse(BaseModel):
-    id: uuid.UUID
+    id: UUIDStr
     name: str
-    created_by: uuid.UUID
+    created_by: UUIDStr
     owner_name: str = ""
     created_at: datetime
     updated_at: datetime
-    modified_by: uuid.UUID | None = None
+    modified_by: OptionalUUIDStr = None
 
     model_config = {"from_attributes": True}
-
-    @field_serializer("modified_by")
-    def serialize_modified_by(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value else None
-
-    @field_serializer("id", "created_by")
-    def serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class TopologyDetail(TopologyResponse):
@@ -51,25 +43,17 @@ class PaginatedTopologyResponse(BaseModel):
 
 
 class TopologyVersionResponse(BaseModel):
-    id: uuid.UUID
-    topology_id: uuid.UUID
+    id: UUIDStr
+    topology_id: UUIDStr
     version_number: int
     name: str
     description: str | None = None
-    created_by: uuid.UUID
+    created_by: UUIDStr
     author_name: str
     created_at: datetime
-    restored_from_id: uuid.UUID | None = None
+    restored_from_id: OptionalUUIDStr = None
 
     model_config = {"from_attributes": True}
-
-    @field_serializer("id", "topology_id", "created_by")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
-
-    @field_serializer("restored_from_id")
-    def _serialize_optional_uuid(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value else None
 
 
 class TopologyVersionDetail(TopologyVersionResponse):
@@ -90,18 +74,14 @@ class ModifiedItem(BaseModel):
 
 
 class TopologyVersionDiff(BaseModel):
-    version_a: uuid.UUID
-    version_b: uuid.UUID
+    version_a: UUIDStr
+    version_b: UUIDStr
     nodes_added: list[dict[str, Any]]
     nodes_removed: list[dict[str, Any]]
     nodes_modified: list[ModifiedItem]
     edges_added: list[dict[str, Any]]
     edges_removed: list[dict[str, Any]]
     edges_modified: list[ModifiedItem]
-
-    @field_serializer("version_a", "version_b")
-    def _serialize_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class TopologyRestoreRequest(BaseModel):
@@ -111,14 +91,10 @@ class TopologyRestoreRequest(BaseModel):
 
 class InvalidEdge(BaseModel):
     edge_id: str
-    source_device_id: uuid.UUID | None = None
-    target_device_id: uuid.UUID | None = None
+    source_device_id: OptionalUUIDStr = None
+    target_device_id: OptionalUUIDStr = None
     layer: str | None = None
     reason: str
-
-    @field_serializer("source_device_id", "target_device_id")
-    def _serialize_optional_uuid(self, value: uuid.UUID | None) -> str | None:
-        return str(value) if value else None
 
 
 class TopologyValidationResponse(BaseModel):

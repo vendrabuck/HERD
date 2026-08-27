@@ -2,7 +2,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_serializer
+from app.schemas._types import UUIDStr
+from pydantic import BaseModel
 
 
 class TemplateCreate(BaseModel):
@@ -23,19 +24,15 @@ class TemplateUpdate(BaseModel):
 
 
 class TemplateResponse(BaseModel):
-    id: uuid.UUID
+    id: UUIDStr
     name: str
     description: str | None = None
-    created_by: uuid.UUID
+    created_by: UUIDStr
     owner_name: str
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
-
-    @field_serializer("id", "created_by")
-    def _ser_uuid(self, value: uuid.UUID) -> str:
-        return str(value)
 
 
 class TemplateDetail(TemplateResponse):
