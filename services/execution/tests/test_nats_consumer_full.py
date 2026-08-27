@@ -175,11 +175,18 @@ async def test_start_nats_consumer_success():
     mock_nats_module = MagicMock()
     mock_nats_module.connect = AsyncMock(return_value=mock_nc)
 
-    with patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)):
+    ensure_stream_exists_mock = AsyncMock()
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
+        patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_exists_mock),
+    ):
         await start_nats_consumer(mock_app)
 
-    # Verify stream was created
-    mock_js.add_stream.assert_called_once()
+    # Verify the stream was confirmed to exist (this consumer does not own its
+    # config; see herd_common.jetstream.ensure_stream_exists)
+    ensure_stream_exists_mock.assert_awaited_once_with(
+        mock_js, name="HERD_RESERVATIONS", subjects=["herd.reservations.*"]
+    )
     # Verify subscription was created
     mock_js.pull_subscribe.assert_called_once()
     # Verify consumer task was stored
@@ -207,7 +214,6 @@ async def test_start_nats_consumer_stream_create_failure():
     mock_js = AsyncMock()
     mock_nc = AsyncMock()
     mock_nc.jetstream = MagicMock(return_value=mock_js)
-    mock_js.add_stream.side_effect = Exception("stream error")
 
     # Pull subscription with no messages (fetch always times out).
     mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([]))
@@ -215,7 +221,11 @@ async def test_start_nats_consumer_stream_create_failure():
     mock_nats_module = MagicMock()
     mock_nats_module.connect = AsyncMock(return_value=mock_nc)
 
-    with patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)):
+    ensure_stream_exists_mock = AsyncMock(side_effect=Exception("stream error"))
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
+        patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_exists_mock),
+    ):
         await start_nats_consumer(mock_app)
 
     # Stream creation failed but subscribe still happened

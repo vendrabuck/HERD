@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import httpx
+from herd_common.jetstream import ensure_stream_exists
 from herd_common.outbox import event_dedupe_key
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import select
@@ -3708,9 +3709,12 @@ async def start_nats_consumer(app) -> None:
         app.state.nats = nc
         js = nc.jetstream()
 
-        # Ensure stream exists (idempotent; no-op if already created by reservations service)
+        # Confirm stream exists; this consumer does not own its config (reservations
+        # does, via herd_common.jetstream.ensure_stream), so it never re-declares or
+        # updates it, only creates it (with no max_age) if reservations hasn't yet.
         try:
-            await js.add_stream(
+            await ensure_stream_exists(
+                js,
                 name="HERD_RESERVATIONS",
                 subjects=["herd.reservations.*"],
             )
