@@ -1,6 +1,7 @@
 import logging
 import uuid
 
+from herd_common.pagination import paginate
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,15 +30,8 @@ async def create_group(
 async def get_all_groups(
     db: AsyncSession, skip: int = 0, limit: int = 50
 ) -> tuple[list[UserGroup], int]:
-    from sqlalchemy import func
-
-    count_query = select(func.count()).select_from(UserGroup)
-    total = (await db.execute(count_query)).scalar() or 0
-
-    result = await db.execute(
-        select(UserGroup).order_by(UserGroup.created_at).offset(skip).limit(limit)
-    )
-    return list(result.scalars().all()), total
+    stmt = select(UserGroup).order_by(UserGroup.created_at)
+    return await paginate(db, stmt, skip=skip, limit=limit)
 
 
 async def get_group_by_id(db: AsyncSession, group_id: uuid.UUID) -> UserGroup | None:

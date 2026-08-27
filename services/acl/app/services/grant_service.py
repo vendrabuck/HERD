@@ -1,5 +1,6 @@
 import uuid
 
+from herd_common.pagination import paginate
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,14 +49,8 @@ async def list_grants(
     if resource_id is not None:
         stmt = stmt.where(ResourceGrant.resource_id == resource_id)
 
-    from sqlalchemy import func
-
-    count_query = select(func.count()).select_from(stmt.subquery())
-    total = (await db.execute(count_query)).scalar() or 0
-
-    stmt = stmt.order_by(ResourceGrant.granted_at).offset(skip).limit(limit)
-    result = await db.execute(stmt)
-    return list(result.scalars().all()), total
+    stmt = stmt.order_by(ResourceGrant.granted_at)
+    return await paginate(db, stmt, skip=skip, limit=limit)
 
 
 async def get_grant(db: AsyncSession, grant_id: uuid.UUID) -> ResourceGrant | None:

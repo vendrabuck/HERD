@@ -4,6 +4,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from herd_common.pagination import paginate
 from passlib.context import CryptContext
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -113,13 +114,8 @@ async def get_user_by_id(db: AsyncSession, user_id: uuid.UUID | str) -> User | N
 
 
 async def get_all_users(db: AsyncSession, skip: int = 0, limit: int = 50) -> tuple[list[User], int]:
-    from sqlalchemy import func
-
-    count_query = select(func.count()).select_from(User)
-    total = (await db.execute(count_query)).scalar() or 0
-
-    result = await db.execute(select(User).order_by(User.created_at).offset(skip).limit(limit))
-    return list(result.scalars().all()), total
+    stmt = select(User).order_by(User.created_at)
+    return await paginate(db, stmt, skip=skip, limit=limit)
 
 
 async def superadmin_exists(db: AsyncSession) -> bool:
