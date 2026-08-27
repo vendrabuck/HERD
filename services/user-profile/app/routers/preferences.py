@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.auth import caller_id as _caller_id
 from herd_common.auth import make_auth_dependencies
 from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,16 +24,6 @@ get_current_user_payload, _require_admin = make_auth_dependencies(
 )
 
 router = APIRouter(tags=["preferences"])
-
-
-def _caller_id(payload: dict) -> uuid.UUID:
-    try:
-        return uuid.UUID(payload["sub"])
-    except (KeyError, ValueError, TypeError):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid subject in token",
-        )
 
 
 @router.get("/preferences", response_model=PreferencesResponse)

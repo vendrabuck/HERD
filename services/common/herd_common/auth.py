@@ -7,7 +7,14 @@ Usage in a service:
         secret_key=settings.secret_key,
         algorithm=settings.algorithm,
     )
+
+`caller_id` consumes the same JWT payload shape that factory produces, to turn
+the payload's `sub` claim into a UUID:
+    from herd_common.auth import caller_id
+    user_id = caller_id(payload)
 """
+
+import uuid
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,6 +23,21 @@ from jose import JWTError, jwt
 ADMIN_ROLES = {"admin", "superadmin"}
 
 bearer_scheme = HTTPBearer()
+
+
+def caller_id(payload: dict) -> uuid.UUID:
+    """Extract and parse the caller's user id from a decoded JWT payload's `sub`.
+
+    Raises 401 "Invalid subject in token" when `sub` is missing, not a string,
+    or not a valid UUID.
+    """
+    try:
+        return uuid.UUID(payload["sub"])
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid subject in token",
+        )
 
 
 def make_auth_dependencies(secret_key: str, algorithm: str = "HS256"):

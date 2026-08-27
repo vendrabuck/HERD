@@ -4,6 +4,7 @@ import uuid
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from herd_common.auth import caller_id as _caller_id
 from herd_common.auth import make_auth_dependencies
 from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,16 +55,6 @@ def get_bearer_credentials(
 
 
 router = APIRouter(tags=["notifications"])
-
-
-def _caller_id(payload: dict) -> uuid.UUID:
-    try:
-        return uuid.UUID(payload["sub"])
-    except (KeyError, ValueError, TypeError):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid subject in token",
-        )
 
 
 def _auth_header(credentials: HTTPAuthorizationCredentials) -> dict[str, str]:

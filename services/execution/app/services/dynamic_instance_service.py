@@ -13,19 +13,15 @@ concurrent insert lose to IntegrityError and re-read the winner.
 """
 
 import logging
-import uuid
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dynamic_instance import DynamicInstance
+from app.services._uuid_utils import as_uuid as _as_uuid
 
 logger = logging.getLogger(__name__)
-
-
-def _as_uuid(value) -> uuid.UUID:
-    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
 async def get_by_request_id(db: AsyncSession, request_id) -> DynamicInstance | None:

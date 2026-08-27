@@ -28,6 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.l2_port_assignment import L2PortAssignment
+from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
 
 logger = logging.getLogger(__name__)
@@ -49,10 +50,6 @@ FROZEN_JOIN_PENDING_REMOVAL = "join landed after wiring freeze; pending removal"
 STALE_JOIN_SUPERSEDED_PENDING_REMOVAL = (
     "superseded at record time by another reservation's membership; pending removal"
 )
-
-
-def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
-    return value if isinstance(value, uuid.UUID) else uuid.UUID(value)
 
 
 async def _find_active(
