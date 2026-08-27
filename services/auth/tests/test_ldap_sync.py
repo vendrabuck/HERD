@@ -24,36 +24,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from app import database
 from app.config import settings
-from app.database import Base, get_db
-from app.dependencies.auth import get_current_user
-from app.main import app
 from app.models.ldap_sync_run import LdapSyncRun
-from app.models.user import Role, User
+from app.models.user import Role
 from app.routers.ldap_sync import NO_MEMBERS_WARNING
 from app.services import ldap_service, ldap_sync_service
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+from tests._harness import TestSessionLocal, mock_user
 
 _GROUP_DN = "cn=herd-eng,ou=groups,dc=company,dc=local"
-
-
-async def override_get_db():
-    async with TestSessionLocal() as session:
-        yield session
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
 
 
 @pytest.fixture(autouse=True)
@@ -61,36 +39,16 @@ def ldap_mode(monkeypatch):
     monkeypatch.setattr(settings, "auth_method", "ldap", raising=False)
 
 
-def _make_mock_user(role: Role, username: str) -> User:
-    return User(
-        id=uuid.uuid4(),
-        email=f"{username}@test.com",
-        username=username,
-        hashed_password="fake",
-        is_active=True,
-        role=role,
-    )
-
-
-def _client_for(user: User | None):
-    app.dependency_overrides[get_db] = override_get_db
-    if user is not None:
-        app.dependency_overrides[get_current_user] = lambda: user
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+@pytest.fixture
+async def admin_client(make_client):
+    async with make_client(mock_user(Role.ADMIN, username="admin")) as ac:
+        yield ac
 
 
 @pytest.fixture
-async def admin_client():
-    async with _client_for(_make_mock_user(Role.ADMIN, "admin")) as ac:
+async def user_client(make_client):
+    async with make_client(mock_user(Role.USER, username="regular")) as ac:
         yield ac
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-async def user_client():
-    async with _client_for(_make_mock_user(Role.USER, "regular")) as ac:
-        yield ac
-    app.dependency_overrides.clear()
 
 
 def _stub_fetch_group(monkeypatch, *, entry=..., error=None):
@@ -362,15 +320,12 @@ async def test_status_never_409s_under_local_mode(monkeypatch, admin_client):
 
 
 @pytest.mark.asyncio
-async def test_unauthenticated_is_401():
-    try:
-        async with _client_for(None) as ac:
-            mappings = await ac.get("/admin/ldap-sync/mappings")
-            status_resp = await ac.get("/admin/ldap-sync/status")
-        assert mappings.status_code == 401
-        assert status_resp.status_code == 401
-    finally:
-        app.dependency_overrides.clear()
+async def test_unauthenticated_is_401(make_client):
+    async with make_client() as ac:
+        mappings = await ac.get("/admin/ldap-sync/mappings")
+        status_resp = await ac.get("/admin/ldap-sync/status")
+    assert mappings.status_code == 401
+    assert status_resp.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +352,13 @@ async def _await_background() -> None:
 
 @pytest.fixture(autouse=True)
 async def drain_background_tasks():
-    # Teardown ordering matters: this fixture is defined after setup_db, so
-    # it finalizes first and no background task outlives the tables.
+    # Teardown ordering matters: setup_db is now an autouse conftest fixture
+    # (issue #511), and pytest instantiates autouse conftest fixtures before
+    # autouse fixtures declared in the test module, then tears them down in
+    # reverse order. So setup_db is set up first and torn down LAST relative
+    # to this module-level fixture: this one still finalizes first, and no
+    # background task outlives the tables. Verified directly with
+    # `-p no:randomly -v`, not just assumed from the ordering rule.
     yield
     await _await_background()
     assert not ldap_sync_service._sync_lock.locked()

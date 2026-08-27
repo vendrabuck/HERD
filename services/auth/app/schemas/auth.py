@@ -4,6 +4,7 @@ from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field
 
 from app.models.user import Role
+from app.schemas.pagination import Paginated
 
 
 class RegisterRequest(BaseModel):
@@ -50,8 +51,5 @@ class SetRoleRequest(BaseModel):
     role: Role
 
 
-class PaginatedUserResponse(BaseModel):
-    items: list[UserResponse]
-    total: int
-    skip: int
-    limit: int
+class PaginatedUserResponse(Paginated[UserResponse]):
+    pass

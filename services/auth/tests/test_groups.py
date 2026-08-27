@@ -1,86 +1,40 @@
 import uuid
 
 import pytest
-from app.database import Base, get_db
-from app.dependencies.auth import get_current_user
-from app.main import app
 from app.models.group import UserGroup
 from app.models.user import Role, User
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
-
-async def override_get_db():
-    async with TestSessionLocal() as session:
-        yield session
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
+from tests._harness import TestSessionLocal, mock_user
 
 _admin_id = uuid.uuid4()
 _superadmin_id = uuid.uuid4()
 _user_id = uuid.uuid4()
 
 
-def _make_mock_user(user_id: uuid.UUID, role: Role, username: str = "mock") -> User:
-    return User(
-        id=user_id,
-        email=f"{username}@test.com",
-        username=username,
-        hashed_password="fake",
-        is_active=True,
-        role=role,
-    )
+@pytest.fixture
+async def admin_client(make_client):
+    async with make_client(mock_user(Role.ADMIN, user_id=_admin_id, username="admin")) as ac:
+        yield ac
 
 
 @pytest.fixture
-async def admin_client():
-    mock_admin = _make_mock_user(_admin_id, Role.ADMIN, "admin")
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: mock_admin
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+async def superadmin_client(make_client):
+    async with make_client(
+        mock_user(Role.SUPERADMIN, user_id=_superadmin_id, username="superadmin")
+    ) as ac:
         yield ac
-    app.dependency_overrides.clear()
 
 
 @pytest.fixture
-async def superadmin_client():
-    mock_sa = _make_mock_user(_superadmin_id, Role.SUPERADMIN, "superadmin")
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: mock_sa
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+async def user_client(make_client):
+    async with make_client(mock_user(Role.USER, user_id=_user_id, username="regular")) as ac:
         yield ac
-    app.dependency_overrides.clear()
 
 
 @pytest.fixture
-async def user_client():
-    mock_user = _make_mock_user(_user_id, Role.USER, "regular")
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: mock_user
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+async def no_auth_client(make_client):
+    async with make_client() as ac:
         yield ac
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-async def no_auth_client():
-    app.dependency_overrides[get_db] = override_get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
-    app.dependency_overrides.clear()
 
 
 async def _create_group(client, name="Test Group", description="A test group"):

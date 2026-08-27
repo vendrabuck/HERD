@@ -9,40 +9,18 @@ admin-targeted events without a real admin JWT.
 import uuid
 
 import pytest
-from app.database import Base, get_db
-from app.main import app
 from app.models.user import Role, User
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from tests._harness import TestSessionLocal
 
 INTERNAL_TOKEN = "test-internal-token-iter2"  # noqa: S105
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
-
-async def override_get_db():
-    async with TestSessionLocal() as session:
-        yield session
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
 
 @pytest.fixture
-async def internal_client(monkeypatch):
+async def internal_client(monkeypatch, make_client):
     monkeypatch.setattr("app.routers.internal.settings.internal_api_token", INTERNAL_TOKEN)
-    app.dependency_overrides[get_db] = override_get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with make_client() as ac:
         yield ac
-    app.dependency_overrides.clear()
 
 
 async def _seed_user(
@@ -171,13 +149,11 @@ async def test_internal_user_contact_requires_valid_token(internal_client):
 
 
 @pytest.mark.asyncio
-async def test_internal_admins_503_when_token_not_configured(monkeypatch):
+async def test_internal_admins_503_when_token_not_configured(monkeypatch, make_client):
     """If the deployer has not set INTERNAL_API_TOKEN, the endpoint is
     deliberately unreachable rather than silently allowing any caller in.
     """
     monkeypatch.setattr("app.routers.internal.settings.internal_api_token", "")
-    app.dependency_overrides[get_db] = override_get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with make_client() as ac:
         resp = await ac.get("/internal/admins", headers={"X-Internal-Token": "anything"})
-    app.dependency_overrides.clear()
     assert resp.status_code == 503

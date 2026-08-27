@@ -10,38 +10,14 @@ test_auth.py and test_groups.py already verify behaviorally.
 import uuid
 
 import pytest
-from app.database import Base, get_db
+from app.database import get_db
 from app.models.user import Role, User
 from app.services.auth_service import create_user
 from app.services.group_service import add_member, create_group
 from fastapi import HTTPException
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
-
-def _mock_user(role=Role.USER, user_id=None, username="mockuser", email="mock@test.com"):
-    return User(
-        id=user_id or uuid.uuid4(),
-        email=email,
-        username=username,
-        hashed_password="fake",
-        is_active=True,
-        role=role,
-    )
-
+from tests._harness import TestSessionLocal
+from tests._harness import mock_user as _mock_user
 
 # --- auth router: register ---
 

@@ -3,6 +3,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.schemas.pagination import Paginated
+
 
 class GroupCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -65,8 +67,5 @@ class BulkMemberRemoveResponse(BaseModel):
     not_found: int = 0
 
 
-class PaginatedGroupResponse(BaseModel):
-    items: list[GroupResponse]
-    total: int
-    skip: int
-    limit: int
+class PaginatedGroupResponse(Paginated[GroupResponse]):
+    pass

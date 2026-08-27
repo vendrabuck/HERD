@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.pagination import Paginated
+
 
 class LdapSyncStatusResponse(BaseModel):
     # Drives the phase 6 admin UI's mode gating (ADR 0011): the page reads
@@ -41,11 +43,8 @@ class MappingCreateResponse(MappingResponse):
     warning: str | None = None
 
 
-class PaginatedMappingResponse(BaseModel):
-    items: list[MappingResponse]
-    total: int
-    skip: int
-    limit: int
+class PaginatedMappingResponse(Paginated[MappingResponse]):
+    pass
 
 
 class SyncRunResponse(BaseModel):
@@ -66,11 +65,8 @@ class SyncRunResponse(BaseModel):
     error: str | None
 
 
-class PaginatedSyncRunResponse(BaseModel):
-    items: list[SyncRunResponse]
-    total: int
-    skip: int
-    limit: int
+class PaginatedSyncRunResponse(Paginated[SyncRunResponse]):
+    pass
 
 
 class SyncRunStartResponse(BaseModel):
