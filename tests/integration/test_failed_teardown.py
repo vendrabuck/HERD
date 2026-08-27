@@ -86,8 +86,11 @@ async def _publish_raw(subject: str, payload: bytes) -> None:
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
-        # Idempotent: the stream is created by the reservations/execution lifespan.
-        await js.add_stream(name="HERD_RESERVATIONS", subjects=["herd.reservations.*"])
+        # Confirm the stream exists rather than re-declaring it: the stream is
+        # created by the reservations/execution lifespan, and add_stream
+        # against an existing stream with a different config (e.g. a
+        # configured max_age, issue #620) raises instead of returning it.
+        await js.stream_info("HERD_RESERVATIONS")
         await js.publish(subject, payload)
     finally:
         await nc.close()

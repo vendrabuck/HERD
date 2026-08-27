@@ -18,6 +18,11 @@ class Settings(HerdBaseSettings):
 
     # NATS
     nats_url: str = "nats://nats:4222"
+    # JetStream retention cap for HERD_HEALTH and HERD_DLQ (issue #620). 0
+    # means no cap. Only takes effect where JetStream state is durable (make
+    # prod, the nats-data volume); the dev/test override starts every stream
+    # empty on each recreate regardless of this setting.
+    nats_stream_max_age_seconds: int = 7 * 24 * 3600
 
     # Execution settings
     driver_cache_path: str = "/data/driver-cache"

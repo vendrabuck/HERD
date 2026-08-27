@@ -127,12 +127,20 @@ services:
       retries: 5
 
   # --- NATS JetStream ---
+  # JetStream state (streams, unconsumed events, DLQ contents, consumer
+  # positions) persists across a container recreate under make prod only
+  # (issue #620). The dev override replaces `command` with an ephemeral store
+  # dir, because a compose override cannot remove a base-file volume mount
+  # (volumes merge; command is a scalar and replaces), so make up and the gate
+  # stack keep starting with empty streams.
   nats:
     image: nats:2.10-alpine
-    command: ["-js", "-m", "8222"]
+    command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
       - "4222:4222"
       - "8222:8222"  # NATS monitoring
+    volumes:
+      - nats-data:/data
     networks:
       - herd-net
     restart: unless-stopped
@@ -649,3 +657,4 @@ volumes:
   driver-storage:
   driver-cache:
   herd-config:
+  nats-data:

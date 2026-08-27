@@ -13,22 +13,30 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from app import main as main_module
+from app.config import settings
 from app.main import _ensure_dlq_stream, start_outbox_relay, stop_outbox_relay
 
 
 @pytest.mark.asyncio
-async def test_ensure_dlq_stream_binds_shared_stream():
-    """Creates HERD_DLQ over the herd.*.dlq.> subject space."""
+async def test_ensure_dlq_stream_binds_shared_stream(monkeypatch):
+    """Creates HERD_DLQ over the herd.*.dlq.> subject space via ensure_stream."""
     mock_js = AsyncMock()
     mock_nc = MagicMock()
     mock_nc.jetstream = MagicMock(return_value=mock_js)
+    ensure_stream_mock = AsyncMock()
+    monkeypatch.setattr(main_module, "ensure_stream", ensure_stream_mock)
 
     app = MagicMock()
     app.state.nats = mock_nc
 
     await _ensure_dlq_stream(app)
 
-    mock_js.add_stream.assert_awaited_once_with(name="HERD_DLQ", subjects=["herd.*.dlq.>"])
+    ensure_stream_mock.assert_awaited_once_with(
+        mock_js,
+        name="HERD_DLQ",
+        subjects=["herd.*.dlq.>"],
+        max_age_seconds=settings.nats_stream_max_age_seconds,
+    )
 
 
 @pytest.mark.asyncio
@@ -42,19 +50,20 @@ async def test_ensure_dlq_stream_noop_when_nats_down():
 
 
 @pytest.mark.asyncio
-async def test_ensure_dlq_stream_swallows_broker_error():
-    """add_stream failure is logged, not raised, so the service still boots."""
+async def test_ensure_dlq_stream_swallows_broker_error(monkeypatch):
+    """ensure_stream failure is logged, not raised, so the service still boots."""
     mock_js = AsyncMock()
-    mock_js.add_stream.side_effect = Exception("stream error")
     mock_nc = MagicMock()
     mock_nc.jetstream = MagicMock(return_value=mock_js)
+    ensure_stream_mock = AsyncMock(side_effect=Exception("stream error"))
+    monkeypatch.setattr(main_module, "ensure_stream", ensure_stream_mock)
 
     app = MagicMock()
     app.state.nats = mock_nc
 
     # Must not raise.
     await _ensure_dlq_stream(app)
-    mock_js.add_stream.assert_awaited_once()
+    ensure_stream_mock.assert_awaited_once()
 
 
 # --- outbox relay lifespan wiring (issue #21) ---

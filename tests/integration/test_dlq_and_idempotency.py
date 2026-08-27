@@ -38,8 +38,11 @@ async def _publish_raw(payload: bytes, subject: str = _RESERVATIONS_SUBJECT) -> 
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
-        # Idempotent: the stream is created by the reservations/execution lifespan.
-        await js.add_stream(name="HERD_RESERVATIONS", subjects=["herd.reservations.*"])
+        # Confirm the stream exists rather than re-declaring it: the stream is
+        # created by the reservations/execution lifespan, and add_stream
+        # against an existing stream with a different config (e.g. a
+        # configured max_age, issue #620) raises instead of returning it.
+        await js.stream_info("HERD_RESERVATIONS")
         await js.publish(subject, payload)
     finally:
         await nc.close()
@@ -55,7 +58,8 @@ async def _find_in_execution_dlq(marker: bytes, *, timeout: float = 15.0) -> byt
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
-        await js.add_stream(name="HERD_DLQ", subjects=["herd.*.dlq.>"])  # idempotent
+        # Confirm the stream exists rather than re-declaring it (see _publish_raw).
+        await js.stream_info("HERD_DLQ")
         sub = await js.pull_subscribe(_EXECUTION_DLQ_SUBJECT, stream="HERD_DLQ")
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
@@ -86,7 +90,8 @@ async def _fetch_reservation_event(
     nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
     try:
         js = nc.jetstream()
-        await js.add_stream(name="HERD_RESERVATIONS", subjects=["herd.reservations.*"])
+        # Confirm the stream exists rather than re-declaring it (see _publish_raw).
+        await js.stream_info("HERD_RESERVATIONS")
         sub = await js.pull_subscribe("herd.reservations.*", stream="HERD_RESERVATIONS")
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:

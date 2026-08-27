@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
+from herd_common.jetstream import ensure_stream
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.outbox import run_outbox_relay
 from herd_common.schema_init import create_all_and_stamp
@@ -45,9 +46,11 @@ async def lifespan(app: FastAPI):
         app.state.nats = nc
         logger.info("Connected to NATS at %s", settings.nats_url)
         js = nc.jetstream()
-        await js.add_stream(
+        await ensure_stream(
+            js,
             name="HERD_RESERVATIONS",
             subjects=["herd.reservations.*"],
+            max_age_seconds=settings.nats_stream_max_age_seconds,
         )
         logger.info("JetStream stream HERD_RESERVATIONS ready")
     except Exception:
