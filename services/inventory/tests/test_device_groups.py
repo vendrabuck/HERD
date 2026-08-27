@@ -710,11 +710,11 @@ async def test_fetch_user_group_ids_raises_on_auth_service_5xx():
     mock_resp.text = "internal server error"
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = mock_resp
+    mock_client.request.return_value = mock_resp
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+    with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as excinfo:
             await _fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
 
@@ -732,9 +732,9 @@ async def test_fetch_user_group_ids_raises_on_connection_error():
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get.side_effect = httpx.ConnectError("connection refused")
+    mock_client.request.side_effect = httpx.ConnectError("connection refused")
 
-    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+    with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as excinfo:
             await _fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
 
@@ -755,11 +755,11 @@ async def test_fetch_user_group_names_raises_on_auth_service_5xx():
     mock_resp.text = "service unavailable"
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = mock_resp
+    mock_client.request.return_value = mock_resp
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+    with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as excinfo:
             await _fetch_user_group_names([uuid.uuid4()], "Bearer fake-token")
 
@@ -772,11 +772,11 @@ async def test_fetch_user_group_names_empty_input_returns_empty_map_without_call
     from app.routers.device_groups import _fetch_user_group_names
 
     mock_client = AsyncMock()
-    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+    with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         result = await _fetch_user_group_names([], "Bearer fake-token")
 
     assert result == {}
-    mock_client.get.assert_not_called()
+    mock_client.request.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -892,11 +892,11 @@ async def test_fetch_user_group_ids_success_parses_ids():
             return [{"id": str(gid), "name": "G"}]
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = _Resp()
+    mock_client.request.return_value = _Resp()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+    with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         ids = await _fetch_user_group_ids(uuid.uuid4(), "Bearer t")
     assert ids == [gid]
 
@@ -942,11 +942,11 @@ async def test_fetch_user_group_names_success_maps_wanted_ids():
             }
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = _Resp()
+    mock_client.request.return_value = _Resp()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+    with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         name_map = await _fetch_user_group_names([wanted], "Bearer t")
     assert name_map == {wanted: "Wanted"}
 
@@ -960,9 +960,9 @@ async def test_fetch_user_group_names_connection_error_raises_503():
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get.side_effect = httpx.ConnectError("down")
+    mock_client.request.side_effect = httpx.ConnectError("down")
 
-    with patch("app.routers.device_groups.httpx.AsyncClient", return_value=mock_client):
+    with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as exc:
             await _fetch_user_group_names([uuid.uuid4()], "Bearer t")
     assert exc.value.status_code == 503

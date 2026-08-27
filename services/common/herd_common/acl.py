@@ -18,6 +18,8 @@ import logging
 
 import httpx
 
+from herd_common.internal_client import ForwardedAuth, InternalTokenAuth, call_service
+
 logger = logging.getLogger(__name__)
 
 _ACL_HTTP_TIMEOUT_SECONDS = 5.0
@@ -38,17 +40,21 @@ async def user_has_grant(
     resource type). Closed-by-default: network error, non-200, or malformed
     JSON returns False.
     """
-    url = f"{acl_service_url.rstrip('/')}/check"
     body = {
         "user_id": user_id,
         "resource_type": resource_type,
         "resource_id": resource_id,
         "permission": permission,
     }
-    headers = {"Authorization": authorization}
     try:
-        async with httpx.AsyncClient(timeout=_ACL_HTTP_TIMEOUT_SECONDS) as client:
-            resp = await client.post(url, json=body, headers=headers)
+        resp = await call_service(
+            acl_service_url.rstrip("/"),
+            "POST",
+            "/check",
+            json_body=body,
+            timeout=_ACL_HTTP_TIMEOUT_SECONDS,
+            auth=ForwardedAuth(authorization=authorization),
+        )
     except httpx.HTTPError as exc:
         logger.info("acl_check_unreachable", extra={"error": str(exc)})
         return False
@@ -92,12 +98,16 @@ async def _owns_active_reservation(
     """
     if not internal_api_token:
         return False
-    url = f"{reservations_service_url.rstrip('/')}/internal/active"
-    headers = {"X-Internal-Token": internal_api_token}
     params = {"user_id": user_id, "device_id": device_id}
     try:
-        async with httpx.AsyncClient(timeout=_ACL_HTTP_TIMEOUT_SECONDS) as client:
-            resp = await client.get(url, headers=headers, params=params)
+        resp = await call_service(
+            reservations_service_url.rstrip("/"),
+            "GET",
+            "/internal/active",
+            params=params,
+            timeout=_ACL_HTTP_TIMEOUT_SECONDS,
+            auth=InternalTokenAuth(token=internal_api_token),
+        )
     except httpx.HTTPError as exc:
         logger.info("reservations_active_unreachable", extra={"error": str(exc)})
         return False

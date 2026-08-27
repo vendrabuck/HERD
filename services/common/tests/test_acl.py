@@ -42,7 +42,12 @@ def _patch_http(
     acl_exception: Exception | None = None,
     res_exception: Exception | None = None,
 ):
-    """Install a fake httpx.AsyncClient that returns/raises per-URL."""
+    """Install a fake httpx.AsyncClient that returns/raises per-method.
+
+    acl.py now issues both calls through herd_common.internal_client.call_service,
+    which always calls client.request(method, url, ...): POST for the ACL
+    check, GET for the reservations active-reservation check.
+    """
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -54,17 +59,16 @@ def _patch_http(
         async def __aexit__(self, *args):
             return None
 
-        async def post(self, url, **kwargs):
-            if acl_exception is not None:
-                raise acl_exception
-            return acl_response
-
-        async def get(self, url, **kwargs):
+        async def request(self, method, url, **kwargs):
+            if method == "POST":
+                if acl_exception is not None:
+                    raise acl_exception
+                return acl_response
             if res_exception is not None:
                 raise res_exception
             return res_response
 
-    monkeypatch.setattr("herd_common.acl.httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr("herd_common.internal_client.httpx.AsyncClient", FakeClient)
 
 
 @pytest.mark.asyncio

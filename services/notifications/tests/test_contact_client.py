@@ -16,8 +16,9 @@ def _client(handler):
     transport = httpx.MockTransport(handler)
     c = ContactClient(base_url="http://auth", internal_token="tok", ttl_seconds=60)
 
-    # Patch httpx.AsyncClient used inside _fetch to route through MockTransport.
-    import app.services.contact_client as mod
+    # Patch httpx.AsyncClient used inside herd_common.internal_client.call_service
+    # (the shared transport _fetch now delegates to) to route through MockTransport.
+    import herd_common.internal_client as mod
 
     orig = mod.httpx.AsyncClient
 
@@ -117,7 +118,7 @@ async def test_cache_expires_after_ttl():
         )
 
     c = _client(handler)
-    c._ttl = 0  # entry expires immediately -> _cache_hit returns (False, None)
+    c._cache._ttl = 0  # entry expires immediately -> _cache_hit returns (False, None)
     await c.get(uid)
     await c.get(uid)
     c._restore()

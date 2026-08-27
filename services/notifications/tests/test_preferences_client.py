@@ -27,9 +27,9 @@ async def test_get_returns_defaults_when_no_stored_prefs():
     resp.status_code = 200
     resp.json = lambda: _make_upstream(None)
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = AsyncMock(return_value=resp)
+        inst.request = AsyncMock(return_value=resp)
         prefs = await client.get(uuid.uuid4())
 
     assert prefs.channel_enabled("in_app") is True
@@ -45,9 +45,9 @@ async def test_get_returns_stored_prefs():
     resp.status_code = 200
     resp.json = lambda: _make_upstream(stored)
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = AsyncMock(return_value=resp)
+        inst.request = AsyncMock(return_value=resp)
         prefs = await client.get(user_id)
 
     assert prefs.channel_enabled("in_app") is False
@@ -64,9 +64,9 @@ async def test_cache_hit_avoids_second_http_call():
     resp.json = lambda: _make_upstream(None)
     get_mock = AsyncMock(return_value=resp)
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = get_mock
+        inst.request = get_mock
         await client.get(user_id)
         await client.get(user_id)
 
@@ -82,9 +82,9 @@ async def test_invalidate_forces_refetch():
     resp.json = lambda: _make_upstream(None)
     get_mock = AsyncMock(return_value=resp)
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = get_mock
+        inst.request = get_mock
         await client.get(user_id)
         client.invalidate(user_id)
         await client.get(user_id)
@@ -97,9 +97,9 @@ async def test_fetch_falls_back_on_http_error():
     client = PreferencesClient(ttl_seconds=60)
     import httpx
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        inst.request = AsyncMock(side_effect=httpx.ConnectError("boom"))
         prefs = await client.get(uuid.uuid4())
 
     assert prefs.channel_enabled("in_app") is True
@@ -113,9 +113,9 @@ async def test_fetch_falls_back_on_non_200():
     resp.status_code = 503
     resp.json = lambda: {}
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = AsyncMock(return_value=resp)
+        inst.request = AsyncMock(return_value=resp)
         prefs = await client.get(uuid.uuid4())
 
     # Non-200 falls back to defaults (all channels/events enabled).
@@ -133,9 +133,9 @@ async def test_cache_expires_after_ttl_forces_refetch():
     resp.json = lambda: _make_upstream(None)
     get_mock = AsyncMock(return_value=resp)
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = get_mock
+        inst.request = get_mock
         await client.get(user_id)
         await client.get(user_id)
 
@@ -172,9 +172,9 @@ async def test_concurrent_callers_fetch_once():
         resp.json = lambda: _make_upstream(None)
         return resp
 
-    with patch("app.services.preferences_client.httpx.AsyncClient") as MockClient:
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
         inst = MockClient.return_value.__aenter__.return_value
-        inst.get = AsyncMock(side_effect=slow_get)
+        inst.request = AsyncMock(side_effect=slow_get)
         first = asyncio.create_task(client.get(user_id))
         await started.wait()
         second = asyncio.create_task(client.get(user_id))
