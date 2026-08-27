@@ -23,6 +23,7 @@ existing route and test imports.
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -63,6 +64,7 @@ __all__ = [
     "TurnSegment",
     "ai_is_configured",
     "get_ai_client",
+    "get_provider_construction_status",
 ]
 
 # Client-facing 503 detail for a provider that is not usable. Kept as a single
@@ -964,6 +966,34 @@ def ai_is_configured() -> bool:
     return False
 
 
+def _build_provider() -> LLMProvider:
+    """Construct the configured LLMProvider (no network call, construction only).
+
+    Raises whatever the provider constructor raises (e.g. a TypeError from an
+    SDK/http-client mismatch, or an OSError from a missing ai_ca_cert path) so
+    callers can decide how to report it. Raises ValueError for an unrecognized
+    ai_provider, the state ai_is_configured() already reports as unconfigured
+    (issue #245).
+    """
+    if settings.ai_provider not in ("anthropic", "openai_compat"):
+        raise ValueError(f"unrecognized ai_provider: {settings.ai_provider!r}")
+    if settings.ai_provider == "anthropic":
+        return AnthropicProvider(
+            api_key=settings.ai_api_key,
+            model=settings.ai_model,
+            base_url=settings.ai_base_url or None,
+            verify_tls=settings.ai_tls_verify,
+            ca_cert=settings.ai_ca_cert or None,
+        )
+    return OpenAICompatProvider(
+        api_key=settings.ai_api_key,
+        base_url=settings.ai_base_url or None,
+        model=settings.ai_model,
+        verify_tls=settings.ai_tls_verify,
+        ca_cert=settings.ai_ca_cert or None,
+    )
+
+
 def get_ai_client() -> AIClient:
     """Dependency provider. Tests override this via app.dependency_overrides.
 
@@ -980,26 +1010,63 @@ def get_ai_client() -> AIClient:
     A construction error's detail is logged server-side; the client sees only
     the generic not-configured string so an internal path is never echoed.
     """
-    if settings.ai_provider not in ("anthropic", "openai_compat"):
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AI_NOT_CONFIGURED_DETAIL)
     try:
-        if settings.ai_provider == "anthropic":
-            provider: LLMProvider = AnthropicProvider(
-                api_key=settings.ai_api_key,
-                model=settings.ai_model,
-                base_url=settings.ai_base_url or None,
-                verify_tls=settings.ai_tls_verify,
-                ca_cert=settings.ai_ca_cert or None,
-            )
-        else:
-            provider = OpenAICompatProvider(
-                api_key=settings.ai_api_key,
-                base_url=settings.ai_base_url or None,
-                model=settings.ai_model,
-                verify_tls=settings.ai_tls_verify,
-                ca_cert=settings.ai_ca_cert or None,
-            )
+        provider = _build_provider()
     except Exception as exc:
         logger.warning("ai_client_construction_failed: %s: %s", type(exc).__name__, exc)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AI_NOT_CONFIGURED_DETAIL) from exc
     return AIClient(provider=provider, max_tokens=settings.ai_max_tokens)
+
+
+class _ProviderConstructionCache:
+    """Short-lived cache of the last provider-construction attempt.
+
+    `GET /api/ai/status` is unauthenticated (issue #606), so a cheap
+    construction-only probe run on every request would let anyone hammer
+    provider construction (e.g. repeated TLS context builds). The result is
+    cached for `ttl_seconds` against a monotonic clock; the clock is
+    injectable so tests can advance it without real sleeps.
+    """
+
+    def __init__(self, ttl_seconds: float = 30.0, clock=time.monotonic) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._expires_at: float = -1.0
+        self._degraded: bool = False
+        self._reason: str | None = None
+
+    def check(self) -> tuple[bool, str | None]:
+        """Return (degraded, reason), constructing at most once per TTL window."""
+        now = self._clock()
+        if now < self._expires_at:
+            return self._degraded, self._reason
+        try:
+            _build_provider()
+        except Exception as exc:
+            logger.warning("ai_status_construction_probe_failed: %s: %s", type(exc).__name__, exc)
+            self._degraded = True
+            self._reason = type(exc).__name__
+        else:
+            self._degraded = False
+            self._reason = None
+        self._expires_at = now + self.ttl_seconds
+        return self._degraded, self._reason
+
+    def reset(self) -> None:
+        """Force the next check() to re-construct. Test-only convenience."""
+        self._expires_at = -1.0
+
+
+_provider_construction_cache = _ProviderConstructionCache()
+
+
+def get_provider_construction_status() -> tuple[bool, str | None]:
+    """(degraded, reason) for the currently configured provider, cached.
+
+    Only meaningful when ai_is_configured() is True: an unconfigured provider
+    is reported via `enabled: false` alone, not as "degraded" (degraded means
+    settings look sufficient but construction still fails, e.g. issue #280's
+    ai_ca_cert case or issue #592's SDK/http-client mismatch). Callers that
+    care about the unconfigured case should check ai_is_configured() first.
+    """
+    return _provider_construction_cache.check()

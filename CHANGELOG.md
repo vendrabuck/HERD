@@ -4,6 +4,23 @@
 
 ### Delivery detail
 
+#### AI orchestrator
+
+- `GET /api/ai/status` reports a degraded state when the configured provider
+  fails to CONSTRUCT rather than claiming `enabled: true` from the static
+  settings check alone (issue #606, split out of #592; the 2026-08-24 gate case
+  was an anthropic 1.0.0 rejecting an httpx 0.x client that the settings check
+  could not see). The status handler now attempts a cheap, no-network provider
+  construction, through the same `_build_provider` path `get_ai_client` uses,
+  after the settings check passes, and reports `enabled: false`, `degraded:
+  true`, `reason: <exception class name>` on failure; the reason is the
+  exception CLASS NAME only, never the message, which can carry a base URL or
+  key material. The construction attempt is cached for 30 seconds (module-
+  level, monotonic clock) so the unauthenticated endpoint cannot be used to
+  hammer provider construction. Additive response shape: `degraded` and
+  `reason` are new fields, `enabled` semantics are unchanged for the
+  already-covered unconfigured and successfully-configured cases.
+
 #### Auth and LDAP
 
 - ADR 0011, LDAP directory group sync (issue #38, CLOSED), delivered across six phases:
