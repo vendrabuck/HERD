@@ -6,6 +6,16 @@
 
 #### AI orchestrator
 
+- Migrated to anthropic SDK 1.x (issue #592, PR #608): `anthropic_provider.py` now
+  imports `httpx2` (aliased as `httpx`, kept local to that file) so its exception
+  catch matches the `TransportError` type the 1.x SDK actually raises, and gets its
+  own `_build_anthropic_http_client` returning `anthropic.DefaultAsyncHttpxClient`
+  (ca_cert wins, verification fails closed) instead of the shared
+  `openai_provider._build_http_client`, which stays on plain httpx for the
+  unaffected OpenAI-compatible path. `pyproject.toml` moved `anthropic>=0.39.0,<1`
+  to `>=1,<2`; `uv.lock` regenerated (anthropic 0.96.0 to 1.0.0, plus the new
+  httpx2/httpcore2/truststore transitive entries). This is the fix for the
+  construction-time `TypeError` PR #591 had worked around.
 - `GET /api/ai/status` reports a degraded state when the configured provider
   fails to CONSTRUCT rather than claiming `enabled: true` from the static
   settings check alone (issue #606, split out of #592; the 2026-08-24 gate case
@@ -183,6 +193,14 @@
   fails closed (nothing driven, reported `still_failed`, not a 503). Pinned-reason
   zombie rows (unresolvable or not-a-simple-chain) stay excluded from the widening;
   their recovery remains a fork re-save.
+- `cancel_reservation` and `release_reservation` adopt
+  `_release_exclusive_devices_best_effort` (issue #599 part 1, PR #604) instead of
+  reimplementing it inline, closing three gaps: a per-device warning log on a
+  fetch failure during the release loop (a new optional `context_label` names the
+  caller's operation, defaulting to "provision failure" for the two pre-existing
+  callers so their behavior is unchanged); an optional `user_id` on the
+  retry-exhausted error log; and the retry-exhausted message text parameterized
+  by `context_label` so cancel and release keep their existing wording exactly.
 
 #### Cabling and inventory
 
@@ -278,6 +296,27 @@
   the `AdminGuard` group left the full vitest suite green. `AdminGuard.test.tsx`
   still pins the guard's own redirect/render behavior; this test only pins route
   membership and structure.
+- Consolidated admin-role check (issue #561, PR #607): the inline
+  `role === "admin" || role === "superadmin"` predicate, copied across ten call
+  sites, is replaced by one `isAdminRole` helper in `frontend/src/lib/roles.ts`.
+  Behavior is unchanged; this is a structural consolidation.
+- Loopback 1:1 pairing fix (issue #585, PR #603): `MultiConnectDialog`'s "Connect
+  1:1 in order" button paired `freeSource[i]` with `freeTarget[i]` positionally,
+  so picking the same device on both sides made every index a self-pair
+  (`freeSource[i].id === freeTarget[i].id`) and the button staged nothing. A
+  same-device pick now intersects the two independently filtered free-port lists
+  by port id, in source-column order, and pairs adjacently: `(p1, p2), (p3, p4),
+  ...`, with an odd leftover left unpaired and a port visible in only one
+  column's filter excluded entirely. Different-device pairing is unchanged. A
+  same-device pick with fewer than two pairable ports now reports "Need at least
+  two free ports to pair", distinct from the different-device wording.
+- Inventory page-size selector (issue #599 part 2, PR #605): `Pagination` gains
+  optional `pageSizeOptions`/`onPageSizeChange` props that render a labelled
+  Rows-per-page select and keep the bar visible even when the result set fits on
+  one page; other `Pagination` consumers are unaffected. `InventoryPage` wires
+  the selector (25/50/100/200, within the inventory list endpoint's `le=500` cap)
+  to `preferencesStore`, so the chosen page size persists across sessions;
+  `preferencesStore` drops the unused `getSavedFilter`.
 
 #### Developer platform and CI
 
@@ -317,6 +356,48 @@
   `types/ai.types.ts`, and the unused `class-variance-authority` dependency.
   Duplication-reduction follow-ups from the same sweep are tracked separately in
   issues #595 to #599 and were deliberately left out of this PR's scope.
+- Duplication-reduction batch from the #600 sweep's follow-ups, four independent
+  extractions into `herd_common`:
+  - Shared count-then-page pagination (issue #597, PR #612): `herd_common/pagination.py`'s
+    `paginate(db, stmt, *, skip, limit)` runs a `func.count()` over the caller's
+    statement (ORDER BY dropped for the count only) plus offset/limit on the
+    caller's own statement, with ordering left entirely to the caller. Adopted by
+    six list endpoints (acl `list_grants`; auth `get_all_users`,
+    `get_all_groups`, `list_mappings`, `list_sync_runs`; notifications
+    `list_for_user`); no query parameter or response shape changed at any of
+    them. Notifications keeps its existing `offset` parameter and `le=200` cap by
+    maintainer decision, and keeps its total decoupled from the `unread_only`
+    filter as a separate statement, both pre-existing, tested behaviors.
+  - Six third-copy extractions in one batch (issue #595, PR #614):
+    `herd_common/database.py`'s `make_database(database_url)` factory, adopted by
+    all 11 DB-backed services' `app/database.py`; `herd_common/cors.py`'s
+    `add_cors_middleware(app, cors_origins)`, replacing the identical six-line
+    `CORSMiddleware` block duplicated across 11 of 12 services (the config
+    service's bootstrap-UI `allow_origins=["*"]` exception is untouched);
+    `herd_common/auth.py`'s `caller_id(payload)`, adopted by notifications and
+    user-profile; execution's `services/_uuid_utils.py` `as_uuid()`, replacing
+    three duplicate copies; inventory's `services/manage_guard.py` for
+    `_is_admin`/`_user_can_manage_device` (kept inventory-local since they bind
+    this service's own settings); and cabling's `routes/forks.py` `_to_delta`
+    helper, replacing the same seven-field `WireSpec` mapping written out three
+    times. Pure extraction, zero behavior change.
+  - Cabling UUID serializer collapse (issue #596, PR #610):
+    `services/cabling/app/schemas/_types.py` defines `UUIDStr`,
+    `OptionalUUIDStr`, and `UUIDStrList` `Annotated` aliases, replacing 27
+    hand-written `@field_serializer` methods across six files. Verified
+    offline that the OpenAPI contract is byte-for-byte unchanged.
+  - Cached internal-service client (issue #598, PR #615):
+    `herd_common/internal_client.py`'s `call_service(base_url, method, path, *,
+    auth, ...)` is the client-side transport for one HERD service calling a
+    sibling, selecting `InternalTokenAuth` or `ForwardedAuth`; and
+    `herd_common/ttl_cache.py`'s `TTLCache`/`SingletonTTLCache` preserve the
+    check-lock-re-check-fetch-store sequence three notifications clients had
+    hand-rolled, with an injectable clock. Migrated: reservations'
+    `_cabling_fork_call`/`_execution_wiring_call`; notifications'
+    `ContactClient`/`PreferencesClient`/`AdminListClient`; inventory's
+    `_fetch_user_group_ids`/`_fetch_user_group_names`; and `herd_common/acl.py`'s
+    `user_has_grant`/`_owns_active_reservation`. Timeouts, error-mapping, and
+    fail-closed semantics are unchanged at every call site.
 - Lock-faithful service images (issue #593): every service Dockerfile installs
   third-party dependencies from the workspace `uv.lock` instead of resolving
   fresh at build time. Each Dockerfile now runs
