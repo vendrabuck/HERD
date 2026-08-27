@@ -3,7 +3,6 @@ import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from herd_common.acl import user_has_manage_or_owns_active_reservation
 from herd_common.device_config import (
     ConfigValidationError,
     PublishedSchemaError,
@@ -29,37 +28,13 @@ from app.schemas.device_config import (
     PaginatedDeviceConfigVersions,
 )
 from app.services.config_diff import render_unified_diff
+from app.services.manage_guard import _is_admin, _user_can_manage_device
 from app.services.published_schema import published_schema_for_device
 from app.services.reservation_guard import find_blocking_reservations_for_device
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["device-configs"])
-
-
-def _is_admin(payload: dict) -> bool:
-    return payload.get("role") in ("admin", "superadmin")
-
-
-async def _user_can_manage_device(
-    user_id: str,
-    device_id: uuid.UUID,
-    authorization: str | None,
-) -> bool:
-    """Wrap the shared herd-common helper with this service's URL config.
-
-    Accepts an explicit `manage` grant OR reservation-owner-of-an-active-
-    reservation-containing-this-device, per the iter-3 widening documented
-    in docs/ROLES.md.
-    """
-    return await user_has_manage_or_owns_active_reservation(
-        user_id=user_id,
-        device_id=str(device_id),
-        authorization=authorization,
-        acl_service_url=settings.acl_service_url,
-        reservations_service_url=settings.reservations_service_url,
-        internal_api_token=settings.internal_api_token,
-    )
 
 
 async def _load_device(db: AsyncSession, device_id: uuid.UUID) -> Device:

@@ -12,11 +12,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from herd_common.acl import user_has_manage_or_owns_active_reservation
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload
 from app.models.device import Device
@@ -29,35 +27,11 @@ from app.schemas.device_config import (
     ApplyJobScheduleRequest,
     PaginatedApplyJobs,
 )
+from app.services.manage_guard import _is_admin, _user_can_manage_device
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["apply-jobs"])
-
-
-def _is_admin(payload: dict) -> bool:
-    return payload.get("role") in ("admin", "superadmin")
-
-
-async def _user_can_manage_device(
-    user_id: str,
-    device_id: uuid.UUID,
-    authorization: str | None,
-) -> bool:
-    """Wrap the shared herd-common helper with this service's URL config.
-
-    Accepts an explicit `manage` grant OR reservation-owner-of-an-active-
-    reservation-containing-this-device, per the iter-3 widening documented
-    in docs/ROLES.md.
-    """
-    return await user_has_manage_or_owns_active_reservation(
-        user_id=user_id,
-        device_id=str(device_id),
-        authorization=authorization,
-        acl_service_url=settings.acl_service_url,
-        reservations_service_url=settings.reservations_service_url,
-        internal_api_token=settings.internal_api_token,
-    )
 
 
 @router.post(

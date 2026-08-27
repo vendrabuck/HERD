@@ -43,7 +43,7 @@ from app.schemas.fork import (
     ForkSaveResponse,
     ForkVersionSummary,
 )
-from app.services.fork_save_service import prune_fork_devices, save_fork
+from app.services.fork_save_service import WireSpec, prune_fork_devices, save_fork
 from app.services.fork_service import create_fork
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
@@ -63,6 +63,19 @@ async def _load_fork(db: AsyncSession, reservation_id: uuid.UUID) -> Reservation
     if fork is None:
         raise HTTPException(status_code=404, detail="Fork not found")
     return fork
+
+
+def _to_delta(spec: WireSpec) -> ForkConnectionDelta:
+    """Map a resolved WireSpec to its wire-facing ForkConnectionDelta shape."""
+    return ForkConnectionDelta(
+        device_a_id=spec.device_a_id,
+        port_a=spec.port_a,
+        device_b_id=spec.device_b_id,
+        port_b=spec.port_b,
+        layer=spec.layer,
+        physical_connection_id=spec.physical_connection_id,
+        edge_key=spec.edge_key,
+    )
 
 
 @router.post("", response_model=ForkCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -286,30 +299,8 @@ async def save_fork_internal(
     return ForkSaveResponse(
         fork_id=result.fork_id,
         version_number=result.version_number,
-        released=[
-            ForkConnectionDelta(
-                device_a_id=spec.device_a_id,
-                port_a=spec.port_a,
-                device_b_id=spec.device_b_id,
-                port_b=spec.port_b,
-                layer=spec.layer,
-                physical_connection_id=spec.physical_connection_id,
-                edge_key=spec.edge_key,
-            )
-            for spec in result.released
-        ],
-        built=[
-            ForkConnectionDelta(
-                device_a_id=spec.device_a_id,
-                port_a=spec.port_a,
-                device_b_id=spec.device_b_id,
-                port_b=spec.port_b,
-                layer=spec.layer,
-                physical_connection_id=spec.physical_connection_id,
-                edge_key=spec.edge_key,
-            )
-            for spec in result.built
-        ],
+        released=[_to_delta(spec) for spec in result.released],
+        built=[_to_delta(spec) for spec in result.built],
         unchanged_count=result.unchanged_count,
     )
 
@@ -344,18 +335,7 @@ async def prune_fork_devices_internal(
         fork_id=result.fork_id,
         version_number=result.version_number,
         changed=result.changed,
-        released=[
-            ForkConnectionDelta(
-                device_a_id=spec.device_a_id,
-                port_a=spec.port_a,
-                device_b_id=spec.device_b_id,
-                port_b=spec.port_b,
-                layer=spec.layer,
-                physical_connection_id=spec.physical_connection_id,
-                edge_key=spec.edge_key,
-            )
-            for spec in result.released
-        ],
+        released=[_to_delta(spec) for spec in result.released],
     )
 
 

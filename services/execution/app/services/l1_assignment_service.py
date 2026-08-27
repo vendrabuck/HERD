@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
+from app.services._uuid_utils import as_uuid as _as_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +39,6 @@ def canonical_port_pair(port_a: str, port_b: str) -> tuple[str, str]:
     reversed-order resolve cannot create a second ACTIVE row for the same pair.
     """
     return (port_a, port_b) if port_a <= port_b else (port_b, port_a)
-
-
-def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
-    return value if isinstance(value, uuid.UUID) else uuid.UUID(value)
 
 
 async def record_l1_connect(

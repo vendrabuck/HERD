@@ -362,9 +362,10 @@ async def test_device_configs_manage_wrapper_forwards_to_helper():
     from unittest.mock import AsyncMock
 
     from app.routers import device_configs
+    from app.services import manage_guard
 
     with patch.object(
-        device_configs,
+        manage_guard,
         "user_has_manage_or_owns_active_reservation",
         new=AsyncMock(return_value=True),
     ) as mock_helper:
@@ -378,9 +379,10 @@ async def test_apply_jobs_manage_wrapper_forwards_to_helper():
     from unittest.mock import AsyncMock
 
     from app.routers import apply_jobs
+    from app.services import manage_guard
 
     with patch.object(
-        apply_jobs,
+        manage_guard,
         "user_has_manage_or_owns_active_reservation",
         new=AsyncMock(return_value=False),
     ) as mock_helper:

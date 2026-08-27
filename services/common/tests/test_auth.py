@@ -1,9 +1,10 @@
 import time
+import uuid
 
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
-from herd_common.auth import make_auth_dependencies
+from herd_common.auth import caller_id, make_auth_dependencies
 from jose import jwt
 
 SECRET = "test-secret"
@@ -93,3 +94,33 @@ def test_require_admin_with_user_role_raises_403():
     with pytest.raises(HTTPException) as exc_info:
         require_admin(payload)
     assert exc_info.value.status_code == 403
+
+
+# --- caller_id ---
+
+
+def test_caller_id_parses_valid_uuid_subject():
+    user_id = uuid.uuid4()
+    result = caller_id({"sub": str(user_id)})
+    assert result == user_id
+
+
+def test_caller_id_rejects_missing_subject():
+    with pytest.raises(HTTPException) as exc_info:
+        caller_id({})
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Invalid subject in token"
+
+
+def test_caller_id_rejects_non_uuid_subject():
+    with pytest.raises(HTTPException) as exc_info:
+        caller_id({"sub": "not-a-uuid"})
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Invalid subject in token"
+
+
+def test_caller_id_rejects_non_string_subject():
+    with pytest.raises(HTTPException) as exc_info:
+        caller_id({"sub": None})
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Invalid subject in token"

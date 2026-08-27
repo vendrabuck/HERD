@@ -2,11 +2,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from herd_common.consumer_schema_gate import (
     start_consumer_when_schema_ready,
     stop_consumer_schema_gate,
 )
+from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
 
@@ -51,13 +51,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+add_cors_middleware(app, settings.cors_origins)
 
 app.add_middleware(RequestLoggingMiddleware)
 

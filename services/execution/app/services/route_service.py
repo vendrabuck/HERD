@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.route_assignment import RouteAssignment
+from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
 
 logger = logging.getLogger(__name__)
@@ -27,10 +28,6 @@ logger = logging.getLogger(__name__)
 # intended RELEASED under this reason so the release-direction retry channels drive
 # the remove_route pass. Deliberately outside the non-retryable prefixes.
 FROZEN_PROVISION_PENDING_REMOVAL = "routes landed after wiring freeze; pending removal"
-
-
-def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
-    return value if isinstance(value, uuid.UUID) else uuid.UUID(value)
 
 
 async def get_route_assignments(
