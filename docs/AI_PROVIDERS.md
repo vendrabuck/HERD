@@ -45,7 +45,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
    Expected:
 
    ```json
-   {"enabled": true, "provider": "openai_compat", "model": "your-model-identifier", "recipe_authoring": false}
+   {"enabled": true, "provider": "openai_compat", "model": "your-model-identifier", "recipe_authoring": false, "degraded": false, "reason": null}
    ```
 
 4. Make a real call to confirm end-to-end wiring. The cheapest one is `suggest-identity`; it is a single round trip and exercises tool-use:
@@ -92,7 +92,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
    Expected:
 
    ```json
-   {"enabled": true, "provider": "anthropic", "model": "claude-sonnet-4-6", "recipe_authoring": false}
+   {"enabled": true, "provider": "anthropic", "model": "claude-sonnet-4-6", "recipe_authoring": false, "degraded": false, "reason": null}
    ```
 
 4. Same smoke call (`suggest-identity`).
@@ -104,7 +104,7 @@ To disable AI without removing the configuration, blank the credential for the a
 - Under `anthropic`: set both `AI_API_KEY=` and `AI_BASE_URL=` (empty); either one alone keeps the provider configured and AI enabled.
 - Under `openai_compat`: set `AI_BASE_URL=` (empty).
 
-Recreate `ai-orchestrator` and `config`. `GET /api/ai/status` will then return `{"enabled": false, "provider": "...", "model": "...", "recipe_authoring": ...}`, the frontend will hide the **Use AI** button, the **AI Assistant** tab, and the **Draft with AI** panel, and the guarded endpoints will return 503.
+Recreate `ai-orchestrator` and `config`. `GET /api/ai/status` will then return `{"enabled": false, "provider": "...", "model": "...", "recipe_authoring": ..., "degraded": false, "reason": null}`, the frontend will hide the **Use AI** button, the **AI Assistant** tab, and the **Draft with AI** panel, and the guarded endpoints will return 503.
 
 ## Choosing a model
 
@@ -189,6 +189,7 @@ AI_TLS_VERIFY=true
 ## Troubleshooting
 
 - **`/api/ai/status` returns `{"enabled": false}` after the switch**: the orchestrator does not see the new config. Check `docker compose exec ai-orchestrator env | grep AI_` to confirm the env actually reached the container. If the env is correct but the status is wrong, the container is still the pre-edit one; rerun `docker compose up -d --force-recreate ai-orchestrator`.
+- **`/api/ai/status` returns `{"enabled": false, "degraded": true, "reason": "..."}`**: settings look sufficient but the provider failed to CONSTRUCT (issue #606), for example an `AI_CA_CERT` path that does not exist, or an SDK/http-client version mismatch. `reason` is the exception class name only (never the message, which can carry a base URL or key material); check the ai-orchestrator container logs for the full `ai_status_construction_probe_failed` or `ai_client_construction_failed` line. The result is cached for 30 seconds, so a config fix needs up to that long (or a container recreate, which resets the cache) to be reflected.
 
 - **`/api/ai/status` returns the HTML SPA index**: you hit the Traefik catch-all. Either the URL is wrong (the path was not `/api/ai/status` exactly) or the ai-orchestrator container is not healthy yet (Traefik falls back to the SPA when the labelled service has no healthy endpoints). Wait a few seconds and retry, or `docker compose ps ai-orchestrator` to confirm health.
 

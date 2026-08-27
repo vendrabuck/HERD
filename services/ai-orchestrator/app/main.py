@@ -34,7 +34,7 @@ from app.routes.recipes import router as recipes_router
 from app.routes.reservation_assistant import router as reservation_assistant_router
 from app.routes.template_identity import router as template_identity_router
 from app.routes.usage import router as usage_router
-from app.services.ai_client import ai_is_configured
+from app.services.ai_client import ai_is_configured, get_provider_construction_status
 from app.tasks.conversation_sweeper import conversation_sweeper_loop
 
 setup_logging("ai-orchestrator", level=settings.log_level)
@@ -102,11 +102,28 @@ async def health():
 
 @app.get("/status")
 async def ai_status():
+    # ai_is_configured() only checks settings; a provider that looks
+    # configured can still fail to CONSTRUCT (issue #280's bad ai_ca_cert
+    # path, issue #592's SDK/http-client mismatch). Probe construction (cached,
+    # see get_provider_construction_status) only when settings say configured,
+    # so an unconfigured provider stays a plain enabled: false with no
+    # construction attempt.
+    configured = ai_is_configured()
+    degraded = False
+    reason: str | None = None
+    if configured:
+        degraded, reason = get_provider_construction_status()
     return {
-        "enabled": ai_is_configured(),
+        "enabled": configured and not degraded,
         "provider": settings.ai_provider,
         "model": settings.ai_model,
         # Conditional-UI signal for the DriversPage panel (ADR 0005): the
         # feature is usable only when this AND enabled are both true.
         "recipe_authoring": settings.ai_recipe_authoring_enabled,
+        # Additive (issue #606): degraded means settings looked sufficient but
+        # provider construction still failed; reason is the exception CLASS
+        # NAME only, never the message, which can carry a base URL or key
+        # material. Always present so the frontend/docs shape is stable.
+        "degraded": degraded,
+        "reason": reason,
     }

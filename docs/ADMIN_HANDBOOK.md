@@ -228,7 +228,7 @@ The AI feature is opt-in and gated by `ai_is_configured()`:
 - For the default `AI_PROVIDER=anthropic`, either `AI_API_KEY` (hosted API) or `AI_BASE_URL` (a local Anthropic-compatible endpoint, e.g. vLLM) being set is enough. For `AI_PROVIDER=openai_compat`, `AI_BASE_URL` must be set. Set the relevant variable(s) in `.env` (or via the config UI's AI Integration section) and `make restart`. The frontend checks `GET /api/ai/status` on load, so the **Use AI** button appears on the topology editor only when the provider is configured.
 - Optional `AI_MODEL` (default `claude-sonnet-4-6`) lets you bias for quality (`claude-opus-4-7`) or cost (`claude-haiku-4-5`).
 - To turn the feature off cleanly, blank the relevant variable(s) and `make restart`; users will see the button disappear on reload.
-- `/api/ai/status` is unauthenticated by design (no secret content) so the frontend can decide whether to render the button before any user logs in. It returns `{enabled, provider, model, recipe_authoring}`.
+- `/api/ai/status` is unauthenticated by design (no secret content) so the frontend can decide whether to render the button before any user logs in. It returns `{enabled, provider, model, recipe_authoring, degraded, reason}`.
 
 See [AI_GENERATE.md](AI_GENERATE.md) for the user-facing flow and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#ai-topology-generation) for failure modes.
 

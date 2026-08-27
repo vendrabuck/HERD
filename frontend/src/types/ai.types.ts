@@ -30,6 +30,15 @@ export interface AIStatusResponse {
   // Conditional-UI signal for the recipe drafting panel (issue #28); the
   // panel is usable only when this AND enabled are both true.
   recipe_authoring?: boolean;
+  // True when settings look configured but provider construction still
+  // failed (issue #606), e.g. a bad ai_ca_cert path or an SDK/http-client
+  // mismatch. enabled is already false in this case, so existing enabled
+  // gating needs no change; these fields are additive, for an
+  // operator-facing hint only.
+  degraded?: boolean;
+  // Exception class name only, never present with message text (may carry a
+  // base URL or key material). Null when not degraded.
+  reason?: string | null;
 }
 
 export interface RecipeValidationSection {
