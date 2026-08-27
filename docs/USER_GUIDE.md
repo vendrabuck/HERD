@@ -148,6 +148,10 @@ match). The template dropdown, topology-type dropdown, and "Show reserved" toggl
 in the topology editor's equipment palette (Equipment Browser), not on this page; see
 [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#the-equipment-palette).
 
+A **Rows per page** selector on the pagination bar (25, 50, 100, or 200) sets how many
+devices the table shows at once; your choice persists across sessions the same way your
+saved filters do, per the Settings note below.
+
 ## Topology editor
 
 See [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md) for the full walkthrough. In short:

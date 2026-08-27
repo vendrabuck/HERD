@@ -82,14 +82,6 @@ They are the core of the "larger refactor another time" scope.
   (the ordered list of guarded actions plus their kwargs and identity) would collapse the
   copies into one skeleton plus three small planners, and would make a future Layer 4 or
   vendor-specific contract a planner rather than a fourth copy.
-- **A shared internal-service HTTP client in `herd_common`.** Every service hand-rolls
-  `httpx.AsyncClient(...)` calls to peers with an inline timeout and an `X-Internal-Token`
-  header, and each re-implements the 5xx-is-transient / 404-is-absent classification
-  (`nats_consumer._get_internal` is the most developed version). Promoting that helper
-  into `herd_common` (with the retry-with-backoff helper already there, and the shared
-  `internal_auth.internal_token_matches` verifier now covering the inbound side) would give
-  every service one consistent, correctly-classifying client and remove a class of
-  copy-paste drift.
 - **Frontend batch-fetch hooks.** The two perf items above are symptoms of the same
   structural gap: `frontend/src/api/` has per-item fetch hooks but no batch primitives.
   Adding `useDevicesByIds` and `usePathfindBatch` (backed by the new endpoints) and making
