@@ -2,9 +2,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from app.database import Base, get_db
-from app.dependencies.auth import get_current_user
-from app.main import app
 from app.models.api_token import ApiToken
 from app.models.user import Role, User
 from app.services.api_token_service import (
@@ -13,28 +10,9 @@ from app.services.api_token_service import (
     revoke_api_token,
 )
 from app.utils.jwt import hash_token, verify_access_token
-from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
-
-async def override_get_db():
-    async with TestSessionLocal() as session:
-        yield session
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+from tests._harness import TestSessionLocal, mock_user
 
 
 async def _make_user(
@@ -335,53 +313,28 @@ async def test_revoke_is_idempotent():
 # --- HTTP / RBAC tests ---
 
 
-def _mock_user(role: Role, username: str = "mock") -> User:
-    return User(
-        id=uuid.uuid4(),
-        email=f"{username}@test.com",
-        username=username,
-        hashed_password="fake",
-        is_active=True,
-        role=role,
-    )
+@pytest.fixture
+async def admin_client(make_client):
+    async with make_client(mock_user(Role.ADMIN, username="adminuser")) as ac:
+        yield ac
 
 
 @pytest.fixture
-async def admin_client():
-    mock_admin = _mock_user(Role.ADMIN, "adminuser")
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: mock_admin
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+async def regular_client(make_client):
+    async with make_client(mock_user(Role.USER, username="regular")) as ac:
         yield ac
-    app.dependency_overrides.clear()
 
 
 @pytest.fixture
-async def regular_client():
-    mock_user = _mock_user(Role.USER, "regular")
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: mock_user
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+async def superadmin_client(make_client):
+    async with make_client(mock_user(Role.SUPERADMIN, username="superuser")) as ac:
         yield ac
-    app.dependency_overrides.clear()
 
 
 @pytest.fixture
-async def superadmin_client():
-    mock_super = _mock_user(Role.SUPERADMIN, "superuser")
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: mock_super
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+async def anon_client(make_client):
+    async with make_client() as ac:
         yield ac
-    app.dependency_overrides.clear()
-
-
-@pytest.fixture
-async def anon_client():
-    app.dependency_overrides[get_db] = override_get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
-    app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
