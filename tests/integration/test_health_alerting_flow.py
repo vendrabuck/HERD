@@ -56,11 +56,9 @@ async def _publish_health_event(payload: dict) -> None:
     via env to talk to a host-mapped port (`make up` does not expose 4222
     by default). Tests that can't reach NATS skip rather than fail.
 
-    The caller must have stamped payload["event_id"]; this sets the matching
-    Nats-Msg-Id header so a real producer's dedup contract is mirrored,
-    rather than falling back to the stream:sequence key that a NATS
-    container recreate on a reused stack (dev/test has no volume) resets
-    to values Postgres already holds notification rows for (issue #611).
+    The caller must have stamped payload["event_id"]; the publish sets the
+    matching Nats-Msg-Id header so the outbox relay's contract is mirrored
+    exactly (see the module docstring and issue #611 for why).
     """
     nats_url = os.getenv("NATS_URL_HOST", "nats://localhost:4222")
     nc = await nats.connect(nats_url, connect_timeout=5)
