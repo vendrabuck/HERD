@@ -19,7 +19,8 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from herd_common.pagination import paginate
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -189,21 +190,13 @@ async def list_mappings(
     db: AsyncSession = Depends(get_db),
     _: User = _admin_or_superadmin,
 ):
-    total = (await db.execute(select(func.count()).select_from(LdapGroupMapping))).scalar_one()
-    rows = (
-        (
-            await db.execute(
-                select(LdapGroupMapping)
-                # id tiebreaker: equal timestamps otherwise make skip/limit
-                # pages nondeterministic (rows skipped or duplicated).
-                .order_by(LdapGroupMapping.created_at, LdapGroupMapping.id)
-                .offset(skip)
-                .limit(limit)
-            )
-        )
-        .scalars()
-        .all()
+    stmt = (
+        select(LdapGroupMapping)
+        # id tiebreaker: equal timestamps otherwise make skip/limit pages
+        # nondeterministic (rows skipped or duplicated).
+        .order_by(LdapGroupMapping.created_at, LdapGroupMapping.id)
     )
+    rows, total = await paginate(db, stmt, skip=skip, limit=limit)
     return PaginatedMappingResponse(
         items=[MappingResponse.model_validate(r) for r in rows],
         total=total,
@@ -281,21 +274,13 @@ async def list_sync_runs(
     db: AsyncSession = Depends(get_db),
     _: User = _admin_or_superadmin,
 ):
-    total = (await db.execute(select(func.count()).select_from(LdapSyncRun))).scalar_one()
-    rows = (
-        (
-            await db.execute(
-                select(LdapSyncRun)
-                # Newest first; id tiebreaker keeps equal timestamps from
-                # making skip/limit pages nondeterministic.
-                .order_by(LdapSyncRun.started_at.desc(), LdapSyncRun.id.desc())
-                .offset(skip)
-                .limit(limit)
-            )
-        )
-        .scalars()
-        .all()
+    stmt = (
+        select(LdapSyncRun)
+        # Newest first; id tiebreaker keeps equal timestamps from making
+        # skip/limit pages nondeterministic.
+        .order_by(LdapSyncRun.started_at.desc(), LdapSyncRun.id.desc())
     )
+    rows, total = await paginate(db, stmt, skip=skip, limit=limit)
     return PaginatedSyncRunResponse(
         items=[SyncRunResponse.model_validate(r) for r in rows],
         total=total,

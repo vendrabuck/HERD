@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
+from herd_common.pagination import paginate
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,23 +17,29 @@ async def list_for_user(
     offset: int = 0,
     unread_only: bool = False,
 ) -> tuple[list[Notification], int, int]:
+    """`total` is always the user's full notification count, independent of
+    `unread_only`: only `items` (the page) and `unread` narrow with the
+    filter. That decouples `total` from the paginate() helper's own count
+    (which tracks whatever statement it is handed), so the page and its
+    total are fetched from two different statements here rather than one.
+    """
     base = select(Notification).where(Notification.user_id == user_id)
+    page_stmt = base
     if unread_only:
-        base = base.where(Notification.read_at.is_(None))
-    total_q = select(func.count()).select_from(
-        select(Notification).where(Notification.user_id == user_id).subquery()
-    )
+        page_stmt = page_stmt.where(Notification.read_at.is_(None))
+    page_stmt = page_stmt.order_by(Notification.created_at.desc())
+
     unread_q = select(func.count()).select_from(
         select(Notification)
         .where(Notification.user_id == user_id, Notification.read_at.is_(None))
         .subquery()
     )
-    items_q = base.order_by(Notification.created_at.desc()).limit(limit).offset(offset)
+    total_q = select(func.count()).select_from(base.subquery())
 
-    items = (await db.execute(items_q)).scalars().all()
-    total = (await db.execute(total_q)).scalar_one()
+    items, _ = await paginate(db, page_stmt, skip=offset, limit=limit)
+    total = (await db.execute(total_q)).scalar() or 0
     unread = (await db.execute(unread_q)).scalar_one()
-    return list(items), int(total), int(unread)
+    return items, total, int(unread)
 
 
 async def unread_count(db: AsyncSession, user_id: uuid.UUID) -> int:
