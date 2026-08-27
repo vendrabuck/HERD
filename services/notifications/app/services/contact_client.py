@@ -10,13 +10,13 @@ A lookup failure (auth unreachable, non-200, missing user) returns None; the
 calling dispatcher logs and skips its channel without blocking the others.
 """
 
-import asyncio
 import logging
-import time
 import uuid
 from dataclasses import dataclass
 
 import httpx
+from herd_common.internal_client import InternalTokenAuth, call_service
+from herd_common.ttl_cache import TTLCache
 
 from app.config import settings
 
@@ -42,30 +42,12 @@ class ContactClient:
         self._ttl = (
             ttl_seconds if ttl_seconds is not None else settings.preferences_cache_ttl_seconds
         )
-        self._cache: dict[uuid.UUID, tuple[float, UserContact | None]] = {}
-        self._lock = asyncio.Lock()
-
-    def _cache_hit(self, user_id: uuid.UUID) -> tuple[bool, UserContact | None]:
-        entry = self._cache.get(user_id)
-        if entry is None:
-            return False, None
-        expires_at, contact = entry
-        if expires_at < time.monotonic():
-            return False, None
-        return True, contact
+        self._cache: TTLCache[uuid.UUID, UserContact | None] = TTLCache(
+            fetch=self._fetch, ttl_seconds=self._ttl
+        )
 
     async def get(self, user_id: uuid.UUID) -> UserContact | None:
-        hit, contact = self._cache_hit(user_id)
-        if hit:
-            return contact
-
-        async with self._lock:
-            hit, contact = self._cache_hit(user_id)
-            if hit:
-                return contact
-            contact = await self._fetch(user_id)
-            self._cache[user_id] = (time.monotonic() + self._ttl, contact)
-            return contact
+        return await self._cache.get(user_id)
 
     async def _fetch(self, user_id: uuid.UUID) -> UserContact | None:
         if not self._token:
@@ -74,10 +56,14 @@ class ContactClient:
                 extra={"action": "contact_fetch_no_token", "user_id": str(user_id)},
             )
             return None
-        url = f"{self._base_url}/internal/users/{user_id}/contact"
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, headers={"X-Internal-Token": self._token}, timeout=5.0)
+            resp = await call_service(
+                self._base_url,
+                "GET",
+                f"/internal/users/{user_id}/contact",
+                timeout=5.0,
+                auth=InternalTokenAuth(token=self._token),
+            )
         except httpx.HTTPError:
             logger.warning(
                 "Failed to fetch user contact from auth; skipping outbound channel",
@@ -110,7 +96,7 @@ class ContactClient:
             return None
 
     def invalidate(self, user_id: uuid.UUID) -> None:
-        self._cache.pop(user_id, None)
+        self._cache.invalidate(user_id)
 
 
 _client: ContactClient | None = None

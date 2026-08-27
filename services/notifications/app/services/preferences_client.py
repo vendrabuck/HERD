@@ -1,9 +1,9 @@
-import asyncio
 import logging
-import time
 import uuid
 
 import httpx
+from herd_common.internal_client import InternalTokenAuth, call_service
+from herd_common.ttl_cache import TTLCache
 
 from app.config import settings
 from app.schemas.preferences import NotificationPreferences
@@ -29,42 +29,23 @@ class PreferencesClient:
         self._ttl = (
             ttl_seconds if ttl_seconds is not None else settings.preferences_cache_ttl_seconds
         )
-        self._cache: dict[uuid.UUID, tuple[float, NotificationPreferences]] = {}
-        self._lock = asyncio.Lock()
-
-    def _cache_hit(self, user_id: uuid.UUID) -> NotificationPreferences | None:
-        entry = self._cache.get(user_id)
-        if entry is None:
-            return None
-        expires_at, prefs = entry
-        if expires_at < time.monotonic():
-            return None
-        return prefs
+        self._cache: TTLCache[uuid.UUID, NotificationPreferences] = TTLCache(
+            fetch=self._fetch, ttl_seconds=self._ttl
+        )
 
     async def get(self, user_id: uuid.UUID) -> NotificationPreferences:
-        cached = self._cache_hit(user_id)
-        if cached is not None:
-            return cached
-
-        async with self._lock:
-            cached = self._cache_hit(user_id)
-            if cached is not None:
-                return cached
-
-            prefs = await self._fetch(user_id)
-            self._cache[user_id] = (time.monotonic() + self._ttl, prefs)
-            return prefs
+        return await self._cache.get(user_id)
 
     async def _fetch(self, user_id: uuid.UUID) -> NotificationPreferences:
-        url = f"{self._base_url}/preferences/internal"
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    url,
-                    params={"user_id": str(user_id)},
-                    headers={"X-Internal-Token": self._token},
-                    timeout=5.0,
-                )
+            resp = await call_service(
+                self._base_url,
+                "GET",
+                "/preferences/internal",
+                params={"user_id": str(user_id)},
+                timeout=5.0,
+                auth=InternalTokenAuth(token=self._token),
+            )
         except httpx.HTTPError:
             logger.warning(
                 "Failed to fetch preferences; falling back to defaults",
@@ -89,7 +70,7 @@ class PreferencesClient:
         return NotificationPreferences.with_defaults(stored)
 
     def invalidate(self, user_id: uuid.UUID) -> None:
-        self._cache.pop(user_id, None)
+        self._cache.invalidate(user_id)
 
 
 _client: PreferencesClient | None = None

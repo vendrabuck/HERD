@@ -10,12 +10,12 @@ dispatch silently produces zero messages; matches the closed-default
 posture used elsewhere when an upstream service is unreachable.
 """
 
-import asyncio
 import logging
-import time
 import uuid
 
 import httpx
+from herd_common.internal_client import InternalTokenAuth, call_service
+from herd_common.ttl_cache import SingletonTTLCache
 
 from app.config import settings
 
@@ -44,20 +44,12 @@ class AdminListClient:
             if ttl_seconds is not None
             else settings.health_notify_admin_cache_ttl_seconds
         )
-        self._cached_until: float = 0.0
-        self._cached: list[uuid.UUID] = []
-        self._lock = asyncio.Lock()
+        self._cache: SingletonTTLCache[list[uuid.UUID]] = SingletonTTLCache(
+            fetch=self._fetch, ttl_seconds=self._ttl
+        )
 
     async def list_admins(self) -> list[uuid.UUID]:
-        if self._cached_until > time.monotonic():
-            return list(self._cached)
-        async with self._lock:
-            if self._cached_until > time.monotonic():
-                return list(self._cached)
-            admins = await self._fetch()
-            self._cached = admins
-            self._cached_until = time.monotonic() + self._ttl
-            return list(admins)
+        return list(await self._cache.get())
 
     async def _fetch(self) -> list[uuid.UUID]:
         if not self._token:
@@ -66,10 +58,14 @@ class AdminListClient:
                 extra={"action": "admin_fetch_no_token"},
             )
             return []
-        url = f"{self._base_url}/internal/admins"
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, headers={"X-Internal-Token": self._token}, timeout=5.0)
+            resp = await call_service(
+                self._base_url,
+                "GET",
+                "/internal/admins",
+                timeout=5.0,
+                auth=InternalTokenAuth(token=self._token),
+            )
         except httpx.HTTPError:
             logger.warning(
                 "Failed to fetch admin list from auth; returning empty",
@@ -97,8 +93,7 @@ class AdminListClient:
         return out
 
     def invalidate(self) -> None:
-        self._cached_until = 0.0
-        self._cached = []
+        self._cache.invalidate()
 
 
 async def _fetch_active_reservation_holders(device_id: uuid.UUID) -> list[uuid.UUID]:

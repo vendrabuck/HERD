@@ -51,13 +51,13 @@ async def test_admin_list_caches_within_ttl():
 
     with patch("httpx.AsyncClient") as MockClient:
         instance = MockClient.return_value.__aenter__.return_value
-        instance.get = AsyncMock(side_effect=fake_get)
+        instance.request = AsyncMock(side_effect=fake_get)
         first = await client.list_admins()
         second = await client.list_admins()
         assert set(first) == {a, b}
         assert second == first
         # Only one HTTP call thanks to the cache
-        assert instance.get.call_count == 1
+        assert instance.request.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -70,11 +70,11 @@ async def test_admin_list_refetches_after_invalidate():
 
     with patch("httpx.AsyncClient") as MockClient:
         instance = MockClient.return_value.__aenter__.return_value
-        instance.get = AsyncMock(side_effect=fake_get)
+        instance.request = AsyncMock(side_effect=fake_get)
         await client.list_admins()
         client.invalidate()
         await client.list_admins()
-        assert instance.get.call_count == 2
+        assert instance.request.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -89,7 +89,7 @@ async def test_admin_list_returns_empty_on_http_error():
     client = AdminListClient(base_url="http://auth-test:8000", internal_token="t", ttl_seconds=60)
     with patch("httpx.AsyncClient") as MockClient:
         instance = MockClient.return_value.__aenter__.return_value
-        instance.get = AsyncMock(side_effect=httpx.ConnectError("nope"))
+        instance.request = AsyncMock(side_effect=httpx.ConnectError("nope"))
         result = await client.list_admins()
     assert result == []
 
@@ -99,7 +99,7 @@ async def test_admin_list_returns_empty_on_non_200():
     client = AdminListClient(base_url="http://auth-test:8000", internal_token="t", ttl_seconds=60)
     with patch("httpx.AsyncClient") as MockClient:
         instance = MockClient.return_value.__aenter__.return_value
-        instance.get = AsyncMock(return_value=_mock_resp(status_code=500))
+        instance.request = AsyncMock(return_value=_mock_resp(status_code=500))
         result = await client.list_admins()
     assert result == []
 
@@ -110,7 +110,9 @@ async def test_admin_list_skips_unparseable_ids():
     client = AdminListClient(base_url="http://auth-test:8000", internal_token="t", ttl_seconds=60)
     with patch("httpx.AsyncClient") as MockClient:
         instance = MockClient.return_value.__aenter__.return_value
-        instance.get = AsyncMock(return_value=_mock_resp(json_data=[str(a), "not-a-uuid", None, 7]))
+        instance.request = AsyncMock(
+            return_value=_mock_resp(json_data=[str(a), "not-a-uuid", None, 7])
+        )
         result = await client.list_admins()
     assert result == [a]
 
@@ -131,7 +133,7 @@ async def test_admin_list_concurrent_callers_fetch_once():
 
     with patch("httpx.AsyncClient") as MockClient:
         instance = MockClient.return_value.__aenter__.return_value
-        instance.get = AsyncMock(side_effect=slow_get)
+        instance.request = AsyncMock(side_effect=slow_get)
 
         first = asyncio.create_task(client.list_admins())
         # Wait until the first caller is inside the (gated) HTTP fetch, holding
@@ -145,7 +147,7 @@ async def test_admin_list_concurrent_callers_fetch_once():
 
     assert r1 == [a]
     assert r2 == [a]
-    assert instance.get.call_count == 1
+    assert instance.request.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -153,7 +155,7 @@ async def test_admin_list_returns_empty_on_malformed_json():
     client = AdminListClient(base_url="http://auth-test:8000", internal_token="t", ttl_seconds=60)
     with patch("httpx.AsyncClient") as MockClient:
         instance = MockClient.return_value.__aenter__.return_value
-        instance.get = AsyncMock(return_value=_mock_resp(raise_value_error=True))
+        instance.request = AsyncMock(return_value=_mock_resp(raise_value_error=True))
         result = await client.list_admins()
     assert result == []
 
