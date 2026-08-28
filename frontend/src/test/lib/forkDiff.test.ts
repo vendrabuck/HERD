@@ -89,6 +89,28 @@ describe("diffForkCanvases", () => {
     expect(diff.removedEdges).toEqual([]);
   });
 
+  it("uses multiset semantics for same-key edges, not set membership (coordinator review)", () => {
+    // Two edges between the same pair with no recorded port names (pre-#531
+    // canvases stored no source_port_name/target_port_name) share the exact
+    // same identity key. A plain Set of keys would collapse them into one
+    // membership test and report zero change when only one is removed;
+    // per-key COUNTS must catch it instead.
+    const dupBefore = canvas(
+      [node("n1"), node("n2")],
+      [edge("e1", "n1", "n2", "", ""), edge("e2", "n1", "n2", "", "")],
+    );
+    const dupAfterOne = canvas([node("n1"), node("n2")], [edge("e1", "n1", "n2", "", "")]);
+
+    const shrunk = diffForkCanvases(dupBefore, dupAfterOne);
+    expect(shrunk.removedEdges).toHaveLength(1);
+    expect(shrunk.addedEdges).toEqual([]);
+
+    // The reverse: one same-key edge duplicating to two reports one added.
+    const grown = diffForkCanvases(dupAfterOne, dupBefore);
+    expect(grown.addedEdges).toHaveLength(1);
+    expect(grown.removedEdges).toEqual([]);
+  });
+
   it("treats a null/undefined canvas as empty rather than throwing", () => {
     const after = canvas([node("n1")], [edge("e1", "n1", "n1", "eth1", "eth2")]);
     expect(diffForkCanvases(null, after).addedNodes).toHaveLength(1);

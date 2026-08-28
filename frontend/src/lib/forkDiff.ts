@@ -56,12 +56,62 @@ export function diffForkCanvases(
   const addedNodes = afterNodes.filter((n) => !beforeNodeIds.has(n.id));
   const removedNodes = beforeNodes.filter((n) => !afterNodeIds.has(n.id));
 
-  const beforeEdgeKeys = new Set(beforeEdges.map(edgeIdentityKey));
-  const afterEdgeKeys = new Set(afterEdges.map(edgeIdentityKey));
-  const addedEdges = afterEdges.filter((e) => !beforeEdgeKeys.has(edgeIdentityKey(e)));
-  const removedEdges = beforeEdges.filter((e) => !afterEdgeKeys.has(edgeIdentityKey(e)));
+  const { addedEdges, removedEdges } = diffEdgesByKeyCount(beforeEdges, afterEdges);
 
   return { addedNodes, removedNodes, addedEdges, removedEdges };
+}
+
+// Groups edges by identity key, preserving each key's edges in their
+// original array order (so a "take the extra N" slice below picks a stable,
+// arbitrary-but-deterministic representative when several edges share a key).
+function groupEdgesByKey(edges: Edge<LayerEdgeData>[]): Map<string, Edge<LayerEdgeData>[]> {
+  const groups = new Map<string, Edge<LayerEdgeData>[]>();
+  for (const edge of edges) {
+    const key = edgeIdentityKey(edge);
+    const group = groups.get(key);
+    if (group) {
+      group.push(edge);
+    } else {
+      groups.set(key, [edge]);
+    }
+  }
+  return groups;
+}
+
+/**
+ * Multiset (count-based) edge diff, keyed by edgeIdentityKey. A plain Set of
+ * keys collapses same-key duplicates into one membership test, so two edges
+ * sharing a key (e.g. two lines with no recorded port names, common on a
+ * canvas saved before issue #531 gave each line its own source_port_name/
+ * target_port_name) would report zero change if only one of them were
+ * removed. Comparing per-key COUNTS instead catches that: N before and M
+ * after nets max(0, M - N) added and max(0, N - M) removed, each reported as
+ * that many representative edges from the respective side (the edges are
+ * identical by identity, so which specific instances stand in does not
+ * change what the diff communicates).
+ */
+function diffEdgesByKeyCount(
+  before: Edge<LayerEdgeData>[],
+  after: Edge<LayerEdgeData>[],
+): { addedEdges: Edge<LayerEdgeData>[]; removedEdges: Edge<LayerEdgeData>[] } {
+  const beforeGroups = groupEdgesByKey(before);
+  const afterGroups = groupEdgesByKey(after);
+  const allKeys = new Set([...beforeGroups.keys(), ...afterGroups.keys()]);
+
+  const addedEdges: Edge<LayerEdgeData>[] = [];
+  const removedEdges: Edge<LayerEdgeData>[] = [];
+  for (const key of allKeys) {
+    const beforeGroup = beforeGroups.get(key) ?? [];
+    const afterGroup = afterGroups.get(key) ?? [];
+    const delta = afterGroup.length - beforeGroup.length;
+    if (delta > 0) {
+      addedEdges.push(...afterGroup.slice(afterGroup.length - delta));
+    } else if (delta < 0) {
+      const removedCount = -delta;
+      removedEdges.push(...beforeGroup.slice(beforeGroup.length - removedCount));
+    }
+  }
+  return { addedEdges, removedEdges };
 }
 
 // Builds a read-only render of `after` annotated with the diff so the canvas
