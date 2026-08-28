@@ -471,7 +471,7 @@ def test_restore_then_save_via_fork_readback_pw(pw_page):
         # versions newest-first (cabling orders ForkVersion.version_number
         # desc), so a bare `.first` on the Restore buttons would hit v2's row
         # instead: find the "v1" label span, then walk up to its enclosing
-        # row (the span's grandparent -- ForkHistoryPanel.tsx nests the
+        # row (the span's grandparent: ForkHistoryPanel.tsx nests the
         # version label in `<div className="flex items-center gap-2">`,
         # itself a child of the per-version row div), and restore from
         # inside that specific row.
