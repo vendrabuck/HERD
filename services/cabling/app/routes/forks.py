@@ -39,8 +39,10 @@ from app.schemas.fork import (
     ForkDetailResponse,
     ForkPruneRequest,
     ForkPruneResponse,
+    ForkRestoreResponse,
     ForkSaveRequest,
     ForkSaveResponse,
+    ForkVersionDetailResponse,
     ForkVersionSummary,
 )
 from app.services.fork_save_service import WireSpec, prune_fork_devices, save_fork
@@ -63,6 +65,15 @@ async def _load_fork(db: AsyncSession, reservation_id: uuid.UUID) -> Reservation
     if fork is None:
         raise HTTPException(status_code=404, detail="Fork not found")
     return fork
+
+
+async def _load_fork_version(
+    db: AsyncSession, fork_id: uuid.UUID, version_id: uuid.UUID
+) -> ForkVersion:
+    version = await db.get(ForkVersion, version_id)
+    if version is None or version.fork_id != fork_id:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return version
 
 
 def _to_delta(spec: WireSpec) -> ForkConnectionDelta:
@@ -225,10 +236,97 @@ async def get_fork_internal(
         parent_version_id=fork.parent_version_id,
         status=fork.status,
         canvas_data=fork.canvas_data,
+        draft_restored_from_id=fork.draft_restored_from_id,
         created_at=fork.created_at,
         updated_at=fork.updated_at,
         connections=[ForkConnectionResponse.model_validate(c) for c in connections],
         versions=[ForkVersionSummary.model_validate(v) for v in versions],
+    )
+
+
+@router.get(
+    "/{reservation_id}/versions/{version_id}",
+    response_model=ForkVersionDetailResponse,
+)
+async def get_fork_version_internal(
+    reservation_id: uuid.UUID,
+    version_id: uuid.UUID,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return one fork_versions row's full canvas payload (issue #622).
+
+    The read side of the history panel's version preview and diff: unlike the GET
+    above, this carries the version's own canvas_data rather than the fork's current
+    draft. 404 when the fork does not exist, or when the version exists but belongs
+    to a different fork (never leaks a foreign version's existence). Read-only; no
+    status check, mirroring GET /{reservation_id} which is allowed for any
+    reservation status.
+    """
+    _check_internal_token(x_internal_token)
+    fork = await _load_fork(db, reservation_id)
+    version = await _load_fork_version(db, fork.id, version_id)
+
+    return ForkVersionDetailResponse(
+        id=version.id,
+        fork_id=version.fork_id,
+        version_number=version.version_number,
+        restored_from_id=version.restored_from_id,
+        created_at=version.created_at,
+        canvas_data=version.canvas_data,
+    )
+
+
+@router.post(
+    "/{reservation_id}/versions/{version_id}/restore",
+    response_model=ForkRestoreResponse,
+)
+async def restore_fork_version_internal(
+    reservation_id: uuid.UUID,
+    version_id: uuid.UUID,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restore to draft: copy a version's canvas onto the fork's draft (issue #622).
+
+    Restore-to-draft, never restore-and-reconcile (ADR 0006 addendum, 2026-08-28,
+    revised after PR #623 review): this replaces ONLY the fork's draft canvas_data
+    and sets draft_restored_from_id = version_id on the fork row. It deliberately
+    appends NO fork_versions row of its own: a version means something was
+    reconciled (see the loose canvas PUT just below, which also appends none), and
+    the standing wiring-heal reconciler (ADR 0007 Decision 2) relies on cabling's
+    latest fork_version only outrunning reservations' wiring ledger when a save's
+    staging was actually missed. An appended version here would falsely trip that
+    heal for a canvas-only change. The marker rides on the fork row until the next
+    save consumes it (see save_fork_internal), so it is NOT cleared here.
+
+    Never touches fork_connections, the wiring ledger, or the outbox; nothing is
+    wired until the caller runs the existing save-reconcile endpoint. 404 when the
+    fork or the version (scoped to that fork) does not exist; 409 when the fork is
+    ARCHIVED, the same wording as the loose canvas PUT and the save endpoint.
+    """
+    _check_internal_token(x_internal_token)
+    fork = await _load_fork(db, reservation_id)
+    if fork.status == ForkStatus_ARCHIVED:
+        raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
+    version = await _load_fork_version(db, fork.id, version_id)
+
+    restored_canvas = version.canvas_data
+    fork.canvas_data = restored_canvas
+    fork.draft_restored_from_id = version.id
+    # Same validation the loose canvas PUT runs, on the same terms: reported, not
+    # gated on. This also mirrors that endpoint in appending no version and not
+    # touching fork_connections.
+    validation = await _run_topology_validation(Topology(canvas_data=restored_canvas), db)
+    fork_id = fork.id
+    draft_restored_from_id = fork.draft_restored_from_id
+    await db.commit()
+
+    return ForkRestoreResponse(
+        id=fork_id,
+        valid=validation.valid,
+        invalid_edges=validation.invalid_edges,
+        draft_restored_from_id=draft_restored_from_id,
     )
 
 
@@ -246,7 +344,10 @@ async def update_fork_canvas_internal(
     to the save endpoint (phase 2). It reuses the topology route validator to report
     route shape so the editor can flag unreachable edges, but does not gate the draft
     on it: an invalid draft still stores, matching "drafts are cheap". An ARCHIVED
-    fork is frozen (Decision 5) and refuses the edit with 409.
+    fork is frozen (Decision 5) and refuses the edit with 409. It never touches
+    draft_restored_from_id either way (issue #622): editing a canvas that was just
+    restored leaves the marker in place, since the user is still editing the restored
+    draft and only a save consumes it.
     """
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id)
@@ -283,6 +384,12 @@ async def save_fork_internal(
     one fork_versions row. Rolls back wholesale on any failure: never a half-applied
     save. An ARCHIVED fork is frozen (Decision 5) and refuses the save with 409, the
     same wording pattern as the loose canvas PUT.
+
+    Consumes the restore-to-draft marker (issue #622, see restore_fork_version_internal):
+    if the fork's draft_restored_from_id is set, the appended fork_versions row carries
+    it as its own restored_from_id, and the fork-row marker is cleared in the same
+    transaction (see save_fork in fork_save_service.py). A save with no pending restore
+    just appends restored_from_id=None as before.
     """
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id)

@@ -52,6 +52,44 @@ class ForkVersionSummary(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ForkVersionDetailResponse(BaseModel):
+    """GET /internal/forks/{reservation_id}/versions/{version_id}: one version, full.
+
+    ForkVersionSummary's fields plus the canvas payload the summary omits (issue
+    #622); the read side of preview/diff in the fork history panel.
+    """
+
+    id: UUIDStr
+    fork_id: UUIDStr
+    version_number: int
+    restored_from_id: OptionalUUIDStr = None
+    created_at: datetime
+    canvas_data: dict[str, Any] | None = None
+
+
+class ForkRestoreResponse(BaseModel):
+    """POST .../versions/{version_id}/restore result (issue #622, restore-to-draft).
+
+    ForkCanvasUpdateResponse's exact shape (the restored draft's route validation)
+    plus draft_restored_from_id, the marker the restore just set. Restore-to-draft
+    NEVER appends a fork_versions row: a version means something was reconciled
+    (the canvas PUT below never appends one either), and the standing wiring-heal
+    reconciler (ADR 0007 Decision 2) relies on cabling's latest fork_version only
+    outrunning the ledger when a save's staging was missed. Restore instead only
+    replaces the fork's draft canvas_data and sets draft_restored_from_id on the
+    fork row; the NEXT save carries that marker onto the ForkVersion it appends as
+    that version's own restored_from_id and clears it (see save_fork_internal). It
+    never touches fork_connections, the wiring ledger, or the outbox (ADR 0006
+    addendum, 2026-08-28, revised after PR #623 review). Nothing is wired until the
+    caller runs the existing save.
+    """
+
+    id: UUIDStr
+    valid: bool
+    invalid_edges: list[InvalidEdge]
+    draft_restored_from_id: OptionalUUIDStr = None
+
+
 class ForkDetailResponse(BaseModel):
     """GET /internal/forks/{reservation_id}: fork metadata, canvas, wiring, versions."""
 
@@ -61,6 +99,10 @@ class ForkDetailResponse(BaseModel):
     parent_version_id: OptionalUUIDStr = None
     status: str
     canvas_data: dict[str, Any] | None = None
+    # The version the draft was last restored from, still unsaved (issue #622); null
+    # once a save consumes it, or when the draft was never restored. Lets the
+    # frontend label the draft "restored from version N, unsaved".
+    draft_restored_from_id: OptionalUUIDStr = None
     created_at: datetime
     updated_at: datetime
     connections: list[ForkConnectionResponse]
@@ -74,7 +116,13 @@ class ForkCanvasUpdate(BaseModel):
 
 
 class ForkCanvasUpdateResponse(BaseModel):
-    """Loose-edit result: the stored draft's route validation, no reconcile."""
+    """Loose-edit result: the stored draft's route validation, no reconcile.
+
+    A canvas PUT after a restore leaves the fork's draft_restored_from_id marker in
+    place (the user is still editing the restored draft; only a save consumes it),
+    so this response deliberately does not echo the marker: GET the fork detail to
+    read it.
+    """
 
     id: UUIDStr
     valid: bool

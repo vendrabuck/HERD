@@ -38,6 +38,13 @@ _schema = settings.db_schema or None
 ForkStatus_ACTIVE = "ACTIVE"
 ForkStatus_ARCHIVED = "ARCHIVED"
 
+# Computed ahead of ReservationFork so its draft_restored_from_id FK (added issue
+# #622) can reference fork_versions.id even though the ForkVersion class is defined
+# later in this module; SQLAlchemy resolves string-based ForeignKey targets against
+# Base.metadata lazily, at mapper-configuration time, not at class-definition time,
+# so the forward reference is safe.
+_fork_version_fk = f"{_schema}.fork_versions.id" if _schema else "fork_versions.id"
+
 
 class ReservationFork(Base):
     __tablename__ = "reservation_fork"
@@ -62,6 +69,29 @@ class ReservationFork(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=ForkStatus_ACTIVE, server_default=ForkStatus_ACTIVE
     )
+    # The fork_versions row the draft was last restored from (issue #622,
+    # restore-to-draft). Restore never appends a fork_versions row of its own (a
+    # version means something was reconciled, per the canvas PUT below); instead it
+    # sets this marker so the NEXT save can carry it onto the ForkVersion it
+    # appends as that version's own restored_from_id, then clear this field in the
+    # same transaction. A loose canvas PUT between a restore and a save leaves the
+    # marker in place: the user is still editing the restored draft. ON DELETE SET
+    # NULL so pruning old versions never blocks on this back-reference. use_alter=True
+    # because this FK, together with fork_versions.fork_id -> reservation_fork.id,
+    # forms a genuine table-level cycle (reservation_fork references fork_versions,
+    # fork_versions references reservation_fork); without it, DDL table sorting
+    # (create_all/drop_all, used by every SQLite unit test) raises SAWarning, which
+    # this repo's filterwarnings=["error"] turns into a hard test failure.
+    draft_restored_from_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            _fork_version_fk,
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_reservation_fork_draft_restored_from_id",
+        ),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -69,7 +99,6 @@ class ReservationFork(Base):
 
 
 _fork_fk = f"{_schema}.reservation_fork.id" if _schema else "reservation_fork.id"
-_fork_version_fk = f"{_schema}.fork_versions.id" if _schema else "fork_versions.id"
 
 
 class ForkConnection(Base):

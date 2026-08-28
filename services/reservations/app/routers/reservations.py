@@ -568,6 +568,11 @@ async def release_reservation_early(
 FORK_EDIT_REQUIRES_ACTIVE = "Fork editing requires an ACTIVE reservation"
 FORK_SAVE_REQUIRES_ACTIVE = "Fork save requires an ACTIVE reservation"
 
+# Issue #622: the restore endpoint's contract pins a structured 409 body rather than
+# the plain-string wording the two guards above use, since the frontend history panel
+# branches on `error` rather than matching the message text.
+FORK_RESTORE_REQUIRES_ACTIVE = {"error": "reservation_not_active"}
+
 # Pinned 409 wording when a wiring retry targets a not-yet-provisioned reservation.
 # ADR 0009 phase 3 (issue #369) relaxed the old ACTIVE-only rule: retry is permitted for
 # ACTIVE and the terminal statuses (COMPLETED/CANCELLED/FAILED), because a stuck
@@ -678,7 +683,10 @@ async def get_reservation_fork(
     fork GET. On a cabling 404 the behavior forks on status: an ACTIVE reservation
     lazy-creates the fork through the idempotent POST /internal/forks (ADR 0001
     Decision 3 Case A, including a reservation with no parent topology) and re-reads;
-    a non-ACTIVE reservation with no fork returns 404.
+    a non-ACTIVE reservation with no fork returns 404. The relayed body carries
+    draft_restored_from_id (issue #622) whenever the draft was last restored from an
+    earlier version and not yet saved, so the frontend can label it "restored from
+    version N, unsaved".
     """
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")
@@ -794,6 +802,75 @@ async def save_reservation_fork(
             exc_info=True,
         )
     return data
+
+
+@router.get("/{reservation_id}/fork/versions/{version_id}")
+async def get_reservation_fork_version(
+    reservation_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Return one fork version's full canvas payload (issue #622).
+
+    Owner-or-admin gated, allowed for ANY reservation status: the same visibility
+    rule as GET /{id}/fork, since previewing or diffing a past version of the
+    as-built record after the reservation ends is the point. Forwards to cabling's
+    internal version GET and relays its response verbatim, including a 404 for a
+    version that does not exist or belongs to a different reservation's fork.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    try:
+        resp = await _cabling_fork_call(
+            "GET", f"/internal/forks/{reservation_id}/versions/{version_id}"
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return _relay_cabling_fork_response(resp)
+
+
+@router.post("/{reservation_id}/fork/versions/{version_id}/restore")
+async def restore_reservation_fork_version(
+    reservation_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Restore the reservation's fork draft to one of its versions (issue #622).
+
+    Owner-or-admin gated and ACTIVE-only, the same rule as the canvas PUT and save
+    endpoints (409 FORK_RESTORE_REQUIRES_ACTIVE otherwise). Forwards to cabling's
+    internal restore, which replaces ONLY the fork's draft canvas_data and sets a
+    draft_restored_from_id marker on the fork row (revised after PR #623 review: it
+    appends NO fork_versions row of its own, since a version means something was
+    reconciled and the standing wiring-heal reconciler would otherwise misread the
+    canvas-only change as a missed save; the marker rides until the next save, which
+    carries it onto the version it appends and clears it). It never touches
+    fork_connections, the wiring ledger, or the outbox, so unlike
+    save_reservation_fork this proxy stages no reservation.wiring_changed event and
+    advances no fork_wiring_ledger row. Cabling's 404 (foreign or missing version)
+    and 409 (ARCHIVED fork) relay verbatim.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if reservation.status != ReservationStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail=FORK_RESTORE_REQUIRES_ACTIVE)
+
+    try:
+        resp = await _cabling_fork_call(
+            "POST", f"/internal/forks/{reservation_id}/versions/{version_id}/restore"
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return _relay_cabling_fork_response(resp)
 
 
 @router.get("/{reservation_id}/wiring-status")

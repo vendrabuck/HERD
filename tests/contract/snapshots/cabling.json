@@ -61,6 +61,14 @@
       "/internal/forks/{reservation_id}/save"
     ],
     [
+      "GET",
+      "/internal/forks/{reservation_id}/versions/{version_id}"
+    ],
+    [
+      "POST",
+      "/internal/forks/{reservation_id}/versions/{version_id}/restore"
+    ],
+    [
       "POST",
       "/pathfind"
     ],
@@ -400,6 +408,7 @@
         "canvas_data": "anyOf",
         "connections": "array",
         "created_at": "string",
+        "draft_restored_from_id": "anyOf",
         "id": "string",
         "parent_topology_id": "anyOf",
         "parent_version_id": "anyOf",
@@ -443,6 +452,20 @@
       ],
       "type": "object"
     },
+    "ForkRestoreResponse": {
+      "properties": {
+        "draft_restored_from_id": "anyOf",
+        "id": "string",
+        "invalid_edges": "array",
+        "valid": "boolean"
+      },
+      "required": [
+        "id",
+        "invalid_edges",
+        "valid"
+      ],
+      "type": "object"
+    },
     "ForkSaveRequest": {
       "properties": {
         "canvas_data": "object",
@@ -466,6 +489,23 @@
         "fork_id",
         "released",
         "unchanged_count",
+        "version_number"
+      ],
+      "type": "object"
+    },
+    "ForkVersionDetailResponse": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "created_at": "string",
+        "fork_id": "string",
+        "id": "string",
+        "restored_from_id": "anyOf",
+        "version_number": "integer"
+      },
+      "required": [
+        "created_at",
+        "fork_id",
+        "id",
         "version_number"
       ],
       "type": "object"
