@@ -2,10 +2,19 @@ import { http, HttpResponse } from "msw";
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { toastSuccess } = vi.hoisted(() => ({ toastSuccess: vi.fn() }));
 vi.mock("react-hot-toast", () => ({ default: { success: toastSuccess, error: vi.fn() } }));
+
+// Identity stub (same pattern as TopologyEditorForkMode.test.tsx): the real
+// hydrateCanvasNodes fetches devices from inventory, which these tests don't
+// stand up. Stubbed as identity so hydration is observable (call assertions)
+// without changing any test's canvas-shape expectations.
+const { hydrateCanvasNodesMock } = vi.hoisted(() => ({
+  hydrateCanvasNodesMock: vi.fn((data: unknown) => Promise.resolve(data)),
+}));
+vi.mock("@/api/inventory", () => ({ hydrateCanvasNodes: hydrateCanvasNodesMock }));
 
 import { server } from "../mocks/server";
 import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
@@ -57,6 +66,10 @@ function mockVersionDetail(version: ForkVersionSummary, canvas: CanvasData) {
   );
 }
 
+beforeEach(() => {
+  hydrateCanvasNodesMock.mockClear();
+});
+
 describe("useForkVersionPreview", () => {
   it("starts idle and inactive", () => {
     const { result } = renderHook(
@@ -65,6 +78,7 @@ describe("useForkVersionPreview", () => {
           reservationId: RES_ID,
           currentCanvas: canvasWithNode("current"),
           loadCanvas: vi.fn(),
+          flushAutosave: vi.fn(),
         }),
       { wrapper },
     );
@@ -72,7 +86,7 @@ describe("useForkVersionPreview", () => {
     expect(result.current.isActive).toBe(false);
   });
 
-  it("preview loads the fetched version's canvas, ghosted as a proposal", async () => {
+  it("preview loads the fetched version's canvas, ghosted as a proposal, hydrated first", async () => {
     mockVersionDetail(V1, canvasWithNode("n1"));
     const loadCanvas = vi.fn();
     const { result } = renderHook(
@@ -81,6 +95,7 @@ describe("useForkVersionPreview", () => {
           reservationId: RES_ID,
           currentCanvas: canvasWithNode("current"),
           loadCanvas,
+          flushAutosave: vi.fn(),
         }),
       { wrapper },
     );
@@ -89,10 +104,38 @@ describe("useForkVersionPreview", () => {
     await waitFor(() => expect(result.current.mode).toBe("preview"));
     await waitFor(() => expect(loadCanvas).toHaveBeenCalled());
 
+    // Hydration runs before the canvas ever reaches loadCanvas (issue #622
+    // review): a version's canvas_data is server-fetched and can carry thin
+    // nodes, exactly like the normal fork/topology load path.
+    expect(hydrateCanvasNodesMock).toHaveBeenCalled();
+    const hydratedArg = hydrateCanvasNodesMock.mock.calls[0][0] as CanvasData;
+    expect(hydratedArg.nodes[0].id).toBe("n1");
+
     const loaded = loadCanvas.mock.calls[loadCanvas.mock.calls.length - 1][0] as CanvasData;
     expect(loaded.nodes[0].id).toBe("n1");
     expect((loaded.nodes[0].data as { isProposal?: boolean }).isProposal).toBe(true);
     expect(result.current.previewVersion).toEqual(V1);
+  });
+
+  it("startPreview flushes the autosave before hijacking the canvas store", async () => {
+    mockVersionDetail(V1, canvasWithNode("n1"));
+    const loadCanvas = vi.fn();
+    const flushAutosave = vi.fn();
+    const { result } = renderHook(
+      () =>
+        useForkVersionPreview({
+          reservationId: RES_ID,
+          currentCanvas: canvasWithNode("current"),
+          loadCanvas,
+          flushAutosave,
+        }),
+      { wrapper },
+    );
+
+    expect(flushAutosave).not.toHaveBeenCalled();
+    result.current.startPreview(V1);
+    expect(flushAutosave).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(loadCanvas).toHaveBeenCalled());
   });
 
   it("exit restores the preserved live draft and resets to idle", async () => {
@@ -100,7 +143,13 @@ describe("useForkVersionPreview", () => {
     mockVersionDetail(V1, canvasWithNode("n1"));
     const loadCanvas = vi.fn();
     const { result } = renderHook(
-      () => useForkVersionPreview({ reservationId: RES_ID, currentCanvas: live, loadCanvas }),
+      () =>
+        useForkVersionPreview({
+          reservationId: RES_ID,
+          currentCanvas: live,
+          loadCanvas,
+          flushAutosave: vi.fn(),
+        }),
       { wrapper },
     );
 
@@ -127,7 +176,13 @@ describe("useForkVersionPreview", () => {
     mockVersionDetail(V1, canvasWithNode("n1")); // no edges: v1 had none
     const loadCanvas = vi.fn();
     const { result } = renderHook(
-      () => useForkVersionPreview({ reservationId: RES_ID, currentCanvas: live, loadCanvas }),
+      () =>
+        useForkVersionPreview({
+          reservationId: RES_ID,
+          currentCanvas: live,
+          loadCanvas,
+          flushAutosave: vi.fn(),
+        }),
       { wrapper },
     );
 
@@ -147,6 +202,7 @@ describe("useForkVersionPreview", () => {
           reservationId: RES_ID,
           currentCanvas: canvasWithNode("current"),
           loadCanvas,
+          flushAutosave: vi.fn(),
         }),
       { wrapper },
     );
@@ -158,7 +214,7 @@ describe("useForkVersionPreview", () => {
     expect(result.current.diffCompareLabel).toBe("v2");
   });
 
-  it("restoreVersion fetches the version's canvas, calls restore, then loads the restored canvas", async () => {
+  it("restoreVersion fetches the version's canvas, calls restore, then loads the restored (hydrated) canvas", async () => {
     const restoredCanvas = canvasWithNode("n1");
     mockVersionDetail(V1, restoredCanvas);
     let restoreCalled = false;
@@ -182,6 +238,7 @@ describe("useForkVersionPreview", () => {
           reservationId: RES_ID,
           currentCanvas: canvasWithNode("current"),
           loadCanvas,
+          flushAutosave: vi.fn(),
         }),
       { wrapper },
     );
@@ -190,6 +247,13 @@ describe("useForkVersionPreview", () => {
 
     expect(restoreCalled).toBe(true);
     expect(toastSuccess).toHaveBeenCalled();
+    // Hydration runs before the restored canvas reaches loadCanvas (issue
+    // #622 review), the same as the preview path.
+    expect(hydrateCanvasNodesMock).toHaveBeenCalled();
+    const hydrateCalls = hydrateCanvasNodesMock.mock.calls;
+    const hydratedArg = hydrateCalls[hydrateCalls.length - 1][0] as CanvasData;
+    expect(hydratedArg.nodes[0].id).toBe("n1");
+
     const loaded = loadCanvas.mock.calls[loadCanvas.mock.calls.length - 1][0] as CanvasData;
     expect(loaded.nodes[0].id).toBe("n1");
     await waitFor(() => expect(result.current.mode).toBe("idle"));

@@ -5,6 +5,7 @@ import { fetchForkVersion, forkVersionKey, useForkVersion, useRestoreForkVersion
 import type { ForkVersionSummary } from "@/types/reservation.types";
 import type { CanvasData, DeviceNodeData, LayerEdgeData } from "@/types/topology.types";
 import { buildForkDiffOverlayCanvas, diffForkCanvases, type ForkCanvasDiff } from "@/lib/forkDiff";
+import { hydrateAndLoadCanvas } from "@/lib/canvasHydration";
 
 export type ForkHistoryViewMode = "idle" | "preview" | "diff";
 
@@ -19,6 +20,13 @@ interface UseForkVersionPreviewParams {
   // snapshot restored when the history view exits.
   currentCanvas: CanvasData | null;
   loadCanvas: (canvas: CanvasData) => void;
+  // Fires the fork's debounced autosave immediately if a pending edit exists
+  // (ForkAutosaveController.flush), called before this hook hijacks the
+  // canvas store. Without this an edit made just before Preview/Diff sits
+  // unsaved: the autosave effect's own cleanup only CANCELS a pending PUT
+  // when it gets disabled (which entering a history view does, via
+  // isReadOnly), it never sends one first.
+  flushAutosave: () => void;
 }
 
 export interface UseForkVersionPreviewResult {
@@ -61,6 +69,7 @@ export function useForkVersionPreview({
   reservationId,
   currentCanvas,
   loadCanvas,
+  flushAutosave,
 }: UseForkVersionPreviewParams): UseForkVersionPreviewResult {
   const [mode, setMode] = useState<ForkHistoryViewMode>("idle");
   const [previewVersion, setPreviewVersion] = useState<ForkVersionSummary | null>(null);
@@ -79,8 +88,13 @@ export function useForkVersionPreview({
   const restoreMutation = useRestoreForkVersion(reservationId ?? "");
 
   const enterHistoryView = useCallback(() => {
+    // Flush BEFORE the snapshot: latestRef inside useForkAutosave already
+    // captures whatever is live right now, so ordering only matters in that
+    // flush must run before loadCanvas below ever overwrites the store with
+    // a preview/diff/restored canvas.
+    flushAutosave();
     setPreservedCanvas((prev) => prev ?? currentCanvas ?? { nodes: [], edges: [] });
-  }, [currentCanvas]);
+  }, [currentCanvas, flushAutosave]);
 
   const exit = useCallback(() => {
     if (preservedCanvas) {
@@ -141,11 +155,16 @@ export function useForkVersionPreview({
   // parent-topology HistoryPanel's own preview treatment); diff shows the
   // compare side at full opacity with only the changed edges colored, since
   // the compare side can be the live draft itself, which should not look
-  // like an AI ghost proposal.
+  // like an AI ghost proposal. Both route through hydrateAndLoadCanvas
+  // (issue #622 review), not a raw loadCanvas: a version's canvas_data comes
+  // straight off the server and can carry thin nodes (`{ device: { id } }`
+  // with no name/topology_type), exactly like the normal fork/topology load
+  // path this mirrors.
   useEffect(() => {
+    let cancelled = false;
     if (mode === "preview" && previewQuery.data?.canvas_data) {
       const canvas = previewQuery.data.canvas_data;
-      loadCanvas({
+      const ghosted: CanvasData = {
         ...canvas,
         nodes: canvas.nodes.map((n) => ({
           ...n,
@@ -155,10 +174,19 @@ export function useForkVersionPreview({
           ...e,
           data: { ...((e.data as LayerEdgeData | undefined) ?? { layer: "L1" }), isProposal: true },
         })),
+      };
+      void hydrateAndLoadCanvas(ghosted, (hydrated) => {
+        if (!cancelled) loadCanvas(hydrated);
       });
     } else if (mode === "diff" && diffResult && diffCompareCanvas) {
-      loadCanvas(buildForkDiffOverlayCanvas(diffCompareCanvas, diffResult));
+      const overlay = buildForkDiffOverlayCanvas(diffCompareCanvas, diffResult);
+      void hydrateAndLoadCanvas(overlay, (hydrated) => {
+        if (!cancelled) loadCanvas(hydrated);
+      });
     }
+    return () => {
+      cancelled = true;
+    };
   }, [mode, previewQuery.data, diffResult, diffCompareCanvas, loadCanvas]);
 
   const restoreVersion = useCallback(
@@ -175,7 +203,7 @@ export function useForkVersionPreview({
       await restoreMutation.mutateAsync(version.id);
       exit();
       if (detail.canvas_data) {
-        loadCanvas(detail.canvas_data);
+        await hydrateAndLoadCanvas(detail.canvas_data, loadCanvas);
       }
     },
     [reservationId, queryClient, restoreMutation, exit, loadCanvas],

@@ -28,7 +28,7 @@ import {
 import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
-import { hydrateCanvasNodes } from "@/api/inventory";
+import { hydrateAndLoadCanvas } from "@/lib/canvasHydration";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
@@ -200,6 +200,16 @@ function TopologyEditorInner() {
     };
   }, [nodes, strippedEdges, selectedEdgeLayer]);
 
+  // Indirection for autosave.flush (issue #622 review): useForkVersionPreview
+  // needs a flush callback to call before it hijacks the canvas store, but
+  // useForkAutosave's own `enabled` depends on isReadOnly, which depends on
+  // forkPreview.isActive below -- autosave can only be constructed AFTER
+  // forkPreview. A ref breaks the cycle: forkPreview gets a stable wrapper
+  // now, autosave is constructed later, and an effect keeps the ref pointed
+  // at the current flush.
+  const flushAutosaveRef = useRef<() => void>(() => {});
+  const flushAutosave = useCallback(() => flushAutosaveRef.current(), []);
+
   // Fork version preview/diff/restore state (issue #622, ADR 0006 addendum).
   // Inert outside live-edit mode (reservationId null keeps every query
   // disabled). Owns the temporary canvas-store swap for Preview/Diff so this
@@ -208,6 +218,7 @@ function TopologyEditorInner() {
     reservationId: isLiveEdit ? reservationId : null,
     currentCanvas: persistableCanvas,
     loadCanvas,
+    flushAutosave,
   });
   const isHistoryViewActive = forkPreview.isActive;
   const historyViewBannerMode: "preview" | "diff" | null =
@@ -432,9 +443,7 @@ function TopologyEditorInner() {
         const persisted = fork.canvas_data;
         const applyLoad =
           persisted && persisted.nodes
-            ? hydrateCanvasNodes(persisted)
-                .then((hydrated) => loadCanvas(hydrated))
-                .catch(() => loadCanvas(persisted))
+            ? hydrateAndLoadCanvas(persisted, loadCanvas)
             : Promise.resolve().then(() => clearTopology());
         // Flip forkLoaded off the sync effect body (in a promise callback) so the
         // autosave baseline is seeded only once the loaded canvas is in the store.
@@ -445,12 +454,7 @@ function TopologyEditorInner() {
     if (topology && !initializedRef.current) {
       initializedRef.current = true;
       if (topology.canvas_data) {
-        const persisted = topology.canvas_data;
-        hydrateCanvasNodes(persisted)
-          .then((hydrated) => loadCanvas(hydrated))
-          // hydrateCanvasNodes already swallows per-device failures; this guards
-          // a total fetch outage so the editor still shows the persisted canvas.
-          .catch(() => loadCanvas(persisted));
+        void hydrateAndLoadCanvas(topology.canvas_data, loadCanvas);
       } else {
         clearTopology();
       }
@@ -465,6 +469,9 @@ function TopologyEditorInner() {
     canvas: persistableCanvas,
     enabled: isLiveEdit && !isReadOnly && forkLoaded,
   });
+  useEffect(() => {
+    flushAutosaveRef.current = autosave.flush;
+  }, [autosave.flush]);
 
   // Reset initialized ref when navigating to a different topology or reservation
   useEffect(() => {
