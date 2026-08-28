@@ -310,7 +310,7 @@ describe("TopologyEditorPage live-edit fork mode", () => {
     // The current draft has two devices and NO edge between them; v1 (the
     // diff base) had an edge between the same two devices. Diffing v1 to
     // current therefore overlays a diffStatus:"removed" annotation edge for
-    // that pair onto the canvas -- a pair with no real committed wire.
+    // that pair onto the canvas: a pair with no real committed wire.
     const secondNode = forkNode("other-node", "d-other");
     const fork = makeFork({
       canvas_data: {

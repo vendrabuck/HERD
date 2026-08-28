@@ -20,7 +20,7 @@ Scenarios:
 Issue #622 (ADR 0006 addendum, fork version preview/diff/restore) adds two more
 scenarios at the bottom, in Playwright (the `pw_page` fixture from conftest.py;
 NOT the pytest-playwright plugin fixtures, which a local conftest fixture of the
-same name shadows for everything under tests/e2e/ -- see the pw_browser
+same name shadows for everything under tests/e2e/; see the pw_browser
 docstring). Same edge-drawing constraint as above, so both scenarios stay within
 the single-device (no-edge) fork the setup helper builds: they exercise the
 preview lock and the restore/Save round trip through API read-back rather than
@@ -405,7 +405,7 @@ def test_preview_shows_history_banner_and_disables_save_pw(pw_page):
     """Previewing a fork version locks Save/commit and shows the banner (issue #622).
 
     Committing before preview creates fork version 2 (identical to version 1,
-    since no edges were ever drawn -- see the module docstring), giving the
+    since no edges were ever drawn; see the module docstring), giving the
     history panel a second, genuinely-previewable row.
     """
     pw_login(pw_page)
@@ -441,7 +441,7 @@ def test_restore_then_save_via_fork_readback_pw(pw_page):
     restored_from_id pointing at the restored version, and
     draft_restored_from_id must be null again afterward. The wiring-status
     read-back confirms Save's reconcile ran (empty connections either side,
-    since this fork never had an edge -- see the module docstring).
+    since this fork never had an edge; see the module docstring).
     """
     pw_login(pw_page)
     setup = _pw_create_reserved_topology(pw_page)
