@@ -8,6 +8,9 @@ import type { LayerEdge as LayerEdgeType } from "@/types/topology.types";
 import { LAYER_STYLES } from "./layerStyles";
 import { resolveEdgeStroke } from "./edgeStatus";
 
+const DIFF_ADDED_STROKE = "#16a34a";
+const DIFF_REMOVED_STROKE = "#dc2626";
+
 export function LayerEdge({
   id,
   sourceX,
@@ -21,6 +24,7 @@ export function LayerEdge({
   const layer = data?.layer ?? "L2";
   const baseStyle = LAYER_STYLES[layer] ?? LAYER_STYLES.L2;
   const isProposal = data?.isProposal === true;
+  const diffStatus = data?.diffStatus;
 
   // Physical reachability is the only authority; applies at every layer
   // because L2/L3 still ride on the L1 cable graph. resolveEdgeStroke is the
@@ -28,11 +32,19 @@ export function LayerEdge({
   // label), shared with BundledEdge; passing `data` straight through also
   // covers a data-less edge (review item 3) the same way resolveEdgeStroke's
   // own default does, with no separate null-check needed here.
-  const { stroke, statusLabel } = resolveEdgeStroke(data);
+  const { stroke: pathStroke, statusLabel: pathStatusLabel } = resolveEdgeStroke(data);
+  // A fork version diff overlay (issue #622) takes over both the stroke and
+  // the status label: path validity is not meaningful for a historical
+  // snapshot, and green/red communicates "changed" more directly here than
+  // the layer's usual color would.
+  const stroke = diffStatus === "added" ? DIFF_ADDED_STROKE : diffStatus === "removed" ? DIFF_REMOVED_STROKE : pathStroke;
+  const statusLabel = diffStatus === "added" ? "added" : diffStatus === "removed" ? "removed" : pathStatusLabel;
   // Proposals always render dashed in the proposal-edge color so they are
   // visually distinct from committed edges even when the same L1/L2/L3 style
-  // would otherwise apply.
-  const strokeDasharray = isProposal ? "4 3" : baseStyle.strokeDasharray;
+  // would otherwise apply; a removed-in-diff edge dashes too, since it no
+  // longer exists on the compare side.
+  const strokeDasharray =
+    isProposal || diffStatus === "removed" ? "4 3" : baseStyle.strokeDasharray;
   const style = { ...baseStyle, stroke, strokeDasharray };
   const edgeOpacity = isProposal ? 0.6 : 1;
 

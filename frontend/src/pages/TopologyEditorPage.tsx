@@ -25,9 +25,10 @@ import {
   useSaveReservationFork,
   forkConflictDetail,
 } from "@/api/reservations";
+import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
-import { hydrateCanvasNodes } from "@/api/inventory";
+import { hydrateAndLoadCanvas } from "@/lib/canvasHydration";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
@@ -44,6 +45,7 @@ import { AsBuiltBar } from "@/components/topology-editor/AsBuiltBar";
 import { ForkSaveResultToast } from "@/components/topology-editor/ForkSaveResultToast";
 import { ForkConflictDialog } from "@/components/topology-editor/ForkConflictDialog";
 import { ForkHistoryPanel } from "@/components/topology-editor/ForkHistoryPanel";
+import { ForkVersionPreviewBar } from "@/components/topology-editor/ForkVersionPreviewBar";
 import { HistoryPanel } from "@/components/topology-editor/HistoryPanel";
 import { VersionDiffDialog } from "@/components/topology-editor/VersionDiffDialog";
 import { RestoreConfirmDialog } from "@/components/topology-editor/RestoreConfirmDialog";
@@ -54,7 +56,7 @@ import { DeviceNode } from "@/components/topology-editor/nodes/DeviceNode";
 import { DynamicPlaceholderNode } from "@/components/topology-editor/nodes/DynamicPlaceholderNode";
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
 import { BundledEdge } from "@/components/topology-editor/edges/BundledEdge";
-import { groupEdgesForRender } from "@/components/topology-editor/edges/groupEdgesForRender";
+import { groupEdgesForRender, isAnnotationEdge } from "@/components/topology-editor/edges/groupEdgesForRender";
 import { LAYER_OPTIONS } from "@/components/topology-editor/edges/layerStyles";
 import { resolveEdgeStroke } from "@/components/topology-editor/edges/edgeStatus";
 import { genId } from "@/lib/id";
@@ -147,8 +149,12 @@ function TopologyEditorInner() {
 
   // An ARCHIVED fork is the frozen as-built record of an ended reservation: the
   // canvas renders read-only. This is the authoritative signal (the fork is
-  // archived by the teardown paths), so mutations key off it directly.
-  const isReadOnly = isLiveEdit && fork?.status === "ARCHIVED";
+  // archived by the teardown paths), so mutations key off it directly. Kept
+  // separate from the broader isReadOnly below (which ALSO locks during a
+  // fork-history preview/diff) since the "As-built (read-only)" banner must
+  // stay specific to an actually-archived fork, not a temporary history view
+  // of an otherwise-editable one.
+  const isArchivedFork = isLiveEdit && fork?.status === "ARCHIVED";
 
   const {
     nodes,
@@ -167,6 +173,64 @@ function TopologyEditorInner() {
     acceptProposalNodes,
     rejectProposalNodes,
   } = useTopologyStore();
+
+  // Placeholders are excluded from every persistence path (parent topology
+  // save, fork save, fork autosave): they are not devices or wiring, only a
+  // reserve-time planning aid. Edges touching one are refused at draw time;
+  // the edge filter here is belt and braces.
+  // Stripping is memoized separately, keyed on [edges] alone (issue #517
+  // review round 3 item 12.6): it does not depend on nodes or
+  // selectedEdgeLayer at all, so recomputing it whenever THOSE change (as a
+  // single combined memo below would) is wasted work.
+  const strippedEdges = useMemo(() => edges.map(stripTransientEdgeFields), [edges]);
+
+  // The live draft canvas as it would be persisted right now. Computed early
+  // (ahead of the read-only/render wiring below) because useForkVersionPreview
+  // needs it as the "current draft" side of a diff and as the snapshot
+  // restored when a history view exits.
+  const persistableCanvas = useMemo<CanvasData>(() => {
+    const placeholderIds = new Set(nodes.filter(isDynamicPlaceholder).map((n) => n.id));
+    return {
+      nodes: placeholderIds.size === 0 ? nodes : nodes.filter((n) => !placeholderIds.has(n.id)),
+      edges:
+        placeholderIds.size === 0
+          ? strippedEdges
+          : strippedEdges.filter((e) => !placeholderIds.has(e.source) && !placeholderIds.has(e.target)),
+      selectedEdgeLayer,
+    };
+  }, [nodes, strippedEdges, selectedEdgeLayer]);
+
+  // Indirection for autosave.flush (issue #622 review): useForkVersionPreview
+  // needs a flush callback to call before it hijacks the canvas store, but
+  // useForkAutosave's own `enabled` depends on isReadOnly, which depends on
+  // forkPreview.isActive below: autosave can only be constructed AFTER
+  // forkPreview. A ref breaks the cycle: forkPreview gets a stable wrapper
+  // now, autosave is constructed later, and an effect keeps the ref pointed
+  // at the current flush.
+  const flushAutosaveRef = useRef<() => void>(() => {});
+  const flushAutosave = useCallback(() => flushAutosaveRef.current(), []);
+
+  // Fork version preview/diff/restore state (issue #622, ADR 0006 addendum).
+  // Inert outside live-edit mode (reservationId null keeps every query
+  // disabled). Owns the temporary canvas-store swap for Preview/Diff so this
+  // page only wires its result to the ReactFlow props and ForkHistoryPanel.
+  const forkPreview = useForkVersionPreview({
+    reservationId: isLiveEdit ? reservationId : null,
+    currentCanvas: persistableCanvas,
+    loadCanvas,
+    flushAutosave,
+  });
+  const isHistoryViewActive = forkPreview.isActive;
+  const historyViewBannerMode: "preview" | "diff" | null =
+    forkPreview.mode === "preview" || forkPreview.mode === "diff" ? forkPreview.mode : null;
+
+  // The union that actually locks the canvas: an archived fork's as-built
+  // record, OR a history-view (preview/diff) currently painted over the live
+  // draft. A history view must lock editing too, not just hide Save: it has
+  // hijacked the store's nodes/edges (see useForkVersionPreview), so an edit
+  // made while it is up would corrupt the overlay and, if it ever reached
+  // autosave, the draft itself.
+  const isReadOnly = isArchivedFork || isHistoryViewActive;
 
   const { data: aiStatus } = useAIStatus();
 
@@ -187,7 +251,7 @@ function TopologyEditorInner() {
     const seen = new Set<string>();
     const pairs: DevicePair[] = [];
     for (const edge of edges) {
-      if (edge.data?.isProposal) continue;
+      if (isAnnotationEdge(edge.data)) continue;
       const src = nodeIdToDeviceId.get(edge.source);
       const tgt = nodeIdToDeviceId.get(edge.target);
       if (!src || !tgt) continue;
@@ -279,7 +343,7 @@ function TopologyEditorInner() {
     if (!pathfindResults) return;
     const updates = new Map<string, { pathValid: boolean | null; hopCount?: number }>();
     for (const edge of edges) {
-      if (edge.data?.isProposal) continue;
+      if (isAnnotationEdge(edge.data)) continue;
       const src = nodeIdToDeviceId.get(edge.source);
       const tgt = nodeIdToDeviceId.get(edge.target);
       if (!src || !tgt) continue;
@@ -301,7 +365,7 @@ function TopologyEditorInner() {
   // precedence inline, so this can never drift from what LayerEdge/
   // BundledEdge actually render as red.
   const invalidEdges = useMemo(
-    () => edges.filter((e) => !e.data?.isProposal && resolveEdgeStroke(e.data).isInvalid),
+    () => edges.filter((e) => !isAnnotationEdge(e.data) && resolveEdgeStroke(e.data).isInvalid),
     [edges],
   );
   const hasInvalidEdges = invalidEdges.length > 0;
@@ -333,7 +397,7 @@ function TopologyEditorInner() {
     if (!pendingConnection) return { sourcePortIds, targetPortIds };
     const { source: pendingSourceNode, target: pendingTargetNode } = pendingConnection.connection;
     for (const e of edges) {
-      if (e.data?.isProposal) continue;
+      if (isAnnotationEdge(e.data)) continue;
       const srcPortId = e.data?.source_port_id;
       const tgtPortId = e.data?.target_port_id;
       if (e.source === pendingSourceNode && srcPortId) sourcePortIds.add(srcPortId);
@@ -379,9 +443,7 @@ function TopologyEditorInner() {
         const persisted = fork.canvas_data;
         const applyLoad =
           persisted && persisted.nodes
-            ? hydrateCanvasNodes(persisted)
-                .then((hydrated) => loadCanvas(hydrated))
-                .catch(() => loadCanvas(persisted))
+            ? hydrateAndLoadCanvas(persisted, loadCanvas)
             : Promise.resolve().then(() => clearTopology());
         // Flip forkLoaded off the sync effect body (in a promise callback) so the
         // autosave baseline is seeded only once the loaded canvas is in the store.
@@ -392,39 +454,12 @@ function TopologyEditorInner() {
     if (topology && !initializedRef.current) {
       initializedRef.current = true;
       if (topology.canvas_data) {
-        const persisted = topology.canvas_data;
-        hydrateCanvasNodes(persisted)
-          .then((hydrated) => loadCanvas(hydrated))
-          // hydrateCanvasNodes already swallows per-device failures; this guards
-          // a total fetch outage so the editor still shows the persisted canvas.
-          .catch(() => loadCanvas(persisted));
+        void hydrateAndLoadCanvas(topology.canvas_data, loadCanvas);
       } else {
         clearTopology();
       }
     }
   }, [isLiveEdit, fork, topology, loadCanvas, clearTopology]);
-
-  // Placeholders are excluded from every persistence path (parent topology
-  // save, fork save, fork autosave): they are not devices or wiring, only a
-  // reserve-time planning aid. Edges touching one are refused at draw time;
-  // the edge filter here is belt and braces.
-  // Stripping is memoized separately, keyed on [edges] alone (issue #517
-  // review round 3 item 12.6): it does not depend on nodes or
-  // selectedEdgeLayer at all, so recomputing it whenever THOSE change (as a
-  // single combined memo below would) is wasted work.
-  const strippedEdges = useMemo(() => edges.map(stripTransientEdgeFields), [edges]);
-
-  const persistableCanvas = useMemo<CanvasData>(() => {
-    const placeholderIds = new Set(nodes.filter(isDynamicPlaceholder).map((n) => n.id));
-    return {
-      nodes: placeholderIds.size === 0 ? nodes : nodes.filter((n) => !placeholderIds.has(n.id)),
-      edges:
-        placeholderIds.size === 0
-          ? strippedEdges
-          : strippedEdges.filter((e) => !placeholderIds.has(e.source) && !placeholderIds.has(e.target)),
-      selectedEdgeLayer,
-    };
-  }, [nodes, strippedEdges, selectedEdgeLayer]);
 
   // Debounced fork-draft autosave: PUTs the loose canvas a couple of seconds
   // after edits pause and flushes on unmount. Enabled only for an editable
@@ -434,6 +469,9 @@ function TopologyEditorInner() {
     canvas: persistableCanvas,
     enabled: isLiveEdit && !isReadOnly && forkLoaded,
   });
+  useEffect(() => {
+    flushAutosaveRef.current = autosave.flush;
+  }, [autosave.flush]);
 
   // Reset initialized ref when navigating to a different topology or reservation
   useEffect(() => {
@@ -932,12 +970,12 @@ function TopologyEditorInner() {
           <span className="text-sm font-medium text-gray-900 truncate">
             {topology?.name ?? "Topology"}
           </span>
-          {isLiveEdit && !isReadOnly && (
+          {isLiveEdit && !isArchivedFork && (
             <span className="text-xs font-medium px-2 py-0.5 rounded bg-blue-100 text-blue-700">
               Editing reservation{liveReservation ? ` (${liveReservation.purpose})` : ""}
             </span>
           )}
-          {isReadOnly && (
+          {isArchivedFork && (
             <span className="text-xs font-medium px-2 py-0.5 rounded bg-gray-200 text-gray-700">
               As-built (read-only){liveReservation ? ` (${liveReservation.purpose})` : ""}
             </span>
@@ -1081,8 +1119,18 @@ function TopologyEditorInner() {
             />
           )}
 
-          {isReadOnly && !pendingProposal && (
+          {isArchivedFork && !pendingProposal && (
             <AsBuiltBar deviceCount={allDeviceIds.length} onClose={handleCancelLiveEdit} />
+          )}
+
+          {historyViewBannerMode && !pendingProposal && (
+            <ForkVersionPreviewBar
+              mode={historyViewBannerMode}
+              previewVersion={forkPreview.previewVersion}
+              diffBase={forkPreview.diffBase}
+              diffCompareLabel={forkPreview.diffCompareLabel}
+              onExit={forkPreview.exit}
+            />
           )}
 
           <ReactFlow
@@ -1191,11 +1239,22 @@ function TopologyEditorInner() {
 
         {/* In live-edit mode History lists the FORK's versions (ADR 0006), not the
             parent topology's, so an owner's edits never appear in the master's
-            history. Read-only: P3a ships no fork version preview/diff/restore. */}
+            history. Preview/diff/restore (issue #622, ADR 0006 addendum): Restore
+            renders ACTIVE-only, mirroring the Retry button's rule. */}
         {showHistory && isLiveEdit && (
           <ForkHistoryPanel
             versions={fork?.versions ?? []}
-            onClose={() => setShowHistory(false)}
+            isActiveReservation={liveReservation?.status === "ACTIVE"}
+            draftRestoredFromId={fork?.draft_restored_from_id ?? null}
+            preview={forkPreview}
+            onClose={() => {
+              // Closing the panel is the only other way out besides the
+              // banner's own Exit button; without also exiting here, a
+              // preview/diff left active keeps the canvas locked with the
+              // panel gone and no visible way back in.
+              forkPreview.exit();
+              setShowHistory(false);
+            }}
           />
         )}
 

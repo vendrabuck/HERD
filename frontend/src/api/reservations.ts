@@ -5,6 +5,8 @@ import type {
   ForkCanvasDraftResult,
   ForkConflictDetail,
   ForkSaveResult,
+  ForkVersionDetail,
+  ForkVersionRestoreResult,
   Reservation,
   ReservationCreate,
   ReservationFork,
@@ -190,6 +192,75 @@ export function useSaveReservationFork() {
       // in-progress edit is never stomped by the refetch.
       queryClient.invalidateQueries({ queryKey: forkKey(reservationId) });
     },
+  });
+}
+
+// --- Fork version preview, diff, and restore (ADR 0006 addendum, issue #622) ---
+// Restore is restore-TO-DRAFT, never restore-and-reconcile, and (contract
+// revised 2026-08-28) never itself appends a fork_versions row: it copies a
+// past version's canvas onto the fork's draft and sets
+// ReservationFork.draft_restored_from_id, so the "restored" marker
+// (ForkVersionSummary.restored_from_id) only shows up on the NEW version the
+// user's next Save creates. Nothing is wired until that Save. Preview and
+// diff are both read-only renders of already-fetched version snapshots; diff
+// is computed client-side (lib/forkDiff.ts).
+
+export function forkVersionKey(
+  reservationId: string,
+  versionId: string | null | undefined,
+): (string | undefined)[] {
+  return ["reservations", reservationId, "fork", "versions", versionId ?? undefined];
+}
+
+export async function fetchForkVersion(
+  reservationId: string,
+  versionId: string,
+): Promise<ForkVersionDetail> {
+  const resp = await apiClient.get<ForkVersionDetail>(
+    `/reservations/${reservationId}/fork/versions/${versionId}`,
+  );
+  return resp.data;
+}
+
+export async function restoreForkVersion(
+  reservationId: string,
+  versionId: string,
+): Promise<ForkVersionRestoreResult> {
+  const resp = await apiClient.post<ForkVersionRestoreResult>(
+    `/reservations/${reservationId}/fork/versions/${versionId}/restore`,
+  );
+  return resp.data;
+}
+
+export function useForkVersion(
+  reservationId: string | null | undefined,
+  versionId: string | null | undefined,
+) {
+  return useQuery({
+    queryKey: forkVersionKey(reservationId ?? "", versionId),
+    queryFn: () => fetchForkVersion(reservationId!, versionId!),
+    enabled: !!reservationId && !!versionId,
+    // A saved version's canvas_data is immutable, so this response never
+    // needs a background refetch.
+    staleTime: Infinity,
+  });
+}
+
+export function useRestoreForkVersion(reservationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (versionId: string) => restoreForkVersion(reservationId, versionId),
+    onSuccess: () => {
+      // The fork's draft canvas_data AND draft_restored_from_id changed
+      // server-side (no new version yet: that lands on the next Save); refresh
+      // so the panel's "Draft restored from vN (unsaved)" chip picks it up.
+      // The caller is responsible for loading the restored canvas into the
+      // editor (this response carries no canvas payload; see
+      // ForkVersionRestoreResult).
+      queryClient.invalidateQueries({ queryKey: forkKey(reservationId) });
+      toast.success("Draft replaced with the restored version. Nothing is wired until you Save.");
+    },
+    onError: (err) => toast.error(errorDetail(err, "Failed to restore version")),
   });
 }
 

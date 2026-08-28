@@ -1,6 +1,19 @@
 import type { Edge } from "@xyflow/react";
 import type { LayerEdgeData } from "@/types/topology.types";
 
+/**
+ * True for an edge that is a read-only annotation rather than real committed
+ * wiring: an AI ghost proposal (`isProposal`) or a fork version diff overlay
+ * edge (`diffStatus`, issue #622). Shared by groupEdgesForRender's own
+ * bundling exclusion below and by TopologyEditorPage's pathfind/validity
+ * logic, so a diff overlay edge (which carries `diffStatus` but not
+ * `isProposal`) is excluded everywhere a proposal edge already was, not just
+ * here.
+ */
+export function isAnnotationEdge(data: LayerEdgeData | undefined): boolean {
+  return !!data?.isProposal || !!data?.diffStatus;
+}
+
 export interface BundledEdgeData extends Record<string, unknown> {
   // A member's data can be missing at runtime even though the app's own
   // typing assumes otherwise (review item 3): an externally- or legacy-
@@ -58,7 +71,11 @@ export interface GroupEdgesResult {
  * first member's, since those are not meaningfully per-member here.
  *
  * Proposal edges (AI ghost edges) are excluded from bundling: they are not
- * real committed wiring and should keep rendering individually.
+ * real committed wiring and should keep rendering individually. A fork
+ * version diff overlay edge (issue #622, `data.diffStatus` set) is excluded
+ * for the same reason: it is a read-only annotation, not a real duplicate
+ * wire, and bundling it would hide its added/removed color under a plain
+ * count badge.
  */
 export function groupEdgesForRender(
   edges: Edge<LayerEdgeData>[],
@@ -68,7 +85,7 @@ export function groupEdgesForRender(
   const order: string[] = [];
 
   for (const edge of edges) {
-    if (edge.data?.isProposal) continue;
+    if (isAnnotationEdge(edge.data)) continue;
     const pairKey = [edge.source, edge.target].sort().join("::");
     if (!groups.has(pairKey)) {
       groups.set(pairKey, []);
@@ -77,7 +94,7 @@ export function groupEdgesForRender(
     groups.get(pairKey)!.push(edge);
   }
 
-  const proposals = edges.filter((e) => e.data?.isProposal);
+  const proposals = edges.filter((e) => isAnnotationEdge(e.data));
   const renderEdges: RenderEdge[] = [];
   const bundleMembers = new Map<string, string[]>();
 

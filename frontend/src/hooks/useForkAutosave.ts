@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { putForkCanvas } from "@/api/reservations";
 import type { CanvasData } from "@/types/topology.types";
@@ -15,6 +15,14 @@ export interface ForkAutosaveController {
   // Mark the current canvas as already persisted (call after an explicit save)
   // so the unmount flush does not re-PUT a draft the reconcile already captured.
   markClean: () => void;
+  // Fire the pending debounced PUT immediately (and cancel its timer) if the
+  // canvas has diverged from the last-saved baseline; a no-op otherwise. Call
+  // this before anything hijacks the canvas out from under the debounce (a
+  // fork-history preview/diff, issue #622 review): the debounce effect's own
+  // cleanup only CANCELS a pending PUT when `enabled` flips false, it never
+  // sends one, so an edit made just before entering a history view would
+  // otherwise sit unsaved until the next real edit re-arms the timer.
+  flush: () => void;
 }
 
 // A content-only signature of the canvas: the fields that define the wiring,
@@ -88,6 +96,10 @@ export function useForkAutosave(params: {
     }
   }, [enabled, signature]);
 
+  // The pending debounce timer's handle, mirrored outside the effect so flush()
+  // (an imperative call, not a render-time effect) can cancel it directly.
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Debounced draft PUT. Every canvas change reschedules the timer; it fires only
   // after `delay` ms of quiet, PUTting the latest canvas.
   useEffect(() => {
@@ -96,6 +108,7 @@ export function useForkAutosave(params: {
     if (signature === lastSavedRef.current) return; // no unsaved change
 
     const handle = setTimeout(() => {
+      timeoutRef.current = null;
       const target = latestRef.current;
       if (!target.id) return;
       setStatus("saving");
@@ -106,8 +119,12 @@ export function useForkAutosave(params: {
         })
         .catch(() => setStatus("error"));
     }, delay);
+    timeoutRef.current = handle;
 
-    return () => clearTimeout(handle);
+    return () => {
+      clearTimeout(handle);
+      if (timeoutRef.current === handle) timeoutRef.current = null;
+    };
   }, [signature, enabled, reservationId, delay]);
 
   // Flush an unsaved draft on unmount (navigate-away). Fire-and-forget: cleanup
@@ -128,5 +145,24 @@ export function useForkAutosave(params: {
     setStatus("saved");
   };
 
-  return { status, markClean };
+  const flush = useCallback(() => {
+    if (timeoutRef.current !== null) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    const target = latestRef.current;
+    if (!target.id) return;
+    if (lastSavedRef.current === null) return; // baseline not seeded; nothing to flush
+    if (target.signature === lastSavedRef.current) return; // no unsaved change
+
+    setStatus("saving");
+    putForkCanvas(target.id, target.canvas)
+      .then(() => {
+        lastSavedRef.current = target.signature;
+        setStatus("saved");
+      })
+      .catch(() => setStatus("error"));
+  }, []);
+
+  return { status, markClean, flush };
 }

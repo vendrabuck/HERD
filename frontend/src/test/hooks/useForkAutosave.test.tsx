@@ -113,4 +113,44 @@ describe("useForkAutosave", () => {
     await vi.advanceTimersByTimeAsync(3000);
     expect(putForkCanvasMock).not.toHaveBeenCalled();
   });
+
+  // flush() (issue #622 review): entering a fork-history preview/diff disables
+  // autosave via `enabled`, and the debounce effect's own cleanup only CANCELS
+  // a pending timer on that transition, it never sends one. flush() is the fix:
+  // callers invoke it themselves, before anything hijacks the canvas.
+  describe("flush", () => {
+    it("PUTs a pending edit immediately and cancels the debounce timer", async () => {
+      const { result, rerender } = renderHook(
+        (props: { canvas: CanvasData }) =>
+          useForkAutosave({ reservationId: RES_ID, canvas: props.canvas, enabled: true, delay: 2000 }),
+        { initialProps: { canvas: canvasWith("a") } },
+      );
+
+      rerender({ canvas: canvasWith("edited") });
+      // Before the debounce interval elapses, flush sends it right away.
+      result.current.flush();
+      expect(putForkCanvasMock).toHaveBeenCalledTimes(1);
+      expect(putForkCanvasMock).toHaveBeenCalledWith(RES_ID, canvasWith("edited"));
+
+      // The cancelled debounce timer must not ALSO fire a second PUT later.
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(putForkCanvasMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("is a no-op when there is no unsaved edit", () => {
+      const { result } = renderHook(() =>
+        useForkAutosave({ reservationId: RES_ID, canvas: canvasWith("a"), enabled: true, delay: 2000 }),
+      );
+      result.current.flush();
+      expect(putForkCanvasMock).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op while disabled (no baseline seeded)", () => {
+      const { result } = renderHook(() =>
+        useForkAutosave({ reservationId: RES_ID, canvas: canvasWith("a"), enabled: false, delay: 2000 }),
+      );
+      result.current.flush();
+      expect(putForkCanvasMock).not.toHaveBeenCalled();
+    });
+  });
 });
