@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import toast from "react-hot-toast";
 
 import { fetchForkVersion, forkVersionKey, useForkVersion, useRestoreForkVersion } from "@/api/reservations";
 import type { ForkVersionSummary } from "@/types/reservation.types";
@@ -189,6 +190,27 @@ export function useForkVersionPreview({
     };
   }, [mode, previewQuery.data, diffResult, diffCompareCanvas, loadCanvas]);
 
+  // A failed version fetch leaves the mode active with no canvas ever
+  // reaching loadCanvas: the store keeps showing the last thing it painted
+  // (often the locked read-only banner) with no way out but the exit button
+  // buried behind it. Bail out to idle and say so instead.
+  const previewErrored = mode === "preview" && previewQuery.isError;
+  const diffErrored =
+    mode === "diff" && (diffBaseQuery.isError || diffCompareQuery.isError);
+  useEffect(() => {
+    if (previewErrored || diffErrored) {
+      // Intentional state sync: bail out to idle the moment the active
+      // version fetch reports an error, so a broken preview/diff never
+      // leaves the canvas locked with no way out.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      exit();
+      toast.error("Could not load that version");
+    }
+    // exit is deliberately omitted below: including it would refire this
+    // effect on every exit() identity change instead of only on a fresh error.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewErrored, diffErrored]);
+
   const restoreVersion = useCallback(
     async (version: ForkVersionSummary) => {
       if (!reservationId) return;
@@ -201,12 +223,18 @@ export function useForkVersionPreview({
         queryFn: () => fetchForkVersion(reservationId, version.id),
       });
       await restoreMutation.mutateAsync(version.id);
-      exit();
-      if (detail.canvas_data) {
-        await hydrateAndLoadCanvas(detail.canvas_data, loadCanvas);
-      }
+      // Clear the history-view state directly (not via exit(), which would
+      // load the stale preservedCanvas onto the store first) so the ONLY
+      // visible canvas write here is the restored version itself; a null
+      // canvas_data still replaces the stale draft, with an empty canvas.
+      setPreservedCanvas(null);
+      setMode("idle");
+      setPreviewVersion(null);
+      setDiffBase(null);
+      setDiffCompare(null);
+      await hydrateAndLoadCanvas(detail.canvas_data ?? { nodes: [], edges: [] }, loadCanvas);
     },
-    [reservationId, queryClient, restoreMutation, exit, loadCanvas],
+    [reservationId, queryClient, restoreMutation, loadCanvas],
   );
 
   return {

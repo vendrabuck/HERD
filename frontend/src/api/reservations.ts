@@ -240,6 +240,9 @@ export function useForkVersion(
     queryKey: forkVersionKey(reservationId ?? "", versionId),
     queryFn: () => fetchForkVersion(reservationId!, versionId!),
     enabled: !!reservationId && !!versionId,
+    // A saved version's canvas_data is immutable, so this response never
+    // needs a background refetch.
+    staleTime: Infinity,
   });
 }
 

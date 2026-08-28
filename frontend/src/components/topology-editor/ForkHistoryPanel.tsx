@@ -1,4 +1,5 @@
 import { useState } from "react";
+import toast from "react-hot-toast";
 
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import type { ForkVersionSummary } from "@/types/reservation.types";
@@ -76,10 +77,22 @@ export function ForkHistoryPanel({
   };
 
   const confirmDiff = (base: ForkVersionSummary) => {
-    const target: ForkDiffCompareTarget =
-      diffTarget === "current"
-        ? { kind: "current" }
-        : { kind: "version", version: versions.find((v) => v.id === diffTarget)! };
+    let target: ForkDiffCompareTarget;
+    if (diffTarget === "current") {
+      target = { kind: "current" };
+    } else {
+      const version = versions.find((v) => v.id === diffTarget);
+      if (!version) {
+        // The picked version fell out of the list between opening the picker
+        // and clicking Compare (e.g. the panel re-rendered with a fresh
+        // versions prop). Bail out rather than throwing on the old `!`
+        // non-null assertion.
+        setDiffPickerFor(null);
+        toast.error("That version is no longer available");
+        return;
+      }
+      target = { kind: "version", version };
+    }
     preview.startDiff(base, target);
     setDiffPickerFor(null);
   };

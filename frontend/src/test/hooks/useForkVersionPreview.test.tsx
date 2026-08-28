@@ -4,8 +4,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { toastSuccess } = vi.hoisted(() => ({ toastSuccess: vi.fn() }));
-vi.mock("react-hot-toast", () => ({ default: { success: toastSuccess, error: vi.fn() } }));
+const { toastSuccess, toastError } = vi.hoisted(() => ({
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
+}));
+vi.mock("react-hot-toast", () => ({ default: { success: toastSuccess, error: toastError } }));
 
 // Identity stub (same pattern as TopologyEditorForkMode.test.tsx): the real
 // hydrateCanvasNodes fetches devices from inventory, which these tests don't
@@ -68,6 +71,7 @@ function mockVersionDetail(version: ForkVersionSummary, canvas: CanvasData) {
 
 beforeEach(() => {
   hydrateCanvasNodesMock.mockClear();
+  toastError.mockClear();
 });
 
 describe("useForkVersionPreview", () => {
@@ -257,5 +261,70 @@ describe("useForkVersionPreview", () => {
     const loaded = loadCanvas.mock.calls[loadCanvas.mock.calls.length - 1][0] as CanvasData;
     expect(loaded.nodes[0].id).toBe("n1");
     await waitFor(() => expect(result.current.mode).toBe("idle"));
+  });
+
+  it("restoreVersion with a null canvas_data ends on an empty canvas, never the stale preserved draft", async () => {
+    const live = canvasWithNode("current");
+    server.use(
+      http.get(`/api/reservations/${RES_ID}/fork/versions/${V1.id}`, () =>
+        HttpResponse.json({ ...V1, canvas_data: null }),
+      ),
+      http.post(`/api/reservations/${RES_ID}/fork/versions/${V1.id}/restore`, () =>
+        HttpResponse.json({
+          id: "f1",
+          valid: true,
+          invalid_edges: [],
+          draft_restored_from_id: V1.id,
+        }),
+      ),
+    );
+    const loadCanvas = vi.fn();
+    const { result } = renderHook(
+      () =>
+        useForkVersionPreview({
+          reservationId: RES_ID,
+          currentCanvas: live,
+          loadCanvas,
+          flushAutosave: vi.fn(),
+        }),
+      { wrapper },
+    );
+
+    await result.current.restoreVersion(V1);
+
+    // loadCanvas's LAST call must be the empty restored canvas, not the
+    // preserved live draft: a null canvas_data must still replace the stale
+    // draft rather than leaving it on screen.
+    const lastCall = loadCanvas.mock.calls[loadCanvas.mock.calls.length - 1][0] as CanvasData;
+    expect(lastCall).toEqual({ nodes: [], edges: [] });
+    expect(loadCanvas.mock.calls.every((call) => call[0] !== live)).toBe(true);
+    await waitFor(() => expect(result.current.mode).toBe("idle"));
+  });
+
+  it("a failed preview fetch exits back to idle and shows an error toast", async () => {
+    server.use(
+      http.get(`/api/reservations/${RES_ID}/fork/versions/${V1.id}`, () =>
+        HttpResponse.json({ error: "not found" }, { status: 500 }),
+      ),
+    );
+    const live = canvasWithNode("current");
+    const loadCanvas = vi.fn();
+    const { result } = renderHook(
+      () =>
+        useForkVersionPreview({
+          reservationId: RES_ID,
+          currentCanvas: live,
+          loadCanvas,
+          flushAutosave: vi.fn(),
+        }),
+      { wrapper },
+    );
+
+    result.current.startPreview(V1);
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError).toHaveBeenCalledWith("Could not load that version");
+    expect(result.current.mode).toBe("idle");
+    expect(result.current.previewVersion).toBeNull();
   });
 });

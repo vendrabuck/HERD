@@ -3,7 +3,7 @@ import type { CanvasData } from "@/types/topology.types";
 
 /**
  * Hydrate a canvas's node device data fresh from inventory, then hand it to
- * loadCanvas -- factored out of TopologyEditorPage's own canvas-load effect
+ * loadCanvas: factored out of TopologyEditorPage's own canvas-load effect
  * (issue #622 review) so every canvas the fork-history preview/diff/restore
  * flow loads goes through the identical path, not a raw loadCanvas. A thin
  * persisted/fetched node (`{ device: { id } }` with no name or

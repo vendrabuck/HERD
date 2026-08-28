@@ -56,7 +56,7 @@ import { DeviceNode } from "@/components/topology-editor/nodes/DeviceNode";
 import { DynamicPlaceholderNode } from "@/components/topology-editor/nodes/DynamicPlaceholderNode";
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
 import { BundledEdge } from "@/components/topology-editor/edges/BundledEdge";
-import { groupEdgesForRender } from "@/components/topology-editor/edges/groupEdgesForRender";
+import { groupEdgesForRender, isAnnotationEdge } from "@/components/topology-editor/edges/groupEdgesForRender";
 import { LAYER_OPTIONS } from "@/components/topology-editor/edges/layerStyles";
 import { resolveEdgeStroke } from "@/components/topology-editor/edges/edgeStatus";
 import { genId } from "@/lib/id";
@@ -203,7 +203,7 @@ function TopologyEditorInner() {
   // Indirection for autosave.flush (issue #622 review): useForkVersionPreview
   // needs a flush callback to call before it hijacks the canvas store, but
   // useForkAutosave's own `enabled` depends on isReadOnly, which depends on
-  // forkPreview.isActive below -- autosave can only be constructed AFTER
+  // forkPreview.isActive below: autosave can only be constructed AFTER
   // forkPreview. A ref breaks the cycle: forkPreview gets a stable wrapper
   // now, autosave is constructed later, and an effect keeps the ref pointed
   // at the current flush.
@@ -251,7 +251,7 @@ function TopologyEditorInner() {
     const seen = new Set<string>();
     const pairs: DevicePair[] = [];
     for (const edge of edges) {
-      if (edge.data?.isProposal) continue;
+      if (isAnnotationEdge(edge.data)) continue;
       const src = nodeIdToDeviceId.get(edge.source);
       const tgt = nodeIdToDeviceId.get(edge.target);
       if (!src || !tgt) continue;
@@ -343,7 +343,7 @@ function TopologyEditorInner() {
     if (!pathfindResults) return;
     const updates = new Map<string, { pathValid: boolean | null; hopCount?: number }>();
     for (const edge of edges) {
-      if (edge.data?.isProposal) continue;
+      if (isAnnotationEdge(edge.data)) continue;
       const src = nodeIdToDeviceId.get(edge.source);
       const tgt = nodeIdToDeviceId.get(edge.target);
       if (!src || !tgt) continue;
@@ -365,7 +365,7 @@ function TopologyEditorInner() {
   // precedence inline, so this can never drift from what LayerEdge/
   // BundledEdge actually render as red.
   const invalidEdges = useMemo(
-    () => edges.filter((e) => !e.data?.isProposal && resolveEdgeStroke(e.data).isInvalid),
+    () => edges.filter((e) => !isAnnotationEdge(e.data) && resolveEdgeStroke(e.data).isInvalid),
     [edges],
   );
   const hasInvalidEdges = invalidEdges.length > 0;
@@ -397,7 +397,7 @@ function TopologyEditorInner() {
     if (!pendingConnection) return { sourcePortIds, targetPortIds };
     const { source: pendingSourceNode, target: pendingTargetNode } = pendingConnection.connection;
     for (const e of edges) {
-      if (e.data?.isProposal) continue;
+      if (isAnnotationEdge(e.data)) continue;
       const srcPortId = e.data?.source_port_id;
       const tgtPortId = e.data?.target_port_id;
       if (e.source === pendingSourceNode && srcPortId) sourcePortIds.add(srcPortId);
@@ -1247,7 +1247,14 @@ function TopologyEditorInner() {
             isActiveReservation={liveReservation?.status === "ACTIVE"}
             draftRestoredFromId={fork?.draft_restored_from_id ?? null}
             preview={forkPreview}
-            onClose={() => setShowHistory(false)}
+            onClose={() => {
+              // Closing the panel is the only other way out besides the
+              // banner's own Exit button; without also exiting here, a
+              // preview/diff left active keeps the canvas locked with the
+              // panel gone and no visible way back in.
+              forkPreview.exit();
+              setShowHistory(false);
+            }}
           />
         )}
 

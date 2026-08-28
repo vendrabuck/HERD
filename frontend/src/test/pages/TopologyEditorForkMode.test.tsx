@@ -265,4 +265,118 @@ describe("TopologyEditorPage live-edit fork mode", () => {
     );
     expect(screen.getByText("EDITING LIVE RESERVATION")).toBeInTheDocument();
   });
+
+  it("closing the history panel while previewing also exits the preview (issue #622 review)", async () => {
+    const fork = makeFork();
+    server.use(
+      ...baseHandlers(fork),
+      http.get(`/api/reservations/${RES_ID}/fork/versions/fv-1`, () =>
+        HttpResponse.json({
+          id: "fv-1",
+          fork_id: "fork-1",
+          version_number: 1,
+          restored_from_id: null,
+          created_at: "2026-06-01T00:00:00Z",
+          canvas_data: { nodes: [forkNode("v1-node", "d-v1")], edges: [], selectedEdgeLayer: "L2" },
+        }),
+      ),
+    );
+    renderPage();
+
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("v1-node"),
+    );
+    expect(screen.getByText(/Previewing version 1/)).toBeInTheDocument();
+
+    // Close the panel via its own close control, NOT the banner's Exit
+    // button: this must also exit the preview, not just hide the panel.
+    fireEvent.click(screen.getByRole("button", { name: "Close history panel" }));
+
+    await waitFor(() => expect(screen.queryByText(/Previewing version 1/)).not.toBeInTheDocument());
+    expect(screen.getByText("EDITING LIVE RESERVATION")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+  });
+
+  it("a diff overlay's removed-edge annotation never fires a pathfind request for that pair (issue #622 review)", async () => {
+    // The current draft has two devices and NO edge between them; v1 (the
+    // diff base) had an edge between the same two devices. Diffing v1 to
+    // current therefore overlays a diffStatus:"removed" annotation edge for
+    // that pair onto the canvas -- a pair with no real committed wire.
+    const secondNode = forkNode("other-node", "d-other");
+    const fork = makeFork({
+      canvas_data: {
+        nodes: [forkNode("fork-node", "d-fork"), secondNode],
+        edges: [],
+        selectedEdgeLayer: "L2",
+      },
+    });
+    const pathfindBodies: unknown[] = [];
+    server.use(
+      ...baseHandlers(fork),
+      http.get(`/api/reservations/${RES_ID}/fork/versions/fv-1`, () =>
+        HttpResponse.json({
+          id: "fv-1",
+          fork_id: "fork-1",
+          version_number: 1,
+          restored_from_id: null,
+          created_at: "2026-06-01T00:00:00Z",
+          canvas_data: {
+            nodes: [forkNode("fork-node", "d-fork"), secondNode],
+            edges: [
+              {
+                id: "e-v1",
+                source: "fork-node",
+                target: "other-node",
+                type: "layerEdge",
+                data: { layer: "L1", source_port_name: "eth1", target_port_name: "eth1" },
+              },
+            ],
+            selectedEdgeLayer: "L2",
+          },
+        }),
+      ),
+      http.post("/api/cabling/pathfind/batch", async ({ request }) => {
+        const body = await request.json();
+        pathfindBodies.push(body);
+        return HttpResponse.json({ results: [] });
+      }),
+    );
+    renderPage();
+
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: "Diff" }));
+    fireEvent.click(screen.getByRole("button", { name: "Compare" }));
+
+    await waitFor(() => expect(screen.getByText(/Diff: v1/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(useTopologyStore.getState().edges.some((e) => e.data?.diffStatus === "removed")).toBe(
+        true,
+      ),
+    );
+
+    // No pathfind request, across the whole diff-mode session, ever asked
+    // about the d-fork/d-other pair: the diff overlay's removed-edge
+    // annotation must never be treated as a real wire needing validation.
+    const askedAboutPair = pathfindBodies.some((body) =>
+      (body as { pairs: { source_device_id: string; target_device_id: string }[] }).pairs.some(
+        (p) =>
+          (p.source_device_id === "d-fork" && p.target_device_id === "d-other") ||
+          (p.source_device_id === "d-other" && p.target_device_id === "d-fork"),
+      ),
+    );
+    expect(askedAboutPair).toBe(false);
+  });
 });

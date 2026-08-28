@@ -1,5 +1,8 @@
 import { render, screen, fireEvent, within } from "@testing-library/react";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { toastError } = vi.hoisted(() => ({ toastError: vi.fn() }));
+vi.mock("react-hot-toast", () => ({ default: { error: toastError, success: vi.fn() } }));
 
 import { ForkHistoryPanel } from "@/components/topology-editor/ForkHistoryPanel";
 import type { UseForkVersionPreviewResult } from "@/hooks/useForkVersionPreview";
@@ -50,6 +53,10 @@ function makePreview(overrides: Partial<UseForkVersionPreviewResult> = {}): UseF
     ...overrides,
   };
 }
+
+beforeEach(() => {
+  toastError.mockClear();
+});
 
 describe("ForkHistoryPanel", () => {
   it("shows the restored marker on a version carrying restored_from_id", () => {
@@ -250,5 +257,36 @@ describe("ForkHistoryPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Restore" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(preview.restoreVersion).not.toHaveBeenCalled();
+  });
+
+  it("Compare against a picked version that has since disappeared from versions shows an error instead of throwing", () => {
+    const preview = makePreview();
+    const { rerender } = render(
+      <ForkHistoryPanel
+        versions={[V1, V2_RESTORED]}
+        isActiveReservation={false}
+        draftRestoredFromId={null}
+        preview={preview}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: "Diff" })[0]);
+    fireEvent.change(screen.getByLabelText("Diff v1 against"), { target: { value: V2_RESTORED.id } });
+
+    // The picked target (v2) drops out of the versions list before Compare
+    // is clicked, e.g. a stale render racing a fresh versions prop.
+    rerender(
+      <ForkHistoryPanel
+        versions={[V1]}
+        isActiveReservation={false}
+        draftRestoredFromId={null}
+        preview={preview}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(() => fireEvent.click(screen.getByRole("button", { name: "Compare" }))).not.toThrow();
+    expect(toastError).toHaveBeenCalledWith("That version is no longer available");
+    expect(preview.startDiff).not.toHaveBeenCalled();
   });
 });
