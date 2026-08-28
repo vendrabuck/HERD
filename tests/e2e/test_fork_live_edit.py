@@ -467,9 +467,18 @@ def test_restore_then_save_via_fork_readback_pw(pw_page):
         expect(pw_page.get_by_text(FORK_SAVED_TOAST_RE)).to_be_visible(timeout=15_000)
         assert len(fork_now()["versions"]) == 2
 
-        # Restore version 1 through the history panel.
+        # Restore version 1 through the history panel. The panel lists
+        # versions newest-first (cabling orders ForkVersion.version_number
+        # desc), so a bare `.first` on the Restore buttons would hit v2's row
+        # instead: find the "v1" label span, then walk up to its enclosing
+        # row (the span's grandparent -- ForkHistoryPanel.tsx nests the
+        # version label in `<div className="flex items-center gap-2">`,
+        # itself a child of the per-version row div), and restore from
+        # inside that specific row.
         pw_page.get_by_role("button", name="History").click()
-        pw_page.get_by_role("button", name="Restore", exact=True).first.click()
+        v1_label = pw_page.get_by_text("v1", exact=True)
+        v1_row = v1_label.locator("xpath=../..")
+        v1_row.get_by_role("button", name="Restore", exact=True).click()
         dialog = pw_page.get_by_role("dialog")
         expect(dialog).to_be_visible()
         dialog.get_by_role("button", name="Restore", exact=True).click()
