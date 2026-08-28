@@ -964,6 +964,86 @@ async def test_commit_fork_with_new_version_retries_on_conflict():
 
 
 @pytest.mark.asyncio
+async def test_commit_fork_with_new_version_reapplies_restore_marker_on_retry():
+    """A version-race retry must not drop the restore-to-draft marker clear (issue #622).
+
+    Mirrors test_commit_fork_with_new_version_retries_on_conflict's race mechanics,
+    but exercises save_fork's marker discipline: capture fork.draft_restored_from_id
+    into a local, clear the fork row's copy, and pass the captured id as the new
+    snapshot's restored_from_id. The concurrent writer that forces the retry ALSO
+    resets the fork row's marker (to a second version, simulating a genuinely
+    concurrent restore-to-draft landing in between): a rollback that only re-runs
+    the max+1 query, without reapplying fork.draft_restored_from_id, would leave the
+    concurrent writer's marker value in place instead of the intended clear. Only a
+    correct reapply of BOTH pending fields drives the fork row back to None.
+    """
+    from app.services.version_service import commit_fork_with_new_version
+
+    fork_id = await _make_active_fork(uuid.uuid4())
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        v1 = (
+            await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id))
+        ).scalar_one()
+        marker_target_id = v1.id
+
+        distinct_canvas = {"nodes": [{"id": "restored-draft"}], "edges": []}
+        fork.canvas_data = distinct_canvas
+        fork.draft_restored_from_id = marker_target_id
+        await db.commit()
+
+        # Re-read so the marker and canvas_data are the committed baseline that
+        # save_fork's discipline captures before clearing, mirroring
+        # fork_save_service.save_fork's exact capture-then-clear sequence.
+        fork = await db.get(ReservationFork, fork_id)
+        restored_from_id = fork.draft_restored_from_id
+        fork.draft_restored_from_id = None
+        assert restored_from_id == marker_target_id
+
+        snapshot = ForkVersion(
+            fork_id=fork.id, canvas_data=fork.canvas_data, restored_from_id=restored_from_id
+        )
+
+        real_commit = db.commit
+        state = {"raced": False}
+
+        async def racing_commit():
+            if not state["raced"]:
+                state["raced"] = True
+                # A concurrent save grabs version 2 (the number this call allocated)
+                # AND sets its own restore-to-draft marker on the fork row, before
+                # our commit lands.
+                async with TestSessionLocal() as other:
+                    other.add(ForkVersion(fork_id=fork_id, version_number=2))
+                    other_fork = await other.get(ReservationFork, fork_id)
+                    other_fork.draft_restored_from_id = v1.id
+                    await other.commit()
+            return await real_commit()
+
+        with patch.object(db, "commit", side_effect=racing_commit):
+            await commit_fork_with_new_version(db, fork, snapshot)
+
+        # Retried onto 3 after the constraint rejected 2, same as the plain race test.
+        assert snapshot.version_number == 3
+        assert snapshot.restored_from_id == marker_target_id
+
+    async with TestSessionLocal() as db:
+        versions = (
+            (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+        assert len(versions) == 3
+        appended = next(v for v in versions if v.version_number == 3)
+        assert appended.restored_from_id == marker_target_id
+
+        fork = await db.get(ReservationFork, fork_id)
+        assert fork.draft_restored_from_id is None
+        assert fork.canvas_data == distinct_canvas
+
+
+@pytest.mark.asyncio
 async def test_commit_fork_with_new_version_exhausts_retries_and_raises():
     """Persistent contention past the cap re-raises IntegrityError rather than looping.
 
