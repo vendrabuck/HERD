@@ -73,6 +73,14 @@
       "/{reservation_id}/fork/save"
     ],
     [
+      "GET",
+      "/{reservation_id}/fork/versions/{version_id}"
+    ],
+    [
+      "POST",
+      "/{reservation_id}/fork/versions/{version_id}/restore"
+    ],
+    [
       "PUT",
       "/{reservation_id}/release"
     ],

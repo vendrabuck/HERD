@@ -41,10 +41,13 @@ from app.schemas.fork import (
     ForkPruneResponse,
     ForkSaveRequest,
     ForkSaveResponse,
+    ForkVersionDetailResponse,
+    ForkVersionRestoreResponse,
     ForkVersionSummary,
 )
 from app.services.fork_save_service import WireSpec, prune_fork_devices, save_fork
 from app.services.fork_service import create_fork
+from app.services.version_service import commit_fork_with_new_version
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
 
@@ -63,6 +66,15 @@ async def _load_fork(db: AsyncSession, reservation_id: uuid.UUID) -> Reservation
     if fork is None:
         raise HTTPException(status_code=404, detail="Fork not found")
     return fork
+
+
+async def _load_fork_version(
+    db: AsyncSession, fork_id: uuid.UUID, version_id: uuid.UUID
+) -> ForkVersion:
+    version = await db.get(ForkVersion, version_id)
+    if version is None or version.fork_id != fork_id:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return version
 
 
 def _to_delta(spec: WireSpec) -> ForkConnectionDelta:
@@ -229,6 +241,87 @@ async def get_fork_internal(
         updated_at=fork.updated_at,
         connections=[ForkConnectionResponse.model_validate(c) for c in connections],
         versions=[ForkVersionSummary.model_validate(v) for v in versions],
+    )
+
+
+@router.get(
+    "/{reservation_id}/versions/{version_id}",
+    response_model=ForkVersionDetailResponse,
+)
+async def get_fork_version_internal(
+    reservation_id: uuid.UUID,
+    version_id: uuid.UUID,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return one fork_versions row's full canvas payload (issue #622).
+
+    The read side of the history panel's version preview and diff: unlike the GET
+    above, this carries the version's own canvas_data rather than the fork's current
+    draft. 404 when the fork does not exist, or when the version exists but belongs
+    to a different fork (never leaks a foreign version's existence). Read-only; no
+    status check, mirroring GET /{reservation_id} which is allowed for any
+    reservation status.
+    """
+    _check_internal_token(x_internal_token)
+    fork = await _load_fork(db, reservation_id)
+    version = await _load_fork_version(db, fork.id, version_id)
+
+    return ForkVersionDetailResponse(
+        id=version.id,
+        fork_id=version.fork_id,
+        version_number=version.version_number,
+        restored_from_id=version.restored_from_id,
+        created_at=version.created_at,
+        canvas_data=version.canvas_data,
+    )
+
+
+@router.post(
+    "/{reservation_id}/versions/{version_id}/restore",
+    response_model=ForkVersionRestoreResponse,
+)
+async def restore_fork_version_internal(
+    reservation_id: uuid.UUID,
+    version_id: uuid.UUID,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restore to draft: copy a version's canvas onto the fork's draft (issue #622).
+
+    Restore-to-draft, never restore-and-reconcile (ADR 0006 addendum, 2026-08-28):
+    this replaces ONLY the fork's draft canvas_data and appends a new fork_versions
+    row carrying restored_from_id = version_id, numbered max+1 exactly like a save.
+    It never touches fork_connections, the wiring ledger, or the outbox; nothing is
+    wired until the caller runs the existing save-reconcile endpoint. 404 when the
+    fork or the version (scoped to that fork) does not exist; 409 when the fork is
+    ARCHIVED, the same wording as the loose canvas PUT and the save endpoint.
+    """
+    _check_internal_token(x_internal_token)
+    fork = await _load_fork(db, reservation_id)
+    if fork.status == ForkStatus_ARCHIVED:
+        raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
+    version = await _load_fork_version(db, fork.id, version_id)
+
+    restored_canvas = version.canvas_data
+    fork.canvas_data = restored_canvas
+    snapshot = ForkVersion(
+        fork_id=fork.id,
+        canvas_data=restored_canvas,
+        restored_from_id=version.id,
+    )
+    await commit_fork_with_new_version(db, fork, snapshot)
+    await db.refresh(snapshot)
+
+    # Reports route validation of the restored canvas exactly like the loose canvas
+    # PUT, but gates nothing on it: an invalid restored draft still restores.
+    validation = await _run_topology_validation(Topology(canvas_data=restored_canvas), db)
+
+    return ForkVersionRestoreResponse(
+        id=fork.id,
+        valid=validation.valid,
+        invalid_edges=validation.invalid_edges,
+        version=ForkVersionSummary.model_validate(snapshot),
     )
 
 

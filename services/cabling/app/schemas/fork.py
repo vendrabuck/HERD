@@ -52,6 +52,37 @@ class ForkVersionSummary(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ForkVersionDetailResponse(BaseModel):
+    """GET /internal/forks/{reservation_id}/versions/{version_id}: one version, full.
+
+    ForkVersionSummary's fields plus the canvas payload the summary omits (issue
+    #622); the read side of preview/diff in the fork history panel.
+    """
+
+    id: UUIDStr
+    fork_id: UUIDStr
+    version_number: int
+    restored_from_id: OptionalUUIDStr = None
+    created_at: datetime
+    canvas_data: dict[str, Any] | None = None
+
+
+class ForkVersionRestoreResponse(BaseModel):
+    """POST .../versions/{version_id}/restore result (issue #622, restore-to-draft).
+
+    ForkCanvasUpdateResponse's fields (the restored draft's route validation) plus
+    the new fork_versions row this restore appended. Restore only ever replaces the
+    fork's draft canvas_data and appends a version carrying restored_from_id; it
+    never touches fork_connections, the wiring ledger, or the outbox (ADR 0006
+    addendum, 2026-08-28). Nothing is wired until the caller runs the existing save.
+    """
+
+    id: UUIDStr
+    valid: bool
+    invalid_edges: list[InvalidEdge]
+    version: ForkVersionSummary
+
+
 class ForkDetailResponse(BaseModel):
     """GET /internal/forks/{reservation_id}: fork metadata, canvas, wiring, versions."""
 

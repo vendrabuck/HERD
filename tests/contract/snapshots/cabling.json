@@ -61,6 +61,14 @@
       "/internal/forks/{reservation_id}/save"
     ],
     [
+      "GET",
+      "/internal/forks/{reservation_id}/versions/{version_id}"
+    ],
+    [
+      "POST",
+      "/internal/forks/{reservation_id}/versions/{version_id}/restore"
+    ],
+    [
       "POST",
       "/pathfind"
     ],
@@ -467,6 +475,38 @@
         "released",
         "unchanged_count",
         "version_number"
+      ],
+      "type": "object"
+    },
+    "ForkVersionDetailResponse": {
+      "properties": {
+        "canvas_data": "anyOf",
+        "created_at": "string",
+        "fork_id": "string",
+        "id": "string",
+        "restored_from_id": "anyOf",
+        "version_number": "integer"
+      },
+      "required": [
+        "created_at",
+        "fork_id",
+        "id",
+        "version_number"
+      ],
+      "type": "object"
+    },
+    "ForkVersionRestoreResponse": {
+      "properties": {
+        "id": "string",
+        "invalid_edges": "array",
+        "valid": "boolean",
+        "version": "#/components/schemas/ForkVersionSummary"
+      },
+      "required": [
+        "id",
+        "invalid_edges",
+        "valid",
+        "version"
       ],
       "type": "object"
     },
