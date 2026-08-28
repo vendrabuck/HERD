@@ -9,10 +9,13 @@ Three end-to-end flows over a running HERD stack:
 - The backfill / standing-reconciler proof: manufacture a zombie (an ACTIVE fork whose
   reservation is already terminal) via the cabling internal fork-create, then let the
   reservations expiration sweep's archive reconciler freeze it, polling for ARCHIVED.
-- The restore-to-draft flow (issue #622): save twice, restore an earlier version,
-  assert the restore only rewrote the draft canvas and staged NO wiring change (the
-  applied wiring stays exactly what the last save left), then save again and assert
-  the wire that only the intermediate version had is what gets released.
+- The restore-to-draft flow (issue #622, revised after PR #623 review): save twice,
+  restore an earlier version, assert the restore only rewrote the draft canvas,
+  appended NO fork_versions row (so cabling's latest fork_version does not advance
+  and the standing wiring-heal reconciler cannot mistake it for a missed save), and
+  staged NO wiring change (the applied wiring stays exactly what the last save
+  left); then save again and assert THAT save both advances the version and
+  releases the wire that only the intermediate version had.
 
 All three self-seed via the conftest fixtures and clean up in try/finally. They
 require a running HERD stack; without one they error at connect time, which is
@@ -109,9 +112,7 @@ async def test_fork_lifecycle_read_edit_save_archive(admin_client, fresh_devices
     a_id, b_id = devices[0]["id"], devices[1]["id"]
 
     connection_id = await _create_connection(admin_client, a_id, b_id)
-    topology_id = await _create_topology_with_canvas(
-        admin_client, _canvas_with_edge(a_id, b_id)
-    )
+    topology_id = await _create_topology_with_canvas(admin_client, _canvas_with_edge(a_id, b_id))
     reservation_id: str | None = None
     try:
         reservation_id = await _create_reservation(admin_client, [a_id, b_id], topology_id)
@@ -224,7 +225,8 @@ def _endpoint_pair(delta: dict) -> frozenset:
 async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
     admin_client, fresh_devices
 ):
-    """Restore-to-draft (issue #622, ADR 0006 addendum, 2026-08-28) never wires.
+    """Restore-to-draft (issue #622, revised after PR #623 review) never wires and
+    never appends a fork_versions row of its own.
 
     Sequence: activate onto a topology wiring A-B (fork v1, no wiring built yet: the
     activation snapshot alone stages nothing). Save #1 (v2) moves the canvas to A-C,
@@ -232,11 +234,16 @@ async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
     nothing. Save #2 (v3) resaves the SAME A-C canvas (an unchanged re-save, per the
     cabling reconcile's own convention): the applied wiring stays A-C, only the
     version number advances. Restoring v1 must then only rewrite the fork's draft
-    canvas back to A-B and stage NO wiring_changed event, so the applied wiring (still
-    A-C, v2's wire, unchanged since) is untouched; the wiring-status read proves this
-    directly rather than trusting the restore response. A follow-up save of the
-    restored draft (A-B) then reconciles for real: it releases the version-2-only
-    wire A-C and builds A-B.
+    canvas back to A-B and set draft_restored_from_id: it appends NO version (the
+    fork's version list stays at exactly v1/v2/v3, proving cabling's own
+    latest-fork-version count never advanced, so the standing wiring-heal reconciler
+    has nothing to misread as a missed save) and stages NO wiring_changed event, so
+    the applied wiring (still A-C, v2's wire, unchanged since) is untouched; the
+    wiring-status read proves this directly rather than trusting the restore
+    response. A follow-up save of the restored draft (A-B) is the one that actually
+    advances the version (to v4, since restore consumed no number) and carries
+    restored_from_id = v1's id; it reconciles for real, releasing the
+    version-2-only wire A-C and building A-B.
     """
     devices = await fresh_devices(3)
     a_id, b_id, c_id = devices[0]["id"], devices[1]["id"], devices[2]["id"]
@@ -280,9 +287,7 @@ async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
         assert body_1["version_number"] == 2
         assert body_1["released"] == []
         assert len(body_1["built"]) == 1
-        assert _endpoint_pair(body_1["built"][0]) == frozenset(
-            {(a_id, "eth2"), (c_id, "eth1")}
-        )
+        assert _endpoint_pair(body_1["built"][0]) == frozenset({(a_id, "eth2"), (c_id, "eth1")})
 
         # Save #2 -> v3: resave the identical A-C canvas. unchanged, no new delta.
         save_2 = await admin_client.post(
@@ -296,56 +301,80 @@ async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
         assert body_2["built"] == []
         assert body_2["unchanged_count"] == 1
 
-        # Snapshot wiring-status right before the restore, so the "restore stages
-        # nothing" assertion below is a real before/after comparison, not a guess.
+        # Snapshot wiring-status AND the fork's version count right before the
+        # restore, so both "restore changes nothing" assertions below are real
+        # before/after comparisons, not guesses.
         pre_restore_status = await _wiring_status(admin_client, reservation_id)
+        pre_restore_fork = await admin_client.get(f"/reservations/{reservation_id}/fork")
+        assert pre_restore_fork.status_code == 200, pre_restore_fork.text
+        pre_restore_versions = pre_restore_fork.json()["versions"]
+        assert len(pre_restore_versions) == 3
+        assert max(v["version_number"] for v in pre_restore_versions) == 3
 
         restored = await admin_client.post(
             f"/reservations/{reservation_id}/fork/versions/{v1['id']}/restore"
         )
         assert restored.status_code == 200, restored.text
         restore_body = restored.json()
-        assert restore_body["version"]["version_number"] == 4
-        assert restore_body["version"]["restored_from_id"] == v1["id"]
+        assert restore_body["draft_restored_from_id"] == v1["id"]
+        # ForkCanvasUpdateResponse's shape plus the marker: no "version" key, and
+        # specifically no version_number, since restore appends none.
+        assert "version" not in restore_body
 
-        # The draft is back to v1's canvas...
+        # The draft is back to v1's canvas, and the marker is visible on the fork...
         after_restore_fork = await admin_client.get(f"/reservations/{reservation_id}/fork")
         assert after_restore_fork.status_code == 200, after_restore_fork.text
-        assert after_restore_fork.json()["canvas_data"] == canvas_ab
+        after_restore_body = after_restore_fork.json()
+        assert after_restore_body["canvas_data"] == canvas_ab
+        assert after_restore_body["draft_restored_from_id"] == v1["id"]
 
-        # ...but the APPLIED wiring never moved: restore's own request/commit path
-        # never calls stage_wiring_changed (unlike save), so a read immediately after
-        # the restore response matches the pre-restore snapshot exactly. This is a
-        # deterministic property of the restore endpoint itself, not a timing-window
-        # guess: the standing wiring-heal reconciler (ADR 0007 Decision 2) is a
-        # SEPARATE, pre-existing sweep that may later notice cabling's fork_version
-        # advanced past the ledger's last_applied_fork_version and stage a delta-less
-        # heal for it; since fork_connections is untouched by restore, that heal (if
-        # it fires) resolves to the same intended set and is a no-op on the applied
-        # wiring, just an eventual last_applied_fork_version bump. That is expected,
-        # pre-existing behavior and intentionally not asserted against here.
+        # ...but cabling's own latest fork_version never advanced: still exactly
+        # v1/v2/v3, proving restore appended no fork_versions row. This is the
+        # PR #623 review fix: an appended version here would have falsely tripped
+        # the standing wiring-heal reconciler (ADR 0007 Decision 2), which trusts a
+        # fork_version advance to mean a save's staging was missed.
+        after_restore_versions = after_restore_body["versions"]
+        assert len(after_restore_versions) == 3, (
+            f"restore must append no fork_versions row, got {after_restore_versions}"
+        )
+        assert max(v["version_number"] for v in after_restore_versions) == 3
+        assert {v["id"] for v in after_restore_versions} == {v["id"] for v in pre_restore_versions}
+
+        # And the APPLIED wiring never moved either: restore's own request/commit
+        # path never calls stage_wiring_changed (unlike save), so a read immediately
+        # after the restore response matches the pre-restore snapshot exactly.
         immediately_after = await _wiring_status(admin_client, reservation_id)
         assert immediately_after == pre_restore_status, (
             "wiring-status changed across the restore call; restore must be canvas-only"
         )
 
         # Now save the restored draft for real: this is the reconcile the user runs
-        # deliberately. It must release the version-2-only wire A-C and build A-B.
+        # deliberately, and the FIRST save to actually advance the version since the
+        # restore (to v4, since restore consumed no number). It must carry
+        # restored_from_id = v1's id, and release the version-2-only wire A-C while
+        # building A-B.
         final_save = await admin_client.post(
             f"/reservations/{reservation_id}/fork/save",
             json={"canvas_data": canvas_ab},
         )
         assert final_save.status_code == 200, final_save.text
         final_body = final_save.json()
-        assert final_body["version_number"] == 5
+        assert final_body["version_number"] == 4
         assert len(final_body["released"]) == 1
         assert _endpoint_pair(final_body["released"][0]) == frozenset(
             {(a_id, "eth2"), (c_id, "eth1")}
         )
         assert len(final_body["built"]) == 1
-        assert _endpoint_pair(final_body["built"][0]) == frozenset(
-            {(a_id, "eth1"), (b_id, "eth1")}
-        )
+        assert _endpoint_pair(final_body["built"][0]) == frozenset({(a_id, "eth1"), (b_id, "eth1")})
+
+        # The marker is consumed: the fork row's draft_restored_from_id clears, and
+        # the newly appended v4 carries it as its own restored_from_id instead.
+        after_save_fork = await admin_client.get(f"/reservations/{reservation_id}/fork")
+        assert after_save_fork.status_code == 200, after_save_fork.text
+        after_save_body = after_save_fork.json()
+        assert after_save_body["draft_restored_from_id"] is None
+        v4 = next(v for v in after_save_body["versions"] if v["version_number"] == 4)
+        assert v4["restored_from_id"] == v1["id"]
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")

@@ -187,7 +187,7 @@ async def test_restore_active_owner_forwards():
         "id": str(uuid.uuid4()),
         "valid": True,
         "invalid_edges": [],
-        "version": {"version_number": 2, "restored_from_id": str(version_id)},
+        "draft_restored_from_id": str(version_id),
     }
     with patch(
         "app.routers.reservations._cabling_fork_call",
@@ -203,7 +203,12 @@ async def test_restore_active_owner_forwards():
 @pytest.mark.asyncio
 async def test_restore_active_admin_allowed_for_other_owner():
     rid = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
-    result = {"id": str(uuid.uuid4()), "valid": True, "invalid_edges": [], "version": {}}
+    result = {
+        "id": str(uuid.uuid4()),
+        "valid": True,
+        "invalid_edges": [],
+        "draft_restored_from_id": None,
+    }
     with patch(
         "app.routers.reservations._cabling_fork_call",
         new=AsyncMock(return_value=_resp(200, result)),
@@ -299,7 +304,12 @@ async def test_restore_does_not_stage_wiring_changed():
     """Restore forwards to cabling only; it must never call the execution/outbox
     staging path save_reservation_fork uses (stage_wiring_changed)."""
     rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
-    result = {"id": str(uuid.uuid4()), "valid": True, "invalid_edges": [], "version": {}}
+    result = {
+        "id": str(uuid.uuid4()),
+        "valid": True,
+        "invalid_edges": [],
+        "draft_restored_from_id": None,
+    }
     with (
         patch(
             "app.routers.reservations._cabling_fork_call",

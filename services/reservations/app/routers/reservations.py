@@ -683,7 +683,10 @@ async def get_reservation_fork(
     fork GET. On a cabling 404 the behavior forks on status: an ACTIVE reservation
     lazy-creates the fork through the idempotent POST /internal/forks (ADR 0001
     Decision 3 Case A, including a reservation with no parent topology) and re-reads;
-    a non-ACTIVE reservation with no fork returns 404.
+    a non-ACTIVE reservation with no fork returns 404. The relayed body carries
+    draft_restored_from_id (issue #622) whenever the draft was last restored from an
+    earlier version and not yet saved, so the frontend can label it "restored from
+    version N, unsaved".
     """
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")
@@ -842,9 +845,13 @@ async def restore_reservation_fork_version(
 
     Owner-or-admin gated and ACTIVE-only, the same rule as the canvas PUT and save
     endpoints (409 FORK_RESTORE_REQUIRES_ACTIVE otherwise). Forwards to cabling's
-    internal restore, which replaces ONLY the fork's draft canvas_data and appends a
-    fork_versions row carrying restored_from_id; it never touches fork_connections,
-    the wiring ledger, or the outbox (ADR 0006 addendum, 2026-08-28), so unlike
+    internal restore, which replaces ONLY the fork's draft canvas_data and sets a
+    draft_restored_from_id marker on the fork row (revised after PR #623 review: it
+    appends NO fork_versions row of its own, since a version means something was
+    reconciled and the standing wiring-heal reconciler would otherwise misread the
+    canvas-only change as a missed save; the marker rides until the next save, which
+    carries it onto the version it appends and clears it). It never touches
+    fork_connections, the wiring ledger, or the outbox, so unlike
     save_reservation_fork this proxy stages no reservation.wiring_changed event and
     advances no fork_wiring_ledger row. Cabling's 404 (foreign or missing version)
     and 409 (ARCHIVED fork) relay verbatim.

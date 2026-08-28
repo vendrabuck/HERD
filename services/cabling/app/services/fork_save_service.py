@@ -433,7 +433,17 @@ async def save_fork(
         result["unchanged_count"] = unchanged_count
 
     await reconcile()
-    snapshot = ForkVersion(fork_id=fork_id, canvas_data=canvas_data)
+    # Consume the restore-to-draft marker (issue #622): if the draft being saved was
+    # last restored from an earlier version, THIS is the save that finally reconciles
+    # it, so this new version is the one that carries restored_from_id, and the
+    # fork-row marker is cleared in the same transaction (commit_fork_with_new_version
+    # reapplies both fork.canvas_data and this clear together on a version-race
+    # retry, so a retry cannot resurrect the pre-clear marker).
+    restored_from_id = fork.draft_restored_from_id
+    fork.draft_restored_from_id = None
+    snapshot = ForkVersion(
+        fork_id=fork_id, canvas_data=canvas_data, restored_from_id=restored_from_id
+    )
     await commit_fork_with_new_version(db, fork, snapshot, reconcile=reconcile)
 
     return ForkSaveResult(

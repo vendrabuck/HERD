@@ -151,11 +151,22 @@ async def commit_fork_with_new_version(
     re-stage its deletes and inserts before the next version allocation. Passing it
     here threads that recompute into the same retry loop; it is awaited after the
     canvas reapply on each retry.
+
+    Also captures and reapplies ``fork.draft_restored_from_id`` alongside
+    ``canvas_data`` (issue #622): a save that consumes the restore-to-draft marker
+    (by copying it onto ``snapshot.restored_from_id`` and clearing the fork row's
+    copy before calling this) must not let a version-race rollback silently restore
+    the pre-clear value. A caller that never touches the field (prune-devices) just
+    reapplies its current, unchanged value, a harmless no-op.
     """
-    pending_changes = {"canvas_data": fork.canvas_data}
+    pending_changes = {
+        "canvas_data": fork.canvas_data,
+        "draft_restored_from_id": fork.draft_restored_from_id,
+    }
 
     async def _reapply() -> None:
         fork.canvas_data = pending_changes["canvas_data"]
+        fork.draft_restored_from_id = pending_changes["draft_restored_from_id"]
         if reconcile is not None:
             await reconcile()
 

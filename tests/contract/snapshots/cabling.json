@@ -408,6 +408,7 @@
         "canvas_data": "anyOf",
         "connections": "array",
         "created_at": "string",
+        "draft_restored_from_id": "anyOf",
         "id": "string",
         "parent_topology_id": "anyOf",
         "parent_version_id": "anyOf",
@@ -448,6 +449,20 @@
         "fork_id",
         "released",
         "version_number"
+      ],
+      "type": "object"
+    },
+    "ForkRestoreResponse": {
+      "properties": {
+        "draft_restored_from_id": "anyOf",
+        "id": "string",
+        "invalid_edges": "array",
+        "valid": "boolean"
+      },
+      "required": [
+        "id",
+        "invalid_edges",
+        "valid"
       ],
       "type": "object"
     },
@@ -492,21 +507,6 @@
         "fork_id",
         "id",
         "version_number"
-      ],
-      "type": "object"
-    },
-    "ForkVersionRestoreResponse": {
-      "properties": {
-        "id": "string",
-        "invalid_edges": "array",
-        "valid": "boolean",
-        "version": "#/components/schemas/ForkVersionSummary"
-      },
-      "required": [
-        "id",
-        "invalid_edges",
-        "valid",
-        "version"
       ],
       "type": "object"
     },

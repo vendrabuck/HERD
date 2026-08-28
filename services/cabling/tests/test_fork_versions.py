@@ -1,10 +1,16 @@
 """GET .../versions/{version_id} and POST .../versions/{version_id}/restore (issue #622).
 
 Restore is restore-to-draft, never restore-and-reconcile (ADR 0006 addendum,
-2026-08-28): it copies a version's canvas onto the fork's draft canvas_data and
-appends a new fork_versions row carrying restored_from_id. It must never touch
-fork_connections, the wiring ledger, or the outbox; that is the load-bearing
-assertion the tests below pin.
+2026-08-28, revised after PR #623 review): it copies a version's canvas onto the
+fork's draft canvas_data and sets a draft_restored_from_id marker on the fork row.
+It deliberately appends NO fork_versions row of its own (a version means something
+was reconciled, and the standing wiring-heal reconciler relies on that to tell a
+missed save from a canvas-only change); the marker rides on the fork row until the
+NEXT save, which carries it onto the version it appends as that version's own
+restored_from_id and clears it. Restore must never touch fork_connections, the
+wiring ledger, or the outbox; that is the load-bearing assertion the tests below
+pin, alongside the "no version appended" and "marker survives a canvas PUT, only a
+save consumes it" invariants.
 """
 
 import uuid
@@ -269,7 +275,13 @@ async def test_restore_replaces_draft_canvas_byte_for_byte(client):
 
 
 @pytest.mark.asyncio
-async def test_restore_sets_restored_from_id_and_appends_version(client):
+async def test_restore_appends_no_version_and_sets_marker(client):
+    """Restore's response and the fork's version list both prove NO version landed.
+
+    issue #622 (revised after PR #623 review): a version means something was
+    reconciled, so restore-to-draft must never append one. It sets
+    draft_restored_from_id on the fork row instead, echoed in the response.
+    """
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     v1_canvas = _canvas([a, b], [(0, 1)])
@@ -279,21 +291,24 @@ async def test_restore_sets_restored_from_id_and_appends_version(client):
     resp = await client.post(f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr())
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["version"]["version_number"] == 2
-    assert body["version"]["restored_from_id"] == str(version_id)
-    assert body["id"] == body["version"]["fork_id"]
+    assert body["draft_restored_from_id"] == str(version_id)
     assert body["valid"] is True
     assert body["invalid_edges"] == []
+    # ForkCanvasUpdateResponse's exact shape plus the marker: no "version" key.
+    assert "version" not in body
+    assert set(body) == {"id", "valid", "invalid_edges", "draft_restored_from_id"}
 
     detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
-    versions = detail.json()["versions"]
-    assert len(versions) == 2
-    v2 = next(v for v in versions if v["version_number"] == 2)
-    assert v2["restored_from_id"] == str(version_id)
+    detail_body = detail.json()
+    assert detail_body["draft_restored_from_id"] == str(version_id)
+    versions = detail_body["versions"]
+    assert len(versions) == 1, f"restore must append no fork_versions row, got {versions}"
+    assert versions[0]["version_number"] == 1
 
 
 @pytest.mark.asyncio
-async def test_restore_version_number_monotonic_across_two_restores(client):
+async def test_restore_twice_still_appends_no_version(client):
+    """Restoring repeatedly just keeps overwriting the marker; still no version."""
     a, b = uuid.uuid4(), uuid.uuid4()
     v1_canvas = _canvas([a, b], [(0, 1)])
     rid, _fork_id = await _create_fork_from_parent(client, v1_canvas)
@@ -303,20 +318,117 @@ async def test_restore_version_number_monotonic_across_two_restores(client):
         f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr()
     )
     assert first.status_code == 200, first.text
-    assert first.json()["version"]["version_number"] == 2
-
     second = await client.post(
         f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr()
     )
     assert second.status_code == 200, second.text
-    assert second.json()["version"]["version_number"] == 3
+    assert second.json()["draft_restored_from_id"] == str(version_id)
 
     detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
-    numbers = sorted(v["version_number"] for v in detail.json()["versions"])
-    assert numbers == [1, 2, 3]
-    restored_from = {v["version_number"]: v["restored_from_id"] for v in detail.json()["versions"]}
-    assert restored_from[2] == str(version_id)
-    assert restored_from[3] == str(version_id)
+    assert len(detail.json()["versions"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_canvas_put_between_restore_and_save_keeps_marker(client):
+    """A loose canvas PUT after a restore leaves draft_restored_from_id in place.
+
+    The user is still editing the restored draft; only a save consumes the marker.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    v1_canvas = _canvas([a, b], [(0, 1)])
+    rid, _fork_id = await _create_fork_from_parent(client, v1_canvas)
+    version_id = await _get_version_id(client, rid, 1)
+
+    restore_resp = await client.post(
+        f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr()
+    )
+    assert restore_resp.status_code == 200, restore_resp.text
+
+    put_resp = await client.put(
+        f"/internal/forks/{rid}/canvas",
+        json={"canvas_data": _canvas([a, b], [])},
+        headers=_hdr(),
+    )
+    assert put_resp.status_code == 200, put_resp.text
+
+    detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert detail.json()["draft_restored_from_id"] == str(version_id)
+    assert len(detail.json()["versions"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_after_restore_carries_marker_and_clears_it(client):
+    """The FIRST save after a restore is the one that carries restored_from_id.
+
+    It appends a new fork_versions row (v2) whose restored_from_id equals the
+    restored version's id, and the fork's draft_restored_from_id marker is cleared
+    in that same save.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    v1_canvas = _canvas([a, b], [(0, 1)])
+    rid, _fork_id = await _create_fork_from_parent(client, v1_canvas)
+    version_id = await _get_version_id(client, rid, 1)
+
+    restore_resp = await client.post(
+        f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr()
+    )
+    assert restore_resp.status_code == 200, restore_resp.text
+
+    save_resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": v1_canvas},
+        headers=_hdr(),
+    )
+    assert save_resp.status_code == 200, save_resp.text
+    assert save_resp.json()["version_number"] == 2
+
+    detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    detail_body = detail.json()
+    assert detail_body["draft_restored_from_id"] is None
+    versions = detail_body["versions"]
+    assert len(versions) == 2
+    v2 = next(v for v in versions if v["version_number"] == 2)
+    assert v2["restored_from_id"] == str(version_id)
+
+
+@pytest.mark.asyncio
+async def test_second_save_after_restore_carries_no_marker(client):
+    """Only the save that CONSUMES the marker carries restored_from_id; the next
+    save, with no pending restore, appends a version with restored_from_id null."""
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    await _make_physical(a, "a1", c, "c0")
+    v1_canvas = _canvas([a, b], [(0, 1)])
+    rid, _fork_id = await _create_fork_from_parent(client, v1_canvas)
+    version_id = await _get_version_id(client, rid, 1)
+
+    restore_resp = await client.post(
+        f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr()
+    )
+    assert restore_resp.status_code == 200, restore_resp.text
+
+    first_save = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": v1_canvas},
+        headers=_hdr(),
+    )
+    assert first_save.status_code == 200, first_save.text
+    assert first_save.json()["version_number"] == 2
+
+    second_save = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": _canvas([a, c], [(0, 1)])},
+        headers=_hdr(),
+    )
+    assert second_save.status_code == 200, second_save.text
+    assert second_save.json()["version_number"] == 3
+
+    detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    versions = detail.json()["versions"]
+    v3 = next(v for v in versions if v["version_number"] == 3)
+    assert v3["restored_from_id"] is None
+    assert detail.json()["draft_restored_from_id"] is None
 
 
 @pytest.mark.asyncio
@@ -325,7 +437,7 @@ async def test_restore_does_not_touch_fork_connections(client):
 
     Builds a fork wired A-B from v1, saves A-C over it (v2's wiring, released A-B
     and built A-C), then restores v1. The wiring must still be A-C: restore never
-    re-runs the release-before-build reconcile.
+    re-runs the release-before-build reconcile, and appends no version.
     """
     a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
@@ -349,12 +461,34 @@ async def test_restore_does_not_touch_fork_connections(client):
         f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr()
     )
     assert restore_resp.status_code == 200, restore_resp.text
-    # version_number bumps to 3 (v1, v2 from save, v3 from restore); the draft
-    # canvas is back to v1's, but the wiring is untouched.
-    assert restore_resp.json()["version"]["version_number"] == 3
+    assert restore_resp.json()["draft_restored_from_id"] == str(version_id)
 
     conns_after = await _fork_connections(fork_id)
     assert _connection_identities(conns_after) == identities_before
 
     detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
     assert detail.json()["canvas_data"] == v1_canvas
+    # v1 and v2 (from the save above) only: restore appended nothing.
+    assert len(detail.json()["versions"]) == 2
+    assert {v["version_number"] for v in detail.json()["versions"]} == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_get_fork_detail_exposes_draft_restored_from_id(client):
+    """GET /internal/forks/{reservation_id} carries the marker so the frontend can
+    label an unsaved restored draft."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    v1_canvas = _canvas([a, b], [(0, 1)])
+    rid, _fork_id = await _create_fork_from_parent(client, v1_canvas)
+
+    fresh = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert fresh.json()["draft_restored_from_id"] is None
+
+    version_id = await _get_version_id(client, rid, 1)
+    restore_resp = await client.post(
+        f"/internal/forks/{rid}/versions/{version_id}/restore", headers=_hdr()
+    )
+    assert restore_resp.status_code == 200, restore_resp.text
+
+    after_restore = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert after_restore.json()["draft_restored_from_id"] == str(version_id)
