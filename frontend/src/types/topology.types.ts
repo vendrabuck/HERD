@@ -33,6 +33,12 @@ export interface LayerEdgeData extends Record<string, unknown> {
   pathHopCount?: number;
   portsCabled?: boolean | null;
   isProposal?: boolean;
+  // Set only on the read-only overlay canvas a fork version diff renders
+  // (issue #622, lib/forkDiff.ts buildForkDiffOverlayCanvas): "added" for a
+  // wire present in the compare side but not the base, "removed" for one
+  // synthesized back in from the base side. Never persisted; the overlay
+  // canvas is never autosaved (the editor locks while it is loaded).
+  diffStatus?: "added" | "removed";
 }
 
 export type DeviceNode = Node<DeviceNodeData, "deviceNode">;

@@ -97,7 +97,19 @@ export interface ForkVersionSummary {
   created_at: string;
 }
 
+// GET /reservations/{id}/fork/versions/{version_id}: one historical version's
+// full canvas snapshot (issue #622). Same fields as ForkVersionSummary plus the
+// canvas payload, used for read-only preview and the client-side diff.
+export interface ForkVersionDetail extends ForkVersionSummary {
+  canvas_data: CanvasData | null;
+}
+
 // GET /reservations/{id}/fork: the editable/as-built fork for a reservation.
+// draft_restored_from_id (issue #622 contract revision, 2026-08-28): non-null
+// only while the draft canvas holds a restored-but-unsaved snapshot (set by
+// POST .../restore, cleared the moment the next Save appends the version that
+// carries restored_from_id instead). Restore never appends a version itself;
+// this field is how the UI shows "unsaved restore" in the meantime.
 export interface ReservationFork {
   id: string;
   reservation_id: string;
@@ -109,6 +121,7 @@ export interface ReservationFork {
   updated_at: string;
   connections: ForkConnection[];
   versions: ForkVersionSummary[];
+  draft_restored_from_id: string | null;
 }
 
 // PUT /reservations/{id}/fork/canvas: the loose-draft store result (no version,
@@ -118,6 +131,22 @@ export interface ForkCanvasDraftResult {
   id: string;
   valid: boolean;
   invalid_edges: unknown[];
+}
+
+// POST /reservations/{id}/fork/versions/{version_id}/restore: restore-to-draft
+// (ADR 0006 addendum, issue #622; contract revised 2026-08-28: restore is a
+// SAVE-less draft replace, so it appends no fork_versions row). ForkCanvasUpdateResponse-shaped
+// (id, valid, invalid_edges: the restored draft's route validation) plus
+// draft_restored_from_id, the id of the version that was restored (mirrors
+// ReservationFork.draft_restored_from_id, which the fork refetch this
+// triggers will now also carry). The "restored" marker
+// (ForkVersionSummary.restored_from_id) appears only once the user runs Save,
+// on the NEW version that save creates. Restore never wires anything; the
+// caller re-fetches the version's own canvas_data
+// (GET .../versions/{version_id}) to load the restored draft, since this
+// response does not carry the canvas payload itself.
+export interface ForkVersionRestoreResult extends ForkCanvasDraftResult {
+  draft_restored_from_id: string;
 }
 
 // One released or built wire in a save result (canonical connection identity).

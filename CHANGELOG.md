@@ -317,6 +317,30 @@
   the selector (25/50/100/200, within the inventory list endpoint's `le=500` cap)
   to `preferencesStore`, so the chosen page size persists across sessions;
   `preferencesStore` drops the unused `getSavedFilter`.
+- Fork version preview, diff, and restore (issue #622, ADR 0006 addendum): the
+  fork history panel's read-only version list gains per-version Preview (a
+  read-only render of that snapshot on the canvas, ghosted the same way the
+  parent-topology preview is, with a "Previewing version N" banner and Exit
+  control; editing, the wiring dialog, and Save all lock while it is up), Diff
+  (against another version or the current draft; `lib/forkDiff.ts` is the pure
+  client-side set-difference, keying an edge on (source, target,
+  source_port_name, target_port_name) rather than its own id so a redrawn
+  identical wire never reads as churn; added/removed devices and wires list in
+  the panel and added/removed edges color-highlight on the canvas), and Restore,
+  rendered ACTIVE-only mirroring the Wiring tab's Retry button. Restore is
+  restore-TO-DRAFT, never restore-and-reconcile, and appends no fork_versions
+  row itself: it copies the version's canvas onto the fork's draft
+  (`ReservationFork.draft_restored_from_id` tracks the pending, unsaved
+  restore, surfaced as an amber "Draft restored from version N (unsaved)"
+  chip), and nothing is wired until the existing Save runs, which is what
+  appends the version carrying the `restored_from_id` marker. New API:
+  `useForkVersion`/`useRestoreForkVersion` in `api/reservations.ts`, both
+  proxying the reservations-service endpoints under
+  `/reservations/{id}/fork/versions/{version_id}`. The preview/diff/restore
+  canvas state lives in one hook, `hooks/useForkVersionPreview.ts`, so
+  `TopologyEditorPage.tsx` only wires its result to the ReactFlow props and
+  `ForkHistoryPanel.tsx` rather than growing further inline. Closes the epic's
+  last `Partial` entry in `PLANNED_FEATURES.md`.
 
 #### Developer platform and CI
 

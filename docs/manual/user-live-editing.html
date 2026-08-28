@@ -65,7 +65,7 @@
     <ul class="list">
       <li><b>It exists from activation onward.</b> A <span class="badge pending">PENDING</span> reservation has no fork yet, so there is nothing to edit before it goes active.</li>
       <li><b>It's yours.</b> Only the reservation owner (or an admin) can open it, and it's editable only while the reservation is <span class="badge active">ACTIVE</span>.</li>
-      <li><b>It has its own version history.</b> Every commit appends a fork version. The fork history panel lists them (newest first, with author and timestamp) but is view-only &mdash; no preview, diff, or restore, unlike a standalone topology's history.</li>
+      <li><b>It has its own version history.</b> Every commit appends a fork version. The fork history panel lists them newest first, and each row offers <b>Preview</b> (a read-only render of that snapshot, with editing and Save locked until you exit), <b>Diff</b> (against another version or your current draft, with added/removed devices and wires listed and highlighted on the canvas), and, while the reservation is <span class="badge active">ACTIVE</span>, <b>Restore</b>. Restoring copies that snapshot onto your draft &mdash; nothing is wired until you Commit, and Commit is what appends the version marked "restored".</li>
       <li><b>It outlives the reservation</b> &mdash; as a frozen, read-only <a href="#asbuilt">as-built record</a>.</li>
     </ul>
 

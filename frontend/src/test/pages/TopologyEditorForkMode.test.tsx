@@ -75,6 +75,9 @@ function makeFork(overrides: Record<string, unknown> = {}) {
     versions: [
       { id: "fv-1", fork_id: "fork-1", version_number: 1, restored_from_id: null, created_at: "2026-06-01T00:00:00Z" },
     ],
+    // null except while the draft holds a restored-but-unsaved snapshot
+    // (issue #622 contract, revised 2026-08-28).
+    draft_restored_from_id: null,
     ...overrides,
   };
 }
@@ -215,5 +218,51 @@ describe("TopologyEditorPage live-edit fork mode", () => {
     expect(
       screen.queryByRole("button", { name: "Commit to reservation" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("previewing a fork version shows the history banner and locks editing (issue #622)", async () => {
+    const fork = makeFork();
+    server.use(
+      ...baseHandlers(fork),
+      http.get(`/api/reservations/${RES_ID}/fork/versions/fv-1`, () =>
+        HttpResponse.json({
+          id: "fv-1",
+          fork_id: "fork-1",
+          version_number: 1,
+          restored_from_id: null,
+          created_at: "2026-06-01T00:00:00Z",
+          canvas_data: { nodes: [forkNode("v1-node", "d-v1")], edges: [], selectedEdgeLayer: "L2" },
+        }),
+      ),
+    );
+    renderPage();
+
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    // Editable before entering preview.
+    expect(screen.getByText("EDITING LIVE RESERVATION")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("v1-node"),
+    );
+    // Read-only history banner is up, and the live-edit commit affordance
+    // (and thus Save/commit) is gone while it is.
+    expect(screen.getByText(/Previewing version 1/)).toBeInTheDocument();
+    expect(screen.queryByText("EDITING LIVE RESERVATION")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Commit to reservation" }),
+    ).not.toBeInTheDocument();
+
+    // Exiting restores the live draft the user was editing.
+    fireEvent.click(screen.getByRole("button", { name: /Exit preview/ }));
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+    expect(screen.getByText("EDITING LIVE RESERVATION")).toBeInTheDocument();
   });
 });

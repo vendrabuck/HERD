@@ -1,7 +1,8 @@
 # Decision: Fork Reconcile-on-Save and As-Built Archive, Issue #25 P3
 
-Status: Accepted; P3a delivered. Extends ADR 0001 (accepted), whose P1-P2 (fork
-schema and fork-on-activation) shipped in migration `0007_reservation_forks.py`.
+Status: Accepted; P3a delivered, including its former remainder (fork version
+preview, diff, and restore, issue #622). Extends ADR 0001 (accepted), whose P1-P2
+(fork schema and fork-on-activation) shipped in migration `0007_reservation_forks.py`.
 Resolves ADR 0001's open risks 1, 2, 4, and 5, and phases risk 3. P3a shipped in
 phases 1 to 5 (PRs #349, #353, #359, #360, and this docs sweep): the cabling
 internal fork surface, the reservations user-facing fork endpoints with teardown
@@ -290,3 +291,72 @@ Each phase is independently mergeable, matching the #32 delivery pattern.
    where the blast radius is smallest.
 4. Frontend removal of the parent PUT changes live-edit behavior users may
    have internalized; the release notes and USER_GUIDE must call it out.
+
+## Addendum: fork version preview, diff, and restore-to-draft (issue #622, 2026-08-28)
+
+P3a shipped the fork history panel read-only: a version list with no
+preview, diff, or restore, because those endpoints did not exist yet. Issue #622
+closed that gap, deciding restore as **restore-to-draft, never
+restore-and-reconcile**: restoring version K copies K's `canvas_data` onto
+the fork's DRAFT canvas and records that the draft came from K
+(`ReservationFork.draft_restored_from_id`, cleared again once the next Save
+runs). It does not itself append a `fork_versions` row and it drives no
+hardware. Nothing is wired until the user runs the existing Save, which
+already performs the set-arithmetic reconcile, the cross-reservation
+port-claim 409s, and the atomic `fork_wiring_ledger` advance plus
+`reservation.wiring_changed` staging: restore is a canvas operation that
+reuses that whole path unchanged, so a history-panel click can never drive
+hardware. The version that carries the "restored" marker
+(`ForkVersionSummary.restored_from_id`, the same column the parent-topology
+restore at `services/cabling/app/routes/versions.py:113-165` already used as
+precedent) is the NEW version that Save creates from the restored draft, not
+a version restore appends on its own.
+
+This shape was chosen over the initial draft, which had `POST
+.../restore` append a version directly (mirroring the parent-topology
+restore exactly): a version that appears before any reconcile ran would
+misrepresent what is actually wired, and would let a discarded restore (the
+user restores, then edits further, then commits something else entirely)
+leave a phantom version in the fork's audit trail that was never really
+"the" state at any point Save ran. Tying the marker to Save keeps the
+invariant "every fork_versions row is something Save actually reconciled to
+hardware" true without exception.
+
+Preview and diff are simpler: both are read-only renders of already-fetched
+version snapshots (`GET
+/reservations/{id}/fork/versions/{version_id}` = `ForkVersionSummary` plus
+`canvas_data`), with diff computed client-side as a set difference of nodes
+and edges (the same arithmetic the save path's reconcile does server-side
+for wires, keyed on a wire's (source, target, source_port_name,
+target_port_name) identity rather than the canvas edge's own id, since a
+redrawn identical wire gets a fresh client-generated id). No new
+cabling/reservations read surface was needed beyond the one version-detail
+endpoint; diffing two already-fetched payloads client-side was judged
+sufficient rather than adding a server-side diff endpoint (out of scope,
+recorded in the issue).
+
+Contract (implemented in `services/cabling/app/routes/forks.py` and
+`services/reservations/app/routers/reservations.py`):
+
+- `GET /internal/forks/{reservation_id}/versions/{version_id}` (internal) and
+  `GET /reservations/{id}/fork/versions/{version_id}` (user-facing, any
+  reservation status, owner-or-admin, mirroring `GET /{id}/fork`): the
+  version's `canvas_data` alongside its summary fields. 404 for a version
+  that does not belong to that reservation's fork.
+- `POST /internal/forks/{reservation_id}/versions/{version_id}/restore` and
+  `POST /reservations/{id}/fork/versions/{version_id}/restore` (user-facing,
+  ACTIVE only, owner-or-admin, mirroring the canvas PUT and save write
+  guards; 409 `{"error": "reservation_not_active"}` otherwise): sets the
+  fork's draft `canvas_data` to the version's payload and
+  `draft_restored_from_id` to the version's id; returns the loose-draft
+  canvas-update shape (`id`, `valid`, `invalid_edges`) plus
+  `draft_restored_from_id`. 404 for a foreign version, 409 when the fork is
+  archived.
+
+Frontend: `frontend/src/hooks/useForkVersionPreview.ts` owns the
+preview/diff/restore canvas state (a temporary store swap, restored on
+exit, the same technique the pre-existing parent-topology version preview
+used); `frontend/src/lib/forkDiff.ts` is the pure client-side diff;
+`ForkHistoryPanel.tsx` renders per-version Preview/Diff/(ACTIVE-only)
+Restore plus a "Draft restored from version N (unsaved)" chip derived from
+`draft_restored_from_id` while a restore is pending its Save.

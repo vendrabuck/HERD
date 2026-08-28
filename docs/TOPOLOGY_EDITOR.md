@@ -135,7 +135,7 @@ Every save writes a new version unless the canvas is byte-identical to the previ
 
 Permissions: restoring requires admin or the topology's original creator; any authenticated user with read access to the topology can view the version list and run a diff.
 
-The History sidebar above is for standalone topologies. A reservation's topology fork (see the next section) has its own version list with the same visual pattern, but it is view-only: forks have no preview, diff, or restore.
+The History sidebar above is for standalone topologies. A reservation's topology fork (see the next section) has its own version list with the same visual pattern, plus its own Preview/Diff/Restore actions described there.
 
 ## Live-edit mode (editing a reservation's topology)
 
@@ -147,6 +147,14 @@ When you open the editor bound to a reservation (from the reservation detail mod
 - **As-built (read-only).** After the reservation ends the fork is archived. The button becomes **View as-built** and the editor opens the fork read-only, showing the immutable as-built record of the last wiring the reservation was reconciled to.
 
 Only the reservation owner or an admin can open the fork, and the fork is editable only while the reservation is `ACTIVE`. A `PENDING` reservation has no fork yet, so it offers no topology editing.
+
+### Fork version preview, diff, and restore (issue #622)
+
+The fork's own History sidebar lists its versions the same way the standalone one does, but each row also offers:
+
+- **Preview.** Renders that version's canvas read-only on top of the live draft, with a purple "Previewing version N" banner and an **Exit preview** control. While it is up, editing, drawing wires, and Commit are all locked; exiting restores your draft exactly as you left it.
+- **Diff.** Pick a compare target for the row's version, either another version or "current draft", and click Compare. Added and removed devices and connections are listed in the panel and, for connections, color-highlighted on the canvas (green for added, red dashed for removed). Diff shares the same read-only lock as Preview while it is up.
+- **Restore**, shown only while the reservation is `ACTIVE` (the same rule as the Wiring tab's Retry button). Restore is a canvas operation, never a reconcile: it copies that version's canvas onto the fork's draft and nothing is wired until you run Commit. Because restore does not itself append a version, the panel shows an amber "Draft restored from version N (unsaved)" chip until the next Commit; that Commit is what appends the new version carrying the "restored" marker.
 
 ## AI generation (optional)
 

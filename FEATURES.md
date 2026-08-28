@@ -106,6 +106,18 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   hardware-retryable failures on top of the background auto-retry, both
   direction-aware (a failed release retries as a release). See ADR 0006, ADR 0007,
   and ADR 0009 (issues #345 and #416, delivered).
+- **Fork version preview, diff, and restore** (Shipped): the live-edit history
+  panel's per-version list (newest first) offers Preview, a client-side Diff, and
+  Restore. Preview renders a version's canvas read-only on top of the live draft,
+  banner and Exit visible, with editing, the wiring dialog, and Save all locked
+  until you exit. Diff compares any version against another version or the
+  current draft, listing added and removed devices and wires in the panel and
+  color-highlighting added/removed edges on the canvas. Restore copies a past
+  version's canvas onto the fork's draft; nothing is wired until the existing
+  Save runs, and Save is what appends the version carrying the "restored"
+  marker (a restore alone appends no version, only a "Draft restored from
+  version N (unsaved)" indicator that clears on Save). See the ADR 0006
+  addendum (issue #622).
 - **Shortest-path cable routing** (Shipped): on-demand BFS (minimum-hop) pathfinding through
   Layer 1 switch infrastructure, with visual feedback on the canvas (green stroke
   and hop-count badge when a path exists, red stroke when not).

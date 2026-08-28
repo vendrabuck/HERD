@@ -58,7 +58,11 @@ export interface GroupEdgesResult {
  * first member's, since those are not meaningfully per-member here.
  *
  * Proposal edges (AI ghost edges) are excluded from bundling: they are not
- * real committed wiring and should keep rendering individually.
+ * real committed wiring and should keep rendering individually. A fork
+ * version diff overlay edge (issue #622, `data.diffStatus` set) is excluded
+ * for the same reason: it is a read-only annotation, not a real duplicate
+ * wire, and bundling it would hide its added/removed color under a plain
+ * count badge.
  */
 export function groupEdgesForRender(
   edges: Edge<LayerEdgeData>[],
@@ -68,7 +72,7 @@ export function groupEdgesForRender(
   const order: string[] = [];
 
   for (const edge of edges) {
-    if (edge.data?.isProposal) continue;
+    if (edge.data?.isProposal || edge.data?.diffStatus) continue;
     const pairKey = [edge.source, edge.target].sort().join("::");
     if (!groups.has(pairKey)) {
       groups.set(pairKey, []);
@@ -77,7 +81,7 @@ export function groupEdgesForRender(
     groups.get(pairKey)!.push(edge);
   }
 
-  const proposals = edges.filter((e) => e.data?.isProposal);
+  const proposals = edges.filter((e) => e.data?.isProposal || e.data?.diffStatus);
   const renderEdges: RenderEdge[] = [];
   const bundleMembers = new Map<string, string[]>();
 
