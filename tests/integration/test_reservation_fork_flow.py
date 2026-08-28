@@ -216,6 +216,30 @@ async def _wiring_status(client, reservation_id: str) -> dict:
     return resp.json()
 
 
+async def _wait_for_applied_version(
+    client, reservation_id: str, version: int, *, timeout: float = 30.0, interval: float = 0.5
+) -> dict:
+    """Poll wiring-status until last_applied_fork_version reaches ``version``.
+
+    A save stages reservation.wiring_changed and returns before the NATS consumer
+    has necessarily applied it (CI caught exactly this race, PR #623: a
+    pre-restore snapshot taken right after a save can still show
+    last_applied_fork_version None or behind, then "catch up" on its own between
+    two otherwise-adjacent reads, with no restore call responsible for the
+    apparent change). Call this to settle onto a known-applied baseline before
+    snapshotting wiring-status for a before/after comparison. 30s cap matches the
+    other stack-dependent polls in this file (e.g. the standing-reconciler test).
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    status: dict = {}
+    while asyncio.get_event_loop().time() < deadline:
+        status = await _wiring_status(client, reservation_id)
+        if status.get("last_applied_fork_version") == version:
+            return status
+        await asyncio.sleep(interval)
+    return status
+
+
 def _endpoint_pair(delta: dict) -> frozenset:
     return frozenset(
         {(delta["device_a_id"], delta["port_a"]), (delta["device_b_id"], delta["port_b"])}
@@ -355,8 +379,17 @@ async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
 
         # Snapshot wiring-status AND the fork's version count right before the
         # restore, so both "restore changes nothing" assertions below are real
-        # before/after comparisons, not guesses.
-        pre_restore_status = await _wiring_status(admin_client, reservation_id)
+        # before/after comparisons, not guesses. Settle onto save #2's applied
+        # version (3) first: a save stages its wiring_changed event and returns
+        # before the NATS consumer has necessarily applied it (CI caught exactly
+        # this race, PR #623: an unsettled snapshot can "catch up" on its own
+        # between two otherwise-adjacent reads, with no restore call responsible
+        # for the apparent change).
+        pre_restore_status = await _wait_for_applied_version(admin_client, reservation_id, 3)
+        assert pre_restore_status.get("last_applied_fork_version") == 3, (
+            f"wiring ledger never settled onto save #2's version before the restore "
+            f"snapshot: {pre_restore_status}"
+        )
         pre_restore_fork = await admin_client.get(f"/reservations/{reservation_id}/fork")
         assert pre_restore_fork.status_code == 200, pre_restore_fork.text
         pre_restore_versions = pre_restore_fork.json()["versions"]
@@ -415,6 +448,18 @@ async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
         assert final_save.status_code == 200, final_save.text
         final_body = final_save.json()
         assert final_body["version_number"] == 4
+
+        # Settle onto the final save's applied version (4) before asserting the
+        # release: same race as the pre-restore snapshot above, just at the tail
+        # end of the flow. released/built below come from the save response
+        # itself (a synchronous cabling result, not the async wiring-status
+        # surface), so the settle-wait here is about leaving the ledger in a
+        # known-settled state rather than about racing this specific assertion.
+        settled_after_save = await _wait_for_applied_version(admin_client, reservation_id, 4)
+        assert settled_after_save.get("last_applied_fork_version") == 4, (
+            f"wiring ledger never settled onto the final save's version: {settled_after_save}"
+        )
+
         assert len(final_body["released"]) == 1
         assert _endpoint_pair(final_body["released"][0]) == frozenset(
             {(a_id, "eth2"), (c_id, "eth1")}
