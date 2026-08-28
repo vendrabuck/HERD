@@ -259,7 +259,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   retries across a messaging outage and prunes old rows, so an outage delays delivery
   instead of silently dropping a provisioning or notification event. Consumers dedupe
   on a stable per-event id, so a relay republish is recognized as a duplicate rather
-  than reprocessed. (Issue #21.)
+  than reprocessed. (Issue #21.) The underlying JetStream store itself is durable
+  under a production deployment (a mounted volume with a configurable retention cap)
+  and deliberately ephemeral under local dev, for clean-start test isolation.
+  (Issue #620.)
 - **Structured JSON logging** (Shipped): every service emits JSON logs with request
   middleware and business-event logging; per-service log level configurable.
 - **Config service** (Shipped): zero-database web UI for configuring HERD on first

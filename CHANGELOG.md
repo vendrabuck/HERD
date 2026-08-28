@@ -440,6 +440,36 @@
   existence with `stream_info`, so they no longer race a configured `max_age`
   into an in-use error. `docs/OPERATIONS.md` documents the ephemeral-vs-durable
   split and `docs/ENV_VARS.md` documents the new knob.
+- Reused-stack dedup fix for raw-published integration events (issue #611):
+  `test_health_alerting_flow.py`'s `_bad_news_event` and `_recovery_event` now
+  stamp a fresh payload `event_id`, and `_publish_health_event` sets the
+  matching `Nats-Msg-Id` header, mirroring what the outbox producer always
+  does. The dev/test NATS container has no volume, so a container recreate
+  resets stream sequences to 1 while Postgres still holds notification rows
+  keyed under the same `<stream>:<sequence>` dedupe key from an earlier run;
+  the next run's inserts then collided on the unique constraint and were
+  silently dropped as redeliveries. Stamping `event_id` gives every run its
+  own dedupe key regardless of stream sequence.
+- Shared auth test harness and generic `Paginated[T]` base (issue #511):
+  six auth test files (`test_api_tokens.py`, `test_internal.py`,
+  `test_groups.py`, `test_ldap_sync.py`, `test_auth.py`,
+  `test_routers_direct.py`) each carried a byte-identical in-memory SQLite
+  engine, sessionmaker, `get_db` override, and `setup_db` fixture, plus
+  drifted mock-user builder helpers. New `services/auth/tests/_harness.py`
+  holds the importable engine/sessionmaker/`mock_user` builder; `conftest.py`
+  gains the shared autouse `setup_db` fixture and a `make_client` factory.
+  Files that build a private engine by design (the LDAP-sync
+  service/reaper/loop suites, the `*_unit.py` files, `test_auth_ldap.py`,
+  `test_ldap_service*.py`) are untouched. Separately, `PaginatedUserResponse`,
+  `PaginatedGroupResponse`, `PaginatedMappingResponse`, and
+  `PaginatedSyncRunResponse` now subclass a new generic
+  `app/schemas/pagination.py::Paginated[T]` instead of repeating the same four
+  fields (`items`, `total`, `skip`, `limit`); subclassing rather than using the
+  bare generic as a `response_model` keeps the OpenAPI component names and
+  field order unchanged, so `tests/contract/snapshots/auth.json` needed no
+  edit. `Paginated` is deliberately auth-local; promotion to `herd_common`
+  waits for a second service wanting the same shape. Full auth suite: 442
+  passed, 43 skipped.
 
 ## [0.2.0] - 2026-08-03
 

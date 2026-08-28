@@ -61,11 +61,9 @@ heavy-usage reports become common
 
 ## Reliability and correctness
 
-- **AI provider misconfiguration returns 500 instead of 503 ([#245](https://github.com/vendrabuck/HERD/issues/245)).**
-  An unrecognized `AI_PROVIDER` makes `get_ai_client` raise a bare `RuntimeError` that
-  escapes as a 500 before the route's 503 gate runs, because the client is a FastAPI
-  dependency resolved first. `ai_is_configured()` and `get_ai_client()` disagree about the
-  same state; reconciling them at the source restores the documented degradation contract.
+The one issue previously tracked here (AI provider misconfiguration returning 500 instead
+of 503, [#245](https://github.com/vendrabuck/HERD/issues/245)) has closed and is pruned
+per this doc's own rule.
 
 ## Structural and refactor directions
 
