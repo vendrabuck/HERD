@@ -47,12 +47,12 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix coverage-,$(SERVICES)) \
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
-	test-frontend test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-stop test-auth-ldap \
+	test-frontend test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap \
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
-	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images
+	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run
 
 ## --- Meta ---
 
@@ -200,6 +200,10 @@ master-clean: _clean-images  ## master with all HERD compose images rebuilt --no
 # Differences from `master`:
 #   - `ruff format --check` instead of `ruff format` (no source mutation).
 #   - Runs backend and frontend tests under coverage (master skips coverage).
+#   - After seeding the gate stack, re-runs e2e via test-e2e-seeded (issue #629):
+#     the first e2e pass above runs against an unseeded stack, so tests gated on
+#     an available device always skip there; this second pass runs the same
+#     suite against the now-seeded stack and fails the phase on any skip.
 #   - Adds headless locust stress test after e2e.
 #   - On SUCCESS the gate stack is left RUNNING and seeded (a live,
 #     freshly-validated stack at https://localhost); `make gate-down` stops
@@ -260,6 +264,8 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 		$(MAKE) _gate-pg-live-tests && \
 		echo "" && echo "=== Seeding gate stack ===" && \
 		$(MAKE) _everything-seed && \
+		echo "" && echo "=== E2E tests (seeded, no skips allowed) ===" && \
+		$(MAKE) test-e2e-seeded COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		if [ "$(EVERYTHING_LOAD)" != "0" ]; then \
 			echo "" && echo "=== Load / stress tests ===" && \
 			HERD_BASE_URL=https://localhost $(MAKE) test-load; \
@@ -425,11 +431,20 @@ test-load:  ## Run headless locust load test (needs a running stack)
 test-load-ui:  ## Run locust with its web UI (needs a running stack)
 	cd tests/load && uv run locust -f locustfile.py --host $${HERD_BASE_URL:-https://localhost}
 
-test-e2e:  ## Run e2e tests, Selenium + Playwright (needs a running stack)
+# Shared body for test-e2e and test-e2e-seeded (issue #629), so the two
+# cannot drift apart. HERD_E2E_REQUIRE_NO_SKIP is whatever the caller's
+# environment/command line already has: test-e2e leaves it unset, test-e2e-seeded
+# sets it to 1 before invoking this via a recursive $(MAKE).
+_test-e2e-run:
 	-docker compose --profile e2e rm -fsv selenium
 	docker compose --profile e2e up -d --force-recreate selenium
 	uv run playwright install chromium  # no-op once cached; on a fresh host, missing OS libs need: uv run playwright install --with-deps chromium (sudo)
 	uv run pytest tests/e2e/ -v --tb=short
+
+test-e2e: _test-e2e-run  ## Run e2e tests, Selenium + Playwright (needs a running stack)
+
+test-e2e-seeded:  ## Run e2e tests against a seeded stack; fails if any test skips (issue #629)
+	HERD_E2E_REQUIRE_NO_SKIP=1 $(MAKE) _test-e2e-run
 
 test-e2e-stop:  ## Stop and remove the e2e Selenium container
 	-docker compose --profile e2e rm -fsv selenium

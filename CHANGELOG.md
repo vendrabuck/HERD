@@ -494,6 +494,26 @@
   edit. `Paginated` is deliberately auth-local; promotion to `herd_common`
   waits for a second service wanting the same shape. Full auth suite: 442
   passed, 43 skipped.
+- Seeded e2e phase, so a silently-skipping e2e test cannot hide behind a green
+  gate (issue #629): the `everything` recipe's existing `test-e2e` pass runs
+  before the gate stack is seeded, so every test gated on an available device
+  (the fork Playwright tests' `_pw_create_reserved_topology`, `pw_two_devices_with_ports`,
+  `transient_reservation`, ...) always skips there by design, and nothing in the
+  gate or in nightly.yml re-ran that suite once the stack was actually seeded. New
+  Make target `test-e2e-seeded` runs the identical `test-e2e` body (factored into a
+  shared `_test-e2e-run` helper so the two cannot drift) with
+  `HERD_E2E_REQUIRE_NO_SKIP=1`; `tests/e2e/conftest.py` gates a `pytest_sessionfinish`
+  hook on that env var, collects every skipped test (including setup-phase skips
+  from a fixture's own `pytest.skip()`) via `pytest_runtest_logreport`, and fails
+  the run if any remain, printing each skipped node id and its reason. `everything`
+  now runs `test-e2e-seeded` right after seeding the gate stack and before the
+  load-test tail, so `EVERYTHING_LOAD=0`/`everything-noload` still gets the seeded
+  e2e pass and only the load test itself is skipped; `master` is unchanged (no
+  seed phase to run the seeded pass against). `nightly.yml` runs the same target
+  right after its "Seed stack for load test" step. The unseeded `test-e2e` pass
+  is kept as-is: it exercises the empty-stack UI paths deliberately, this is
+  additive. `format_skip_block`, the pure formatting function behind the report
+  block, is pinned directly in `tests/unit/test_e2e_seed_gate.py`.
 
 ## [0.2.0] - 2026-08-03
 

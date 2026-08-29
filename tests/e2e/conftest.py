@@ -62,6 +62,67 @@ ADMIN_PASSWORD = os.environ.get("E2E_PASSWORD") or os.environ.get(
 
 WAIT_TIMEOUT = 15
 
+# -- Seeded-stack skip gate (issue #629) --------------------------------------
+#
+# make test-e2e runs before the gate stack is seeded (both in the everything
+# recipe and in nightly.yml), so every test gated on an available device
+# (transient_reservation above, pw_two_devices_with_ports, the fork tests'
+# _pw_create_reserved_topology helper, ...) always skips there by design; that
+# pass exercises the empty-stack UI paths instead. HERD_E2E_REQUIRE_NO_SKIP=1
+# (set by `make test-e2e-seeded`) re-runs the identical suite against a
+# seeded stack and turns any remaining skip into a failure, so a silent skip
+# regression on the seeded pass shows up red instead of a quiet pass.
+HERD_E2E_REQUIRE_NO_SKIP = "HERD_E2E_REQUIRE_NO_SKIP"
+
+_skip_reports: list[tuple[str, str]] = []
+
+
+def _skip_reason(report: pytest.TestReport) -> str:
+    """Best-effort human-readable reason from a skipped test's longrepr."""
+    longrepr = report.longrepr
+    if isinstance(longrepr, tuple) and len(longrepr) == 3:
+        return str(longrepr[2])
+    if longrepr:
+        return str(longrepr)
+    return "skipped"
+
+
+def format_skip_block(skips: list[tuple[str, str]]) -> str:
+    """Render collected (nodeid, reason) pairs as the failure-mode report block.
+
+    Pure and stack-free (no pytest hook machinery) so it can be unit tested
+    directly, in tests/unit/test_e2e_seed_gate.py, without importing this
+    module's Selenium/Playwright fixtures.
+    """
+    lines = [f"HERD_E2E_REQUIRE_NO_SKIP=1: {len(skips)} test(s) skipped on a seeded stack:"]
+    for nodeid, reason in skips:
+        lines.append(f"  {nodeid}: {reason}")
+    return "\n".join(lines)
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Collect every skipped test, including setup-phase skips.
+
+    A test skipped by a fixture (most of this gate's cases: transient_reservation,
+    pw_two_devices_with_ports, _pw_create_reserved_topology) reports skipped at
+    "setup"; a test that calls pytest.skip() itself reports at "call". Only one
+    of the two phases is ever skipped for a given test, so no dedup is needed.
+    """
+    if report.skipped and report.when in ("setup", "call"):
+        _skip_reports.append((report.nodeid, _skip_reason(report)))
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Fail the whole run if HERD_E2E_REQUIRE_NO_SKIP=1 and anything skipped.
+
+    Inert (a no-op) without the env var, so a plain `make test-e2e` run is
+    unaffected.
+    """
+    if os.environ.get(HERD_E2E_REQUIRE_NO_SKIP) != "1" or not _skip_reports:
+        return
+    print("\n" + format_skip_block(_skip_reports) + "\n")
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
 
 def _make_chrome_options():
     options = Options()
