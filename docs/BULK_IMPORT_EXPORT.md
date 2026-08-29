@@ -203,6 +203,15 @@ with the endpoint devices named. CSV is a convenience view of the wiring graph:
 it does not carry isolated nodes (a device node with no edges), so use JSON when
 a topology has unconnected devices.
 
+CSV also does not carry network element nodes or their attachment edges (see
+[TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#network-elements)): the CSV row shape
+is keyed by resolved device names on both ends, and an element endpoint has no
+device name to resolve to, so a row for it would just be blank and
+meaningless. This is a documented limitation of the CSV format, not a bug:
+CSV is the intentionally lossy interchange format, and JSON round-trips a
+topology's element nodes and attachments byte-for-byte, same as it does for
+every other canvas node kind.
+
 ## Validation on import
 
 A topology import runs the existing `build_adjacency_graph` and validate path

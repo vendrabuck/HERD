@@ -19,6 +19,7 @@ from app.schemas.topology import (
     TopologyUpdate,
     TopologyValidationResponse,
 )
+from app.services.fork_save_service import classify_element_edge, node_to_element_map
 from app.services.pathfind_service import (
     build_adjacency_graph,
     find_all_shortest_paths_batch_async,
@@ -226,6 +227,11 @@ async def _run_topology_validation(
         except (ValueError, TypeError):
             continue
 
+    # node_id to network element id (ADR 0012 phase 1, issue #22). Shared with
+    # resolve_canvas_wiring's classification via node_to_element_map so the validator
+    # and the fork-save resolver agree on which edges are element attachments.
+    node_to_element = node_to_element_map(canvas)
+
     if not edges:
         return TopologyValidationResponse(valid=True, invalid_edges=[])
 
@@ -259,6 +265,38 @@ async def _run_topology_validation(
         target_node = edge.get("target")
         source_device = node_to_device.get(source_node) if source_node else None
         target_device = node_to_device.get(target_node) if target_node else None
+
+        # Network element classification (ADR 0012 phase 1, issue #22), via the
+        # classifier shared with resolve_canvas_wiring. Checked before the
+        # missing_device fallback so an element edge is classified on its own terms
+        # rather than as a dangling device reference.
+        classification = classify_element_edge(edge, node_to_device, node_to_element)
+
+        if classification == "element_to_element":
+            edge_results[idx] = InvalidEdge(
+                edge_id=edge_id,
+                source_device_id=None,
+                target_device_id=None,
+                layer=layer,
+                reason="element_to_element",
+            )
+            continue
+
+        if classification == "element_edge_no_port":
+            edge_results[idx] = InvalidEdge(
+                edge_id=edge_id,
+                source_device_id=source_device,
+                target_device_id=target_device,
+                layer=layer,
+                reason="element_edge_no_port",
+            )
+            continue
+
+        if classification == "attachment":
+            # VALID declarative attachment: no BFS, not added to `pending`. An
+            # element is not a physical thing the cabling graph could contain a
+            # path to.
+            continue
 
         if source_device is None or target_device is None:
             edge_results[idx] = InvalidEdge(

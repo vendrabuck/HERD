@@ -167,6 +167,10 @@ export interface ForkSaveResult {
   released: ForkConnectionDelta[];
   built: ForkConnectionDelta[];
   unchanged_count: number;
+  // ADR 0012 phase 1: count of device-to-element edges the resolver skipped
+  // explicitly (declarative attachments never become a wiring hop). Optional
+  // since the backend defaults it to 0 and older responses may omit it.
+  element_attachments_skipped?: number;
 }
 
 // One port already claimed by another ACTIVE reservation, from a save 409.

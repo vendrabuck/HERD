@@ -1,8 +1,11 @@
 import { useState, useDeferredValue, useMemo } from "react";
+import type { LucideIcon } from "lucide-react";
 import { useDevices } from "@/api/inventory";
 import { useTemplates } from "@/api/templates";
+import { NETWORK_ELEMENT_TYPES } from "@/lib/networkElements";
 import type { Device, TopologyType } from "@/types/device.types";
 import type { DeviceTemplate } from "@/types/template.types";
+import type { NetworkElementType } from "@/types/topology.types";
 
 function TemplateIcon({ device }: { device: Device }) {
   if (device.template_icon) {
@@ -94,6 +97,41 @@ function DynamicTemplateCard({ template }: { template: DeviceTemplate }) {
   );
 }
 
+function NetworkElementCard({
+  type,
+  label,
+  icon: Icon,
+}: {
+  type: NetworkElementType;
+  label: string;
+  icon: LucideIcon;
+}) {
+  const onDragStart = (e: React.DragEvent) => {
+    e.dataTransfer.setData(
+      "application/herd-network-element",
+      JSON.stringify({ element_type: type, label }),
+    );
+    e.dataTransfer.effectAllowed = "copy";
+  };
+
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      className="flex items-center gap-2 p-2 rounded border border-dashed border-gray-300 bg-gray-50 cursor-grab active:cursor-grabbing hover:shadow-sm transition-shadow select-none"
+      title="Drag onto canvas"
+    >
+      <span className="inline-flex items-center justify-center w-5 h-5 rounded bg-gray-200 text-gray-600 shrink-0">
+        <Icon className="w-3.5 h-3.5" />
+      </span>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium truncate">{label}</p>
+        <p className="text-xs text-gray-500 truncate">Reachability hub</p>
+      </div>
+    </div>
+  );
+}
+
 function ChevronIcon({ expanded }: { expanded: boolean }) {
   return (
     <svg
@@ -118,6 +156,7 @@ export function EquipmentBrowser({ canvasDeviceIds = [] }: EquipmentBrowserProps
   const [search, setSearch] = useState("");
   const [showReserved, setShowReserved] = useState(true);
   const [showDynamic, setShowDynamic] = useState(true);
+  const [showNetworkElements, setShowNetworkElements] = useState(true);
   const deferredSearch = useDeferredValue(search);
 
   const { data: templates } = useTemplates("device");
@@ -254,6 +293,28 @@ export function EquipmentBrowser({ canvasDeviceIds = [] }: EquipmentBrowserProps
           )}
         </div>
       )}
+
+      {/* Network elements: the four v1 types are static, not fetched, so
+          unlike the dynamic-templates section this one always renders (ADR
+          0012 "Editing surface"). */}
+      <div className="border-t border-gray-200 bg-white">
+        <button
+          type="button"
+          onClick={() => setShowNetworkElements((v) => !v)}
+          aria-expanded={showNetworkElements}
+          className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-50 transition-colors"
+        >
+          Network elements
+          <ChevronIcon expanded={showNetworkElements} />
+        </button>
+        {showNetworkElements && (
+          <div className="px-2 pb-2 space-y-1.5">
+            {NETWORK_ELEMENT_TYPES.map((entry) => (
+              <NetworkElementCard key={entry.type} type={entry.type} label={entry.label} icon={entry.icon} />
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* Legend */}
       <div className="px-3 py-2 border-t border-gray-200 bg-white">

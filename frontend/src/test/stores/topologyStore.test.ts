@@ -1,6 +1,11 @@
 import { useTopologyStore } from "@/stores/topologyStore";
 import type { Node, Edge } from "@xyflow/react";
-import type { DeviceNodeData, LayerEdgeData, CanvasData } from "@/types/topology.types";
+import type {
+  DeviceNodeData,
+  LayerEdgeData,
+  CanvasData,
+  NetworkElementNodeData,
+} from "@/types/topology.types";
 
 const makeNode = (id: string): Node<DeviceNodeData> =>
   ({
@@ -13,6 +18,16 @@ const makeNode = (id: string): Node<DeviceNodeData> =>
       topologyType: "PHYSICAL",
     },
   }) as Node<DeviceNodeData>;
+
+const makeElementNode = (id: string, label = "VLAN segment"): Node<NetworkElementNodeData> =>
+  ({
+    id,
+    type: "networkElementNode",
+    position: { x: 0, y: 0 },
+    data: {
+      element: { id: `elem-${id}`, element_type: "vlan_segment", label, attrs: {} },
+    },
+  }) as Node<NetworkElementNodeData>;
 
 const makeEdge = (id: string, source: string, target: string): Edge<LayerEdgeData> =>
   ({
@@ -283,5 +298,125 @@ describe("topologyStore", () => {
     const state = useTopologyStore.getState();
     expect(state.nodes.map((n) => n.id)).toEqual(["keep"]);
     expect(state.edges.map((e) => e.id)).toEqual(["ke"]);
+  });
+
+  describe("network element edge normalization (ADR 0012 Attachments)", () => {
+    it("addEnrichedEdge leaves a device-first, element-target connection unchanged", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("dev"));
+      useTopologyStore.getState().addDeviceNode(makeElementNode("elem"));
+      useTopologyStore
+        .getState()
+        .addEnrichedEdge(
+          { source: "dev", target: "elem", sourceHandle: null, targetHandle: null },
+          { layer: "L2", source_port_name: "eth0" },
+        );
+      const edge = useTopologyStore.getState().edges[0];
+      expect(edge.source).toBe("dev");
+      expect(edge.target).toBe("elem");
+      expect(edge.data?.source_port_name).toBe("eth0");
+    });
+
+    it("addEnrichedEdge normalizes an element-first connection so the device becomes source", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("dev"));
+      useTopologyStore.getState().addDeviceNode(makeElementNode("elem"));
+      // Drawn element-first (e.g. a drag started from the element's handle).
+      useTopologyStore
+        .getState()
+        .addEnrichedEdge(
+          { source: "elem", target: "dev", sourceHandle: "a", targetHandle: "b" },
+          { layer: "L2", source_port_name: "eth1" },
+        );
+      const edge = useTopologyStore.getState().edges[0];
+      expect(edge.source).toBe("dev");
+      expect(edge.target).toBe("elem");
+      // Handles swap along with the endpoints.
+      expect(edge.sourceHandle).toBe("b");
+      expect(edge.targetHandle).toBe("a");
+      // The port name (device-side data) is untouched by the swap.
+      expect(edge.data?.source_port_name).toBe("eth1");
+    });
+
+    it("addEnrichedEdges normalizes every item in a batch independently", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("dev1"));
+      useTopologyStore.getState().addDeviceNode(makeNode("dev2"));
+      useTopologyStore.getState().addDeviceNode(makeElementNode("elem"));
+      useTopologyStore.getState().addEnrichedEdges([
+        {
+          connection: { source: "elem", target: "dev1", sourceHandle: null, targetHandle: null },
+          data: { layer: "L2", source_port_name: "p1" },
+        },
+        {
+          connection: { source: "dev2", target: "elem", sourceHandle: null, targetHandle: null },
+          data: { layer: "L2", source_port_name: "p2" },
+        },
+      ]);
+      const edges = useTopologyStore.getState().edges;
+      expect(edges).toHaveLength(2);
+      // Both land device-source, element-target, regardless of drawn direction.
+      expect(edges.every((e) => e.source === "dev1" || e.source === "dev2")).toBe(true);
+      expect(edges.every((e) => e.target === "elem")).toBe(true);
+    });
+
+    it("does not normalize when the target does not resolve to a node on the canvas", () => {
+      // Review fix: the swap used to fire whenever source was an element and
+      // target was NOT resolvably an element, which incorrectly included an
+      // unresolved (missing) target. Both endpoints must resolve for the
+      // swap to apply; an unresolved one passes through unchanged.
+      useTopologyStore.getState().addDeviceNode(makeElementNode("elem"));
+      useTopologyStore
+        .getState()
+        .addEnrichedEdge(
+          { source: "elem", target: "missing-node", sourceHandle: null, targetHandle: null },
+          { layer: "L2", source_port_name: "eth0" },
+        );
+      const edge = useTopologyStore.getState().edges[0];
+      expect(edge.source).toBe("elem");
+      expect(edge.target).toBe("missing-node");
+    });
+
+    it("does not normalize when the source does not resolve to a node on the canvas", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("dev"));
+      useTopologyStore
+        .getState()
+        .addEnrichedEdge(
+          { source: "missing-node", target: "dev", sourceHandle: null, targetHandle: null },
+          { layer: "L2" },
+        );
+      const edge = useTopologyStore.getState().edges[0];
+      expect(edge.source).toBe("missing-node");
+      expect(edge.target).toBe("dev");
+    });
+
+    it("does not normalize a plain device-to-device connection", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("a"));
+      useTopologyStore.getState().addDeviceNode(makeNode("b"));
+      useTopologyStore
+        .getState()
+        .addEnrichedEdge({ source: "b", target: "a", sourceHandle: null, targetHandle: null }, { layer: "L1" });
+      const edge = useTopologyStore.getState().edges[0];
+      expect(edge.source).toBe("b");
+      expect(edge.target).toBe("a");
+    });
+
+    it("setNetworkElementLabel updates only the targeted element node's label", () => {
+      useTopologyStore.getState().addDeviceNode(makeElementNode("e1", "Original"));
+      useTopologyStore.getState().addDeviceNode(makeElementNode("e2", "Other"));
+      useTopologyStore.getState().setNetworkElementLabel("e1", "Renamed");
+      const nodes = useTopologyStore.getState().nodes;
+      expect((nodes.find((n) => n.id === "e1")?.data as NetworkElementNodeData).element.label).toBe(
+        "Renamed",
+      );
+      expect((nodes.find((n) => n.id === "e2")?.data as NetworkElementNodeData).element.label).toBe(
+        "Other",
+      );
+    });
+
+    it("setNetworkElementLabel is a no-op for a non-element node id", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("dev"));
+      const before = useTopologyStore.getState().nodes;
+      useTopologyStore.getState().setNetworkElementLabel("dev", "Should not apply");
+      const after = useTopologyStore.getState().nodes;
+      expect((after[0].data as DeviceNodeData).label).toBe(before[0].data.label);
+    });
   });
 });

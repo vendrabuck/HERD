@@ -40,6 +40,12 @@ export function ForkSaveResultToast({ result, onDismiss }: ForkSaveResultToastPr
             Released {result.released.length}, built {result.built.length}, unchanged{" "}
             {result.unchanged_count}
           </p>
+          {!!result.element_attachments_skipped && result.element_attachments_skipped > 0 && (
+            <p className="text-xs text-gray-600 mt-0.5">
+              {result.element_attachments_skipped} element attachment
+              {result.element_attachments_skipped === 1 ? "" : "s"} recorded (not wired)
+            </p>
+          )}
           {hasDetail && (
             <button
               onClick={() => setExpanded((v) => !v)}

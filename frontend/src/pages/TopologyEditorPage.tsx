@@ -29,6 +29,12 @@ import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
 import { hydrateAndLoadCanvas } from "@/lib/canvasHydration";
+import {
+  isDynamicPlaceholder,
+  isNetworkElement,
+  isDeviceNode,
+  collectCanvasDeviceIds,
+} from "@/lib/canvasNodes";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
@@ -36,6 +42,10 @@ import { FloatingPanel } from "@/components/ui/FloatingPanel";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CreateReservationModal } from "@/components/reservations/CreateReservationModal";
 import { WiringDialog, type SessionConnection } from "@/components/topology-editor/WiringDialog";
+import {
+  ElementAttachDialog,
+  type ElementAttachSelection,
+} from "@/components/topology-editor/ElementAttachDialog";
 import { QuickConnectPopover } from "@/components/topology-editor/QuickConnectPopover";
 import { AIDialog } from "@/components/topology-editor/AIDialog";
 import { AICommitDialog } from "@/components/topology-editor/AICommitDialog";
@@ -54,6 +64,7 @@ import { useCreateTemplateFromTopology } from "@/api/topologyTemplates";
 import apiClient from "@/api/client";
 import { DeviceNode } from "@/components/topology-editor/nodes/DeviceNode";
 import { DynamicPlaceholderNode } from "@/components/topology-editor/nodes/DynamicPlaceholderNode";
+import { NetworkElementNode } from "@/components/topology-editor/nodes/NetworkElementNode";
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
 import { BundledEdge } from "@/components/topology-editor/edges/BundledEdge";
 import { groupEdgesForRender, isAnnotationEdge } from "@/components/topology-editor/edges/groupEdgesForRender";
@@ -65,11 +76,12 @@ import type { AIGenerateResponse } from "@/types/ai.types";
 import type { ForkConflictDetail } from "@/types/reservation.types";
 import type {
   CanvasData,
-  CanvasNodeData,
   DeviceNodeData,
   DynamicPlaceholderNodeData,
   EdgeLayerType,
   LayerEdgeData,
+  NetworkElementNodeData,
+  NetworkElementType,
   TopologyVersion,
   TopologyVersionDetail,
 } from "@/types/topology.types";
@@ -91,13 +103,27 @@ interface PendingConnection {
   surface: "quick" | "dialog";
 }
 
-const nodeTypes = { deviceNode: DeviceNode, dynamicPlaceholderNode: DynamicPlaceholderNode };
-const edgeTypes = { layerEdge: LayerEdge, bundledEdge: BundledEdge };
+// ADR 0012 "Editing surface": a device-to-element line opens ElementAttachDialog
+// instead of either wiring surface above. Kept as its own state (not folded
+// into PendingConnection) since the shapes genuinely differ: one element id/
+// label/type on one side instead of a second device.
+interface PendingElementAttach {
+  connection: Connection;
+  deviceId: string;
+  deviceName: string;
+  deviceTopologyType: TopologyType;
+  elementNodeId: string;
+  elementId: string;
+  elementLabel: string;
+  elementType: NetworkElementType;
+}
 
-// Placeholder nodes are canvas-local planning artifacts: no inventory device
-// id, no cabling, never persisted as devices or wiring.
-const isDynamicPlaceholder = (node: Node<CanvasNodeData>) =>
-  node.type === "dynamicPlaceholderNode";
+const nodeTypes = {
+  deviceNode: DeviceNode,
+  dynamicPlaceholderNode: DynamicPlaceholderNode,
+  networkElementNode: NetworkElementNode,
+};
+const edgeTypes = { layerEdge: LayerEdge, bundledEdge: BundledEdge };
 
 // React Flow annotates edges it manages as a controlled component with its
 // own transient fields (selected, animated, style, zIndex); none of these
@@ -375,6 +401,9 @@ function TopologyEditorInner() {
   const [showAIDialog, setShowAIDialog] = useState(false);
   const [showAICommit, setShowAICommit] = useState(false);
   const [pendingConnection, setPendingConnection] = useState<PendingConnection | null>(null);
+  const [pendingElementAttach, setPendingElementAttach] = useState<PendingElementAttach | null>(
+    null,
+  );
   // Entry-point resolution (issue #517 addendum decision 1 left the concrete
   // trigger open): the full wiring dialog is the primary post-draw surface.
   // "Quick connect" is a toolbar toggle that, while on, opens the compact
@@ -407,6 +436,27 @@ function TopologyEditorInner() {
     }
     return { sourcePortIds, targetPortIds };
   }, [edges, pendingConnection]);
+
+  // Same cross-session duplicate-prevention rule for ElementAttachDialog (ADR
+  // 0012 "Editing surface", "identical to WiringDialog's rule"): a port
+  // already wired on the canvas to ANY node, device or element, is
+  // unavailable. Only the pending device's own node id is relevant here;
+  // there is no counterpart-device side to also track.
+  const existingWiredElementDevicePortIds = useMemo(() => {
+    const portIds = new Set<string>();
+    if (!pendingElementAttach) return portIds;
+    const pendingDeviceNode = pendingElementAttach.connection.source === pendingElementAttach.elementNodeId
+      ? pendingElementAttach.connection.target
+      : pendingElementAttach.connection.source;
+    for (const e of edges) {
+      if (isAnnotationEdge(e.data)) continue;
+      const srcPortId = e.data?.source_port_id;
+      const tgtPortId = e.data?.target_port_id;
+      if (e.source === pendingDeviceNode && srcPortId) portIds.add(srcPortId);
+      if (e.target === pendingDeviceNode && tgtPortId) portIds.add(tgtPortId);
+    }
+    return portIds;
+  }, [edges, pendingElementAttach]);
 
   const [pendingProposal, setPendingProposal] = useState<AIGenerateResponse | null>(null);
   const [showHistory, setShowHistory] = useState(false);
@@ -481,13 +531,14 @@ function TopologyEditorInner() {
     };
   }, [id, reservationId]);
 
+  // Excludes both placeholders (no device id) and network elements (no
+  // `data.device` at all; reading `.device.id` on one would throw, ADR 0012
+  // "Canvas shape" site :489).
   const allDeviceIds = useMemo(
     () =>
       [
         ...new Set(
-          nodes
-            .filter((n) => !isDynamicPlaceholder(n))
-            .map((n) => (n.data as DeviceNodeData).device.id)
+          nodes.filter(isDeviceNode).map((n) => (n.data as DeviceNodeData).device.id)
         ),
       ],
     [nodes]
@@ -504,6 +555,11 @@ function TopologyEditorInner() {
     [nodes]
   );
 
+  // A true result no longer implies both endpoints are device nodes (ADR
+  // 0012 "Attachments"): device-to-element is a valid connection too, and
+  // skips the topology-type check below since it only makes sense between
+  // two devices. Callers branching on the result (handleConnect) must still
+  // check isNetworkElement themselves before reading either side's `.device`.
   const isValidConnection = useCallback(
     (connection: Connection | { source: string; target: string }): boolean => {
       const sourceNode = nodes.find((n) => n.id === connection.source);
@@ -516,6 +572,21 @@ function TopologyEditorInner() {
           id: "dynamic-placeholder",
         });
         return false;
+      }
+
+      // ADR 0012 "Attachments": element-to-element is refused, since neither
+      // side has a device or a port. Device-to-element is the whole feature,
+      // so it is valid here (and skips the topology-type check below, which
+      // only makes sense between two devices) and branches in handleConnect
+      // to open ElementAttachDialog instead of the wiring dialogs.
+      if (isNetworkElement(sourceNode) && isNetworkElement(targetNode)) {
+        toast.error("Network elements cannot be linked to each other", {
+          id: "element-to-element",
+        });
+        return false;
+      }
+      if (isNetworkElement(sourceNode) || isNetworkElement(targetNode)) {
+        return true;
       }
 
       const sourceType = (sourceNode.data as DeviceNodeData).device.topology_type;
@@ -570,6 +641,31 @@ function TopologyEditorInner() {
         return;
       }
 
+      const elementJson = event.dataTransfer.getData("application/herd-network-element");
+      if (elementJson) {
+        // Unlike the placeholder branch, multiple elements of the same type
+        // are allowed (ADR 0012 "Editing surface"): a topology can carry two
+        // distinct VLAN segments, so there is no "already on canvas" guard
+        // here.
+        const dragged: { element_type: NetworkElementType; label: string } = JSON.parse(elementJson);
+        const position = screenToFlowPosition({ x: event.clientX, y: event.clientY });
+        const node: Node<NetworkElementNodeData> = {
+          id: genId(),
+          type: "networkElementNode",
+          position,
+          data: {
+            element: {
+              id: genId(),
+              element_type: dragged.element_type,
+              label: dragged.label,
+              attrs: {},
+            },
+          },
+        };
+        addDeviceNode(node);
+        return;
+      }
+
       const deviceJson = event.dataTransfer.getData("application/herd-device");
       if (!deviceJson) return;
 
@@ -613,6 +709,28 @@ function TopologyEditorInner() {
       // isValidConnection already refuses these with a toast; guard again so a
       // placeholder can never reach the port-selection modal.
       if (isDynamicPlaceholder(sourceNode) || isDynamicPlaceholder(targetNode)) return;
+
+      // ADR 0012 "Editing surface": device-to-element opens ElementAttachDialog.
+      // isValidConnection already refuses element-to-element with a toast;
+      // guard again here so it can never reach either modal.
+      if (isNetworkElement(sourceNode) || isNetworkElement(targetNode)) {
+        if (isNetworkElement(sourceNode) && isNetworkElement(targetNode)) return;
+        const elementNode = isNetworkElement(sourceNode) ? sourceNode : targetNode;
+        const deviceNode = isNetworkElement(sourceNode) ? targetNode : sourceNode;
+        const element = (elementNode.data as NetworkElementNodeData).element;
+        const device = (deviceNode.data as DeviceNodeData).device;
+        setPendingElementAttach({
+          connection,
+          deviceId: device.id,
+          deviceName: device.name,
+          deviceTopologyType: device.topology_type,
+          elementNodeId: elementNode.id,
+          elementId: element.id,
+          elementLabel: element.label,
+          elementType: element.element_type,
+        });
+        return;
+      }
 
       const sourceDevice = (sourceNode.data as DeviceNodeData).device;
       const targetDevice = (targetNode.data as DeviceNodeData).device;
@@ -688,6 +806,36 @@ function TopologyEditorInner() {
     setPendingConnection((pc) => (pc ? { ...pc, surface: "dialog" } : pc));
   }, []);
 
+  // ElementAttachDialog confirm: every selected port becomes its own
+  // attachment edge, added in ONE addEnrichedEdges call (ADR 0012 "Editing
+  // surface"). source_port_name is set, no target port (the element side has
+  // no ports). The store's addEnrichedEdges normalizes direction so the
+  // device always lands as source regardless of which side the drawn
+  // connection started from.
+  const handleElementAttachConfirm = useCallback(
+    (selections: ElementAttachSelection[]) => {
+      if (!pendingElementAttach) return;
+      const conn = pendingElementAttach.connection;
+      addEnrichedEdges(
+        selections.map((sel) => ({
+          connection: conn,
+          data: {
+            layer: selectedEdgeLayer,
+            source_port_id: sel.portId,
+            source_port_name: sel.portName,
+            pathValid: null,
+          } satisfies LayerEdgeData,
+        })),
+      );
+      setPendingElementAttach(null);
+    },
+    [pendingElementAttach, addEnrichedEdges, selectedEdgeLayer],
+  );
+
+  const handleElementAttachCancel = useCallback(() => {
+    setPendingElementAttach(null);
+  }, []);
+
   const handleAIProposal = useCallback(
     (response: AIGenerateResponse) => {
       // Reject any stale proposal before rendering the new one
@@ -703,11 +851,7 @@ function TopologyEditorInner() {
 
       // Skip any resolved device that is already on the canvas; the resolver
       // cannot see the canvas and could pick a device the user just dropped.
-      const canvasDeviceIdSet = new Set(
-        nodes
-          .filter((n) => !isDynamicPlaceholder(n) && !(n.data as DeviceNodeData).isProposal)
-          .map((n) => (n.data as DeviceNodeData).device.id)
-      );
+      const canvasDeviceIdSet = collectCanvasDeviceIds(nodes);
       const duplicates = response.devices.filter(
         (d) => d.device && canvasDeviceIdSet.has(d.device.id)
       );
@@ -1157,6 +1301,7 @@ function TopologyEditorInner() {
             <MiniMap
               nodeColor={(node) => {
                 if (node.type === "dynamicPlaceholderNode") return "#a855f7";
+                if (node.type === "networkElementNode") return "#9ca3af";
                 const data = node.data as DeviceNodeData;
                 return data?.device?.topology_type === "CLOUD" ? "#a855f7" : "#3b82f6";
               }}
@@ -1234,6 +1379,20 @@ function TopologyEditorInner() {
             existingWiredTargetPortIds={existingWiredPortIds.targetPortIds}
             onConfirm={handleWiringConfirm}
             onCancel={handleConnectionCancel}
+          />
+        )}
+
+        {pendingElementAttach && (
+          <ElementAttachDialog
+            open={!!pendingElementAttach}
+            deviceId={pendingElementAttach.deviceId}
+            deviceName={pendingElementAttach.deviceName}
+            deviceTopologyType={pendingElementAttach.deviceTopologyType}
+            elementLabel={pendingElementAttach.elementLabel}
+            elementType={pendingElementAttach.elementType}
+            existingWiredPortIds={existingWiredElementDevicePortIds}
+            onConfirm={handleElementAttachConfirm}
+            onCancel={handleElementAttachCancel}
           />
         )}
 

@@ -90,6 +90,25 @@ class TopologyRestoreRequest(BaseModel):
 
 
 class InvalidEdge(BaseModel):
+    """One canvas edge `_run_topology_validation` could not accept, with why.
+
+    ``reason`` is a plain str (no enum), currently one of:
+
+    - ``missing_device``: an endpoint's node id resolves to neither a known device nor
+      a network element.
+    - ``no_path``: both endpoints are known devices, but the cabling graph has no
+      physical path between them.
+    - ``element_to_element`` (ADR 0012 phase 1, issue #22): both endpoints are network
+      element nodes. Two elements have no device and no port between them.
+    - ``element_edge_no_port`` (ADR 0012 phase 1): one endpoint is a network element
+      and the other a known device, but the device-side port name
+      (``source_port_name``/``target_port_name``, whichever names the device) is
+      missing or empty.
+
+    A device-to-element edge with a non-empty device-side port name is VALID and never
+    appears here.
+    """
+
     edge_id: str
     source_device_id: OptionalUUIDStr = None
     target_device_id: OptionalUUIDStr = None

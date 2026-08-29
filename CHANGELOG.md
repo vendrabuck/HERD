@@ -204,6 +204,52 @@
 
 #### Cabling and inventory
 
+- Network element objects, phase 1 of 3, cabling backend only (ADR 0012, refs
+  issue #22; frontend and docs land in later phases). A network element is a
+  non-device canvas node (`networkElementNode`) many device ports can attach
+  to with a many-to-one edge, modeling a shared VLAN segment, subnet, external
+  cloud, or patch-panel trunk without a full mesh of point-to-point links or a
+  new registry table (canvas-native and topology-local by decision).
+  `node_to_element_map` (`fork_save_service.py`, beside `node_to_device_map`)
+  maps React Flow node ids to element ids for nodes of type
+  `networkElementNode`, keyed off `data.element.id` with a fall back to the
+  node id. `classify_element_edge` (`fork_save_service.py`, beside
+  `node_to_element_map`) is the one shared, pure edge-classification helper
+  built on top of it: given one edge plus both maps it returns `"attachment"`
+  (a device-to-element edge with a non-empty device-side port name),
+  `"element_to_element"`, `"element_edge_no_port"` (a missing or empty
+  device-side port name), or `None` (not an element edge, or an element
+  endpoint paired with an unresolvable other side). `_run_topology_validation`
+  (`services/cabling/app/routes/topologies.py`) and `resolve_canvas_wiring`
+  both call this one classifier and act on its result identically. In
+  `_run_topology_validation`, checked before the existing BFS pass:
+  `"attachment"` is VALID with no BFS and never enters the pathfind batch,
+  since an element is not a physical thing the cabling graph could contain a
+  path to; `"element_to_element"` reports the new reason `element_to_element`;
+  `"element_edge_no_port"` reports the new reason `element_edge_no_port`; `None`
+  falls through to the existing `missing_device` handling, unchanged.
+  `InvalidEdge`'s docstring (`schemas/topology.py`) now enumerates all four
+  reasons; `reason` stays a plain `str`, no schema enum change. In
+  `resolve_canvas_wiring`, only `"attachment"` is counted in the returned
+  `element_attachments_skipped`: an element edge the validator would reject
+  (`"element_to_element"` or `"element_edge_no_port"`) falls through to the
+  same silent skip a genuinely broken non-element edge takes, uncounted, so
+  the count only ever reflects edges the validator would actually accept.
+  None of the three element classifications contribute a `WireSpec`. The
+  result threads through a new `CanvasWiringResolution` return type, and the
+  count from there through `ForkSaveResult` to the new additive
+  `ForkSaveResponse.element_attachments_skipped:
+  int = 0` field (`schemas/fork.py`), returned by `POST
+  /internal/forks/{reservation_id}/save`; fork-on-activation snapshotting
+  (`fork_service.py`'s `_snapshot_connections`) uses the same resolver and
+  ignores the count. `tests/contract/snapshots/cabling.json` is regenerated
+  (additive: one new `ForkSaveResponse` property, `required` unchanged) and
+  `services/cabling/tests/` gains unit coverage for every classification rule
+  (both endpoint orderings), the resolver's skip-and-count behavior on a
+  mixed canvas, the response defaults, and (follow-on) that the resolver
+  does NOT count an `element_to_element` or `element_edge_no_port` edge while
+  still counting a genuine `attachment`, pinning the exact validator-agreement
+  claim above.
 - Bulk connection creation (PR #537): `POST /connections/bulk` (admin-only) creates
   up to 200 connections per call (the cap mirrors inventory's
   `BulkPortCreate.instances`), returning a per-row created/rejected
@@ -321,7 +367,7 @@
   fork history panel's read-only version list gains per-version Preview (a
   read-only render of that snapshot on the canvas, ghosted the same way the
   parent-topology preview is, with a "Previewing version N" banner and Exit
-  control; editing, the wiring dialog, and Save all lock while it is up), Diff
+  control; editing, the wiring dialog, and Commit all lock while it is up), Diff
   (against another version or the current draft; `lib/forkDiff.ts` is the pure
   client-side set-difference, keying an edge on (source, target,
   source_port_name, target_port_name) rather than its own id so a redrawn
@@ -332,8 +378,8 @@
   row itself: it copies the version's canvas onto the fork's draft
   (`ReservationFork.draft_restored_from_id` tracks the pending, unsaved
   restore, surfaced as an amber "Draft restored from version N (unsaved)"
-  chip), and nothing is wired until the existing Save runs, which is what
-  appends the version carrying the `restored_from_id` marker. New API:
+  chip), and nothing is wired until you run Commit to reservation, which is
+  what appends the version carrying the `restored_from_id` marker. New API:
   `useForkVersion`/`useRestoreForkVersion` in `api/reservations.ts`, both
   proxying the reservations-service endpoints under
   `/reservations/{id}/fork/versions/{version_id}`. The preview/diff/restore
@@ -341,6 +387,45 @@
   `TopologyEditorPage.tsx` only wires its result to the ReactFlow props and
   `ForkHistoryPanel.tsx` rather than growing further inline. Closes the epic's
   last `Partial` entry in `PLANNED_FEATURES.md`.
+- Network element objects, frontend (issue #22, ADR 0012 phase 2; backend
+  validation and fork-save handling land as a separate phase 1): a new canvas
+  node kind, `networkElementNode`, models a non-device reachability hub (a
+  shared VLAN segment, a subnet, an external cloud, or a patch-panel trunk)
+  that many device ports can attach to without a device-to-device mesh.
+  `NetworkElementNodeData` (`types/topology.types.ts`) carries a
+  client-minted UUID element id, `element_type` (the closed four-value
+  vocabulary), an editable `label`, and free-form `attrs`. Unlike a dynamic
+  placeholder, an element node is the OPPOSITE of ephemeral: it PERSISTS into
+  `canvas_data`, so `persistableCanvas` in `TopologyEditorPage.tsx` keeps it
+  (and its edges) while still stripping placeholders, the one deliberate
+  asymmetry in the six `isDynamicPlaceholder`-adjacent call sites the new
+  `isNetworkElement` predicate needed its own decision at. The Equipment
+  Browser gains an unconditional (not fetched, so never absent) "Network
+  elements" collapsible section with four drag cards using the
+  `application/herd-network-element` MIME; dropping one onto the canvas mints
+  a fresh element id and multiple elements of the same type are allowed,
+  unlike the one-placeholder-per-template rule. Drawing a line from a device
+  to an element opens a new `ElementAttachDialog.tsx` (a single device-side
+  `PortColumn` plus a static element target card, not `WiringDialog`, whose
+  props assume a device on both sides) with multi-select: Confirm creates one
+  attachment edge per selected port in a single `addEnrichedEdges` call, each
+  carrying `source_port_name` and no target port, since the element side has
+  no ports. `topologyStore.ts`'s `addEnrichedEdge`/`addEnrichedEdges` now
+  normalize direction so the device always lands as the edge's `source` and
+  the element as `target`, regardless of which side a connection was drawn
+  from. Element-to-element connections are refused in both
+  `isValidConnection` and `handleConnect` with the toast "Network elements
+  cannot be linked to each other". N attachments to one element bundle into
+  one `BundledEdge` for free: `groupEdgesForRender`'s pair key is node ids,
+  not device ids, so no code change was needed there. `NetworkElementNode.tsx`
+  renders dashed neutral gray with a per-type icon and an inline
+  double-click-to-rename label, deliberately distinct from
+  `DynamicPlaceholderNode.tsx`'s dashed purple so the two ephemeral-looking
+  node kinds are never confused, since only one of them survives a save. The
+  minimap colors an element node neutral gray. No provisioning of any kind in
+  this phase; the frontend renders whatever `InvalidEdge.reason` string the
+  backend validator returns and does not otherwise depend on the backend
+  phase.
 
 #### Developer platform and CI
 
@@ -494,6 +579,27 @@
   edit. `Paginated` is deliberately auth-local; promotion to `herd_common`
   waits for a second service wanting the same shape. Full auth suite: 442
   passed, 43 skipped.
+- Shared reservations test harness (issue #628, PR #630, the same split as
+  #511): six reservations test files (`test_fork_endpoints.py`,
+  `test_fork_version_endpoints.py`, `test_wiring_proxy_endpoints.py`,
+  `test_rbac_denial.py`, `test_coverage_gaps.py`, `test_reservations.py`) each
+  carried a byte-identical in-memory SQLite engine, sessionmaker, `get_db`
+  override, and bearer-scheme override. New
+  `services/reservations/tests/_harness.py` holds the importable
+  `TEST_DATABASE_URL`/`engine`/`TestSessionLocal`/`override_get_db`/
+  `override_bearer`; `conftest.py` gains the shared autouse `setup_db` fixture
+  and a `make_client(payload)` factory. Each file keeps its own small,
+  differently-shaped client helper; only the copied block moved. Eight files
+  that bind their session to `app.database`'s own engine at import time
+  (`test_expiration.py`, `test_expiry_reminder.py`, `test_dynamic_requests.py`,
+  `test_fork_archive_reconcile.py`, `test_fork_backstop_giveup.py`,
+  `test_pending_fork_prune.py`, `test_wiring_changed_staging.py`, and
+  `test_reservation_service_unit.py`, which patches
+  `app.tasks.expiration.AsyncSessionLocal` directly) are untouched by design,
+  mirroring auth's LDAP-sync exception; `test_fleet_report.py` mixes a
+  fixture-scoped engine with a route-engine block and was left unmigrated
+  rather than half-migrated. Full reservations suite: 519 passed, unchanged
+  before and after.
 - Seeded e2e phase, so a silently-skipping e2e test cannot hide behind a green
   gate (issue #629): the `everything` recipe's existing `test-e2e` pass runs
   before the gate stack is seeded, so every test gated on an available device
@@ -535,6 +641,72 @@
   not have it: its placeholder `<option>` is unconditional in
   `CreateDeviceForm.tsx`, rendered outside the templates map, so it needed no
   change.
+
+#### Documentation
+
+- ADR 0012, network element objects (issue #22, design only, no code):
+  `docs/design/0012-network-element-objects.md` records three decisions taken
+  2026-08-29. Storage is canvas-native and topology-local, a new
+  `networkElementNode` kind inside `topologies.canvas_data` (and so inside fork
+  canvases and version snapshots for free) with no tables and no migration,
+  rejecting the registry-plus-attachments shape the issue body proposed because
+  reservation-time edits would mutate global rows, forks would need their own
+  element story, and element delete would have to sweep every topology's
+  canvas. Provisioning is out for v1: an element is a reachability hub only,
+  attachments are declarative `layerEdge` rows the validator accepts without a
+  BFS, and cabling's fork-save resolver skips them explicitly with a new
+  additive `element_attachments_skipped` count, so the invariant is that an
+  element edge never becomes a hop and ADR 0009's derivations need no element
+  rule. The anchored-VLAN variant is recorded as phase 2 with its hook named
+  (synthetic device-to-anchor-switch hops at fork save, since a chain endpoint
+  never receives a driver call). AI generation of elements is deferred to a
+  follow-up issue. `PLANNED_FEATURES.md` links the ADR from the network element
+  objects bullet, which stays `Planned`.
+- Network element objects, phase 3 of 3, docs plus live Playwright e2e (ADR
+  0012, refs issue #22; closes out the epic phase 1, PR #634, and phase 2 both
+  merged first). `TOPOLOGY_EDITOR.md` gains a "Network elements" section
+  beside "Dynamic placeholders" covering the palette, the attach dialog, and
+  the persist-versus-strip contrast between the two dashed node kinds (gray
+  elements persist, purple placeholders never do); `USER_GUIDE.md`'s topology
+  editor summary and the published manual
+  (`docs/manual/user-topology.html`, a new "Network elements" section, and
+  `docs/manual/user-reservations.html`'s equipment-browser note that
+  elements never add to a reservation's device count) get the same coverage;
+  `BULK_IMPORT_EXPORT.md` documents the CSV-does-not-carry-attachments
+  limitation next to the existing isolated-node caveat; `FEATURES.md` gains
+  the shipped capability and `PLANNED_FEATURES.md`'s bullet flips from
+  `Planned` to `Shipped` with the three-phase delivery summary. This entry's
+  ADR doc also gets one amendment: the "Canvas shape" call-site list for
+  `isDynamicPlaceholder` missed a seventh site discovered during phase 2
+  review, `handleAIProposal`'s device-id set, which phase 2 fixed with a
+  positive `isDeviceNode` predicate (`frontend/src/lib/canvasNodes.ts`) and
+  the extracted `collectCanvasDeviceIds` helper rather than a negated
+  placeholder/element pair, since a negated pair silently stops being
+  exhaustive the moment a future node kind is added.
+  `tests/e2e/test_network_elements_playwright.py` (new) covers the two
+  acceptance paths the ADR's "Testing" e2e level names: dropping a
+  `vlan_segment` element from the Equipment Browser (a native DragEvent
+  dispatch, since the card is a plain draggable div rather than a React Flow
+  node) and attaching two ports through `ElementAttachDialog` via a real
+  device-node-handle-to-element-node-handle drag (the same mouse
+  move/down/move/move/up technique `test_wiring_dialog_playwright.py` uses
+  for device-to-device wiring, since `NetworkElementNode` exposes exactly one
+  target handle), then saving, reloading, and reading back through `GET
+  /cabling/topologies/{id}` that the element node and both attachment edges
+  persisted with `source_port_name` set and through `POST
+  .../validate` that the canvas reports `valid: true`; and a reservation
+  created against an element-carrying topology reaching `ACTIVE`, with the
+  fork's `GET /reservations/{id}/fork` canvas carrying the element node and
+  its `POST .../fork/save` response reporting `element_attachments_skipped:
+  1` with zero released/built rows, confirmed by a `wiring-status` read-back
+  showing no wiring at all for the attachment. Run live, twice, against a
+  Playwright-driven Vite dev server proxied at the seeded gate stack (issue
+  #629's device-availability seeding trap applies here too: run explicitly
+  against a seeded stack, since both `make everything` and `nightly.yml` run
+  e2e before `make seed`), plus every other `*_playwright.py` file that opens
+  the canvas or the Equipment Browser
+  (`test_wiring_dialog_playwright.py`, `test_connections_bulk_playwright.py`,
+  `test_fork_live_edit.py -k _pw`, `test_tier2_playwright.py`), all green.
 
 ## [0.2.0] - 2026-08-03
 
