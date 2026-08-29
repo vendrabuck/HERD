@@ -508,6 +508,7 @@ make coverage-frontend   # vitest with coverage
 
 # E2E browser tests (Selenium + Playwright, requires running stack)
 make test-e2e            # starts Selenium container, installs Playwright's Chromium, runs tests
+make test-e2e-seeded     # same suite against a seeded stack; fails the run if anything still skips
 make test-e2e-stop       # stops the Selenium container
 
 # Integration tests (requires running stack + seed data)

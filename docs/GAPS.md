@@ -90,7 +90,7 @@ covered except:
 
 ## E2E
 
-`tests/e2e/` has 49 files and 155 tests (122 Selenium, 33 Playwright). Remaining UI gaps:
+`tests/e2e/` has 52 files and 163 tests (123 Selenium, 40 Playwright). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
