@@ -51,9 +51,7 @@ def _ai_enabled(driver) -> bool:
 
 
 def _find_use_ai_buttons(driver):
-    return driver.find_elements(
-        By.XPATH, "//button[normalize-space()='Use AI']"
-    )
+    return driver.find_elements(By.XPATH, "//button[normalize-space()='Use AI']")
 
 
 def test_ai_status_endpoint_reachable(logged_in_browser):
@@ -65,9 +63,7 @@ def test_ai_status_endpoint_reachable(logged_in_browser):
     assert isinstance(body["enabled"], bool)
 
 
-def test_use_ai_button_matches_status(
-    logged_in_browser, base_url, transient_topology_for_ai
-):
+def test_use_ai_button_matches_status(logged_in_browser, base_url, transient_topology_for_ai):
     """Editor button visibility must match /api/ai/status.enabled."""
     enabled = _ai_enabled(logged_in_browser)
 
@@ -85,14 +81,15 @@ def test_use_ai_button_matches_status(
         assert buttons, "Use AI button should render when ai/status reports enabled=true"
         assert buttons[0].is_displayed()
     else:
-        assert buttons == [], (
-            "Use AI button must not render when ai/status reports enabled=false"
-        )
+        assert buttons == [], "Use AI button must not render when ai/status reports enabled=false"
 
 
 @pytest.mark.skipif(
     True,  # documentation-only; toggling the real config needs a stack restart
     reason="Requires live AI config toggle and container restart, outside e2e scope",
+)
+@pytest.mark.seeded_skip_ok(
+    "documentation-only placeholder; no seed can provide a live config toggle + restart"
 )
 def test_use_ai_button_toggles_with_key_change():  # pragma: no cover
     """Placeholder for a manual flip test.

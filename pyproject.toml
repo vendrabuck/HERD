@@ -26,6 +26,9 @@ select = ["E", "F", "I"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["error"]
+markers = [
+    "seeded_skip_ok(reason): skip is expected even on a seeded stack (issue #629)",
+]
 
 [dependency-groups]
 dev = [

@@ -514,6 +514,27 @@
   is kept as-is: it exercises the empty-stack UI paths deliberately, this is
   additive. `format_skip_block`, the pure formatting function behind the report
   block, is pinned directly in `tests/unit/test_e2e_seed_gate.py`.
+  Follow-up from review: a new `seeded_skip_ok(reason)` marker (registered in
+  `pyproject.toml`'s `markers` list, since `filterwarnings = ["error"]` would
+  otherwise turn the unregistered-marker warning into a collection error)
+  exempts a skip that is expected even on a seeded stack: applied to both
+  `test_ldap_login.py` tests (the gate stack runs `AUTH_METHOD=local`; LDAP-mode
+  coverage lives in the integration phase, not e2e), and to the two
+  deliberately-manual placeholders, `test_ai_feature_gate.py::test_use_ai_button_toggles_with_key_change`
+  and `test_config_playwright.py::test_config_save_and_restart_gated`. An exempt
+  skip is never counted toward the failing total but is still printed, via the
+  new `format_exempt_block` (also pinned in `tests/unit/test_e2e_seed_gate.py`),
+  under its own `exempt (seeded_skip_ok):` heading so the log keeps showing it.
+  Separately, `test_add_device_ui.py::test_create_device_via_form` had a real
+  race on a seeded stack: it read the template `<select>`'s options before the
+  templates query had populated them, so it skipped ("no device templates
+  seeded") even when the stack actually had 28 templates seeded; it now waits
+  (bounded, falling through to the existing skip on a genuine timeout) for at
+  least one value-bearing option before checking. The sibling
+  `test_template_select_has_placeholder` was checked for the same race and does
+  not have it: its placeholder `<option>` is unconditional in
+  `CreateDeviceForm.tsx`, rendered outside the templates map, so it needed no
+  change.
 
 ## [0.2.0] - 2026-08-03
 

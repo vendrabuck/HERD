@@ -74,7 +74,16 @@ WAIT_TIMEOUT = 15
 # regression on the seeded pass shows up red instead of a quiet pass.
 HERD_E2E_REQUIRE_NO_SKIP = "HERD_E2E_REQUIRE_NO_SKIP"
 
+# A test carrying @pytest.mark.seeded_skip_ok("reason") is expected to keep
+# skipping even on a seeded stack (an environmental gate the seed can't
+# satisfy, e.g. AUTH_METHOD=local, or a deliberately opt-in/manual case). Its
+# skip is excluded from the failing count but still surfaced, in a separate
+# "exempt" block, so the log doesn't hide it. Registered in the root
+# pyproject.toml `markers` list; filterwarnings=["error"] would otherwise turn
+# the unregistered-marker warning into a collection error.
+_exempt_reasons: dict[str, str] = {}
 _skip_reports: list[tuple[str, str]] = []
+_exempt_reports: list[tuple[str, str]] = []
 
 
 def _skip_reason(report: pytest.TestReport) -> str:
@@ -92,12 +101,43 @@ def format_skip_block(skips: list[tuple[str, str]]) -> str:
 
     Pure and stack-free (no pytest hook machinery) so it can be unit tested
     directly, in tests/unit/test_e2e_seed_gate.py, without importing this
-    module's Selenium/Playwright fixtures.
+    module's Selenium/Playwright fixtures. Unchanged by the seeded_skip_ok
+    exemption: callers pass only the non-exempt skips in here.
     """
     lines = [f"HERD_E2E_REQUIRE_NO_SKIP=1: {len(skips)} test(s) skipped on a seeded stack:"]
     for nodeid, reason in skips:
         lines.append(f"  {nodeid}: {reason}")
     return "\n".join(lines)
+
+
+def format_exempt_block(exempt: list[tuple[str, str]]) -> str:
+    """Render seeded_skip_ok-exempted skips as their own labeled block.
+
+    Kept separate from format_skip_block (which stays unchanged) so an
+    exempted skip never inflates the failing count; this is visibility only,
+    an empty list renders as the empty string so callers can skip it cleanly.
+    """
+    if not exempt:
+        return ""
+    lines = ["exempt (seeded_skip_ok):"]
+    for nodeid, reason in exempt:
+        lines.append(f"  {nodeid}: {reason}")
+    return "\n".join(lines)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list) -> None:
+    """Record which collected items carry @pytest.mark.seeded_skip_ok.
+
+    Runs regardless of HERD_E2E_REQUIRE_NO_SKIP; it only populates a lookup
+    table that pytest_runtest_logreport consults, so it is cheap and inert
+    when the gate itself is off.
+    """
+    for item in items:
+        marker = item.get_closest_marker("seeded_skip_ok")
+        if marker is None:
+            continue
+        reason = marker.args[0] if marker.args else marker.kwargs.get("reason", "")
+        _exempt_reasons[item.nodeid] = str(reason)
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -107,21 +147,37 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     pw_two_devices_with_ports, _pw_create_reserved_topology) reports skipped at
     "setup"; a test that calls pytest.skip() itself reports at "call". Only one
     of the two phases is ever skipped for a given test, so no dedup is needed.
+    A node id recorded in _exempt_reasons (seeded_skip_ok) routes to the
+    exempt list instead of the failing one.
     """
-    if report.skipped and report.when in ("setup", "call"):
-        _skip_reports.append((report.nodeid, _skip_reason(report)))
+    if not (report.skipped and report.when in ("setup", "call")):
+        return
+    entry = (report.nodeid, _skip_reason(report))
+    if report.nodeid in _exempt_reasons:
+        _exempt_reports.append(entry)
+    else:
+        _skip_reports.append(entry)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Fail the whole run if HERD_E2E_REQUIRE_NO_SKIP=1 and anything skipped.
+    """Fail the whole run if HERD_E2E_REQUIRE_NO_SKIP=1 and anything non-exempt skipped.
 
     Inert (a no-op) without the env var, so a plain `make test-e2e` run is
-    unaffected.
+    unaffected. seeded_skip_ok exemptions never fail the run but are always
+    printed alongside the failing block when either list is non-empty, so the
+    log shows exactly what skipped and why.
     """
-    if os.environ.get(HERD_E2E_REQUIRE_NO_SKIP) != "1" or not _skip_reports:
+    if os.environ.get(HERD_E2E_REQUIRE_NO_SKIP) != "1":
         return
-    print("\n" + format_skip_block(_skip_reports) + "\n")
-    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    if not _skip_reports and not _exempt_reports:
+        return
+    blocks = [format_skip_block(_skip_reports)]
+    exempt_block = format_exempt_block(_exempt_reports)
+    if exempt_block:
+        blocks.append(exempt_block)
+    print("\n" + "\n\n".join(blocks) + "\n")
+    if _skip_reports:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def _make_chrome_options():

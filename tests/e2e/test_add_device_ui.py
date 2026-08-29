@@ -18,6 +18,7 @@ import time
 import uuid
 
 import pytest
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
@@ -79,6 +80,22 @@ def test_create_device_via_form(admin_browser, base_url):
     """Filling and submitting the form creates a device visible via the API."""
     _open_add_device(admin_browser, base_url)
     _show_form(admin_browser)
+
+    # The template <select> renders its "Select a template..." placeholder
+    # immediately, but the real, value-bearing options only appear once the
+    # templates query resolves; without this wait the check below can read
+    # the select before that query settles and skip on a stack that actually
+    # has templates seeded (issue #629 review). A genuine absence of
+    # templates still times out here and falls through to the existing skip.
+    try:
+        WebDriverWait(admin_browser, WAIT).until(
+            lambda d: any(
+                o.get_attribute("value")
+                for o in Select(d.find_element(By.ID, "dev-template")).options
+            )
+        )
+    except TimeoutException:
+        pass
 
     select = Select(admin_browser.find_element(By.ID, "dev-template"))
     real_options = [o for o in select.options if o.get_attribute("value")]
