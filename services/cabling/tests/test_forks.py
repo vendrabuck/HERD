@@ -2255,3 +2255,398 @@ async def test_get_fork_connections_carry_edge_key(client):
     conns = get.json()["connections"]
     assert len(conns) == 1
     assert conns[0]["edge_key"] == "e0"
+
+
+# --- Network element attachments (ADR 0012 phase 1, issue #22) ---
+
+
+def _element_node(node_id: str, element_id: str | None) -> dict:
+    data = {"element_type": "vlan_segment", "label": "Segment"}
+    if element_id is not None:
+        data["id"] = element_id
+    return {"id": node_id, "type": "networkElementNode", "data": {"element": data}}
+
+
+def _attachment_canvas(
+    device_id: uuid.UUID,
+    *,
+    element_id: str | None = "elem-1",
+    source_port_name: str | None = "eth0",
+    device_is_source: bool = True,
+) -> dict:
+    device_node = {"id": "nDev", "data": {"device": {"id": str(device_id)}}}
+    element_node = _element_node("nElem", element_id)
+    source = "nDev" if device_is_source else "nElem"
+    target = "nElem" if device_is_source else "nDev"
+    edge_data = (
+        {"source_port_name": source_port_name}
+        if device_is_source
+        else {"target_port_name": source_port_name}
+    )
+    return {
+        "nodes": [device_node, element_node],
+        "edges": [{"id": "attach-1", "source": source, "target": target, "data": edge_data}],
+    }
+
+
+def test_node_to_element_map_reads_element_id():
+    from app.services.fork_save_service import node_to_element_map
+
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(uuid.uuid4())}}},
+            _element_node("n1", "elem-abc"),
+        ]
+    }
+    mapping = node_to_element_map(canvas)
+    assert mapping == {"n1": "elem-abc"}
+
+
+def test_node_to_element_map_falls_back_to_node_id_when_element_id_absent():
+    from app.services.fork_save_service import node_to_element_map
+
+    canvas = {"nodes": [_element_node("n1", None)]}
+    mapping = node_to_element_map(canvas)
+    assert mapping == {"n1": "n1"}
+
+
+def test_node_to_element_map_ignores_non_element_nodes():
+    from app.services.fork_save_service import node_to_element_map
+
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(uuid.uuid4())}}},
+            {"id": "n1", "type": "dynamicPlaceholderNode", "data": {}},
+        ]
+    }
+    assert node_to_element_map(canvas) == {}
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_element_edge_yields_no_specs_and_reports_count():
+    """An element attachment edge contributes zero WireSpecs and is counted."""
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    device_id = uuid.uuid4()
+    canvas = _attachment_canvas(device_id)
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_element_edge_either_direction_skipped():
+    """Element-first canvases skip identically to device-first ones."""
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    device_id = uuid.uuid4()
+    canvas = _attachment_canvas(device_id, device_is_source=False, source_port_name="eth0")
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_broken_non_element_edge_still_skips_silently():
+    """A genuinely broken (non-element) edge keeps the old silent continue: skipped,
+    but NOT counted as an element attachment.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    canvas = {
+        "nodes": [{"id": "n0", "data": {"device": {"id": str(uuid.uuid4())}}}],
+        "edges": [{"id": "broken", "source": "n0", "target": "does-not-exist"}],
+    }
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_mixed_canvas_one_device_wire_three_attachments():
+    """One device-to-device edge plus three element attachments yields exactly the
+    device-to-device WireSpec and a count of 3.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+
+    canvas = {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": str(a)}}},
+            {"id": "nB", "data": {"device": {"id": str(b)}}},
+            _element_node("nE1", "elem-1"),
+            _element_node("nE2", "elem-2"),
+            _element_node("nE3", "elem-3"),
+        ],
+        "edges": [
+            {"id": "wire", "source": "nA", "target": "nB"},
+            {
+                "id": "attach-1",
+                "source": "nA",
+                "target": "nE1",
+                "data": {"source_port_name": "a1"},
+            },
+            {
+                "id": "attach-2",
+                "source": "nB",
+                "target": "nE2",
+                "data": {"source_port_name": "b1"},
+            },
+            {
+                "id": "attach-3",
+                "source": "nA",
+                "target": "nE3",
+                "data": {"source_port_name": "a2"},
+            },
+        ],
+    }
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.element_attachments_skipped == 3
+    assert len(resolution.specs) == 1
+    assert _endpoint_set(
+        {
+            "device_a_id": str(resolution.specs[0].device_a_id),
+            "port_a": resolution.specs[0].port_a,
+            "device_b_id": str(resolution.specs[0].device_b_id),
+            "port_b": resolution.specs[0].port_b,
+        }
+    ) == frozenset({(str(a), "a0"), (str(b), "b0")})
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_element_to_element_not_counted():
+    """An element-to-element edge is a shape the validator rejects, so the resolver
+    must not count it as an attachment: no WireSpec, and no increment of
+    element_attachments_skipped either.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    canvas = {
+        "nodes": [_element_node("nE1", "elem-1"), _element_node("nE2", "elem-2")],
+        "edges": [{"id": "e2e", "source": "nE1", "target": "nE2", "data": {}}],
+    }
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_element_edge_no_port_not_counted():
+    """An element edge with an empty device-side port name is a shape the validator
+    rejects (element_edge_no_port), so the resolver must not count it: no WireSpec,
+    and no increment of element_attachments_skipped either.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    device_id = uuid.uuid4()
+    canvas = _attachment_canvas(device_id, source_port_name=None)
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_valid_attachment_still_counted():
+    """A genuine valid attachment (the validator-accepted shape) still counts 1,
+    guarding against an overcorrection that stops counting anything.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    device_id = uuid.uuid4()
+    canvas = _attachment_canvas(device_id)
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fork_element_attachment_reports_skip_count_and_builds_nothing(client):
+    """Saving a fork over a canvas with two element attachments builds zero
+    fork_connections and reports element_attachments_skipped=2.
+    """
+    device_id = uuid.uuid4()
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    canvas = {
+        "nodes": [
+            {"id": "nDev", "data": {"device": {"id": str(device_id)}}},
+            _element_node("nE1", "elem-1"),
+            _element_node("nE2", "elem-2"),
+        ],
+        "edges": [
+            {
+                "id": "attach-1",
+                "source": "nDev",
+                "target": "nE1",
+                "data": {"source_port_name": "eth0"},
+            },
+            {
+                "id": "attach-2",
+                "source": "nDev",
+                "target": "nE2",
+                "data": {"source_port_name": "eth1"},
+            },
+        ],
+    }
+    resp = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["built"] == []
+    assert body["released"] == []
+    assert body["unchanged_count"] == 0
+    assert body["element_attachments_skipped"] == 2
+
+    conns = await _fork_connections(uuid.UUID(body["fork_id"]))
+    assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_save_fork_mixed_canvas_wire_plus_attachments(client):
+    """A save with one device-to-device wire and three attachments builds exactly
+    the one wire and reports element_attachments_skipped=3.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+
+    canvas = {
+        "nodes": [
+            {"id": "nA", "data": {"device": {"id": str(a)}}},
+            {"id": "nB", "data": {"device": {"id": str(b)}}},
+            _element_node("nE1", "elem-1"),
+            _element_node("nE2", "elem-2"),
+            _element_node("nE3", "elem-3"),
+        ],
+        "edges": [
+            {"id": "wire", "source": "nA", "target": "nB"},
+            {
+                "id": "attach-1",
+                "source": "nA",
+                "target": "nE1",
+                "data": {"source_port_name": "a1"},
+            },
+            {
+                "id": "attach-2",
+                "source": "nB",
+                "target": "nE2",
+                "data": {"source_port_name": "b1"},
+            },
+            {
+                "id": "attach-3",
+                "source": "nA",
+                "target": "nE3",
+                "data": {"source_port_name": "a2"},
+            },
+        ],
+    }
+    resp = await client.post(
+        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["built"]) == 1
+    assert _endpoint_set(body["built"][0]) == frozenset({(str(a), "a0"), (str(b), "b0")})
+    assert body["element_attachments_skipped"] == 3
+
+    conns = await _fork_connections(uuid.UUID(body["fork_id"]))
+    assert len(conns) == 1
+
+
+def test_fork_save_response_element_attachments_skipped_defaults_to_zero():
+    """ForkSaveResponse's new field defaults to 0 for a client that never sees it
+    populated (e.g. constructed without the kwarg)."""
+    from app.schemas.fork import ForkSaveResponse
+
+    resp = ForkSaveResponse(
+        fork_id=str(uuid.uuid4()),
+        version_number=1,
+        released=[],
+        built=[],
+        unchanged_count=0,
+    )
+    assert resp.element_attachments_skipped == 0
+
+
+def test_fork_save_result_element_attachments_skipped_defaults_to_zero():
+    """ForkSaveResult (the service-layer dataclass) defaults the field to 0 too, so
+    the prune path and other construction sites are unaffected."""
+    from app.services.fork_save_service import ForkSaveResult
+
+    result = ForkSaveResult(
+        fork_id=uuid.uuid4(),
+        version_number=1,
+        released=[],
+        built=[],
+        unchanged_count=0,
+    )
+    assert result.element_attachments_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_create_fork_skips_element_attachment_in_parent_canvas(client):
+    """Fork-on-activation snapshotting (_snapshot_connections) also skips an element
+    attachment edge in the parent canvas: it contributes zero fork_connections and
+    does not error, sharing resolve_canvas_wiring with the save path.
+    """
+    dev_a = uuid.uuid4()
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": str(dev_a)}}},
+            _element_node("n2", "elem-1"),
+        ],
+        "edges": [
+            {
+                "id": "attach-1",
+                "source": "n1",
+                "target": "n2",
+                "data": {"source_port_name": "eth0"},
+            }
+        ],
+    }
+    async with TestSessionLocal() as db:
+        topo = Topology(name="t", created_by=uuid.uuid4(), canvas_data=canvas)
+        db.add(topo)
+        await db.flush()
+        db.add(
+            TopologyVersion(
+                topology_id=topo.id,
+                version_number=1,
+                canvas_data=canvas,
+                name="t",
+                created_by=uuid.uuid4(),
+            )
+        )
+        await db.commit()
+        topo_id = topo.id
+
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+
+    async with TestSessionLocal() as db:
+        fork = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        conns = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        assert conns == []

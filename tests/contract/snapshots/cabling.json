@@ -479,6 +479,7 @@
     "ForkSaveResponse": {
       "properties": {
         "built": "array",
+        "element_attachments_skipped": "integer",
         "fork_id": "string",
         "released": "array",
         "unchanged_count": "integer",

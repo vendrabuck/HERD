@@ -409,6 +409,7 @@ async def save_fork_internal(
         released=[_to_delta(spec) for spec in result.released],
         built=[_to_delta(spec) for spec in result.built],
         unchanged_count=result.unchanged_count,
+        element_attachments_skipped=result.element_attachments_skipped,
     )
 
 

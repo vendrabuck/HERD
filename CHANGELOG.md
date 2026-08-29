@@ -204,6 +204,52 @@
 
 #### Cabling and inventory
 
+- Network element objects, phase 1 of 3, cabling backend only (ADR 0012, refs
+  issue #22; frontend and docs land in later phases). A network element is a
+  non-device canvas node (`networkElementNode`) many device ports can attach
+  to with a many-to-one edge, modeling a shared VLAN segment, subnet, external
+  cloud, or patch-panel trunk without a full mesh of point-to-point links or a
+  new registry table (canvas-native and topology-local by decision).
+  `node_to_element_map` (`fork_save_service.py`, beside `node_to_device_map`)
+  maps React Flow node ids to element ids for nodes of type
+  `networkElementNode`, keyed off `data.element.id` with a fall back to the
+  node id. `classify_element_edge` (`fork_save_service.py`, beside
+  `node_to_element_map`) is the one shared, pure edge-classification helper
+  built on top of it: given one edge plus both maps it returns `"attachment"`
+  (a device-to-element edge with a non-empty device-side port name),
+  `"element_to_element"`, `"element_edge_no_port"` (a missing or empty
+  device-side port name), or `None` (not an element edge, or an element
+  endpoint paired with an unresolvable other side). `_run_topology_validation`
+  (`services/cabling/app/routes/topologies.py`) and `resolve_canvas_wiring`
+  both call this one classifier and act on its result identically. In
+  `_run_topology_validation`, checked before the existing BFS pass:
+  `"attachment"` is VALID with no BFS and never enters the pathfind batch,
+  since an element is not a physical thing the cabling graph could contain a
+  path to; `"element_to_element"` reports the new reason `element_to_element`;
+  `"element_edge_no_port"` reports the new reason `element_edge_no_port`; `None`
+  falls through to the existing `missing_device` handling, unchanged.
+  `InvalidEdge`'s docstring (`schemas/topology.py`) now enumerates all four
+  reasons; `reason` stays a plain `str`, no schema enum change. In
+  `resolve_canvas_wiring`, only `"attachment"` is counted in the returned
+  `element_attachments_skipped`: an element edge the validator would reject
+  (`"element_to_element"` or `"element_edge_no_port"`) falls through to the
+  same silent skip a genuinely broken non-element edge takes, uncounted, so
+  the count only ever reflects edges the validator would actually accept.
+  None of the three element classifications contribute a `WireSpec`. The
+  result threads through a new `CanvasWiringResolution` return type, and the
+  count from there through `ForkSaveResult` to the new additive
+  `ForkSaveResponse.element_attachments_skipped:
+  int = 0` field (`schemas/fork.py`), returned by `POST
+  /internal/forks/{reservation_id}/save`; fork-on-activation snapshotting
+  (`fork_service.py`'s `_snapshot_connections`) uses the same resolver and
+  ignores the count. `tests/contract/snapshots/cabling.json` is regenerated
+  (additive: one new `ForkSaveResponse` property, `required` unchanged) and
+  `services/cabling/tests/` gains unit coverage for every classification rule
+  (both endpoint orderings), the resolver's skip-and-count behavior on a
+  mixed canvas, the response defaults, and (follow-on) that the resolver
+  does NOT count an `element_to_element` or `element_edge_no_port` edge while
+  still counting a genuine `attachment`, pinning the exact validator-agreement
+  claim above.
 - Bulk connection creation (PR #537): `POST /connections/bulk` (admin-only) creates
   up to 200 connections per call (the cap mirrors inventory's
   `BulkPortCreate.instances`), returning a per-row created/rejected
