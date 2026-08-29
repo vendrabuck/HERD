@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from app.database import Base
 from app.models.reservation import (
     Reservation,
     ReservationStatus,
@@ -32,25 +31,13 @@ from app.services.reservation_service import (
     update_reservation,
 )
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+from tests._harness import TestSessionLocal
 
 NOW = datetime.now(timezone.utc)
 USER_ID = uuid.uuid4()
 DEVICE_A = uuid.uuid4()
 DEVICE_B = uuid.uuid4()
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
 
 
 def _make_device(device_id, topology="PHYSICAL", status="AVAILABLE", exclusive=True):
@@ -955,20 +942,15 @@ async def admin_router_client():
     from app.dependencies.auth import get_current_user_payload, require_admin
     from app.main import app
     from app.routers.reservations import bearer_scheme
-    from fastapi.security import HTTPAuthorizationCredentials
     from httpx import ASGITransport, AsyncClient
 
-    async def _get_db():
-        async with TestSessionLocal() as session:
-            yield session
+    from tests._harness import override_bearer, override_get_db
 
     admin_payload = {"sub": str(USER_ID), "username": "adminuser", "role": "admin"}
-    app.dependency_overrides[get_db] = _get_db
+    app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user_payload] = lambda: admin_payload
     app.dependency_overrides[require_admin] = lambda: admin_payload
-    app.dependency_overrides[bearer_scheme] = lambda: HTTPAuthorizationCredentials(
-        scheme="Bearer", credentials="fake-token"
-    )
+    app.dependency_overrides[bearer_scheme] = override_bearer
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()
@@ -993,19 +975,14 @@ async def non_admin_router_client():
     from app.dependencies.auth import get_current_user_payload
     from app.main import app
     from app.routers.reservations import bearer_scheme
-    from fastapi.security import HTTPAuthorizationCredentials
     from httpx import ASGITransport, AsyncClient
 
-    async def _get_db():
-        async with TestSessionLocal() as session:
-            yield session
+    from tests._harness import override_bearer, override_get_db
 
     payload = {"sub": str(USER_ID), "username": "regular", "role": "user"}
-    app.dependency_overrides[get_db] = _get_db
+    app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user_payload] = lambda: payload
-    app.dependency_overrides[bearer_scheme] = lambda: HTTPAuthorizationCredentials(
-        scheme="Bearer", credentials="fake-token"
-    )
+    app.dependency_overrides[bearer_scheme] = override_bearer
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()

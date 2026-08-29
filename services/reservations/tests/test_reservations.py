@@ -8,19 +8,15 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from app.database import Base, get_db
+from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus
 from app.routers.reservations import bearer_scheme
-from fastapi.security import HTTPAuthorizationCredentials
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+from tests._harness import TestSessionLocal, override_bearer, override_get_db
 
 USER_ID = str(uuid.uuid4())
 OTHER_USER_ID = str(uuid.uuid4())
@@ -35,30 +31,12 @@ START = NOW.isoformat()
 END = (NOW + timedelta(hours=3)).isoformat()
 
 
-async def override_get_db():
-    async with TestSessionLocal() as session:
-        yield session
-
-
 def override_auth():
     return {"sub": USER_ID, "username": "testuser", "role": "user"}
 
 
 def override_auth_other():
     return {"sub": OTHER_USER_ID, "username": "otheruser", "role": "user"}
-
-
-def override_bearer():
-    return HTTPAuthorizationCredentials(scheme="Bearer", credentials="fake-token")
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
 
 
 @pytest.fixture
