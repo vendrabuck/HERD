@@ -14,7 +14,7 @@ Navigation: **Topology** in the nav bar, then either pick an existing topology t
 
 The palette is a floating, collapsible panel in the upper-left of the canvas. You can drag it around by its title bar and collapse it with the `-` button.
 
-The palette lists every DUT (Management-connection device) you have visibility on, plus a collapsible **Dynamic templates** section when any hypervisor-backed templates are published:
+The palette lists every DUT (Management-connection device) you have visibility on, plus a collapsible **Dynamic templates** section when any hypervisor-backed templates are published, and a **Network elements** section that is always present.
 
 - Already-reserved exclusive devices are shown by default. Toggle **Show reserved resources** off to hide them.
 - Filters: search, template dropdown, topology type dropdown.
@@ -26,6 +26,24 @@ Regardless of your role, the palette shows Management-type devices and published
 ## Dynamic placeholders
 
 Dragging a dynamic template onto the canvas creates one placeholder node per template (dashed purple, tagged DYNAMIC) carrying an editable instance count. Placeholders are planning artifacts, not devices: they cannot be cabled (a connection attempt is refused with a toast, since instances have no ports until the reservation activates), they are never saved into the parent topology (saving with placeholders present says so in the toast; reserve first to keep them), and **Reserve Topology** prefills the reservation's dynamic instances from them, one request per count. A canvas holding only placeholders can still be reserved (dynamic-only bookings are valid).
+
+## Network elements
+
+A network element models infrastructure that is not a device with ports and not driven by HERD: a shared VLAN segment, a management subnet, an external cloud or upstream provider, or a patch-panel trunk. Real labs have this kind of thing everywhere, and modeling it as a fake device (no driver, no port inventory) or as a full mesh of point-to-point device links (accurate but combinatorially noisy for anything more than two devices sharing a segment) is both worse than leaving it out.
+
+The palette's **Network elements** section holds four fixed types, each its own drag card: **VLAN segment**, **Subnet**, **External cloud**, **Patch trunk**. Unlike dynamic templates, this section is not fetched from anything, so it is never absent and never needs an admin to publish something first.
+
+1. Drag a type card onto the canvas. It drops in as a dashed, neutral-gray node with an editable label (double-click to rename) and exactly one connection point. Dropping the same type twice is fine; a topology can carry two distinct VLAN segments, each its own node.
+2. Draw a line from a device's handle to the element to open the **Attach** dialog, a single port column for that one device (there is no second device-shaped side, since an element has no ports of its own). Select one or more ports, then **Attach**; every selected port becomes its own attachment line to the element, added in one step.
+3. Ports already used elsewhere on the canvas, by a device-to-device line or by another attachment, are unavailable here too, same rule as the wiring dialog.
+4. Multiple attachments to the same element bundle into one edge with a count badge, exactly like multiple device-to-device connections do.
+5. An element-to-element line is refused with a toast; two segments have no device or port between them, so a line drawn between them would not mean anything.
+
+The persistence rule is the opposite of a dynamic placeholder, and it is worth stating plainly because the two dashed node kinds look similar at a glance: **a network element and its attachment lines are saved with the topology**; a dynamic placeholder is never saved (see above). The gray, non-purple dash is the visual cue for which kind of ephemeral-looking node you are looking at.
+
+A network element is a reachability and documentation hub only, nothing more, in this release: attaching a port to one records no driver call, no VLAN, no route, and no ledger row. Two device ports attached to the same element validate as reachable to each other by definition (that is what attaching them to a shared segment asserts), but the element itself is never routed through, and it never becomes part of what a reservation actually provisions. An element is topology-local: it is not a reusable catalog entry, so two topologies that both need "the same" VLAN segment each carry their own independent element node.
+
+CSV export does not carry element attachments (see [BULK_IMPORT_EXPORT.md](BULK_IMPORT_EXPORT.md)); use JSON export/import if you need a byte-for-byte round trip of a topology that includes elements.
 
 ## Adding devices
 

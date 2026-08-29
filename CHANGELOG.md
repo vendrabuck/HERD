@@ -600,6 +600,51 @@
   never receives a driver call). AI generation of elements is deferred to a
   follow-up issue. `PLANNED_FEATURES.md` links the ADR from the network element
   objects bullet, which stays `Planned`.
+- Network element objects, phase 3 of 3, docs plus live Playwright e2e (ADR
+  0012, refs issue #22; closes out the epic phase 1, PR #634, and phase 2 both
+  merged first). `TOPOLOGY_EDITOR.md` gains a "Network elements" section
+  beside "Dynamic placeholders" covering the palette, the attach dialog, and
+  the persist-versus-strip contrast between the two dashed node kinds (gray
+  elements persist, purple placeholders never do); `USER_GUIDE.md`'s topology
+  editor summary and the published manual
+  (`docs/manual/user-topology.html`, a new "Network elements" section, and
+  `docs/manual/user-reservations.html`'s equipment-browser note that
+  elements never add to a reservation's device count) get the same coverage;
+  `BULK_IMPORT_EXPORT.md` documents the CSV-does-not-carry-attachments
+  limitation next to the existing isolated-node caveat; `FEATURES.md` gains
+  the shipped capability and `PLANNED_FEATURES.md`'s bullet flips from
+  `Planned` to `Shipped` with the three-phase delivery summary. This entry's
+  ADR doc also gets one amendment: the "Canvas shape" call-site list for
+  `isDynamicPlaceholder` missed a seventh site discovered during phase 2
+  review, `handleAIProposal`'s device-id set, which phase 2 fixed with a
+  positive `isDeviceNode` predicate (`frontend/src/lib/canvasNodes.ts`) and
+  the extracted `collectCanvasDeviceIds` helper rather than a negated
+  placeholder/element pair, since a negated pair silently stops being
+  exhaustive the moment a future node kind is added.
+  `tests/e2e/test_network_elements_playwright.py` (new) covers the two
+  acceptance paths the ADR's "Testing" e2e level names: dropping a
+  `vlan_segment` element from the Equipment Browser (a native DragEvent
+  dispatch, since the card is a plain draggable div rather than a React Flow
+  node) and attaching two ports through `ElementAttachDialog` via a real
+  device-node-handle-to-element-node-handle drag (the same mouse
+  move/down/move/move/up technique `test_wiring_dialog_playwright.py` uses
+  for device-to-device wiring, since `NetworkElementNode` exposes exactly one
+  target handle), then saving, reloading, and reading back through `GET
+  /cabling/topologies/{id}` that the element node and both attachment edges
+  persisted with `source_port_name` set and through `POST
+  .../validate` that the canvas reports `valid: true`; and a reservation
+  created against an element-carrying topology reaching `ACTIVE`, with the
+  fork's `GET /reservations/{id}/fork` canvas carrying the element node and
+  its `POST .../fork/save` response reporting `element_attachments_skipped:
+  1` with zero released/built rows, confirmed by a `wiring-status` read-back
+  showing no wiring at all for the attachment. Run live, twice, against a
+  Playwright-driven Vite dev server proxied at the seeded gate stack (issue
+  #629's device-availability seeding trap applies here too: run explicitly
+  against a seeded stack, since both `make everything` and `nightly.yml` run
+  e2e before `make seed`), plus every other `*_playwright.py` file that opens
+  the canvas or the Equipment Browser
+  (`test_wiring_dialog_playwright.py`, `test_connections_bulk_playwright.py`,
+  `test_fork_live_edit.py -k _pw`, `test_tier2_playwright.py`), all green.
 
 ## [0.2.0] - 2026-08-03
 

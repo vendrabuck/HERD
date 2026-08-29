@@ -157,6 +157,7 @@ saved filters do, per the Settings note below.
 See [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md) for the full walkthrough. In short:
 
 - Drag devices (and published dynamic templates, as count-carrying placeholders) from the floating palette onto the canvas.
+- Drag a **network element** (VLAN segment, subnet, external cloud, or patch trunk) from the palette to model shared infrastructure that is not a device, then attach any number of device ports to it. Unlike a dynamic placeholder, an element is saved with the topology; it is a reachability and documentation hub only, with no provisioning behind it. See [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#network-elements).
 - Click between devices to draw connections at Layer 1 (physical cabling), Layer 2 (Ethernet/VLAN), or Layer 3 (IP).
 - Each connection is checked against the physical cabling graph. Edges that have a real route between the two devices turn green; edges that do not (for example, devices in separate isolated labs) turn red and block reservation. The check applies regardless of layer; see [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#edge-visual-indicators) for details.
 - Save a canvas as a named topology; it can later feed into a reservation.

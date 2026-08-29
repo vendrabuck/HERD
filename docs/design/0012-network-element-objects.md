@@ -33,7 +33,26 @@ Relevant existing fabric, verified:
   the canvas device-id set (`:489`), the reserve-modal prefill (`:500`), the
   connection guard `isValidConnection` (`:514`), and the second guard in
   `handleConnect` (`:615`). A sixth site keys the minimap color off the raw
-  type string (`:1159`).
+  type string (`:1159`). A seventh call site was missed by this list at
+  design time and only surfaced during phase 2 review:
+  `handleAIProposal`'s device-id set (`:854`, the resolver's AI-proposal
+  duplicate check), which does not consult `isDynamicPlaceholder` at all.
+  It instead reads `.device.id` off every node it iterates, so a negated
+  `isDynamicPlaceholder`/`isNetworkElement` pair would have stayed
+  exhaustive only until a fourth node type existed, and in the meantime
+  would have crashed on a `networkElementNode`'s absent `.device` field
+  the moment an AI proposal ran over a canvas that already had an element
+  on it. Phase 2 fixed this with a positive predicate instead of a negated
+  pair: `isDeviceNode` (`frontend/src/lib/canvasNodes.ts`, `node.type ===
+  "deviceNode"`) guards every node before its `.device` is read, and the
+  extracted, unit-testable `collectCanvasDeviceIds(nodes)` helper filters on
+  `isDeviceNode` (excluding proposal ghosts) to build the set
+  `handleAIProposal` diffs against. The general lesson this leaves for any
+  future canvas node kind: prefer a positive "is this the node type I can
+  safely read `.device` from" check over negating the list of node kinds
+  known not to be a device, since the latter silently stops being exhaustive
+  the moment a new node kind is added and nobody remembers to touch every
+  negation.
 - Drop handling: `TopologyEditorPage.tsx:541` reads the
   `application/herd-dynamic-template` MIME from the drag payload and builds a
   `dynamicPlaceholderNode` at `:560`; the device path reads
