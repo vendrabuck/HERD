@@ -37,13 +37,12 @@ UI-driven versus API-driven, precisely:
   toast ForkSaveResultToast.tsx already renders), the wiring-status
   read-back, and all cleanup deletes.
 
-Per the ADR's phase 3 seeding-trap note (issue #629, PR #631 open, not yet
-merged as of this test's authorship): both `make everything` and
-`nightly.yml` run e2e BEFORE `make seed`, so a device-gated test like this one
-skips silently in every automated run today. Each test below self-provisions
-and skips with a clear reason string when no AVAILABLE DUT device exists, and
-must be run explicitly against a seeded stack; a green automated run is not
-evidence these executed until #629/PR #631 lands.
+Per the ADR's phase 3 seeding-trap note (issue #629): both `make everything`
+and `nightly.yml` run e2e BEFORE `make seed`, so a device-gated test like this
+one skips silently in every automated run today. Each test below
+self-provisions and skips with a clear reason string when no AVAILABLE DUT
+device exists, and must be run explicitly against a seeded stack; a green
+automated run is not evidence these executed.
 """
 
 import time
