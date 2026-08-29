@@ -1,20 +1,13 @@
 import { useCallback, useMemo, useState } from "react";
-import { Network, Waypoints, Cloud, Cable } from "lucide-react";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
 import { usePortAvailability } from "./wiring/usePortAvailability";
 import { PortColumn, type PortRowVisual, type Side } from "./wiring/PortColumn";
 import { filterPorts } from "./wiring/filterPorts";
+import { ELEMENT_ICONS } from "@/lib/networkElements";
 import type { TopologyType } from "@/types/device.types";
 import type { NetworkElementType } from "@/types/topology.types";
 import type { Port } from "@/types/port.types";
-
-const ELEMENT_ICONS: Record<NetworkElementType, typeof Network> = {
-  vlan_segment: Network,
-  subnet: Waypoints,
-  external_cloud: Cloud,
-  patch_trunk: Cable,
-};
 
 export interface ElementAttachSelection {
   portId: string;
@@ -26,7 +19,6 @@ export interface ElementAttachDialogProps {
   deviceId: string;
   deviceName: string;
   deviceTopologyType: TopologyType;
-  elementId: string;
   elementLabel: string;
   elementType: NetworkElementType;
   // Ports already used by an existing canvas edge touching this device

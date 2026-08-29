@@ -357,6 +357,36 @@ describe("topologyStore", () => {
       expect(edges.every((e) => e.target === "elem")).toBe(true);
     });
 
+    it("does not normalize when the target does not resolve to a node on the canvas", () => {
+      // Review fix: the swap used to fire whenever source was an element and
+      // target was NOT resolvably an element, which incorrectly included an
+      // unresolved (missing) target. Both endpoints must resolve for the
+      // swap to apply; an unresolved one passes through unchanged.
+      useTopologyStore.getState().addDeviceNode(makeElementNode("elem"));
+      useTopologyStore
+        .getState()
+        .addEnrichedEdge(
+          { source: "elem", target: "missing-node", sourceHandle: null, targetHandle: null },
+          { layer: "L2", source_port_name: "eth0" },
+        );
+      const edge = useTopologyStore.getState().edges[0];
+      expect(edge.source).toBe("elem");
+      expect(edge.target).toBe("missing-node");
+    });
+
+    it("does not normalize when the source does not resolve to a node on the canvas", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("dev"));
+      useTopologyStore
+        .getState()
+        .addEnrichedEdge(
+          { source: "missing-node", target: "dev", sourceHandle: null, targetHandle: null },
+          { layer: "L2" },
+        );
+      const edge = useTopologyStore.getState().edges[0];
+      expect(edge.source).toBe("missing-node");
+      expect(edge.target).toBe("dev");
+    });
+
     it("does not normalize a plain device-to-device connection", () => {
       useTopologyStore.getState().addDeviceNode(makeNode("a"));
       useTopologyStore.getState().addDeviceNode(makeNode("b"));

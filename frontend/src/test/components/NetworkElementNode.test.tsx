@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ReactNode } from "react";
 
@@ -150,5 +150,53 @@ describe("NetworkElementNode", () => {
   it("renders a PROPOSED tag when isProposal is set", () => {
     renderNode({ ...elementData(), isProposal: true });
     expect(screen.getByText("PROPOSED")).toBeInTheDocument();
+  });
+
+  // Enter/Escape both end the edit by flipping `editing` to false, which
+  // unmounts the input; in a real browser, removing a focused element from
+  // the DOM fires a native blur on it as part of that removal, and since
+  // React's synthetic onBlur is still wired to the node at that instant, it
+  // re-invokes onBlur={commit} from a stale closure. jsdom does not
+  // synthesize that blur on unmount by itself (a known jsdom/browser gap,
+  // see CLAUDE.md's canvas-UI note), so these tests reproduce the same
+  // ordering explicitly: batching the key event and the blur into one
+  // `act()` call delivers both to the still-mounted input before React
+  // commits the unmount, exactly as the browser's same-tick sequence would.
+  // Firing them as two separate fireEvent calls (React's default automatic
+  // batching flushes between them) does NOT reproduce the bug: the input is
+  // already disconnected by the time blur fires, so the earlier version of
+  // this test passed even against the unfixed component.
+  it("Escape then blur does not write the cancelled draft to the store", () => {
+    seedStore(elementData({ label: "Original" }));
+    renderNode(elementData({ label: "Original" }));
+
+    fireEvent.doubleClick(screen.getByText("Original"));
+    const input = screen.getByLabelText(/Label for VLAN segment/);
+    fireEvent.change(input, { target: { value: "Should not stick" } });
+
+    act(() => {
+      fireEvent.keyDown(input, { key: "Escape" });
+      fireEvent.blur(input);
+    });
+
+    expect(storeLabel()).toBe("Original");
+  });
+
+  it("Enter then blur commits exactly once", () => {
+    seedStore(elementData({ label: "Original" }));
+    renderNode(elementData({ label: "Original" }));
+    const setNetworkElementLabel = vi.spyOn(useTopologyStore.getState(), "setNetworkElementLabel");
+
+    fireEvent.doubleClick(screen.getByText("Original"));
+    const input = screen.getByLabelText(/Label for VLAN segment/);
+    fireEvent.change(input, { target: { value: "Renamed once" } });
+
+    act(() => {
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.blur(input);
+    });
+
+    expect(storeLabel()).toBe("Renamed once");
+    expect(setNetworkElementLabel).toHaveBeenCalledTimes(1);
   });
 });

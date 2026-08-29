@@ -1,7 +1,8 @@
 import { useState, useDeferredValue, useMemo } from "react";
-import { Network, Waypoints, Cloud, Cable } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useDevices } from "@/api/inventory";
 import { useTemplates } from "@/api/templates";
+import { NETWORK_ELEMENT_TYPES } from "@/lib/networkElements";
 import type { Device, TopologyType } from "@/types/device.types";
 import type { DeviceTemplate } from "@/types/template.types";
 import type { NetworkElementType } from "@/types/topology.types";
@@ -96,16 +97,6 @@ function DynamicTemplateCard({ template }: { template: DeviceTemplate }) {
   );
 }
 
-// The closed v1 element vocabulary (ADR 0012 "Canvas shape"): four fixed
-// palette entries with their own icons, mirroring ELEMENT_ICONS in
-// NetworkElementNode.tsx/ElementAttachDialog.tsx.
-const NETWORK_ELEMENT_TYPES: Array<{ type: NetworkElementType; label: string; icon: typeof Network }> = [
-  { type: "vlan_segment", label: "VLAN segment", icon: Network },
-  { type: "subnet", label: "Subnet", icon: Waypoints },
-  { type: "external_cloud", label: "External cloud", icon: Cloud },
-  { type: "patch_trunk", label: "Patch trunk", icon: Cable },
-];
-
 function NetworkElementCard({
   type,
   label,
@@ -113,7 +104,7 @@ function NetworkElementCard({
 }: {
   type: NetworkElementType;
   label: string;
-  icon: typeof Network;
+  icon: LucideIcon;
 }) {
   const onDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData(

@@ -1,26 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import { Network, Waypoints, Cloud, Cable } from "lucide-react";
 import { useTopologyStore } from "@/stores/topologyStore";
-import type {
-  NetworkElementNode as NetworkElementNodeType,
-  NetworkElementType,
-} from "@/types/topology.types";
-
-// Icon per element_type (herd-design: Lucide, outline, currentColor).
-const ELEMENT_ICONS: Record<NetworkElementType, typeof Network> = {
-  vlan_segment: Network,
-  subnet: Waypoints,
-  external_cloud: Cloud,
-  patch_trunk: Cable,
-};
-
-const ELEMENT_LABELS: Record<NetworkElementType, string> = {
-  vlan_segment: "VLAN segment",
-  subnet: "Subnet",
-  external_cloud: "External cloud",
-  patch_trunk: "Patch trunk",
-};
+import { ELEMENT_ICONS, ELEMENT_LABELS } from "@/lib/networkElements";
+import type { NetworkElementNode as NetworkElementNodeType } from "@/types/topology.types";
 
 // Dashed NEUTRAL gray, deliberately distinct from DynamicPlaceholderNode's
 // dashed purple (ADR 0012 "Canvas shape"): the two ephemeral-looking node
@@ -34,6 +16,18 @@ export function NetworkElementNode({ id, data, selected }: NodeProps<NetworkElem
   const [draft, setDraft] = useState(element.label);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Enter (commit) and Escape (cancel) both end the edit by unmounting the
+  // input, and an unmount fires the input's native blur, which re-invokes
+  // this component's onBlur={commit} handler from a stale closure. Without
+  // this guard: Enter commits, the resulting blur commits AGAIN (harmless
+  // but redundant, and one commit too many if the store write has a side
+  // effect); Escape cancels, but the stale-closure blur then commits the
+  // pre-cancel draft anyway, silently overwriting the user's cancel. The
+  // ref (not state, since it must be readable synchronously inside the same
+  // blur callback that flips it) tracks whether this edit session already
+  // ended, by either path, so commit is a no-op afterward.
+  const editEndedRef = useRef(true);
+
   useEffect(() => {
     if (editing) inputRef.current?.focus();
   }, [editing]);
@@ -41,12 +35,15 @@ export function NetworkElementNode({ id, data, selected }: NodeProps<NetworkElem
   const Icon = ELEMENT_ICONS[element.element_type];
 
   const commit = () => {
+    if (editEndedRef.current) return;
+    editEndedRef.current = true;
     const trimmed = draft.trim();
     setNetworkElementLabel(id, trimmed.length > 0 ? trimmed : element.label);
     setEditing(false);
   };
 
   const cancel = () => {
+    editEndedRef.current = true;
     setDraft(element.label);
     setEditing(false);
   };
@@ -96,6 +93,7 @@ export function NetworkElementNode({ id, data, selected }: NodeProps<NetworkElem
             type="button"
             onDoubleClick={() => {
               setDraft(element.label);
+              editEndedRef.current = false;
               setEditing(true);
             }}
             aria-label={`Edit label for ${element.label}`}

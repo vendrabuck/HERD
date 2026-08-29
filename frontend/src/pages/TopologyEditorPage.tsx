@@ -29,6 +29,12 @@ import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
 import { hydrateAndLoadCanvas } from "@/lib/canvasHydration";
+import {
+  isDynamicPlaceholder,
+  isNetworkElement,
+  isDeviceNode,
+  collectCanvasDeviceIds,
+} from "@/lib/canvasNodes";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
@@ -70,7 +76,6 @@ import type { AIGenerateResponse } from "@/types/ai.types";
 import type { ForkConflictDetail } from "@/types/reservation.types";
 import type {
   CanvasData,
-  CanvasNodeData,
   DeviceNodeData,
   DynamicPlaceholderNodeData,
   EdgeLayerType,
@@ -119,17 +124,6 @@ const nodeTypes = {
   networkElementNode: NetworkElementNode,
 };
 const edgeTypes = { layerEdge: LayerEdge, bundledEdge: BundledEdge };
-
-// Placeholder nodes are canvas-local planning artifacts: no inventory device
-// id, no cabling, never persisted as devices or wiring.
-const isDynamicPlaceholder = (node: Node<CanvasNodeData>) =>
-  node.type === "dynamicPlaceholderNode";
-
-// Network element nodes are the OPPOSITE of placeholders in one crucial way
-// (ADR 0012 "Canvas shape"): they DO persist into canvas_data. Every other
-// call site that consults isDynamicPlaceholder needs its own element
-// decision; see the six sites this predicate is used at below.
-const isNetworkElement = (node: Node<CanvasNodeData>) => node.type === "networkElementNode";
 
 // React Flow annotates edges it manages as a controlled component with its
 // own transient fields (selected, animated, style, zIndex); none of these
@@ -544,9 +538,7 @@ function TopologyEditorInner() {
     () =>
       [
         ...new Set(
-          nodes
-            .filter((n) => !isDynamicPlaceholder(n) && !isNetworkElement(n))
-            .map((n) => (n.data as DeviceNodeData).device.id)
+          nodes.filter(isDeviceNode).map((n) => (n.data as DeviceNodeData).device.id)
         ),
       ],
     [nodes]
@@ -563,6 +555,11 @@ function TopologyEditorInner() {
     [nodes]
   );
 
+  // A true result no longer implies both endpoints are device nodes (ADR
+  // 0012 "Attachments"): device-to-element is a valid connection too, and
+  // skips the topology-type check below since it only makes sense between
+  // two devices. Callers branching on the result (handleConnect) must still
+  // check isNetworkElement themselves before reading either side's `.device`.
   const isValidConnection = useCallback(
     (connection: Connection | { source: string; target: string }): boolean => {
       const sourceNode = nodes.find((n) => n.id === connection.source);
@@ -854,11 +851,7 @@ function TopologyEditorInner() {
 
       // Skip any resolved device that is already on the canvas; the resolver
       // cannot see the canvas and could pick a device the user just dropped.
-      const canvasDeviceIdSet = new Set(
-        nodes
-          .filter((n) => !isDynamicPlaceholder(n) && !(n.data as DeviceNodeData).isProposal)
-          .map((n) => (n.data as DeviceNodeData).device.id)
-      );
+      const canvasDeviceIdSet = collectCanvasDeviceIds(nodes);
       const duplicates = response.devices.filter(
         (d) => d.device && canvasDeviceIdSet.has(d.device.id)
       );
@@ -1395,7 +1388,6 @@ function TopologyEditorInner() {
             deviceId={pendingElementAttach.deviceId}
             deviceName={pendingElementAttach.deviceName}
             deviceTopologyType={pendingElementAttach.deviceTopologyType}
-            elementId={pendingElementAttach.elementId}
             elementLabel={pendingElementAttach.elementLabel}
             elementType={pendingElementAttach.elementType}
             existingWiredPortIds={existingWiredElementDevicePortIds}

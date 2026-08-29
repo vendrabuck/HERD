@@ -43,20 +43,36 @@ function buildEnrichedEdge(connection: Connection, data: LayerEdgeData): Edge<La
 // buildEnrichedEdge ever mints the edge. A device-to-device or
 // element-to-element connection (the latter refused upstream in
 // TopologyEditorPage, but not re-validated here) passes through unchanged.
+//
+// The swap requires BOTH endpoints to resolve (review fix): an unresolved
+// target previously still counted as "not an element" (targetIsElement
+// defaulted to false via optional chaining), so a source-is-element
+// connection with an unresolvable target got swapped anyway, turning a
+// dangling id into the CONNECTION'S source. Passing an unresolved connection
+// through unchanged instead leaves the ambiguity where it was, for the
+// caller to reject or ignore rather than silently reinterpreting it.
+//
+// `getNode` replaces a prebuilt `Map<string, Node>` (issue review: two direct
+// lookups per call is cheaper than materializing the whole node list into a
+// fresh Map on every addEnrichedEdge/addEnrichedEdges call).
 function normalizeElementDirection(
   connection: Connection,
   data: LayerEdgeData,
-  nodesById: Map<string, Node<CanvasNodeData>>,
+  getNode: (id: string) => Node<CanvasNodeData> | undefined,
 ): { connection: Connection; data: LayerEdgeData } {
-  const targetNode = nodesById.get(connection.target);
-  const sourceIsElement = nodesById.get(connection.source)?.type === "networkElementNode";
-  const targetIsElement = targetNode?.type === "networkElementNode";
+  const sourceNode = getNode(connection.source);
+  const targetNode = getNode(connection.target);
+  if (!sourceNode || !targetNode) {
+    return { connection, data };
+  }
+  const sourceIsElement = sourceNode.type === "networkElementNode";
+  const targetIsElement = targetNode.type === "networkElementNode";
   if (!sourceIsElement || targetIsElement) {
     return { connection, data };
   }
-  // Source is the element, target is the device (or unresolved): swap so the
-  // device becomes source. source_port_name/id are device-side only; there is
-  // no target-side port for an element, so nothing needs to move there.
+  // Source is the element, target is the device: swap so the device becomes
+  // source. source_port_name/id are device-side only; there is no
+  // target-side port for an element, so nothing needs to move there.
   return {
     connection: {
       source: connection.target,
@@ -137,8 +153,8 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
   // generator (genId) and one append path, with no dedupe anywhere.
   addEnrichedEdge: (connection, data) =>
     set((state) => {
-      const nodesById = new Map(state.nodes.map((n) => [n.id, n]));
-      const normalized = normalizeElementDirection(connection, data, nodesById);
+      const getNode = (id: string) => state.nodes.find((n) => n.id === id);
+      const normalized = normalizeElementDirection(connection, data, getNode);
       return {
         edges: [...state.edges, buildEnrichedEdge(normalized.connection, normalized.data)],
       };
@@ -152,9 +168,9 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
   // counterpart) still comes out device-source/element-target throughout.
   addEnrichedEdges: (items) =>
     set((state) => {
-      const nodesById = new Map(state.nodes.map((n) => [n.id, n]));
+      const getNode = (id: string) => state.nodes.find((n) => n.id === id);
       const built = items.map(({ connection, data }) => {
-        const normalized = normalizeElementDirection(connection, data, nodesById);
+        const normalized = normalizeElementDirection(connection, data, getNode);
         return buildEnrichedEdge(normalized.connection, normalized.data);
       });
       return { edges: [...state.edges, ...built] };

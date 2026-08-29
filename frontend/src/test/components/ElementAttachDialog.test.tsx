@@ -28,7 +28,6 @@ function baseProps(overrides: Partial<React.ComponentProps<typeof ElementAttachD
     deviceId: SOURCE_DEVICE,
     deviceName: "dut-01",
     deviceTopologyType: "PHYSICAL" as const,
-    elementId: "elem-1",
     elementLabel: "Mgmt VLAN",
     elementType: "vlan_segment" as const,
     onConfirm: vi.fn(),
