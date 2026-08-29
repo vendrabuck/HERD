@@ -13,42 +13,20 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from app.database import Base, get_db
+from app.database import get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import FORK_RESTORE_REQUIRES_ACTIVE, bearer_scheme
-from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+from tests._harness import TestSessionLocal, override_bearer, override_get_db
 
 OWNER_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
 ADMIN_ID = str(uuid.uuid4())
 
 NOW = datetime.now(timezone.utc)
-
-
-async def override_get_db():
-    async with TestSessionLocal() as session:
-        yield session
-
-
-def override_bearer():
-    return HTTPAuthorizationCredentials(scheme="Bearer", credentials="fake-token")
-
-
-@pytest.fixture(autouse=True)
-async def setup_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
 
 
 def _client_as(sub: str, role: str = "user") -> AsyncClient:
