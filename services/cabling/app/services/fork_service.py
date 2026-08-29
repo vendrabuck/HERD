@@ -88,7 +88,7 @@ async def _snapshot_connections(
     save-time wiring byte-for-byte identical, including multi-hop paths and shared-hop
     de-duplication.
     """
-    for spec in await resolve_canvas_wiring(db, canvas):
+    for spec in (await resolve_canvas_wiring(db, canvas)).specs:
         db.add(
             ForkConnection(
                 fork_id=fork_id,

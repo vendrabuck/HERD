@@ -77,6 +77,11 @@ class ForkSaveResult:
     released: list[WireSpec]
     built: list[WireSpec]
     unchanged_count: int
+    # ADR 0012 phase 1 (issue #22): count of device-to-element attachment edges the
+    # resolver recognized and skipped explicitly. Additive; defaults to 0 so every
+    # other ForkSaveResult construction site (prune, version-race retries) is
+    # unaffected.
+    element_attachments_skipped: int = 0
 
 
 @dataclass
@@ -110,7 +115,46 @@ def node_to_device_map(canvas: dict) -> dict[str, uuid.UUID]:
     return mapping
 
 
-async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[WireSpec]:
+def node_to_element_map(canvas: dict) -> dict[str, str]:
+    """Map React Flow node ids to network element ids (ADR 0012 phase 1, issue #22).
+
+    Populated from nodes whose ``type`` is ``"networkElementNode"``, keyed by node id,
+    valued by ``data.element.id`` (the client-minted element UUID). A node of that type
+    with no ``data.element.id`` falls back to the node id itself, so a malformed element
+    node still classifies as an element rather than silently vanishing from the map.
+    Shared by ``_run_topology_validation`` and ``resolve_canvas_wiring`` so both
+    classify an element edge identically.
+    """
+    nodes = canvas.get("nodes") or []
+    mapping: dict[str, str] = {}
+    for node in nodes:
+        if node.get("type") != "networkElementNode":
+            continue
+        node_id = node.get("id")
+        if not node_id:
+            continue
+        element_id = ((node.get("data") or {}).get("element") or {}).get("id")
+        mapping[node_id] = element_id or node_id
+    return mapping
+
+
+@dataclass(frozen=True)
+class CanvasWiringResolution:
+    """The result of resolving a canvas's committed edges (ADR 0012 phase 1).
+
+    ``specs`` is unchanged from what ``resolve_canvas_wiring`` returned before this
+    phase. ``element_attachments_skipped`` counts the device-to-element edges the
+    resolver recognized and skipped explicitly: a network element edge never becomes a
+    hop (decision 2), so it contributes no WireSpec, but the skip is now counted rather
+    than falling through the generic unresolvable-endpoint branch indistinguishably
+    from a genuinely broken edge.
+    """
+
+    specs: list[WireSpec]
+    element_attachments_skipped: int = 0
+
+
+async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> CanvasWiringResolution:
     """Resolve a canvas's committed edges to intended physical wiring (WireSpecs).
 
     The shared resolver behind both fork-on-activation snapshotting and save-reconcile
@@ -134,14 +178,23 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[W
     and is logged at INFO; it NEVER falls back to the unconstrained device-pair search,
     since a fallback would silently wire different ports than the user chose. Layer is
     deliberately not read from the canvas here; see the module docstring.
+
+    Network element edges (ADR 0012 phase 1, issue #22): an edge with one endpoint on
+    a ``networkElementNode`` is recognized via ``node_to_element_map`` BEFORE the
+    generic unresolvable-endpoint check below, so it is skipped explicitly and counted
+    in the returned ``element_attachments_skipped`` rather than falling through the
+    silent ``continue`` a genuinely broken edge still takes. An element edge never
+    becomes a hop (decision 2): it contributes no WireSpec regardless of endpoint
+    order, since ``node_to_element_map`` recognizes an element node on either side.
     """
     if not canvas:
-        return []
+        return CanvasWiringResolution(specs=[])
     edges = canvas.get("edges") or []
     if not edges:
-        return []
+        return CanvasWiringResolution(specs=[])
 
     node_to_device = node_to_device_map(canvas)
+    node_to_element = node_to_element_map(canvas)
     graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
 
     component_devices = set(graph.keys())
@@ -171,13 +224,19 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[W
 
     specs: list[WireSpec] = []
     seen: set[tuple[uuid.UUID, str, uuid.UUID, str, str]] = set()
+    element_attachments_skipped = 0
 
     for edge in edges:
         edge_data = edge.get("data") or {}
         if edge_data.get("isProposal"):
             continue
-        source_device = node_to_device.get(edge.get("source"))
-        target_device = node_to_device.get(edge.get("target"))
+        edge_source = edge.get("source")
+        edge_target = edge.get("target")
+        if edge_source in node_to_element or edge_target in node_to_element:
+            element_attachments_skipped += 1
+            continue
+        source_device = node_to_device.get(edge_source)
+        target_device = node_to_device.get(edge_target)
         if source_device is None or target_device is None:
             continue
 
@@ -240,7 +299,16 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> list[W
                     edge_key=edge_key,
                 )
             )
-    return specs
+
+    if element_attachments_skipped:
+        logger.debug(
+            "resolve_canvas_wiring: skipped %d network element attachment edge(s), "
+            "no hop emitted for any of them",
+            element_attachments_skipped,
+        )
+    return CanvasWiringResolution(
+        specs=specs, element_attachments_skipped=element_attachments_skipped
+    )
 
 
 def connection_identity(
@@ -382,7 +450,8 @@ async def save_fork(
     # off the async loop. Setting ``fork.canvas_data`` is a plain attribute write and
     # needs no load.
     fork_id = fork.id
-    new_specs = await resolve_canvas_wiring(db, canvas_data)
+    wiring_resolution = await resolve_canvas_wiring(db, canvas_data)
+    new_specs = wiring_resolution.specs
     result: dict = {}
 
     async def reconcile() -> None:
@@ -452,6 +521,7 @@ async def save_fork(
         released=result["released"],
         built=result["built"],
         unchanged_count=result["unchanged_count"],
+        element_attachments_skipped=wiring_resolution.element_attachments_skipped,
     )
 
 
@@ -650,11 +720,13 @@ async def prune_fork_devices(
 
 
 __all__ = [
+    "CanvasWiringResolution",
     "ForkPruneResult",
     "ForkSaveResult",
     "WireSpec",
     "connection_identity",
     "node_to_device_map",
+    "node_to_element_map",
     "prune_canvas_for_devices",
     "prune_fork_devices",
     "reconcile_connection_sets",

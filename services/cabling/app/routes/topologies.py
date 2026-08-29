@@ -19,6 +19,7 @@ from app.schemas.topology import (
     TopologyUpdate,
     TopologyValidationResponse,
 )
+from app.services.fork_save_service import node_to_element_map
 from app.services.pathfind_service import (
     build_adjacency_graph,
     find_all_shortest_paths_batch_async,
@@ -226,6 +227,11 @@ async def _run_topology_validation(
         except (ValueError, TypeError):
             continue
 
+    # node_id to network element id (ADR 0012 phase 1, issue #22). Shared with
+    # resolve_canvas_wiring's classification via node_to_element_map so the validator
+    # and the fork-save resolver agree on which edges are element attachments.
+    node_to_element = node_to_element_map(canvas)
+
     if not edges:
         return TopologyValidationResponse(valid=True, invalid_edges=[])
 
@@ -259,6 +265,51 @@ async def _run_topology_validation(
         target_node = edge.get("target")
         source_device = node_to_device.get(source_node) if source_node else None
         target_device = node_to_device.get(target_node) if target_node else None
+
+        # Network element classification (ADR 0012 phase 1, issue #22). Checked before
+        # the missing_device fallback so an element edge is classified on its own
+        # terms rather than as a dangling device reference. Direction is accepted
+        # either way: the frontend normalizes device-as-source, but an older client or
+        # a hand-edited import may hand back the element first.
+        source_is_element = source_node in node_to_element
+        target_is_element = target_node in node_to_element
+
+        if source_is_element and target_is_element:
+            edge_results[idx] = InvalidEdge(
+                edge_id=edge_id,
+                source_device_id=None,
+                target_device_id=None,
+                layer=layer,
+                reason="element_to_element",
+            )
+            continue
+
+        if source_is_element or target_is_element:
+            # Exactly one endpoint is an element. The other must be a known device for
+            # this to be a real attachment; if it is not, fall through to the existing
+            # missing_device handling below (a dangling node reference is a dangling
+            # node reference regardless of what the other end is).
+            device_side_id = target_device if source_is_element else source_device
+            if device_side_id is not None:
+                device_side_port = (
+                    edge_data.get("target_port_name")
+                    if source_is_element
+                    else edge_data.get("source_port_name")
+                )
+                if not device_side_port:
+                    edge_results[idx] = InvalidEdge(
+                        edge_id=edge_id,
+                        source_device_id=source_device,
+                        target_device_id=target_device,
+                        layer=layer,
+                        reason="element_edge_no_port",
+                    )
+                    continue
+
+                # VALID declarative attachment: no BFS, not added to `pending`. An
+                # element is not a physical thing the cabling graph could contain a
+                # path to.
+                continue
 
         if source_device is None or target_device is None:
             edge_results[idx] = InvalidEdge(

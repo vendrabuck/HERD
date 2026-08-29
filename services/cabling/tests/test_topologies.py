@@ -1,6 +1,7 @@
 import uuid
 from unittest.mock import patch
 
+import app.routes.topologies as topologies_module
 import pytest
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload, require_admin
@@ -961,6 +962,229 @@ async def test_validate_topology_multi_edge_mix_preserves_order(admin_client, us
     missing = body["invalid_edges"][0]
     assert missing["source_device_id"] == str(a1)
     assert missing["target_device_id"] is None
+
+
+def _element_canvas(
+    *,
+    device_id: uuid.UUID,
+    device_node_id: str = "nDev",
+    element_node_id: str = "nElem",
+    element_id: str | None = None,
+    edge_id: str = "attach-1",
+    device_is_source: bool = True,
+    source_port_name: str | None = "eth0",
+    target_port_name: str | None = None,
+) -> dict:
+    """Build a canvas with one device node, one networkElementNode, and one edge
+    between them, mirroring ADR 0012's canvas shape.
+    """
+    element_data: dict = {"element_type": "vlan_segment", "label": "Segment"}
+    if element_id is not None:
+        element_data["id"] = element_id
+    device_node = {"id": device_node_id, "data": {"device": {"id": str(device_id)}}}
+    element_node = {
+        "id": element_node_id,
+        "type": "networkElementNode",
+        "data": {"element": element_data},
+    }
+    source_id = device_node_id if device_is_source else element_node_id
+    target_id = element_node_id if device_is_source else device_node_id
+    return {
+        "nodes": [device_node, element_node],
+        "edges": [
+            {
+                "id": edge_id,
+                "source": source_id,
+                "target": target_id,
+                "data": {
+                    "layer": "L1",
+                    "source_port_name": source_port_name,
+                    "target_port_name": target_port_name,
+                },
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_element_attachment_valid_no_bfs(user_client):
+    """A device-to-element edge with a non-empty device-side port is VALID and the
+    batched pathfind call excludes it entirely (no BFS for a declarative attachment).
+    """
+    device_id = uuid.uuid4()
+    canvas = _element_canvas(device_id=device_id, element_id=str(uuid.uuid4()))
+
+    create = await user_client.post("/topologies", json={"name": "Element"})
+    topology_id = create.json()["id"]
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    seen_pairs: list[list] = []
+    real = topologies_module.find_all_shortest_paths_batch_async
+
+    async def _spy(graph, pairs):
+        seen_pairs.append(list(pairs))
+        return await real(graph, pairs)
+
+    with patch("app.routes.topologies.find_all_shortest_paths_batch_async", _spy):
+        resp = await user_client.post(f"/topologies/{topology_id}/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is True
+    assert body["invalid_edges"] == []
+    # The batch call, if made at all, must not include the element edge's pair.
+    for pairs in seen_pairs:
+        assert pairs == []
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_element_attachment_valid_element_first(user_client):
+    """Direction is accepted either way: element-as-source classifies identically to
+    device-as-source.
+    """
+    device_id = uuid.uuid4()
+    canvas = _element_canvas(
+        device_id=device_id,
+        element_id=str(uuid.uuid4()),
+        device_is_source=False,
+        source_port_name=None,
+        target_port_name="eth0",
+    )
+
+    create = await user_client.post("/topologies", json={"name": "ElementFirst"})
+    topology_id = create.json()["id"]
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is True
+    assert body["invalid_edges"] == []
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_element_to_element(user_client):
+    """Two network element nodes joined by an edge report element_to_element."""
+    create = await user_client.post("/topologies", json={"name": "ElementToElement"})
+    topology_id = create.json()["id"]
+    canvas = {
+        "nodes": [
+            {
+                "id": "nE1",
+                "type": "networkElementNode",
+                "data": {"element": {"id": str(uuid.uuid4()), "element_type": "subnet"}},
+            },
+            {
+                "id": "nE2",
+                "type": "networkElementNode",
+                "data": {"element": {"id": str(uuid.uuid4()), "element_type": "subnet"}},
+            },
+        ],
+        "edges": [{"id": "e-e", "source": "nE1", "target": "nE2", "data": {"layer": "L1"}}],
+    }
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert len(body["invalid_edges"]) == 1
+    assert body["invalid_edges"][0]["reason"] == "element_to_element"
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_element_edge_no_port(user_client):
+    """An element edge whose device-side port name is missing reports
+    element_edge_no_port."""
+    device_id = uuid.uuid4()
+    canvas = _element_canvas(
+        device_id=device_id, element_id=str(uuid.uuid4()), source_port_name=None
+    )
+
+    create = await user_client.post("/topologies", json={"name": "NoPort"})
+    topology_id = create.json()["id"]
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert len(body["invalid_edges"]) == 1
+    assert body["invalid_edges"][0]["reason"] == "element_edge_no_port"
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_element_edge_empty_port(user_client):
+    """An empty-string device-side port name is treated the same as missing."""
+    device_id = uuid.uuid4()
+    canvas = _element_canvas(device_id=device_id, element_id=str(uuid.uuid4()), source_port_name="")
+
+    create = await user_client.post("/topologies", json={"name": "EmptyPort"})
+    topology_id = create.json()["id"]
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert body["invalid_edges"][0]["reason"] == "element_edge_no_port"
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_element_edge_unknown_device_side(user_client):
+    """An element edge whose OTHER endpoint's node id is in neither map still reports
+    missing_device, unchanged (issue #22's fourth classification rule).
+    """
+    create = await user_client.post("/topologies", json={"name": "DanglingOtherSide"})
+    topology_id = create.json()["id"]
+    canvas = {
+        "nodes": [
+            {
+                "id": "nElem",
+                "type": "networkElementNode",
+                "data": {"element": {"id": str(uuid.uuid4()), "element_type": "subnet"}},
+            },
+            # nDangling is intentionally absent from nodes: the edge references a node
+            # id that resolves to neither a device nor an element.
+        ],
+        "edges": [
+            {
+                "id": "dangling",
+                "source": "nDangling",
+                "target": "nElem",
+                "data": {"layer": "L1", "target_port_name": "eth0"},
+            }
+        ],
+    }
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert len(body["invalid_edges"]) == 1
+    assert body["invalid_edges"][0]["reason"] == "missing_device"
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_element_node_missing_element_id_falls_back_to_node_id(
+    user_client,
+):
+    """A malformed element node with no data.element.id still classifies as an
+    element (falls back to the node id), per node_to_element_map's contract.
+    """
+    device_id = uuid.uuid4()
+    canvas = _element_canvas(device_id=device_id, element_id=None)
+
+    create = await user_client.post("/topologies", json={"name": "NoElementId"})
+    topology_id = create.json()["id"]
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is True
+    assert body["invalid_edges"] == []
 
 
 @pytest.mark.asyncio

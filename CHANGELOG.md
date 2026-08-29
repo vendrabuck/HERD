@@ -204,6 +204,45 @@
 
 #### Cabling and inventory
 
+- Network element objects, phase 1 of 3, cabling backend only (ADR 0012, refs
+  issue #22; frontend and docs land in later phases). A network element is a
+  non-device canvas node (`networkElementNode`) many device ports can attach
+  to with a many-to-one edge, modeling a shared VLAN segment, subnet, external
+  cloud, or patch-panel trunk without a full mesh of point-to-point links or a
+  new registry table (canvas-native and topology-local by decision).
+  `node_to_element_map` (`fork_save_service.py`, beside `node_to_device_map`)
+  is the one shared node-classification helper: it maps React Flow node ids to
+  element ids for nodes of type `networkElementNode`, keyed off
+  `data.element.id` with a fall back to the node id, and is used by both
+  `_run_topology_validation` and `resolve_canvas_wiring` so the two classify
+  an edge identically. `_run_topology_validation`
+  (`services/cabling/app/routes/topologies.py`) gains four classification
+  rules, checked before the existing BFS pass: a device-to-element edge with a
+  non-empty device-side port name (`source_port_name` when the device is the
+  source, `target_port_name` when the device is the target) is VALID with no
+  BFS and never enters the pathfind batch, since an element is not a physical
+  thing the cabling graph could contain a path to and direction is accepted
+  either way; both endpoints elements reports the new reason
+  `element_to_element`; one element endpoint with a missing or empty
+  device-side port name reports the new reason `element_edge_no_port`; an
+  element-side node id present in neither map still falls through to the
+  existing `missing_device`, unchanged. `InvalidEdge`'s docstring
+  (`schemas/topology.py`) now enumerates all four reasons; `reason` stays a
+  plain `str`, no schema enum change. `resolve_canvas_wiring` recognizes an
+  element edge via the same map before its existing unresolvable-endpoint
+  check, skips it explicitly (an element edge never becomes a hop; a broken
+  non-element edge keeps the old silent skip, uncounted), and returns the
+  skip count alongside its `WireSpec` list via a new
+  `CanvasWiringResolution` result type. The count threads through
+  `ForkSaveResult` to the new additive `ForkSaveResponse.element_attachments_skipped:
+  int = 0` field (`schemas/fork.py`), returned by `POST
+  /internal/forks/{reservation_id}/save`; fork-on-activation snapshotting
+  (`fork_service.py`'s `_snapshot_connections`) uses the same resolver and
+  ignores the count. `tests/contract/snapshots/cabling.json` is regenerated
+  (additive: one new `ForkSaveResponse` property, `required` unchanged) and
+  `services/cabling/tests/` gains unit coverage for every classification rule
+  (both endpoint orderings), the resolver's skip-and-count behavior on a
+  mixed canvas, and the response defaults.
 - Bulk connection creation (PR #537): `POST /connections/bulk` (admin-only) creates
   up to 200 connections per call (the cap mirrors inventory's
   `BulkPortCreate.instances`), returning a per-row created/rejected

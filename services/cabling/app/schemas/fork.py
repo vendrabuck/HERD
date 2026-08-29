@@ -165,6 +165,10 @@ class ForkSaveResponse(BaseModel):
     released: list[ForkConnectionDelta]
     built: list[ForkConnectionDelta]
     unchanged_count: int
+    # ADR 0012 phase 1 (issue #22): count of device-to-element attachment edges the
+    # resolver skipped explicitly (never a hop, so never in released/built). Additive
+    # field, defaulted to 0 so existing clients are unaffected.
+    element_attachments_skipped: int = 0
 
 
 class ForkPruneRequest(BaseModel):
