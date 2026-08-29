@@ -109,15 +109,15 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Fork version preview, diff, and restore** (Shipped): the live-edit history
   panel's per-version list (newest first) offers Preview, a client-side Diff, and
   Restore. Preview renders a version's canvas read-only on top of the live draft,
-  banner and Exit visible, with editing, the wiring dialog, and Save all locked
+  banner and Exit visible, with editing, the wiring dialog, and Commit all locked
   until you exit. Diff compares any version against another version or the
   current draft, listing added and removed devices and wires in the panel and
   color-highlighting added/removed edges on the canvas. Restore copies a past
-  version's canvas onto the fork's draft; nothing is wired until the existing
-  Save runs, and Save is what appends the version carrying the "restored"
-  marker (a restore alone appends no version, only a "Draft restored from
-  version N (unsaved)" indicator that clears on Save). See the ADR 0006
-  addendum (issue #622).
+  version's canvas onto the fork's draft; nothing is wired until you run
+  Commit to reservation, and that commit is what appends the version carrying
+  the "restored" marker (a restore alone appends no version, only a "Draft
+  restored from version N (unsaved)" indicator that clears on the next
+  commit). See the ADR 0006 addendum (issue #622).
 - **Network element objects** (Shipped): a canvas node kind, `networkElementNode`,
   models non-device infrastructure a topology needs to reference but not
   provision: a shared VLAN segment, a management subnet, an external cloud, or a

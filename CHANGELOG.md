@@ -367,7 +367,7 @@
   fork history panel's read-only version list gains per-version Preview (a
   read-only render of that snapshot on the canvas, ghosted the same way the
   parent-topology preview is, with a "Previewing version N" banner and Exit
-  control; editing, the wiring dialog, and Save all lock while it is up), Diff
+  control; editing, the wiring dialog, and Commit all lock while it is up), Diff
   (against another version or the current draft; `lib/forkDiff.ts` is the pure
   client-side set-difference, keying an edge on (source, target,
   source_port_name, target_port_name) rather than its own id so a redrawn
@@ -378,8 +378,8 @@
   row itself: it copies the version's canvas onto the fork's draft
   (`ReservationFork.draft_restored_from_id` tracks the pending, unsaved
   restore, surfaced as an amber "Draft restored from version N (unsaved)"
-  chip), and nothing is wired until the existing Save runs, which is what
-  appends the version carrying the `restored_from_id` marker. New API:
+  chip), and nothing is wired until you run Commit to reservation, which is
+  what appends the version carrying the `restored_from_id` marker. New API:
   `useForkVersion`/`useRestoreForkVersion` in `api/reservations.ts`, both
   proxying the reservations-service endpoints under
   `/reservations/{id}/fork/versions/{version_id}`. The preview/diff/restore
@@ -579,6 +579,27 @@
   edit. `Paginated` is deliberately auth-local; promotion to `herd_common`
   waits for a second service wanting the same shape. Full auth suite: 442
   passed, 43 skipped.
+- Shared reservations test harness (issue #628, PR #630, the same split as
+  #511): six reservations test files (`test_fork_endpoints.py`,
+  `test_fork_version_endpoints.py`, `test_wiring_proxy_endpoints.py`,
+  `test_rbac_denial.py`, `test_coverage_gaps.py`, `test_reservations.py`) each
+  carried a byte-identical in-memory SQLite engine, sessionmaker, `get_db`
+  override, and bearer-scheme override. New
+  `services/reservations/tests/_harness.py` holds the importable
+  `TEST_DATABASE_URL`/`engine`/`TestSessionLocal`/`override_get_db`/
+  `override_bearer`; `conftest.py` gains the shared autouse `setup_db` fixture
+  and a `make_client(payload)` factory. Each file keeps its own small,
+  differently-shaped client helper; only the copied block moved. Eight files
+  that bind their session to `app.database`'s own engine at import time
+  (`test_expiration.py`, `test_expiry_reminder.py`, `test_dynamic_requests.py`,
+  `test_fork_archive_reconcile.py`, `test_fork_backstop_giveup.py`,
+  `test_pending_fork_prune.py`, `test_wiring_changed_staging.py`, and
+  `test_reservation_service_unit.py`, which patches
+  `app.tasks.expiration.AsyncSessionLocal` directly) are untouched by design,
+  mirroring auth's LDAP-sync exception; `test_fleet_report.py` mixes a
+  fixture-scoped engine with a route-engine block and was left unmigrated
+  rather than half-migrated. Full reservations suite: 519 passed, unchanged
+  before and after.
 
 #### Documentation
 

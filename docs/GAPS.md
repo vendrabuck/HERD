@@ -50,18 +50,18 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Frontend: pages and components
 
-**19 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
+**20 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
 `DeviceGroupDetailPage`, `DevicePage`, `DriversPage`, `GrantsPage`, `HypervisorsPage`,
 `InventoryPage`, `LdapSyncPage`, `LoginPage`, `RegisterPage`, `ReportingPage`,
-`ReservationsPage`, `SettingsPage`, `TemplateEditorPage`, `TemplatesPage`, plus three
+`ReservationsPage`, `SettingsPage`, `TemplateEditorPage`, `TemplatesPage`, plus four
 TopologyEditorPage suites: `TopologyEditorForkMode`, `TopologyEditorDynamicPlaceholders`,
-and `TopologyEditorWiring`).
+`TopologyEditorNetworkElements`, and `TopologyEditorWiring`).
 
 - [HIGH] Page smoke tests (render, key interactions):
   - `frontend/src/pages/ReservationCalendarPage.tsx`
   - `frontend/src/pages/TopologyEditorPage.tsx` beyond the fork-mode,
-    dynamic-placeholder, and wiring-dialog suites: the base editor flows (device drop,
-    edge draw, parent save) still lack direct page-level coverage.
+    dynamic-placeholder, network-element, and wiring-dialog suites: the base editor
+    flows (device drop, edge draw, parent save) still lack direct page-level coverage.
 - [MEDIUM] Remaining pages: `TopologyPage`, `TopologyTemplatesPage`, and the
   admin-only `AddDevicePage`, `DeviceGroupsPage`, `GroupDetailPage`, `GroupsPage`, and
   `UsersPage`.
