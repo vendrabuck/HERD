@@ -186,6 +186,9 @@ def test_config_full_cycle_edit_and_restore_via_ui(pw_page, config_api, preserve
     os.environ.get("HERD_E2E_RESTART") != "1",
     reason="Save and Restart bounces the whole stack; opt in with HERD_E2E_RESTART=1",
 )
+@pytest.mark.seeded_skip_ok(
+    "deliberately opt-in only (HERD_E2E_RESTART=1); no seed makes this safe to run implicitly"
+)
 def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_marker):
     """Save and Restart: persists a value AND restarts services, asserted by effect.
 

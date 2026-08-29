@@ -50,23 +50,26 @@ def _stack_is_ldap() -> bool:
     return True
 
 
-pytestmark = pytest.mark.skipif(
-    not _stack_is_ldap(),
-    reason=(
-        "stack not configured for LDAP (AUTH_METHOD != 'ldap'). See "
-        "the local LDAP setup notes for how to point the stack at the local "
-        "OpenLDAP container."
+pytestmark = [
+    pytest.mark.skipif(
+        not _stack_is_ldap(),
+        reason=(
+            "stack not configured for LDAP (AUTH_METHOD != 'ldap'). See "
+            "the local LDAP setup notes for how to point the stack at the local "
+            "OpenLDAP container."
+        ),
     ),
-)
+    pytest.mark.seeded_skip_ok(
+        "gate stack runs AUTH_METHOD=local, the LDAP-mode phase covers integration not e2e"
+    ),
+]
 
 
 def test_ldap_user_can_login(browser, base_url):
     """A directory user binds successfully through the login form."""
     browser.get(f"{base_url}/login")
     wait = WebDriverWait(browser, WAIT)
-    email_input = wait.until(
-        EC.presence_of_element_located((By.ID, "login-email"))
-    )
+    email_input = wait.until(EC.presence_of_element_located((By.ID, "login-email")))
     password_input = browser.find_element(By.ID, "login-password")
 
     email_input.clear()

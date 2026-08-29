@@ -497,6 +497,10 @@ def _parse_stream_conversation_id(sse_text: str) -> str | None:
     return None
 
 
+@pytest.mark.seeded_skip_ok(
+    "AI provider is not configured on the gate or nightly stack; an environmental "
+    "gate no seed can satisfy"
+)
 def test_assistant_stream_token_by_token(pw_page):
     pw_login(pw_page)
 

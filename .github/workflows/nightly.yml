@@ -4,6 +4,12 @@
 # full failure set instead of stopping at the first one. workflow_dispatch
 # lets a reviewer run this on any branch before merging a frontend-heavy PR.
 #
+# The first e2e pass (before the LDAP-mode and Postgres-live phases) runs
+# against an unseeded stack, so every test gated on an available device skips
+# there by design; after "Seed stack for load test" a second pass,
+# `make test-e2e-seeded`, re-runs the same suite against the now-seeded stack
+# and fails if anything still skips (issue #629).
+#
 # Also runs the LDAP-mode stack coverage the master/everything gates run
 # (issue #572): infra/ldap-test boots alongside the stack, and after e2e the
 # stack's auth service is switched to LDAP mode, tests/integration/
@@ -107,6 +113,9 @@ jobs:
 
       - name: Seed stack for load test
         run: make seed
+
+      - name: E2E tests (seeded, no skips allowed)
+        run: make test-e2e-seeded
 
       - name: Load test (locust, headless)
         run: HERD_BASE_URL=https://localhost make test-load

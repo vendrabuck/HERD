@@ -600,6 +600,59 @@
   fixture-scoped engine with a route-engine block and was left unmigrated
   rather than half-migrated. Full reservations suite: 519 passed, unchanged
   before and after.
+- Seeded e2e phase, so a silently-skipping e2e test cannot hide behind a green
+  gate (issue #629): the `everything` recipe's existing `test-e2e` pass runs
+  before the gate stack is seeded, so every test gated on an available device
+  (the fork Playwright tests' `_pw_create_reserved_topology`, `pw_two_devices_with_ports`,
+  `transient_reservation`, ...) always skips there by design, and nothing in the
+  gate or in nightly.yml re-ran that suite once the stack was actually seeded. New
+  Make target `test-e2e-seeded` runs the identical `test-e2e` body (factored into a
+  shared `_test-e2e-run` helper so the two cannot drift) with
+  `HERD_E2E_REQUIRE_NO_SKIP=1`; `tests/e2e/conftest.py` gates a `pytest_sessionfinish`
+  hook on that env var, collects every skipped test (including setup-phase skips
+  from a fixture's own `pytest.skip()`) via `pytest_runtest_logreport`, and fails
+  the run if any remain, printing each skipped node id and its reason. `everything`
+  now runs `test-e2e-seeded` right after seeding the gate stack and before the
+  load-test tail, so `EVERYTHING_LOAD=0`/`everything-noload` still gets the seeded
+  e2e pass and only the load test itself is skipped; `master` is unchanged (no
+  seed phase to run the seeded pass against). `nightly.yml` runs the same target
+  right after its "Seed stack for load test" step. The unseeded `test-e2e` pass
+  is kept as-is: it exercises the empty-stack UI paths deliberately, this is
+  additive. `format_skip_block`, the pure formatting function behind the report
+  block, is pinned directly in `tests/unit/test_e2e_seed_gate.py`.
+  Follow-up from review: a new `seeded_skip_ok(reason)` marker (registered in
+  `pyproject.toml`'s `markers` list, since `filterwarnings = ["error"]` would
+  otherwise turn the unregistered-marker warning into a collection error)
+  exempts a skip that is expected even on a seeded stack: applied to both
+  `test_ldap_login.py` tests (the gate stack runs `AUTH_METHOD=local`; LDAP-mode
+  coverage lives in the integration phase, not e2e), and to the two
+  deliberately-manual placeholders, `test_ai_feature_gate.py::test_use_ai_button_toggles_with_key_change`
+  and `test_config_playwright.py::test_config_save_and_restart_gated`. An exempt
+  skip is never counted toward the failing total but is still printed, via the
+  new `format_exempt_block` (also pinned in `tests/unit/test_e2e_seed_gate.py`),
+  under its own `exempt (seeded_skip_ok):` heading so the log keeps showing it.
+  Separately, `test_add_device_ui.py::test_create_device_via_form` had a real
+  race on a seeded stack: it read the template `<select>`'s options before the
+  templates query had populated them, so it skipped ("no device templates
+  seeded") even when the stack actually had 28 templates seeded; it now waits
+  (bounded, falling through to the existing skip on a genuine timeout) for at
+  least one value-bearing option before checking. The sibling
+  `test_template_select_has_placeholder` was checked for the same race and does
+  not have it: its placeholder `<option>` is unconditional in
+  `CreateDeviceForm.tsx`, rendered outside the templates map, so it needed no
+  change. A second review pass added three more fixes: the `seeded_skip_ok`
+  marker now also covers the five AI-gated tests (`test_ai_generate_dialog.py`'s
+  three `ai_topology`-dependent tests, `test_ai_chat_multi_turn.py`'s chat test,
+  and `test_tier2_playwright.py::test_assistant_stream_token_by_token`), since
+  neither the gate nor `nightly.yml` configures an AI provider and that skip is
+  an environmental gate no seed can satisfy; the new `WebDriverWait` in
+  `test_add_device_ui.py::test_create_device_via_form` now ignores
+  `StaleElementReferenceException`/`NoSuchElementException` while polling the
+  template `<select>`, since a mid-poll re-render could raise one and was not
+  caught by the existing `TimeoutException` handler; and the sessionfinish log
+  no longer prints the `HERD_E2E_REQUIRE_NO_SKIP=1: 0 test(s) skipped` header
+  when every skip is exempt, via the new pure `format_sessionfinish_report`
+  helper (also pinned in `tests/unit/test_e2e_seed_gate.py`).
 
 #### Documentation
 
