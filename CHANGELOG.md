@@ -495,6 +495,27 @@
   waits for a second service wanting the same shape. Full auth suite: 442
   passed, 43 skipped.
 
+#### Documentation
+
+- ADR 0012, network element objects (issue #22, design only, no code):
+  `docs/design/0012-network-element-objects.md` records three decisions taken
+  2026-08-29. Storage is canvas-native and topology-local, a new
+  `networkElementNode` kind inside `topologies.canvas_data` (and so inside fork
+  canvases and version snapshots for free) with no tables and no migration,
+  rejecting the registry-plus-attachments shape the issue body proposed because
+  reservation-time edits would mutate global rows, forks would need their own
+  element story, and element delete would have to sweep every topology's
+  canvas. Provisioning is out for v1: an element is a reachability hub only,
+  attachments are declarative `layerEdge` rows the validator accepts without a
+  BFS, and cabling's fork-save resolver skips them explicitly with a new
+  additive `element_attachments_skipped` count, so the invariant is that an
+  element edge never becomes a hop and ADR 0009's derivations need no element
+  rule. The anchored-VLAN variant is recorded as phase 2 with its hook named
+  (synthetic device-to-anchor-switch hops at fork save, since a chain endpoint
+  never receives a driver call). AI generation of elements is deferred to a
+  follow-up issue. `PLANNED_FEATURES.md` links the ADR from the network element
+  objects bullet, which stays `Planned`.
+
 ## [0.2.0] - 2026-08-03
 
 - Completed the connection-driven reconcile epic (ADR 0009): initial provisioning, fork saves, and terminal teardown all flow through one full-reconcile pipeline over the three wiring ledgers, retiring the legacy device-set resolvers; device-set changes wire and release only through fork saves.
