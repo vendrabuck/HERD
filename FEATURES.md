@@ -118,6 +118,26 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   marker (a restore alone appends no version, only a "Draft restored from
   version N (unsaved)" indicator that clears on Save). See the ADR 0006
   addendum (issue #622).
+- **Network element objects** (Shipped): a canvas node kind, `networkElementNode`,
+  models non-device infrastructure a topology needs to reference but not
+  provision: a shared VLAN segment, a management subnet, an external cloud, or a
+  patch-panel trunk (four fixed types). Many device ports can attach to one
+  element with a many-to-one edge, avoiding both a fake device with no driver and
+  a combinatorial device-to-device mesh. Attachments are ordinary edges (device
+  always the source, element the target, normalized regardless of which side you
+  drew from); multiple attachments to one element bundle into one edge on the
+  canvas with a count badge, the same rendering the wiring dialog already uses.
+  Two device ports attached to the same element validate as reachable by
+  definition, with no BFS against the element itself. Unlike a dynamic
+  placeholder, an element node and its attachment edges are saved with the
+  topology and ride into reservation forks and version snapshots for free
+  (canvas-native, topology-local storage; no new database table). No
+  provisioning of any kind in v1: an attachment records no driver call, no VLAN,
+  no route, and no ledger row, and a fork save reports the count of attachment
+  edges it skipped for exactly this reason (`element_attachments_skipped`). JSON
+  bulk export/import round-trips element nodes byte-for-byte; CSV export does
+  not carry them, a documented limitation of that lossy format. See ADR 0012
+  (issue #22).
 - **Shortest-path cable routing** (Shipped): on-demand BFS (minimum-hop) pathfinding through
   Layer 1 switch infrastructure, with visual feedback on the canvas (green stroke
   and hop-count badge when a path exists, red stroke when not).
