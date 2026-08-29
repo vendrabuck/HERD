@@ -2420,6 +2420,55 @@ async def test_resolve_canvas_wiring_mixed_canvas_one_device_wire_three_attachme
 
 
 @pytest.mark.asyncio
+async def test_resolve_canvas_wiring_element_to_element_not_counted():
+    """An element-to-element edge is a shape the validator rejects, so the resolver
+    must not count it as an attachment: no WireSpec, and no increment of
+    element_attachments_skipped either.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    canvas = {
+        "nodes": [_element_node("nE1", "elem-1"), _element_node("nE2", "elem-2")],
+        "edges": [{"id": "e2e", "source": "nE1", "target": "nE2", "data": {}}],
+    }
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_element_edge_no_port_not_counted():
+    """An element edge with an empty device-side port name is a shape the validator
+    rejects (element_edge_no_port), so the resolver must not count it: no WireSpec,
+    and no increment of element_attachments_skipped either.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    device_id = uuid.uuid4()
+    canvas = _attachment_canvas(device_id, source_port_name=None)
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_valid_attachment_still_counted():
+    """A genuine valid attachment (the validator-accepted shape) still counts 1,
+    guarding against an overcorrection that stops counting anything.
+    """
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    device_id = uuid.uuid4()
+    canvas = _attachment_canvas(device_id)
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert resolution.specs == []
+    assert resolution.element_attachments_skipped == 1
+
+
+@pytest.mark.asyncio
 async def test_save_fork_element_attachment_reports_skip_count_and_builds_nothing(client):
     """Saving a fork over a canvas with two element attachments builds zero
     fork_connections and reports element_attachments_skipped=2.

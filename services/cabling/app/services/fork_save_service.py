@@ -138,6 +138,64 @@ def node_to_element_map(canvas: dict) -> dict[str, str]:
     return mapping
 
 
+def classify_element_edge(
+    edge: dict,
+    node_to_device: dict[str, uuid.UUID],
+    node_to_element: dict[str, str],
+) -> str | None:
+    """Classify one canvas edge against the element/device maps (ADR 0012 phase 1).
+
+    The single shared classifier behind both ``_run_topology_validation`` and
+    ``resolve_canvas_wiring``, so the validator and the fork-save resolver agree on
+    which edges are element attachments and which of those are valid. Direction is
+    accepted either way: the frontend normalizes device-as-source, but an older client
+    or a hand-edited import may hand back the element first.
+
+    Returns one of:
+
+    - ``"attachment"``: exactly one endpoint is a network element, the other is a
+      known device, and the device-side port name (``target_port_name`` when the
+      device is the target, ``source_port_name`` when the device is the source) is
+      non-empty. This is the only shape ``_run_topology_validation`` accepts and the
+      only shape ``resolve_canvas_wiring`` should count.
+    - ``"element_to_element"``: both endpoints are network elements.
+    - ``"element_edge_no_port"``: exactly one endpoint is a network element, the other
+      is a known device, but the device-side port name is missing or empty.
+    - ``None``: not an element edge (neither endpoint is in ``node_to_element``), OR
+      exactly one endpoint is an element and the other resolves to no known device
+      either. That second case is deliberately left for the caller's own
+      missing-device/unresolvable-endpoint handling, since a dangling node reference
+      is a dangling node reference regardless of what the other end is.
+    """
+    source_node = edge.get("source")
+    target_node = edge.get("target")
+    source_is_element = source_node in node_to_element
+    target_is_element = target_node in node_to_element
+
+    if not source_is_element and not target_is_element:
+        return None
+
+    if source_is_element and target_is_element:
+        return "element_to_element"
+
+    source_device = node_to_device.get(source_node) if source_node else None
+    target_device = node_to_device.get(target_node) if target_node else None
+    device_side_id = target_device if source_is_element else source_device
+    if device_side_id is None:
+        return None
+
+    edge_data = edge.get("data") or {}
+    device_side_port = (
+        edge_data.get("target_port_name")
+        if source_is_element
+        else edge_data.get("source_port_name")
+    )
+    if not device_side_port:
+        return "element_edge_no_port"
+
+    return "attachment"
+
+
 @dataclass(frozen=True)
 class CanvasWiringResolution:
     """The result of resolving a canvas's committed edges (ADR 0012 phase 1).
@@ -179,13 +237,15 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> Canvas
     since a fallback would silently wire different ports than the user chose. Layer is
     deliberately not read from the canvas here; see the module docstring.
 
-    Network element edges (ADR 0012 phase 1, issue #22): an edge with one endpoint on
-    a ``networkElementNode`` is recognized via ``node_to_element_map`` BEFORE the
-    generic unresolvable-endpoint check below, so it is skipped explicitly and counted
-    in the returned ``element_attachments_skipped`` rather than falling through the
-    silent ``continue`` a genuinely broken edge still takes. An element edge never
-    becomes a hop (decision 2): it contributes no WireSpec regardless of endpoint
-    order, since ``node_to_element_map`` recognizes an element node on either side.
+    Network element edges (ADR 0012 phase 1, issue #22): every edge is classified via
+    the shared ``classify_element_edge`` helper BEFORE the generic unresolvable-endpoint
+    check below, so only the edges ``_run_topology_validation`` would accept as a valid
+    attachment (classification ``"attachment"``) are counted in the returned
+    ``element_attachments_skipped``. An element edge the validator would reject
+    (``"element_to_element"`` or ``"element_edge_no_port"``) falls through to the
+    existing silent ``continue``, uncounted, same as a genuinely broken non-element
+    edge. An element edge never becomes a hop (decision 2): none of the three element
+    classifications contribute a WireSpec.
     """
     if not canvas:
         return CanvasWiringResolution(specs=[])
@@ -232,8 +292,13 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> Canvas
             continue
         edge_source = edge.get("source")
         edge_target = edge.get("target")
-        if edge_source in node_to_element or edge_target in node_to_element:
+        classification = classify_element_edge(edge, node_to_device, node_to_element)
+        if classification == "attachment":
             element_attachments_skipped += 1
+            continue
+        if classification in ("element_to_element", "element_edge_no_port"):
+            # Not a shape the validator accepts either; fall through to the same
+            # silent skip a genuinely broken non-element edge takes, uncounted.
             continue
         source_device = node_to_device.get(edge_source)
         target_device = node_to_device.get(edge_target)
