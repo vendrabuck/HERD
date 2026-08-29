@@ -18,7 +18,11 @@ import time
 import uuid
 
 import pytest
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
@@ -88,7 +92,11 @@ def test_create_device_via_form(admin_browser, base_url):
     # has templates seeded (issue #629 review). A genuine absence of
     # templates still times out here and falls through to the existing skip.
     try:
-        WebDriverWait(admin_browser, WAIT).until(
+        WebDriverWait(
+            admin_browser,
+            WAIT,
+            ignored_exceptions=(StaleElementReferenceException, NoSuchElementException),
+        ).until(
             lambda d: any(
                 o.get_attribute("value")
                 for o in Select(d.find_element(By.ID, "dev-template")).options

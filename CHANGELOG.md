@@ -640,7 +640,19 @@
   `test_template_select_has_placeholder` was checked for the same race and does
   not have it: its placeholder `<option>` is unconditional in
   `CreateDeviceForm.tsx`, rendered outside the templates map, so it needed no
-  change.
+  change. A second review pass added three more fixes: the `seeded_skip_ok`
+  marker now also covers the five AI-gated tests (`test_ai_generate_dialog.py`'s
+  three `ai_topology`-dependent tests, `test_ai_chat_multi_turn.py`'s chat test,
+  and `test_tier2_playwright.py::test_assistant_stream_token_by_token`), since
+  neither the gate nor `nightly.yml` configures an AI provider and that skip is
+  an environmental gate no seed can satisfy; the new `WebDriverWait` in
+  `test_add_device_ui.py::test_create_device_via_form` now ignores
+  `StaleElementReferenceException`/`NoSuchElementException` while polling the
+  template `<select>`, since a mid-poll re-render could raise one and was not
+  caught by the existing `TimeoutException` handler; and the sessionfinish log
+  no longer prints the `HERD_E2E_REQUIRE_NO_SKIP=1: 0 test(s) skipped` header
+  when every skip is exempt, via the new pure `format_sessionfinish_report`
+  helper (also pinned in `tests/unit/test_e2e_seed_gate.py`).
 
 #### Documentation
 

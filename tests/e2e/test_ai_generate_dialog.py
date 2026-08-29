@@ -82,6 +82,10 @@ def _open_ai_dialog(driver):
     wait.until(EC.element_to_be_clickable((By.ID, "ai-prompt")))
 
 
+@pytest.mark.seeded_skip_ok(
+    "AI provider is not configured on the gate or nightly stack; an environmental "
+    "gate no seed can satisfy"
+)
 def test_use_ai_opens_dialog(logged_in_browser, base_url, ai_topology):
     """Clicking Use AI opens a dialog with a prompt textarea."""
     _open_editor(logged_in_browser, base_url, ai_topology["id"])
@@ -90,6 +94,10 @@ def test_use_ai_opens_dialog(logged_in_browser, base_url, ai_topology):
     assert prompt.is_displayed()
 
 
+@pytest.mark.seeded_skip_ok(
+    "AI provider is not configured on the gate or nightly stack; an environmental "
+    "gate no seed can satisfy"
+)
 def test_ai_generate_button_disabled_when_prompt_empty(
     logged_in_browser, base_url, ai_topology
 ):
@@ -113,6 +121,10 @@ def test_ai_generate_button_disabled_when_prompt_empty(
     assert generate.get_attribute("disabled") is None
 
 
+@pytest.mark.seeded_skip_ok(
+    "AI provider is not configured on the gate or nightly stack; an environmental "
+    "gate no seed can satisfy"
+)
 def test_ai_dialog_closes_via_escape(logged_in_browser, base_url, ai_topology):
     """Pressing Escape dismisses the AI dialog.
 

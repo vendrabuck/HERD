@@ -15,7 +15,11 @@ login tests on a local-auth gate stack) is still visible in the log without
 inflating the failing count.
 """
 
-from tests.e2e.conftest import format_exempt_block, format_skip_block
+from tests.e2e.conftest import (
+    format_exempt_block,
+    format_sessionfinish_report,
+    format_skip_block,
+)
 
 
 def test_format_skip_block_empty():
@@ -73,3 +77,36 @@ def test_format_exempt_block_does_not_affect_skip_block_count():
     # them as two separate sections rather than merging the lists.
     failing_count_line = format_skip_block([]).splitlines()[0]
     assert failing_count_line == "HERD_E2E_REQUIRE_NO_SKIP=1: 0 test(s) skipped on a seeded stack:"
+
+
+def test_format_sessionfinish_report_empty_is_empty_string():
+    # Nothing skipped at all: pytest_sessionfinish should print nothing.
+    assert format_sessionfinish_report([], []) == ""
+
+
+def test_format_sessionfinish_report_exempt_only_omits_failing_header():
+    # Review fix: when every skip is seeded_skip_ok-exempt, the log must not
+    # show the "0 test(s) skipped on a seeded stack:" header with nothing
+    # under it; only the exempt block renders.
+    exempt = [("tests/e2e/test_ldap_login.py::test_ldap_user_can_login", "AUTH_METHOD != 'ldap'")]
+    output = format_sessionfinish_report([], exempt)
+    assert "HERD_E2E_REQUIRE_NO_SKIP=1: 0 test(s) skipped" not in output
+    assert "exempt (seeded_skip_ok):" in output
+    assert "test_ldap_user_can_login: AUTH_METHOD != 'ldap'" in output
+
+
+def test_format_sessionfinish_report_failing_only_omits_exempt_block():
+    skips = [("tests/e2e/test_fork_live_edit.py::test_x", "no AVAILABLE device")]
+    output = format_sessionfinish_report(skips, [])
+    assert "HERD_E2E_REQUIRE_NO_SKIP=1: 1 test(s) skipped on a seeded stack:" in output
+    assert "exempt (seeded_skip_ok):" not in output
+
+
+def test_format_sessionfinish_report_both_present_shows_both_blocks():
+    skips = [("tests/e2e/test_fork_live_edit.py::test_x", "no AVAILABLE device")]
+    exempt = [("tests/e2e/test_ldap_login.py::test_ldap_user_can_login", "AUTH_METHOD != 'ldap'")]
+    output = format_sessionfinish_report(skips, exempt)
+    assert "HERD_E2E_REQUIRE_NO_SKIP=1: 1 test(s) skipped on a seeded stack:" in output
+    assert "exempt (seeded_skip_ok):" in output
+    # The failing block renders before the exempt block.
+    assert output.index("1 test(s) skipped") < output.index("exempt (seeded_skip_ok):")

@@ -125,6 +125,27 @@ def format_exempt_block(exempt: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def format_sessionfinish_report(skips: list[tuple[str, str]], exempt: list[tuple[str, str]]) -> str:
+    """Render the full sessionfinish log output from the two report lists.
+
+    Pure and stack-free, mirroring format_skip_block/format_exempt_block, so
+    it can be unit tested directly. Returns the empty string when both lists
+    are empty (nothing to print). The failing block (format_skip_block) is
+    included only when skips is non-empty, so an all-exempt run prints just
+    the exempt block rather than a "0 test(s) skipped" header with nothing
+    under it.
+    """
+    if not skips and not exempt:
+        return ""
+    blocks = []
+    if skips:
+        blocks.append(format_skip_block(skips))
+    exempt_block = format_exempt_block(exempt)
+    if exempt_block:
+        blocks.append(exempt_block)
+    return "\n" + "\n\n".join(blocks) + "\n"
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list) -> None:
     """Record which collected items carry @pytest.mark.seeded_skip_ok.
 
@@ -163,19 +184,17 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Fail the whole run if HERD_E2E_REQUIRE_NO_SKIP=1 and anything non-exempt skipped.
 
     Inert (a no-op) without the env var, so a plain `make test-e2e` run is
-    unaffected. seeded_skip_ok exemptions never fail the run but are always
-    printed alongside the failing block when either list is non-empty, so the
-    log shows exactly what skipped and why.
+    unaffected. seeded_skip_ok exemptions never fail the run and are always
+    printed when present; the failing block is printed only when at least
+    one non-exempt skip occurred, so an all-exempt run doesn't show a
+    "0 test(s) skipped" header with nothing under it.
     """
     if os.environ.get(HERD_E2E_REQUIRE_NO_SKIP) != "1":
         return
-    if not _skip_reports and not _exempt_reports:
+    output = format_sessionfinish_report(_skip_reports, _exempt_reports)
+    if not output:
         return
-    blocks = [format_skip_block(_skip_reports)]
-    exempt_block = format_exempt_block(_exempt_reports)
-    if exempt_block:
-        blocks.append(exempt_block)
-    print("\n" + "\n\n".join(blocks) + "\n")
+    print(output)
     if _skip_reports:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 

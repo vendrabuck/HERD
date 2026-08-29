@@ -52,6 +52,10 @@ def _click_reservation_row(driver):
     driver.find_element(By.CSS_SELECTOR, "tbody tr").click()
 
 
+@pytest.mark.seeded_skip_ok(
+    "AI provider is not configured on the gate or nightly stack; an environmental "
+    "gate no seed can satisfy"
+)
 def test_chat_tab_renders_thread_and_input(admin_browser, base_url, transient_reservation):
     """Open the AI Assistant tab, type a question, send it, and assert a
     user bubble + assistant bubble appear. Asserts only on the chat
