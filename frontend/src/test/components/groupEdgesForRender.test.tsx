@@ -55,3 +55,37 @@ describe("groupEdgesForRender annotation exclusion", () => {
     expect(bundleMembers.size).toBe(1);
   });
 });
+
+describe("groupEdgesForRender with network element attachments (ADR 0012 Attachments)", () => {
+  // The pairKey is [source, target].sort().join("::"), keyed on node ids, so
+  // it works unchanged for a device-to-element pair: no code change was
+  // needed for this, only this test to pin the behavior.
+  function attachEdge(id: string, sourcePort: string): Edge<LayerEdgeData> {
+    return {
+      id,
+      source: "device-node",
+      target: "element-node",
+      data: { layer: "L2", source_port_name: sourcePort } as LayerEdgeData,
+    };
+  }
+
+  it("bundles N device-to-element attachment edges into one BundledEdge with all N members", () => {
+    const edges = [attachEdge("a1", "eth0"), attachEdge("a2", "eth1"), attachEdge("a3", "eth2")];
+    const { renderEdges, bundleMembers } = groupEdgesForRender(edges);
+
+    expect(renderEdges).toHaveLength(1);
+    const bundle = renderEdges[0];
+    expect(bundle.type).toBe("bundledEdge");
+    expect(bundle.source).toBe("device-node");
+    expect(bundle.target).toBe("element-node");
+    expect(bundleMembers.get(bundle.id)).toEqual(["a1", "a2", "a3"]);
+  });
+
+  it("a single device-to-element attachment passes through unbundled", () => {
+    const edges = [attachEdge("a1", "eth0")];
+    const { renderEdges, bundleMembers } = groupEdgesForRender(edges);
+    expect(renderEdges).toHaveLength(1);
+    expect(renderEdges[0].id).toBe("a1");
+    expect(bundleMembers.size).toBe(0);
+  });
+});

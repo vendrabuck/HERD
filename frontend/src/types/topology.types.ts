@@ -21,7 +21,32 @@ export interface DynamicPlaceholderNodeData extends Record<string, unknown> {
   count: number;
 }
 
-export type CanvasNodeData = DeviceNodeData | DynamicPlaceholderNodeData;
+// The closed v1 element vocabulary (ADR 0012 Decision, "Canvas shape"). The
+// three motivating examples plus patch_trunk, the one type with a plausible
+// physical realization.
+export type NetworkElementType = "vlan_segment" | "subnet" | "external_cloud" | "patch_trunk";
+
+// A network element's own identity, distinct from the React Flow node id: it
+// is minted client-side at drop time (no server registry, ADR 0012 Decision
+// 1) and stays stable across a copy-paste or re-layout. `attrs` is free-form
+// and DESCRIPTIVE only in v1 (ADR 0012 "Canvas shape"): nothing reads it yet.
+export interface NetworkElementData {
+  id: string;
+  element_type: NetworkElementType;
+  label: string;
+  attrs: Record<string, unknown>;
+}
+
+// Unlike DynamicPlaceholderNodeData, this node type is the OPPOSITE of a
+// placeholder: it persists into canvas_data (ADR 0012 "Canvas shape", the
+// element predicate is deliberately absent from the persistableCanvas strip
+// filter). It carries no `device` field, same precedent as the placeholder.
+export interface NetworkElementNodeData extends Record<string, unknown> {
+  element: NetworkElementData;
+  isProposal?: boolean;
+}
+
+export type CanvasNodeData = DeviceNodeData | DynamicPlaceholderNodeData | NetworkElementNodeData;
 
 export interface LayerEdgeData extends Record<string, unknown> {
   layer: EdgeLayerType;
@@ -43,6 +68,7 @@ export interface LayerEdgeData extends Record<string, unknown> {
 
 export type DeviceNode = Node<DeviceNodeData, "deviceNode">;
 export type DynamicPlaceholderNode = Node<DynamicPlaceholderNodeData, "dynamicPlaceholderNode">;
+export type NetworkElementNode = Node<NetworkElementNodeData, "networkElementNode">;
 export type LayerEdge = Edge<LayerEdgeData>;
 
 export interface Topology {

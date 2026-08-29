@@ -387,6 +387,45 @@
   `TopologyEditorPage.tsx` only wires its result to the ReactFlow props and
   `ForkHistoryPanel.tsx` rather than growing further inline. Closes the epic's
   last `Partial` entry in `PLANNED_FEATURES.md`.
+- Network element objects, frontend (issue #22, ADR 0012 phase 2; backend
+  validation and fork-save handling land as a separate phase 1): a new canvas
+  node kind, `networkElementNode`, models a non-device reachability hub (a
+  shared VLAN segment, a subnet, an external cloud, or a patch-panel trunk)
+  that many device ports can attach to without a device-to-device mesh.
+  `NetworkElementNodeData` (`types/topology.types.ts`) carries a
+  client-minted UUID element id, `element_type` (the closed four-value
+  vocabulary), an editable `label`, and free-form `attrs`. Unlike a dynamic
+  placeholder, an element node is the OPPOSITE of ephemeral: it PERSISTS into
+  `canvas_data`, so `persistableCanvas` in `TopologyEditorPage.tsx` keeps it
+  (and its edges) while still stripping placeholders, the one deliberate
+  asymmetry in the six `isDynamicPlaceholder`-adjacent call sites the new
+  `isNetworkElement` predicate needed its own decision at. The Equipment
+  Browser gains an unconditional (not fetched, so never absent) "Network
+  elements" collapsible section with four drag cards using the
+  `application/herd-network-element` MIME; dropping one onto the canvas mints
+  a fresh element id and multiple elements of the same type are allowed,
+  unlike the one-placeholder-per-template rule. Drawing a line from a device
+  to an element opens a new `ElementAttachDialog.tsx` (a single device-side
+  `PortColumn` plus a static element target card, not `WiringDialog`, whose
+  props assume a device on both sides) with multi-select: Confirm creates one
+  attachment edge per selected port in a single `addEnrichedEdges` call, each
+  carrying `source_port_name` and no target port, since the element side has
+  no ports. `topologyStore.ts`'s `addEnrichedEdge`/`addEnrichedEdges` now
+  normalize direction so the device always lands as the edge's `source` and
+  the element as `target`, regardless of which side a connection was drawn
+  from. Element-to-element connections are refused in both
+  `isValidConnection` and `handleConnect` with the toast "Network elements
+  cannot be linked to each other". N attachments to one element bundle into
+  one `BundledEdge` for free: `groupEdgesForRender`'s pair key is node ids,
+  not device ids, so no code change was needed there. `NetworkElementNode.tsx`
+  renders dashed neutral gray with a per-type icon and an inline
+  double-click-to-rename label, deliberately distinct from
+  `DynamicPlaceholderNode.tsx`'s dashed purple so the two ephemeral-looking
+  node kinds are never confused, since only one of them survives a save. The
+  minimap colors an element node neutral gray. No provisioning of any kind in
+  this phase; the frontend renders whatever `InvalidEdge.reason` string the
+  backend validator returns and does not otherwise depend on the backend
+  phase.
 
 #### Developer platform and CI
 

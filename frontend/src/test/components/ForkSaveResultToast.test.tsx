@@ -55,4 +55,27 @@ describe("ForkSaveResultToast", () => {
     );
     expect(screen.queryByRole("button", { name: "Show detail" })).not.toBeInTheDocument();
   });
+
+  it("omits the element attachments clause when the count is undefined or zero", () => {
+    const { rerender } = render(<ForkSaveResultToast result={RESULT} onDismiss={vi.fn()} />);
+    expect(screen.queryByText(/element attachment/)).not.toBeInTheDocument();
+
+    rerender(
+      <ForkSaveResultToast
+        result={{ ...RESULT, element_attachments_skipped: 0 }}
+        onDismiss={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/element attachment/)).not.toBeInTheDocument();
+  });
+
+  it("shows the element attachments clause when the count is greater than zero", () => {
+    render(
+      <ForkSaveResultToast
+        result={{ ...RESULT, element_attachments_skipped: 3 }}
+        onDismiss={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("3 element attachments recorded (not wired)")).toBeInTheDocument();
+  });
 });

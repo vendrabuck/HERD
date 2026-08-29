@@ -219,8 +219,10 @@ describe("EquipmentBrowser", () => {
     expect(screen.getByText("DYN")).toBeInTheDocument();
 
     // Dragging a template card stages the dynamic-template payload, a separate
-    // MIME type from the device drag.
-    const card = screen.getByTitle("Drag onto canvas");
+    // MIME type from the device drag. Scoped to the card containing the
+    // template's own name: "Drag onto canvas" titles both this card and the
+    // always-present network-element cards below it (ADR 0012).
+    const card = screen.getByText("Ubuntu VM").closest("[draggable]") as HTMLElement;
     const setData = vi.fn();
     fireEvent.dragStart(card, { dataTransfer: { setData, effectAllowed: "" } });
     expect(setData).toHaveBeenCalledWith(
@@ -257,5 +259,54 @@ describe("EquipmentBrowser", () => {
     // Wait for the data to land, then assert the section is absent entirely.
     expect(await screen.findByText("device-1")).toBeInTheDocument();
     expect(screen.queryByText(/Dynamic templates/)).not.toBeInTheDocument();
+  });
+
+  describe("Network elements section (ADR 0012 Editing surface)", () => {
+    it("renders unconditionally, with no fetch and no absent-when-empty case", async () => {
+      // Unlike dynamic templates, the four types are static: no template
+      // stub returns anything and the section still renders.
+      stubTemplates();
+      stubDevices([]);
+
+      renderWithProviders(<EquipmentBrowser />);
+
+      expect(await screen.findByText("Network elements")).toBeInTheDocument();
+      expect(screen.getByText("VLAN segment")).toBeInTheDocument();
+      expect(screen.getByText("Subnet")).toBeInTheDocument();
+      expect(screen.getByText("External cloud")).toBeInTheDocument();
+      expect(screen.getByText("Patch trunk")).toBeInTheDocument();
+    });
+
+    it("drags a card with the application/herd-network-element MIME carrying element_type and a default label", async () => {
+      stubTemplates();
+      stubDevices([]);
+
+      renderWithProviders(<EquipmentBrowser />);
+      await screen.findByText("Network elements");
+
+      const card = screen.getByText("VLAN segment").closest("[draggable]") as HTMLElement;
+      const setData = vi.fn();
+      fireEvent.dragStart(card, { dataTransfer: { setData, effectAllowed: "" } });
+
+      expect(setData).toHaveBeenCalledWith(
+        "application/herd-network-element",
+        JSON.stringify({ element_type: "vlan_segment", label: "VLAN segment" }),
+      );
+    });
+
+    it("collapses and re-expands the network elements section", async () => {
+      stubTemplates();
+      stubDevices([]);
+
+      renderWithProviders(<EquipmentBrowser />);
+      const toggle = await screen.findByRole("button", { name: "Network elements" });
+      expect(screen.getByText("VLAN segment")).toBeInTheDocument();
+
+      await userEvent.click(toggle);
+      expect(screen.queryByText("VLAN segment")).not.toBeInTheDocument();
+
+      await userEvent.click(toggle);
+      expect(screen.getByText("VLAN segment")).toBeInTheDocument();
+    });
   });
 });
