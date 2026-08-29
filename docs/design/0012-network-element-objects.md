@@ -178,9 +178,9 @@ shape deliberately preserves.
 ### 3. AI generation: deferred to a follow-up issue (decided)
 
 `_build_canvas_data` (`committer.py:54`) keeps emitting only `deviceNode`. The
-AI topology generator proposing elements is a follow-up issue, filed
-separately. Nothing in this design blocks it: an element node is plain JSON the
-committer could emit once the tool schema learns the vocabulary.
+AI topology generator proposing elements is issue #632. Nothing in this design
+blocks it: an element node is plain JSON the committer could emit once the tool
+schema learns the vocabulary.
 
 ### Canvas shape
 
@@ -211,10 +211,12 @@ ship four fixed palette entries and four icons; widening it later is additive.
 
 `attrs` is a free JSON object whose per-type conventions are DESCRIPTIVE in v1,
 not enforced: a `vlan_segment` may carry `vlan_id`, a `subnet` may carry
-`cidr`. The backend validates only that `attrs` is an object (or absent).
-Nothing reads `attrs` in v1; enforcing a per-type schema before any consumer
-exists would pin a shape that phase 2's real requirements would then have to
-migrate.
+`cidr`. The backend does not validate node data shape in v1: the canvas PUT
+already accepts `deviceNode` data without schema checks, and the validator
+reads only `node.type` to build its element map, so `attrs` is carried
+verbatim. Nothing reads `attrs` in v1; enforcing a per-type schema before any
+consumer exists would pin a shape that phase 2's real requirements would then
+have to migrate.
 
 The element `id` is a UUID minted CLIENT-SIDE at drop time, because there is no
 server registry to mint it (decision 1). It is distinct from the React Flow
@@ -345,7 +347,11 @@ BFS pending list is built:
   attachments are DECLARATIVE. An element is not a physical thing the cabling
   graph could contain a path to, so a BFS against it would be a guaranteed
   `no_path` for a topology the user modeled correctly. Direction is accepted
-  either way (see Attachments).
+  either way (see Attachments). Port EXISTENCE on the device is not checked in
+  v1: the attach dialog offers only real ports, and device-to-device edges
+  only get that check as a side effect of the BFS port filters, so an
+  attachment with a misspelled port name in a hand-edited canvas validates;
+  phase 2 will need a real check when a port must be driven.
 - Both endpoints in `node_to_element`: INVALID, new reason
   `element_to_element`. The frontend refuses these, so reaching the server
   means an import or a hand-edited canvas.
