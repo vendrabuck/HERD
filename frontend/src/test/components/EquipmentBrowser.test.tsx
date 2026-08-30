@@ -165,6 +165,107 @@ describe("EquipmentBrowser", () => {
     expect(screen.getByText("CLD")).toBeInTheDocument();
   });
 
+  it("renders the device's template icon image when one is set", async () => {
+    stubTemplates();
+    stubDevices([
+      makeDevice({ id: "d1", name: "iconed", template_icon: "/icons/ex2200.svg" }),
+    ]);
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    const img = (await screen.findByAltText("EX2200")) as HTMLImageElement;
+    expect(img.tagName).toBe("IMG");
+    expect(img.src).toContain("/icons/ex2200.svg");
+  });
+
+  it("drags an available device card with the device payload and copy effect", async () => {
+    stubTemplates();
+    stubDevices([makeDevice({ id: "d1", name: "grabbable", status: "AVAILABLE" })]);
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    const card = (await screen.findByText("grabbable")).closest("[draggable]") as HTMLElement;
+    expect(card).toHaveAttribute("draggable", "true");
+
+    const dataTransfer = { setData: vi.fn(), effectAllowed: "" };
+    fireEvent.dragStart(card, { dataTransfer });
+
+    expect(dataTransfer.setData).toHaveBeenCalledWith(
+      "application/herd-device",
+      expect.stringContaining('"id":"d1"'),
+    );
+    expect(dataTransfer.effectAllowed).toBe("copy");
+  });
+
+  it("refuses to start a drag for an unavailable device card", async () => {
+    stubTemplates();
+    stubDevices([
+      makeDevice({ id: "d1", name: "unavailable-card", status: "RESERVED", exclusive: false }),
+    ]);
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    const card = (await screen.findByText("unavailable-card")).closest(
+      "[draggable]",
+    ) as HTMLElement;
+    // Non-draggable in the DOM, and title explains why.
+    expect(card).toHaveAttribute("draggable", "false");
+    expect(card).toHaveAttribute("title", "Not available: RESERVED");
+
+    const dataTransfer = { setData: vi.fn(), effectAllowed: "" };
+    const preventDefault = vi.fn();
+    fireEvent.dragStart(card, { dataTransfer, preventDefault });
+
+    // The handler's early return means setData is never reached.
+    expect(dataTransfer.setData).not.toHaveBeenCalled();
+  });
+
+  it("filters devices by template via the template select", async () => {
+    stubTemplates([{ id: "tmpl-1", name: "EX2200" }]);
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        const templateId = new URL(request.url).searchParams.get("template_id");
+        const items =
+          templateId === "tmpl-1"
+            ? [makeDevice({ id: "d1", name: "matched-by-template" })]
+            : [makeDevice({ id: "d2", name: "unfiltered" })];
+        return HttpResponse.json(paginate(items));
+      }),
+    );
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    await screen.findByText("unfiltered");
+
+    await userEvent.selectOptions(screen.getByLabelText("Template filter"), "tmpl-1");
+
+    expect(await screen.findByText("matched-by-template")).toBeInTheDocument();
+    expect(screen.queryByText("unfiltered")).not.toBeInTheDocument();
+  });
+
+  it("filters devices by topology type via the topology select", async () => {
+    stubTemplates();
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        const topo = new URL(request.url).searchParams.get("topology_type");
+        const items =
+          topo === "CLOUD"
+            ? [makeDevice({ id: "d1", name: "cloud-only", topology_type: "CLOUD" })]
+            : [makeDevice({ id: "d2", name: "all-topos" })];
+        return HttpResponse.json(paginate(items));
+      }),
+    );
+
+    renderWithProviders(<EquipmentBrowser />);
+
+    await screen.findByText("all-topos");
+
+    await userEvent.selectOptions(screen.getByLabelText("Topology type filter"), "CLOUD");
+
+    expect(await screen.findByText("cloud-only")).toBeInTheDocument();
+    expect(screen.queryByText("all-topos")).not.toBeInTheDocument();
+  });
+
   it("excludes devices already placed on the canvas", async () => {
     stubTemplates();
     stubDevices([

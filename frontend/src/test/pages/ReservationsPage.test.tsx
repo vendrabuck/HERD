@@ -19,14 +19,21 @@ beforeAll(() => {
 
 // The reservation detail modal pulls in heavy nested UI (AI tab, inventory tab,
 // etc.) that is exercised elsewhere. Stub it to keep this test page-focused.
+// The close button is wired to the real onClose prop so the page's own
+// onClose callback (setSelectedReservation(null)) stays under test.
 vi.mock("@/components/reservations/ReservationDetailModal", () => ({
   ReservationDetailModal: ({
     reservation,
+    onClose,
   }: {
     reservation: { id: string } | null;
+    onClose: () => void;
   }) =>
     reservation ? (
-      <div data-testid="reservation-detail-modal">{reservation.id}</div>
+      <div data-testid="reservation-detail-modal">
+        {reservation.id}
+        <button onClick={onClose}>close-detail-modal</button>
+      </div>
     ) : null,
 }));
 
@@ -200,6 +207,82 @@ describe("ReservationsPage", () => {
         screen.getByText("Failed to load reservations"),
       ).toBeInTheDocument(),
     );
+  });
+
+  it("releases an ACTIVE reservation without navigating to its detail modal", async () => {
+    const releaseCalls: string[] = [];
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 50 }),
+      ),
+      http.put("/api/reservations/:id/release", ({ params }) => {
+        releaseCalls.push(params.id as string);
+        return HttpResponse.json({ ...RESERVATION, status: "COMPLETED" });
+      }),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    const releaseButton = await screen.findByRole("button", {
+      name: `Release reservation ${RESERVATION.id.slice(0, 8)}`,
+    });
+    fireEvent.click(releaseButton);
+
+    await waitFor(() => expect(releaseCalls).toEqual([RESERVATION.id]));
+    // The row's own onClick (which opens the detail modal) must not have
+    // fired: the cell's stopPropagation swallowed the click bubble.
+    expect(screen.queryByTestId("reservation-detail-modal")).not.toBeInTheDocument();
+  });
+
+  it("cancels an ACTIVE reservation through the confirm dialog, and Keep aborts it", async () => {
+    const cancelCalls: string[] = [];
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 50 }),
+      ),
+      http.delete("/api/reservations/:id", ({ params }) => {
+        cancelCalls.push(params.id as string);
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    const cancelButton = await screen.findByRole("button", {
+      name: `Cancel reservation ${RESERVATION.id.slice(0, 8)}`,
+    });
+    fireEvent.click(cancelButton);
+
+    // The confirm dialog opens; Keep reservation backs out without calling
+    // the API.
+    const keepButton = await screen.findByRole("button", { name: "Keep reservation" });
+    fireEvent.click(keepButton);
+    expect(screen.queryByRole("button", { name: "Keep reservation" })).not.toBeInTheDocument();
+    expect(cancelCalls).toEqual([]);
+
+    // Re-opening and confirming actually cancels.
+    fireEvent.click(cancelButton);
+    const confirmButton = await screen.findByRole("button", { name: "Cancel reservation" });
+    fireEvent.click(confirmButton);
+
+    await waitFor(() => expect(cancelCalls).toEqual([RESERVATION.id]));
+    expect(screen.queryByRole("button", { name: "Cancel reservation" })).not.toBeInTheDocument();
+  });
+
+  it("closes the detail modal when its onClose fires", async () => {
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 50 }),
+      ),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    const ownerCell = await screen.findByText("alice");
+    fireEvent.click(ownerCell);
+    const modal = screen.getByTestId("reservation-detail-modal");
+    expect(modal).toHaveTextContent(RESERVATION.id);
+
+    // The mocked modal exposes a close button wired to the real onClose prop.
+    fireEvent.click(screen.getByRole("button", { name: "close-detail-modal" }));
+    expect(screen.queryByTestId("reservation-detail-modal")).not.toBeInTheDocument();
   });
 
   it("shows a New Reservation button that opens the create modal", async () => {
