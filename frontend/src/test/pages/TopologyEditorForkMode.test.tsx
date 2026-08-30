@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -378,5 +378,151 @@ describe("TopologyEditorPage live-edit fork mode", () => {
       ),
     );
     expect(askedAboutPair).toBe(false);
+  });
+});
+
+describe("TopologyEditorPage handleCommitToReservation error branches", () => {
+  it("disables the Commit button with the invalid-edge count when an edge has no physical path, and never calls the fork save", async () => {
+    // LiveEditBar itself disables the Commit button under the identical
+    // invalidEdgeCount > 0 condition handleCommitToReservation guards
+    // against, so this scenario is unreachable via a real click; the
+    // page-level check is defense in depth. This test pins the reachable,
+    // user-visible half of that guard: the button is disabled and titled
+    // with the exact count, and the fork-save endpoint is never hit.
+    let forkSaveHit = false;
+    const fork = makeFork({
+      canvas_data: {
+        nodes: [forkNode("fork-node", "d-fork"), forkNode("other-node", "d-other")],
+        edges: [
+          {
+            id: "e-bad",
+            source: "fork-node",
+            target: "other-node",
+            type: "layerEdge",
+            data: { layer: "L1", pathValid: false },
+          },
+        ],
+        selectedEdgeLayer: "L2",
+      },
+    });
+    server.use(
+      ...baseHandlers(fork),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () => {
+        forkSaveHit = true;
+        return HttpResponse.json({});
+      }),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    const commitButton = await screen.findByRole("button", { name: "Commit to reservation" });
+    expect(commitButton).toBeDisabled();
+    expect(commitButton).toHaveAttribute("title", "Cannot commit: 1 edge have no physical path");
+
+    fireEvent.click(commitButton);
+    expect(forkSaveHit).toBe(false);
+  });
+
+  it("a structured 409 port-claim conflict opens the conflict dialog and keeps the drawing", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              message: "Ports already claimed by another reservation",
+              conflicts: [{ reservation_id: "res-x", device_id: "d-x", port: "eth1" }],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    const conflictHeading = await screen.findByText("Ports already claimed by another reservation");
+    expect(screen.getByText(/port eth1/)).toBeInTheDocument();
+    // The canvas is untouched: the fork node is still there for the user to rework.
+    expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node");
+
+    // Its own close button clears the conflict state.
+    const conflictDialog = conflictHeading.closest("dialog") as HTMLDialogElement;
+    fireEvent.click(
+      within(conflictDialog).getByRole("button", { name: "Back to editing", hidden: true }),
+    );
+    await waitFor(() => expect(conflictDialog.open).toBe(false));
+  });
+
+  it("a plain 409 with a string detail toasts that string verbatim", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json({ detail: "Fork is not ACTIVE" }, { status: 409 }),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Fork is not ACTIVE"));
+  });
+
+  it("a transport failure with no detail falls back to the default save-failed message", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json({}, { status: 500 }),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Failed to save the reservation fork"),
+    );
+  });
+
+  it("a device-set PATCH failure after a successful fork save gets its own toast, distinct from a save failure", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json({
+          fork_id: "fork-1",
+          version_number: 2,
+          released: [],
+          built: [],
+          unchanged_count: 0,
+        }),
+      ),
+      http.patch(`/api/reservations/${RES_ID}`, () => HttpResponse.json({ detail: "boom" }, { status: 500 })),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Fork saved, but updating the reservation's device set failed; commit again to retry",
+      ),
+    );
+    // The fork-save toast still fired: the two failures are reported distinctly.
+    expect(toastCustom).toHaveBeenCalled();
   });
 });
