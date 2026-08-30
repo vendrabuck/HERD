@@ -15,14 +15,17 @@ from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services import l1_assignment_service as svc
 from app.services.l1_assignment_service import (
+    all_assignments_for_reservation,
     canonical_port_pair,
     compute_backfill_assignments,
     compute_backfill_intended,
     freeze_reservation_wiring,
     pair_needs_release,
+    park_stale_l1_build,
     record_l1_connect,
     record_l1_failed,
     release_l1_connection,
+    stamp_last_applied,
 )
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -489,6 +492,33 @@ async def test_record_connect_loses_race_returns_winner(shared_engine, monkeypat
     assert await _active_pairs(shared_engine, switch) == [("A", "B")]
 
 
+# --- all_assignments_for_reservation ---
+
+
+@pytest.mark.asyncio
+async def test_all_assignments_returns_every_status_oldest_first(db):
+    """Unlike active_assignments_for_reservation, no status filter is applied: an
+    ACTIVE row, a RELEASED row, and a FAILED row for the same reservation all come
+    back, ordered oldest-created first."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    active = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
+    released = await record_l1_connect(db, rid, switch, "0/0/3", "0/0/4")
+    await release_l1_connection(db, rid, switch, "0/0/3", "0/0/4")
+    failed = await record_l1_failed(
+        db, rid, switch, "0/0/5", "0/0/6", attempts=1, last_error="boom", intended="ACTIVE"
+    )
+
+    rows = await all_assignments_for_reservation(db, rid)
+    assert [r.id for r in rows] == [active.id, released.id, failed.id]
+    assert {r.status for r in rows} == {"ACTIVE", "RELEASED", "FAILED"}
+
+
+@pytest.mark.asyncio
+async def test_all_assignments_empty_for_unknown_reservation(db):
+    assert await all_assignments_for_reservation(db, uuid.uuid4()) == []
+
+
 # --- freeze_reservation_wiring ---
 
 
@@ -796,3 +826,324 @@ async def test_record_connect_supersedes_stale_cross_reservation_active_row(db):
         .all()
     )
     assert [r.reservation_id for r in active] == [new_res], "exactly one ACTIVE row remains"
+
+
+# --- stamp_last_applied ---
+
+
+@pytest.mark.asyncio
+async def test_stamp_last_applied_inserts_row_when_absent(db):
+    rid = uuid.uuid4()
+    row = await stamp_last_applied(db, rid, 3)
+    assert row.reservation_id == rid
+    assert row.last_applied_fork_version == 3
+    assert row.frozen is False
+
+
+@pytest.mark.asyncio
+async def test_stamp_last_applied_advances_existing_row(db):
+    rid = uuid.uuid4()
+    await stamp_last_applied(db, rid, 2)
+    row = await stamp_last_applied(db, rid, 5)
+    assert row.last_applied_fork_version == 5
+
+    rows = (await db.execute(select(ReservationWiringState))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_stamp_last_applied_never_regresses(db):
+    """A stale replay carrying a lower fork_version must not lower the marker."""
+    rid = uuid.uuid4()
+    await stamp_last_applied(db, rid, 7)
+    row = await stamp_last_applied(db, rid, 4)
+    assert row.last_applied_fork_version == 7
+
+
+@pytest.mark.asyncio
+async def test_stamp_last_applied_loses_race_advances_winners_row(db):
+    """The leading read misses the row (nothing exists yet from this session's own
+    query), so stamp_last_applied tries the insert; a concurrent writer's commit
+    already landed on the same primary key in between, so our commit trips
+    IntegrityError. We roll back, re-read, and advance the winner's row rather
+    than leaving it unstamped or raising (the counterpart to the does-not-regress
+    test: here our value is HIGHER than the winner's, so the retry branch's
+    monotonic guard lets it through)."""
+    rid = uuid.uuid4()
+    real_execute = db.execute
+    calls = {"n": 0}
+
+    async def execute_miss_once(*args, **kwargs):
+        if calls["n"] == 0:
+            calls["n"] += 1
+            # The competing writer's commit lands only now, after our own leading
+            # read has already missed the row.
+            async with TestSessionLocal() as competitor:
+                competitor.add(
+                    ReservationWiringState(reservation_id=rid, last_applied_fork_version=1)
+                )
+                await competitor.commit()
+            return await real_execute(
+                select(ReservationWiringState).where(
+                    ReservationWiringState.reservation_id == uuid.UUID(int=0)
+                )
+            )
+        return await real_execute(*args, **kwargs)
+
+    db.execute = execute_miss_once
+    row = await stamp_last_applied(db, rid, 9)
+
+    assert row.reservation_id == rid
+    assert row.last_applied_fork_version == 9
+
+    rows = (await real_execute(select(ReservationWiringState))).scalars().all()
+    assert len(rows) == 1, "the race must not leave two rows for one reservation"
+    assert rows[0].last_applied_fork_version == 9
+
+
+@pytest.mark.asyncio
+async def test_freeze_loses_race_flips_winners_row_frozen(db):
+    """Mirrors the stamp_last_applied race: the leading read misses the row, a
+    concurrent writer's commit lands on the same primary key before our own
+    commit, our commit trips IntegrityError, we roll back, re-read, and flip the
+    winner's row frozen instead of raising or leaving it unfrozen."""
+    rid = uuid.uuid4()
+    real_execute = db.execute
+    calls = {"n": 0}
+
+    async def execute_miss_once(*args, **kwargs):
+        if calls["n"] == 0:
+            calls["n"] += 1
+            async with TestSessionLocal() as competitor:
+                competitor.add(ReservationWiringState(reservation_id=rid, frozen=False))
+                await competitor.commit()
+            return await real_execute(
+                select(ReservationWiringState).where(
+                    ReservationWiringState.reservation_id == uuid.UUID(int=0)
+                )
+            )
+        return await real_execute(*args, **kwargs)
+
+    db.execute = execute_miss_once
+    row = await freeze_reservation_wiring(db, rid)
+
+    assert row.reservation_id == rid
+    assert row.frozen is True
+
+    rows = (await real_execute(select(ReservationWiringState))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].frozen is True
+
+
+# --- park_stale_l1_build ---
+
+
+@pytest.mark.asyncio
+async def test_park_stale_build_missing_row_returns_none(db):
+    assert await park_stale_l1_build(db, uuid.uuid4(), "gone") is None
+
+
+@pytest.mark.asyncio
+async def test_park_stale_build_non_failed_row_left_untouched(db):
+    """An ACTIVE row is not FAILED, so it is returned as-is: a concurrent writer
+    already proved the pair connects and must not be parked RELEASED."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    active = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
+    assert active.status == "ACTIVE"
+
+    row = await park_stale_l1_build(db, active.id, "build intent gone")
+    assert row.id == active.id
+    assert row.status == "ACTIVE"
+    assert row.intended == "ACTIVE", "an ACTIVE row must not be parked RELEASED"
+
+
+@pytest.mark.asyncio
+async def test_park_stale_build_flips_failed_intended_released(db):
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    failed = await record_l1_failed(
+        db, rid, switch, "0/0/1", "0/0/2", attempts=3, last_error="boom", intended="ACTIVE"
+    )
+    assert failed.status == "FAILED"
+    assert failed.intended == "ACTIVE"
+
+    row = await park_stale_l1_build(db, failed.id, "build intent gone")
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.attempts == 0, "attempts reset so the pending disconnect is not near the retry cap"
+    assert row.last_error == "build intent gone"
+
+
+# --- _row_get dict branch ---
+
+
+def test_row_get_reads_dict_rows():
+    """compute_backfill_assignments/_intended accept dict rows as well as attribute
+    objects; _row_get's dict branch is exercised only by a plain-dict row."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    run = {
+        "reservation_id": rid,
+        "device_id": switch,
+        "action": "connect_ports",
+        "status": "SUCCESS",
+        "port_a": "A",
+        "port_b": "B",
+        "created_at": 1,
+    }
+    out = compute_backfill_assignments([run])
+    assert out == [
+        {
+            "reservation_id": rid,
+            "switch_device_id": switch,
+            "port_a": "A",
+            "port_b": "B",
+        }
+    ]
+
+
+# --- _strictly_after via compute_backfill_assignments (None-timestamp edges) ---
+#
+# _strictly_after is only actually CALLED once a dict entry already exists for the
+# key (the first entry short-circuits on `prev is None`), so these need a SECOND
+# run against the same pair to force the comparison itself to execute.
+
+
+def test_backfill_none_created_at_does_not_replace_a_real_incumbent():
+    """A second connect with a None created_at is never treated as strictly after
+    the first (real-timestamp) connect: _strictly_after(None, real) hits the
+    `a is None: return False` branch, so the incumbent (real, non-None) entry is
+    kept as the live owner."""
+    rid = uuid.uuid4()
+    later_rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    runs = [
+        _run(rid, switch, "connect_ports", "SUCCESS", "A", "B", 1),
+        _run(later_rid, switch, "connect_ports", "SUCCESS", "A", "B", None),
+    ]
+    out = compute_backfill_assignments(runs)
+    assert len(out) == 1
+    assert out[0]["reservation_id"] == rid, "the None-timestamp entry must not win"
+
+
+def test_backfill_real_timestamp_beats_none_incumbent():
+    """A second connect with a real timestamp DOES replace a None-timestamp
+    incumbent: _strictly_after(real, None) hits the `b is None: return True`
+    branch, so a real event always wins over an unset one."""
+    rid = uuid.uuid4()
+    later_rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    runs = [
+        _run(rid, switch, "connect_ports", "SUCCESS", "A", "B", None),
+        _run(later_rid, switch, "connect_ports", "SUCCESS", "A", "B", 1),
+    ]
+    out = compute_backfill_assignments(runs)
+    assert len(out) == 1
+    assert out[0]["reservation_id"] == later_rid, "the real-timestamp entry must win"
+
+
+# --- compute_backfill_assignments / compute_backfill_intended: skip branches ---
+
+
+def test_backfill_assignments_skips_unrecognized_action():
+    runs = [_run(uuid.uuid4(), uuid.uuid4(), "reboot_switch", "SUCCESS", "A", "B", 1)]
+    assert compute_backfill_assignments(runs) == []
+
+
+def test_backfill_assignments_skips_run_missing_switch_id():
+    runs = [_run(uuid.uuid4(), None, "connect_ports", "SUCCESS", "A", "B", 1)]
+    assert compute_backfill_assignments(runs) == []
+
+
+def test_backfill_assignments_skips_run_missing_port():
+    runs = [_run(uuid.uuid4(), uuid.uuid4(), "connect_ports", "SUCCESS", None, "B", 1)]
+    assert compute_backfill_assignments(runs) == []
+
+
+def test_backfill_intended_skips_unrecognized_action():
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    row_id = uuid.uuid4()
+    row = _failed_row(row_id, rid, switch, "A", "B")
+    runs = [_run(rid, switch, "reboot_switch", "SUCCESS", "A", "B", 1)]
+    assert compute_backfill_intended([row], runs) == {row_id: "ACTIVE"}
+
+
+def test_backfill_intended_skips_run_missing_switch_id():
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    row_id = uuid.uuid4()
+    row = _failed_row(row_id, rid, switch, "A", "B")
+    runs = [_run(rid, None, "connect_ports", "SUCCESS", "A", "B", 1)]
+    assert compute_backfill_intended([row], runs) == {row_id: "ACTIVE"}
+
+
+@pytest.mark.asyncio
+async def test_stamp_last_applied_loses_race_does_not_regress_a_higher_winner_value():
+    """The retry branch's monotonic guard applies on the loser's path too: if the
+    winner's committed value is already ahead of what we tried to stamp, the retry
+    leaves it alone rather than regressing it."""
+    from app.services.l1_assignment_service import stamp_last_applied
+    from sqlalchemy.exc import IntegrityError
+
+    rid = uuid.uuid4()
+    async with TestSessionLocal() as session:
+        session.add(ReservationWiringState(reservation_id=rid, last_applied_fork_version=9))
+        await session.commit()
+
+    calls = {"n": 0}
+
+    async with TestSessionLocal() as session:
+        real_commit = session.commit
+
+        async def commit_once_then_real():
+            if calls["n"] == 0:
+                calls["n"] += 1
+                raise IntegrityError("stmt", {}, Exception("dup"))
+            await real_commit()
+
+        session.commit = commit_once_then_real
+        row = await stamp_last_applied(session, rid, 3)
+
+    assert row.last_applied_fork_version == 9, "a lower stamp must not regress the winner's value"
+
+
+def test_backfill_none_created_at_does_not_supersede_a_real_prior_timestamp():
+    """_strictly_after(None, <real timestamp>) is False (line: `if a is None: return
+    False`): a later-iterated run with no created_at must not be treated as newer
+    than an already-tracked real-timestamped run of the same action on the same
+    pair, so the earlier real timestamp is kept as the latest connect."""
+    rid = uuid.uuid4()
+    switch = uuid.uuid4()
+    runs = [
+        _run(rid, switch, "connect_ports", "SUCCESS", "A", "B", 5),
+        _run(rid, switch, "connect_ports", "SUCCESS", "A", "B", None),
+    ]
+    out = compute_backfill_assignments(runs)
+    assert len(out) == 1, "the pair is still live; a None-timestamp rerun must not drop it"
+    assert out[0]["reservation_id"] == rid
+
+
+@pytest.mark.asyncio
+async def test_all_assignments_for_reservation_returns_every_status_oldest_first(db):
+    """all_assignments_for_reservation backs the wiring-status surface: it applies no
+    status filter (ACTIVE, RELEASED, and FAILED rows all come back) and orders by
+    created_at ascending, unlike active_assignments_for_reservation."""
+    from app.services.l1_assignment_service import all_assignments_for_reservation
+
+    rid = uuid.uuid4()
+    other_rid = uuid.uuid4()
+    switch = uuid.uuid4()
+
+    active = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
+    failed = await record_l1_failed(
+        db, rid, switch, "0/0/3", "0/0/4", attempts=1, last_error="boom", intended="ACTIVE"
+    )
+    # A different reservation's row must not leak in.
+    await record_l1_connect(db, other_rid, switch, "0/0/5", "0/0/6")
+
+    rows = await all_assignments_for_reservation(db, rid)
+
+    assert [r.id for r in rows] == [active.id, failed.id]
+    assert {r.status for r in rows} == {"ACTIVE", "FAILED"}

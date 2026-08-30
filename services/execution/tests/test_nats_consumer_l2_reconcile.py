@@ -16,6 +16,8 @@ from app.database import Base
 from app.models.l2_port_assignment import L2PortAssignment
 from app.models.vlan_assignment import VlanAssignment
 from app.services.nats_consumer import (
+    WIRING_UNRESOLVABLE_REASON,
+    _apply_l2_memberships,
     _derive_l2_memberships,
     _FetchContext,
     handle_wiring_changed,
@@ -485,3 +487,397 @@ async def test_reconcile_stale_nil_allocation_join_flips_released_with_no_driver
     released = await _l2_rows("RELEASED")
     assert [r.id for r in released] == [rid]
     assert await _l2_rows("FAILED") == []
+
+
+# --- switch cannot be driven: parks adds and still-live removes FAILED --------
+
+
+async def test_apply_l2_memberships_switch_not_found_parks_adds_and_removes_failed():
+    """A switch that does not resolve in inventory parks every add on it FAILED
+    intended ACTIVE and every still-live remove FAILED intended RELEASED, tagged with
+    the pinned unresolvable reason, without any driver call.
+
+    Both live callers of _apply_l2_memberships (the wiring_changed reconcile and the
+    retry channel) pre-filter an unresolvable switch out of `adds` before this
+    function ever sees it (derivation classifies the endpoint device first), so this
+    exercises the function's own defensive branch directly rather than trying to
+    contrive an unreachable end-to-end path.
+    """
+    gone_switch = str(uuid.uuid4())
+    # Scoped ONLY to gone_switch (unlike _seed_alloc's default [SW_L2]): the vlan
+    # define pre-pass and orphan-release tail _apply_l2_memberships itself runs
+    # would otherwise drive real calls against SW_L2, muddying the "no driver call"
+    # assertion below with activity unrelated to this switch's own resolution.
+    async with TestSessionLocal() as s:
+        va_row = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=100,
+            switch_device_ids=[gone_switch],
+            defined_switch_ids=[],
+            status="ACTIVE",
+        )
+        s.add(va_row)
+        await s.commit()
+        await s.refresh(va_row)
+        va = va_row.id
+        # membership_needs_remove only parks a remove that is believed live; seed
+        # the pre-existing ACTIVE row the remove is meant to tear down.
+        s.add(
+            L2PortAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                vlan_assignment_id=va,
+                switch_device_id=uuid.UUID(gone_switch),
+                port="0/0/9",
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        await s.commit()
+
+    async def device_fetch(device_id, client=None):
+        return None if str(device_id) == gone_switch else DEVICES.get(str(device_id))
+
+    execute_fn, calls = _l2_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l2_memberships(
+            RES_ID,
+            [
+                {
+                    "switch_device_id": gone_switch,
+                    "port": "0/0/9",
+                    "vlan_assignment_id": va,
+                    "vlan_id": 100,
+                }
+            ],
+            [
+                {
+                    "switch_device_id": gone_switch,
+                    "port": "0/0/1",
+                    "vlan_assignment_id": va,
+                    "vlan_id": 100,
+                }
+            ],
+            ctx,
+            _db_session_factory(),
+        )
+
+    assert calls == [], "an unresolvable switch must never be driven"
+    async with TestSessionLocal() as s:
+        rows = (await s.execute(select(L2PortAssignment))).scalars().all()
+    by_port = {r.port: r for r in rows}
+    expected_error = f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {gone_switch} not found"
+    assert by_port["0/0/1"].status == "FAILED"
+    assert by_port["0/0/1"].intended == "ACTIVE"
+    assert by_port["0/0/1"].last_error == expected_error, (
+        "must be the switch-not-found message, not the template-not-found variant"
+    )
+    assert by_port["0/0/9"].status == "FAILED"
+    assert by_port["0/0/9"].intended == "RELEASED"
+    assert by_port["0/0/9"].last_error == expected_error
+
+
+async def test_reconcile_template_not_found_parks_add_failed():
+    """A switch that resolves but whose template lookup 404s is the same park path,
+    tagged with the template-not-found variant of the pinned reason."""
+    from contextlib import ExitStack
+
+    execute_fn, calls = _l2_recorder()
+    patches = [
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch("app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=None)),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=[_wire(DUT1, "eth0", SW_L2, "0/0/1")]),
+        ),
+        patch("app.services.vlan_service.fetch_fabric_id", new=AsyncMock(return_value=FABRIC)),
+    ]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await handle_wiring_changed(
+            {"reservation_id": RES_ID, "fork_version": 1},
+            _db_session_factory(),
+        )
+
+    assert calls == [], "a missing template must never be driven"
+    async with TestSessionLocal() as s:
+        rows = (await s.execute(select(L2PortAssignment))).scalars().all()
+    assert rows[0].status == "FAILED"
+    assert "template for L2 switch" in rows[0].last_error
+    assert "not found" in rows[0].last_error
+
+
+async def test_reconcile_driver_load_raises_parks_add_failed_no_driver_call():
+    """A load_driver exception (corrupt cache, package missing) parks the add FAILED
+    with the pinned reason wrapping the load error, and fires no driver call."""
+    from contextlib import ExitStack
+
+    execute_fn, calls = _l2_recorder()
+    patches = [
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch(
+            "app.services.driver_loader.load_driver",
+            new=AsyncMock(side_effect=RuntimeError("package corrupt")),
+        ),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=[_wire(DUT1, "eth0", SW_L2, "0/0/1")]),
+        ),
+        patch("app.services.vlan_service.fetch_fabric_id", new=AsyncMock(return_value=FABRIC)),
+    ]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await handle_wiring_changed(
+            {"reservation_id": RES_ID, "fork_version": 1},
+            _db_session_factory(),
+        )
+
+    assert calls == [], "a driver that cannot load must never be driven"
+    async with TestSessionLocal() as s:
+        rows = (await s.execute(select(L2PortAssignment))).scalars().all()
+    assert rows[0].status == "FAILED"
+    assert "driver load failed" in rows[0].last_error
+    assert "package corrupt" in rows[0].last_error
+
+
+async def test_reconcile_login_failure_parks_add_and_remove_failed_no_port_ops():
+    """A per-switch login failure parks every pair on that switch FAILED, tagged with
+    its direction, and no add_to_vlan/remove_from_vlan op ever reaches the driver
+    (only the login attempt does)."""
+    va = await _seed_alloc()
+    remove_id = await _seed_l2_failed("0/0/9", va, attempts=0, err="stale")
+    async with TestSessionLocal() as s:
+        row = await s.get(L2PortAssignment, remove_id)
+        row.status = "ACTIVE"
+        row.last_error = None
+        await s.commit()
+
+    calls = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        mk = kwargs.get("method_kwargs") or {}
+        calls.append((action, mk.get("port"), mk.get("vlan_id")))
+        if action == "login":
+            return {"success": False, "output": None, "error": "auth failed", "duration_ms": 1}
+        return SUCCESS_RESULT
+
+    await _reconcile([_wire(DUT1, "eth0", SW_L2, "0/0/1")], execute_fn=execute_fn, calls=calls)
+
+    assert [c for c in calls if c[0] in ("add_to_vlan", "remove_from_vlan")] == [], (
+        "no port op may fire when login fails"
+    )
+    async with TestSessionLocal() as s:
+        rows = (await s.execute(select(L2PortAssignment))).scalars().all()
+    by_port = {r.port: r for r in rows}
+    assert by_port["0/0/1"].status == "FAILED"
+    assert by_port["0/0/1"].intended == "ACTIVE"
+    assert "driver login failed" in by_port["0/0/1"].last_error
+    assert "auth failed" in by_port["0/0/1"].last_error
+    assert by_port["0/0/9"].status == "FAILED"
+    assert by_port["0/0/9"].intended == "RELEASED"
+    assert "driver login failed" in by_port["0/0/9"].last_error
+
+
+async def test_reconcile_no_allocation_for_fabric_parks_add_failed_no_driver_call():
+    """When _resolve_add_allocations cannot resolve a VLAN allocation for a switch's
+    fabric (an upstream fabric lookup or allocation failure), the join is parked
+    FAILED intended ACTIVE with the pinned unresolvable reason, and the driver is
+    never called for it: the retry channel is the recovery path, not this pass."""
+    from contextlib import ExitStack
+
+    execute_fn, calls = _l2_recorder()
+    patches = [
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=[_wire(DUT1, "eth0", SW_L2, "0/0/1")]),
+        ),
+        patch(
+            "app.services.nats_consumer._resolve_add_allocations",
+            new=AsyncMock(return_value={}),
+        ),
+    ]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await handle_wiring_changed(
+            {"reservation_id": RES_ID, "fork_version": 1},
+            _db_session_factory(),
+        )
+
+    assert calls == [], "an unresolved allocation must never be driven"
+    async with TestSessionLocal() as s:
+        rows = (await s.execute(select(L2PortAssignment))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert str(rows[0].vlan_assignment_id) == "00000000-0000-0000-0000-000000000000", (
+        "no allocation resolved: the row carries the nil-UUID placeholder, not a real id"
+    )
+    assert "no VLAN allocation for fabric" in rows[0].last_error
+
+
+# --- _apply_l2_memberships idempotency gates: already-settled adds/removes skip ---
+#
+# Both live callers only ever pass an add/remove genuinely outside the current DB
+# state (the intended/current diff excludes anything already matching), so these
+# in-pass idempotency re-checks are exercised directly against _apply_l2_memberships,
+# covering a redelivery or a race that lands a duplicate item in the same batch.
+
+
+async def test_apply_l2_memberships_add_already_active_is_skipped_no_driver_call():
+    """An add whose (switch, port) is already an ACTIVE membership for this
+    reservation is a convergent no-op: is_membership_active gates it out before any
+    add_to_vlan call, while a genuinely new add on the same switch still drives."""
+    async with TestSessionLocal() as s:
+        va_row = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=100,
+            switch_device_ids=[SW_L2],
+            defined_switch_ids=[SW_L2],
+            status="ACTIVE",
+        )
+        s.add(va_row)
+        await s.commit()
+        await s.refresh(va_row)
+        va = va_row.id
+        s.add(
+            L2PortAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                vlan_assignment_id=va,
+                switch_device_id=uuid.UUID(SW_L2),
+                port="0/0/1",
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        await s.commit()
+
+    execute_fn, calls = _l2_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l2_memberships(
+            RES_ID,
+            [],
+            [
+                {
+                    "switch_device_id": SW_L2,
+                    "port": "0/0/1",
+                    "vlan_assignment_id": va,
+                    "vlan_id": 100,
+                },
+                {
+                    "switch_device_id": SW_L2,
+                    "port": "0/0/2",
+                    "vlan_assignment_id": va,
+                    "vlan_id": 100,
+                },
+            ],
+            ctx,
+            _db_session_factory(),
+        )
+
+    actions = [(a, p) for a, p, _v in calls]
+    assert ("add_to_vlan", "0/0/1") not in actions, "already-ACTIVE membership skips the driver"
+    assert ("add_to_vlan", "0/0/2") in actions, "the genuinely new add still drives"
+    async with TestSessionLocal() as s:
+        rows = (await s.execute(select(L2PortAssignment))).scalars().all()
+    by_port = {r.port: r for r in rows}
+    assert by_port["0/0/1"].status == "ACTIVE", "the pre-existing row is untouched"
+    assert by_port["0/0/2"].status == "ACTIVE"
+
+
+async def test_apply_l2_memberships_remove_not_live_is_skipped_no_driver_call():
+    """A remove whose (switch, port) is not believed live (no row at all) is a
+    convergent no-op: membership_needs_remove gates it out before any
+    remove_from_vlan call, while a genuinely live remove on the same switch still
+    drives."""
+    async with TestSessionLocal() as s:
+        va_row = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=100,
+            switch_device_ids=[SW_L2],
+            defined_switch_ids=[SW_L2],
+            status="ACTIVE",
+        )
+        s.add(va_row)
+        await s.commit()
+        await s.refresh(va_row)
+        va = va_row.id
+        s.add(
+            L2PortAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                vlan_assignment_id=va,
+                switch_device_id=uuid.UUID(SW_L2),
+                port="0/0/9",
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        await s.commit()
+
+    execute_fn, calls = _l2_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l2_memberships(
+            RES_ID,
+            [
+                # 0/0/5 has no matching DB row at all: not believed live.
+                {
+                    "switch_device_id": SW_L2,
+                    "port": "0/0/5",
+                    "vlan_assignment_id": va,
+                    "vlan_id": 100,
+                },
+                {
+                    "switch_device_id": SW_L2,
+                    "port": "0/0/9",
+                    "vlan_assignment_id": va,
+                    "vlan_id": 100,
+                },
+            ],
+            [],
+            ctx,
+            _db_session_factory(),
+        )
+
+    actions = [(a, p) for a, p, _v in calls]
+    assert ("remove_from_vlan", "0/0/5") not in actions, "not-believed-live skips the driver"
+    assert ("remove_from_vlan", "0/0/9") in actions, "the genuinely live remove still drives"
