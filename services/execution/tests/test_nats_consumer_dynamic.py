@@ -821,6 +821,36 @@ async def test_delete_dynamic_device_maps_status_codes():
     assert await _delete_dynamic_device(client, DEVICE_ID) is False
 
 
+async def test_post_provision_result_posts_body_and_raises_for_status():
+    """The real (unmocked) implementation: POSTs the expected body and calls
+    raise_for_status so a non-2xx surfaces as an httpx error, not silently."""
+    from app.services.nats_consumer import _post_provision_result
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=resp)
+
+    await _post_provision_result(client, RES_ID, succeeded=True, device_ids=[DEVICE_ID], error=None)
+
+    client.post.assert_awaited_once()
+    _url, kwargs = client.post.await_args.args, client.post.await_args.kwargs
+    assert kwargs["json"] == {"succeeded": True, "device_ids": [DEVICE_ID], "error": None}
+    resp.raise_for_status.assert_called_once()
+
+
+async def test_post_provision_result_propagates_raise_for_status():
+    from app.services.nats_consumer import _post_provision_result
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock(side_effect=RuntimeError("500 Server Error"))
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=resp)
+
+    with pytest.raises(RuntimeError, match="500 Server Error"):
+        await _post_provision_result(client, RES_ID, succeeded=False, device_ids=[], error="boom")
+
+
 async def test_create_dynamic_device_raises_on_transport_error():
     import httpx
 

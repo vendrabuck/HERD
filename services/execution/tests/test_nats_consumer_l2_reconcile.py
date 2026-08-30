@@ -16,6 +16,7 @@ from app.database import Base
 from app.models.l2_port_assignment import L2PortAssignment
 from app.models.vlan_assignment import VlanAssignment
 from app.services.nats_consumer import (
+    WIRING_UNRESOLVABLE_REASON,
     _apply_l2_memberships,
     _derive_l2_memberships,
     _FetchContext,
@@ -573,14 +574,15 @@ async def test_apply_l2_memberships_switch_not_found_parks_adds_and_removes_fail
     async with TestSessionLocal() as s:
         rows = (await s.execute(select(L2PortAssignment))).scalars().all()
     by_port = {r.port: r for r in rows}
+    expected_error = f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {gone_switch} not found"
     assert by_port["0/0/1"].status == "FAILED"
     assert by_port["0/0/1"].intended == "ACTIVE"
-    assert "L2 switch" in by_port["0/0/1"].last_error
-    assert "not found" in by_port["0/0/1"].last_error
+    assert by_port["0/0/1"].last_error == expected_error, (
+        "must be the switch-not-found message, not the template-not-found variant"
+    )
     assert by_port["0/0/9"].status == "FAILED"
     assert by_port["0/0/9"].intended == "RELEASED"
-    assert "L2 switch" in by_port["0/0/9"].last_error
-    assert "not found" in by_port["0/0/9"].last_error
+    assert by_port["0/0/9"].last_error == expected_error
 
 
 async def test_reconcile_template_not_found_parks_add_failed():
