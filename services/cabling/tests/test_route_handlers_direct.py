@@ -2038,3 +2038,627 @@ async def test_forks_route_handler_rejects_bad_token():
                 )
     assert exc.value.status_code == 403
     assert exc.value.detail == "Invalid internal token"
+
+
+# --- routes/forks.py: remaining handlers, called directly ------------------
+#
+# coverage.py's tracer loses line attribution for these handler bodies when they
+# run only through the ASGI transport path (the async/greenlet post-await gap
+# documented for this repo): test_forks.py, test_fork_versions.py, and
+# test_fork_prune.py already pin every one of these behaviors over HTTP, and this
+# section adds one direct call per handler purely so pytest-cov credits the
+# bodies it already proved. Each test still asserts on real response content, not
+# just "it returns".
+
+
+async def _direct_create_fork(db, rid, *, parent_topology_id=None, parent_version_id=None):
+    from app.config import settings
+    from app.routes.forks import create_fork_internal
+    from app.schemas.fork import ForkCreate
+
+    with patch.object(settings, "internal_api_token", "tok"):
+        return await create_fork_internal(
+            body=ForkCreate(
+                reservation_id=rid,
+                parent_topology_id=parent_topology_id,
+                parent_version_id=parent_version_id,
+            ),
+            x_internal_token="tok",
+            db=db,
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_active_forks_handler_reports_latest_version_per_fork():
+    """list_active_forks_internal pairs each ACTIVE reservation_id with its own
+    latest fork_version, and both list shapes describe the same page
+    (routes/forks.py lines 143-181)."""
+    from app.config import settings
+    from app.routes.forks import list_active_forks_internal
+    from app.services.fork_save_service import save_fork
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    saved_rid, fresh_rid = uuid.uuid4(), uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth0")
+        await _direct_create_fork(db, saved_rid)
+        fresh_fork = await _direct_create_fork(db, fresh_rid)
+        fresh_fork_id = fresh_fork.fork_id
+
+    async with TestSession() as db:
+        from app.models.fork import ReservationFork
+        from sqlalchemy import select
+
+        saved_fork = (
+            await db.execute(
+                select(ReservationFork).where(ReservationFork.reservation_id == saved_rid)
+            )
+        ).scalar_one()
+        canvas = {
+            "nodes": [
+                {"id": "n0", "data": {"device": {"id": str(a)}}},
+                {"id": "n1", "data": {"device": {"id": str(b)}}},
+            ],
+            "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
+        }
+        result = await save_fork(db, saved_fork, canvas_data=canvas, created_by="tester")
+    assert result.version_number == 2
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await list_active_forks_internal(
+                skip=0, limit=200, x_internal_token="tok", db=db
+            )
+
+    assert resp.total == 2
+    assert set(resp.reservation_ids) == {saved_rid, fresh_rid}
+    versions = {e.reservation_id: e.latest_fork_version for e in resp.forks}
+    assert versions[saved_rid] == 2
+    assert versions[fresh_rid] == 1
+    assert set(versions) == set(resp.reservation_ids)
+    # fork_ids list-comprehension branch (line 166) ran for a non-empty page; the
+    # id used to key it is not itself part of the response, only reservation_id is.
+    assert fresh_fork_id is not None
+
+
+@pytest.mark.asyncio
+async def test_get_fork_handler_returns_full_detail():
+    """get_fork_internal returns metadata, canvas, connections, and versions
+    together for a fork with real wiring (routes/forks.py lines 206-237)."""
+    from app.config import settings
+    from app.routes.forks import get_fork_internal
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth0")
+        canvas = {
+            "nodes": [
+                {"id": "n0", "data": {"device": {"id": str(a)}}},
+                {"id": "n1", "data": {"device": {"id": str(b)}}},
+            ],
+            "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
+        }
+        topo_id, _ = await _make_parent_topology(db, canvas)
+        await _direct_create_fork(db, rid, parent_topology_id=topo_id)
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await get_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+
+    assert resp.reservation_id == rid
+    assert resp.status == "ACTIVE"
+    assert len(resp.connections) == 1
+    assert resp.connections[0].device_a_id == a
+    assert len(resp.versions) == 1
+    assert resp.versions[0].version_number == 1
+
+
+@pytest.mark.asyncio
+async def test_get_fork_handler_404_when_absent():
+    from app.config import settings
+    from app.routes.forks import get_fork_internal
+    from fastapi import HTTPException
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            with pytest.raises(HTTPException) as exc:
+                await get_fork_internal(reservation_id=uuid.uuid4(), x_internal_token="tok", db=db)
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "Fork not found"
+
+
+@pytest.mark.asyncio
+async def test_get_fork_version_handler_returns_own_canvas():
+    """get_fork_version_internal returns the version row's own canvas_data, distinct
+    from the fork's current draft (routes/forks.py lines 264-274)."""
+    from app.config import settings
+    from app.routes.forks import get_fork_version_internal
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        created = await _direct_create_fork(db, rid)
+
+    async with TestSession() as db:
+        from app.models.fork import ForkVersion
+        from sqlalchemy import select
+
+        version = (
+            await db.execute(select(ForkVersion).where(ForkVersion.fork_id == created.fork_id))
+        ).scalar_one()
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await get_fork_version_internal(
+                reservation_id=rid, version_id=version.id, x_internal_token="tok", db=db
+            )
+
+    assert resp.version_number == 1
+    assert resp.fork_id == created.fork_id
+    assert resp.restored_from_id is None
+
+
+@pytest.mark.asyncio
+async def test_get_fork_version_handler_404_for_unknown_version():
+    from app.config import settings
+    from app.routes.forks import get_fork_version_internal
+    from fastapi import HTTPException
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _direct_create_fork(db, rid)
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            with pytest.raises(HTTPException) as exc:
+                await get_fork_version_internal(
+                    reservation_id=rid, version_id=uuid.uuid4(), x_internal_token="tok", db=db
+                )
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "Version not found"
+
+
+@pytest.mark.asyncio
+async def test_restore_fork_version_handler_sets_marker_and_reports_validation():
+    """restore_fork_version_internal copies the version's canvas onto the draft,
+    sets draft_restored_from_id, and reports validation without gating on it
+    (routes/forks.py lines 306-334)."""
+    from app.config import settings
+    from app.routes.forks import restore_fork_version_internal
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        created = await _direct_create_fork(db, rid)
+
+    async with TestSession() as db:
+        from app.models.fork import ForkVersion
+        from sqlalchemy import select
+
+        version = (
+            await db.execute(select(ForkVersion).where(ForkVersion.fork_id == created.fork_id))
+        ).scalar_one()
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await restore_fork_version_internal(
+                reservation_id=rid, version_id=version.id, x_internal_token="tok", db=db
+            )
+
+    assert resp.id == created.fork_id
+    assert resp.draft_restored_from_id == version.id
+    assert resp.valid is True
+    assert resp.invalid_edges == []
+
+    # The marker actually persisted on the fork row, not just on the response.
+    async with TestSession() as db:
+        from app.models.fork import ReservationFork
+
+        fork_row = await db.get(ReservationFork, created.fork_id)
+        assert fork_row.draft_restored_from_id == version.id
+
+
+@pytest.mark.asyncio
+async def test_restore_fork_version_handler_refuses_archived():
+    from app.config import settings
+    from app.routes.forks import archive_fork_internal, restore_fork_version_internal
+    from fastapi import HTTPException
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        created = await _direct_create_fork(db, rid)
+
+    async with TestSession() as db:
+        from app.models.fork import ForkVersion
+        from sqlalchemy import select
+
+        version = (
+            await db.execute(select(ForkVersion).where(ForkVersion.fork_id == created.fork_id))
+        ).scalar_one()
+        version_id = version.id
+        with patch.object(settings, "internal_api_token", "tok"):
+            await archive_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            with pytest.raises(HTTPException) as exc:
+                await restore_fork_version_internal(
+                    reservation_id=rid, version_id=version_id, x_internal_token="tok", db=db
+                )
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Fork is archived and cannot be edited"
+
+
+@pytest.mark.asyncio
+async def test_update_fork_canvas_handler_stores_draft_and_reports_invalid_edge():
+    """update_fork_canvas_internal stores whatever canvas it is given, even one
+    with an unreachable edge, and reports (not gates on) that invalidity
+    (routes/forks.py lines 356-378)."""
+    from app.config import settings
+    from app.routes.forks import update_fork_canvas_internal
+    from app.schemas.fork import ForkCanvasUpdate
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _direct_create_fork(db, rid)
+
+    # a and b share no cable, so this edge cannot resolve to any path.
+    bad_canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+        ],
+        "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
+    }
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await update_fork_canvas_internal(
+                reservation_id=rid,
+                body=ForkCanvasUpdate(canvas_data=bad_canvas),
+                x_internal_token="tok",
+                db=db,
+            )
+
+    assert resp.valid is False
+    assert len(resp.invalid_edges) == 1
+    assert resp.invalid_edges[0].edge_id == "e0"
+
+    # The invalid draft still stored (drafts are cheap: no gating on validity).
+    async with TestSession() as db:
+        from app.models.fork import ReservationFork
+        from sqlalchemy import select
+
+        fork_row = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        assert fork_row.canvas_data == bad_canvas
+
+
+@pytest.mark.asyncio
+async def test_update_fork_canvas_handler_refuses_archived():
+    from app.config import settings
+    from app.routes.forks import archive_fork_internal, update_fork_canvas_internal
+    from app.schemas.fork import ForkCanvasUpdate
+    from fastapi import HTTPException
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _direct_create_fork(db, rid)
+        with patch.object(settings, "internal_api_token", "tok"):
+            await archive_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            with pytest.raises(HTTPException) as exc:
+                await update_fork_canvas_internal(
+                    reservation_id=rid,
+                    body=ForkCanvasUpdate(canvas_data={"nodes": [], "edges": []}),
+                    x_internal_token="tok",
+                    db=db,
+                )
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Fork is archived and cannot be edited"
+
+
+@pytest.mark.asyncio
+async def test_save_fork_handler_builds_wire_and_bumps_version():
+    """save_fork_internal reconciles the submitted canvas, appends a version, and
+    reports the built delta (routes/forks.py lines 419-445)."""
+    from app.config import settings
+    from app.routes.forks import save_fork_internal
+    from app.schemas.fork import ForkSaveRequest
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth0")
+        await _direct_create_fork(db, rid)
+
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+        ],
+        "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
+    }
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await save_fork_internal(
+                reservation_id=rid,
+                body=ForkSaveRequest(canvas_data=canvas, created_by="tester"),
+                x_internal_token="tok",
+                db=db,
+            )
+
+    assert resp.version_number == 2
+    assert len(resp.built) == 1
+    assert resp.built[0].device_a_id == a
+    assert resp.built[0].port_a == "eth0"
+    assert resp.released == []
+    assert resp.unchanged_count == 0
+
+
+@pytest.mark.asyncio
+async def test_save_fork_handler_refuses_archived():
+    from app.config import settings
+    from app.routes.forks import archive_fork_internal, save_fork_internal
+    from app.schemas.fork import ForkSaveRequest
+    from fastapi import HTTPException
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _direct_create_fork(db, rid)
+        with patch.object(settings, "internal_api_token", "tok"):
+            await archive_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            with pytest.raises(HTTPException) as exc:
+                await save_fork_internal(
+                    reservation_id=rid,
+                    body=ForkSaveRequest(canvas_data={"nodes": [], "edges": []}),
+                    x_internal_token="tok",
+                    db=db,
+                )
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Fork is archived and cannot be edited"
+
+
+@pytest.mark.asyncio
+async def test_prune_fork_devices_handler_releases_wiring():
+    """prune_fork_devices_internal releases a removed device's saved wiring and
+    reports it as changed (routes/forks.py lines 460-475)."""
+    from app.config import settings
+    from app.routes.forks import prune_fork_devices_internal, save_fork_internal
+    from app.schemas.fork import ForkPruneRequest, ForkSaveRequest
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth0")
+        await _direct_create_fork(db, rid)
+
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+        ],
+        "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
+    }
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            await save_fork_internal(
+                reservation_id=rid,
+                body=ForkSaveRequest(canvas_data=canvas, created_by="tester"),
+                x_internal_token="tok",
+                db=db,
+            )
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await prune_fork_devices_internal(
+                reservation_id=rid,
+                body=ForkPruneRequest(device_ids=[a]),
+                x_internal_token="tok",
+                db=db,
+            )
+
+    assert resp.changed is True
+    assert resp.version_number == 3
+    assert len(resp.released) == 1
+    assert resp.released[0].device_a_id == a
+
+
+@pytest.mark.asyncio
+async def test_prune_fork_devices_handler_refuses_archived():
+    from app.config import settings
+    from app.routes.forks import archive_fork_internal, prune_fork_devices_internal
+    from app.schemas.fork import ForkPruneRequest
+    from fastapi import HTTPException
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _direct_create_fork(db, rid)
+        with patch.object(settings, "internal_api_token", "tok"):
+            await archive_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            with pytest.raises(HTTPException) as exc:
+                await prune_fork_devices_internal(
+                    reservation_id=rid,
+                    body=ForkPruneRequest(device_ids=[uuid.uuid4()]),
+                    x_internal_token="tok",
+                    db=db,
+                )
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Fork is archived and cannot be edited"
+
+
+@pytest.mark.asyncio
+async def test_archive_fork_handler_freezes_fork_and_is_idempotent():
+    """archive_fork_internal flips an ACTIVE fork to ARCHIVED and returns 200 with
+    the frozen state on a repeat call rather than re-flipping it
+    (routes/forks.py lines 466-480)."""
+    from app.config import settings
+    from app.models.fork import ForkStatus_ARCHIVED
+    from app.routes.forks import archive_fork_internal
+
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        created = await _direct_create_fork(db, rid)
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            first = await archive_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+    assert first.status == ForkStatus_ARCHIVED
+    assert first.fork_id == created.fork_id
+    assert first.reservation_id == rid
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            second = await archive_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+    assert second.status == ForkStatus_ARCHIVED
+
+
+@pytest.mark.asyncio
+async def test_archive_fork_handler_returns_204_for_unknown_reservation():
+    from app.config import settings
+    from app.routes.forks import archive_fork_internal
+    from starlette.responses import Response
+
+    async with TestSession() as db:
+        with patch.object(settings, "internal_api_token", "tok"):
+            resp = await archive_fork_internal(
+                reservation_id=uuid.uuid4(), x_internal_token="tok", db=db
+            )
+    assert isinstance(resp, Response)
+    assert resp.status_code == 204
+
+
+def test_node_to_element_map_skips_element_node_with_no_id():
+    """A networkElementNode entry with no node id is dropped rather than mapped
+    under a falsy key (fork_save_service.py line 135's guard clause)."""
+    from app.services.fork_save_service import node_to_element_map
+
+    canvas = {
+        "nodes": [
+            {"type": "networkElementNode", "data": {"element": {"id": "el-1"}}},  # no "id"
+            {"id": "n2", "type": "networkElementNode", "data": {"element": {"id": "el-2"}}},
+        ]
+    }
+    mapping = node_to_element_map(canvas)
+    assert mapping == {"n2": "el-2"}
+
+
+def test_prune_canvas_for_devices_none_canvas_is_a_no_op():
+    """A None canvas (a fork with no saved version yet) prunes to itself with
+    empty edge-id sets, rather than raising on `.get` (fork_save_service.py
+    line 606's early return)."""
+    from app.services.fork_save_service import prune_canvas_for_devices
+
+    pruned, changed, remaining, dropped = prune_canvas_for_devices(None, {"anything"})
+    assert pruned is None
+    assert changed is False
+    assert remaining == set()
+    assert dropped == set()
+
+
+def test_prune_canvas_for_devices_empty_canvas_is_a_no_op():
+    """An empty-dict canvas is falsy too and takes the same early-return branch."""
+    from app.services.fork_save_service import prune_canvas_for_devices
+
+    empty: dict = {}
+    pruned, changed, remaining, dropped = prune_canvas_for_devices(empty, {"anything"})
+    assert pruned is empty
+    assert changed is False
+    assert remaining == set()
+    assert dropped == set()
+
+
+@pytest.mark.asyncio
+async def test_prune_fork_devices_no_release_no_draft_change_is_a_pure_replay():
+    """Pruning a device that appears nowhere (not in the saved wiring, not in the
+    draft) hits the `if not to_release` branch with draft_changed False: no commit,
+    no version bump, changed False (fork_save_service.py lines 727-731, the
+    branch test_prune_scrubs_draft_only_content_without_a_version does not
+    reach since its draft always changes)."""
+    from app.services.fork_save_service import prune_fork_devices
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        await _seed_cable(db, a, "eth0", b, "eth0")
+        created = await _direct_create_fork(db, rid)
+
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+        ],
+        "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
+    }
+    async with TestSession() as db:
+        from app.config import settings
+        from app.routes.forks import save_fork_internal
+        from app.schemas.fork import ForkSaveRequest
+
+        with patch.object(settings, "internal_api_token", "tok"):
+            await save_fork_internal(
+                reservation_id=rid,
+                body=ForkSaveRequest(canvas_data=canvas, created_by="tester"),
+                x_internal_token="tok",
+                db=db,
+            )
+
+    unrelated = uuid.uuid4()
+    async with TestSession() as db:
+        from app.models.fork import ReservationFork
+
+        fork = await db.get(ReservationFork, created.fork_id)
+        result = await prune_fork_devices(db, fork, [unrelated])
+
+    assert result.changed is False
+    assert result.released == []
+    # Version stayed at the last save (2): no third version was appended for a
+    # no-op prune.
+    assert result.version_number == 2
+
+
+@pytest.mark.asyncio
+async def test_prune_fork_devices_scrubs_draft_only_device_without_a_version():
+    """A device that exists only in the draft (never saved) releases nothing
+    (to_release stays empty), but the draft is still scrubbed and committed
+    (fork_save_service.py lines 727-731's draft_changed branch), matching
+    test_prune_scrubs_draft_only_content_without_a_version's HTTP-level pin,
+    called directly so the commit line gets coverage credit too."""
+    from app.services.fork_save_service import prune_fork_devices
+
+    a, dut = uuid.uuid4(), uuid.uuid4()
+    rid = uuid.uuid4()
+    async with TestSession() as db:
+        created = await _direct_create_fork(db, rid)
+
+    async with TestSession() as db:
+        from app.models.fork import ReservationFork
+
+        fork = await db.get(ReservationFork, created.fork_id)
+        # A draft edge naming a device that was never part of any save.
+        fork.canvas_data = {
+            "nodes": [
+                {"id": "nA", "data": {"device": {"id": str(a)}}},
+                {"id": "nD", "data": {"device": {"id": str(dut)}}},
+            ],
+            "edges": [{"id": "eDraft", "source": "nA", "target": "nD"}],
+        }
+        await db.commit()
+
+        result = await prune_fork_devices(db, fork, [dut])
+
+    assert result.changed is False
+    assert result.released == []
+    assert result.version_number == 1
+
+    async with TestSession() as db:
+        from app.models.fork import ReservationFork
+
+        fork_row = await db.get(ReservationFork, created.fork_id)
+        node_ids = {n["id"] for n in fork_row.canvas_data["nodes"]}
+        assert node_ids == {"nA"}
+        assert fork_row.canvas_data["edges"] == []
