@@ -345,6 +345,43 @@ async def test_gap_triggers_full_reconcile():
 
 
 @pytest.mark.asyncio
+async def test_gap_full_reconcile_releases_active_row_no_longer_desired():
+    """A gap's full-reconcile diffs the CURRENT ACTIVE set against the freshly
+    fetched desired set: a pre-existing ACTIVE pair no longer in the fork's intended
+    wiring is released, and a pinned non-retryable FAILED row is excluded from the
+    stale-build widening (its recovery is a re-save, never a release here)."""
+    await _seed_state(last_applied=0)
+    await _seed_active("0/0/8", "0/0/9")
+    await _seed_failed(
+        "0/0/20", "0/0/21", intended="ACTIVE", attempts=0, last_error=WIRING_UNRESOLVABLE_REASON
+    )
+    # A release-direction FAILED row: excluded from the stale-build widening by the
+    # intended-ACTIVE-only filter (only a build-direction failure needs settling
+    # here), separately from the pinned-reason exclusion above.
+    await _seed_failed("0/0/30", "0/0/31", intended="RELEASED", attempts=1, last_error="boom")
+    execute_fn, calls = _sandbox_recorder()
+    await _run(_event(5, released=[], built=[]), execute_fn, fork_wires=PAIR_12)
+
+    assert ("disconnect_ports", "0/0/8", "0/0/9") in calls, (
+        "the stranded ACTIVE pair no longer desired must be released"
+    )
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    released = await _assignments("RELEASED")
+    assert [(r.port_a, r.port_b) for r in released] == [("0/0/8", "0/0/9")]
+
+    # Both FAILED rows are excluded from the stale-build widening (each for a
+    # different reason: the pinned reason on one, the RELEASED intended on the
+    # other) and stay untouched, with no driver call for either.
+    failed = await _assignments("FAILED")
+    assert {(r.port_a, r.port_b, r.intended) for r in failed} == {
+        ("0/0/20", "0/0/21", "ACTIVE"),
+        ("0/0/30", "0/0/31", "RELEASED"),
+    }
+    assert not any(pa in ("0/0/20", "0/0/21", "0/0/30", "0/0/31") for _a, pa, _pb in calls)
+    assert await _last_applied() == 5
+
+
+@pytest.mark.asyncio
 async def test_missing_state_is_gap_then_stamped():
     """No wiring_state row: full-reconcile (gap by definition), then stamp the version."""
     execute_fn, calls = _sandbox_recorder()

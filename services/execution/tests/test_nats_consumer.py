@@ -28,6 +28,10 @@ from app.services.nats_consumer import (
     PermanentEventError,
     TransientUpstreamError,
     _fetch_device,
+    _fetch_fork_intended_wires,
+    _fetch_hypervisor,
+    _fetch_latest_config,
+    _fetch_secret_value,
     _fetch_template,
     handle_reservation_event,
     process_reservation_message,
@@ -504,6 +508,70 @@ async def test_fetch_template_returns_none_on_404():
 
 
 @pytest.mark.asyncio
+async def test_fetch_device_returns_json_on_200():
+    """The success path: a real 200 is parsed and returned, not mocked away."""
+    payload = {"id": "dev-1", "name": "switch-1"}
+    with _patch_httpx_get(status_code=200, json_body=payload):
+        assert await _fetch_device("dev-1") == payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_template_returns_json_on_200():
+    payload = {"id": "tpl-1", "sections": []}
+    with _patch_httpx_get(status_code=200, json_body=payload):
+        assert await _fetch_template("tpl-1") == payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_config_returns_json_on_200():
+    payload = {"config": {"routes": []}}
+    with _patch_httpx_get(status_code=200, json_body=payload):
+        assert await _fetch_latest_config("dev-1") == payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_config_returns_none_on_404():
+    with _patch_httpx_get(status_code=404):
+        assert await _fetch_latest_config("dev-1") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_config_raises_on_5xx():
+    with _patch_httpx_get(status_code=502):
+        with pytest.raises(TransientUpstreamError):
+            await _fetch_latest_config("dev-1")
+
+
+@pytest.mark.asyncio
+async def test_fetch_fork_intended_wires_200_filters_to_l1_and_defaults_layer():
+    """The success path: a real 200 is parsed, filtered to L1 rows (a row with no
+    `layer` key defaults to L1, a non-L1 row is dropped)."""
+    payload = {
+        "connections": [
+            {"device_a_id": "a", "port_a": "p1", "device_b_id": "b", "port_b": "p2"},
+            {
+                "device_a_id": "c",
+                "port_a": "p3",
+                "device_b_id": "d",
+                "port_b": "p4",
+                "layer": "L1",
+            },
+            {
+                "device_a_id": "e",
+                "port_a": "p5",
+                "device_b_id": "f",
+                "port_b": "p6",
+                "layer": "L2",
+            },
+        ]
+    }
+    with _patch_httpx_get(status_code=200, json_body=payload):
+        result = await _fetch_fork_intended_wires("res-1")
+
+    assert [c["device_a_id"] for c in result] == ["a", "c"]
+
+
+@pytest.mark.asyncio
 async def test_fetch_device_raises_on_transport_error():
     with _patch_httpx_get(raises=httpx.ConnectError("connection refused")):
         with pytest.raises(TransientUpstreamError):
@@ -545,6 +613,53 @@ async def test_fetch_context_memoizes_device_and_config_fetches():
         with pytest.raises(TransientUpstreamError):
             await ctx.get_device("dev-3")
         assert boom.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_hypervisor_raises_on_5xx():
+    with _patch_httpx_get(status_code=502):
+        with pytest.raises(TransientUpstreamError):
+            await _fetch_hypervisor("hv-1")
+
+
+@pytest.mark.asyncio
+async def test_fetch_hypervisor_returns_none_on_404():
+    with _patch_httpx_get(status_code=404):
+        assert await _fetch_hypervisor("hv-1") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_hypervisor_returns_body_on_200():
+    body = {"id": "hv-1", "name": "esxi-1"}
+    with _patch_httpx_get(status_code=200, json_body=body):
+        assert await _fetch_hypervisor("hv-1") == body
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_raises_on_5xx():
+    with _patch_httpx_get(status_code=500):
+        with pytest.raises(TransientUpstreamError):
+            await _fetch_secret_value("sec-1")
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_returns_none_on_404():
+    with _patch_httpx_get(status_code=404):
+        assert await _fetch_secret_value("sec-1") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_extracts_data_field_on_200():
+    with _patch_httpx_get(status_code=200, json_body={"data": {"username": "admin"}}):
+        assert await _fetch_secret_value("sec-1") == {"username": "admin"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_non_dict_body_yields_empty_dict():
+    """A malformed 200 body (not a dict) must not raise: it degrades to an empty
+    secret-value mapping rather than crashing the config-build path."""
+    with _patch_httpx_get(status_code=200, json_body=["not", "a", "dict"]):
+        assert await _fetch_secret_value("sec-1") == {}
 
 
 # --- dedupe key switch: payload event_id over stream:sequence (issue #21) ---

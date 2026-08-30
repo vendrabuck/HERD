@@ -435,3 +435,110 @@ async def test_heal_after_converged_apply_is_a_no_op():
     vas = await _allocation()
     assert len(vas) == 1
     assert set(vas[0].defined_switch_ids) == {SW_L2, SW_MID, SW_L2_B}
+
+
+# --- _resolve_add_allocations: find_or_assign committed but the re-read misses ---
+
+
+async def test_resolve_add_allocations_defensive_missing_row_parks_add_failed():
+    """_resolve_add_allocations re-reads the ACTIVE vlan_assignment right after
+    find_or_assign_vlan returns, purely defensively (find_or_assign_vlan always
+    leaves a matching row committed in practice). If that re-read ever came up
+    empty, the fabric gets no allocation entry, so the switch's add is later parked
+    FAILED with the pinned no-allocation reason rather than silently vanishing."""
+    from app.services import vlan_service as vlan_service_module
+
+    async def fake_find_or_assign(db, reservation_id, fabric_id, switch_device_ids):
+        # Returns a VLAN id without ever inserting the matching row, forcing the
+        # caller's immediate re-read to come up empty.
+        return 123
+
+    execute_fn, calls = _recorder()
+    with patch.object(vlan_service_module, "find_or_assign_vlan", new=fake_find_or_assign):
+        await _reconcile([_wire(DUT1, "eth0", SW_L2, "0/0/1")], execute_fn=execute_fn, calls=calls)
+
+    assert calls == [], "no driver call: the add could not be resolved to an allocation"
+    rows = await _membership_rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert "no VLAN allocation for fabric" in rows[0].last_error
+    assert await _allocation() == [], "no allocation row was ever committed"
+
+
+# --- _release_orphaned_allocations: no matching ACTIVE row to release ---------
+
+
+async def test_release_orphaned_allocations_no_active_row_is_a_defensive_no_op():
+    """A vlan_assignment_id with zero active memberships but no matching ACTIVE row
+    (already released by a racing pass, or a bogus id) is a silent no-op: no driver
+    call, no exception, nothing to release."""
+    va_id = uuid.uuid4()
+    execute_fn, calls = _recorder()
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        await _release_orphaned_allocations({va_id}, _db_session_factory(), _FetchContext(None))
+
+    assert calls == [], "nothing to release: no driver call may fire"
+
+
+# --- zero membership delta but the definition SCOPE still changed (issue #442) ---
+
+
+async def test_scope_grows_with_no_membership_delta_defines_new_transit_switch():
+    """A re-wire that inserts a new trunk-transit switch between the same two
+    terminal ports produces ZERO membership delta (both terminal memberships are
+    unchanged), but the definition scope grows to include the new transit switch,
+    which must still get create_vlan even though add_keys/remove_keys/stale_rows are
+    all empty."""
+    # Version 1: direct trunk, no transit switch in the scope.
+    await _reconcile(
+        [
+            _wire(DUT1, "eth0", SW_L2, "0/0/1"),
+            _wire(SW_L2, "0/0/9", SW_L2_B, "0/0/9"),
+            _wire(SW_L2_B, "0/0/1", DUT2, "eth0"),
+        ],
+        fork_version=1,
+    )
+    before = await _allocation()
+    assert len(before) == 1
+    assert set(before[0].defined_switch_ids) == {SW_L2, SW_L2_B}
+
+    members_before = {
+        (str(r.switch_device_id), r.port) for r in await _membership_rows() if r.status == "ACTIVE"
+    }
+    assert members_before == {(SW_L2, "0/0/1"), (SW_L2_B, "0/0/1")}
+
+    # Version 2: routed through SW_MID as a transit hop, but the SAME terminal
+    # ports on SW_L2 and SW_L2_B, so membership is unchanged.
+    execute_fn, calls = _recorder()
+    calls_result = await _reconcile(
+        [
+            _wire(DUT1, "eth0", SW_L2, "0/0/1"),
+            _wire(SW_L2, "0/0/9", SW_MID, "0/0/1"),
+            _wire(SW_MID, "0/0/2", SW_L2_B, "0/0/9"),
+            _wire(SW_L2_B, "0/0/1", DUT2, "eth0"),
+        ],
+        fork_version=2,
+        execute_fn=execute_fn,
+        calls=calls,
+    )
+
+    members_after = {
+        (str(r.switch_device_id), r.port) for r in await _membership_rows() if r.status == "ACTIVE"
+    }
+    assert members_after == members_before, "the terminal memberships must not change"
+
+    after = await _allocation()
+    assert len(after) == 1
+    assert after[0].id == before[0].id, "the same allocation is reused, not recreated"
+    assert set(after[0].defined_switch_ids) == {SW_L2, SW_MID, SW_L2_B}, (
+        "the new transit switch must be added to the definition scope"
+    )
+    create_vlan_switches = {
+        device_id for a, device_id, _p, _v in calls_result if a == "create_vlan"
+    }
+    assert SW_MID in create_vlan_switches, "the newly-scoped transit switch must be defined"

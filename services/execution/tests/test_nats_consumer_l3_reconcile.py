@@ -19,6 +19,7 @@ from app.database import Base
 from app.models.route_assignment import RouteAssignment
 from app.services.nats_consumer import (
     TransientUpstreamError,
+    _apply_l3_adjacency,
     _derive_l3_adjacency,
     _fetch_latest_config,
     _FetchContext,
@@ -361,6 +362,25 @@ async def test_reconcile_failed_provision_lands_failed_intended_active():
     assert await _active_switches() == set()
 
 
+async def test_reconcile_login_failure_parks_provision_failed_no_configure_call():
+    """A per-switch login failure (the L3 analogue of the L2 login-failure park path)
+    parks the pinned-set provision FAILED intended ACTIVE with the login error, and
+    configure_route never reaches the driver for that switch."""
+    execute_fn, calls = _l3_recorder(fail={"login"})
+    await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], execute_fn=execute_fn, calls=calls)
+
+    assert not any(action == "configure_route" for action, _dest in calls), (
+        "a login failure must never reach configure_route"
+    )
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert rows[0].routes == ROUTES, "the pinned set is still captured on a login failure"
+    assert "driver login failed" in rows[0].last_error
+    assert await _active_switches() == set()
+
+
 async def test_reconcile_present_key_falsy_result_is_failure():
     """configure_route returning {"success": False} in its output (transport ok) fails."""
 
@@ -546,3 +566,136 @@ async def test_reconcile_still_rebuilds_failed_provision_that_is_still_intended(
     active = await _rows("ACTIVE")
     assert [r.id for r in active] == [rid], "the FAILED row flipped ACTIVE in place"
     assert await _rows("FAILED") == []
+
+
+# --- switch cannot be driven: parks its pinned set FAILED, no driver call -----
+#
+# Both live callers of _apply_l3_adjacency pre-filter an unresolvable switch out of
+# `provisions`/`deprovisions` before this function ever sees it (derivation
+# classifies the endpoint device first, the L2 twin of this same gap), so these
+# exercise the function's own defensive branches directly.
+
+
+async def test_apply_l3_adjacency_switch_not_found_parks_provision_failed():
+    gone_switch = str(uuid.uuid4())
+
+    async def device_fetch(device_id, client=None):
+        return None if str(device_id) == gone_switch else DEVICES.get(str(device_id))
+
+    execute_fn, calls = _l3_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [{"device_id": gone_switch, "routes": ROUTES}],
+            ctx,
+            _db_session_factory(),
+        )
+
+    assert calls == [], "an unresolvable switch must never be driven"
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert "L3 switch" in rows[0].last_error
+    assert "not found" in rows[0].last_error
+
+
+async def test_apply_l3_adjacency_template_not_found_parks_provision_failed():
+    execute_fn, calls = _l3_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch("app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=None)),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [{"device_id": SW_L3, "routes": ROUTES}],
+            ctx,
+            _db_session_factory(),
+        )
+
+    assert calls == [], "a missing template must never be driven"
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert "template for L3 switch" in rows[0].last_error
+    assert "not found" in rows[0].last_error
+
+
+async def test_apply_l3_adjacency_driver_load_raises_parks_provision_failed():
+    execute_fn, calls = _l3_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch(
+            "app.services.driver_loader.load_driver",
+            new=AsyncMock(side_effect=RuntimeError("package corrupt")),
+        ),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [{"device_id": SW_L3, "routes": ROUTES}],
+            ctx,
+            _db_session_factory(),
+        )
+
+    assert calls == [], "a driver that cannot load must never be driven"
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert "driver load failed" in rows[0].last_error
+    assert "package corrupt" in rows[0].last_error
+
+
+async def test_apply_l3_adjacency_deprovision_switch_not_found_parks_failed():
+    """A deprovision (a switch losing adjacency) whose switch itself no longer
+    resolves is the same park path, tagged intended RELEASED."""
+    gone_switch = str(uuid.uuid4())
+    async with TestSessionLocal() as s:
+        await record_route_active(s, RES_ID, gone_switch, ROUTES)
+
+    async def device_fetch(device_id, client=None):
+        return None if str(device_id) == gone_switch else DEVICES.get(str(device_id))
+
+    execute_fn, calls = _l3_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l3_adjacency(
+            RES_ID,
+            [{"device_id": gone_switch, "routes": ROUTES}],
+            [],
+            ctx,
+            _db_session_factory(),
+        )
+
+    assert calls == [], "an unresolvable switch must never be driven"
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "RELEASED"
+    assert "L3 switch" in rows[0].last_error
+    assert "not found" in rows[0].last_error

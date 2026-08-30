@@ -34,7 +34,7 @@ from app.services.wiring_retry_service import (
     stop_wiring_retry_scheduler,
 )
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 test_engine = create_async_engine(
@@ -864,3 +864,323 @@ async def test_parked_stale_build_settles_through_release_on_a_later_pass():
     released = await _rows("RELEASED")
     assert [r.id for r in released] == [fid]
     assert second["results"][0]["outcome"] == "released"
+
+
+# --- Row vanishes between reattempt and refresh-by-id (L1/L2/L3) ------------
+
+
+@pytest.mark.asyncio
+async def test_reattempt_rows_skips_id_deleted_before_refresh():
+    """_reattempt_rows drives the ORM row objects it is handed directly, then refetches
+    by id afterward to read back the outcome. A row deleted in that window (concurrent
+    admin cleanup, a race) is silently skipped in the returned outcomes rather than
+    raising a KeyError or synthesizing a fake outcome for it, even though the driver
+    call for it still fired."""
+    from app.services.wiring_retry_service import _reattempt_rows
+
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=0)
+    async with TestSessionLocal() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(L1ConnectionAssignment).where(L1ConnectionAssignment.id == fid)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Delete the row now: _reattempt_rows drives the in-memory `rows` objects passed
+    # in without re-checking existence, then refreshes by id only at the very end.
+    async with TestSessionLocal() as s:
+        victim = await s.get(L1ConnectionAssignment, fid)
+        await s.delete(victim)
+        await s.commit()
+
+    execute_fn, calls = _sandbox_recorder()
+    ps = _patches(execute_fn)
+    for p in ps:
+        p.start()
+    try:
+        outcomes = await _reattempt_rows(rows, _db_session_factory())
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert outcomes == [], "a row missing on refresh contributes no outcome, not an error"
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls, "the driver call still fired"
+
+
+# --- L2/L3 skipped stats in the background tick ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_skips_non_retryable_l2_and_l3_rows(monkeypatch):
+    """The tick's skipped_not_retryable counter applies to L1, L2, and L3 rows alike:
+    a pinned unresolvable reason on any layer is excluded from the batch and never
+    reaches the driver."""
+    from app.models.l2_port_assignment import L2PortAssignment
+    from app.models.route_assignment import RouteAssignment
+
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    await _seed_failed("0/0/1", "0/0/2", attempts=0, last_error=WIRING_UNRESOLVABLE_REASON)
+    async with TestSessionLocal() as s:
+        s.add(
+            L2PortAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                vlan_assignment_id=uuid.uuid4(),
+                switch_device_id=uuid.UUID(SWITCH_ID),
+                port="0/0/1",
+                intended="ACTIVE",
+                status="FAILED",
+                attempts=0,
+                last_error=WIRING_UNRESOLVABLE_REASON,
+            )
+        )
+        s.add(
+            RouteAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                device_id=uuid.UUID(SWITCH_ID),
+                routes=[],
+                intended="ACTIVE",
+                status="FAILED",
+                attempts=0,
+                last_error=WIRING_NOT_SIMPLE_CHAIN_REASON,
+            )
+        )
+        await s.commit()
+
+    execute_fn, calls = _sandbox_recorder()
+    stats = await _run_tick(execute_fn)
+
+    assert stats["skipped_not_retryable"] == 3
+    assert stats["rows_retried"] == 0
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_tick_skips_frozen_l2_and_l3_build_rows(monkeypatch):
+    """Direction-scoped freeze applies uniformly across layers: a frozen reservation's
+    build-direction L2 and L3 rows are counted skipped_frozen and never driven."""
+    from app.models.l2_port_assignment import L2PortAssignment
+    from app.models.route_assignment import RouteAssignment
+
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    await _seed_state(frozen=True)
+    async with TestSessionLocal() as s:
+        s.add(
+            L2PortAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                vlan_assignment_id=uuid.uuid4(),
+                switch_device_id=uuid.UUID(SWITCH_ID),
+                port="0/0/1",
+                intended="ACTIVE",
+                status="FAILED",
+                attempts=0,
+                last_error="boom",
+            )
+        )
+        s.add(
+            RouteAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                device_id=uuid.UUID(SWITCH_ID),
+                routes=[],
+                intended="ACTIVE",
+                status="FAILED",
+                attempts=0,
+                last_error="boom",
+            )
+        )
+        await s.commit()
+
+    execute_fn, calls = _sandbox_recorder()
+    stats = await _run_tick(execute_fn)
+
+    assert stats["skipped_frozen"] == 2
+    assert stats["rows_retried"] == 0
+    assert calls == []
+
+
+# --- Per-layer reattempt exceptions never wedge the tick ---------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_l1_reattempt_exception_leaves_row_failed_and_does_not_raise(monkeypatch):
+    """A TransientUpstreamError (or any other exception) out of _reattempt_rows is
+    caught inside the tick: the row stays FAILED, l1_rows_retried is 0, and the tick
+    returns normally instead of propagating (so one bad reservation never wedges the
+    background loop)."""
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    fid = await _seed_failed("0/0/1", "0/0/2", attempts=0)
+
+    with patch(
+        "app.services.wiring_retry_service._reattempt_rows",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert stats["l1_rows_retried"] == 0
+    assert stats["rows_retried"] == 0
+    assert [r.id for r in await _rows("FAILED")] == [fid]
+
+
+@pytest.mark.asyncio
+async def test_tick_l2_reattempt_exception_leaves_row_failed_and_does_not_raise(monkeypatch):
+    """The L2 analogue: an exception out of _reattempt_l2_rows is swallowed, the row
+    stays FAILED, and l2_rows_retried is 0."""
+    from app.models.l2_port_assignment import L2PortAssignment
+
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    async with TestSessionLocal() as s:
+        row = L2PortAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            vlan_assignment_id=uuid.uuid4(),
+            switch_device_id=uuid.UUID(SWITCH_ID),
+            port="0/0/1",
+            intended="ACTIVE",
+            status="FAILED",
+            attempts=0,
+            last_error="boom",
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        fid = row.id
+
+    with patch(
+        "app.services.wiring_retry_service._reattempt_l2_rows",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert stats["l2_rows_retried"] == 0
+    assert stats["rows_retried"] == 0
+    async with TestSessionLocal() as s:
+        row = await s.get(L2PortAssignment, fid)
+    assert row.status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_tick_l3_reattempt_exception_leaves_row_failed_and_does_not_raise(monkeypatch):
+    """The L3 analogue: an exception out of _reattempt_l3_rows is swallowed, the row
+    stays FAILED, and l3_rows_retried is 0."""
+    from app.models.route_assignment import RouteAssignment
+
+    monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
+    async with TestSessionLocal() as s:
+        row = RouteAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            device_id=uuid.UUID(SWITCH_ID),
+            routes=[],
+            intended="ACTIVE",
+            status="FAILED",
+            attempts=0,
+            last_error="boom",
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        fid = row.id
+
+    with patch(
+        "app.services.wiring_retry_service._reattempt_l3_rows",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert stats["l3_rows_retried"] == 0
+    assert stats["rows_retried"] == 0
+    async with TestSessionLocal() as s:
+        row = await s.get(RouteAssignment, fid)
+    assert row.status == "FAILED"
+
+
+# --- Loop: CancelledError raised from inside the tick itself -----------------
+
+
+@pytest.mark.asyncio
+async def test_loop_propagates_cancellation_raised_from_inside_the_tick():
+    """A CancelledError raised by run_wiring_retry_tick itself (not by asyncio.sleep)
+    is re-raised immediately, without being treated as a failed tick (no backoff
+    computed, no sleep called): cancellation must exit the loop, not be swallowed."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+
+    with (
+        patch(
+            "app.services.wiring_retry_service.run_wiring_retry_tick",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ),
+        patch("app.services.wiring_retry_service.asyncio.sleep", new=fake_sleep),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await run_wiring_retry_loop(_db_session_factory())
+    assert sleeps == [], "cancellation exits before any backoff sleep is scheduled"
+
+
+# --- make_session_ctx_factory: the real session-context implementation -------
+
+
+@pytest.mark.asyncio
+async def test_make_session_ctx_factory_opens_and_closes_a_real_session():
+    """make_session_ctx_factory's _SessionCtx wraps AsyncSessionLocal directly (the
+    production factory used by the real background loop, as opposed to the test
+    harness's own _db_session_factory): entering yields a usable AsyncSession bound
+    to the app's production sessionmaker, and exiting calls close() on it exactly
+    once."""
+    from app.services.wiring_retry_service import make_session_ctx_factory
+
+    closed = {"count": 0}
+
+    class _TrackingSession(AsyncSession):
+        async def close(self):
+            closed["count"] += 1
+            await super().close()
+
+    tracking_sessionmaker = async_sessionmaker(
+        test_engine, expire_on_commit=False, class_=_TrackingSession
+    )
+    with patch("app.database.AsyncSessionLocal", tracking_sessionmaker):
+        factory = make_session_ctx_factory()
+        ctx = factory()
+        async with ctx as session:
+            result = await session.execute(select(L1ConnectionAssignment))
+            assert result.scalars().all() == []
+            assert closed["count"] == 0
+    assert closed["count"] == 1, "__aexit__ must close the session exactly once"
+
+
+# --- start_wiring_retry_scheduler: the done-callback surfaces a real crash ----
+
+
+@pytest.mark.asyncio
+async def test_scheduler_surface_crash_logs_unexpected_task_exception(monkeypatch, caplog):
+    """When the background task exits with an exception (not cancellation), the
+    done-callback logs it via the surface_crash path instead of letting it vanish
+    silently into the task object."""
+    monkeypatch.setattr(settings, "wiring_retry_enabled", True)
+
+    with patch(
+        "app.services.wiring_retry_service.run_wiring_retry_loop",
+        new=AsyncMock(side_effect=RuntimeError("loop exploded")),
+    ):
+        app = types.SimpleNamespace(state=types.SimpleNamespace())
+        with caplog.at_level("ERROR", logger="app.services.wiring_retry_service"):
+            await start_wiring_retry_scheduler(app)
+            task = app.state.wiring_retry_task
+            with pytest.raises(RuntimeError, match="loop exploded"):
+                await task
+            # Let the done-callback (scheduled via call_soon) actually run.
+            await asyncio.sleep(0)
+
+    assert any("wiring retry task exited unexpectedly" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stop_scheduler_with_no_task_attribute_is_a_no_op():
+    """stop_wiring_retry_scheduler on an app that never started the task (e.g. it was
+    disabled at startup) returns immediately rather than raising AttributeError."""
+    app = types.SimpleNamespace(state=types.SimpleNamespace())
+    assert not hasattr(app.state, "wiring_retry_task")
+    await stop_wiring_retry_scheduler(app)  # must not raise

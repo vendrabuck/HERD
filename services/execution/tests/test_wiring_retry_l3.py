@@ -413,3 +413,30 @@ async def test_l3_fetch_failure_leaves_build_row_untouched():
     assert row.attempts == 3
     assert row.last_error == "boom"
     assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_reattempt_l3_rows_skips_id_deleted_before_refresh():
+    """_reattempt_l3_rows drives the ORM row objects it is handed directly, then
+    refetches by id afterward. A row deleted in that window is skipped in the
+    returned outcomes rather than raising, even though its driver call still fired
+    (the L3 analogue of the L1 _reattempt_rows race)."""
+    from app.services.wiring_retry_service import _reattempt_l3_rows
+
+    rid = await _seed_l3_failed("ACTIVE", attempts=0)
+    async with TestSessionLocal() as db:
+        rows = (
+            (await db.execute(select(RouteAssignment).where(RouteAssignment.id == rid)))
+            .scalars()
+            .all()
+        )
+    async with TestSessionLocal() as s:
+        victim = await s.get(RouteAssignment, rid)
+        await s.delete(victim)
+        await s.commit()
+
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn):
+        outcomes = await _reattempt_l3_rows(rows, _db_session_factory())
+
+    assert outcomes == [], "a row missing on refresh contributes no outcome, not an error"
+    assert calls, "the driver call still fired"

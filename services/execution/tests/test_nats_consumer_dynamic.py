@@ -51,6 +51,7 @@ from app.services.nats_consumer import (
     _delete_dynamic_device,
     _execute_dynamic_teardown,
     _handle_provision_requested,
+    _maybe_post_provision_failure,
     _post_provision_result_best_effort,
     _recipe_reported_success,
     handle_reservation_event,
@@ -820,6 +821,24 @@ async def test_delete_dynamic_device_maps_status_codes():
     assert await _delete_dynamic_device(client, DEVICE_ID) is False
 
 
+async def test_create_dynamic_device_raises_on_transport_error():
+    import httpx
+
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    with pytest.raises(TransientUpstreamError):
+        await _create_dynamic_device(client, TEMPLATE_ID, RES_ID, {}, REQUEST_ID)
+
+
+async def test_delete_dynamic_device_raises_on_transport_error():
+    import httpx
+
+    client = AsyncMock()
+    client.delete = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    with pytest.raises(TransientUpstreamError):
+        await _delete_dynamic_device(client, DEVICE_ID)
+
+
 # --- teardown matrix --------------------------------------------------------
 
 
@@ -1014,6 +1033,29 @@ def test_build_recipe_context_carries_hypervisor_and_ids():
     assert context["HERD_image"] == "debian12"
 
 
+def test_build_recipe_context_skips_field_with_no_key():
+    """A malformed section field with no `key` contributes no HERD_ context entry
+    (defensively skipped) rather than raising or producing a HERD_None key."""
+    template = {
+        **TEMPLATE_DATA,
+        "sections": [
+            {
+                "name": "Instance",
+                "fields": [
+                    {"key": "image", "type": "string", "default": "debian12"},
+                    {"type": "string", "default": "orphan-value"},
+                ],
+            }
+        ],
+    }
+    context, _ = _build_recipe_context(
+        template, HYPERVISOR_DATA, SECRET_DATA, REQUEST_ID, RES_ID, USER_ID
+    )
+    assert context["HERD_image"] == "debian12"
+    assert "HERD_None" not in context
+    assert "orphan-value" not in context.values()
+
+
 # --- callback retry-then-log ------------------------------------------------
 
 
@@ -1040,6 +1082,69 @@ async def test_callback_persistent_failure_is_swallowed():
         # Must not raise: the timeout backstop covers a lost callback.
         await _post_provision_result_best_effort(
             RES_ID, succeeded=True, device_ids=[DEVICE_ID], error=None
+        )
+
+
+# --- _maybe_post_provision_failure: best-effort DLQ failure callback --------
+
+
+async def test_maybe_post_provision_failure_ignores_other_events():
+    """Only reservation.provision_requested gets the failure callback; any other
+    event type is a silent no-op (no callback attempt at all)."""
+    called = {"n": 0}
+
+    async def _spy(client, reservation_id, *, succeeded, device_ids, error):
+        called["n"] += 1
+
+    with patch("app.services.nats_consumer._post_provision_result", new=_spy):
+        await _maybe_post_provision_failure(
+            {"event": "reservation.wiring_changed", "reservation_id": RES_ID}, "boom"
+        )
+    assert called["n"] == 0
+
+
+async def test_maybe_post_provision_failure_ignores_missing_reservation_id():
+    called = {"n": 0}
+
+    async def _spy(client, reservation_id, *, succeeded, device_ids, error):
+        called["n"] += 1
+
+    with patch("app.services.nats_consumer._post_provision_result", new=_spy):
+        await _maybe_post_provision_failure({"event": "reservation.provision_requested"}, "boom")
+    assert called["n"] == 0
+
+
+async def test_maybe_post_provision_failure_posts_failed_callback():
+    seen = {}
+
+    async def _spy(client, reservation_id, *, succeeded, device_ids, error):
+        seen["reservation_id"] = reservation_id
+        seen["succeeded"] = succeeded
+        seen["device_ids"] = device_ids
+        seen["error"] = error
+
+    with patch("app.services.nats_consumer._post_provision_result", new=_spy):
+        await _maybe_post_provision_failure(
+            {"event": "reservation.provision_requested", "reservation_id": RES_ID},
+            "DLQ exhausted",
+        )
+
+    assert seen == {
+        "reservation_id": RES_ID,
+        "succeeded": False,
+        "device_ids": [],
+        "error": "DLQ exhausted",
+    }
+
+
+async def test_maybe_post_provision_failure_swallows_callback_error():
+    async def _always_fail(client, reservation_id, *, succeeded, device_ids, error):
+        raise RuntimeError("reservations unreachable")
+
+    with patch("app.services.nats_consumer._post_provision_result", new=_always_fail):
+        # Must not raise: this is a best-effort callback on an already-DLQ'd event.
+        await _maybe_post_provision_failure(
+            {"event": "reservation.provision_requested", "reservation_id": RES_ID}, "boom"
         )
 
 
@@ -1096,3 +1201,86 @@ def test_transport_failure_agrees_on_both_helpers():
     result = {"success": False, "output": None, "error": "driver crashed", "duration_ms": 1}
     assert driver_result_failed(result) == (True, "driver crashed")
     assert _recipe_reported_success(result) is False
+
+
+# --- _fetch_hypervisor / _fetch_secret_value: the fetch helpers themselves ----
+#
+# Both are mocked out wholesale everywhere else in this file; these exercise their
+# own status-code handling directly (mirrors the _StubClient pattern used for
+# _fetch_fork_intended_wires in test_nats_consumer_wiring_changed.py).
+
+
+class _StubResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+
+class _StubClient:
+    def __init__(self, status_code, payload=None):
+        self._response = _StubResponse(status_code, payload)
+
+    async def get(self, url, **kwargs):
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_fetch_hypervisor_200_returns_record():
+    from app.services.nats_consumer import _fetch_hypervisor
+
+    payload = {"id": "hv-1", "secret_id": "sec-1"}
+    result = await _fetch_hypervisor("hv-1", _StubClient(200, payload))
+    assert result == payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_hypervisor_404_returns_none():
+    """A genuine 404 is a permanent config error to the caller, not a retryable one."""
+    from app.services.nats_consumer import _fetch_hypervisor
+
+    assert await _fetch_hypervisor("hv-gone", _StubClient(404)) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_hypervisor_5xx_raises_transient():
+    from app.services.nats_consumer import TransientUpstreamError, _fetch_hypervisor
+
+    with pytest.raises(TransientUpstreamError):
+        await _fetch_hypervisor("hv-1", _StubClient(503))
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_200_returns_data_mapping():
+    from app.services.nats_consumer import _fetch_secret_value
+
+    payload = {"data": {"username": "admin", "password": "hunter2"}}
+    result = await _fetch_secret_value("sec-1", _StubClient(200, payload))
+    assert result == {"username": "admin", "password": "hunter2"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_200_non_dict_body_returns_empty_dict():
+    """A 200 whose body is not a dict (malformed upstream response) degrades to an
+    empty data mapping rather than raising on .get()."""
+    from app.services.nats_consumer import _fetch_secret_value
+
+    result = await _fetch_secret_value("sec-1", _StubClient(200, ["not", "a", "dict"]))
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_404_returns_none():
+    from app.services.nats_consumer import _fetch_secret_value
+
+    assert await _fetch_secret_value("sec-gone", _StubClient(404)) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_secret_value_5xx_raises_transient():
+    from app.services.nats_consumer import TransientUpstreamError, _fetch_secret_value
+
+    with pytest.raises(TransientUpstreamError):
+        await _fetch_secret_value("sec-1", _StubClient(500))
