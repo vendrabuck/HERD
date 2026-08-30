@@ -314,6 +314,12 @@
 
 #### Frontend
 
+- Inventory page Next-click revert (PR #662, nightly run 33300868733): the
+  search-debounce effect armed a 300ms `setSkip(0)` timer on every mount, so a
+  Next click inside that window was silently reverted to page 1. The effect now
+  returns early when the input already matches the applied search; a
+  fake-timer vitest pins the race and the seeded e2e pass exercises it live.
+
 - Multi-port wiring dialog (issue #517, PR #530): drawing a line between two device
   nodes on the topology canvas opens `WiringDialog.tsx` (port columns via
   react-window, drag or click-to-connect, per-line L1/L2/L3, "Connect 1:1 in order"
