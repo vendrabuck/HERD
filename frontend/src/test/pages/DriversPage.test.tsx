@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
 // Mock HTMLDialogElement methods
@@ -14,10 +14,11 @@ vi.mock("react-router-dom", () => ({
 
 // Mock react-hot-toast
 const mockToastError = vi.fn();
+const mockToastSuccess = vi.fn();
 vi.mock("react-hot-toast", () => ({
   default: {
     error: (...args: unknown[]) => mockToastError(...args),
-    success: vi.fn(),
+    success: (...args: unknown[]) => mockToastSuccess(...args),
   },
 }));
 
@@ -224,5 +225,219 @@ describe("DriversPage", () => {
     expect(
       screen.getByText(/Are you sure you want to delete this driver/)
     ).toBeInTheDocument();
+  });
+
+  it("formats a large file size in MB rather than KB", () => {
+    render(<DriversPage />);
+    // SAMPLE_DRIVERS[1].size_bytes is 2048000, which is >= 1024*1024.
+    expect(screen.getByText("2.0 MB")).toBeInTheDocument();
+    // The smaller driver stays in KB.
+    expect(screen.getByText("1.0 KB")).toBeInTheDocument();
+  });
+
+  it("uploads a driver with the full payload and closes the modal on success", async () => {
+    mockCreateDriver.mutateAsync.mockResolvedValue({ id: "new-driver" });
+    render(<DriversPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload Driver" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "New Driver" } });
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "a description" },
+    });
+    fireEvent.change(screen.getByLabelText("Connection Type"), {
+      target: { value: "Hypervisor" },
+    });
+    const file = new File(["zip bytes"], "new.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByLabelText("File (.zip or .tar.gz)"), {
+      target: { files: [file] },
+    });
+
+    const uploadDialog = document.querySelectorAll("dialog")[0];
+    const submitBtn = Array.from(uploadDialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Upload"
+    )!;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => expect(mockCreateDriver.mutateAsync).toHaveBeenCalled());
+    expect(mockCreateDriver.mutateAsync).toHaveBeenCalledWith({
+      name: "New Driver",
+      description: "a description",
+      connection_type: "Hypervisor",
+      file,
+    });
+    expect(mockToastSuccess).toHaveBeenCalledWith("Driver uploaded");
+    // The upload modal's fields reset (closeUploadModal's job); Name is
+    // gone from the DOM only if the dialog fully unmounts, so instead check
+    // the field cleared while remaining mounted.
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("");
+  });
+
+  it("omits the description field when it is left blank", async () => {
+    mockCreateDriver.mutateAsync.mockResolvedValue({ id: "new-driver" });
+    render(<DriversPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload Driver" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "New Driver" } });
+    fireEvent.change(screen.getByLabelText("Connection Type"), {
+      target: { value: "Management" },
+    });
+    const file = new File(["zip bytes"], "new.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByLabelText("File (.zip or .tar.gz)"), {
+      target: { files: [file] },
+    });
+    const uploadDialog = document.querySelectorAll("dialog")[0];
+    const submitBtn = Array.from(uploadDialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Upload"
+    )!;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => expect(mockCreateDriver.mutateAsync).toHaveBeenCalled());
+    expect(mockCreateDriver.mutateAsync.mock.calls[0][0].description).toBeUndefined();
+  });
+
+  it("surfaces the server detail message when upload fails", async () => {
+    mockCreateDriver.mutateAsync.mockRejectedValue({
+      response: { data: { detail: "duplicate driver name" } },
+    });
+    render(<DriversPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload Driver" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "New Driver" } });
+    fireEvent.change(screen.getByLabelText("Connection Type"), {
+      target: { value: "Management" },
+    });
+    fireEvent.change(screen.getByLabelText("File (.zip or .tar.gz)"), {
+      target: { files: [new File(["x"], "n.zip")] },
+    });
+    const uploadDialog = document.querySelectorAll("dialog")[0];
+    const submitBtn = Array.from(uploadDialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Upload"
+    )!;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("duplicate driver name"),
+    );
+  });
+
+  it("falls back to a generic message when the upload error has no detail", async () => {
+    mockCreateDriver.mutateAsync.mockRejectedValue(new Error("network down"));
+    render(<DriversPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Upload Driver" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "New Driver" } });
+    fireEvent.change(screen.getByLabelText("Connection Type"), {
+      target: { value: "Management" },
+    });
+    fireEvent.change(screen.getByLabelText("File (.zip or .tar.gz)"), {
+      target: { files: [new File(["x"], "n.zip")] },
+    });
+    const uploadDialog = document.querySelectorAll("dialog")[0];
+    const submitBtn = Array.from(uploadDialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Upload"
+    )!;
+    fireEvent.click(submitBtn);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("Failed to upload driver"),
+    );
+  });
+
+  it("cancel closes the upload modal without submitting", () => {
+    render(<DriversPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Upload Driver" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "abandoned" } });
+
+    const uploadDialog = document.querySelectorAll("dialog")[0];
+    const cancelBtn = Array.from(uploadDialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Cancel"
+    )!;
+    fireEvent.click(cancelBtn);
+
+    expect(mockCreateDriver.mutateAsync).not.toHaveBeenCalled();
+    // Reopening shows the reset form, not the abandoned value.
+    fireEvent.click(screen.getByRole("button", { name: "Upload Driver" }));
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("");
+  });
+
+  describe("delete flow", () => {
+    it("deletes the driver and toasts success", async () => {
+      mockDeleteDriver.mutateAsync.mockResolvedValue(undefined);
+      render(<DriversPage />);
+      fireEvent.click(screen.getAllByText("Delete")[0]);
+
+      const confirmDialog = document.querySelectorAll("dialog")[2];
+      const confirmBtn = Array.from(confirmDialog.querySelectorAll("button")).find(
+        (b) => b.textContent === "Delete"
+      )!;
+      fireEvent.click(confirmBtn);
+
+      await waitFor(() => expect(mockDeleteDriver.mutateAsync).toHaveBeenCalledWith("d1"));
+      expect(mockToastSuccess).toHaveBeenCalledWith("Driver deleted");
+    });
+
+    it("surfaces the server detail message when delete fails", async () => {
+      mockDeleteDriver.mutateAsync.mockRejectedValue({
+        response: { data: { detail: "referenced by a template" } },
+      });
+      render(<DriversPage />);
+      fireEvent.click(screen.getAllByText("Delete")[0]);
+
+      const confirmDialog = document.querySelectorAll("dialog")[2];
+      const confirmBtn = Array.from(confirmDialog.querySelectorAll("button")).find(
+        (b) => b.textContent === "Delete"
+      )!;
+      fireEvent.click(confirmBtn);
+
+      await waitFor(() =>
+        expect(mockToastError).toHaveBeenCalledWith("referenced by a template"),
+      );
+    });
+
+    it("cancelling the delete confirmation issues no delete call", () => {
+      render(<DriversPage />);
+      fireEvent.click(screen.getAllByText("Delete")[0]);
+
+      const confirmDialog = document.querySelectorAll("dialog")[2];
+      const cancelBtn = Array.from(confirmDialog.querySelectorAll("button")).find(
+        (b) => b.textContent === "Cancel"
+      )!;
+      fireEvent.click(cancelBtn);
+
+      expect(mockDeleteDriver.mutateAsync).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("download flow", () => {
+    it("downloads a driver by creating and clicking an object URL anchor", async () => {
+      const blob = new Blob(["zip bytes"], { type: "application/zip" });
+      mockDownloadDriver.mutateAsync.mockResolvedValue(blob);
+      const createObjectURL = vi.fn(() => "blob:mock-url");
+      const revokeObjectURL = vi.fn();
+      vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+
+      const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+      render(<DriversPage />);
+      fireEvent.click(screen.getAllByText("Download")[0]);
+
+      await waitFor(() => expect(mockDownloadDriver.mutateAsync).toHaveBeenCalledWith("d1"));
+      expect(createObjectURL).toHaveBeenCalledWith(blob);
+      expect(clickSpy).toHaveBeenCalled();
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
+
+      clickSpy.mockRestore();
+      vi.unstubAllGlobals();
+    });
+
+    it("toasts an error when the download fails", async () => {
+      mockDownloadDriver.mutateAsync.mockRejectedValue(new Error("boom"));
+      render(<DriversPage />);
+      fireEvent.click(screen.getAllByText("Download")[0]);
+
+      await waitFor(() =>
+        expect(mockToastError).toHaveBeenCalledWith("Failed to download driver"),
+      );
+    });
   });
 });

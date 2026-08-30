@@ -123,4 +123,34 @@ describe("drivers api hooks", () => {
     expect(typeof result.current.mutate).toBe("function");
     expect(result.current.isPending).toBe(false);
   });
+
+  it("useDriver fetches a single driver by id", async () => {
+    server.use(
+      http.get("/api/inventory/drivers/d1", () => HttpResponse.json(DRV)),
+    );
+    const { result } = renderHook(() => useDriver("d1"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual(DRV);
+  });
+
+  it("useCreateDriver omits the description field when none is given", async () => {
+    let hasDescriptionField = true;
+    server.use(
+      http.post("/api/inventory/drivers", async ({ request }) => {
+        const body = await request.formData();
+        hasDescriptionField = body.has("description");
+        return HttpResponse.json(DRV);
+      }),
+    );
+    const { result } = renderHook(() => useCreateDriver(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({
+        name: "Junos",
+        connection_type: "Management",
+        file: new File(["x"], "j.zip", { type: "application/zip" }),
+      });
+    });
+    expect(hasDescriptionField).toBe(false);
+  });
+
 });

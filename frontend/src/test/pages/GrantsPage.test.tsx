@@ -286,4 +286,142 @@ describe("GrantsPage", () => {
 
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("grant not found"));
   });
+
+  it("blocks create with a validation toast when the resource id is left blank", async () => {
+    server.use(grantsHandler([]));
+    renderWithProviders(<GrantsPage />);
+    await waitFor(() => expect(screen.getByText("No grants found")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Grant" }));
+    const dialog = screen.getByRole("dialog", { name: "Create Grant" });
+    const form = within(dialog);
+    fireEvent.change(form.getByLabelText("Group"), { target: { value: "grp-1" } });
+    fireEvent.click(form.getByRole("button", { name: "Create" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Resource ID is required"),
+    );
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it("cancel closes the create modal without submitting", async () => {
+    server.use(grantsHandler([]));
+    renderWithProviders(<GrantsPage />);
+    await waitFor(() => expect(screen.getByText("No grants found")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Grant" }));
+    const dialog = screen.getByRole("dialog", { name: "Create Grant" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog", { name: "Create Grant" })).not.toBeInTheDocument();
+    expect(toastSuccess).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("cancelling the delete confirm dialog issues no delete call", async () => {
+    let deleteCalled = false;
+    server.use(
+      grantsHandler([GRANT]),
+      http.delete("/api/acl/grants/grant-1", () => {
+        deleteCalled = true;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderWithProviders(<GrantsPage />);
+    const table = await screen.findByRole("table");
+    await within(table).findByText("Network Team");
+
+    fireEvent.click(clickRowDelete());
+    const confirm = within(screen.getByRole("dialog", { name: /Delete Grant/i }));
+    fireEvent.click(confirm.getByRole("button", { name: "Cancel" }));
+
+    expect(deleteCalled).toBe(false);
+  });
+
+  describe("filters", () => {
+    it("filters by group, then resource type, and resets to the first page on each change", async () => {
+      const requests: { group_id: string | null; resource_type: string | null; skip: string | null }[] = [];
+      server.use(
+        http.get("/api/acl/grants", ({ request }) => {
+          const url = new URL(request.url);
+          requests.push({
+            group_id: url.searchParams.get("group_id"),
+            resource_type: url.searchParams.get("resource_type"),
+            skip: url.searchParams.get("skip"),
+          });
+          return HttpResponse.json({ items: [GRANT], total: 1, skip: 0, limit: 50 });
+        }),
+      );
+      renderWithProviders(<GrantsPage />);
+      await waitFor(() => expect(requests.length).toBeGreaterThan(0));
+
+      // The create modal (closed, but always mounted) has its own "Group"
+      // and "Resource Type" labels, so getByLabelText would find two matches;
+      // the filter controls have distinct ids to select by instead.
+      const filterGroup = document.getElementById("grant-filter-group") as HTMLSelectElement;
+      const filterResourceType = document.getElementById(
+        "grant-filter-resource-type",
+      ) as HTMLSelectElement;
+
+      fireEvent.change(filterGroup, { target: { value: "grp-2" } });
+      await waitFor(() =>
+        expect(requests[requests.length - 1]).toEqual({
+          group_id: "grp-2",
+          resource_type: null,
+          skip: "0",
+        }),
+      );
+
+      fireEvent.change(filterResourceType, { target: { value: "topology" } });
+      await waitFor(() =>
+        expect(requests[requests.length - 1]).toEqual({
+          group_id: "grp-2",
+          resource_type: "topology",
+          skip: "0",
+        }),
+      );
+    });
+
+    it("ignores a partial resource-id filter as unparseable, then applies it once it is a full uuid", async () => {
+      const requests: (string | null)[] = [];
+      server.use(
+        http.get("/api/acl/grants", ({ request }) => {
+          requests.push(new URL(request.url).searchParams.get("resource_id"));
+          return HttpResponse.json({ items: [GRANT], total: 1, skip: 0, limit: 50 });
+        }),
+      );
+      renderWithProviders(<GrantsPage />);
+      await waitFor(() => expect(requests.length).toBeGreaterThan(0));
+
+      const filterResourceId = document.getElementById(
+        "grant-filter-resource-id",
+      ) as HTMLInputElement;
+
+      fireEvent.change(filterResourceId, { target: { value: "not-a-full-uuid" } });
+      await waitFor(() => expect(requests[requests.length - 1]).toBeNull());
+
+      fireEvent.change(filterResourceId, {
+        target: { value: "11111111-1111-1111-1111-111111111111" },
+      });
+      await waitFor(() =>
+        expect(requests[requests.length - 1]).toBe("11111111-1111-1111-1111-111111111111"),
+      );
+    });
+
+    it("shows Clear filters only once a filter is active, and clearing resets every field", async () => {
+      server.use(grantsHandler([GRANT]));
+      renderWithProviders(<GrantsPage />);
+      await waitFor(() => expect(screen.getByRole("table")).toBeInTheDocument());
+
+      expect(screen.queryByRole("button", { name: "Clear filters" })).not.toBeInTheDocument();
+
+      const filterGroup = document.getElementById("grant-filter-group") as HTMLSelectElement;
+      fireEvent.change(filterGroup, { target: { value: "grp-1" } });
+      const clearBtn = await screen.findByRole("button", { name: "Clear filters" });
+      fireEvent.click(clearBtn);
+
+      expect(screen.queryByRole("button", { name: "Clear filters" })).not.toBeInTheDocument();
+      expect(filterGroup.value).toBe("");
+    });
+  });
 });
