@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-30
+
+- Shipped LDAP directory group sync end to end (ADR 0011): a directory group
+  client and mapping store, a fail-closed reconciler with an asymmetric skip
+  taxonomy, a deactivation/reactivation sweep, an interval sync loop, and an
+  admin UI at `/admin/ldap-sync`, plus a checked-in LDAP test gate and live
+  Postgres/LDAP coverage wired into `make master` and `make everything`.
+- Added fork version preview, diff, and restore to the reservation topology
+  editor: a read-only ghosted preview of any saved version, a client-side diff
+  against another version or the current draft, and restore-to-draft that
+  stages a version's canvas for the next Commit rather than reconciling
+  directly.
+- Introduced network element objects (ADR 0012, issue #22): a persistent,
+  non-device canvas node that many device ports can attach to for a shared
+  VLAN segment, subnet, external cloud, or patch-panel trunk, with backend
+  validation and fork-save handling, a frontend palette and attach dialog, and
+  a live Playwright suite; provisioning is deferred to a later anchored-VLAN
+  phase.
+- Added a seeded end-to-end test pass (issue #629) so a device-gated Playwright
+  test can no longer silently skip behind a green gate: `make test-e2e-seeded`
+  runs after the gate stack is seeded, in both `make everything` and nightly,
+  and fails the run on any unexpected skip.
+- Hardened JetStream for production: `make prod` now persists stream data
+  across container recreates via a mounted volume, with a shared add-or-update
+  stream helper and a configurable retention cap; dev and gate stacks keep
+  starting every stream empty by design.
+- Migrated the AI orchestrator to the anthropic 1.x SDK and made service
+  images lock-faithful: every backend Dockerfile now installs from the
+  workspace `uv.lock` export instead of resolving dependencies fresh, with a
+  new CI check that diffs an image's installed packages against the lock.
+- Consolidated recurring backend patterns into `herd_common`: pagination,
+  database setup, CORS, internal-service calls with TTL caching, and more,
+  removing duplicated code across most of the 12 services with no behavior
+  change.
+- Shipped a multi-port wiring dialog and a matching admin multi-connect
+  dialog, both backed by a new bulk connection-create endpoint, and fixed
+  same-device ("loopback") 1:1 pairing in the admin dialog.
+- Closed two reconcile edge cases left from the ADR 0009 epic: record-time L2
+  supersession settles a stale cross-reservation row on frozen wiring instead
+  of leaking its VLAN allocation, and stale-intent revalidation widens
+  release-direction reconcile against failed-but-still-intended rows without
+  weakening build-direction rebuild.
+
 ### Delivery detail
 
 #### AI orchestrator
@@ -270,6 +313,12 @@
   migration path if a second consumer of secrets ever appears.
 
 #### Frontend
+
+- Inventory page Next-click revert (PR #662, nightly run 33300868733): the
+  search-debounce effect armed a 300ms `setSkip(0)` timer on every mount, so a
+  Next click inside that window was silently reverted to page 1. The effect now
+  returns early when the input already matches the applied search; a
+  fake-timer vitest pins the race and the seeded e2e pass exercises it live.
 
 - Multi-port wiring dialog (issue #517, PR #530): drawing a line between two device
   nodes on the topology canvas opens `WiringDialog.tsx` (port columns via
@@ -719,6 +768,35 @@
   the canvas or the Equipment Browser
   (`test_wiring_dialog_playwright.py`, `test_connections_bulk_playwright.py`,
   `test_fork_live_edit.py -k _pw`, `test_tier2_playwright.py`), all green.
+
+#### Test coverage
+
+- Coverage batch (2026-08-30, PRs #650 through #660): backend workspace line
+  coverage stood at 94.76% before this batch (secrets 80.8%, integration
+  82.3%, the two lowest services); frontend stood at 73.75% lines with seven
+  pages at 0%. After the batch: backend 97.07% lines with every service at 94% or above (secrets 98.3%, integration 97.3%), frontend 89.7% lines with 1,210 tests (was 879), and no file added since v0.2.0 below 85%.
+  - Backend: secrets routers to 100% (PR #650); acl's grants router plus a
+    root-level unit test for `scripts/check_image_matches_lock.py` (PR #651);
+    integration's `nats_consumer` and `webhooks` to 100% (PR #653); cabling's
+    forks routes and `fork_save_service` to 100% (PR #654); auth's
+    `ldap_sync`, admin, and tokens routers to 100% (PR #656); execution's
+    `nats_consumer` 90% to 95%, `wiring_retry_service` and
+    `l1_assignment_service` to 100% (PR #659).
+  - Frontend: admin group, device-group, users, and add-device pages 0% to
+    95-100% (PR #652); the topology editor page 60% to 96%, `AppLayout` to
+    100%, plus the reporting and reservations pages, alongside a new vitest
+    coverage config that switches to include-based reporting so an untested
+    file surfaces at 0% instead of being omitted from the report (PR #658);
+    topology and template pages plus `FieldRow`, a 32% lane average to 96%
+    (PR #660); the inventory, connections, drivers, recipes, and grants pages
+    (PR #655).
+  - Most of the backend router gaps were not missing behavior but a
+    coverage.py artifact: post-await lines under-attributed behind httpx's
+    `ASGITransport`, closed with direct handler-call tests in the existing
+    `test_routers_direct.py` convention rather than new HTTP-layer tests.
+    A minority were genuine gaps and got real behavior tests instead:
+    cabling's prune paths, execution's race branches, and `AppLayout`'s
+    dropdown-close behavior.
 
 ## [0.2.0] - 2026-08-03
 
