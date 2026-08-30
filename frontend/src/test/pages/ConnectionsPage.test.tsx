@@ -218,4 +218,231 @@ describe("ConnectionsPage", () => {
       expect(toastError).toHaveBeenCalledWith("connection in use"),
     );
   });
+
+  describe("single-pair create form", () => {
+    async function openSingleForm() {
+      renderWithProviders(<ConnectionsPage />);
+      // Wait for the initial connections query to settle before interacting,
+      // regardless of whether the list ends up empty or populated.
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Create Connection" })).toBeInTheDocument(),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Single" }));
+      fireEvent.click(screen.getByRole("button", { name: "Create Connection" }));
+    }
+
+    function searchAndPickDevice(searchLabelIndex: 0 | 1, query: string, pick: string) {
+      const searchInputs = screen.getAllByPlaceholderText("Search devices...");
+      fireEvent.change(searchInputs[searchLabelIndex], { target: { value: query } });
+      return waitFor(() => screen.getByRole("button", { name: pick }));
+    }
+
+    // Neither Port A/B <select> nor Connection Type/Notes are wired to their
+    // <label> via htmlFor/id (a pre-existing gap, not something this lane
+    // fixes), so getByLabelText cannot find them; grab the create dialog's
+    // form controls by tag/position instead.
+    function createDialog() {
+      return screen.getByRole("dialog", { name: "Create Connection", hidden: true });
+    }
+    function portASelect() {
+      return createDialog().querySelectorAll("select")[0] as HTMLSelectElement;
+    }
+    function portBSelect() {
+      return createDialog().querySelectorAll("select")[1] as HTMLSelectElement;
+    }
+    function connectionTypeInput() {
+      return createDialog().querySelector('input[type="text"]') as HTMLInputElement;
+    }
+    function notesTextarea() {
+      return createDialog().querySelector("textarea") as HTMLTextAreaElement;
+    }
+
+    it("blocks create at each successive missing field, in order", async () => {
+      server.use(connectionsHandler([]));
+      await openSingleForm();
+
+      const submit = () => fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+      // Device A picked, Port A still missing.
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          const search = new URL(request.url).searchParams.get("search");
+          if (search === "spine") {
+            return HttpResponse.json({ items: DEVICES.slice(0, 1), total: 1, skip: 0, limit: 20 });
+          }
+          return HttpResponse.json({ items: DEVICES, total: 2, skip: 0, limit: 500 });
+        }),
+        http.get("/api/inventory/devices/dev-a/ports", () => HttpResponse.json([])),
+      );
+      const pickBtn = await searchAndPickDevice(0, "spine", "spine-1");
+      fireEvent.click(pickBtn);
+      submit();
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith("Port A is required"));
+    });
+
+    it("shows a no-ports hint when the selected device has no ports configured", async () => {
+      server.use(
+        connectionsHandler([]),
+        http.get("/api/inventory/devices/dev-a/ports", () => HttpResponse.json([])),
+      );
+      await openSingleForm();
+      const pickBtn = await searchAndPickDevice(0, "sp", "spine-1");
+      fireEvent.click(pickBtn);
+
+      await waitFor(() =>
+        expect(screen.getByText("No ports configured on this device")).toBeInTheDocument(),
+      );
+    });
+
+    it("creates a connection with the full payload and closes the modal", async () => {
+      let captured: unknown = null;
+      server.use(
+        connectionsHandler([]),
+        http.get("/api/inventory/devices/dev-a/ports", () =>
+          HttpResponse.json([{ id: "pa1", name: "eth1/1", device_id: "dev-a", template_id: "t", template_name: null, template_icon: null, field_data: {}, created_at: "", updated_at: "" }]),
+        ),
+        http.get("/api/inventory/devices/dev-b/ports", () =>
+          HttpResponse.json([{ id: "pb1", name: "eth2/1", device_id: "dev-b", template_id: "t", template_name: null, template_icon: null, field_data: {}, created_at: "", updated_at: "" }]),
+        ),
+        http.post("/api/cabling/connections", async ({ request }) => {
+          captured = await request.json();
+          return HttpResponse.json(CONNECTION, { status: 201 });
+        }),
+      );
+      await openSingleForm();
+
+      const pickA = await searchAndPickDevice(0, "sp", "spine-1");
+      fireEvent.click(pickA);
+      await waitFor(() => expect(screen.getByText("spine-1")).toBeInTheDocument());
+      const pickB = await searchAndPickDevice(0, "le", "leaf-2");
+      fireEvent.click(pickB);
+
+      await waitFor(() => expect(portASelect().querySelectorAll("option")).toHaveLength(2));
+      fireEvent.change(portASelect(), { target: { value: "eth1/1" } });
+      fireEvent.change(portBSelect(), { target: { value: "eth2/1" } });
+      fireEvent.change(connectionTypeInput(), { target: { value: "fiber" } });
+      fireEvent.change(notesTextarea(), { target: { value: "core uplink" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Connection created"));
+      expect(captured).toEqual({
+        device_a_id: "dev-a",
+        port_a: "eth1/1",
+        device_b_id: "dev-b",
+        port_b: "eth2/1",
+        connection_type: "fiber",
+        notes: "core uplink",
+      });
+      // The modal closed: its fields are gone from the document.
+      expect(screen.queryByRole("dialog", { name: "Create Connection", hidden: true })).toBe(null);
+    });
+
+    it("surfaces the server detail message when create fails", async () => {
+      server.use(
+        connectionsHandler([]),
+        http.get("/api/inventory/devices/dev-a/ports", () =>
+          HttpResponse.json([{ id: "pa1", name: "eth1/1", device_id: "dev-a", template_id: "t", template_name: null, template_icon: null, field_data: {}, created_at: "", updated_at: "" }]),
+        ),
+        http.get("/api/inventory/devices/dev-b/ports", () =>
+          HttpResponse.json([{ id: "pb1", name: "eth2/1", device_id: "dev-b", template_id: "t", template_name: null, template_icon: null, field_data: {}, created_at: "", updated_at: "" }]),
+        ),
+        http.post("/api/cabling/connections", () =>
+          HttpResponse.json({ detail: "port already cabled" }, { status: 409 }),
+        ),
+      );
+      await openSingleForm();
+
+      const pickA = await searchAndPickDevice(0, "sp", "spine-1");
+      fireEvent.click(pickA);
+      const pickB = await searchAndPickDevice(0, "le", "leaf-2");
+      fireEvent.click(pickB);
+      await waitFor(() => expect(portASelect().querySelectorAll("option")).toHaveLength(2));
+      fireEvent.change(portASelect(), { target: { value: "eth1/1" } });
+      fireEvent.change(portBSelect(), { target: { value: "eth2/1" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith("port already cabled"),
+      );
+    });
+
+    it("the Change button clears a selected device and its port", async () => {
+      server.use(
+        connectionsHandler([]),
+        http.get("/api/inventory/devices/dev-a/ports", () =>
+          HttpResponse.json([{ id: "pa1", name: "eth1/1", device_id: "dev-a", template_id: "t", template_name: null, template_icon: null, field_data: {}, created_at: "", updated_at: "" }]),
+        ),
+      );
+      await openSingleForm();
+      const pickA = await searchAndPickDevice(0, "sp", "spine-1");
+      fireEvent.click(pickA);
+      await waitFor(() => expect(screen.getByText("spine-1")).toBeInTheDocument());
+
+      fireEvent.click(screen.getByRole("button", { name: "Change" }));
+      expect(screen.queryByText("spine-1")).not.toBeInTheDocument();
+      expect(screen.getAllByPlaceholderText("Search devices...")).toHaveLength(2);
+    });
+
+    it("cancel closes the modal and resets the form fields", async () => {
+      server.use(connectionsHandler([]));
+      await openSingleForm();
+
+      fireEvent.change(notesTextarea(), { target: { value: "scratch note" } });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("dialog", { name: "Create Connection", hidden: true })).toBe(null);
+
+      // Reopening shows the form reset, not the stale note.
+      fireEvent.click(screen.getByRole("button", { name: "Create Connection" }));
+      expect(notesTextarea()).toHaveValue("");
+    });
+  });
+
+  describe("device filter", () => {
+    it("filters the connection list by the selected device and can be cleared", async () => {
+      const requestedDeviceIds: (string | null)[] = [];
+      server.use(
+        http.get("/api/cabling/connections", ({ request }) => {
+          requestedDeviceIds.push(new URL(request.url).searchParams.get("device_id"));
+          return HttpResponse.json({ items: [CONNECTION], total: 1, skip: 0, limit: 50 });
+        }),
+      );
+      renderWithProviders(<ConnectionsPage />);
+      await screen.findByText("spine-1");
+
+      fireEvent.change(screen.getByPlaceholderText("Filter by device name..."), {
+        target: { value: "spine" },
+      });
+      const option = await screen.findByRole("button", { name: "spine-1" });
+      fireEvent.click(option);
+
+      await waitFor(() =>
+        expect(requestedDeviceIds).toContain("dev-a"),
+      );
+      // The filter input now shows the selected device's name and a Clear button.
+      expect(screen.getByDisplayValue("spine-1")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+      await waitFor(() =>
+        expect(requestedDeviceIds[requestedDeviceIds.length - 1]).toBeNull(),
+      );
+    });
+
+    it("typing over an active filter clears it before applying the new search text", async () => {
+      server.use(connectionsHandler([CONNECTION]));
+      renderWithProviders(<ConnectionsPage />);
+      await screen.findByText("spine-1");
+
+      const filterInput = screen.getByPlaceholderText("Filter by device name...");
+      fireEvent.change(filterInput, { target: { value: "spine" } });
+      const option = await screen.findByRole("button", { name: "spine-1" });
+      fireEvent.click(option);
+      expect(screen.getByDisplayValue("spine-1")).toBeInTheDocument();
+
+      // Typing again while a filter is active clears filterDeviceId first
+      // (the onChange branch at the top of the input handler).
+      fireEvent.change(screen.getByDisplayValue("spine-1"), { target: { value: "leaf" } });
+      expect(screen.queryByRole("button", { name: "Clear" })).not.toBeInTheDocument();
+    });
+  });
+
 });

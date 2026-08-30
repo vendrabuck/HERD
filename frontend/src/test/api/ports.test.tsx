@@ -9,6 +9,7 @@ import {
   usePorts,
   useCreatePort,
   useUpdatePort,
+  useCreatePortsBulk,
   useDeletePort,
 } from "@/api/ports";
 
@@ -94,5 +95,34 @@ describe("ports api hooks", () => {
       await result.current.mutateAsync("p1");
     });
     expect(capturedUrl).toMatch(/\/api\/inventory\/ports\/p1$/);
+  });
+
+  it("useCreatePortsBulk POSTs the bulk body to the device's ports/bulk endpoint", async () => {
+    let capturedUrl = "";
+    let capturedBody: unknown = null;
+    server.use(
+      http.post("/api/inventory/devices/d1/ports/bulk", async ({ request }) => {
+        capturedUrl = request.url;
+        capturedBody = await request.json();
+        return HttpResponse.json([PORT, { ...PORT, id: "p2", name: "eth1" }]);
+      }),
+    );
+    const { result } = renderHook(() => useCreatePortsBulk(), { wrapper });
+    let created: unknown;
+    await act(async () => {
+      created = await result.current.mutateAsync({
+        deviceId: "d1",
+        data: { name_prefix: "eth", starting_index: 0, instances: 2, template_id: "pt1", field_data: {} },
+      });
+    });
+    expect(capturedUrl).toMatch(/\/devices\/d1\/ports\/bulk$/);
+    expect(capturedBody).toEqual({
+      name_prefix: "eth",
+      starting_index: 0,
+      instances: 2,
+      template_id: "pt1",
+      field_data: {},
+    });
+    expect(created).toHaveLength(2);
   });
 });

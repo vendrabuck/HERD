@@ -190,4 +190,139 @@ describe("RecipeDraftPanel", () => {
       expect(mockToastError).toHaveBeenCalledWith("AI recipe authoring is disabled"),
     );
   });
+
+  it("shows a no-report message when the draft carries no validation report", async () => {
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    await draftInPanel(draftResponse({ validation: null as never }));
+    expect(
+      await screen.findByText("No validation report is attached to this draft."),
+    ).toBeInTheDocument();
+  });
+
+  it("requires feedback text before refining", async () => {
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    await draftInPanel(draftResponse());
+    fireEvent.click(await screen.findByRole("button", { name: "Refine", hidden: true }));
+    expect(mockToastError).toHaveBeenCalledWith("Describe what to change first");
+    expect(mockRefineMutate).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the backend detail when refining fails", async () => {
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    await draftInPanel(draftResponse());
+    mockRefineMutate.mockRejectedValue({
+      response: { data: { detail: "refine limit reached" } },
+    });
+    fireEvent.change(await screen.findByLabelText("Request changes"), {
+      target: { value: "add a retry" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refine", hidden: true }));
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("refine limit reached"),
+    );
+  });
+
+  it("requires a driver name before approving", async () => {
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    await draftInPanel(draftResponse({ driver_metadata: { name: "", version: "0.1.0" } }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve and upload", hidden: true }));
+    expect(mockToastError).toHaveBeenCalledWith("Name is required");
+    expect(mockCreateDriver.mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the backend detail when the approve upload fails", async () => {
+    mockCreateDriver.mutateAsync.mockRejectedValue({
+      response: { data: { detail: "driver name already exists" } },
+    });
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    await draftInPanel(draftResponse());
+    fireEvent.click(await screen.findByRole("button", { name: "Approve and upload", hidden: true }));
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("driver name already exists"),
+    );
+  });
+
+  it("closing the panel resets prompt, draft, and upload fields", async () => {
+    const onClose = vi.fn();
+    mockCreateDriver.mutateAsync.mockResolvedValue({});
+    render(<RecipeDraftPanel open onClose={onClose} />);
+    await draftInPanel(draftResponse());
+
+    fireEvent.click(await screen.findByRole("button", { name: "Approve and upload", hidden: true }));
+    await waitFor(() => expect(mockToastSuccess).toHaveBeenCalledWith("Recipe uploaded as a driver"));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("renders FAILED for a failed dry-run method, with its error and transcript", async () => {
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    await draftInPanel(
+      draftResponse({
+        validation: {
+          valid: false,
+          structural: { passed: true, errors: [] },
+          policy: { passed: true, errors: [] },
+          schema: { present: false, schema: null, error: null },
+          dry_run: {
+            passed: false,
+            error: null,
+            methods: [
+              {
+                action: "create_instance",
+                passed: false,
+                success: false,
+                output: null,
+                error: "connection refused",
+                duration_ms: 12,
+                transcript: [{ step: "connect", detail: "refused" }],
+              },
+            ],
+          },
+        },
+      }),
+    );
+    expect(await screen.findByText(/create_instance/)).toBeInTheDocument();
+    expect(screen.getByText(/FAILED/)).toBeInTheDocument();
+    expect(screen.getByText(/connection refused/)).toBeInTheDocument();
+    // The transcript is inside a nested <details>; its JSON is present in the
+    // DOM even while collapsed.
+    expect(screen.getByText(/"step": "connect"/)).toBeInTheDocument();
+  });
+
+  it("downloads the generated package as a named zip file", async () => {
+    const createObjectURL = vi.fn((_file: File) => "blob:mock-url");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    await draftInPanel(draftResponse());
+
+    fireEvent.click(await screen.findByRole("button", { name: "Download package", hidden: true }));
+
+    expect(createObjectURL).toHaveBeenCalled();
+    const uploadedFile = createObjectURL.mock.calls[0][0] as File;
+    expect(uploadedFile.name).toBe("proxmox-clone.zip");
+    expect(clickSpy).toHaveBeenCalled();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
+
+    clickSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("downloads using a fallback filename when no upload name was entered", async () => {
+    const createObjectURL = vi.fn((_file: File) => "blob:mock-url");
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    render(<RecipeDraftPanel open onClose={vi.fn()} />);
+    // driver_metadata.name is blank, so applyDraft never prefills uploadName.
+    await draftInPanel(draftResponse({ driver_metadata: { name: "", version: "0.1.0" } }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Download package", hidden: true }));
+    const uploadedFile = createObjectURL.mock.calls[0][0] as File;
+    expect(uploadedFile.name).toBe("generated-recipe.zip");
+
+    clickSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
 });
