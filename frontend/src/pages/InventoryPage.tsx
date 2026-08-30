@@ -223,6 +223,15 @@ export function InventoryPage() {
   };
 
   useEffect(() => {
+    // Skip entirely when the input already matches what is applied: this is
+    // true on every mount (debouncedSearch is seeded from storedSearch, and
+    // searchInput starts equal to it too), so without this guard the effect
+    // would still arm a 300ms timer that calls setSkip(0) unconditionally.
+    // That stray timer raced a same-page Next click in e2e (a click just
+    // after mount landed setSkip(50), then the leftover mount-timer fired
+    // setSkip(0) a moment later and silently reverted it); see nightly run
+    // 33300868733, test_inventory_pagination_next_advances_page.
+    if (searchInput === debouncedSearch) return;
     const timer = setTimeout(() => {
       setDebouncedSearch(searchInput);
       setSkip(0);
@@ -231,6 +240,10 @@ export function InventoryPage() {
       }
     }, 300);
     return () => clearTimeout(timer);
+    // debouncedSearch is intentionally excluded below: including it would
+    // re-run this effect (and re-arm the timer) every time the timer itself
+    // fires, since the timer's own setDebouncedSearch call changes it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchInput, userSearch, setSavedFilter]);
 
   const filters = debouncedSearch ? { search: debouncedSearch } : undefined;
