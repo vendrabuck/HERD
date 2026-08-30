@@ -8,12 +8,14 @@ import { server } from "../mocks/server";
 import {
   useGroup,
   useGroups,
+  usePaginatedGroups,
   useCreateGroup,
   useUpdateGroup,
   useDeleteGroup,
   useAddMember,
   useRemoveMember,
   useBulkAddMembers,
+  useBulkRemoveMembers,
 } from "@/api/groups";
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -136,5 +138,53 @@ describe("groups api hooks", () => {
       });
     });
     expect((captured as { user_ids: string[] }).user_ids).toEqual(["u1", "u2"]);
+  });
+
+  it("useBulkRemoveMembers POSTs to the bulk-remove path with a user_ids array", async () => {
+    let captured: unknown = null;
+    let capturedUrl = "";
+    server.use(
+      http.post("/api/auth/groups/g1/members/bulk-remove", async ({ request }) => {
+        captured = await request.json();
+        capturedUrl = request.url;
+        return HttpResponse.json({ removed: 1, not_found: 1 });
+      }),
+    );
+    const { result } = renderHook(() => useBulkRemoveMembers(), { wrapper });
+    let mutationResult: { removed: number; not_found: number } | undefined;
+    await act(async () => {
+      mutationResult = await result.current.mutateAsync({
+        groupId: "g1",
+        userIds: ["u1", "u2"],
+      });
+    });
+    expect((captured as { user_ids: string[] }).user_ids).toEqual(["u1", "u2"]);
+    expect(capturedUrl).toMatch(/members\/bulk-remove$/);
+    expect(mutationResult).toEqual({ removed: 1, not_found: 1 });
+  });
+
+  it("usePaginatedGroups passes skip and limit as query params", async () => {
+    let capturedParams: URLSearchParams | undefined;
+    server.use(
+      http.get("/api/auth/groups", ({ request }) => {
+        capturedParams = new URL(request.url).searchParams;
+        return HttpResponse.json({ items: [GROUP], total: 1, skip: 50, limit: 25 });
+      }),
+    );
+    const { result } = renderHook(() => usePaginatedGroups(50, 25), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(capturedParams?.get("skip")).toBe("50");
+    expect(capturedParams?.get("limit")).toBe("25");
+    expect(result.current.data).toEqual({ items: [GROUP], total: 1, skip: 50, limit: 25 });
+  });
+
+  it("useGroup fetches by id when one is provided", async () => {
+    const detail = { ...GROUP, members: [] };
+    server.use(
+      http.get("/api/auth/groups/g1", () => HttpResponse.json(detail)),
+    );
+    const { result } = renderHook(() => useGroup("g1"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual(detail);
   });
 });
