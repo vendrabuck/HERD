@@ -753,5 +753,45 @@ describe("InventoryPage", () => {
         search: "found",
       });
     });
+
+    it("does not revert a Next-page click made right after mount (nightly run 33300868733)", async () => {
+      // The search-debounce effect used to arm its 300ms setSkip(0) timer on
+      // EVERY mount, search unchanged or not. A Next click landing inside
+      // that window (setSkip(50)) was then silently clobbered when the
+      // leftover mount-timer fired setSkip(0) a moment later:
+      // tests/e2e/test_pagination.py::test_inventory_pagination_next_advances_page
+      // timed out on a seeded nightly stack this way. Fake timers hold the
+      // 300ms window open long enough to click Next before it elapses.
+      const requests: { skip: string | null }[] = [];
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          const url = new URL(request.url);
+          const skip = url.searchParams.get("skip");
+          requests.push({ skip });
+          return HttpResponse.json({
+            items: [makeDevice()],
+            total: 150,
+            skip: Number(skip ?? 0),
+            limit: 50,
+          });
+        }),
+      );
+
+      vi.useFakeTimers();
+      renderWithProviders(<InventoryPage />);
+      await vi.waitFor(() => expect(screen.getByText("fw-edge-01")).toBeInTheDocument());
+
+      // Click Next well inside the mount-effect's 300ms debounce window.
+      await vi.advanceTimersByTimeAsync(50);
+      fireEvent.click(screen.getByText("Next"));
+      await vi.waitFor(() => expect(requests.some((r) => r.skip === "50")).toBe(true));
+
+      // Now let the leftover mount-timer's deadline pass. It must not have
+      // scheduled a setSkip(0) that fires here and reverts the page.
+      await vi.advanceTimersByTimeAsync(300);
+      expect(requests[requests.length - 1]?.skip).toBe("50");
+      expect(screen.getByText("Page 2 of 3")).toBeInTheDocument();
+      vi.useRealTimers();
+    });
   });
 });
