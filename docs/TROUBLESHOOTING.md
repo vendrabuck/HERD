@@ -267,6 +267,38 @@ for a stack whose data you need, apply the missing migration by hand instead
 `alembic upgrade head`, matching the service's own chain). Production runs migrations, not
 `create_all`, so this does not apply to a `make prod` stack.
 
+## E2E / testing
+
+### An e2e test failed in a gate run and the output is gone
+
+`pytest tests/e2e/` prints its usual failure output, but a gate run (`make everything`,
+`make master`, or a standalone `make test-e2e`/`make test-e2e-seeded`) can end that
+session before you get a chance to read the scrollback, and `.pytest_cache/v/cache/lastfailed`
+records only the failing nodeid, nothing else.
+
+`tests/e2e/conftest.py` writes durable failure artifacts to disk for any e2e test that
+fails during its call phase, keyed by the test's sanitized nodeid, under
+`HERD_E2E_ARTIFACT_DIR` (default `<tempdir>/herd-e2e-artifacts`, e.g.
+`/tmp/herd-e2e-artifacts` on Linux; see `docs/ENV_VARS.md`). Each failing test gets its own
+subdirectory containing:
+
+- `screenshot.png`: full-page screenshot at the moment of failure.
+- `page.html`: the DOM at the moment of failure.
+- `console.log`: browser console messages (Playwright tests only reliably; Selenium's is
+  best-effort and may be empty if the driver doesn't support it).
+- `traceback.txt`: the pytest failure traceback.
+- `meta.txt`: the page URL and a UTC timestamp, plus any capture-step failures (e.g. a
+  screenshot that itself timed out).
+
+A rerun of the same test overwrites its directory rather than accumulating stale copies.
+Nothing is written for a passing test. The pytest output itself also gets an
+"e2e failure artifacts" section naming the directory and files written, and the end of
+run prints a summary block listing every artifact directory from that session (after the
+existing `HERD_E2E_REQUIRE_NO_SKIP` skip-gate report, when that gate is also active; see
+`Makefile`'s `_test-e2e-run` and `tests/e2e/conftest.py`). If artifacts are missing, check
+that `HERD_E2E_ARTIFACT_DIR` (or its default) points somewhere writable and wasn't cleaned
+up between the failing run and when you looked.
+
 ## Logs and where to look
 
 - **Global tail**: `make logs` (all containers).

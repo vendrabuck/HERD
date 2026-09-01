@@ -439,6 +439,7 @@ _test-e2e-run:
 	-docker compose --profile e2e rm -fsv selenium
 	docker compose --profile e2e up -d --force-recreate selenium
 	uv run playwright install chromium  # no-op once cached; on a fresh host, missing OS libs need: uv run playwright install --with-deps chromium (sudo)
+	@echo "e2e failure artifacts (if any) go to: $${HERD_E2E_ARTIFACT_DIR:-$${TMPDIR:-/tmp}/herd-e2e-artifacts}"
 	uv run pytest tests/e2e/ -v --tb=short
 
 test-e2e: _test-e2e-run  ## Run e2e tests, Selenium + Playwright (needs a running stack)
