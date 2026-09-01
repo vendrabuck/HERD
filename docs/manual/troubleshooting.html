@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html" class="active">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-2-0.html">Release 0.2.0</a>
+    <a href="release-0-3-0.html">Release 0.3.0</a>
   </nav>
 </header>
 
@@ -108,7 +108,7 @@
     <p class="sectitle">AI generation problems</p>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">There's no "Use AI" button</span></summary>
-      <div class="acc-body"><p>The feature is turned off on this deployment (no API key configured). Nothing you can do as a user &mdash; ask your admin if it should be enabled. (Admins: set the key and restart the AI service.)</p></div></details>
+      <div class="acc-body"><p>Two causes now: the provider is <b>not configured</b>, or it is configured but <b>cannot be constructed</b> (a bad base URL, an unreadable CA file, a key of the wrong shape). Nothing you can do as a user; ask your admin. Admins can tell the two apart with <code>GET /api/ai/status</code>: a broken-but-configured provider reports <code>enabled: false, degraded: true, reason: &lt;error class name&gt;</code>. The detail message never leaves the service, so check the ai-orchestrator logs for it. The status is cached for 30 seconds, so a fix can take that long to show.</p></div></details>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"Inventory shifted during generation"</span></summary>
       <div class="acc-body"><p>A device the AI wanted became unavailable between proposing and committing. Just <strong>regenerate</strong> &mdash; it'll plan against the current inventory.</p></div></details>
@@ -142,6 +142,9 @@
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Can't delete a driver</span></summary>
       <div class="acc-body"><p>A template still points at it &mdash; drivers are reference-counted. Remove or repoint the template first, then delete the driver.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Can't delete a device</span></summary>
+      <div class="acc-body"><p>A reservation still holds it. Deleting a device that any non-terminal reservation holds is refused with <code>device_in_use</code>, and the error names the reservation ids. Release or complete those reservations first, then delete. There is no force option.</p></div></details>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">A bulk import rejected some rows</span></summary>
       <div class="acc-body"><p>Read the per-row <b>reason</b> in the report &mdash; usually a reference that didn't resolve ("template not found by name"). Imports resolve references by <em>name</em>, so import <b>templates before devices</b> and <b>devices before topologies</b>. A reject never aborts the batch; fix the named rows and re-run. Always <b>dry-run</b> first to preview the whole thing.</p></div></details>

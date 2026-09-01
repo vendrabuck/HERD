@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Release 0.3.0</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+<style>
+  /* release-page only: the version identity strip */
+  .relmeta{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--gray-200);border:1px solid var(--gray-200);border-radius:var(--radius-lg);overflow:hidden;margin:26px 0 8px;}
+  .relmeta div{background:#fff;padding:14px 16px;}
+  .relmeta .k{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--gray-500);margin:0 0 4px;}
+  .relmeta .v{font-family:var(--font-mono);font-size:15px;color:var(--gray-900);margin:0;font-variant-numeric:tabular-nums;}
+  @media(max-width:680px){.relmeta{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="release-0-3-0.html" class="active">Release 0.3.0</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#what">What 0.3.0 is</a></li>
+      <li><a href="#highlights">What shipped</a></li>
+      <li><a href="#quality">Quality bar</a></li>
+      <li><a href="#boundaries">Known boundaries</a></li>
+      <li><a href="#manual">Reading the manual against this release</a></li>
+    </ul>
+    <p class="eyebrow">Shared reference</p>
+    <ul>
+      <li><a href="troubleshooting.html">Troubleshooting</a></li>
+      <li><a href="glossary.html">Glossary</a></li>
+      <li><a href="release-0-3-0.html" class="active">Release 0.3.0</a></li>
+      <li><a href="release-0-2-0.html">Release 0.2.0</a></li>
+      <li><a href="release-0-1-0.html">Release 0.1.0</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker shared">Shared reference</span>
+    <h1 class="title">Release 0.3.0</h1>
+    <p class="dek">The version this manual documents. 0.3.0 plugs HERD into the company directory, gives a reservation's fork a usable version history, lets the canvas model infrastructure that is not a device, and hardens the reconcile and production paths underneath.</p>
+
+    <div class="relmeta">
+      <div><p class="k">Version</p><p class="v">v0.3.0</p></div>
+      <div><p class="k">Released</p><p class="v">2026-08-30</p></div>
+      <div><p class="k">Tagged commit</p><p class="v">21a315f6</p></div>
+    </div>
+    <p class="shotcap">Source of record: the <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.3.0">v0.3.0 release notes</a> and <a href="https://github.com/vendrabuck/HERD/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg> Read this before you file a bug</div>
+      <p>Some of the things you might expect to find are not missing by accident. The <a href="#boundaries">Known boundaries</a> section below lists what 0.3.0 deliberately does not do yet. Check it first.</p>
+    </div>
+
+    <h2 class="sec" id="what">The short version</h2>
+    <p class="sectitle">What 0.3.0 is</p>
+    <p>0.2.0 finished the wiring-convergence story. 0.3.0 widens the platform around it: accounts and group membership can now mirror your LDAP or Active Directory, the live-editing fork gets preview, diff, and restore across its version history, and the topology canvas gains network element objects and true multi-port wiring. The reconcile pipeline closes the last stale-connection edge cases it had left.</p>
+    <p>Under the floor, production deployments keep their JetStream stream data across container recreates, and every service image now installs exactly what <code>uv.lock</code> pins, checked in CI against the lock itself.</p>
+
+    <h2 class="sec" id="highlights">The contents</h2>
+    <p class="sectitle">What shipped</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <div class="gcard" style="cursor:default;"><span class="num">01</span><h3>LDAP directory group sync</h3><p>ADR 0011, end to end: directory groups map to HERD groups, one to one. Sync now or on an interval, review each run's counts and per-item skips, and let a deactivation and reactivation sweep retire users the directory no longer lists, all on the new <b>Administration &rarr; LDAP Sync</b> page. <a href="admin-ldap-sync.html">LDAP sync &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">02</span><h3>Fork version preview, diff, and restore</h3><p>The live-editing history panel grows three verbs: preview any saved version read-only, diff two versions or a version against the current draft, and restore a version to the draft for the next Commit. Restore stages; it never reconciles by itself. <a href="user-live-editing.html#fork">Live editing &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">03</span><h3>Network element objects</h3><p>A non-device canvas node (VLAN segment, Subnet, External cloud, Patch trunk) that many device ports attach to, saved with the topology and validated on fork save. Model the shared segment once instead of faking it as a device mesh. <a href="user-topology.html#elements">Network elements &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">04</span><h3>Multi-port wiring</h3><p>The canvas wiring dialog and the admin multi-connect dialog stage many lines between two devices in one pass, with per-line L1/L2/L3 and <b>Connect 1:1 in order</b>, including same-device (loopback) pairing. <a href="user-topology.html#connect">Wiring &rarr;</a> <a href="admin-equipment.html#cabling">Cabling &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">05</span><h3>Stale wiring that cannot linger</h3><p>More failure paths that cannot eat wiring: a stale connection left by an ended reservation can no longer strand a VLAN allocation or dodge a rebuild. Leftover rows settle against frozen wiring, and both retry channels revalidate intent before driving anything.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">06</span><h3>Production durability</h3><p>Under <code>make prod</code>, JetStream stream data now survives container recreates on a mounted volume, and every service image installs exactly what <code>uv.lock</code> pins, so a built image can never drift from the lockfile unnoticed.</p></div>
+    </div>
+
+    <p class="sectitle" style="margin-top:34px;">Also in this release</p>
+    <ul class="list">
+      <li>Inventory table: a Rows per page selector (25, 50, 100, 200) that is remembered across sessions.</li>
+      <li>Deleting a device that any reservation still holds is refused with <code>device_in_use</code>; deleting a secret that a hypervisor references is refused with <code>secret_in_use</code>.</li>
+      <li>The Hypervisors page shows an amber "Deleted secret &lt;id&gt;" marker when a hypervisor's secret has been removed.</li>
+      <li><code>GET /api/ai/status</code> reports <code>degraded: true</code> with a <code>reason</code> when the AI provider is configured but cannot be constructed, so "no Use AI button" now has two explanations.</li>
+      <li>A seeded end-to-end pass in the release gate that fails on any unexpected skip, which is how the inventory Next-click bug below was found.</li>
+      <li>Fixed: clicking Next on the inventory page right after it loaded could snap back to page 1.</li>
+    </ul>
+
+    <p>The architecture is unchanged from 0.1.0: twelve FastAPI services behind Traefik, one PostgreSQL schema and migration chain per service, NATS JetStream with transactional outboxes for events. The <a href="release-0-1-0.html#architecture">0.1.0 architecture section</a> still describes it.</p>
+
+    <h2 class="sec" id="quality">What it was tested against</h2>
+    <p class="sectitle">Quality bar</p>
+    <p>Measured at the tagged commit by the full <code>make everything</code> run:</p>
+    <ul class="list">
+      <li>4,498 backend unit tests across the 13 suites plus the repo-root suite; backend line coverage 97.1% with every service at 94% or higher.</li>
+      <li>1,211 frontend tests via vitest, 89.7% line coverage.</li>
+      <li>12 OpenAPI contract snapshot suites.</li>
+      <li>192 cross-service integration tests (182 run, 10 gated on LDAP mode or an AI provider).</li>
+      <li>163 end-to-end browser tests, run twice: 124 on the unseeded stack and 159 again on the seeded stack with no unexpected skip allowed.</li>
+      <li>41 live-LDAP tests against the checked-in <code>infra/ldap-test</code> directory, hard-required in the gate.</li>
+      <li>Load: 20 simulated users for one minute, 691 requests, 0 failures, median 14 ms, p95 240 ms.</li>
+    </ul>
+    <p>The release gate is unchanged: a clean full validation run (lint, format check, every unit suite with coverage, frontend build, contract snapshots, integration, end-to-end, and load, against a rebuilt ephemeral stack) at the tagged commit, plus the same branch-protection ruleset on <code>main</code> described on the <a href="release-0-1-0.html#quality">0.1.0 page</a>. The ruleset also covers <code>release/*</code> branches.</p>
+
+    <h2 class="sec" id="boundaries">The honest part</h2>
+    <p class="sectitle">Known boundaries</p>
+    <p>These are limits of 0.3.0, not bugs. If you hit one, the answer is "not yet", not "file a ticket".</p>
+    <ul class="list">
+      <li><b>Network element provisioning (anchored VLANs) is a later phase.</b> Elements are canvas objects today: they attach, save, validate, and diff, but nothing is provisioned from them.</li>
+      <li><b>Manual wiring retry is not exposed through the external API.</b> The <code>/api/v1</code> wiring-status passthrough is deliberately read-only; retrying a failed connection is an interactive, owner-gated action.</li>
+      <li><b>A failed VLAN removal is logged, not blocked on.</b> If <code>delete_vlan</code> fails on last-free, the allocation is already released and the empty definition lingers on the switch until an operator removes it. Bounded lingering is the accepted trade.</li>
+      <li><b>AI recipe authoring is dark by default.</b> Unchanged from 0.1.0: it stays behind <code>AI_RECIPE_AUTHORING_ENABLED</code>.</li>
+      <li><b>Driver packages are trusted code.</b> Unchanged from 0.1.0: POSIX <code>setrlimit</code> caps and a subprocess boundary are resource bounding, not OS-level isolation.</li>
+    </ul>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><p>Some manual pages describe screens that only appear when a feature is configured, for example the <b>AI Assistant</b> tab, the <b>Use AI</b> button, and the <b>LDAP Sync</b> page's actions. On an install where the feature is off, those surfaces are hidden or inactive. That is the feature gate, not a broken deployment.</p></div>
+    </div>
+
+    <h2 class="sec" id="manual">Version and docs</h2>
+    <p class="sectitle">Reading the manual against this release</p>
+    <p>This manual is published from the repository and describes <b>0.3.0</b>. The <a href="release-0-2-0.html">0.2.0 page</a> remains as the record of the previous release, and links the 0.1.0 record in turn. If a screen in front of you does not match a page here, check your deployed version before assuming the page is wrong.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Full release notes, the tag, and the changelog live in the repository: <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.3.0">github.com/vendrabuck/HERD releases/tag/v0.3.0</a>.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Release 0.3.0</p>
+      <div class="pagenav">
+        <a href="release-0-2-0.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Release 0.2.0</a>
+        <a href="index.html">Home <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+</body>
+</html>

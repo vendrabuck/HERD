@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-2-0.html">Release 0.2.0</a>
+    <a href="release-0-3-0.html">Release 0.3.0</a>
   </nav>
 </header>
 
@@ -68,6 +68,51 @@
       <li><b>It has its own version history.</b> Every commit appends a fork version. The fork history panel lists them newest first, and each row offers <b>Preview</b> (a read-only render of that snapshot, with editing and Commit locked until you exit), <b>Diff</b> (against another version or your current draft, with added/removed devices and wires listed and highlighted on the canvas), and, while the reservation is <span class="badge active">ACTIVE</span>, <b>Restore</b>. Restoring copies that snapshot onto your draft: nothing is wired until you Commit, and Commit is what appends the version marked "restored".</li>
       <li><b>It outlives the reservation</b> &mdash; as a frozen, read-only <a href="#asbuilt">as-built record</a>.</li>
     </ul>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd"><div style="padding:20px;background:var(--gray-100);">
+            <div class="hd-card" style="max-width:520px;margin:0 auto;">
+              <div class="head">Fork history</div>
+              <div style="margin:10px 12px 0;padding:7px 10px;border:1px solid #fcd34d;background:#fffbeb;color:#92400e;font-size:12px;border-radius:6px;" data-anno="4" data-anno-pin="r" data-anno-arrow>Draft restored from version 2 (unsaved)</div>
+              <div style="display:flex;align-items:center;gap:8px;padding:11px 12px;border-bottom:1px solid var(--gray-100);font-size:13px;">
+                <span style="font-weight:600;color:var(--gray-900);white-space:nowrap;">Version 3</span>
+                <span style="color:var(--gray-400);font-size:12px;white-space:nowrap;">today 14:12</span>
+                <span style="flex:1"></span>
+                <span class="hd-btn secondary sm" data-anno="1" data-anno-pin="t" data-anno-arrow>Preview</span>
+                <span class="hd-btn secondary sm" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">Diff</span>
+                <span class="hd-btn secondary sm" data-anno="3" data-anno-pin="r" data-anno-arrow>Restore</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;padding:11px 12px;border-bottom:1px solid var(--gray-100);font-size:13px;">
+                <span style="font-weight:600;color:var(--gray-900);white-space:nowrap;">Version 2</span>
+                <span style="color:var(--gray-400);font-size:12px;white-space:nowrap;">today 11:03</span>
+                <span style="flex:1"></span>
+                <span class="hd-btn secondary sm">Preview</span>
+                <span class="hd-btn secondary sm">Diff</span>
+                <span class="hd-btn secondary sm">Restore</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;padding:11px 12px;font-size:13px;">
+                <span style="font-weight:600;color:var(--gray-900);white-space:nowrap;">Version 1</span>
+                <span style="color:var(--gray-400);font-size:12px;white-space:nowrap;">yesterday 16:41</span>
+                <span style="flex:1"></span>
+                <span class="hd-btn secondary sm">Preview</span>
+                <span class="hd-btn secondary sm">Diff</span>
+                <span class="hd-btn secondary sm">Restore</span>
+              </div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The fork history panel.</b> Every commit appends a version; each row can be previewed, diffed, or restored.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Preview.</b> A read-only, ghosted render of that snapshot on the canvas, with a "Previewing version N" banner and an Exit control. Editing, the wiring dialog, and Commit all lock while it is up.</li>
+      <li><b>Diff.</b> Compare against another version or your current draft: added and removed devices and wires list in the panel, and the affected edges highlight on the canvas.</li>
+      <li><b>Restore.</b> Copies that version's canvas onto your draft. Restore stages the draft; the next <b>Commit to reservation</b> is what applies it. Restore never reconciles by itself.</li>
+      <li><b>The amber chip.</b> A pending, unsaved restore. Commit to keep it, or keep editing on top of it.</li>
+    </ol>
 
     <h2 class="sec" id="changes">Read this if you used the old behavior</h2>
     <p class="sectitle">Two changes that will surprise you</p>
