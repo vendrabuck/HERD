@@ -3,7 +3,7 @@
 Tracking doc for test coverage not yet implemented. Shipped work lives under
 the usual service test directories; this file is the backlog.
 
-Last audit: 2026-05-04, refreshed 2026-08-16. When you close a gap, delete the
+Last audit: 2026-05-04, refreshed 2026-09-01. When you close a gap, delete the
 entry. When a new one surfaces, add it with a severity tag (CRITICAL, HIGH,
 MEDIUM, LOW) and a concrete target file path.
 
@@ -50,37 +50,78 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Frontend: pages and components
 
-**20 page test files exist today** (`ConfigPage`, `ConnectionsPage`,
-`DeviceGroupDetailPage`, `DevicePage`, `DriversPage`, `GrantsPage`, `HypervisorsPage`,
-`InventoryPage`, `LdapSyncPage`, `LoginPage`, `RegisterPage`, `ReportingPage`,
-`ReservationsPage`, `SettingsPage`, `TemplateEditorPage`, `TemplatesPage`, plus four
-TopologyEditorPage suites: `TopologyEditorForkMode`, `TopologyEditorDynamicPlaceholders`,
-`TopologyEditorNetworkElements`, and `TopologyEditorWiring`).
+**33 page test files exist today**, covering every page under `frontend/src/pages/`
+except `ReservationCalendarPage`. The 2026-08-30 coverage batch (PRs #650 to #660)
+added direct suites for the seven pages this register used to list as untested
+(`AddDevicePage`, `DeviceGroupsPage`, `GroupDetailPage`, `GroupsPage`, `UsersPage`,
+`TopologyPage`, `TopologyTemplatesPage`), plus three more `TopologyEditorPage`
+suites (`TopologyEditorPage.HistoryAndSave`, `TopologyEditorPage.ElementAttachAndDrop`,
+`TopologyEditorPage.AIProposal`) covering the base editor flows this register used
+to call out as missing: device drop, element attach, AI-proposal edge mapping,
+version-history preview/restore, save-as-template, and pathfind-status reconcile.
+`TopologyEditorPage.tsx` itself is now at 96.4% lines.
 
-- [HIGH] Page smoke tests (render, key interactions):
-  - `frontend/src/pages/ReservationCalendarPage.tsx`
-  - `frontend/src/pages/TopologyEditorPage.tsx` beyond the fork-mode,
-    dynamic-placeholder, network-element, and wiring-dialog suites: the base editor
-    flows (device drop, edge draw, parent save) still lack direct page-level coverage.
-- [MEDIUM] Remaining pages: `TopologyPage`, `TopologyTemplatesPage`, and the
-  admin-only `AddDevicePage`, `DeviceGroupsPage`, `GroupDetailPage`, `GroupsPage`, and
-  `UsersPage`.
+- [HIGH] `frontend/src/pages/ReservationCalendarPage.tsx` (3.8% lines, no test
+  file). Calendar rendering, month navigation, and reservation-click handling are
+  all untested.
 
-**Component coverage priorities** (`CreateReservationModal`, `ReservationDetailModal`,
-`AIDialog`, `AIProposalBar`, `AICommitDialog`, `EditDevicesModal`,
-and `PortsSection` now all carry targeted suites; the dead `TopologyEditor` component
-was deleted in issue #489, and the dead `DeviceDetailModal` component was deleted in
-PR #600; device detail is rendered by `DevicePage.tsx` as a full page, not a modal):
+Measured frontend coverage on main is 89.7% lines (1,211 tests, 129 test files).
+The files below 85% lines, all predating v0.2.0, grouped by area with a note on
+what a test would still need to cover:
 
-- [LOW] `AppLayout`, `FloatingPanel`, `FieldRow` (lower-complexity presentation, still
-  untested).
+- [MEDIUM] `frontend/src/pages/ConfigPage.tsx` (30.6%): has a suite covering
+  initial render, but the save-and-restart flow (compose-project self-check plus
+  restart confirmation) is untested.
+- [LOW] `frontend/src/App.tsx` (0%): no test imports it; router wiring,
+  `ErrorBoundary`, and the `Toaster` mount are exercised only indirectly through
+  page tests that render individual routed components.
+- [MEDIUM] Device-config panels: `frontend/src/components/device-config/ApplyJobsPanel.tsx`
+  (6.7%, exercised only indirectly through `DeviceConfigSection.test.tsx`) and
+  `frontend/src/components/device-config/DeviceConfigSection.tsx` (49.4%, has its
+  own suite). The schedule-apply submit and job-status-polling branches are the
+  deferred piece, the same UI-journey gap the E2E section below already tracks.
+- [MEDIUM] AI assistant tabs: `frontend/src/components/reservations/AIAssistantTab.tsx`
+  (77.8%, has a suite) and `frontend/src/components/reservations/AIAssistantTabLegacy.tsx`
+  (68.4%, no suite of its own, the default render path since
+  `VITE_AI_CHAT_ENABLED` defaults false, exercised only indirectly through
+  `AIAssistantTab.test.tsx`). Streaming-error and multi-turn branches are the
+  untested remainder.
+- [LOW] Topology editor and canvas dialogs: `frontend/src/components/topology-editor/AIDialog.tsx`
+  (52.6%, has a suite), `frontend/src/components/topology-editor/VersionDiffDialog.tsx`
+  (63.6%, has a suite), `frontend/src/components/topology-editor/RestoreConfirmDialog.tsx`
+  (77.8%, no suite of its own, exercised only through the `TopologyEditorPage`
+  suites that mount it), and `frontend/src/components/ui/FloatingPanel.tsx`
+  (40.6%, same: no direct suite).
+- [LOW] `frontend/src/components/devices/PortsSection.tsx` (68.4%) and
+  `frontend/src/components/devices/DynamicFieldRenderer.tsx` (83.3%): both have a
+  targeted suite; validation and edge-case branches are the remainder.
+- [MEDIUM] `frontend/src/components/admin/UserManagementTable.tsx` (0%):
+  `UsersPage.test.tsx` mocks it out entirely rather than rendering it, so its
+  fetch, sort, and promote/demote actions have no test at all.
+- [LOW] `frontend/src/components/NotificationBell.tsx` (60.5%) and
+  `frontend/src/components/ui/BulkImportExport.tsx` (83.3%): both have a
+  targeted suite; dropdown and export-format branches are the remainder.
 
-## Frontend: API clients (1 still untested)
+A file with no test importing it (`App.tsx`, and effectively
+`UserManagementTable.tsx`) now shows 0% rather than being omitted from the report:
+PR #658 switched the vitest coverage config to include-based reporting, so an
+untested file surfaces at 0% instead of staying invisible.
 
-Tests live under `frontend/src/test/api/`. Every client under `frontend/src/api/` is
-covered except:
+`CreateReservationModal`, `ReservationDetailModal`, `AIProposalBar`,
+`AICommitDialog`, `EditDevicesModal`, `AppLayout`, and `FieldRow` all carry
+targeted suites above the 85% line-coverage threshold; no gap. The dead `TopologyEditor`
+component was deleted in issue #489, and the dead `DeviceDetailModal` component
+was deleted in PR #600; device detail is rendered by `DevicePage.tsx` as a full
+page, not a modal.
 
-- [MEDIUM] `recipes.ts`.
+## Frontend: API clients
+
+Tests live under `frontend/src/test/api/`; every client under `frontend/src/api/`
+now has a test file (the 2026-08-30 batch added `recipes.ts`, now 100%). Four
+clients have a suite but stay below 85% lines on error and edge-case branches:
+
+- [MEDIUM] `api/deviceConfig.ts` (71.4%), `api/notifications.ts` (72.4%).
+- [LOW] `api/config.ts` (80.0%), `api/reporting.ts` (82.6%).
 
 ## Frontend: stores and hooks
 
