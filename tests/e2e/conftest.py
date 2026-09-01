@@ -6,9 +6,13 @@ Tests connect to the remote WebDriver at http://localhost:4444.
 """
 
 import os
+import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -146,6 +150,232 @@ def format_sessionfinish_report(skips: list[tuple[str, str]], exempt: list[tuple
     return "\n" + "\n\n".join(blocks) + "\n"
 
 
+# -- Failure artifacts (durable evidence on disk) -----------------------------
+#
+# An e2e failure against the gate stack previously left no trace beyond
+# .pytest_cache/v/cache/lastfailed: one nodeid, no screenshot, no page state,
+# no console log, and a full replay could not always reproduce it. This hook
+# captures what the browser fixtures can still tell us at the moment a test
+# fails, best-effort, and writes it to disk so the failure is diagnosable
+# after the fact without needing to catch it live.
+
+# Console/pageerror messages collected per Playwright Page, keyed by id(page)
+# since Page itself is not hashable in a way we want to rely on. The pw_page
+# fixture below registers the listeners and pops its own entry on teardown,
+# so this never grows across a session and never leaks staled pages.
+_pw_console_log: dict[int, list[str]] = {}
+
+
+@dataclass
+class FailureCapture:
+    """Best-effort snapshot of browser state at the moment a test failed.
+
+    Every field is optional: any capture step (screenshot, page source, ...)
+    can fail on its own, and a failure there is recorded in `errors` rather
+    than raised, so one broken capture step never hides the others or the
+    original test failure.
+    """
+
+    url: str | None = None
+    html: str | None = None
+    screenshot_png: bytes | None = None
+    console: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]")
+_MAX_DIR_NAME_LEN = 200
+
+
+def artifact_dir_for(nodeid: str, root: Path) -> Path:
+    """Map a test nodeid to a filesystem-safe directory under root.
+
+    Every character outside [A-Za-z0-9._-] becomes `_` (nodeid separators
+    `/`, `::`, `[`, `]`, and any spaces included), and the result is
+    truncated to 200 chars so a heavily parametrized nodeid cannot exceed
+    typical filename length limits.
+    """
+    sanitized = _SANITIZE_RE.sub("_", nodeid)[:_MAX_DIR_NAME_LEN]
+    return root / sanitized
+
+
+def save_failure_artifacts(root: Path, nodeid: str, capture: FailureCapture, longrepr: str) -> Path:
+    """Write a FailureCapture to disk under root, keyed by nodeid, and return the dir.
+
+    Pure aside from filesystem writes (no pytest or browser objects), so it is
+    unit-testable directly. Creates the directory (including parents) and
+    overwrites on rerun: a fresh run of the same failing test replaces the
+    prior artifacts rather than accumulating stale ones alongside them.
+    Always writes traceback.txt, console.log (even when empty), and
+    meta.txt; page.html and screenshot.png are written only when present.
+    """
+    out_dir = artifact_dir_for(nodeid, root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    (out_dir / "traceback.txt").write_text(longrepr, encoding="utf-8")
+
+    if capture.html is not None:
+        (out_dir / "page.html").write_text(capture.html, encoding="utf-8")
+
+    if capture.screenshot_png is not None:
+        (out_dir / "screenshot.png").write_bytes(capture.screenshot_png)
+
+    (out_dir / "console.log").write_text(
+        "\n".join(capture.console) + ("\n" if capture.console else ""), encoding="utf-8"
+    )
+
+    meta_lines = [f"url: {capture.url}", f"timestamp: {datetime.now(timezone.utc).isoformat()}"]
+    meta_lines.extend(capture.errors)
+    (out_dir / "meta.txt").write_text("\n".join(meta_lines) + "\n", encoding="utf-8")
+
+    return out_dir
+
+
+def artifact_root() -> Path:
+    """The root directory failure artifacts are written under.
+
+    Resolved at call time (not import time) from HERD_E2E_ARTIFACT_DIR, so a
+    test can set the env var via monkeypatch and see it take effect; falls
+    back to a `herd-e2e-artifacts` directory under the platform temp dir.
+    """
+    override = os.environ.get("HERD_E2E_ARTIFACT_DIR")
+    if override:
+        return Path(override)
+    return Path(tempfile.gettempdir()) / "herd-e2e-artifacts"
+
+
+def format_artifact_block(dirs: list[Path]) -> str:
+    """Render the sessionfinish summary of failure-artifact directories written this run.
+
+    Pure and stack-free, mirroring format_skip_block, so it is unit
+    testable. Callers are expected to only invoke this when dirs is
+    non-empty; an empty list still renders a well-formed (if unhelpful)
+    header with no following lines.
+    """
+    lines = [f"e2e failure artifacts written for {len(dirs)} test(s):"]
+    for d in dirs:
+        lines.append(f"  {d}")
+    return "\n".join(lines)
+
+
+_artifact_dirs_written: list[Path] = []
+
+
+def _capture_playwright(page) -> FailureCapture:
+    capture = FailureCapture(console=list(_pw_console_log.get(id(page), [])))
+    try:
+        capture.url = page.url
+    except Exception as exc:
+        capture.errors.append(f"url: {exc}")
+    try:
+        capture.html = page.content()
+    except Exception as exc:
+        capture.errors.append(f"content: {exc}")
+    try:
+        capture.screenshot_png = page.screenshot(full_page=True)
+    except Exception as exc:
+        capture.errors.append(f"screenshot: {exc}")
+    return capture
+
+
+def _capture_selenium(driver) -> FailureCapture:
+    capture = FailureCapture()
+    try:
+        capture.url = driver.current_url
+    except Exception as exc:
+        capture.errors.append(f"current_url: {exc}")
+    try:
+        capture.html = driver.page_source
+    except Exception as exc:
+        capture.errors.append(f"page_source: {exc}")
+    try:
+        capture.screenshot_png = driver.get_screenshot_as_png()
+    except Exception as exc:
+        capture.errors.append(f"screenshot: {exc}")
+    try:
+        capture.console = [str(entry) for entry in driver.get_log("browser")]
+    except Exception:  # console log support varies by driver and browser
+        pass
+    return capture
+
+
+def _write_and_annotate(report: pytest.TestReport, nodeid: str, capture: FailureCapture) -> None:
+    """Write one capture to disk and append its section to the report."""
+    longrepr = str(report.longrepr) if report.longrepr else "(no longrepr)"
+    out_dir = save_failure_artifacts(artifact_root(), nodeid, capture, longrepr)
+    _artifact_dirs_written.append(out_dir)
+    written = ["traceback.txt", "console.log", "meta.txt"]
+    if capture.html is not None:
+        written.append("page.html")
+    if capture.screenshot_png is not None:
+        written.append("screenshot.png")
+    report.sections.append(("e2e failure artifacts", "\n".join([str(out_dir), *written])))
+
+
+def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport) -> None:
+    """Locate the browser fixture(s) a failing test used and write artifacts for each.
+
+    Order of precedence: pw_page (one page), then pw_contexts (the test
+    built its own contexts through the pool, so every open page of every
+    context is captured, one directory per page, suffixed [page<n>]), then
+    the Selenium drivers. A test that creates contexts straight from
+    pw_browser and closes them in its own finally block is invisible here:
+    that finally runs inside the call phase, before this hook, so the pages
+    are gone by the time it fires. Use pw_contexts instead. The Selenium
+    lookup order is arbitrary but safe: no e2e test requests more than one
+    of those three fixtures.
+    """
+    funcargs = getattr(item, "funcargs", {})
+
+    pw_page = funcargs.get("pw_page")
+    if pw_page is not None:
+        _write_and_annotate(report, report.nodeid, _capture_playwright(pw_page))
+        return
+
+    pool = funcargs.get("pw_contexts")
+    if pool is not None:
+        pages = [page for context in pool.contexts for page in context.pages]
+        for index, page in enumerate(pages, start=1):
+            _write_and_annotate(report, f"{report.nodeid}[page{index}]", _capture_playwright(page))
+        return
+
+    for fixture_name in ("browser", "logged_in_browser", "admin_browser"):
+        driver = funcargs.get(fixture_name)
+        if driver is not None:
+            _write_and_annotate(report, report.nodeid, _capture_selenium(driver))
+            return
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
+    """Capture browser state to disk when a test fails during its call phase.
+
+    Only fires for report.when == "call" and report.failed: a setup-phase
+    failure (a fixture that raised before the browser did anything
+    interesting, or a plain skip) is not a browser-state failure worth
+    capturing. Every browser interaction is wrapped in FailureCapture's
+    helpers, and the whole capture-and-write step sits under one
+    `except Exception`, so a capture failure never masks the original test
+    failure or turns it into an error. New-style `wrapper=True` (pytest 8+)
+    rather than the old `hookwrapper=True`: with the old style an escaping
+    BaseException (Ctrl-C mid-screenshot) surfaced as a pluggy teardown
+    warning, which `filterwarnings = ["error"]` turned into an INTERNALERROR
+    that destroyed the whole session's results; with the new style a
+    KeyboardInterrupt propagates as an ordinary interrupt.
+    """
+    report = yield
+
+    if report.when != "call" or not report.failed:
+        return report
+
+    try:
+        _capture_failure_artifacts(item, report)
+    except Exception as exc:
+        report.sections.append(("e2e failure artifacts", f"failed to write artifacts: {exc}"))
+
+    return report
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list) -> None:
     """Record which collected items carry @pytest.mark.seeded_skip_ok.
 
@@ -190,13 +420,28 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     "0 test(s) skipped" header with nothing under it.
     """
     if os.environ.get(HERD_E2E_REQUIRE_NO_SKIP) != "1":
+        _print_artifact_block()
         return
     output = format_sessionfinish_report(_skip_reports, _exempt_reports)
     if not output:
+        _print_artifact_block()
         return
     print(output)
     if _skip_reports:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    _print_artifact_block()
+
+
+def _print_artifact_block() -> None:
+    """Print the failure-artifact summary if anything was written this session.
+
+    Factored out so pytest_sessionfinish's original skip-gate control flow
+    (its two early returns) stays intact; this is called from every exit
+    path of that function instead of the skip-gate logic being restructured
+    around it.
+    """
+    if _artifact_dirs_written:
+        print("\n" + format_artifact_block(_artifact_dirs_written) + "\n")
 
 
 def _make_chrome_options():
@@ -319,13 +564,72 @@ def pw_browser():
         browser.close()
 
 
+def _register_console_listeners(page) -> None:
+    log: list[str] = []
+    _pw_console_log[id(page)] = log
+    page.on("console", lambda msg: log.append(f"[{msg.type}] {msg.text}"))
+    page.on("pageerror", lambda exc: log.append(f"[pageerror] {exc}"))
+
+
+class _ContextPool:
+    """Contexts a test opened through pw_contexts, closed at fixture teardown.
+
+    Teardown runs after pytest_runtest_makereport for the call phase, which
+    is the whole point: pages are still open when the failure-artifact hook
+    looks for them. Every page opened in a pooled context gets the same
+    console/pageerror listeners as pw_page.
+    """
+
+    def __init__(self, browser):
+        self._browser = browser
+        self.contexts = []
+
+    def new(self, **kwargs):
+        context = self._browser.new_context(**kwargs)
+        context.on("page", _register_console_listeners)
+        self.contexts.append(context)
+        return context
+
+    def close_all(self) -> None:
+        for context in self.contexts:
+            for page in context.pages:
+                _pw_console_log.pop(id(page), None)
+            context.close()
+        self.contexts.clear()
+
+
+@pytest.fixture
+def pw_contexts(pw_browser):
+    """Factory for tests that need more than one browser context (two sessions).
+
+    `pool.new(ignore_https_errors=True)` returns a BrowserContext; all of
+    them are closed at teardown, so the test must NOT close them itself,
+    or the failure-artifact hook finds nothing to capture.
+    """
+    pool = _ContextPool(pw_browser)
+    try:
+        yield pool
+    finally:
+        pool.close_all()
+
+
 @pytest.fixture
 def pw_page(pw_browser):
-    """Fresh Playwright context and page per test, trusting the dev TLS cert."""
+    """Fresh Playwright context and page per test, trusting the dev TLS cert.
+
+    Registers console/pageerror listeners into the module-level
+    _pw_console_log dict, keyed by id(page), so pytest_runtest_makereport can
+    attach the browser console transcript to a failure's artifacts; the
+    entry is popped on teardown so nothing leaks across tests.
+    """
     context = pw_browser.new_context(ignore_https_errors=True)
     page = context.new_page()
-    yield page
-    context.close()
+    try:
+        _register_console_listeners(page)
+        yield page
+    finally:
+        _pw_console_log.pop(id(page), None)
+        context.close()
 
 
 def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> None:

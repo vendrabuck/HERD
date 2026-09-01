@@ -257,9 +257,12 @@ def _conflict_canvas(switch: dict, shared: dict) -> dict:
     }
 
 
-def test_two_session_port_conflict(pw_browser):
-    ctx_a = pw_browser.new_context(ignore_https_errors=True)
-    ctx_b = pw_browser.new_context(ignore_https_errors=True)
+def test_two_session_port_conflict(pw_contexts):
+    # Contexts come from the pw_contexts pool (closed at fixture teardown,
+    # after the failure-artifact hook has captured both pages), not from
+    # pw_browser directly with a close() in the finally block below.
+    ctx_a = pw_contexts.new(ignore_https_errors=True)
+    ctx_b = pw_contexts.new(ignore_https_errors=True)
     page_a = ctx_a.new_page()
     page_b = ctx_b.new_page()
 
@@ -376,8 +379,6 @@ def test_two_session_port_conflict(pw_browser):
             _api(page_a, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
         if topology_id:
             _api(page_a, "DELETE", f"/cabling/topologies/{topology_id}", allow_errors=True)
-        ctx_a.close()
-        ctx_b.close()
 
 
 # --------------------------------------------------------------------------- #

@@ -387,6 +387,16 @@ These are baked into the bundle at build time (Vite reads `VITE_*` env vars duri
 |---|---|---|
 | `VITE_AI_CHAT_ENABLED` | `false` | Render the multi-turn chat UI for the reservation assistant. When `false` the legacy single-shot UI renders instead and each request is independent. Flip to `true` per environment after smoke-testing the round-trip. |
 
+## E2E test runner
+
+Knobs read by `tests/e2e/conftest.py` and `pytest tests/e2e/`, not by the running stack itself.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `E2E_HOST_BASE_URL` | `https://localhost` | HERD URL as seen by the pytest process on the host, used by Playwright tests and by host-side API calls made from Selenium test fixtures. |
+| `HERD_E2E_REQUIRE_NO_SKIP` | (unset) | Set to `1` (via `make test-e2e-seeded`) to fail the run if any non-exempt test skips; see the seeded-stack skip gate in `tests/e2e/conftest.py`. |
+| `HERD_E2E_ARTIFACT_DIR` | `<tempdir>/herd-e2e-artifacts` | Root directory failure artifacts (screenshot, page HTML, console log, traceback, metadata) are written under when an e2e test fails during its call phase. One subdirectory per failing test, named from its sanitized nodeid; overwritten on rerun. Nothing is written for a passing test. See `docs/TROUBLESHOOTING.md`. |
+
 ## Database URLs (auto-computed)
 
 Each service computes its own SQLAlchemy URL from `POSTGRES_*` vars. You do not normally set `DATABASE_URL` directly; it's derived. If you need to point a service at a different DB, override with `DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db`.
