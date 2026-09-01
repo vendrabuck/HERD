@@ -290,9 +290,8 @@ subdirectory containing:
 - `meta.txt`: the page URL and a UTC timestamp, plus any capture-step failures (e.g. a
   screenshot that itself timed out).
 
-A test that builds its own Playwright contexts from the bare `pw_browser` fixture (the
-two-session port-conflict test) gets one directory per open page, suffixed `[page<n>]`,
-with an empty `console.log` since those pages carry no listeners.
+A test that opens several browser contexts through the `pw_contexts` fixture (the
+two-session port-conflict test) gets one directory per open page, suffixed `[page<n>]`.
 A rerun of the same test overwrites its directory rather than accumulating stale copies.
 Nothing is written for a passing test. The pytest output itself also gets an
 "e2e failure artifacts" section naming the directory and files written, and the end of

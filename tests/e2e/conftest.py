@@ -315,12 +315,15 @@ def _write_and_annotate(report: pytest.TestReport, nodeid: str, capture: Failure
 def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport) -> None:
     """Locate the browser fixture(s) a failing test used and write artifacts for each.
 
-    Order of precedence: pw_page (one page), then a bare pw_browser (the
-    test built its own contexts, so every open page of every context is
-    captured, one directory per page, suffixed [page<n>]; those pages have
-    no console listeners, so console.log is empty for them), then the
-    Selenium drivers. The Selenium lookup order is arbitrary but safe: no
-    e2e test requests more than one of those three fixtures.
+    Order of precedence: pw_page (one page), then pw_contexts (the test
+    built its own contexts through the pool, so every open page of every
+    context is captured, one directory per page, suffixed [page<n>]), then
+    the Selenium drivers. A test that creates contexts straight from
+    pw_browser and closes them in its own finally block is invisible here:
+    that finally runs inside the call phase, before this hook, so the pages
+    are gone by the time it fires. Use pw_contexts instead. The Selenium
+    lookup order is arbitrary but safe: no e2e test requests more than one
+    of those three fixtures.
     """
     funcargs = getattr(item, "funcargs", {})
 
@@ -329,9 +332,9 @@ def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport) -> 
         _write_and_annotate(report, report.nodeid, _capture_playwright(pw_page))
         return
 
-    pw_browser = funcargs.get("pw_browser")
-    if pw_browser is not None:
-        pages = [page for context in pw_browser.contexts for page in context.pages]
+    pool = funcargs.get("pw_contexts")
+    if pool is not None:
+        pages = [page for context in pool.contexts for page in context.pages]
         for index, page in enumerate(pages, start=1):
             _write_and_annotate(report, f"{report.nodeid}[page{index}]", _capture_playwright(page))
         return
@@ -561,6 +564,55 @@ def pw_browser():
         browser.close()
 
 
+def _register_console_listeners(page) -> None:
+    log: list[str] = []
+    _pw_console_log[id(page)] = log
+    page.on("console", lambda msg: log.append(f"[{msg.type}] {msg.text}"))
+    page.on("pageerror", lambda exc: log.append(f"[pageerror] {exc}"))
+
+
+class _ContextPool:
+    """Contexts a test opened through pw_contexts, closed at fixture teardown.
+
+    Teardown runs after pytest_runtest_makereport for the call phase, which
+    is the whole point: pages are still open when the failure-artifact hook
+    looks for them. Every page opened in a pooled context gets the same
+    console/pageerror listeners as pw_page.
+    """
+
+    def __init__(self, browser):
+        self._browser = browser
+        self.contexts = []
+
+    def new(self, **kwargs):
+        context = self._browser.new_context(**kwargs)
+        context.on("page", _register_console_listeners)
+        self.contexts.append(context)
+        return context
+
+    def close_all(self) -> None:
+        for context in self.contexts:
+            for page in context.pages:
+                _pw_console_log.pop(id(page), None)
+            context.close()
+        self.contexts.clear()
+
+
+@pytest.fixture
+def pw_contexts(pw_browser):
+    """Factory for tests that need more than one browser context (two sessions).
+
+    `pool.new(ignore_https_errors=True)` returns a BrowserContext; all of
+    them are closed at teardown, so the test must NOT close them itself,
+    or the failure-artifact hook finds nothing to capture.
+    """
+    pool = _ContextPool(pw_browser)
+    try:
+        yield pool
+    finally:
+        pool.close_all()
+
+
 @pytest.fixture
 def pw_page(pw_browser):
     """Fresh Playwright context and page per test, trusting the dev TLS cert.
@@ -572,11 +624,8 @@ def pw_page(pw_browser):
     """
     context = pw_browser.new_context(ignore_https_errors=True)
     page = context.new_page()
-    log: list[str] = []
-    _pw_console_log[id(page)] = log
     try:
-        page.on("console", lambda msg: log.append(f"[{msg.type}] {msg.text}"))
-        page.on("pageerror", lambda exc: log.append(f"[pageerror] {exc}"))
+        _register_console_listeners(page)
         yield page
     finally:
         _pw_console_log.pop(id(page), None)
