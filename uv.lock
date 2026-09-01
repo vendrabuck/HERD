@@ -895,7 +895,7 @@ wheels = [
 
 [[package]]
 name = "herd-acl"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/acl" }
 dependencies = [
     { name = "alembic" },
@@ -939,7 +939,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-ai-orchestrator"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/ai-orchestrator" }
 dependencies = [
     { name = "aiosqlite" },
@@ -997,7 +997,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-auth"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/auth" }
 dependencies = [
     { name = "alembic" },
@@ -1051,7 +1051,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-cabling"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/cabling" }
 dependencies = [
     { name = "alembic" },
@@ -1097,7 +1097,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-common"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/common" }
 dependencies = [
     { name = "fastapi" },
@@ -1123,7 +1123,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-config"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/config" }
 dependencies = [
     { name = "bcrypt" },
@@ -1157,7 +1157,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-execution"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/execution" }
 dependencies = [
     { name = "alembic" },
@@ -1205,7 +1205,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-integration"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/integration" }
 dependencies = [
     { name = "alembic" },
@@ -1251,7 +1251,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-inventory"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/inventory" }
 dependencies = [
     { name = "alembic" },
@@ -1299,7 +1299,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-notifications"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/notifications" }
 dependencies = [
     { name = "alembic" },
@@ -1345,7 +1345,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-reservations"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/reservations" }
 dependencies = [
     { name = "alembic" },
@@ -1393,7 +1393,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-secrets"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/secrets" }
 dependencies = [
     { name = "alembic" },
@@ -1439,7 +1439,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "herd-user-profile"
-version = "0.3.0"
+version = "0.4.0.dev0"
 source = { editable = "services/user-profile" }
 dependencies = [
     { name = "alembic" },
