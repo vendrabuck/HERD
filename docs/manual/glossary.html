@@ -29,7 +29,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html" class="active">Glossary</a>
-    <a href="release-0-2-0.html">Release 0.2.0</a>
+    <a href="release-0-3-0.html">Release 0.3.0</a>
   </nav>
 </header>
 
@@ -60,11 +60,15 @@
 
       <div><dt>Non-exclusive / shared device</dt><dd>Infrastructure that many reservations use at once (shared switches, fabrics). Its status never changes on reserve or release &mdash; it's plumbing everyone shares.</dd></div>
 
+      <div><dt>Fork</dt><dd>A reservation's private copy of its topology, created at activation, with its own version history. The fork history panel previews any version read-only, diffs two versions or a version against the draft, and restores a version to the draft for the next commit. Live edits land here, never on the master topology. <a href="user-live-editing.html#fork">Live editing &rarr;</a></dd></div>
+
       <div><dt>L1 / L2 / L3</dt><dd>The network layer of a connection. <b>L1</b> = physical cabling (gray, dashed). <b>L2</b> = Ethernet / VLAN (blue, solid). <b>L3</b> = IP / routing (green, dashed). L2 and L3 are logical overlays that still need a real L1 path underneath.</dd></div>
 
       <div><dt>Pathfinding &amp; hops</dt><dd>HERD checks whether two devices can actually reach each other through the recorded cabling. A valid link shows <span class="badge available">"N hops"</span> (the number of switches in between); an impossible one shows <span class="badge failed">"no path"</span>.</dd></div>
 
       <div><dt>Fabric</dt><dd>A connected cluster of L2 switches and the ports linking them. Used to keep VLAN ids unique <em>within</em> a fabric while letting isolated fabrics reuse the same ids.</dd></div>
+
+      <div><dt>Network element</dt><dd>A non-device canvas object that device ports attach to: a VLAN segment, a subnet, an external cloud, or a patch trunk. Saved with the topology, validated on fork save, never provisioned today. <a href="user-topology.html#elements">Network elements &rarr;</a></dd></div>
 
       <div><dt>Ghost / proposed node</dt><dd>A device the AI has <em>proposed</em> but you haven't committed yet &mdash; dashed border, semi-transparent, tagged <span class="badge" style="background:#faf5ff;color:var(--proposal)">PROPOSED</span>. Accept to make it real, reject to discard. <a href="user-ai.html#ghost">AI proposals &rarr;</a></dd></div>
 
@@ -92,7 +96,9 @@
 
       <div><dt>LDAP / Active Directory</dt><dd>An optional sign-in method where people use their company directory credentials and HERD provisions their account on first login. A deployment setting; the superadmin always stays local.</dd></div>
 
-      <div><dt>Release / version<span class="mono">v0.2.0</span></dt><dd>The tagged version of HERD your deployment runs. This manual documents <b>0.2.0</b>; when a screen does not match a page here, check the version first. <a href="release-0-2-0.html">Release 0.2.0 &rarr;</a></dd></div>
+      <div><dt>Directory group sync</dt><dd>The LDAP-to-HERD group mapping reconcile: mapped directory groups drive HERD group membership on an interval or on demand, with an optional sweep that deactivates users the directory no longer lists. <a href="admin-ldap-sync.html">LDAP sync &rarr;</a></dd></div>
+
+      <div><dt>Release / version<span class="mono">v0.3.0</span></dt><dd>The tagged version of HERD your deployment runs. This manual documents <b>0.3.0</b>; when a screen does not match a page here, check the version first. <a href="release-0-3-0.html">Release 0.3.0 &rarr;</a></dd></div>
     </dl>
 
     <div class="callout tip" style="margin-top:32px;">

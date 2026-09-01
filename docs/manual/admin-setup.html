@@ -20,7 +20,7 @@
     <a href="admin-setup.html" class="active">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-2-0.html">Release 0.2.0</a>
+    <a href="release-0-3-0.html">Release 0.3.0</a>
   </nav>
 </header>
 
@@ -43,6 +43,7 @@
       <li><a href="admin-equipment.html">B · Equipment &amp; cabling</a></li>
       <li><a href="admin-health-config.html">C · Health &amp; config</a></li>
       <li><a href="admin-reporting.html">D · Reporting</a></li>
+      <li><a href="admin-ldap-sync.html">E · LDAP sync</a></li>
     </ul>
   </aside>
 
@@ -234,6 +235,11 @@
       <li><b>Secret.</b> Credentials, referenced from the secrets store &mdash; create the secret first or this list is empty.</li>
       <li><b>Register.</b> Deleting later fails while any template references it, same as drivers.</li>
     </ol>
+
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Secrets are guarded the same way: deleting a secret that any hypervisor references is refused with <code>secret_in_use</code>, and refused outright if inventory cannot be reached to check; re-point or delete the hypervisor first. If a secret disappears anyway by another path, the Hypervisors page shows an amber "Deleted secret &lt;first 8 chars&gt;" marker in that hypervisor's Secret column until you pick a live secret.</p></div>
+    </div>
 
     <p>Then create the template. In the template editor, the third <b>Type</b> option is what makes it dynamic:</p>
 

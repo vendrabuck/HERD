@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: LDAP group sync (admin)</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html" class="active">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="release-0-3-0.html">Release 0.3.0</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#where">Where it lives</a></li>
+      <li><a href="#mappings">Mapping groups</a></li>
+      <li><a href="#run">Running a sync</a></li>
+      <li><a href="#sweep">The deactivation sweep</a></li>
+      <li><a href="#history">Run history</a></li>
+    </ul>
+    <p class="eyebrow">Admin track</p>
+    <ul>
+      <li><a href="admin-setup.html">A · First-day setup</a></li>
+      <li><a href="admin-equipment.html">B · Equipment &amp; cabling</a></li>
+      <li><a href="admin-health-config.html">C · Health &amp; config</a></li>
+      <li><a href="admin-reporting.html">D · Reporting</a></li>
+      <li><a href="admin-ldap-sync.html" class="active">E · LDAP sync</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker admin">Admin track · Setup E</span>
+    <h1 class="title">LDAP directory group sync</h1>
+    <p class="dek">HERD can mirror group membership from your LDAP or Active Directory: map a directory group to a HERD group, sync on demand or on an interval, and let a sweep deactivate users the directory no longer lists. This page is the admin surface for all of it.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The shape of this</div>
+      <p>A <strong>mapping</strong> says "this directory group is that HERD group." A <strong>sync run</strong> makes the HERD side match the directory: memberships are added and removed, missing users are provisioned, and every run leaves an audit row. Group membership drives device visibility, so a sync run can change what people see and reserve.</p>
+    </div>
+
+    <h2 class="sec" id="where">Finding it</h2>
+    <p class="sectitle">Where it lives</p>
+    <p>Go to <b>Administration &rarr; LDAP Sync</b> (<code>/admin/ldap-sync</code>). It is admin only. The page opens even when sync is off and says so: on a local-auth deployment you get a gray banner ("This deployment uses local authentication; directory sync is inactive") and existing mappings stay viewable and deletable for cleanup, while <b>Create mapping</b> and <b>Sync now</b> stay disabled.</p>
+    <p>For the buttons to light up you need, in order:</p>
+    <ul class="list">
+      <li><b>HERD in LDAP mode</b> (<code>AUTH_METHOD=ldap</code>). The page confirms the mode before enabling anything.</li>
+      <li><b>A service account.</b> Sync refuses to run over an anonymous bind.</li>
+      <li><b><code>ldap_group_sync_enabled</code></b> for the interval loop. Without it the page says "Automatic sync is disabled; runs are manual-only" and only <b>Sync now</b> works.</li>
+    </ul>
+
+    <h2 class="sec" id="mappings">Step one</h2>
+    <p class="sectitle">Mapping groups</p>
+    <p>Click <b>Create mapping</b>, paste the directory group's DN, and pick the HERD group it should drive. A directory group DN maps to exactly one HERD group and vice versa; creating a mapping to a group that is already mapped is refused. A mapping whose directory group currently has no members is accepted with a warning, not rejected: an amber banner names the DN so you can catch a typo that points at a non-group, while a legitimately empty group still maps.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/admin/ldap-sync</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a><a class="active">Administration</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
+            <div class="hd-body">
+              <div class="hd-h1">LDAP Directory Sync</div>
+              <p style="font-size:13px;color:var(--gray-500);margin:0 0 14px;" data-anno="1" data-anno-pin="r" data-anno-arrow>Automatic sync runs every 1 hour.</p>
+              <div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 10px;">
+                <span style="font-size:14px;font-weight:600;color:var(--gray-900);">Group mappings</span>
+                <span class="hd-btn primary sm">Create mapping</span>
+              </div>
+              <div class="hd-card" style="margin-bottom:16px;">
+                <table class="hd-table">
+                  <thead><tr><th>Directory group DN</th><th>Directory name</th><th>HERD group</th><th>Created</th><th>Actions</th></tr></thead>
+                  <tbody>
+                    <tr><td class="mono" style="font-size:12px;">cn=herd-eng,ou=groups,dc=company,dc=local</td><td>herd-eng</td><td class="name">lab-a</td><td style="color:var(--gray-500)">2026-08-16</td><td style="color:var(--res-cancelled-fg);font-size:12px;">Delete</td></tr>
+                    <tr data-anno="2" data-anno-pin="l" data-anno-arrow data-anno-color="blue"><td class="mono" style="font-size:12px;">cn=qa-lab,ou=groups,dc=company,dc=local</td><td>qa-lab</td><td class="name">qa</td><td style="color:var(--gray-500)">2026-08-21</td><td style="color:var(--res-cancelled-fg);font-size:12px;">Delete</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 10px;">
+                <span style="font-size:14px;font-weight:600;color:var(--gray-900);">Sync runs</span>
+                <span class="hd-btn primary sm" data-anno="3" data-anno-pin="t" data-anno-arrow>Sync now</span>
+              </div>
+              <div class="hd-card">
+                <table class="hd-table">
+                  <thead><tr><th>Started</th><th>Trigger</th><th>Status</th><th>Added</th><th>Removed</th><th>Skipped</th><th>Deactivated</th><th>Reactivated</th><th>Detail</th></tr></thead>
+                  <tbody>
+                    <tr data-anno="4" data-anno-pin="b" data-anno-arrow><td style="color:var(--gray-500)">08-31 09:00</td><td>interval</td><td><span class="hd-badge available">success</span></td><td>3</td><td>1</td><td>0</td><td>0</td><td>1</td><td style="color:var(--blue-700);font-size:12px;">Details</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The LDAP Sync page</b> (Administration &rarr; LDAP Sync): mappings on top, run history below.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>The status line.</b> Confirms the mode and the interval; on a manual-only deployment it reads "Automatic sync is disabled; runs are manual-only."</li>
+      <li><b>A mapping row.</b> The directory DN, its cached display name, and the HERD group it drives. Deleting a mapping stops the syncing; the HERD group keeps its current members.</li>
+      <li><b>Sync now.</b> Starts one run in the background; the history below polls while it runs.</li>
+      <li><b>A run row.</b> Counts for everything the run did, plus a Details expander for per-item skips and their reasons.</li>
+    </ol>
+
+    <h2 class="sec" id="run">Step two</h2>
+    <p class="sectitle">Running a sync</p>
+    <p>Only one run executes at a time. Clicking <b>Sync now</b> while a run is in progress reports "A sync run is already in progress" (or "on another replica"); that is information, not an error.</p>
+    <p>What a run does, per mapped group:</p>
+    <ul class="list">
+      <li><b>Membership converges to the directory.</b> HERD group memberships are added and removed to match the directory's member list; a member with no HERD account yet is provisioned first.</li>
+      <li><b>An incomplete read never deletes memberships.</b> A member the directory cannot fully describe (missing email or username) is skipped, and when that happens removals for that group are suppressed for the run, since the skipped entry could be anyone.</li>
+      <li><b>An outage skips the group.</b> If the directory cannot be asked about a group, that group's reconcile is skipped entirely for the run rather than guessed at; the next run converges it.</li>
+      <li><b>Deactivated users are invisible to sync</b> in both directions: never removed from groups, never re-added.</li>
+    </ul>
+
+    <h2 class="sec" id="sweep">The careful part</h2>
+    <p class="sectitle">The deactivation sweep</p>
+    <p>Separately opted in, a sweep deactivates users who are no longer present in the directory, marking them with sync provenance. They are reactivated automatically when they reappear, but only if sync was what deactivated them: a manual activate or deactivate on the <b>Users</b> page always clears that provenance, so an admin's decision is never overridden by the directory.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Deactivation is a flag flip, never a delete: the user's reservations and audit history stay intact, and login is blocked until reactivation.</p></div>
+    </div>
+
+    <h2 class="sec" id="history">Reading the record</h2>
+    <p class="sectitle">Run history</p>
+    <p>Each run lists its counts and, under <b>Details</b>, the per-item skips with reasons. Three things worth knowing when you read it:</p>
+    <ul class="list">
+      <li><b>A run showing "running (stale)"</b> has been running for over 30 minutes and likely belongs to a crashed process; a run orphaned by a crash is marked failed automatically.</li>
+      <li><b>History is kept 90 days by default</b> when the interval loop runs; pruning rides that loop.</li>
+      <li><b>A sync-now-only deployment prunes nothing:</b> rows accumulate until an admin clears them. That is deliberate, not a leak.</li>
+    </ul>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; LDAP group sync (admin)</p>
+      <div class="pagenav">
+        <a href="admin-reporting.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Reporting</a>
+        <a href="index.html">Home <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>
