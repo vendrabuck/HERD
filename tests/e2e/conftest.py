@@ -212,21 +212,21 @@ def save_failure_artifacts(root: Path, nodeid: str, capture: FailureCapture, lon
     out_dir = artifact_dir_for(nodeid, root)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    (out_dir / "traceback.txt").write_text(longrepr)
+    (out_dir / "traceback.txt").write_text(longrepr, encoding="utf-8")
 
     if capture.html is not None:
-        (out_dir / "page.html").write_text(capture.html)
+        (out_dir / "page.html").write_text(capture.html, encoding="utf-8")
 
     if capture.screenshot_png is not None:
         (out_dir / "screenshot.png").write_bytes(capture.screenshot_png)
 
     (out_dir / "console.log").write_text(
-        "\n".join(capture.console) + ("\n" if capture.console else "")
+        "\n".join(capture.console) + ("\n" if capture.console else ""), encoding="utf-8"
     )
 
     meta_lines = [f"url: {capture.url}", f"timestamp: {datetime.now(timezone.utc).isoformat()}"]
     meta_lines.extend(capture.errors)
-    (out_dir / "meta.txt").write_text("\n".join(meta_lines) + "\n")
+    (out_dir / "meta.txt").write_text("\n".join(meta_lines) + "\n", encoding="utf-8")
 
     return out_dir
 
@@ -299,55 +299,78 @@ def _capture_selenium(driver) -> FailureCapture:
     return capture
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
-    """Capture browser state to disk when a test fails during its call phase.
-
-    Only fires for report.when == "call" and report.failed: a setup-phase
-    failure (e.g. a fixture that raised before the browser did anything
-    interesting, or a plain skip) is not a browser-state failure worth
-    capturing. Every browser interaction is wrapped in FailureCapture's
-    helpers so a capture-step exception never masks the original test
-    failure or turns it into an error; this hookwrapper only ever appends a
-    report section, it never re-raises.
-    """
-    outcome = yield
-    report = outcome.get_result()
-
-    if report.when != "call" or not report.failed:
-        return
-
-    capture: FailureCapture | None = None
-    funcargs = getattr(item, "funcargs", {})
-
-    pw_page = funcargs.get("pw_page")
-    if pw_page is not None:
-        capture = _capture_playwright(pw_page)
-    else:
-        for fixture_name in ("browser", "logged_in_browser", "admin_browser"):
-            driver = funcargs.get(fixture_name)
-            if driver is not None:
-                capture = _capture_selenium(driver)
-                break
-
-    if capture is None:
-        return
-
-    try:
-        longrepr = str(report.longrepr) if report.longrepr else "(no longrepr)"
-        out_dir = save_failure_artifacts(artifact_root(), report.nodeid, capture, longrepr)
-    except Exception as exc:
-        report.sections.append(("e2e failure artifacts", f"failed to write artifacts: {exc}"))
-        return
-
+def _write_and_annotate(report: pytest.TestReport, nodeid: str, capture: FailureCapture) -> None:
+    """Write one capture to disk and append its section to the report."""
+    longrepr = str(report.longrepr) if report.longrepr else "(no longrepr)"
+    out_dir = save_failure_artifacts(artifact_root(), nodeid, capture, longrepr)
     _artifact_dirs_written.append(out_dir)
     written = ["traceback.txt", "console.log", "meta.txt"]
     if capture.html is not None:
         written.append("page.html")
     if capture.screenshot_png is not None:
         written.append("screenshot.png")
-    section = "\n".join([str(out_dir), *written])
-    report.sections.append(("e2e failure artifacts", section))
+    report.sections.append(("e2e failure artifacts", "\n".join([str(out_dir), *written])))
+
+
+def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport) -> None:
+    """Locate the browser fixture(s) a failing test used and write artifacts for each.
+
+    Order of precedence: pw_page (one page), then a bare pw_browser (the
+    test built its own contexts, so every open page of every context is
+    captured, one directory per page, suffixed [page<n>]; those pages have
+    no console listeners, so console.log is empty for them), then the
+    Selenium drivers. The Selenium lookup order is arbitrary but safe: no
+    e2e test requests more than one of those three fixtures.
+    """
+    funcargs = getattr(item, "funcargs", {})
+
+    pw_page = funcargs.get("pw_page")
+    if pw_page is not None:
+        _write_and_annotate(report, report.nodeid, _capture_playwright(pw_page))
+        return
+
+    pw_browser = funcargs.get("pw_browser")
+    if pw_browser is not None:
+        pages = [page for context in pw_browser.contexts for page in context.pages]
+        for index, page in enumerate(pages, start=1):
+            _write_and_annotate(report, f"{report.nodeid}[page{index}]", _capture_playwright(page))
+        return
+
+    for fixture_name in ("browser", "logged_in_browser", "admin_browser"):
+        driver = funcargs.get(fixture_name)
+        if driver is not None:
+            _write_and_annotate(report, report.nodeid, _capture_selenium(driver))
+            return
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
+    """Capture browser state to disk when a test fails during its call phase.
+
+    Only fires for report.when == "call" and report.failed: a setup-phase
+    failure (a fixture that raised before the browser did anything
+    interesting, or a plain skip) is not a browser-state failure worth
+    capturing. Every browser interaction is wrapped in FailureCapture's
+    helpers, and the whole capture-and-write step sits under one
+    `except Exception`, so a capture failure never masks the original test
+    failure or turns it into an error. New-style `wrapper=True` (pytest 8+)
+    rather than the old `hookwrapper=True`: with the old style an escaping
+    BaseException (Ctrl-C mid-screenshot) surfaced as a pluggy teardown
+    warning, which `filterwarnings = ["error"]` turned into an INTERNALERROR
+    that destroyed the whole session's results; with the new style a
+    KeyboardInterrupt propagates as an ordinary interrupt.
+    """
+    report = yield
+
+    if report.when != "call" or not report.failed:
+        return report
+
+    try:
+        _capture_failure_artifacts(item, report)
+    except Exception as exc:
+        report.sections.append(("e2e failure artifacts", f"failed to write artifacts: {exc}"))
+
+    return report
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list) -> None:
@@ -551,11 +574,13 @@ def pw_page(pw_browser):
     page = context.new_page()
     log: list[str] = []
     _pw_console_log[id(page)] = log
-    page.on("console", lambda msg: log.append(f"[{msg.type}] {msg.text}"))
-    page.on("pageerror", lambda exc: log.append(f"[pageerror] {exc}"))
-    yield page
-    _pw_console_log.pop(id(page), None)
-    context.close()
+    try:
+        page.on("console", lambda msg: log.append(f"[{msg.type}] {msg.text}"))
+        page.on("pageerror", lambda exc: log.append(f"[pageerror] {exc}"))
+        yield page
+    finally:
+        _pw_console_log.pop(id(page), None)
+        context.close()
 
 
 def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> None:

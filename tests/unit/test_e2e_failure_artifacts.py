@@ -148,3 +148,13 @@ def test_format_artifact_block_header_and_one_line_per_dir():
 def test_format_artifact_block_single_dir():
     block = format_artifact_block([Path("/tmp/herd-e2e-artifacts/only")])
     assert block == ("e2e failure artifacts written for 1 test(s):\n  /tmp/herd-e2e-artifacts/only")
+
+
+def test_save_failure_artifacts_round_trips_non_ascii_as_utf8(tmp_path):
+    capture = FailureCapture(html="<p>café 中文</p>", console=["[log] über"])
+    out_dir = save_failure_artifacts(
+        tmp_path, "tests/e2e/test_x.py::test_utf8", capture, "AssertionError: ☃"
+    )
+    assert (out_dir / "page.html").read_bytes() == "<p>café 中文</p>".encode("utf-8")
+    assert (out_dir / "console.log").read_bytes() == "[log] über\n".encode("utf-8")
+    assert (out_dir / "traceback.txt").read_bytes() == "AssertionError: ☃".encode("utf-8")
