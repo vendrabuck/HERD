@@ -4,7 +4,7 @@ HERD's load tests drive the HTTP API with [Locust](https://locust.io/), a Python
 
 ## What the tests do
 
-The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and five concrete user classes:
+The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and six concrete user classes:
 
 ### `HerdUser` (base)
 
@@ -66,9 +66,23 @@ Simulates a user polling and tuning notifications.
   - `list_notifications` (weight 3): `GET /api/notifications/notifications`
   - `update_preferences` (weight 1): updates the user's notification preferences
 
+### `BulkConnectionAdmin` (weight 1)
+
+Exercises `POST /connections/bulk`, the admin-only bulk cable-create path.
+
+- `on_start`: logs in as admin, caches up to 50 device ids.
+- Tasks:
+  - `bulk_create_and_cleanup` (the class's only task): posts a small batch (2 to
+    5 pairs) built from the cached device ids, then deletes every row the
+    batch actually created so the stack's connection count stays flat across
+    a run. A rejected row (the self-loop guard, or a 503 batch-wide abort if
+    inventory's device-group check is momentarily unreachable) is a
+    legitimate outcome under concurrency, not a load-test failure.
+- Think time: 2 to 5 seconds.
+
 ### Class weighting
 
-Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `NotificationUser` 2, `ACLChecker` 2; total 13), out of every 13 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 2 notification users, and 2 ACL checkers. Increase `-u` to scale all five proportionally.
+Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1; total 14), out of every 14 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 2 notification users, 2 ACL checkers, and 1 bulk-connection admin. Increase `-u` to scale all six proportionally.
 
 ## Prerequisites
 
