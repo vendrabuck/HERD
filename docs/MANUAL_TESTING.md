@@ -12,6 +12,17 @@ named area changes. The automated suites (unit, contract, integration,
 e2e, load; see the Makefile targets) are the baseline and are not repeated
 here.
 
+E2E note: the `standalone-chrome` container caps concurrent sessions at 3
+(`SE_NODE_MAX_SESSIONS=3`, `docker-compose.override.yml`). A pytest fixture
+that raises before its `yield` leaks a session slot until the container is
+recreated; within one e2e run this surfaces as later tests queuing for up
+to `SE_SESSION_REQUEST_TIMEOUT` (300s) before failing to acquire a browser
+session, not a clean failure at the point of the leak. Recover with
+`docker compose --profile e2e up -d --force-recreate selenium`, the same
+step `make test-e2e` and `make test-e2e-seeded` already run at the start of
+every invocation, so a fresh `make test-e2e*` run is unaffected; the risk is
+mid-run exhaustion within a single long invocation.
+
 ## M1. FRR live-config apply (real router path)
 
 - Why manual: needs the external network-simulator lab; netmiko over real
