@@ -120,14 +120,22 @@ jobs:
       - name: Load test (locust, headless)
         run: HERD_BASE_URL=https://localhost make test-load
 
-      - name: Collect stack logs
+      # Issue #648: same container-state-plus-logs split as the CI
+      # integration job, so a nightly failure gets the same diagnostics.
+      - name: Collect stack diagnostics
         if: failure()
-        run: docker compose logs --no-color --timestamps > compose-logs.txt
+        run: |
+          docker compose ps > compose-ps.txt
+          docker ps -a > docker-ps-a.txt
+          docker compose logs --no-color --timestamps > compose-logs.txt
 
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: nightly-failure-artifacts
-          path: compose-logs.txt
+          path: |
+            compose-ps.txt
+            docker-ps-a.txt
+            compose-logs.txt
           retention-days: 7
