@@ -175,6 +175,10 @@ jobs:
       - name: Start stack
         run: docker compose up -d
 
+      # TEMP: force integration failure to prove log artifact (revert before merge)
+      - name: TEMP force failure (issue 648 proof)
+        run: exit 1
+
       - name: Wait for stack healthy
         run: make _master-wait-healthy
 
