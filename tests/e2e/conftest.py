@@ -541,6 +541,25 @@ def driver_tarball() -> bytes:
     return buf.getvalue()
 
 
+def log_cleanup_failure(resource: str, resource_id: str, resp) -> None:
+    """Print a non-2xx cleanup response instead of letting allow_errors=True hide it.
+
+    Best-effort cleanup (allow_errors=True) must never mask the test's real
+    failure by raising during teardown, but silently swallowing a non-2xx
+    DELETE (a 409 from another service's reverse-reference guard, a 503 from
+    a dependency being unreachable, ...) leaves the resource on the shared
+    stack with no trace. This keeps the best-effort semantics and makes the
+    leak visible in the run's output instead. `resp` need only expose
+    `.status_code` and `.text`, so this serves both the httpx responses
+    api_request/pw_api return and any requests-shaped equivalent. Was
+    duplicated byte-for-byte across test_topology_validator.py and
+    test_connections_bulk_playwright.py before being hoisted here (#670
+    review).
+    """
+    if resp.status_code // 100 != 2:
+        print(f"cleanup left {resource} {resource_id} behind: {resp.status_code} {resp.text}")
+
+
 def open_admin_menu(driver):
     """Open the Administration dropdown in the header nav.
 

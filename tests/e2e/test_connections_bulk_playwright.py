@@ -34,7 +34,7 @@ import uuid
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, driver_tarball, pw_api, pw_login
+from .conftest import HOST_BASE_URL, driver_tarball, log_cleanup_failure, pw_api, pw_login
 
 # Minimum ports a candidate device must expose to be usable here. The fixture
 # devices are fresh (issue #670), so every port they get should be free; the
@@ -46,20 +46,6 @@ MIN_PORTS = 3
 # How many lines each test stages. Small enough to stay quick and far under the
 # endpoint's 200-row cap, large enough that the batch is genuinely plural.
 STAGED_LINES = 3
-
-
-def _log_if_failed(resource: str, resource_id: str, resp) -> None:
-    """Print a non-2xx cleanup response instead of letting allow_errors=True hide it.
-
-    Best-effort cleanup (allow_errors=True) must never mask the test's real
-    failure by raising during teardown, but silently swallowing a non-2xx
-    DELETE (a 409 from another service's reverse-reference guard, a 503 from
-    a dependency being unreachable, ...) leaves the resource on the shared
-    stack with no trace. This keeps the best-effort semantics and makes the
-    leak visible in the run's output instead.
-    """
-    if resp.status_code // 100 != 2:
-        print(f"cleanup left {resource} {resource_id} behind: {resp.status_code} {resp.text}")
 
 
 @pytest.fixture
@@ -185,7 +171,7 @@ def bulk_fixture_devices(pw_page):
         # order would 409 against still-referenced rows.
         for device_id in device_ids:
             resp = pw_api(pw_page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
-            _log_if_failed("device", device_id, resp)
+            log_cleanup_failure("device", device_id, resp)
         if device_template_id:
             resp = pw_api(
                 pw_page,
@@ -193,15 +179,15 @@ def bulk_fixture_devices(pw_page):
                 f"/inventory/templates/{device_template_id}",
                 allow_errors=True,
             )
-            _log_if_failed("device template", device_template_id, resp)
+            log_cleanup_failure("device template", device_template_id, resp)
         if port_template_id:
             resp = pw_api(
                 pw_page, "DELETE", f"/inventory/templates/{port_template_id}", allow_errors=True
             )
-            _log_if_failed("port template", port_template_id, resp)
+            log_cleanup_failure("port template", port_template_id, resp)
         if driver_id:
             resp = pw_api(pw_page, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
-            _log_if_failed("driver", driver_id, resp)
+            log_cleanup_failure("driver", driver_id, resp)
 
 
 def _select_device(page, device_name: str) -> None:

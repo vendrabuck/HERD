@@ -19,7 +19,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .conftest import api_request, driver_tarball
+from .conftest import api_request, driver_tarball, log_cleanup_failure
 
 WAIT = 20
 
@@ -54,20 +54,6 @@ def _canvas_with_edge(device_a: dict, device_b: dict) -> dict:
     }
 
 
-def _log_if_failed(resource: str, resource_id: str, resp) -> None:
-    """Print a non-2xx cleanup response instead of letting allow_errors=True hide it.
-
-    Best-effort cleanup (allow_errors=True) must never mask the test's real
-    failure by raising during teardown, but silently swallowing a non-2xx
-    DELETE (a 409 from another service's reverse-reference guard, a 503 from
-    a dependency being unreachable, ...) leaves the resource on the shared
-    stack with no trace. This keeps the best-effort semantics and makes the
-    leak visible in the run's output instead.
-    """
-    if resp.status_code // 100 != 2:
-        print(f"cleanup left {resource} {resource_id} behind: {resp.status_code} {resp.text}")
-
-
 def _cleanup_validator_fixtures(
     driver, device_ids: list[str], template_id: str | None, driver_id: str | None
 ) -> None:
@@ -78,15 +64,15 @@ def _cleanup_validator_fixtures(
     """
     for device_id in device_ids:
         resp = api_request(driver, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
-        _log_if_failed("device", device_id, resp)
+        log_cleanup_failure("device", device_id, resp)
     if template_id:
         resp = api_request(
             driver, "DELETE", f"/inventory/templates/{template_id}", allow_errors=True
         )
-        _log_if_failed("template", template_id, resp)
+        log_cleanup_failure("template", template_id, resp)
     if driver_id:
         resp = api_request(driver, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
-        _log_if_failed("driver", driver_id, resp)
+        log_cleanup_failure("driver", driver_id, resp)
 
 
 @pytest.fixture(scope="module")
