@@ -184,14 +184,27 @@ jobs:
       - name: Integration tests
         run: make test-integration
 
-      - name: Collect stack logs
+      # Issue #648: a flake that shows only pytest's assertion (the polled
+      # notification never arrived) gives no way to tell an ordering bug at
+      # boot from a slow cold path apart, and container-state snapshots
+      # (a crash-looping or still-starting container) do not show up in a
+      # plain log tail at all. Container state plus per-service logs, split
+      # into separate files so a reader is not stuck grepping one 2MB blob.
+      # The collector itself lives once in the Makefile's
+      # _collect-stack-diagnostics target, shared with nightly.yml, so the
+      # two cannot drift apart.
+      - name: Collect stack diagnostics
         if: failure()
-        run: docker compose logs --no-color --timestamps > compose-logs.txt
+        run: make _collect-stack-diagnostics
 
-      - name: Upload stack logs
+      - name: Upload stack diagnostics
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: integration-stack-logs
-          path: compose-logs.txt
+          path: |
+            compose-ps.txt
+            docker-ps-a.txt
+            compose-logs.txt
+            logs-*.txt
           retention-days: 7
