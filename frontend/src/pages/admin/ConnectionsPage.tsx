@@ -373,8 +373,9 @@ export function ConnectionsPage() {
 
           {/* Port A */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Port A</label>
+            <label htmlFor="conn-port-a" className="block text-sm font-medium text-gray-700 mb-1">Port A</label>
             <select
+              id="conn-port-a"
               value={portA}
               onChange={(e) => setPortA(e.target.value)}
               disabled={!deviceAId}
@@ -432,8 +433,9 @@ export function ConnectionsPage() {
 
           {/* Port B */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Port B</label>
+            <label htmlFor="conn-port-b" className="block text-sm font-medium text-gray-700 mb-1">Port B</label>
             <select
+              id="conn-port-b"
               value={portB}
               onChange={(e) => setPortB(e.target.value)}
               disabled={!deviceBId}
@@ -451,8 +453,9 @@ export function ConnectionsPage() {
 
           {/* Connection Type */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Connection Type</label>
+            <label htmlFor="conn-type" className="block text-sm font-medium text-gray-700 mb-1">Connection Type</label>
             <input
+              id="conn-type"
               type="text"
               value={connectionType}
               onChange={(e) => setConnectionType(e.target.value)}
@@ -462,8 +465,9 @@ export function ConnectionsPage() {
 
           {/* Notes */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
+            <label htmlFor="conn-notes" className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
             <textarea
+              id="conn-notes"
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
               rows={2}

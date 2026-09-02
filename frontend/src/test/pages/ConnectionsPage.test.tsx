@@ -154,8 +154,8 @@ describe("ConnectionsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create Connection" }));
 
     // The original two-select form, not the port columns.
-    expect(screen.getByText("Port A")).toBeInTheDocument();
-    expect(document.querySelectorAll("select")).toHaveLength(2);
+    expect(screen.getByLabelText("Port A")).toBeInTheDocument();
+    expect(screen.getByLabelText("Port B")).toBeInTheDocument();
     expect(screen.queryByText("Create multiple connections")).not.toBeInTheDocument();
   });
 
@@ -237,24 +237,23 @@ describe("ConnectionsPage", () => {
       return waitFor(() => screen.getByRole("button", { name: pick }));
     }
 
-    // Neither Port A/B <select> nor Connection Type/Notes are wired to their
-    // <label> via htmlFor/id (a pre-existing gap, not something this lane
-    // fixes), so getByLabelText cannot find them; grab the create dialog's
-    // form controls by tag/position instead.
+    // Port A/B <select> and Connection Type/Notes are wired to their <label>
+    // via htmlFor/id, so getByLabelText resolves them directly and also
+    // verifies the label/input association itself.
     function createDialog() {
       return screen.getByRole("dialog", { name: "Create Connection", hidden: true });
     }
     function portASelect() {
-      return createDialog().querySelectorAll("select")[0] as HTMLSelectElement;
+      return within(createDialog()).getByLabelText("Port A") as HTMLSelectElement;
     }
     function portBSelect() {
-      return createDialog().querySelectorAll("select")[1] as HTMLSelectElement;
+      return within(createDialog()).getByLabelText("Port B") as HTMLSelectElement;
     }
     function connectionTypeInput() {
-      return createDialog().querySelector('input[type="text"]') as HTMLInputElement;
+      return within(createDialog()).getByLabelText("Connection Type") as HTMLInputElement;
     }
     function notesTextarea() {
-      return createDialog().querySelector("textarea") as HTMLTextAreaElement;
+      return within(createDialog()).getByLabelText("Notes") as HTMLTextAreaElement;
     }
 
     it("blocks create at each successive missing field, in order", async () => {
