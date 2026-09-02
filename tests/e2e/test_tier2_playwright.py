@@ -54,7 +54,7 @@ import httpx
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_login
+from .conftest import HOST_BASE_URL, driver_tarball, pw_login
 
 
 # --------------------------------------------------------------------------- #
@@ -93,22 +93,9 @@ def _poll(fn, predicate, *, timeout: float = 30.0, interval: float = 0.5):
 # --------------------------------------------------------------------------- #
 # Seeding helpers.                                                             #
 # --------------------------------------------------------------------------- #
-def _driver_tarball() -> bytes:
-    """A minimal no-op Management driver, enough to back a device template."""
-    import tarfile
-
-    body = b"class Driver:\n    pass\n"
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo("driver.py")
-        info.size = len(body)
-        tf.addfile(info, io.BytesIO(body))
-    return buf.getvalue()
-
-
 def _seed_template(page, suffix: str) -> tuple[str, str]:
     """Upload a driver and create a device template; return (driver_id, template_id)."""
-    files = {"file": ("t2-driver.tar.gz", _driver_tarball(), "application/gzip")}
+    files = {"file": ("t2-driver.tar.gz", driver_tarball(), "application/gzip")}
     data = {
         "name": f"pw-t2-drv-{suffix}",
         "connection_type": "Management",

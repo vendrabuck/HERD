@@ -11,8 +11,6 @@ isn't what we're trying to verify here. The seeding path produces a real
 topology row + canvas_data + connections, which is what the editor reads.
 """
 
-import io
-import tarfile
 import time
 import uuid
 
@@ -21,7 +19,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .conftest import api_request
+from .conftest import api_request, driver_tarball
 
 WAIT = 20
 
@@ -56,15 +54,39 @@ def _canvas_with_edge(device_a: dict, device_b: dict) -> dict:
     }
 
 
-def _driver_tarball() -> bytes:
-    """A minimal no-op Management driver, enough to back a device template."""
-    body = b"class Driver:\n    pass\n"
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo("driver.py")
-        info.size = len(body)
-        tf.addfile(info, io.BytesIO(body))
-    return buf.getvalue()
+def _log_if_failed(resource: str, resource_id: str, resp) -> None:
+    """Print a non-2xx cleanup response instead of letting allow_errors=True hide it.
+
+    Best-effort cleanup (allow_errors=True) must never mask the test's real
+    failure by raising during teardown, but silently swallowing a non-2xx
+    DELETE (a 409 from another service's reverse-reference guard, a 503 from
+    a dependency being unreachable, ...) leaves the resource on the shared
+    stack with no trace. This keeps the best-effort semantics and makes the
+    leak visible in the run's output instead.
+    """
+    if resp.status_code // 100 != 2:
+        print(f"cleanup left {resource} {resource_id} behind: {resp.status_code} {resp.text}")
+
+
+def _cleanup_validator_fixtures(
+    driver, device_ids: list[str], template_id: str | None, driver_id: str | None
+) -> None:
+    """Delete devices, then template, then driver: the dependency order every
+    creation path below reverses. Called both from the fixture's post-yield
+    teardown and from every mid-sequence failure path, so a partial seed
+    never leaks past whatever was actually created.
+    """
+    for device_id in device_ids:
+        resp = api_request(driver, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
+        _log_if_failed("device", device_id, resp)
+    if template_id:
+        resp = api_request(
+            driver, "DELETE", f"/inventory/templates/{template_id}", allow_errors=True
+        )
+        _log_if_failed("template", template_id, resp)
+    if driver_id:
+        resp = api_request(driver, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
+        _log_if_failed("driver", driver_id, resp)
 
 
 @pytest.fixture(scope="module")
@@ -77,14 +99,17 @@ def two_seeded_devices(logged_in_browser, base_url):
     what the negative test needs.
 
     The device template is created here rather than picked from whatever the
-    stack already has (issue #670): `tmpls[0]` depends on seed/list-order and,
-    once a template whose `sections` don't declare ip/login/password sorts
-    first, device create 422s ("Unknown fields: ...") since field_data is
-    validated against the TEMPLATE's own field list
-    (inventory_service.validate_field_data), not a fixed schema. A dedicated
-    throwaway template with exactly those three fields is independent of
-    stack history, mirroring the _seed_template pattern in
-    test_tier2_playwright.py.
+    stack already has (issue #670): `tmpls[0]` depends on seed/list-order,
+    and device create validates any field_data against the picked TEMPLATE's
+    own field list (inventory_service.validate_field_data), not a fixed
+    schema, so an arbitrary existing template's fields are unpredictable. A
+    dedicated throwaway template with an empty field list sidesteps that
+    entirely: field_data is simply omitted, since nothing here reads it back
+    (only device id/name matter to the canvas and cabling calls below),
+    mirroring the port template in test_connections_bulk_playwright.py's
+    bulk_fixture_devices. The driver package itself is a no-op stub
+    (conftest.driver_tarball): cabling/validate-safe only, since nothing here
+    provisions through it.
     """
     logged_in_browser.get(f"{base_url}/topology")
     WebDriverWait(logged_in_browser, WAIT).until(
@@ -92,8 +117,11 @@ def two_seeded_devices(logged_in_browser, base_url):
     )
 
     suffix = uuid.uuid4().hex[:10]
-    driver_id = template_id = None
-    files = {"file": ("e2e-validator-driver.tar.gz", _driver_tarball(), "application/gzip")}
+    driver_id: str | None = None
+    template_id: str | None = None
+    created: list[dict] = []
+
+    files = {"file": ("e2e-validator-driver.tar.gz", driver_tarball(), "application/gzip")}
     data = {
         "name": f"e2e-validator-drv-{suffix}",
         "connection_type": "Management",
@@ -118,68 +146,39 @@ def two_seeded_devices(logged_in_browser, base_url):
             "driver_id": driver_id,
             "vendor": "e2e-validator",
             "model": "fixture",
-            "sections": [
-                {
-                    "name": "General",
-                    "fields": [
-                        {"key": "ip", "label": "IP", "type": "string"},
-                        {"key": "login", "label": "Login", "type": "string"},
-                        {"key": "password", "label": "Password", "type": "password"},
-                    ],
-                }
-            ],
+            "sections": [{"name": "General", "fields": []}],
         },
         allow_errors=True,
     )
     if tmpl_resp.status_code != 201:
-        api_request(
-            logged_in_browser, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True
-        )
+        _cleanup_validator_fixtures(logged_in_browser, [], None, driver_id)
         pytest.skip(
             f"could not create throwaway template: {tmpl_resp.status_code} {tmpl_resp.text}"
         )
     template_id = tmpl_resp.json()["id"]
 
-    created: list[dict] = []
-    for i in range(2):
+    for _ in range(2):
         body = {
             "name": f"e2e-validator-{uuid.uuid4().hex[:10]}",
             "template_id": template_id,
             "topology_type": "PHYSICAL",
             "status": "AVAILABLE",
-            "field_data": {"ip": f"10.0.{i}.1", "login": "admin", "password": "admin123"},
         }
         resp = api_request(
             logged_in_browser, "POST", "/inventory/devices", json=body, allow_errors=True
         )
         if resp.status_code != 201:
-            for d in created:
-                api_request(
-                    logged_in_browser,
-                    "DELETE",
-                    f"/inventory/devices/{d['id']}",
-                    allow_errors=True,
-                )
-            api_request(
-                logged_in_browser,
-                "DELETE",
-                f"/inventory/templates/{template_id}",
-                allow_errors=True,
-            )
-            api_request(
-                logged_in_browser, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True
+            _cleanup_validator_fixtures(
+                logged_in_browser, [d["id"] for d in created], template_id, driver_id
             )
             pytest.skip(f"could not provision fresh device: {resp.status_code} {resp.text}")
         created.append(resp.json())
 
     yield created[0], created[1]
 
-    for d in created:
-        api_request(logged_in_browser, "DELETE", f"/inventory/devices/{d['id']}", allow_errors=True)
-    api_request(
-        logged_in_browser, "DELETE", f"/inventory/templates/{template_id}", allow_errors=True
+    _cleanup_validator_fixtures(
+        logged_in_browser, [d["id"] for d in created], template_id, driver_id
     )
-    api_request(logged_in_browser, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
 
 
 def _make_seeded_topology(driver, device_a: dict, device_b: dict) -> dict:

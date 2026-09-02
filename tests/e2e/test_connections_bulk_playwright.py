@@ -28,19 +28,19 @@ brand-new devices with brand-new ports start with no cabling at all, so every
 port is free regardless of stack history.
 """
 
-import io
-import tarfile
 import time
 import uuid
 
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_api, pw_login
+from .conftest import HOST_BASE_URL, driver_tarball, pw_api, pw_login
 
-# Minimum ports a candidate device must expose to be usable here. Having this
-# many ports does not guarantee this many FREE ones, which is why staging also
-# filters on availability and skips when a pair comes up short.
+# Minimum ports a candidate device must expose to be usable here. The fixture
+# devices are fresh (issue #670), so every port they get should be free; the
+# staging step still filters on the DOM's own availability (_free_port_pairs)
+# and skips short as defense-in-depth, not because this count is expected to
+# come up short.
 MIN_PORTS = 3
 
 # How many lines each test stages. Small enough to stay quick and far under the
@@ -48,105 +48,160 @@ MIN_PORTS = 3
 STAGED_LINES = 3
 
 
-def _driver_tarball() -> bytes:
-    """A minimal no-op Management driver, enough to back a device template."""
-    body = b"class Driver:\n    pass\n"
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo("driver.py")
-        info.size = len(body)
-        tf.addfile(info, io.BytesIO(body))
-    return buf.getvalue()
+def _log_if_failed(resource: str, resource_id: str, resp) -> None:
+    """Print a non-2xx cleanup response instead of letting allow_errors=True hide it.
+
+    Best-effort cleanup (allow_errors=True) must never mask the test's real
+    failure by raising during teardown, but silently swallowing a non-2xx
+    DELETE (a 409 from another service's reverse-reference guard, a 503 from
+    a dependency being unreachable, ...) leaves the resource on the shared
+    stack with no trace. This keeps the best-effort semantics and makes the
+    leak visible in the run's output instead.
+    """
+    if resp.status_code // 100 != 2:
+        print(f"cleanup left {resource} {resource_id} behind: {resp.status_code} {resp.text}")
 
 
-def _seed_fixture_devices(page, min_ports: int):
-    """Create two fresh devices, each with min_ports fresh ports, via the API.
+@pytest.fixture
+def bulk_fixture_devices(pw_page):
+    """Create two fresh devices, each with MIN_PORTS fresh ports, via the API.
 
     Replaces picking the first seeded pair (issue #670): a brand-new device
     starts with zero cabling, so every port it gets is guaranteed free,
     independent of what load tests or prior e2e passes did to the shared
-    stack's seeded fleet. Returns ((device_a, ports_a), (device_b, ports_b))
-    plus the ids of everything created, for teardown.
+    stack's seeded fleet.
+
+    A pytest yield fixture rather than a plain seed/cleanup function pair
+    (#670 review): every id is assigned to its own local (device_ids,
+    device_template_id, port_template_id, driver_id) the moment its create
+    call returns, and the finally block below always runs, so a mid-sequence
+    failure (the port-template POST failing after the driver and device
+    template already exist, say) still tears down everything that DID get
+    created instead of leaking it, and the "assert every id is deleted"
+    checks a test performs on its OWN resources can never skip this
+    fixture's teardown by raising first (fixture teardown runs independently
+    of the test body's own finally).
+
+    Function-scoped, not module-scoped like test_topology_validator.py's
+    two_seeded_devices: pw_page (and the browser context under it) is itself
+    function-scoped, and the failure-artifact hook in conftest.py only knows
+    to look for the `pw_page` fixture by name on a failing test's funcargs;
+    a module-scoped fixture would need its own context via a raw
+    pw_browser.new_context() call, which that hook cannot see (its own
+    docstring calls out that exact gap for pw_contexts-adjacent code), so a
+    failure here would capture no screenshot/HTML/console log. Leak safety
+    is the hard requirement; going function-scoped is what keeps failure
+    artifacts working, at the cost of reseeding once per test instead of
+    once per module.
+
+    Logs in first: pw_page starts on about:blank, where localStorage is
+    cross-origin-denied, so seeding (pw_api reads the JWT from localStorage)
+    must not run before the page has navigated to the app at least once.
+    The tests below no longer call pw_login themselves for that reason; this
+    fixture is a dependency of both, so it always runs first.
+
+    Yields ((device_a, ports_a), (device_b, ports_b)).
     """
+    pw_login(pw_page)
+
     suffix = uuid.uuid4().hex[:10]
-    files = {"file": ("e2e-bulk-driver.tar.gz", _driver_tarball(), "application/gzip")}
-    driver = pw_api(
-        page,
-        "POST",
-        "/inventory/drivers",
-        files=files,
-        data={
-            "name": f"e2e-pw-bulk-drv-{suffix}",
-            "connection_type": "Management",
-            "description": "bulk-connect e2e test driver",
-        },
-    ).json()
+    device_ids: list[str] = []
+    device_template_id: str | None = None
+    port_template_id: str | None = None
+    driver_id: str | None = None
 
-    device_template = pw_api(
-        page,
-        "POST",
-        "/inventory/templates",
-        json={
-            "name": f"e2e-pw-bulk-devtmpl-{suffix}",
-            "template_type": "device",
-            "driver_id": driver["id"],
-            "vendor": "e2e-pw-bulk",
-            "model": "fixture",
-            "sections": [{"name": "General", "fields": []}],
-        },
-    ).json()
-    port_template = pw_api(
-        page,
-        "POST",
-        "/inventory/templates",
-        json={
-            "name": f"e2e-pw-bulk-porttmpl-{suffix}",
-            "template_type": "port",
-            "sections": [{"name": "General", "fields": []}],
-        },
-    ).json()
-
-    devices = []
-    for label in ("a", "b"):
-        device = pw_api(
-            page,
+    try:
+        files = {"file": ("e2e-bulk-driver.tar.gz", driver_tarball(), "application/gzip")}
+        driver = pw_api(
+            pw_page,
             "POST",
-            "/inventory/devices",
-            json={
-                "name": f"e2e-pw-bulk-dev-{label}-{suffix}",
-                "template_id": device_template["id"],
-                "topology_type": "PHYSICAL",
+            "/inventory/drivers",
+            files=files,
+            data={
+                "name": f"e2e-pw-bulk-drv-{suffix}",
+                "connection_type": "Management",
+                "description": "bulk-connect e2e test driver",
             },
         ).json()
-        ports = pw_api(
-            page,
+        driver_id = driver["id"]
+
+        device_template = pw_api(
+            pw_page,
             "POST",
-            f"/inventory/devices/{device['id']}/ports/bulk",
+            "/inventory/templates",
             json={
-                "name_prefix": f"e2e-{label}-",
-                "starting_index": 1,
-                "instances": min_ports,
-                "template_id": port_template["id"],
+                "name": f"e2e-pw-bulk-devtmpl-{suffix}",
+                "template_type": "device",
+                "driver_id": driver_id,
+                "vendor": "e2e-pw-bulk",
+                "model": "fixture",
+                "sections": [{"name": "General", "fields": []}],
             },
         ).json()
-        devices.append((device, ports))
+        device_template_id = device_template["id"]
 
-    ids = {
-        "driver_id": driver["id"],
-        "device_template_id": device_template["id"],
-        "port_template_id": port_template["id"],
-        "device_ids": [devices[0][0]["id"], devices[1][0]["id"]],
-    }
-    return devices[0], devices[1], ids
+        port_template = pw_api(
+            pw_page,
+            "POST",
+            "/inventory/templates",
+            json={
+                "name": f"e2e-pw-bulk-porttmpl-{suffix}",
+                "template_type": "port",
+                "sections": [{"name": "General", "fields": []}],
+            },
+        ).json()
+        port_template_id = port_template["id"]
 
+        devices = []
+        for label in ("a", "b"):
+            device = pw_api(
+                pw_page,
+                "POST",
+                "/inventory/devices",
+                json={
+                    "name": f"e2e-pw-bulk-dev-{label}-{suffix}",
+                    "template_id": device_template_id,
+                    "topology_type": "PHYSICAL",
+                },
+            ).json()
+            device_ids.append(device["id"])
+            ports = pw_api(
+                pw_page,
+                "POST",
+                f"/inventory/devices/{device['id']}/ports/bulk",
+                json={
+                    "name_prefix": f"e2e-{label}-",
+                    "starting_index": 1,
+                    "instances": MIN_PORTS,
+                    "template_id": port_template_id,
+                },
+            ).json()
+            devices.append((device, ports))
 
-def _cleanup_fixture_devices(page, ids: dict) -> None:
-    """Delete everything _seed_fixture_devices created, in dependency order."""
-    for device_id in ids["device_ids"]:
-        pw_api(page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
-    pw_api(page, "DELETE", f"/inventory/templates/{ids['device_template_id']}", allow_errors=True)
-    pw_api(page, "DELETE", f"/inventory/templates/{ids['port_template_id']}", allow_errors=True)
-    pw_api(page, "DELETE", f"/inventory/drivers/{ids['driver_id']}", allow_errors=True)
+        yield devices[0], devices[1]
+    finally:
+        # Reverse dependency order: devices reference the templates, and the
+        # device template references the driver, so deleting in creation
+        # order would 409 against still-referenced rows.
+        for device_id in device_ids:
+            resp = pw_api(pw_page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
+            _log_if_failed("device", device_id, resp)
+        if device_template_id:
+            resp = pw_api(
+                pw_page,
+                "DELETE",
+                f"/inventory/templates/{device_template_id}",
+                allow_errors=True,
+            )
+            _log_if_failed("device template", device_template_id, resp)
+        if port_template_id:
+            resp = pw_api(
+                pw_page, "DELETE", f"/inventory/templates/{port_template_id}", allow_errors=True
+            )
+            _log_if_failed("port template", port_template_id, resp)
+        if driver_id:
+            resp = pw_api(pw_page, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
+            _log_if_failed("driver", driver_id, resp)
 
 
 def _select_device(page, device_name: str) -> None:
@@ -189,23 +244,27 @@ def _free_port_pairs(dialog, ports_a, ports_b, count):
     (aria-disabled="false", what PortColumn renders for a cabled port) rather
     than assuming it, keeping the test in step with whatever the availability
     rules decide. The skip below is now a defensive fallback, not the
-    expected path.
+    expected path. ports_a/ports_b are always the fixture's MIN_PORTS-length
+    lists (never empty) on every path that reaches this function.
 
-    MultiConnectDialog gates EVERY row's aria-disabled on
-    `interactionDisabled = connectionsLoading || submitting`
-    (both columns share one flag), so right after the B-side device is
-    picked its connections query is still in flight and every row briefly
-    reads aria-disabled="true". Waiting for the first row on each side to
-    settle avoids sampling mid-flight and skipping on a false negative.
+    MultiConnectDialog gates EVERY row's aria-disabled on one shared
+    `interactionDisabled = connectionsLoading || submitting` flag (both
+    columns read the same value), and that flag is still true for a moment
+    right after the dialog opens and both devices' ports/connections queries
+    are freshly kicked off, so a same-tick DOM read can catch every row
+    still aria-disabled="true". This is not a case of picking device B
+    re-firing device A's query (usePorts/useDeviceConnections are
+    independently keyed per device id, so that never happens); it is
+    ordinary query-loading latency shared across both columns. Waiting for
+    the first row on each side to settle avoids sampling mid-flight and
+    skipping on a false negative.
     """
-    if ports_a:
-        expect(dialog.get_by_test_id(f"port-row-{ports_a[0]['id']}")).to_have_attribute(
-            "aria-disabled", "false"
-        )
-    if ports_b:
-        expect(dialog.get_by_test_id(f"port-row-{ports_b[0]['id']}")).to_have_attribute(
-            "aria-disabled", "false"
-        )
+    expect(dialog.get_by_test_id(f"port-row-{ports_a[0]['id']}")).to_have_attribute(
+        "aria-disabled", "false"
+    )
+    expect(dialog.get_by_test_id(f"port-row-{ports_b[0]['id']}")).to_have_attribute(
+        "aria-disabled", "false"
+    )
     free_a = [p for p in ports_a if _is_free(dialog, p)]
     free_b = [p for p in ports_b if _is_free(dialog, p)]
     if len(free_a) < count or len(free_b) < count:
@@ -245,12 +304,9 @@ def _cleanup(page, notes):
             pw_api(page, "DELETE", f"/cabling/connections/{conn['id']}", allow_errors=True)
 
 
-def test_bulk_connection_create(pw_page):
+def test_bulk_connection_create(pw_page, bulk_fixture_devices):
     """Stage several lines, confirm the batch, verify every cable via the API."""
-    pw_login(pw_page)
-    (device_a, ports_a), (device_b, ports_b), fixture_ids = _seed_fixture_devices(
-        pw_page, MIN_PORTS
-    )
+    (device_a, ports_a), (device_b, ports_b) = bulk_fixture_devices
     notes = f"e2e-pw-bulk-{int(time.time() * 1000)}"
     created_ids = []
 
@@ -309,16 +365,20 @@ def test_bulk_connection_create(pw_page):
         expect(pw_page.locator("tr", has_text=notes).first).to_be_visible()
     finally:
         _cleanup(pw_page, notes)
-        # Baseline restored: every cable this run created is gone.
+        # Baseline restored: every cable this run created is gone. This
+        # assertion runs LAST, after cleanup already ran (issue #670 review):
+        # an assertion failure here must never skip cleanup, and it cannot
+        # skip bulk_fixture_devices' own teardown either, since that is a
+        # separate fixture whose finally block pytest runs independently of
+        # how this test's body or its own finally exits.
         for connection_id in created_ids:
             gone = pw_api(
                 pw_page, "GET", f"/cabling/connections/{connection_id}", allow_errors=True
             )
             assert gone.status_code == 404, "cleanup left a connection behind"
-        _cleanup_fixture_devices(pw_page, fixture_ids)
 
 
-def test_bulk_partial_success_keeps_rejected_line_staged(pw_page):
+def test_bulk_partial_success_keeps_rejected_line_staged(pw_page, bulk_fixture_devices):
     """A batch with one backend-rejected row keeps that line staged, with reason.
 
     The rejection is provoked by rewriting ONE row in flight into a self-loop
@@ -329,10 +389,7 @@ def test_bulk_partial_success_keeps_rejected_line_staged(pw_page):
     rejected, and a bogus device id would abort the whole batch fail-closed
     rather than produce the partial success under test here.
     """
-    pw_login(pw_page)
-    (device_a, ports_a), (device_b, ports_b), fixture_ids = _seed_fixture_devices(
-        pw_page, MIN_PORTS
-    )
+    (device_a, ports_a), (device_b, ports_b) = bulk_fixture_devices
     notes = f"e2e-pw-bulk-partial-{int(time.time() * 1000)}"
 
     try:
@@ -393,4 +450,3 @@ def test_bulk_partial_success_keeps_rejected_line_staged(pw_page):
     finally:
         pw_page.unroute("**/api/cabling/connections/bulk")
         _cleanup(pw_page, notes)
-        _cleanup_fixture_devices(pw_page, fixture_ids)
