@@ -11,6 +11,8 @@ isn't what we're trying to verify here. The seeding path produces a real
 topology row + canvas_data + connections, which is what the editor reads.
 """
 
+import io
+import tarfile
 import time
 import uuid
 
@@ -54,6 +56,17 @@ def _canvas_with_edge(device_a: dict, device_b: dict) -> dict:
     }
 
 
+def _driver_tarball() -> bytes:
+    """A minimal no-op Management driver, enough to back a device template."""
+    body = b"class Driver:\n    pass\n"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo("driver.py")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
 @pytest.fixture(scope="module")
 def two_seeded_devices(logged_in_browser, base_url):
     """Provision two fresh devices guaranteed to start with no cabling.
@@ -62,24 +75,70 @@ def two_seeded_devices(logged_in_browser, base_url):
     connections), so two arbitrary picks are usually already reachable through
     the switch tier. Creating new devices skips the fabric entirely, which is
     what the negative test needs.
+
+    The device template is created here rather than picked from whatever the
+    stack already has (issue #670): `tmpls[0]` depends on seed/list-order and,
+    once a template whose `sections` don't declare ip/login/password sorts
+    first, device create 422s ("Unknown fields: ...") since field_data is
+    validated against the TEMPLATE's own field list
+    (inventory_service.validate_field_data), not a fixed schema. A dedicated
+    throwaway template with exactly those three fields is independent of
+    stack history, mirroring the _seed_template pattern in
+    test_tier2_playwright.py.
     """
     logged_in_browser.get(f"{base_url}/topology")
     WebDriverWait(logged_in_browser, WAIT).until(
         EC.presence_of_element_located((By.TAG_NAME, "body"))
     )
 
+    suffix = uuid.uuid4().hex[:10]
+    driver_id = template_id = None
+    files = {"file": ("e2e-validator-driver.tar.gz", _driver_tarball(), "application/gzip")}
+    data = {
+        "name": f"e2e-validator-drv-{suffix}",
+        "connection_type": "Management",
+        "description": "topology validator e2e test driver",
+    }
+    driver_resp = api_request(
+        logged_in_browser, "POST", "/inventory/drivers", files=files, data=data, allow_errors=True
+    )
+    if driver_resp.status_code != 201:
+        pytest.skip(
+            f"could not upload throwaway driver: {driver_resp.status_code} {driver_resp.text}"
+        )
+    driver_id = driver_resp.json()["id"]
+
     tmpl_resp = api_request(
         logged_in_browser,
-        "GET",
-        "/inventory/templates?template_type=device&limit=1",
+        "POST",
+        "/inventory/templates",
+        json={
+            "name": f"e2e-validator-tmpl-{suffix}",
+            "template_type": "device",
+            "driver_id": driver_id,
+            "vendor": "e2e-validator",
+            "model": "fixture",
+            "sections": [
+                {
+                    "name": "General",
+                    "fields": [
+                        {"key": "ip", "label": "IP", "type": "string"},
+                        {"key": "login", "label": "Login", "type": "string"},
+                        {"key": "password", "label": "Password", "type": "password"},
+                    ],
+                }
+            ],
+        },
         allow_errors=True,
     )
-    if tmpl_resp.status_code != 200:
-        pytest.skip(f"could not list templates: {tmpl_resp.status_code} {tmpl_resp.text}")
-    tmpls = tmpl_resp.json().get("items") or []
-    if not tmpls:
-        pytest.skip("validator UI tests need at least one device template")
-    template_id = tmpls[0]["id"]
+    if tmpl_resp.status_code != 201:
+        api_request(
+            logged_in_browser, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True
+        )
+        pytest.skip(
+            f"could not create throwaway template: {tmpl_resp.status_code} {tmpl_resp.text}"
+        )
+    template_id = tmpl_resp.json()["id"]
 
     created: list[dict] = []
     for i in range(2):
@@ -101,6 +160,15 @@ def two_seeded_devices(logged_in_browser, base_url):
                     f"/inventory/devices/{d['id']}",
                     allow_errors=True,
                 )
+            api_request(
+                logged_in_browser,
+                "DELETE",
+                f"/inventory/templates/{template_id}",
+                allow_errors=True,
+            )
+            api_request(
+                logged_in_browser, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True
+            )
             pytest.skip(f"could not provision fresh device: {resp.status_code} {resp.text}")
         created.append(resp.json())
 
@@ -108,6 +176,10 @@ def two_seeded_devices(logged_in_browser, base_url):
 
     for d in created:
         api_request(logged_in_browser, "DELETE", f"/inventory/devices/{d['id']}", allow_errors=True)
+    api_request(
+        logged_in_browser, "DELETE", f"/inventory/templates/{template_id}", allow_errors=True
+    )
+    api_request(logged_in_browser, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
 
 
 def _make_seeded_topology(driver, device_a: dict, device_b: dict) -> dict:

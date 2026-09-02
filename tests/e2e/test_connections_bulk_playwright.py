@@ -20,16 +20,23 @@ test_connections_playwright.py:
   rejects: created lines drop out of the dialog while the rejected line stays
   staged carrying the server's reason (applyBulkResult in bulkStaging.ts)
 
-Devices are discovered dynamically through the inventory API rather than
-hardcoded, so the tests do not depend on exact seed data or ordering.
+Devices are created fresh by each test (issue #670) rather than picked as
+the first pair the inventory API happens to return: on a stack that has been
+through load tests or repeated e2e passes, the first pair's free-port count
+depends on cabling history and can come up short, skipping the test. Two
+brand-new devices with brand-new ports start with no cabling at all, so every
+port is free regardless of stack history.
 """
 
+import io
+import tarfile
 import time
+import uuid
 
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_api, pw_login, pw_two_devices_with_ports
+from .conftest import HOST_BASE_URL, pw_api, pw_login
 
 # Minimum ports a candidate device must expose to be usable here. Having this
 # many ports does not guarantee this many FREE ones, which is why staging also
@@ -39,6 +46,107 @@ MIN_PORTS = 3
 # How many lines each test stages. Small enough to stay quick and far under the
 # endpoint's 200-row cap, large enough that the batch is genuinely plural.
 STAGED_LINES = 3
+
+
+def _driver_tarball() -> bytes:
+    """A minimal no-op Management driver, enough to back a device template."""
+    body = b"class Driver:\n    pass\n"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo("driver.py")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+def _seed_fixture_devices(page, min_ports: int):
+    """Create two fresh devices, each with min_ports fresh ports, via the API.
+
+    Replaces picking the first seeded pair (issue #670): a brand-new device
+    starts with zero cabling, so every port it gets is guaranteed free,
+    independent of what load tests or prior e2e passes did to the shared
+    stack's seeded fleet. Returns ((device_a, ports_a), (device_b, ports_b))
+    plus the ids of everything created, for teardown.
+    """
+    suffix = uuid.uuid4().hex[:10]
+    files = {"file": ("e2e-bulk-driver.tar.gz", _driver_tarball(), "application/gzip")}
+    driver = pw_api(
+        page,
+        "POST",
+        "/inventory/drivers",
+        files=files,
+        data={
+            "name": f"e2e-pw-bulk-drv-{suffix}",
+            "connection_type": "Management",
+            "description": "bulk-connect e2e test driver",
+        },
+    ).json()
+
+    device_template = pw_api(
+        page,
+        "POST",
+        "/inventory/templates",
+        json={
+            "name": f"e2e-pw-bulk-devtmpl-{suffix}",
+            "template_type": "device",
+            "driver_id": driver["id"],
+            "vendor": "e2e-pw-bulk",
+            "model": "fixture",
+            "sections": [{"name": "General", "fields": []}],
+        },
+    ).json()
+    port_template = pw_api(
+        page,
+        "POST",
+        "/inventory/templates",
+        json={
+            "name": f"e2e-pw-bulk-porttmpl-{suffix}",
+            "template_type": "port",
+            "sections": [{"name": "General", "fields": []}],
+        },
+    ).json()
+
+    devices = []
+    for label in ("a", "b"):
+        device = pw_api(
+            page,
+            "POST",
+            "/inventory/devices",
+            json={
+                "name": f"e2e-pw-bulk-dev-{label}-{suffix}",
+                "template_id": device_template["id"],
+                "topology_type": "PHYSICAL",
+            },
+        ).json()
+        ports = pw_api(
+            page,
+            "POST",
+            f"/inventory/devices/{device['id']}/ports/bulk",
+            json={
+                "name_prefix": f"e2e-{label}-",
+                "starting_index": 1,
+                "instances": min_ports,
+                "template_id": port_template["id"],
+            },
+        ).json()
+        devices.append((device, ports))
+
+    ids = {
+        "driver_id": driver["id"],
+        "device_template_id": device_template["id"],
+        "port_template_id": port_template["id"],
+        "device_ids": [devices[0][0]["id"], devices[1][0]["id"]],
+    }
+    return devices[0], devices[1], ids
+
+
+def _cleanup_fixture_devices(page, ids: dict) -> None:
+    """Delete everything _seed_fixture_devices created, in dependency order."""
+    for device_id in ids["device_ids"]:
+        pw_api(page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
+    pw_api(page, "DELETE", f"/inventory/templates/{ids['device_template_id']}", allow_errors=True)
+    pw_api(page, "DELETE", f"/inventory/templates/{ids['port_template_id']}", allow_errors=True)
+    pw_api(page, "DELETE", f"/inventory/drivers/{ids['driver_id']}", allow_errors=True)
 
 
 def _select_device(page, device_name: str) -> None:
@@ -76,12 +184,28 @@ def _open_multi_dialog(page, device_a, device_b):
 def _free_port_pairs(dialog, ports_a, ports_b, count):
     """Pick `count` genuinely free ports from each side, in render order.
 
-    Seeded lab switches are mostly patched already (a 48-port hub can have 31
-    ports cabled), and PortColumn renders a cabled port as aria-disabled with
-    no pointer handler, so clicking one stages nothing. Selecting by the DOM's
-    own notion of free (aria-disabled="false") keeps this in step with
-    whatever the availability rules decide, rather than re-deriving them here.
+    The fixture devices are fresh (issue #670), so every port on them should
+    be free; this still reads the DOM's own notion of free
+    (aria-disabled="false", what PortColumn renders for a cabled port) rather
+    than assuming it, keeping the test in step with whatever the availability
+    rules decide. The skip below is now a defensive fallback, not the
+    expected path.
+
+    MultiConnectDialog gates EVERY row's aria-disabled on
+    `interactionDisabled = connectionsLoading || submitting`
+    (both columns share one flag), so right after the B-side device is
+    picked its connections query is still in flight and every row briefly
+    reads aria-disabled="true". Waiting for the first row on each side to
+    settle avoids sampling mid-flight and skipping on a false negative.
     """
+    if ports_a:
+        expect(dialog.get_by_test_id(f"port-row-{ports_a[0]['id']}")).to_have_attribute(
+            "aria-disabled", "false"
+        )
+    if ports_b:
+        expect(dialog.get_by_test_id(f"port-row-{ports_b[0]['id']}")).to_have_attribute(
+            "aria-disabled", "false"
+        )
     free_a = [p for p in ports_a if _is_free(dialog, p)]
     free_b = [p for p in ports_b if _is_free(dialog, p)]
     if len(free_a) < count or len(free_b) < count:
@@ -124,8 +248,8 @@ def _cleanup(page, notes):
 def test_bulk_connection_create(pw_page):
     """Stage several lines, confirm the batch, verify every cable via the API."""
     pw_login(pw_page)
-    (device_a, ports_a), (device_b, ports_b) = pw_two_devices_with_ports(
-        pw_page, min_ports=MIN_PORTS
+    (device_a, ports_a), (device_b, ports_b), fixture_ids = _seed_fixture_devices(
+        pw_page, MIN_PORTS
     )
     notes = f"e2e-pw-bulk-{int(time.time() * 1000)}"
     created_ids = []
@@ -138,7 +262,7 @@ def test_bulk_connection_create(pw_page):
         # arbitration), and a Playwright click delivers mousedown plus mouseup,
         # so a click stages a line. Staging explicitly rather than via "Connect
         # 1:1 in order" keeps the expected count fixed: 1:1 pairs EVERY free
-        # port, and seeded switches carry dozens.
+        # port, and each fixture device carries exactly MIN_PORTS.
         free_a, free_b = _free_port_pairs(dialog, ports_a, ports_b, STAGED_LINES)
         for port_a, port_b in zip(free_a, free_b):
             dialog.get_by_test_id(f"port-row-{port_a['id']}").click()
@@ -191,6 +315,7 @@ def test_bulk_connection_create(pw_page):
                 pw_page, "GET", f"/cabling/connections/{connection_id}", allow_errors=True
             )
             assert gone.status_code == 404, "cleanup left a connection behind"
+        _cleanup_fixture_devices(pw_page, fixture_ids)
 
 
 def test_bulk_partial_success_keeps_rejected_line_staged(pw_page):
@@ -205,8 +330,8 @@ def test_bulk_partial_success_keeps_rejected_line_staged(pw_page):
     rather than produce the partial success under test here.
     """
     pw_login(pw_page)
-    (device_a, ports_a), (device_b, ports_b) = pw_two_devices_with_ports(
-        pw_page, min_ports=MIN_PORTS
+    (device_a, ports_a), (device_b, ports_b), fixture_ids = _seed_fixture_devices(
+        pw_page, MIN_PORTS
     )
     notes = f"e2e-pw-bulk-partial-{int(time.time() * 1000)}"
 
@@ -268,3 +393,4 @@ def test_bulk_partial_success_keeps_rejected_line_staged(pw_page):
     finally:
         pw_page.unroute("**/api/cabling/connections/bulk")
         _cleanup(pw_page, notes)
+        _cleanup_fixture_devices(pw_page, fixture_ids)
