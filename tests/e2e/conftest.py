@@ -5,8 +5,10 @@ so it reaches the app via the Traefik container hostname.
 Tests connect to the remote WebDriver at http://localhost:4444.
 """
 
+import io
 import os
 import re
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -517,6 +519,45 @@ def api_request(driver, method, path, **kwargs):
     if not allow_errors:
         resp.raise_for_status()
     return resp
+
+
+def driver_tarball() -> bytes:
+    """A minimal no-op Management driver, enough to back a device template.
+
+    Shared by every test module that only needs a template's driver_id
+    requirement satisfied, not real device behavior: the produced package
+    never provisions anything (its Driver class has no methods), so it is
+    cabling/validate-safe only. Was duplicated byte-for-byte across
+    test_tier2_playwright.py, test_topology_validator.py, and
+    test_connections_bulk_playwright.py before being hoisted here (#670
+    review).
+    """
+    body = b"class Driver:\n    pass\n"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo("driver.py")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+def log_cleanup_failure(resource: str, resource_id: str, resp) -> None:
+    """Print a non-2xx cleanup response instead of letting allow_errors=True hide it.
+
+    Best-effort cleanup (allow_errors=True) must never mask the test's real
+    failure by raising during teardown, but silently swallowing a non-2xx
+    DELETE (a 409 from another service's reverse-reference guard, a 503 from
+    a dependency being unreachable, ...) leaves the resource on the shared
+    stack with no trace. This keeps the best-effort semantics and makes the
+    leak visible in the run's output instead. `resp` need only expose
+    `.status_code` and `.text`, so this serves both the httpx responses
+    api_request/pw_api return and any requests-shaped equivalent. Was
+    duplicated byte-for-byte across test_topology_validator.py and
+    test_connections_bulk_playwright.py before being hoisted here (#670
+    review).
+    """
+    if resp.status_code // 100 != 2:
+        print(f"cleanup left {resource} {resource_id} behind: {resp.status_code} {resp.text}")
 
 
 def open_admin_menu(driver):

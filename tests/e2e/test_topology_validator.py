@@ -19,7 +19,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .conftest import api_request
+from .conftest import api_request, driver_tarball, log_cleanup_failure
 
 WAIT = 20
 
@@ -54,6 +54,27 @@ def _canvas_with_edge(device_a: dict, device_b: dict) -> dict:
     }
 
 
+def _cleanup_validator_fixtures(
+    driver, device_ids: list[str], template_id: str | None, driver_id: str | None
+) -> None:
+    """Delete devices, then template, then driver: the dependency order every
+    creation path below reverses. Called both from the fixture's post-yield
+    teardown and from every mid-sequence failure path, so a partial seed
+    never leaks past whatever was actually created.
+    """
+    for device_id in device_ids:
+        resp = api_request(driver, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
+        log_cleanup_failure("device", device_id, resp)
+    if template_id:
+        resp = api_request(
+            driver, "DELETE", f"/inventory/templates/{template_id}", allow_errors=True
+        )
+        log_cleanup_failure("template", template_id, resp)
+    if driver_id:
+        resp = api_request(driver, "DELETE", f"/inventory/drivers/{driver_id}", allow_errors=True)
+        log_cleanup_failure("driver", driver_id, resp)
+
+
 @pytest.fixture(scope="module")
 def two_seeded_devices(logged_in_browser, base_url):
     """Provision two fresh devices guaranteed to start with no cabling.
@@ -62,52 +83,88 @@ def two_seeded_devices(logged_in_browser, base_url):
     connections), so two arbitrary picks are usually already reachable through
     the switch tier. Creating new devices skips the fabric entirely, which is
     what the negative test needs.
+
+    The device template is created here rather than picked from whatever the
+    stack already has (issue #670): `tmpls[0]` depends on seed/list-order,
+    and device create validates any field_data against the picked TEMPLATE's
+    own field list (inventory_service.validate_field_data), not a fixed
+    schema, so an arbitrary existing template's fields are unpredictable. A
+    dedicated throwaway template with an empty field list sidesteps that
+    entirely: field_data is simply omitted, since nothing here reads it back
+    (only device id/name matter to the canvas and cabling calls below),
+    mirroring the port template in test_connections_bulk_playwright.py's
+    bulk_fixture_devices. The driver package itself is a no-op stub
+    (conftest.driver_tarball): cabling/validate-safe only, since nothing here
+    provisions through it.
     """
     logged_in_browser.get(f"{base_url}/topology")
     WebDriverWait(logged_in_browser, WAIT).until(
         EC.presence_of_element_located((By.TAG_NAME, "body"))
     )
 
+    suffix = uuid.uuid4().hex[:10]
+    driver_id: str | None = None
+    template_id: str | None = None
+    created: list[dict] = []
+
+    files = {"file": ("e2e-validator-driver.tar.gz", driver_tarball(), "application/gzip")}
+    data = {
+        "name": f"e2e-validator-drv-{suffix}",
+        "connection_type": "Management",
+        "description": "topology validator e2e test driver",
+    }
+    driver_resp = api_request(
+        logged_in_browser, "POST", "/inventory/drivers", files=files, data=data, allow_errors=True
+    )
+    if driver_resp.status_code != 201:
+        pytest.skip(
+            f"could not upload throwaway driver: {driver_resp.status_code} {driver_resp.text}"
+        )
+    driver_id = driver_resp.json()["id"]
+
     tmpl_resp = api_request(
         logged_in_browser,
-        "GET",
-        "/inventory/templates?template_type=device&limit=1",
+        "POST",
+        "/inventory/templates",
+        json={
+            "name": f"e2e-validator-tmpl-{suffix}",
+            "template_type": "device",
+            "driver_id": driver_id,
+            "vendor": "e2e-validator",
+            "model": "fixture",
+            "sections": [{"name": "General", "fields": []}],
+        },
         allow_errors=True,
     )
-    if tmpl_resp.status_code != 200:
-        pytest.skip(f"could not list templates: {tmpl_resp.status_code} {tmpl_resp.text}")
-    tmpls = tmpl_resp.json().get("items") or []
-    if not tmpls:
-        pytest.skip("validator UI tests need at least one device template")
-    template_id = tmpls[0]["id"]
+    if tmpl_resp.status_code != 201:
+        _cleanup_validator_fixtures(logged_in_browser, [], None, driver_id)
+        pytest.skip(
+            f"could not create throwaway template: {tmpl_resp.status_code} {tmpl_resp.text}"
+        )
+    template_id = tmpl_resp.json()["id"]
 
-    created: list[dict] = []
-    for i in range(2):
+    for _ in range(2):
         body = {
             "name": f"e2e-validator-{uuid.uuid4().hex[:10]}",
             "template_id": template_id,
             "topology_type": "PHYSICAL",
             "status": "AVAILABLE",
-            "field_data": {"ip": f"10.0.{i}.1", "login": "admin", "password": "admin123"},
         }
         resp = api_request(
             logged_in_browser, "POST", "/inventory/devices", json=body, allow_errors=True
         )
         if resp.status_code != 201:
-            for d in created:
-                api_request(
-                    logged_in_browser,
-                    "DELETE",
-                    f"/inventory/devices/{d['id']}",
-                    allow_errors=True,
-                )
+            _cleanup_validator_fixtures(
+                logged_in_browser, [d["id"] for d in created], template_id, driver_id
+            )
             pytest.skip(f"could not provision fresh device: {resp.status_code} {resp.text}")
         created.append(resp.json())
 
     yield created[0], created[1]
 
-    for d in created:
-        api_request(logged_in_browser, "DELETE", f"/inventory/devices/{d['id']}", allow_errors=True)
+    _cleanup_validator_fixtures(
+        logged_in_browser, [d["id"] for d in created], template_id, driver_id
+    )
 
 
 def _make_seeded_topology(driver, device_a: dict, device_b: dict) -> dict:
