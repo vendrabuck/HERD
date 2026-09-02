@@ -107,6 +107,28 @@ jobs:
       - name: Postgres-live LDAP sync tests
         run: make _gate-pg-live-tests
 
+      # Issue #648: collected BEFORE "Stop LDAP test server" on purpose. That
+      # step runs unconditionally (if: always()) and tears down the ldap-test
+      # container, so collecting after it would mean an LDAP-phase failure
+      # could never show ldap-test's state or logs in the snapshot. Same
+      # shared Makefile collector as the CI integration job (_collect-
+      # stack-diagnostics), so the two jobs cannot drift apart.
+      - name: Collect stack diagnostics
+        if: failure()
+        run: make _collect-stack-diagnostics
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-failure-artifacts
+          path: |
+            compose-ps.txt
+            docker-ps-a.txt
+            compose-logs.txt
+            logs-*.txt
+          retention-days: 7
+
       - name: Stop LDAP test server
         if: always()
         run: make ldap-down
@@ -119,23 +141,3 @@ jobs:
 
       - name: Load test (locust, headless)
         run: HERD_BASE_URL=https://localhost make test-load
-
-      # Issue #648: same container-state-plus-logs split as the CI
-      # integration job, so a nightly failure gets the same diagnostics.
-      - name: Collect stack diagnostics
-        if: failure()
-        run: |
-          docker compose ps > compose-ps.txt
-          docker ps -a > docker-ps-a.txt
-          docker compose logs --no-color --timestamps > compose-logs.txt
-
-      - name: Upload failure artifacts
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: nightly-failure-artifacts
-          path: |
-            compose-ps.txt
-            docker-ps-a.txt
-            compose-logs.txt
-          retention-days: 7

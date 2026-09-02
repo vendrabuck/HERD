@@ -190,12 +190,12 @@ jobs:
       # (a crash-looping or still-starting container) do not show up in a
       # plain log tail at all. Container state plus per-service logs, split
       # into separate files so a reader is not stuck grepping one 2MB blob.
+      # The collector itself lives once in the Makefile's
+      # _collect-stack-diagnostics target, shared with nightly.yml, so the
+      # two cannot drift apart.
       - name: Collect stack diagnostics
         if: failure()
-        run: |
-          docker compose ps > compose-ps.txt
-          docker ps -a > docker-ps-a.txt
-          docker compose logs --no-color --timestamps > compose-logs.txt
+        run: make _collect-stack-diagnostics
 
       - name: Upload stack diagnostics
         if: failure()
@@ -206,4 +206,5 @@ jobs:
             compose-ps.txt
             docker-ps-a.txt
             compose-logs.txt
+            logs-*.txt
           retention-days: 7

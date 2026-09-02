@@ -52,7 +52,8 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
-	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run
+	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run \
+	_collect-stack-diagnostics
 
 ## --- Meta ---
 
@@ -449,6 +450,29 @@ test-e2e-seeded:  ## Run e2e tests against a seeded stack; fails if any test ski
 
 test-e2e-stop:  ## Stop and remove the e2e Selenium container
 	-docker compose --profile e2e rm -fsv selenium
+
+# Failure diagnostics collector (issue #648), shared by ci.yml's integration
+# job and nightly.yml's full-stack job so the collection logic lives once and
+# the two cannot drift apart. DIAG_DIR is where the files land (a caller sets
+# it to an absolute or workflow-relative path; default is the cwd). Every
+# collector line ends in `|| true`: the default Actions shell is `bash -e`,
+# so a wedged daemon failing the first command would otherwise skip every
+# collector after it, and each destination is created by its own redirect
+# regardless. `docker compose ps -a` (not the bare form) is deliberate: an
+# exited/crashed container is the state this step most needs to catch, and
+# the bare form omits it. Per-service log files come from the same `-a`
+# services listing so a container that already exited still gets its own
+# file. This target must not depend on why the caller failed; it only reads
+# current Docker/compose state.
+DIAG_DIR ?= .
+_collect-stack-diagnostics:
+	mkdir -p $(DIAG_DIR)
+	docker compose ps -a > $(DIAG_DIR)/compose-ps.txt || true
+	docker ps -a > $(DIAG_DIR)/docker-ps-a.txt || true
+	docker compose logs --no-color --timestamps > $(DIAG_DIR)/compose-logs.txt || true
+	for svc in $$(docker compose ps --services -a 2>/dev/null); do \
+		docker compose logs --no-color --timestamps "$$svc" > "$(DIAG_DIR)/logs-$$svc.txt" || true; \
+	done
 
 # -- LDAP test server (infra/ldap-test) ---------------------------------------
 #
