@@ -107,10 +107,27 @@ jobs:
       - name: Postgres-live LDAP sync tests
         run: make _gate-pg-live-tests
 
-      # Issue #648: collected BEFORE "Stop LDAP test server" on purpose. That
-      # step runs unconditionally (if: always()) and tears down the ldap-test
-      # container, so collecting after it would mean an LDAP-phase failure
-      # could never show ldap-test's state or logs in the snapshot. Same
+      - name: Seed stack for load test
+        run: make seed
+
+      - name: E2E tests (seeded, no skips allowed)
+        run: make test-e2e-seeded
+
+      - name: Load test (locust, headless)
+        run: HERD_BASE_URL=https://localhost make test-load
+
+      # Issue #648: this ordering is an invariant in both directions. It must
+      # come AFTER every test phase it is meant to cover (an `if: failure()`
+      # step is evaluated at its own position in the sequence; if nothing has
+      # failed yet by the time the runner reaches it, it is skipped and never
+      # revisited, so placing it any earlier would leave later phases -- seed,
+      # seeded e2e, load test -- with no diagnostics at all on failure). It
+      # must also come BEFORE "Stop LDAP test server": that step runs
+      # unconditionally (if: always()) and tears down the ldap-test container
+      # regardless of position, so collecting after it would mean an
+      # LDAP-phase failure could never show ldap-test's state or logs in the
+      # snapshot. Nothing between the Postgres-live phase and the load test
+      # needs the LDAP container, so it stays up, unused, until here. Same
       # shared Makefile collector as the CI integration job (_collect-
       # stack-diagnostics), so the two jobs cannot drift apart.
       - name: Collect stack diagnostics
@@ -132,12 +149,3 @@ jobs:
       - name: Stop LDAP test server
         if: always()
         run: make ldap-down
-
-      - name: Seed stack for load test
-        run: make seed
-
-      - name: E2E tests (seeded, no skips allowed)
-        run: make test-e2e-seeded
-
-      - name: Load test (locust, headless)
-        run: HERD_BASE_URL=https://localhost make test-load
