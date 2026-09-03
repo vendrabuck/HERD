@@ -863,7 +863,8 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
             admin_client, reservation_id, fork_version, timeout=10.0
         )
         assert version_caught_up, (
-            "execution's ledger did not catch up to the fork version within the timeout"
+            "execution's ledger did not catch up to the fork version within the timeout: "
+            f"{await _wiring_status(admin_client, reservation_id)}"
         )
 
         post_heal_status = await _wiring_status(admin_client, reservation_id)
