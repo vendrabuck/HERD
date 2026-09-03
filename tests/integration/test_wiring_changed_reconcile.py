@@ -849,10 +849,25 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
         )
         assert active is not None, "the delta-less heal never converged the wiring to ACTIVE"
 
-        post_heal_status = await _wiring_status(admin_client, reservation_id)
-        assert post_heal_status.get("last_applied_fork_version") == fork_version, (
-            f"execution's ledger did not catch up to the fork version: {post_heal_status}"
+        # The ACTIVE L1 row and the last_applied_fork_version stamp are two
+        # separate commits in handle_wiring_changed: _apply_wiring_pairs commits
+        # the L1 row first, then the L2/L3 passes run, then stamp_last_applied
+        # commits last (stamp-after-apply is load-bearing for crash safety). A
+        # single unpolled read can land in that window and see the ACTIVE row
+        # with last_applied_fork_version still None, which is what happened in
+        # nightly run 33755501217 (2026-09-03): the ACTIVE row landed at
+        # 12:40:38.003, the ACTIVE poll above read it at 12:40:38.014, but the
+        # stamp did not commit until 12:40:38.034, 31 ms later. Poll the ledger
+        # stamp independently rather than reading it once.
+        version_caught_up = await _poll_wiring_version(
+            admin_client, reservation_id, fork_version, timeout=10.0
         )
+        assert version_caught_up, (
+            "execution's ledger did not catch up to the fork version within the timeout: "
+            f"{await _wiring_status(admin_client, reservation_id)}"
+        )
+
+        post_heal_status = await _wiring_status(admin_client, reservation_id)
         active_rows = [c for c in post_heal_status["connections"] if c["status"] == "ACTIVE"]
         assert len(active_rows) == 1, (
             f"expected exactly one converged L1 cross-connect, got: {active_rows}"
