@@ -52,7 +52,6 @@ NATS_HEARTBEAT_SECONDS = NATS_ACK_WAIT_SECONDS // 2
 # Pull-consumer fetch tuning. A pull consumer re-establishes on the next fetch
 # after a broker reconnect, which a push subscription does not do reliably, so it
 # survives a NATS restart (issue #21).
-NATS_FETCH_BATCH = 10
 NATS_FETCH_TIMEOUT_SECONDS = 5
 # DLQ subject is 4 tokens so the consumer's 3-token "herd.reservations.*" filter
 # (single-token wildcard matches exactly one token) does NOT match it. If it did,
@@ -3755,7 +3754,14 @@ async def start_nats_consumer(app) -> None:
         async def _consumer_loop():
             while True:
                 try:
-                    msgs = await psub.fetch(NATS_FETCH_BATCH, timeout=NATS_FETCH_TIMEOUT_SECONDS)
+                    # batch is deliberately 1: nats-py's multi-message fetch holds
+                    # already-received messages until the batch fills or the
+                    # deadline expires, which added up to NATS_FETCH_TIMEOUT_SECONDS
+                    # of latency to every event (issue #648); the batch=1 path
+                    # returns the first message immediately. Do not "optimize"
+                    # this back to a batch without a pull API that returns
+                    # partial batches promptly.
+                    msgs = await psub.fetch(1, timeout=NATS_FETCH_TIMEOUT_SECONDS)
                 except asyncio.CancelledError:
                     raise
                 except (nats.errors.TimeoutError, asyncio.TimeoutError):

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- Fixed the notifications, execution, and integration NATS pull consumers to
+  fetch one message per pull instead of a batch of 10, so nats-py can no
+  longer hold an already-delivered message for up to the fetch timeout while
+  waiting for the rest of a batch that never fills (issue #648).
+
 ## [0.3.0] - 2026-08-30
 
 - Shipped LDAP directory group sync end to end (ADR 0011): a directory group
