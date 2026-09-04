@@ -472,6 +472,10 @@ function TopologyEditorInner() {
     Array<{ id: string; status: string; end_time?: string }> | undefined
   >(undefined);
   const initializedRef = useRef(false);
+  // Bumped on every preview request and on exit/restore, so a slow hydration
+  // from a superseded or exited preview can never clobber the store after the
+  // fact (issue #627).
+  const previewRequestRef = useRef(0);
   const restoreVersion = useRestoreVersion(id);
   const createTemplate = useCreateTemplateFromTopology();
 
@@ -1016,6 +1020,10 @@ function TopologyEditorInner() {
   const handlePreviewVersion = useCallback(
     async (version: TopologyVersion) => {
       if (!id) return;
+      // Invalidate any hydration still in flight for a prior preview request,
+      // so an earlier version's slow fetch can never win a race against this
+      // one and clobber the canvas it just finished loading.
+      const token = ++previewRequestRef.current;
       if (!preservedBeforePreview) {
         setPreservedBeforePreview({ nodes, edges, selectedEdgeLayer });
       }
@@ -1039,8 +1047,17 @@ function TopologyEditorInner() {
             data: { ...((e.data as LayerEdgeData | undefined) ?? { layer: "L1" }), isProposal: true },
           })),
         };
-        loadCanvas(ghostCanvas);
-        setPreviewVersion(version);
+        // Route through hydrateAndLoadCanvas (issue #627), not a raw
+        // loadCanvas: a version's canvas_data comes straight off the server
+        // and can carry thin nodes (`{ device: { id } }` with no name or
+        // topology_type), exactly like the fork-history preview this
+        // mirrors. Hydration is async, so guard the eventual loadCanvas (and
+        // the previewVersion flip below) with the token: if this request has
+        // since been superseded or exited, its result must be dropped.
+        await hydrateAndLoadCanvas(ghostCanvas, (hydrated) => {
+          if (previewRequestRef.current === token) loadCanvas(hydrated);
+        });
+        if (previewRequestRef.current === token) setPreviewVersion(version);
       } catch {
         toast.error("Failed to load version");
       }
@@ -1049,6 +1066,9 @@ function TopologyEditorInner() {
   );
 
   const handleExitPreview = useCallback(() => {
+    // Invalidate any preview hydration still in flight before restoring the
+    // preserved canvas, so a late result cannot land after exit (issue #627).
+    previewRequestRef.current += 1;
     if (preservedBeforePreview) {
       loadCanvas(preservedBeforePreview);
     }
@@ -1067,6 +1087,10 @@ function TopologyEditorInner() {
             restore_name: restoreName,
           },
         });
+        // Invalidate any preview hydration still in flight before loading the
+        // restored canvas, so a late preview result cannot land after it
+        // (issue #627).
+        previewRequestRef.current += 1;
         if (updated.canvas_data) {
           loadCanvas(updated.canvas_data);
         }
