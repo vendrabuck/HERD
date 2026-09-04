@@ -56,12 +56,26 @@ def _check_internal_token(token: str) -> None:
         raise HTTPException(status_code=403, detail="Invalid internal token")
 
 
-async def _load_fork(db: AsyncSession, reservation_id: uuid.UUID) -> ReservationFork:
-    fork = (
-        await db.execute(
-            select(ReservationFork).where(ReservationFork.reservation_id == reservation_id)
-        )
-    ).scalar_one_or_none()
+async def _load_fork(
+    db: AsyncSession, reservation_id: uuid.UUID, *, for_update: bool = False
+) -> ReservationFork:
+    """Load the fork row for a reservation, optionally under a row lock.
+
+    Issue #626: restore and save both read-modify-write draft_restored_from_id
+    and canvas_data with no coordination, so a restore that commits between a
+    save's read and its commit is silently overwritten by the save's stale
+    in-memory copy. The invariant is that a restore marker is either consumed by
+    exactly one appended fork_versions row or still present on the fork row,
+    never lost. ``for_update=True`` takes ``FOR UPDATE`` on the row (SQLAlchemy
+    only emits it on dialects that support it, so this is a no-op on the SQLite
+    engine the unit suites use); every writer that passes it must hold the lock
+    from this load through its own final commit or rollback, not release and
+    reacquire mid-request. GET routes never pass it: they only read.
+    """
+    stmt = select(ReservationFork).where(ReservationFork.reservation_id == reservation_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    fork = (await db.execute(stmt)).scalar_one_or_none()
     if fork is None:
         raise HTTPException(status_code=404, detail="Fork not found")
     return fork
@@ -304,9 +318,15 @@ async def restore_fork_version_internal(
     wired until the caller runs the existing save-reconcile endpoint. 404 when the
     fork or the version (scoped to that fork) does not exist; 409 when the fork is
     ARCHIVED, the same wording as the loose canvas PUT and the save endpoint.
+
+    Loads the fork row FOR UPDATE (issue #626): without a lock, a save racing this
+    restore between its own load and its own commit can overwrite this restore's
+    fresh marker with the save's stale, already-cleared copy, silently losing it.
+    Holding the row lock from this load through commit serializes against a
+    concurrent save's own locked load.
     """
     _check_internal_token(x_internal_token)
-    fork = await _load_fork(db, reservation_id)
+    fork = await _load_fork(db, reservation_id, for_update=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
     version = await _load_fork_version(db, fork.id, version_id)
@@ -348,9 +368,14 @@ async def update_fork_canvas_internal(
     draft_restored_from_id either way (issue #622): editing a canvas that was just
     restored leaves the marker in place, since the user is still editing the restored
     draft and only a save consumes it.
+
+    Loads the fork row FOR UPDATE (issue #626): this writes canvas_data after a
+    plain load same as the other mutators, so it is locked for consistency even
+    though it never touches draft_restored_from_id and the canvas itself stays
+    last-writer-wins by design.
     """
     _check_internal_token(x_internal_token)
-    fork = await _load_fork(db, reservation_id)
+    fork = await _load_fork(db, reservation_id, for_update=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
@@ -390,9 +415,15 @@ async def save_fork_internal(
     it as its own restored_from_id, and the fork-row marker is cleared in the same
     transaction (see save_fork in fork_save_service.py). A save with no pending restore
     just appends restored_from_id=None as before.
+
+    Loads the fork row FOR UPDATE (issue #626): without a lock, this save can read
+    the marker, decide to clear it, and then commit after a concurrent restore has
+    set a fresh one, dropping the restore's marker on the floor. The lock is held
+    from this load through the final commit inside commit_fork_with_new_version's
+    retry loop, serializing against a concurrent restore's own locked load.
     """
     _check_internal_token(x_internal_token)
-    fork = await _load_fork(db, reservation_id)
+    fork = await _load_fork(db, reservation_id, for_update=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
@@ -431,9 +462,18 @@ async def prune_fork_devices_internal(
     nothing, so no port-claim 409 is possible (issue #462); the only 409 is an
     ARCHIVED fork, whose release the terminal teardown owns. Idempotent: a replay
     releases nothing and reports changed false with no version appended.
+
+    Loads the fork row FOR UPDATE (issue #626): this appends a fork_versions row
+    through the same commit_fork_with_new_version retry loop as save, so an
+    unlocked prune racing a locked save could still force save into a
+    version-conflict retry; the retry rolls back and reapplies save's own captured
+    field values without reacquiring the lock, which reopens the exact window a
+    concurrent restore could land in. Locking every writer that can append a
+    fork_versions row removes the only source of that retry for a shared fork, so
+    the retry path is effectively unreachable here in normal operation.
     """
     _check_internal_token(x_internal_token)
-    fork = await _load_fork(db, reservation_id)
+    fork = await _load_fork(db, reservation_id, for_update=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 

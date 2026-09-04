@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Fixed a race where a fork restore committing between a save's read and its
+  commit could have its restore-to-draft marker silently dropped by the
+  save's stale in-memory copy: every fork-mutating route (restore, the loose
+  canvas PUT, save, and prune-devices) now loads the fork row under
+  `SELECT ... FOR UPDATE`, held through its own commit or rollback, so the
+  writers serialize instead of racing (issue #626).
 - Fixed the notifications, execution, and integration NATS pull consumers to
   fetch one message per pull instead of a batch of 10, so nats-py can no
   longer hold an already-delivered message for up to the fetch timeout while
