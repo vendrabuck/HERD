@@ -49,6 +49,7 @@ def _sample_internal(reservation_id: str | None = None) -> dict:
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
         "modified_by": None,
+        "purpose_category": None,
     }
 
 
@@ -119,9 +120,62 @@ async def test_create_forwards_jwt_and_translated_body(monkeypatch):
         "start_time",
         "end_time",
         "created_at",
+        "purpose_category",
     }
     assert data["id"] == internal["id"]
     assert data["status"] == "PENDING"
+
+
+async def test_create_forwards_and_returns_purpose_category(monkeypatch):
+    """purpose_category (issue #646 phase 1) round-trips through the facade
+    both directions: forwarded on create, and echoed back in the v1 view."""
+    internal = _sample_internal()
+    internal["purpose_category"] = "qa_regression"
+
+    def handler(method, url, headers, json, params):
+        assert method == "POST"
+        return httpx.Response(201, json=internal)
+
+    _install_handler(monkeypatch, handler)
+    now = datetime.now(timezone.utc)
+    body = {
+        "device_ids": [str(uuid.uuid4())],
+        "start_time": now.isoformat(),
+        "end_time": (now + timedelta(hours=2)).isoformat(),
+        "purpose": "lab work",
+        "purpose_category": "qa_regression",
+    }
+    async with _client() as c:
+        resp = await c.post("/reservations", json=body, headers=_auth(_token()))
+
+    assert resp.status_code == 201
+    # Forwarded to the upstream create body.
+    assert CAPTURED["json"]["purpose_category"] == "qa_regression"
+    # Echoed back in the v1 response.
+    assert resp.json()["purpose_category"] == "qa_regression"
+
+
+async def test_create_purpose_category_defaults_to_none(monkeypatch):
+    """Omitting purpose_category forwards None rather than a missing key, and
+    the v1 response carries None back when the upstream reports unclassified."""
+    internal = _sample_internal()
+
+    def handler(method, url, headers, json, params):
+        return httpx.Response(201, json=internal)
+
+    _install_handler(monkeypatch, handler)
+    now = datetime.now(timezone.utc)
+    body = {
+        "device_ids": [str(uuid.uuid4())],
+        "start_time": now.isoformat(),
+        "end_time": (now + timedelta(hours=2)).isoformat(),
+    }
+    async with _client() as c:
+        resp = await c.post("/reservations", json=body, headers=_auth(_token()))
+
+    assert resp.status_code == 201
+    assert CAPTURED["json"]["purpose_category"] is None
+    assert resp.json()["purpose_category"] is None
 
 
 async def test_list_maps_to_v1_paginated(monkeypatch):
@@ -147,6 +201,7 @@ async def test_list_maps_to_v1_paginated(monkeypatch):
         "start_time",
         "end_time",
         "created_at",
+        "purpose_category",
     }
 
 
