@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Purpose review (admin)</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html" class="active">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="release-0-3-0.html">Release 0.3.0</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#where">Where it lives</a></li>
+      <li><a href="#states">The three states</a></li>
+      <li><a href="#queue">The review queue</a></li>
+      <li><a href="#actions">Accept, accept as, dismiss</a></li>
+      <li><a href="#backfill">Classify history</a></li>
+    </ul>
+    <p class="eyebrow">Admin track</p>
+    <ul>
+      <li><a href="admin-setup.html">A · First-day setup</a></li>
+      <li><a href="admin-equipment.html">B · Equipment &amp; cabling</a></li>
+      <li><a href="admin-health-config.html">C · Health &amp; config</a></li>
+      <li><a href="admin-reporting.html">D · Reporting</a></li>
+      <li><a href="admin-ldap-sync.html">E · LDAP sync</a></li>
+      <li><a href="admin-purpose-review.html" class="active">F · Purpose review</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker admin">Admin track · Setup F</span>
+    <h1 class="title">Purpose review</h1>
+    <p class="dek">Reservations owners rarely bother filling in a purpose category by hand for every booking. Purpose review is where the AI's guesses at reservation creation and end of use wait for a human to accept, override, or dismiss them before they count toward the numbers leadership sees.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The shape of this</div>
+      <p>A category an owner or admin <strong>picks by hand</strong> is confirmed immediately, no review needed. A category the <strong>AI proposes</strong> only ever becomes a <em>suggestion</em>: it never writes itself into the reservation. This page is where a suggestion turns into a confirmed category, or gets dismissed. Nothing here changes automatically without an admin clicking something.</p>
+    </div>
+
+    <h2 class="sec" id="where">Finding it</h2>
+    <p class="sectitle">Where it lives</p>
+    <p>Go to <b>Administration &rarr; Purpose Review</b> (<code>/admin/purpose-review</code>). It is admin only. The page depends on your admin having turned on AI purpose classification (<code>AI_PURPOSE_CLASSIFICATION_ENABLED</code>) and having a working AI provider configured; if either is off, nothing ever lands here because the two classification passes described below never run. Manual, hand-picked categories keep working from the reservation create and detail modals regardless &mdash; see <a href="user-reservations.html#create">Reservations</a>.</p>
+
+    <h2 class="sec" id="states">Step one</h2>
+    <p class="sectitle">The three states</p>
+    <p>Every reservation's purpose sits in exactly one of three states, and none of them is a stored column by itself &mdash; they are read off <code>purpose_category</code> and the stored suggestion:</p>
+    <ul class="list">
+      <li><b>Unclassified.</b> No confirmed category, no AI suggestion. Genuinely untouched.</li>
+      <li><b>AI-suggested.</b> No confirmed category yet, but a suggestion exists: a distribution of categories with percentages, produced either at reservation creation (a live preview while the form is open) or at reservation end (a background pass once the reservation goes terminal). Reports in its own bucket on the <a href="admin-reporting.html">Reporting</a> page, never mixed into confirmed totals.</li>
+      <li><b>Confirmed.</b> An owner or admin has set <code>purpose_category</code>, by hand or by accepting a suggestion here. This is the only state the reporting page's main Purpose chart counts.</li>
+    </ul>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>A confirmed reservation can still carry a suggestion underneath (kept for reference, e.g. to see how often the AI and the owner agree), but reporting only ever counts its confirmed value once a category is set.</p></div>
+    </div>
+
+    <h2 class="sec" id="queue">Step two</h2>
+    <p class="sectitle">The review queue</p>
+    <p>The page groups reservations by their suggestion's top category into collapsible cards, each showing a count. A reservation appears here only while it is genuinely worth a look:</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/admin/purpose-review</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a><a class="active">Administration</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
+            <div class="hd-body">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 14px;">
+                <div class="hd-h1" style="margin:0;">Purpose Review</div>
+                <span class="hd-btn primary sm" data-anno="1" data-anno-pin="l" data-anno-arrow>Classify history</span>
+              </div>
+              <div class="hd-card" style="margin-bottom:16px;">
+                <div class="head">QA regression <span style="color:var(--gray-500);font-weight:400;">3</span></div>
+                <table class="hd-table">
+                  <thead><tr><th>Purpose</th><th>Owner</th><th>Dates</th><th>Suggestion</th><th data-anno="2" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Actions</th></tr></thead>
+                  <tbody>
+                    <tr><td>4.2 regression pass</td><td class="name">sara.k</td><td style="color:var(--gray-500)">08-28 &rarr; 08-29</td><td>QA regression 71%</td><td style="color:var(--blue-700);font-size:12px;">Accept &middot; Accept as &middot; Dismiss</td></tr>
+                    <tr data-anno="3" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><td>nightly HA suite</td><td class="name">dmitri.r</td><td style="color:var(--gray-500)">08-30 &rarr; 08-31</td><td>QA regression 64%</td><td style="color:var(--blue-700);font-size:12px;">Accept &middot; Accept as &middot; Dismiss</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="hd-card">
+                <div class="head">Support case replication <span style="color:var(--gray-500);font-weight:400;">1</span></div>
+                <table class="hd-table">
+                  <thead><tr><th>Purpose</th><th>Owner</th><th>Dates</th><th>Suggestion</th><th>Actions</th></tr></thead>
+                  <tbody>
+                    <tr><td>repro for CASE-4821</td><td class="name">li.wei</td><td style="color:var(--gray-500)">08-27 &rarr; 08-27</td><td>Support case replication 58%</td><td style="color:var(--blue-700);font-size:12px;">Accept &middot; Accept as &middot; Dismiss</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The Purpose Review page</b> (Administration &rarr; Purpose Review): grouped by top suggested category, oldest cards expanded by default.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Classify history.</b> The backfill action; see below.</li>
+      <li><b>A category group.</b> Every reservation whose top suggestion is this category, with a count.</li>
+      <li><b>A queue row.</b> Purpose text, owner, dates, status, any confirmed category already set, the top-three suggested categories as percentage chips (the model's rationale shows as a tooltip), and the row actions.</li>
+    </ol>
+
+    <p>A row shows up here only if it has an undismissed suggestion AND either has no confirmed category yet, or has a confirmed category that <em>disagrees</em> with the suggestion's top pick, so an admin can also catch a bad self-classification. A confirmed row that agrees with the AI has nothing left to review and drops out on its own; a dismissed suggestion never resurfaces. The category filter above the list narrows to one suggested category at a time; results page the same way as the other admin tables.</p>
+
+    <h2 class="sec" id="actions">Step three</h2>
+    <p class="sectitle">Accept, accept as, dismiss</p>
+    <ul class="list">
+      <li><b>Accept.</b> Writes the suggestion's own top category into <code>purpose_category</code>, recording you as who set it.</li>
+      <li><b>Accept as&hellip;</b> Pick a different category from the same taxonomy the create modal offers, for when the AI's second- or third-ranked guess (or something it didn't mention at all) is the right call.</li>
+      <li><b>Dismiss.</b> Declines the suggestion without confirming anything. The reservation keeps its AI-suggested state and stays visible in the reporting page's suggested bucket &mdash; dismissing only stops the review queue from surfacing it again. It is not a delete.</li>
+    </ul>
+    <p>Both accept actions can overrule an owner's own pick, too: an admin accepting a different category than what the owner set replaces it, with the admin recorded as who made the change. Every action removes the row from the queue immediately; a failure puts it back with an error toast so nothing silently disappears.</p>
+
+    <h2 class="sec" id="backfill">The catch-up tool</h2>
+    <p class="sectitle">Classify history</p>
+    <p>Reservations that ended before this feature existed, or that a stack outage skipped, never automatically get a suggestion on their own. <b>Classify history</b> marks every terminal reservation (<span class="badge completed">COMPLETED</span>, <span class="badge cancelled">CANCELLED</span>, or <span class="badge failed">FAILED</span>) that has neither a confirmed category nor a suggestion yet as eligible for the same background pass that runs at reservation end, and separately gives a fresh set of attempts to any row that already used up its retries without ever getting a suggestion (a mixed-version deployment where the classify endpoint briefly didn't exist is the usual cause). It reports how many reservations it marked, and running it again once the background pass has caught up reports zero: safe to click more than once.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Marking a reservation eligible does not classify it instantly: it joins the same background queue everything else uses, so suggestions from a large backfill trickle in over the next several sweep ticks rather than appearing all at once.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Purpose review (admin)</p>
+      <div class="pagenav">
+        <a href="admin-ldap-sync.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> LDAP sync</a>
+        <a href="index.html">Home <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+<script src="assets/annotate.js"></script>
+</body>
+</html>

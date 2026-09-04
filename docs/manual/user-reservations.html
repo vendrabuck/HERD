@@ -144,6 +144,11 @@
       <li><b>Purpose category.</b> Optional, separate from the free-text Purpose above: a short, fixed list (QA regression, support case replication, feature development, customer demo/POC, training, performance benchmark, other, or whatever your admin has configured) that the utilization report can chart. Defaults to Unclassified and never blocks submission; you or an admin can set or change it later from the detail modal, in any status.</li>
     </ol>
 
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><span class="ttl">AI suggestion (when your admin has it turned on)</span><p>Once you have typed a few words of purpose or picked a topology, the still-untouched category dropdown prefills itself with the AI's top guess, and a small <b>Suggested: &lt;category&gt; &lt;NN&gt;%</b> line appears underneath with the top three categories as percentage chips. Pick a category yourself at any point and the suggestion stops overwriting it, even if a later, different suggestion comes back. A failed suggestion call just shows a muted "Suggestion unavailable" and never blocks or delays submitting the form. The value you submit, suggested or hand-picked, is recorded as your own choice either way.</p></div>
+    </div>
+
     <div class="callout tip">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
       <div><span class="ttl">Conflict on submit?</span><p>Conflicts aren't caught before you submit; if a device you picked is exclusive and already booked in your window, the reservation is rejected at submit time and HERD tells you <strong>exactly which devices</strong> clashed. Adjust your window (check the <a href="#calendar">calendar</a>) or drop the conflicting device on the topology canvas, then resubmit.</p></div>
@@ -231,7 +236,7 @@
       <li><b>Wiring</b> &mdash; the per-connection status of the L1 wiring HERD applied to the hardware, with a <b>Retry failed</b> action while the reservation is active. Full walkthrough in <a href="user-live-editing.html#wiring">Live editing</a>.</li>
       <li><b>Schedule</b> &mdash; inline-edit the end time and purpose without rebooking.</li>
       <li><b>Dynamic instances</b> &mdash; if the reservation carries dynamic requests, the Details tab lists them grouped by template with a count. The instances themselves appear once the reservation is <span class="badge active">ACTIVE</span>.</li>
-      <li><b>Purpose category</b> &mdash; you (the owner) or an admin can set or change this from the same list of categories offered at creation, in any status including <span class="badge completed">COMPLETED</span>, <span class="badge cancelled">CANCELLED</span>, and <span class="badge failed">FAILED</span>, so past reservations can be classified retroactively. Anyone else sees it as a read-only tag.</li>
+      <li><b>Purpose category</b> &mdash; you (the owner) or an admin can set or change this from the same list of categories offered at creation, in any status including <span class="badge completed">COMPLETED</span>, <span class="badge cancelled">CANCELLED</span>, and <span class="badge failed">FAILED</span>, so past reservations can be classified retroactively. Anyone else sees it as a read-only tag. If the reservation carries an AI suggestion, a muted <b>AI suggested: &lt;category&gt; &lt;NN&gt;%</b> line sits under the category row (the model's reasoning shows as a tooltip on hover), with a "(dismissed)" marker once an admin has dismissed it. This line is read-only here: an admin accepts, overrides, or dismisses a suggestion from the <a href="admin-purpose-review.html">Purpose Review</a> page, not from this modal.</li>
     </ol>
 
     <div class="callout tip">
