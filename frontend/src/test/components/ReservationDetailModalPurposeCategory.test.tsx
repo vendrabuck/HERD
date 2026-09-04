@@ -218,3 +218,49 @@ describe("ReservationDetailModal purpose category", () => {
     );
   });
 });
+
+// AI purpose suggestion display (issue #646 phase 2, ADR 0013 point 9). This
+// modal only ever shows the suggestion read-only; accept/dismiss live on the
+// admin review page (see PurposeReviewPage.test.tsx).
+describe("ReservationDetailModal AI purpose suggestion", () => {
+  const SUGGESTION = {
+    distribution: [
+      { category: "training", probability: 0.65 },
+      { category: "qa_regression", probability: 0.25 },
+      { category: "other", probability: 0.1 },
+    ],
+    top_category: "training",
+    pass: "end" as const,
+    model: "test-model",
+    rationale: "session transcript references onboarding",
+    generated_at: "2026-06-01T12:00:00Z",
+    signals_used: ["purpose_text", "assistant_transcript"],
+  };
+
+  it("renders nothing extra when the reservation carries no suggestion", () => {
+    renderModal(BASE);
+    expect(screen.queryByText(/AI suggested:/)).not.toBeInTheDocument();
+  });
+
+  it("shows the suggestion with its rationale as a title tooltip", () => {
+    renderModal({ ...BASE, purpose_suggestion: SUGGESTION });
+    const line = screen.getByText(/AI suggested: Training 65%/);
+    expect(line).toBeInTheDocument();
+    expect(line).toHaveAttribute("title", SUGGESTION.rationale);
+  });
+
+  it("appends a dismissed marker once purpose_suggestion_dismissed_at is set", () => {
+    renderModal({
+      ...BASE,
+      purpose_suggestion: SUGGESTION,
+      purpose_suggestion_dismissed_at: "2026-06-02T00:00:00Z",
+    });
+    expect(screen.getByText(/AI suggested: Training 65% \(dismissed\)/)).toBeInTheDocument();
+  });
+
+  it("shows the suggestion for a third user too (read-only, same as the tag)", () => {
+    currentUserId = "someone-else";
+    renderModal({ ...BASE, purpose_suggestion: SUGGESTION });
+    expect(screen.getByText(/AI suggested: Training 65%/)).toBeInTheDocument();
+  });
+});
