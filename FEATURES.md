@@ -164,17 +164,34 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   (ADR 0009 Decision 6); removing a device releases its wiring via the fork prune.
 - **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,
   status filters, and click-to-view details.
-- **Lab purpose classification** (Shipped, phase 1): an optional purpose category
-  alongside the existing free-text purpose field, drawn from a configurable
-  taxonomy (`PURPOSE_CATEGORIES`, default qa_regression, support_case_replication,
-  feature_development, customer_demo_poc, training, performance_benchmark, other).
-  The create-reservation modal defaults the select to Unclassified and never blocks
-  submission; the reservation owner or an admin can set or clear it afterward from
-  the detail modal, in any status including terminal ones, so retroactive
-  classification of past reservations is possible. Reporting breaks utilization
-  down by category, by user and category, and by device and category, with an
-  explicit unclassified bucket. AI-suggested classification and an admin review
-  queue are planned for later phases; see
+- **Lab purpose classification** (Shipped, phases 1 and 2): an optional purpose
+  category alongside the existing free-text purpose field, drawn from a
+  configurable taxonomy (`PURPOSE_CATEGORIES`, default qa_regression,
+  support_case_replication, feature_development, customer_demo_poc, training,
+  performance_benchmark, other). The create-reservation modal defaults the
+  select to Unclassified and never blocks submission; the reservation owner or
+  an admin can set or clear it afterward from the detail modal, in any status
+  including terminal ones, so retroactive classification of past reservations
+  is possible. Reporting breaks utilization down by category, by user and
+  category, and by device and category, with an explicit unclassified bucket.
+  Phase 2 adds AI suggestion on top: the create modal calls the AI orchestrator
+  for a live preview once enough purpose text or a topology is present, and
+  prefills the still-untouched category select with the top result and its
+  percentage; a background reconciler in the reservations expiration sweep
+  classifies every reservation again at completion, cancellation, or failure,
+  storing the result as a suggestion rather than writing it directly. A
+  category an owner sets by hand is confirmed as is; an AI suggestion waits on
+  the admin-only Purpose Review page (`/admin/purpose-review`), grouped by top
+  suggested category, until an admin accepts (the top category or a chosen
+  override), dismisses, or overrules an owner's pick; a **Classify history**
+  action backfills suggestions for terminal reservations that predate the
+  feature. Suggested-but-unconfirmed rows report in their own
+  `by_purpose_suggested` bucket, shown as a distinct hatched bar in the
+  reporting page's chart, never mixed into the confirmed totals; the
+  `unclassified` bucket now means genuinely untouched, not merely unconfirmed.
+  Both AI features are dark by default behind `AI_PURPOSE_CLASSIFICATION_ENABLED`
+  and require the AI provider to be configured. Phase 3 (transit-gear device
+  rollups) remains planned; see
   [docs/design/0013-lab-purpose-classification.md](docs/design/0013-lab-purpose-classification.md)
   (issue #646).
 
@@ -293,7 +310,11 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   category, and by device and category (three additional CSV sections). Like the
   per-user and per-device sections it counts COMPLETED reservations by default,
   so a live reservation's category appears once the reservation ends; only the
-  fleet section also counts ACTIVE by default.
+  fleet section also counts ACTIVE by default. A separate `by_purpose_suggested`
+  bucket (its own CSV section) reports reservations that carry an AI suggestion
+  but no confirmed category yet, keyed by the suggestion's top category and
+  drawn as a hatched bar distinct from the confirmed and unclassified bars, so
+  a suggestion never inflates the confirmed totals.
 - **Notifications and dispatch channels** (Shipped): durable NATS consumers turn
   reservation lifecycle and device-health events into per-user notifications. The
   in-app bell ships alongside opt-in email, chat (Slack-style), and outbound-webhook

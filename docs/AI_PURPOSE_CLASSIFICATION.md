@@ -184,3 +184,21 @@ topology generation, the assistant, and recipe drafting. The preview
 endpoint meters against the calling user; the internal endpoint meters
 against the reservation's owner (`user_id` in the request body), since there
 is no other acting user for a background call.
+
+## Operating it
+
+Neither endpoint here is where an admin actually works with suggestions day
+to day; that surface, the review queue, accept/override/dismiss, and the
+`Classify history` backfill action, lives in the reservations service and is
+described in `docs/ADMIN_HANDBOOK.md` (the Utilization report section,
+"Purpose review" and "Classify history (backfill)" entries). This document
+covers the two orchestrator endpoints those features call.
+
+Privacy, restated from above since it is the one operating decision most
+likely to matter to a deployment: the end-of-reservation pass resends the
+reservation's own assistant transcripts to the same AI provider already
+configured for everything else HERD does with it. Nothing new is exposed
+that a chat with the assistant did not already expose once. Set
+`AI_PURPOSE_INCLUDE_TRANSCRIPTS=false` if a deployment must not resend that
+text; both classification endpoints keep working on the remaining
+structured signals with the flag off.
