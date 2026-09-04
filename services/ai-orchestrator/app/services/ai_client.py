@@ -226,6 +226,49 @@ def build_topology_tool(template_names: list[str] | None = None) -> ToolSchema:
                         "required": ["source_role", "target_role", "layer"],
                     },
                 },
+                # Network elements (issue #632, ADR 0012): a shared object a
+                # device attaches to rather than another device. Optional so
+                # a device-only proposal is unaffected. Port selection is
+                # deliberately NOT part of this schema: the committer picks
+                # the device-side port after the model returns (D2), so the
+                # model only ever names a device role and an element role.
+                "elements": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string"},
+                            "element_type": {
+                                "type": "string",
+                                "enum": [
+                                    "vlan_segment",
+                                    "subnet",
+                                    "external_cloud",
+                                    "patch_trunk",
+                                ],
+                            },
+                            "label": {"type": "string"},
+                            "attrs": {
+                                "type": "object",
+                                "description": (
+                                    "Optional descriptive metadata. Not provisioned or "
+                                    "validated beyond these keys."
+                                ),
+                                "properties": {
+                                    "vlan_id": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 4094,
+                                    },
+                                    "cidr": {"type": "string"},
+                                    "description": {"type": "string"},
+                                },
+                                "additionalProperties": False,
+                            },
+                        },
+                        "required": ["role", "element_type", "label"],
+                    },
+                },
                 "notes": {"type": "string"},
             },
             "required": ["purpose", "devices", "edges"],
@@ -393,6 +436,13 @@ Rules:
   or attached files suggest a configuration. Only these keys are accepted:
   {allowed_config_keys}. Any other key causes the commit to be rejected.
   Config is only meaningful for Management-type devices; omit otherwise.
+- You MAY propose a shared network element (in "elements") when three or
+  more devices share one management or data segment, using "vlan_segment"
+  or "subnet", or when the lab needs an upstream network, using
+  "external_cloud". Attach every device that uses the element with exactly
+  ONE edge from the device's role to the element's role; never connect two
+  elements to each other. Element role names must be unique and must not
+  repeat a device role name.
 
 Available device templates (template_name: available count):
 {inventory_block}

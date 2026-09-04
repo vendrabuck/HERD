@@ -120,6 +120,63 @@ async def test_commit_happy_path_creates_topology_and_reservation(async_client):
     assert canvas["edges"][0]["data"]["layer"] == "L2"
 
 
+async def test_commit_with_element_produces_canvas_with_element_and_attachment(async_client):
+    """A request carrying an element results in a canvas PUT whose body
+    includes the element node and a device-sourced attachment edge (issue
+    #632). The committer fetches the device's ports from inventory to pick
+    the attachment port (D2)."""
+    captured_canvas: dict = {}
+
+    def _capture_canvas(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        captured_canvas.update(_json.loads(request.content))
+        return httpx.Response(200, json={"id": TOPOLOGY_ID, "canvas_data": {}})
+
+    body = _commit_body(
+        devices=[{"role": "fw-a", "device_id": DEVICE_A, "position": {"x": 100, "y": 100}}],
+        elements=[
+            {
+                "role": "mgmt-seg",
+                "element_type": "vlan_segment",
+                "label": "Mgmt VLAN",
+                "attrs": {"vlan_id": 100},
+            }
+        ],
+        edges=[{"source_role": "fw-a", "target_role": "mgmt-seg", "layer": "L2"}],
+    )
+    inventory_url = config_module.settings.inventory_service_url.rstrip("/")
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{inventory_url}/devices/{DEVICE_A}/ports").respond(
+            200, json=[{"id": "port-1", "name": "eth1"}]
+        )
+        mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
+        mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").mock(side_effect=_capture_canvas)
+        mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
+
+        headers = {"Authorization": f"Bearer {_user_token()}"}
+        async with async_client as client:
+            resp = await client.post("/commit", json=body, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+
+    canvas = captured_canvas["canvas_data"]
+    element_nodes = [n for n in canvas["nodes"] if n["type"] == "networkElementNode"]
+    device_nodes = [n for n in canvas["nodes"] if n["type"] == "deviceNode"]
+    assert len(element_nodes) == 1
+    assert len(device_nodes) == 1
+    assert element_nodes[0]["data"]["element"]["element_type"] == "vlan_segment"
+    assert element_nodes[0]["data"]["element"]["label"] == "Mgmt VLAN"
+
+    assert len(canvas["edges"]) == 1
+    edge = canvas["edges"][0]
+    assert edge["source"] == device_nodes[0]["id"]
+    assert edge["target"] == element_nodes[0]["id"]
+    assert edge["data"]["source_port_name"] == "eth1"
+    assert edge["data"]["source_port_id"] == "port-1"
+
+
 async def test_commit_rolls_back_topology_when_canvas_save_fails(async_client):
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})

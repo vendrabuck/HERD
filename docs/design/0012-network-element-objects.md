@@ -598,7 +598,22 @@ All five QA levels, per the repo's conventions.
 - Provisioning of any kind. Decision 2 sketches the anchored-VLAN phase 2 and
   names its synthetic-hop hook, but v1 ships no driver call, no VLAN, no route,
   and no ledger row for an element. Per issue #22's own out-of-scope list.
-- AI generation of elements. Decision 3; a follow-up issue.
+- AI generation of elements. Decision 3; delivered via issue #632: the
+  `propose_topology` tool gains an optional `elements` array (role,
+  `element_type`, label, and an allowlisted `attrs` object) alongside the
+  existing devices/edges, and the model attaches a device to an element with
+  one edge from the device role to the element role, never element-to-
+  element (rejected by the same validation/repair loop that catches a
+  hallucinated template or a dangling role). Port selection for that
+  attachment stays OUT of the model's hands: the committer picks the
+  device's next free port itself, in natural port-name order (`eth2` before
+  `eth10`), skipping any port an earlier element attachment of the same
+  device in the proposal already claimed; a device with no free port left
+  has that one attachment silently dropped (logged) rather than committed
+  with an empty port name. This keeps the model's output boundary the same
+  shape as a device proposal (roles and topology only, no port inventory
+  ever in the prompt) and reuses classify_element_edge's existing
+  attachment/element_to_element/no-port taxonomy on the read side.
 - Layer 3 element semantics beyond reachability, per issue #22's out-of-scope
   list; first-class L3 routing is tracked separately in `PLANNED_FEATURES.md`.
 - Element-to-element links. Refused in the frontend and reported invalid by the

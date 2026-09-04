@@ -1,4 +1,5 @@
 import type { Device } from "./device.types";
+import type { NetworkElementType } from "./topology.types";
 
 export interface ProposedDevice {
   role: string;
@@ -12,6 +13,16 @@ export interface ProposedEdge {
   source_role: string;
   target_role: string;
   layer: "L1" | "L2" | "L3";
+}
+
+// A proposed network element (issue #632, ADR 0012): a synthetic role the
+// model invents, distinct from a device role but drawn from the same
+// namespace. Mirrors app.schemas.generate.ProposedElement.
+export interface AIProposedElement {
+  role: string;
+  element_type: NetworkElementType;
+  label: string;
+  attrs: Record<string, unknown>;
 }
 
 export interface AIFileSummary {
@@ -90,6 +101,7 @@ export interface AIGenerateResponse {
   purpose: string;
   devices: ProposedDevice[];
   edges: ProposedEdge[];
+  elements: AIProposedElement[];
   notes: string;
   file_summaries: AIFileSummary[];
 }
@@ -108,6 +120,14 @@ export interface AICommitEdge {
   layer: "L1" | "L2" | "L3";
 }
 
+// Mirrors app.schemas.generate.CommitElement for the accept/commit side.
+export interface AICommitElement {
+  role: string;
+  element_type: NetworkElementType;
+  label: string;
+  attrs: Record<string, unknown>;
+}
+
 export interface AICommitRequest {
   topology_name: string;
   purpose?: string | null;
@@ -115,6 +135,7 @@ export interface AICommitRequest {
   end_time: string;
   devices: AICommitDevice[];
   edges: AICommitEdge[];
+  elements?: AICommitElement[];
   apply_configs?: boolean;
 }
 

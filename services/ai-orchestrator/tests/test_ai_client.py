@@ -82,6 +82,59 @@ def _msgs(seed_block: str, question: str) -> list[Message]:
     ]
 
 
+# --- build_topology_tool / SYSTEM_PROMPT_TEMPLATE: network elements (issue #632) ---
+
+
+def test_build_topology_tool_advertises_elements_with_four_value_enum():
+    from app.services.ai_client import build_topology_tool
+
+    tool = build_topology_tool()
+    elements_schema = tool.input_schema["properties"]["elements"]
+    element_type_schema = elements_schema["items"]["properties"]["element_type"]
+    assert set(element_type_schema["enum"]) == {
+        "vlan_segment",
+        "subnet",
+        "external_cloud",
+        "patch_trunk",
+    }
+    # role/element_type/label required; attrs optional
+    assert set(elements_schema["items"]["required"]) == {"role", "element_type", "label"}
+    # elements itself stays optional at the top level (a device-only proposal
+    # must still validate against this schema).
+    assert "elements" not in tool.input_schema["required"]
+
+
+def test_build_topology_tool_elements_attrs_allowlist():
+    from app.services.ai_client import build_topology_tool
+
+    tool = build_topology_tool()
+    attrs_schema = tool.input_schema["properties"]["elements"]["items"]["properties"]["attrs"]
+    assert attrs_schema["additionalProperties"] is False
+    assert set(attrs_schema["properties"].keys()) == {"vlan_id", "cidr", "description"}
+
+
+def test_build_topology_tool_elements_shape_unaffected_by_template_names():
+    """The template_names enum constrains devices.template_name only; the
+    elements array (which has no template concept) is untouched either way."""
+    from app.services.ai_client import build_topology_tool
+
+    unconstrained = build_topology_tool()
+    constrained = build_topology_tool(["EX3400"])
+    assert (
+        unconstrained.input_schema["properties"]["elements"]
+        == constrained.input_schema["properties"]["elements"]
+    )
+
+
+def test_system_prompt_template_contains_element_guidance():
+    from app.services.ai_client import SYSTEM_PROMPT_TEMPLATE
+
+    rendered = SYSTEM_PROMPT_TEMPLATE.format(inventory_block="(none)", allowed_config_keys="vlan")
+    assert "shared network element" in rendered
+    assert "never connect two" in rendered
+    assert "elements to each other" in rendered
+
+
 # --- propose_topology ---
 
 

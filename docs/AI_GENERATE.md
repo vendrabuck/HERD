@@ -27,7 +27,7 @@ HERD can propose a lab topology from a natural-language prompt by calling the co
 
 ## What the LLM proposes
 
-The orchestrator constrains the LLM's output via a tool schema built per request. The `template_name` field is restricted to an enum of the templates currently visible to you, so a provider that honors schema enums cannot return a name outside your inventory. The orchestrator also validates the response after the fact and, on a repairable mistake (an unknown template, an over-count, a duplicate role, or an edge to a role that was never defined), re-prompts the model once with the exact allow-list before giving up. Each proposed device has:
+The orchestrator constrains the LLM's output via a tool schema built per request. The `template_name` field is restricted to an enum of the templates currently visible to you, so a provider that honors schema enums cannot return a name outside your inventory. The orchestrator also validates the response after the fact and, on a repairable mistake (an unknown template, an over-count, a duplicate role across devices or elements, an edge to a role that was never defined, or an edge connecting two elements directly), re-prompts the model once with the exact allow-list before giving up. Each proposed device has:
 
 - `role` (unique within the proposal; e.g. `fw-a`, `fw-b`, `core-sw-1`)
 - `template_name` (must match a real template in your inventory exactly; no invented names)
@@ -35,6 +35,8 @@ The orchestrator constrains the LLM's output via a tool schema built per request
 - `config` (optional; see [Device configs](#device-configs-the-allowlist))
 
 Edges reference roles by name and carry a `layer` (`L1`, `L2`, or `L3`).
+
+The LLM may also propose a **network element** (issue #632, ADR 0012 at [`docs/design/0012-network-element-objects.md`](design/0012-network-element-objects.md)): a shared object such as a VLAN segment, subnet, or external cloud that several devices attach to instead of wiring every pair directly. An element has a `role` (from the same namespace as device roles, so role names stay unique across both), an `element_type` (`vlan_segment`, `subnet`, `external_cloud`, or `patch_trunk`), a `label`, and optional descriptive `attrs` (currently `vlan_id`, `cidr`, `description`; not provisioned or otherwise validated). A device attaches to an element with one edge from the device's role to the element's role; the model never names a port for that edge, because the LLM never sees per-device port inventories. Instead, on commit, the orchestrator's committer picks the device's next free port itself (ports sorted in natural name order, e.g. `eth2` before `eth10`, skipping any port another element attachment of the same device already claimed); a device with no free port has that attachment silently dropped rather than committed with a missing port. Element ghost nodes render on the canvas alongside device ghosts and are carried through the same accept/modify/reject flow.
 
 The LLM does **not** propose start/end times for the reservation. Those come from you when you commit.
 

@@ -9,13 +9,14 @@ malformed JSON), and the unexpected-non-CommitError rollback in
 commit_proposal.
 """
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 import respx
 from app import config as config_module
-from app.schemas.generate import CommitDevice, CommitEdge, CommitRequest
+from app.schemas.generate import CommitDevice, CommitEdge, CommitElement, CommitRequest
 from app.services import committer
 from app.services.committer import (
     CommitError,
@@ -76,15 +77,163 @@ def test_detail_non_dict_json_body_stringifies():
 # --- _build_canvas_data: dangling edge role is skipped (line 88) ---
 
 
-def test_build_canvas_skips_edge_with_unknown_role():
+async def test_build_canvas_skips_edge_with_unknown_role():
     req = _req(
         devices=[CommitDevice(role="fw-a", device_id=DEVICE_A)],
         edges=[CommitEdge(source_role="fw-a", target_role="does-not-exist", layer="L2")],
     )
-    canvas = _build_canvas_data(req)
+    async with httpx.AsyncClient() as client:
+        canvas = await _build_canvas_data(client, {"Authorization": "Bearer t"}, req)
     # One node, but the edge references a role with no node, so it is dropped.
+    # No element in this proposal, so no ports HTTP call ever fires (proven by
+    # the bare client above having no respx mock registered).
     assert len(canvas["nodes"]) == 1
     assert canvas["edges"] == []
+
+
+# --- _build_canvas_data: network elements (issue #632) -----------------
+
+
+def _ports_route(mock, device_id: str, ports: list[dict]):
+    """Register a respx route for GET /devices/{device_id}/ports on `mock`."""
+    url = f"{config_module.settings.inventory_service_url.rstrip('/')}/devices/{device_id}/ports"
+    return mock.get(url).respond(200, json=ports)
+
+
+async def test_build_canvas_device_to_device_path_is_byte_for_byte_unchanged():
+    """Pins the pre-#632 device-to-device edge shape exactly."""
+    req = _req(
+        devices=[
+            CommitDevice(role="fw-a", device_id=DEVICE_A, position={"x": 1.0, "y": 2.0}),
+            CommitDevice(role="fw-b", device_id="cccccccc-cccc-cccc-cccc-cccccccccccc"),
+        ],
+        edges=[CommitEdge(source_role="fw-a", target_role="fw-b", layer="L3")],
+    )
+    async with httpx.AsyncClient() as client:
+        canvas = await _build_canvas_data(client, {"Authorization": "Bearer t"}, req)
+    assert canvas["selectedEdgeLayer"] == "L2"
+    assert len(canvas["nodes"]) == 2
+    node_a = next(n for n in canvas["nodes"] if n["data"]["device"]["id"] == DEVICE_A)
+    assert node_a["type"] == "deviceNode"
+    assert node_a["position"] == {"x": 1.0, "y": 2.0}
+    assert node_a["data"] == {
+        "device": {"id": DEVICE_A},
+        "label": "fw-a",
+        "topologyType": "PHYSICAL",
+    }
+    assert len(canvas["edges"]) == 1
+    edge = canvas["edges"][0]
+    assert set(edge.keys()) == {"id", "source", "target", "data"}
+    assert edge["data"] == {"layer": "L3"}
+
+
+async def test_build_canvas_element_node_shape():
+    req = _req(
+        devices=[CommitDevice(role="fw-a", device_id=DEVICE_A)],
+        elements=[
+            CommitElement(
+                role="mgmt-seg",
+                element_type="vlan_segment",
+                label="Mgmt VLAN",
+                attrs={"vlan_id": 100},
+            )
+        ],
+        edges=[],
+    )
+    async with httpx.AsyncClient() as client:
+        canvas = await _build_canvas_data(client, {"Authorization": "Bearer t"}, req)
+    element_nodes = [n for n in canvas["nodes"] if n["type"] == "networkElementNode"]
+    assert len(element_nodes) == 1
+    node = element_nodes[0]
+    uuid.UUID(node["id"])  # a real uuid4 canvas node id
+    element = node["data"]["element"]
+    assert set(element.keys()) == {"id", "element_type", "label", "attrs"}
+    uuid.UUID(element["id"])  # a real uuid4 element id, distinct from node id
+    assert element["id"] != node["id"]
+    assert element["element_type"] == "vlan_segment"
+    assert element["label"] == "Mgmt VLAN"
+    assert element["attrs"] == {"vlan_id": 100}
+
+
+async def test_build_canvas_attachment_edge_has_device_as_source_with_chosen_port():
+    req = _req(
+        devices=[CommitDevice(role="fw-a", device_id=DEVICE_A)],
+        elements=[
+            CommitElement(role="mgmt-seg", element_type="vlan_segment", label="Mgmt", attrs={})
+        ],
+        edges=[CommitEdge(source_role="fw-a", target_role="mgmt-seg", layer="L2")],
+    )
+    ports = [
+        {"id": "port-10", "name": "eth10"},
+        {"id": "port-2", "name": "eth2"},
+    ]
+    with respx.mock(assert_all_called=True) as mock:
+        _ports_route(mock, DEVICE_A, ports)
+        async with httpx.AsyncClient() as client:
+            canvas = await _build_canvas_data(client, {"Authorization": "Bearer t"}, req)
+
+    assert len(canvas["edges"]) == 1
+    edge = canvas["edges"][0]
+    device_node = next(n for n in canvas["nodes"] if n["type"] == "deviceNode")
+    element_node = next(n for n in canvas["nodes"] if n["type"] == "networkElementNode")
+    assert edge["source"] == device_node["id"]
+    assert edge["target"] == element_node["id"]
+    # Natural port order picks eth2 before eth10, not lexicographic order
+    # (which would put "eth10" before "eth2").
+    assert edge["data"] == {
+        "layer": "L2",
+        "source_port_id": "port-2",
+        "source_port_name": "eth2",
+    }
+
+
+async def test_build_canvas_two_attachments_from_one_device_get_distinct_ports():
+    req = _req(
+        devices=[CommitDevice(role="fw-a", device_id=DEVICE_A)],
+        elements=[
+            CommitElement(role="mgmt-seg", element_type="vlan_segment", label="Mgmt", attrs={}),
+            CommitElement(role="data-seg", element_type="subnet", label="Data", attrs={}),
+        ],
+        edges=[
+            CommitEdge(source_role="fw-a", target_role="mgmt-seg", layer="L2"),
+            CommitEdge(source_role="fw-a", target_role="data-seg", layer="L2"),
+        ],
+    )
+    ports = [{"id": "port-1", "name": "eth1"}, {"id": "port-2", "name": "eth2"}]
+    with respx.mock(assert_all_called=True) as mock:
+        route = _ports_route(mock, DEVICE_A, ports)
+        async with httpx.AsyncClient() as client:
+            canvas = await _build_canvas_data(client, {"Authorization": "Bearer t"}, req)
+    # Ports are cached per device: one attaching device with two attachments
+    # triggers exactly one fetch, not two.
+    assert route.call_count == 1
+
+    assert len(canvas["edges"]) == 2
+    used_ports = {edge["data"]["source_port_name"] for edge in canvas["edges"]}
+    assert used_ports == {"eth1", "eth2"}
+
+
+async def test_build_canvas_device_with_no_ports_skips_attachment_with_warning(caplog):
+    import logging
+
+    req = _req(
+        devices=[CommitDevice(role="fw-a", device_id=DEVICE_A)],
+        elements=[
+            CommitElement(role="mgmt-seg", element_type="vlan_segment", label="Mgmt", attrs={})
+        ],
+        edges=[CommitEdge(source_role="fw-a", target_role="mgmt-seg", layer="L2")],
+    )
+    with respx.mock(assert_all_called=True) as mock:
+        _ports_route(mock, DEVICE_A, [])
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient() as client:
+                canvas = await _build_canvas_data(client, {"Authorization": "Bearer t"}, req)
+
+    # The element node still exists (it just has no attachment), but the
+    # edge is dropped rather than emitted with an empty source_port_name.
+    assert any(n["type"] == "networkElementNode" for n in canvas["nodes"])
+    assert canvas["edges"] == []
+    assert any(r.message == "ai_commit_element_attachment_skipped_no_port" for r in caplog.records)
 
 
 # --- _delete_topology: rollback delete swallows its own failure (127-128) ---

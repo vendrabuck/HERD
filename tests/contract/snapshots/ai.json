@@ -125,11 +125,26 @@
       ],
       "type": "object"
     },
+    "CommitElement": {
+      "properties": {
+        "attrs": "object",
+        "element_type": "string",
+        "label": "string",
+        "role": "string"
+      },
+      "required": [
+        "element_type",
+        "label",
+        "role"
+      ],
+      "type": "object"
+    },
     "CommitRequest": {
       "properties": {
         "apply_configs": "boolean",
         "devices": "array",
         "edges": "array",
+        "elements": "array",
         "end_time": "string",
         "purpose": "anyOf",
         "start_time": "string",
@@ -228,6 +243,7 @@
       "properties": {
         "devices": "array",
         "edges": "array",
+        "elements": "array",
         "file_summaries": "array",
         "notes": "string",
         "purpose": "string"
@@ -316,6 +332,20 @@
       "required": [
         "source_role",
         "target_role"
+      ],
+      "type": "object"
+    },
+    "ProposedElement": {
+      "properties": {
+        "attrs": "object",
+        "element_type": "string",
+        "label": "string",
+        "role": "string"
+      },
+      "required": [
+        "element_type",
+        "label",
+        "role"
       ],
       "type": "object"
     },

@@ -356,6 +356,153 @@ async def test_generate_rejects_edge_with_unknown_role(async_client, monkeypatch
     assert "unknown role" in resp.json()["detail"]
 
 
+# --- Network elements (issue #632) --------------------------------------
+
+
+async def test_generate_rejects_duplicate_role_across_device_and_element(async_client, monkeypatch):
+    """D4: roles are unique across devices AND elements, not just devices."""
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "dup role across device+element",
+            "devices": [{"role": "seg-a", "template_name": "EX3400"}],
+            "edges": [],
+            "elements": [{"role": "seg-a", "element_type": "vlan_segment", "label": "Seg"}],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert "duplicate role" in detail
+    assert "seg-a" in detail
+
+
+async def test_generate_rejects_element_to_element_edge(async_client, monkeypatch):
+    """D4: an edge whose both ends are elements is rejected as element_to_element."""
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "element to element",
+            "devices": [{"role": "a", "template_name": "EX3400"}],
+            "edges": [{"source_role": "seg-a", "target_role": "seg-b", "layer": "L2"}],
+            "elements": [
+                {"role": "seg-a", "element_type": "vlan_segment", "label": "A"},
+                {"role": "seg-b", "element_type": "subnet", "label": "B"},
+            ],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 502
+    assert "element_to_element" in resp.json()["detail"]
+
+
+async def test_generate_allows_edge_from_device_role_to_element_role(async_client, monkeypatch):
+    """An edge from a valid device role to a valid element role passes
+    validation and both the element and the edge are returned untouched."""
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "device attaches to element",
+            "devices": [{"role": "a", "template_name": "EX3400"}],
+            "edges": [{"source_role": "a", "target_role": "seg-a", "layer": "L2"}],
+            "elements": [
+                {
+                    "role": "seg-a",
+                    "element_type": "vlan_segment",
+                    "label": "Seg",
+                    "attrs": {"vlan_id": 10},
+                }
+            ],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["elements"] == [
+        {"role": "seg-a", "element_type": "vlan_segment", "label": "Seg", "attrs": {"vlan_id": 10}}
+    ]
+    assert body["edges"] == [{"source_role": "a", "target_role": "seg-a", "layer": "L2"}]
+
+
+async def test_generate_device_only_proposal_defaults_elements_to_empty(async_client, monkeypatch):
+    """A device-only proposal (no "elements" key at all) still validates: the
+    field is additive and optional (D1)."""
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "device only",
+            "devices": [{"role": "a", "template_name": "EX3400"}],
+            "edges": [],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["elements"] == []
+
+
+async def test_generate_repair_loop_caps_at_max_repair_attempts_for_element_error(
+    async_client, monkeypatch
+):
+    """The element_to_element rejection is repairable (fed back via
+    _repair_feedback) and retried once (MAX_REPAIR_ATTEMPTS=1); a model that
+    keeps making the same mistake exhausts retries after exactly
+    MAX_REPAIR_ATTEMPTS + 1 total calls, not more."""
+    calls: list[str] = []
+
+    class StubAI:
+        async def propose_topology(
+            self,
+            *,
+            inventory_block: str,
+            user_prompt: str,
+            file_context: str = "",
+            template_names: list[str] | None = None,
+            repair_feedback: str = "",
+        ):
+            calls.append(repair_feedback)
+            return (
+                {
+                    "purpose": "always bad",
+                    "devices": [{"role": "a", "template_name": "EX3400"}],
+                    "edges": [{"source_role": "seg-a", "target_role": "seg-b", "layer": "L2"}],
+                    "elements": [
+                        {"role": "seg-a", "element_type": "vlan_segment", "label": "A"},
+                        {"role": "seg-b", "element_type": "subnet", "label": "B"},
+                    ],
+                },
+                Usage(input_tokens=10, output_tokens=20),
+            )
+
+    app.dependency_overrides[get_ai_client] = lambda: StubAI()
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+
+    assert resp.status_code == 502
+    assert len(calls) == generator_module.MAX_REPAIR_ATTEMPTS + 1
+    # The retry call carries the exact corrective wording the model can act
+    # on: the element_to_element identifier plus the "never connect two
+    # elements" guidance from _repair_feedback.
+    assert calls[0] == ""
+    assert "element_to_element" in calls[1]
+    assert "never connect two elements directly" in calls[1]
+
+
 async def test_generate_surfaces_ai_error(async_client, monkeypatch):
     _override_inventory({"EX3400": 1})
     _override_resolver(monkeypatch)

@@ -889,10 +889,41 @@ function TopologyEditorInner() {
         roleToNodeId.set(proposed.role, nodeId);
       });
 
+      // Network elements (issue #632): one ghost networkElementNode per
+      // proposed element, placed in a row below the devices. Role goes into
+      // the SAME roleToNodeId map as devices (D1: roles are unique across
+      // both), so the edge loop below needs no element-specific branch; a
+      // dangling role (e.g. a rejected element_to_element pair that somehow
+      // slipped through) is simply skipped like any other unresolved role.
+      const elementRowY = baseY + stepX;
+      (response.elements ?? []).forEach((proposed, idx) => {
+        const nodeId = genId();
+        const node: Node<NetworkElementNodeData> = {
+          id: nodeId,
+          type: "networkElementNode",
+          position: { x: baseX + idx * stepX, y: elementRowY },
+          data: {
+            element: {
+              id: genId(),
+              element_type: proposed.element_type as NetworkElementType,
+              label: proposed.label,
+              attrs: proposed.attrs ?? {},
+            },
+            isProposal: true,
+          },
+        };
+        addDeviceNode(node);
+        roleToNodeId.set(proposed.role, nodeId);
+      });
+
       response.edges.forEach((edge) => {
         const sourceId = roleToNodeId.get(edge.source_role);
         const targetId = roleToNodeId.get(edge.target_role);
         if (!sourceId || !targetId) return;
+        // No port fields here even for a device-to-element edge: the
+        // committer picks the device-side port on accept (D2), and the
+        // store's addEnrichedEdge normalizes direction so the device lands
+        // as source regardless of which role came first in the response.
         addEnrichedEdge(
           { source: sourceId, target: targetId, sourceHandle: null, targetHandle: null },
           { layer: edge.layer as EdgeLayerType, isProposal: true }

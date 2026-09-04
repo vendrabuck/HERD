@@ -1,16 +1,20 @@
 """Commits an accepted AI proposal to cabling + reservations.
 
 The flow:
-  1. POST /cabling/topologies to create an empty topology.
-  2. PUT /cabling/topologies/{id} with canvas_data built from the proposal.
-  3. POST /reservations/ for the proposal's devices, tagged with topology_id.
+  1. Build canvas_data from the proposal (device and network-element nodes,
+     plus edges; a device-to-element edge needs a GET to inventory to pick
+     the device-side port, issue #632).
+  2. POST /cabling/topologies to create an empty topology.
+  3. PUT /cabling/topologies/{id} with the built canvas_data.
+  4. POST /reservations/ for the proposal's devices, tagged with topology_id.
 
-If step 2 or 3 fails, the topology is deleted to roll back so the user does
+If step 3 or 4 fails, the topology is deleted to roll back so the user does
 not end up with a dangling empty topology. All upstream calls use the caller's
 JWT so existing RBAC and device-visibility rules apply.
 """
 
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -51,21 +55,105 @@ def _detail(resp: httpx.Response) -> str:
     return str(body)
 
 
-def _build_canvas_data(req: CommitRequest) -> dict[str, Any]:
+# Splits a port name into alternating non-digit/digit runs so "eth2" sorts
+# before "eth10" (issue #632, D2's natural port order). re.split with a
+# capturing group always alternates str/int-able chunks at the same parity
+# for any port name, so comparing two keys never hits a str-vs-int
+# comparison, which sorted() would otherwise raise on.
+_PORT_NAME_RUNS = re.compile(r"(\d+)")
+
+
+def _natural_port_key(name: str) -> tuple[Any, ...]:
+    return tuple(int(part) if part.isdigit() else part for part in _PORT_NAME_RUNS.split(name))
+
+
+async def _fetch_device_ports(
+    client: httpx.AsyncClient, headers: dict[str, str], device_id: str
+) -> list[dict[str, Any]]:
+    """Fetch a device's ports, sorted in natural name order.
+
+    CommitDevice.device (the raw inventory DeviceResponse payload the
+    frontend forwards) carries no ports field (services/inventory/app/schemas
+    /device.py's DeviceResponse has none), so port selection needs its own
+    call to inventory's dedicated ports listing endpoint. Never raises: a
+    fetch failure (unreachable inventory, 404, etc.) is logged and treated as
+    "no ports", which the caller already handles by skipping the attachment.
+    """
+    url = f"{settings.inventory_service_url.rstrip('/')}/devices/{device_id}/ports"
+    try:
+        resp = await client.get(url, headers=headers)
+    except Exception:
+        logger.warning("ai_commit_device_ports_fetch_failed", extra={"device_id": device_id})
+        return []
+    if resp.status_code >= 400:
+        logger.warning(
+            "ai_commit_device_ports_fetch_failed",
+            extra={"device_id": device_id, "status_code": resp.status_code},
+        )
+        return []
+    try:
+        ports = resp.json()
+    except ValueError:
+        return []
+    return sorted(ports, key=lambda p: _natural_port_key(p["name"]))
+
+
+async def _select_element_port(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    device_role: str,
+    device_id: str,
+    ports_cache: dict[str, list[dict[str, Any]]],
+    claimed_ports: dict[str, set[str]],
+) -> dict[str, Any] | None:
+    """Pick the next free port for one device's element attachment (D2).
+
+    Ports come back pre-sorted in natural name order; the first one not
+    already claimed by an earlier attachment of the SAME device in this
+    proposal wins, so two attachments from one device to two elements land
+    on two distinct ports. Cached per device role so a device with several
+    attachments triggers one HTTP fetch, not one per edge.
+    """
+    if device_role not in ports_cache:
+        ports_cache[device_role] = await _fetch_device_ports(client, headers, device_id)
+    claimed = claimed_ports.setdefault(device_role, set())
+    for port in ports_cache[device_role]:
+        if port["id"] not in claimed:
+            claimed.add(port["id"])
+            return port
+    return None
+
+
+async def _build_canvas_data(
+    client: httpx.AsyncClient, headers: dict[str, str], req: CommitRequest
+) -> dict[str, Any]:
     """Build a React-Flow-compatible canvas_data from the accepted proposal.
 
     The frontend renders this via the standard topology load path, so the
     shape has to match what `loadCanvas` expects: nodes keyed by a canvas
-    UUID with `device`/`label`/`topologyType`, edges keyed by UUID with
-    `layer`, referencing the node ids as `source`/`target`.
+    UUID with `device`/`label`/`topologyType` (or, for a network element,
+    `element`), edges keyed by UUID with `layer`, referencing the node ids as
+    `source`/`target`.
+
+    Network elements (issue #632, ADR 0012) persist as one `networkElementNode`
+    per proposed element, positioned in a row below the devices. A device-to-
+    element edge needs a concrete device-side port, which the model never
+    sees (D2: port selection is the committer's job, not the LLM's), so this
+    is async and takes the caller's httpx client to fetch each attaching
+    device's ports on demand.
     """
     role_to_node_id: dict[str, str] = {}
+    device_node_id_by_role: dict[str, str] = {}
+    device_id_by_role: dict[str, str] = {}
+    element_node_id_by_role: dict[str, str] = {}
     nodes: list[dict[str, Any]] = []
     base_x, base_y, step_x = 200, 200, 220
 
     for idx, proposed in enumerate(req.devices):
         node_id = str(uuid.uuid4())
         role_to_node_id[proposed.role] = node_id
+        device_node_id_by_role[proposed.role] = node_id
+        device_id_by_role[proposed.role] = proposed.device_id
         position = proposed.position or {"x": base_x + idx * step_x, "y": base_y}
         nodes.append(
             {
@@ -80,20 +168,92 @@ def _build_canvas_data(req: CommitRequest) -> dict[str, Any]:
             }
         )
 
-    edges: list[dict[str, Any]] = []
-    for edge in req.edges:
-        source_id = role_to_node_id.get(edge.source_role)
-        target_id = role_to_node_id.get(edge.target_role)
-        if not source_id or not target_id:
-            continue
-        edges.append(
+    element_row_y = base_y + step_x
+    for idx, proposed in enumerate(req.elements):
+        node_id = str(uuid.uuid4())
+        role_to_node_id[proposed.role] = node_id
+        element_node_id_by_role[proposed.role] = node_id
+        nodes.append(
             {
-                "id": str(uuid.uuid4()),
-                "source": source_id,
-                "target": target_id,
-                "data": {"layer": edge.layer},
+                "id": node_id,
+                "type": "networkElementNode",
+                "position": {"x": base_x + idx * step_x, "y": element_row_y},
+                "data": {
+                    "element": {
+                        "id": str(uuid.uuid4()),
+                        "element_type": proposed.element_type,
+                        "label": proposed.label,
+                        "attrs": proposed.attrs,
+                    }
+                },
             }
         )
+
+    edges: list[dict[str, Any]] = []
+    ports_cache: dict[str, list[dict[str, Any]]] = {}
+    claimed_ports: dict[str, set[str]] = {}
+
+    for edge in req.edges:
+        source_is_device = edge.source_role in device_node_id_by_role
+        target_is_device = edge.target_role in device_node_id_by_role
+        source_is_element = edge.source_role in element_node_id_by_role
+        target_is_element = edge.target_role in element_node_id_by_role
+
+        if source_is_device and target_is_device:
+            # Device-to-device: unchanged from the pre-#632 shape.
+            edges.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "source": device_node_id_by_role[edge.source_role],
+                    "target": device_node_id_by_role[edge.target_role],
+                    "data": {"layer": edge.layer},
+                }
+            )
+            continue
+
+        if (source_is_device and target_is_element) or (source_is_element and target_is_device):
+            device_role = edge.source_role if source_is_device else edge.target_role
+            element_role = edge.target_role if source_is_device else edge.source_role
+            port = await _select_element_port(
+                client,
+                headers,
+                device_role,
+                device_id_by_role[device_role],
+                ports_cache,
+                claimed_ports,
+            )
+            if port is None:
+                # No port left to attach with (zero ports on the device, or
+                # every port already claimed by another element attachment
+                # of this same device in the proposal): skip the edge rather
+                # than emit an attachment with no source_port_name, which
+                # cabling's classify_element_edge would reject as
+                # element_edge_no_port anyway.
+                logger.warning(
+                    "ai_commit_element_attachment_skipped_no_port",
+                    extra={"role": device_role, "device_id": device_id_by_role[device_role]},
+                )
+                continue
+            edges.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "source": device_node_id_by_role[device_role],
+                    "target": element_node_id_by_role[element_role],
+                    "data": {
+                        "layer": edge.layer,
+                        "source_port_id": port["id"],
+                        "source_port_name": port["name"],
+                    },
+                }
+            )
+            continue
+
+        # Neither side resolved to a device-plus-element pair: a dangling
+        # role (unknown on one or both sides) or an element_to_element edge
+        # (rejected upstream by the generator's validation, D4, but a direct
+        # /commit caller could still send one). Both are silently dropped,
+        # matching the pre-#632 dangling-role treatment.
+        continue
 
     return {"nodes": nodes, "edges": edges, "selectedEdgeLayer": "L2"}
 
@@ -241,9 +401,11 @@ async def commit_proposal(
             raise CommitError(422, str(exc)) from exc
 
     headers = {"Authorization": f"Bearer {user_bearer_token}"}
-    canvas_data = _build_canvas_data(req)
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        # Built inside the client block: an element attachment edge needs a
+        # port lookup against inventory (D2), which reuses this same client.
+        canvas_data = await _build_canvas_data(client, headers, req)
         topology_id = await _create_topology(client, headers, req.topology_name)
         try:
             await _update_topology_canvas(client, headers, topology_id, canvas_data)
