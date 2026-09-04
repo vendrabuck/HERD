@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Added lab purpose classification, phase 2 (issue #646): the AI orchestrator
+  gains `POST /api/ai/classify-purpose/preview` (user JWT, creation pass) and
+  `POST /api/ai/internal/classify-purpose` (X-Internal-Token, end-of-
+  reservation pass), both behind `AI_PURPOSE_CLASSIFICATION_ENABLED`
+  (default off, enforced at the route boundary like recipe authoring). Each
+  makes one forced `classify_purpose` tool call against a caller-supplied
+  category list, assembling a prompt from purpose text, topology device/
+  template/wiring signals, dynamic template names, config-apply job names
+  and counts, fork version count, duration/status, and, when
+  `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is set (default on), the reservation
+  assistant's own transcripts; a signal-fetch failure is logged and dropped
+  rather than failing the request, reflected in the response's
+  `signals_used`. `GET /api/ai/status` gains `purpose_classification`.
+  Inventory gains one small additive internal endpoint,
+  `GET /devices/{device_id}/apply-jobs/internal`, to feed the config-apply
+  signal without a user JWT. See `docs/AI_PURPOSE_CLASSIFICATION.md`.
 - Fixed a race where a fork restore committing between a save's read and its
   commit could have its restore-to-draft marker silently dropped by the
   save's stale in-memory copy: every fork-mutating route (restore, the loose
