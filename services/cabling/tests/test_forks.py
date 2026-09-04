@@ -60,6 +60,42 @@ def _hdr() -> dict:
     return {"X-Internal-Token": INTERNAL_TOKEN}
 
 
+def test_fork_mutating_routes_load_the_fork_row_for_update():
+    """Issue #626: pins that every fork-mutating route loads under FOR UPDATE.
+
+    A code-shape guard, not a behavior test. SQLite (this suite's dialect) never
+    emits FOR UPDATE regardless of the flag, so no test in this file can prove the
+    row lock actually blocks a concurrent writer; see
+    test_fork_restore_save_race_live_pg.py for that proof against real Postgres.
+    That live test drives _load_fork directly with for_update=True to control the
+    hold window, so it would keep passing even if a future edit quietly dropped
+    for_update=True from one of the routes below. This test closes that gap by
+    reading each route function's own source and pinning the exact call shape:
+    restore, the loose canvas PUT, save, and prune-devices must all load locked,
+    while the two GET routes must stay unlocked since they only ever read.
+    """
+    import inspect
+
+    import app.routes.forks as forks_module
+
+    for fn_name in (
+        "restore_fork_version_internal",
+        "update_fork_canvas_internal",
+        "save_fork_internal",
+        "prune_fork_devices_internal",
+    ):
+        source = inspect.getsource(getattr(forks_module, fn_name))
+        assert "for_update=True" in source, (
+            f"{fn_name} must load the fork under FOR UPDATE (issue #626)"
+        )
+
+    for fn_name in ("get_fork_internal", "get_fork_version_internal"):
+        source = inspect.getsource(getattr(forks_module, fn_name))
+        assert "for_update=True" not in source, (
+            f"{fn_name} is read-only and must not take the row lock"
+        )
+
+
 # --- Model-level tests (Phase 1 schema) ---
 
 

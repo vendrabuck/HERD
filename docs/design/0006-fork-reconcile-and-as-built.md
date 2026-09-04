@@ -360,3 +360,32 @@ used); `frontend/src/lib/forkDiff.ts` is the pure client-side diff;
 `ForkHistoryPanel.tsx` renders per-version Preview/Diff/(ACTIVE-only)
 Restore plus a "Draft restored from version N (unsaved)" chip derived from
 `draft_restored_from_id` while a restore is pending its Save.
+
+### Follow-up: the fork row lock (issue #626, closed)
+
+The addendum above left one race unaddressed: restore and save both
+read-modify-write `draft_restored_from_id` and `canvas_data` with no
+coordination, so a restore that committed between a save's own read and its
+own commit could be silently overwritten by the save's stale in-memory
+copy, dropping the restore's freshly set marker on the floor. The invariant
+is that a restore marker is either consumed by exactly one appended
+`fork_versions` row or still present on the fork row, never lost.
+
+Issue #626 closed this with a row lock rather than a version column:
+`app/routes/forks.py`'s `_load_fork` takes an optional `for_update` flag
+that issues `SELECT ... FOR UPDATE` (a no-op on SQLite, since SQLAlchemy
+only emits it on dialects that support it). Every route that mutates the
+fork row loads it locked and holds that lock from the load through its own
+final commit or rollback: restore, the loose canvas PUT, save, and
+prune-devices. The two GET routes stay unlocked. Canvas overwrites remain
+last-writer-wins by design; the lock's job is only to stop the marker field
+from being lost mid-flight, not to change that.
+
+Tests: `services/cabling/tests/test_fork_restore_save_race_live_pg.py`
+proves the lock genuinely serializes two independent Postgres sessions in
+both commit orders (a live database is required, since SQLite cannot
+exercise real blocking); `test_fork_mutating_routes_load_the_fork_row_for_update`
+in `test_forks.py` is a source-level guard pinning that each of the four
+mutating routes actually passes `for_update=True`, closing the gap a live
+concurrency test alone would leave (it drives the loader directly and would
+keep passing even if a route's own call site regressed).
