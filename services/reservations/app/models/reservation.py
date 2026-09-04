@@ -73,6 +73,36 @@ class Reservation(Base):
     purpose_category_set_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # AI purpose suggestion (issue #646 phase 2, ADR 0013 points 8-9). The
+    # orchestrator's classify-purpose response stored verbatim:
+    # {distribution, top_category, pass, model, rationale, generated_at,
+    # signals_used}. `none_as_null=True` is load-bearing: the generic JSON
+    # type otherwise persists a Python None as a literal JSON "null" rather
+    # than SQL NULL, which would silently break every
+    # `purpose_suggestion.is_(None)`/`is_not(None)` filter below (the sweep
+    # reconciler's eligibility check, the review-list query, and backfill).
+    # purpose_classify_requested_at is stamped at the five sites where a
+    # reservation transitions into COMPLETED/CANCELLED/FAILED (the same sites
+    # that archive the fork best-effort), if it is not already set; this is
+    # the ONLY way a row becomes eligible for the background classifier, so
+    # end-of-reservation classification and admin backfill share one
+    # mechanism. purpose_classify_attempts caps sweep retries at
+    # settings.purpose_classify_max_attempts. purpose_suggestion_dismissed_at
+    # marks a suggestion an admin reviewed and declined, so it never resurfaces
+    # on the review page even though the row keeps ai_suggested status.
+    purpose_suggestion: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    purpose_suggested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    purpose_classify_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    purpose_classify_attempts: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )
+    purpose_suggestion_dismissed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     start_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )

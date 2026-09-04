@@ -260,6 +260,7 @@ services:
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       INVENTORY_SERVICE_URL: http://inventory:8000
+      AI_ORCHESTRATOR_SERVICE_URL: http://ai-orchestrator:8000
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}

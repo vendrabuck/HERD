@@ -5,6 +5,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import and_, exists, select
@@ -18,6 +19,7 @@ from app.models.reservation import (
     ReservationDynamicRequest,
     ReservationStatus,
 )
+from app.services.purpose_service import stamp_purpose_classify_requested
 from app.services.reservation_service import (
     _archive_reservation_fork_best_effort,
     _claim_provision_transition,
@@ -283,6 +285,10 @@ async def _run_expiration_cycle() -> None:
         # device_ids is read here while the row is attached, before the commit.
         for res in expired:
             res.status = ReservationStatus.COMPLETED
+            # One of the five terminal-transition sites (issue #646 phase 2,
+            # ADR 0013 point 8): marks the row eligible for background purpose
+            # classification.
+            stamp_purpose_classify_requested(res)
             enqueue_event(
                 db,
                 OutboxEvent,
@@ -336,6 +342,12 @@ async def _run_expiration_cycle() -> None:
                 if not await _claim_provision_transition(db, res.id, ReservationStatus.FAILED):
                     continue
                 stuck.append(res)
+                # One of the five terminal-transition sites (issue #646 phase 2,
+                # ADR 0013 point 8): marks the row eligible for background
+                # purpose classification. The CAS above bypasses the ORM's
+                # in-memory status sync, but this column is untouched by it, so
+                # setting it here on `res` and committing below is safe.
+                stamp_purpose_classify_requested(res)
                 enqueue_event(db, OutboxEvent, FAILED_SUBJECT, _reservation_failed_event(res))
                 logger.error(
                     "Provisioning timed out for reservation %s; failing it",
@@ -743,6 +755,181 @@ async def _run_pending_prune_reconcile() -> None:
         await _prune_removed_devices_from_fork_best_effort(row.id, device_ids, attempts=1)
 
 
+def _dynamic_requests_classify_payload(
+    dynamic_requests: list[ReservationDynamicRequest],
+) -> list[dict] | None:
+    """Group a reservation's dynamic request rows into {template_id, count}.
+
+    Each ReservationDynamicRequest row is one requested instance (issue #32
+    deliberately has no per-row count, so N rows of the same template_id means
+    N instances); the classify-purpose contract wants one entry per distinct
+    template with its count. None (not an empty list) for a physical-only
+    reservation, matching the contract's `[...] | null`.
+    """
+    if not dynamic_requests:
+        return None
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for dr in dynamic_requests:
+        tid = str(dr.template_id)
+        if tid not in counts:
+            order.append(tid)
+        counts[tid] = counts.get(tid, 0) + 1
+    return [{"template_id": tid, "count": counts[tid]} for tid in order]
+
+
+async def _bump_purpose_classify_attempts(reservation_id: uuid.UUID) -> None:
+    """Increment purpose_classify_attempts for one row, in its own transaction."""
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None:
+            return
+        res.purpose_classify_attempts += 1
+        await db.commit()
+
+
+async def _classify_purpose_one(reservation_id: uuid.UUID) -> str:
+    """Classify one reservation's purpose via the AI orchestrator; never raises.
+
+    Returns "ok" (a suggestion was stored, or the row was already resolved by
+    a concurrent writer), "feature_off" (the orchestrator answered 403,
+    meaning AI_PURPOSE_CLASSIFICATION_ENABLED is off; the row is left
+    untouched, no attempt counted), or "failed" (any other non-200, a bad
+    body, or a transport error/timeout; purpose_classify_attempts is
+    incremented). Each outcome that mutates the row does so in its own
+    session/commit, so one row's failure never affects another row in the
+    same batch.
+    """
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None or res.purpose_suggestion is not None:
+            # Already resolved by a concurrent writer (another instance's
+            # sweep tick, or an admin action) since this row was selected for
+            # the batch: nothing to do.
+            return "ok"
+        payload = {
+            "reservation_id": str(res.id),
+            "categories": list(settings.purpose_categories),
+            "purpose": res.purpose,
+            "user_id": str(res.user_id),
+            "device_ids": [str(d) for d in res.device_ids],
+            "topology_id": str(res.topology_id) if res.topology_id else None,
+            "dynamic_requests": _dynamic_requests_classify_payload(res.dynamic_requests),
+            "start_time": res.start_time.isoformat(),
+            "end_time": res.end_time.isoformat(),
+            "status": res.status.value,
+        }
+
+    try:
+        resp = await call_service(
+            settings.ai_orchestrator_service_url,
+            "POST",
+            "/internal/classify-purpose",
+            json_body=payload,
+            timeout=settings.purpose_classify_timeout_seconds,
+            auth=InternalTokenAuth(token=settings.internal_api_token),
+        )
+    except Exception:
+        logger.warning(
+            "Purpose classify reconcile: call to the orchestrator failed for %s",
+            reservation_id,
+            exc_info=True,
+            extra={
+                "action": "purpose_classify_call_failed",
+                "reservation_id": str(reservation_id),
+            },
+        )
+        await _bump_purpose_classify_attempts(reservation_id)
+        return "failed"
+
+    if resp.status_code == 403:
+        return "feature_off"
+
+    if resp.status_code != 200:
+        logger.warning(
+            "Purpose classify reconcile: orchestrator returned %s for %s",
+            resp.status_code,
+            reservation_id,
+            extra={
+                "action": "purpose_classify_bad_status",
+                "reservation_id": str(reservation_id),
+                "status_code": resp.status_code,
+            },
+        )
+        await _bump_purpose_classify_attempts(reservation_id)
+        return "failed"
+
+    try:
+        suggestion = resp.json()
+    except ValueError:
+        logger.warning(
+            "Purpose classify reconcile: unparseable 200 body for %s",
+            reservation_id,
+            extra={"action": "purpose_classify_bad_body", "reservation_id": str(reservation_id)},
+        )
+        await _bump_purpose_classify_attempts(reservation_id)
+        return "failed"
+
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None:
+            return "ok"
+        res.purpose_suggestion = suggestion
+        res.purpose_suggested_at = datetime.now(timezone.utc)
+        await db.commit()
+    logger.info(
+        "Purpose classify reconcile: stored a suggestion for %s",
+        reservation_id,
+        extra={"action": "purpose_classify_stored", "reservation_id": str(reservation_id)},
+    )
+    return "ok"
+
+
+async def _run_purpose_classify_reconcile() -> None:
+    """End-of-reservation background purpose classification (issue #646 phase 2,
+    ADR 0013 point 8's second pass).
+
+    Each tick selects up to `purpose_classify_batch_size` rows where
+    purpose_classify_requested_at is set, purpose_suggestion is still null, and
+    purpose_classify_attempts is under the cap, oldest requested first (so a
+    backfill of old rows drains before newer terminal reservations queue
+    behind it), and classifies each in turn via _classify_purpose_one.
+
+    A "feature_off" outcome (the orchestrator answered 403, meaning
+    AI_PURPOSE_CLASSIFICATION_ENABLED is off there) ends the WHOLE tick
+    immediately without touching any row, including ones later in the batch:
+    there is no point spending N more round trips confirming the same flag is
+    off, and none of them should count as a consumed attempt. Any other
+    failure only affects its own row; the loop continues to the next
+    candidate. This function never raises: every per-row failure is caught
+    inside _classify_purpose_one.
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Reservation.id)
+            .where(
+                and_(
+                    Reservation.purpose_classify_requested_at.is_not(None),
+                    Reservation.purpose_suggestion.is_(None),
+                    Reservation.purpose_classify_attempts < settings.purpose_classify_max_attempts,
+                )
+            )
+            .order_by(Reservation.purpose_classify_requested_at)
+            .limit(settings.purpose_classify_batch_size)
+        )
+        reservation_ids = [row[0] for row in result.all()]
+
+    for reservation_id in reservation_ids:
+        outcome = await _classify_purpose_one(reservation_id)
+        if outcome == "feature_off":
+            logger.info(
+                "Purpose classify reconcile: AI purpose classification is off on the "
+                "orchestrator; ending this tick",
+                extra={"action": "purpose_classify_feature_off"},
+            )
+            break
+
+
 async def expiration_loop(interval_seconds: int = 60) -> None:
     """Run expiration cycles forever at the given interval.
 
@@ -770,4 +957,8 @@ async def expiration_loop(interval_seconds: int = 60) -> None:
             await _run_pending_prune_reconcile()
         except Exception:
             logger.error("Pending fork-prune reconcile cycle failed", exc_info=True)
+        try:
+            await _run_purpose_classify_reconcile()
+        except Exception:
+            logger.error("Purpose classify reconcile cycle failed", exc_info=True)
         await asyncio.sleep(interval_seconds)

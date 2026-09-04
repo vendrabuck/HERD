@@ -28,9 +28,11 @@ from app.schemas.reservation import (
 
 logger = logging.getLogger(__name__)
 
-# Literal bucket label for a reservation with no purpose_category (issue #646
-# phase 1). Never a null value in the report, so a client can group on the
-# field without a null-handling special case.
+# Literal bucket label for a reservation with no purpose_category AND no AI
+# suggestion (issue #646 phase 1, narrowed by phase 2 / ADR 0013 point 9). A
+# row with a suggestion but no confirmed category reports under
+# by_purpose_suggested instead (keyed by the suggestion's top_category), never
+# under this label: a suggestion is progress, not absence.
 UNCLASSIFIED_PURPOSE = "unclassified"
 
 
@@ -150,6 +152,12 @@ async def build_utilization_report(
     user_purpose_count: dict[tuple[uuid.UUID, str], int] = defaultdict(int)
     device_purpose_hours: dict[tuple[uuid.UUID, str], float] = defaultdict(float)
     device_purpose_count: dict[tuple[uuid.UUID, str], int] = defaultdict(int)
+    # AI-suggested-but-unconfirmed rows (issue #646 phase 2, ADR 0013 point 9):
+    # keyed by the suggestion's top_category, reported in their own bucket
+    # (by_purpose_suggested), never mixed into purpose_hours/purpose_count
+    # above or counted as unclassified.
+    purpose_suggested_hours: dict[str, float] = defaultdict(float)
+    purpose_suggested_count: dict[str, int] = defaultdict(int)
 
     window_start = _as_utc(window_start)
     window_end = _as_utc(window_end)
@@ -179,9 +187,32 @@ async def build_utilization_report(
                     day_count[day] += 1
                     seen_days.add(day)
 
-            category = r.purpose_category or UNCLASSIFIED_PURPOSE
-            purpose_count[category] += 1
-            user_purpose_count[(r.user_id, category)] += 1
+            # Three-way split (issue #646 phase 2, ADR 0013 point 9):
+            # confirmed (purpose_category set) counts toward purpose_count/
+            # purpose_hours under its own value; ai_suggested (no confirmed
+            # category, but a suggestion present) counts toward
+            # purpose_suggested_count/_hours under the suggestion's
+            # top_category and NEVER toward purpose_count; genuinely
+            # unclassified (neither) counts toward purpose_count under the
+            # literal "unclassified" label, same as phase 1.
+            category = r.purpose_category
+            is_confirmed = True
+            suggested_category = None
+            if category is None:
+                suggestion = r.purpose_suggestion
+                if suggestion:
+                    is_confirmed = False
+                    suggested_category = (
+                        suggestion.get("top_category") if isinstance(suggestion, dict) else None
+                    ) or UNCLASSIFIED_PURPOSE
+                else:
+                    category = UNCLASSIFIED_PURPOSE
+
+            if is_confirmed:
+                purpose_count[category] += 1
+                user_purpose_count[(r.user_id, category)] += 1
+            else:
+                purpose_suggested_count[suggested_category] += 1
 
         if not in_legacy and not in_fleet:
             continue
@@ -193,10 +224,13 @@ async def build_utilization_report(
             if in_legacy:
                 device_hours[device_id] += hours
                 device_count[device_id] += 1
-                purpose_hours[category] += hours
-                user_purpose_hours[(r.user_id, category)] += hours
-                device_purpose_hours[(device_id, category)] += hours
-                device_purpose_count[(device_id, category)] += 1
+                if is_confirmed:
+                    purpose_hours[category] += hours
+                    user_purpose_hours[(r.user_id, category)] += hours
+                    device_purpose_hours[(device_id, category)] += hours
+                    device_purpose_count[(device_id, category)] += 1
+                else:
+                    purpose_suggested_hours[suggested_category] += hours
             if in_fleet:
                 fleet_device_hours[device_id] += hours
                 fleet_device_count[device_id] += 1
@@ -235,6 +269,18 @@ async def build_utilization_report(
                 device_hours=round(purpose_hours[category], 4),
             )
             for category in purpose_count
+        ),
+        key=lambda b: b.device_hours,
+        reverse=True,
+    )
+    by_purpose_suggested = sorted(
+        (
+            PurposeBucket(
+                purpose_category=category,
+                reservations=purpose_suggested_count[category],
+                device_hours=round(purpose_suggested_hours[category], 4),
+            )
+            for category in purpose_suggested_count
         ),
         key=lambda b: b.device_hours,
         reverse=True,
@@ -303,6 +349,7 @@ async def build_utilization_report(
         by_purpose=by_purpose,
         by_user_purpose=by_user_purpose,
         by_device_purpose=by_device_purpose,
+        by_purpose_suggested=by_purpose_suggested,
     )
 
 
@@ -516,13 +563,14 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
     """Render one section of a UtilizationReport as CSV text.
 
     Supported sections: "user", "device", "fleet", "purpose", "user_purpose",
-    "device_purpose". "template" is a client-side rollup because it requires
-    joining against the inventory service. "fleet" requires report.fleet to be
-    populated; the route turns an unpopulated fleet into a 503 before calling
-    this. The three purpose sections (issue #646 phase 1) are new, standalone
-    sections rather than an added column on "user"/"device": a user or device
-    can span multiple purpose categories, so a per-user or per-device row
-    cannot carry a single category value without losing information.
+    "device_purpose", "purpose_suggested". "template" is a client-side rollup
+    because it requires joining against the inventory service. "fleet"
+    requires report.fleet to be populated; the route turns an unpopulated
+    fleet into a 503 before calling this. The purpose sections (issue #646
+    phase 1, "purpose_suggested" added phase 2) are standalone sections
+    rather than an added column on "user"/"device": a user or device can span
+    multiple purpose categories, so a per-user or per-device row cannot carry
+    a single category value without losing information.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -567,6 +615,10 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
             writer.writerow(
                 [str(b.device_id), b.purpose_category, b.reservations, f"{b.device_hours:.4f}"]
             )
+    elif section == "purpose_suggested":
+        writer.writerow(["purpose_category", "reservations", "device_hours"])
+        for b in report.by_purpose_suggested:
+            writer.writerow([b.purpose_category, b.reservations, f"{b.device_hours:.4f}"])
     else:
         raise ValueError(f"Unsupported CSV section: {section}")
     return buf.getvalue()

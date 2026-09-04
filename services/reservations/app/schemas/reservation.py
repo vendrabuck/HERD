@@ -150,6 +150,56 @@ class PurposeCategoriesResponse(BaseModel):
     categories: list[str]
 
 
+class PurposeReviewItem(BaseModel):
+    """One row of GET /admin/purpose-review (issue #646 phase 2, ADR 0013 point 10).
+
+    purpose_suggestion is the orchestrator's classify-purpose response stored
+    verbatim. device_count is len(device_ids), not the ids themselves: the
+    review page groups by category and shows scale, not device identity.
+    Built by hand in the router (not model_validate), since reservation_id
+    and device_count do not map onto Reservation attribute names.
+    """
+
+    reservation_id: uuid.UUID
+    user_id: uuid.UUID
+    purpose: str | None
+    start_time: datetime
+    end_time: datetime
+    status: ReservationStatus
+    purpose_category: str | None
+    purpose_suggestion: dict[str, Any]
+    purpose_suggested_at: datetime | None
+    device_count: int
+
+
+class PurposeReviewListResponse(BaseModel):
+    """Body of GET /admin/purpose-review, matching this service's other paginated shapes."""
+
+    items: list[PurposeReviewItem]
+    total: int
+    skip: int
+    limit: int
+
+
+class PurposeReviewAcceptBody(BaseModel):
+    """Body of POST /admin/purpose-review/{id}/accept.
+
+    A null purpose_category accepts the suggestion's own top_category; a
+    non-null value is validated against the configured taxonomy in the
+    service layer (the same pinned-wording reason PurposeCategoryUpdate is
+    unvalidated here), letting an admin pick a category other than the AI's
+    top pick from the same distribution.
+    """
+
+    purpose_category: str | None = None
+
+
+class PurposeBackfillResponse(BaseModel):
+    """Body of POST /admin/purpose/backfill."""
+
+    marked: int
+
+
 class DynamicRequestResponse(BaseModel):
     """A booked dynamic instance request; `id` is the execution-side request_id."""
 
@@ -183,6 +233,14 @@ class ReservationResponse(BaseModel):
     # when it was set.
     purpose_category: str | None = None
     purpose_category_set_at: datetime | None = None
+    # AI purpose suggestion (issue #646 phase 2, ADR 0013 points 8-9): the
+    # orchestrator's classify-purpose response stored verbatim, or null before
+    # the background classifier (or an admin backfill) has run. Internal
+    # review state, not exposed on the v1 facade: it is not confirmed until an
+    # admin accepts it into purpose_category above.
+    purpose_suggestion: dict[str, Any] | None = None
+    purpose_suggested_at: datetime | None = None
+    purpose_suggestion_dismissed_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -363,3 +421,11 @@ class UtilizationReport(BaseModel):
     by_purpose: list[PurposeBucket] = []
     by_user_purpose: list[UserPurposeBucket] = []
     by_device_purpose: list[DevicePurposeBucket] = []
+    # AI-suggested-but-unconfirmed rows (issue #646 phase 2, ADR 0013 point
+    # 9): reservations with purpose_category still null but an AI suggestion
+    # present (dismissed or not), keyed by the suggestion's top_category. A
+    # row here is never also counted in by_purpose's "unclassified" bucket or
+    # in any confirmed category total; once an admin (or the owner) confirms a
+    # category, the row moves out of this list and into by_purpose under its
+    # confirmed value, even if it still carries a suggestion.
+    by_purpose_suggested: list[PurposeBucket] = []

@@ -15,6 +15,7 @@ class Settings(HerdBaseSettings):
     auth_service_url: str = "http://auth:8000"
     execution_service_url: str = "http://execution:8000"
     cabling_service_url: str = "http://cabling:8000"
+    ai_orchestrator_service_url: str = "http://ai-orchestrator:8000"
     nats_url: str = "nats://nats:4222"
     # JetStream retention cap for HERD_RESERVATIONS (issue #620). 0 means no
     # cap. Only takes effect where JetStream state is durable (make prod, the
@@ -66,6 +67,22 @@ class Settings(HerdBaseSettings):
     # unbounded result set in memory; a window wider than this is rejected
     # with 422 rather than silently loading everything. 0 disables the cap.
     utilization_max_span_days: int = 366
+
+    # Background purpose-classification sweep (issue #646 phase 2, ADR 0013
+    # point 8's end-of-reservation pass). The reconciler in
+    # app/tasks/expiration.py picks up to this many eligible rows (
+    # purpose_classify_requested_at set, no purpose_suggestion yet, under the
+    # attempt cap) per tick, oldest requested first, and calls the AI
+    # orchestrator's internal classify-purpose endpoint for each.
+    purpose_classify_batch_size: int = 20
+    # Per-row cap on sweep attempts (a 5xx, a timeout, or a transport error
+    # increments this; a 403 from the orchestrator, meaning the feature is
+    # off, does NOT count as an attempt). A row at the cap is skipped until an
+    # admin backfill or a taxonomy/config change makes it worth retrying by
+    # hand; there is no automatic reset.
+    purpose_classify_max_attempts: int = 3
+    # Per-call timeout for the orchestrator's classify-purpose call.
+    purpose_classify_timeout_seconds: float = 30.0
 
     # Lab purpose classification (issue #646 phase 1). The taxonomy is a plain
     # string list validated at write time, not a Postgres enum and not a
