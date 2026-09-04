@@ -70,6 +70,7 @@
         "device_ids": "array",
         "end_time": "string",
         "purpose": "anyOf",
+        "purpose_category": "anyOf",
         "start_time": "string",
         "topology_id": "anyOf"
       },
@@ -86,6 +87,7 @@
         "device_ids": "array",
         "end_time": "string",
         "id": "string",
+        "purpose_category": "anyOf",
         "start_time": "string",
         "status": "string",
         "topology_id": "anyOf"
