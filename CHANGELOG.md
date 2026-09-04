@@ -22,6 +22,24 @@
   `by_device_purpose` breakdowns, with an explicit `unclassified` bucket for
   reservations with no category. Device-level classification counts reserved
   devices only; transit-gear inheritance is deferred to phase 3.
+- Added lab purpose classification, phase 2 reservations-side pieces (issue
+  #646, ADR 0013 points 8-11): a reservation transitioning into COMPLETED,
+  CANCELLED, or FAILED now stamps `purpose_classify_requested_at`, the sole
+  trigger for a new expiration-sweep reconciler that calls the AI
+  orchestrator's internal classify-purpose endpoint in bounded batches
+  (`PURPOSE_CLASSIFY_BATCH_SIZE`, capped at `PURPOSE_CLASSIFY_MAX_ATTEMPTS`
+  retries per row) and stores the result verbatim as `purpose_suggestion`. New
+  admin endpoints: `GET /admin/purpose-review` (paginated, filterable by
+  suggested category) lists undismissed suggestions still worth a look,
+  `POST /admin/purpose-review/{id}/accept` writes a suggestion (or a chosen
+  override) into the confirmed `purpose_category`, `POST
+  /admin/purpose-review/{id}/dismiss` drops a suggestion from the queue
+  without touching the confirmed value, and `POST /admin/purpose/backfill`
+  marks every terminal reservation with no suggestion yet as eligible
+  (idempotent). The utilization report gains `by_purpose_suggested` (and a
+  matching CSV section) for reservations with a suggestion but no confirmed
+  category; `unclassified` now means neither a category nor a suggestion.
+  Suggestions are internal review state, not exposed on the `/api/v1` facade.
 
 ## [0.3.0] - 2026-08-30
 
