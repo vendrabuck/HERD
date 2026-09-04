@@ -36,7 +36,8 @@ A reservation holds one or more devices over a time window. Creating a reservati
 1. Go to **Reservations** in the nav bar.
 2. Click **New reservation**.
 3. Fill in purpose, start time, end time, and pick the devices you want. The UI hides devices you cannot see and marks already-reserved exclusive devices.
-4. Submit. You will see the reservation in your list.
+4. Optionally pick a **Purpose category** from the dropdown below the purpose field: a short, fixed list (QA regression, support case replication, feature development, customer demo/POC, training, performance benchmark, other, or an admin-configured variant of that list). It defaults to Unclassified and never blocks submission; you can set or change it later.
+5. Submit. You will see the reservation in your list.
 
 You can also create a reservation from the topology editor's AI flow (see [AI_GENERATE.md](AI_GENERATE.md)).
 
@@ -87,7 +88,7 @@ You can also plan canvas-first: drag a dynamic template from the topology editor
 
 Click any reservation in the list to open the detail modal. Five tabs (plus an AI Assistant tab when the assistant is enabled):
 
-- **Details** (default): basic info (id, purpose, dates, status).
+- **Details** (default): basic info (id, purpose, dates, status), plus the purpose category. The reservation owner or an admin can set or change it here from the same dropdown as at creation, in any status including terminal ones, so a completed reservation can still be classified after the fact. Anyone else sees it as a read-only tag.
 - **Inventory**: the devices in the reservation. Expand a row to see its ports and what each port is physically connected to.
 - **Routes**: for DUT-to-DUT pairs, shows the hop-by-hop path through L1 switches computed by the pathfinder. Green badges for reachable pairs, red for unreachable.
 - **Wiring**: the applied wiring state across all three layers (L1 cross-connects, L2 VLAN memberships, L3 route pins), with per-row status and a Retry button for failed rows on active reservations. See the topology-editing section for details.

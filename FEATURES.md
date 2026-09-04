@@ -164,6 +164,19 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   (ADR 0009 Decision 6); removing a device releases its wiring via the fork prune.
 - **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,
   status filters, and click-to-view details.
+- **Lab purpose classification** (Shipped, phase 1): an optional purpose category
+  alongside the existing free-text purpose field, drawn from a configurable
+  taxonomy (`PURPOSE_CATEGORIES`, default qa_regression, support_case_replication,
+  feature_development, customer_demo_poc, training, performance_benchmark, other).
+  The create-reservation modal defaults the select to Unclassified and never blocks
+  submission; the reservation owner or an admin can set or clear it afterward from
+  the detail modal, in any status including terminal ones, so retroactive
+  classification of past reservations is possible. Reporting breaks utilization
+  down by category, by user and category, and by device and category, with an
+  explicit unclassified bucket. AI-suggested classification and an admin review
+  queue are planned for later phases; see
+  [docs/design/0013-lab-purpose-classification.md](docs/design/0013-lab-purpose-classification.md)
+  (issue #646).
 
 ## Dynamic resources
 
@@ -275,7 +288,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   device, topology type, day, and group, with CSV export. Includes a fleet
   utilization section: a per-device utilization rate against the full window, an
   idle-device view (devices with zero bookings in the window), and fleet-wide
-  summary numbers, counting active plus completed reservations by default.
+  summary numbers, counting active plus completed reservations by default. A
+  Purpose section breaks device-hours down by lab purpose category, by user and
+  category, and by device and category (three additional CSV sections), counting
+  COMPLETED reservations by default like the rest of the report.
 - **Notifications and dispatch channels** (Shipped): durable NATS consumers turn
   reservation lifecycle and device-health events into per-user notifications. The
   in-app bell ships alongside opt-in email, chat (Slack-style), and outbound-webhook

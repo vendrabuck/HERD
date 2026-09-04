@@ -111,6 +111,7 @@
               <div class="mhead"><h2>New reservation</h2><span class="x">&times;</span></div>
               <div class="mbody">
                 <div class="hd-field"><label class="hd-label">Purpose</label><div class="hd-input" data-anno="1" data-anno-pin="r" data-anno-arrow>HA failover regression</div></div>
+                <div class="hd-field"><label class="hd-label">Purpose category (optional)</label><div class="hd-select" data-anno="6" data-anno-pin="r" data-anno-arrow>Unclassified</div></div>
                 <div class="hd-row2">
                   <div class="hd-field"><label class="hd-label">Start</label><div class="hd-input" data-anno="2" data-anno-pin="t" data-anno-arrow>2026-05-28 09:00</div></div>
                   <div class="hd-field"><label class="hd-label">End</label><div class="hd-input">2026-06-04 18:00</div></div>
@@ -140,6 +141,7 @@
       <li><b>Devices.</b> Chosen beforehand on the <a href="user-topology.html">topology canvas</a>; this form just shows how many you picked. There's no separate device picker in the reservation form itself.</li>
       <li><b>Reserve.</b> Submit. The new reservation appears in your list immediately.</li>
       <li><b>Dynamic instances.</b> Only useful if your admin has created dynamic templates: add rows to book hypervisor-backed instances alongside (or instead of) real devices. Coming from the topology canvas, placeholder nodes prefill this block &mdash; see <a href="user-topology.html#dynamic">Dynamic resources</a>.</li>
+      <li><b>Purpose category.</b> Optional, separate from the free-text Purpose above: a short, fixed list (QA regression, support case replication, feature development, customer demo/POC, training, performance benchmark, other, or whatever your admin has configured) that the utilization report can chart. Defaults to Unclassified and never blocks submission; you or an admin can set or change it later from the detail modal, in any status.</li>
     </ol>
 
     <div class="callout tip">
@@ -207,6 +209,7 @@
                 <dl class="hd-dl">
                   <dt>Status</dt><dd><span class="hd-badge active">ACTIVE</span></dd>
                   <dt>Purpose</dt><dd>HA failover regression</dd>
+                  <dt>Purpose category</dt><dd>Feature development</dd>
                   <dt>Period</dt><dd>May 28 09:00 &rarr; Jun 04 18:00</dd>
                   <dt>Topology</dt><dd><span class="hd-badge physical">PHYSICAL</span> &middot; 9a81c0d2</dd>
                   <dt>Devices</dt><dd>4</dd>
@@ -228,6 +231,7 @@
       <li><b>Wiring</b> &mdash; the per-connection status of the L1 wiring HERD applied to the hardware, with a <b>Retry failed</b> action while the reservation is active. Full walkthrough in <a href="user-live-editing.html#wiring">Live editing</a>.</li>
       <li><b>Schedule</b> &mdash; inline-edit the end time and purpose without rebooking.</li>
       <li><b>Dynamic instances</b> &mdash; if the reservation carries dynamic requests, the Details tab lists them grouped by template with a count. The instances themselves appear once the reservation is <span class="badge active">ACTIVE</span>.</li>
+      <li><b>Purpose category</b> &mdash; you (the owner) or an admin can set or change this from the same list of categories offered at creation, in any status including <span class="badge completed">COMPLETED</span>, <span class="badge cancelled">CANCELLED</span>, and <span class="badge failed">FAILED</span>, so past reservations can be classified retroactively. Anyone else sees it as a read-only tag.</li>
     </ol>
 
     <div class="callout tip">
