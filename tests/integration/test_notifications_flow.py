@@ -126,10 +126,19 @@ async def test_disabled_event_suppresses_notification(user_client, visible_fresh
                 params={"limit": 50, "offset": 0},
             )
             items = after.json().get("items", [])
+            # Only reservation.created is opted out above. The reservation is
+            # one hour long and expiry_reminder_lead_seconds defaults to 3600,
+            # so the expiration sweep (every 5 s on the test stack) stages a
+            # legitimate reservation.expiring_soon reminder for it almost at
+            # once, and since issue #682 the outbox delivers that reminder in
+            # milliseconds, inside this 3 s window. Match on the event type,
+            # not merely the reservation id, or the reminder trips the check.
             for item in items:
                 data = item.get("data") or {}
+                if data.get("event") != "reservation.created":
+                    continue
                 assert data.get("reservation_id") != reservation["id"], (
-                    "notification was created despite event opt-out"
+                    "reservation.created notification was created despite event opt-out"
                 )
             assert after.json().get("total", 0) <= baseline_total + 1, (
                 "unexpected notification count increase while event was disabled"
