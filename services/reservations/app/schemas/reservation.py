@@ -58,6 +58,12 @@ class ReservationCreate(BaseModel):
     # callback. Instances are hypervisor-bound, so the cap is deliberately
     # tighter than the 200-device cap.
     dynamic_requests: list[DynamicRequestSpec] = Field(default_factory=list, max_length=50)
+    # Lab purpose classification (issue #646 phase 1). Validated against the
+    # configured taxonomy in the service layer (app.services.purpose_service),
+    # not here: a schema-level field_validator raising ValueError would wrap
+    # the pinned "Unknown purpose_category '<value>'; allowed: ..." message in
+    # pydantic's request-validation envelope instead of returning it verbatim.
+    purpose_category: str | None = None
 
     @field_validator("device_ids")
     @classmethod
@@ -126,6 +132,24 @@ class ReservationUpdate(BaseModel):
         return _dedupe_preserve_order(v)
 
 
+class PurposeCategoryUpdate(BaseModel):
+    """Body of PATCH /{reservation_id}/purpose-category (issue #646 phase 1).
+
+    A null purpose_category clears the classification (and its set_by/set_at)
+    rather than being rejected; taxonomy membership is validated in the
+    service layer, not here, for the same pinned-detail-wording reason
+    ReservationCreate.purpose_category is unvalidated at the schema level.
+    """
+
+    purpose_category: str | None = None
+
+
+class PurposeCategoriesResponse(BaseModel):
+    """Body of GET /purpose-categories: the configured taxonomy, in order."""
+
+    categories: list[str]
+
+
 class DynamicRequestResponse(BaseModel):
     """A booked dynamic instance request; `id` is the execution-side request_id."""
 
@@ -154,6 +178,11 @@ class ReservationResponse(BaseModel):
     # Non-null only when an admin cancelled a reservation they do not own (#340).
     cancelled_by: uuid.UUID | None = None
     dynamic_requests: list[DynamicRequestResponse] = []
+    # Lab purpose classification (issue #646 phase 1). purpose_category_set_by
+    # is deliberately not exposed here; the response carries only the value and
+    # when it was set.
+    purpose_category: str | None = None
+    purpose_category_set_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -258,6 +287,41 @@ class GroupBucket(BaseModel):
     hours: float
 
 
+class PurposeBucket(BaseModel):
+    """One row of the report's by_purpose breakdown (issue #646 phase 1).
+
+    purpose_category is the literal string "unclassified" for reservations
+    with a null purpose_category, never a null value, so a client can group
+    on the field without a null-handling special case.
+    """
+
+    purpose_category: str
+    reservations: int
+    device_hours: float
+
+
+class UserPurposeBucket(BaseModel):
+    """One (user, purpose_category) row of the report's by_user_purpose breakdown."""
+
+    user_id: uuid.UUID
+    purpose_category: str
+    reservations: int
+    device_hours: float
+
+
+class DevicePurposeBucket(BaseModel):
+    """One (device, purpose_category) row of the report's by_device_purpose breakdown.
+
+    Reserved devices only (issue #646 phase 1 scope); transit-gear inheritance
+    is deferred to phase 3 alongside the device rollups.
+    """
+
+    device_id: uuid.UUID
+    purpose_category: str
+    reservations: int
+    device_hours: float
+
+
 class FleetDeviceBucket(BaseModel):
     device_id: uuid.UUID
     name: str
@@ -293,3 +357,9 @@ class UtilizationReport(BaseModel):
     # None when the inventory service could not be reached; the rest of the
     # report is still served (same degrade contract as execution_run_count).
     fleet: FleetSection | None = None
+    # Lab purpose classification breakdowns (issue #646 phase 1). Honor the
+    # same status_filter as by_user/by_device/by_topology_type/by_day; count
+    # reserved devices only (transit gear is phase 3).
+    by_purpose: list[PurposeBucket] = []
+    by_user_purpose: list[UserPurposeBucket] = []
+    by_device_purpose: list[DevicePurposeBucket] = []

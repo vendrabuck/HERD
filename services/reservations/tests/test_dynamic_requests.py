@@ -256,6 +256,7 @@ async def test_dynamic_booking_stages_provision_requested_payload_exactly(client
         "topology_id": None,
         "topology_type": "PHYSICAL",
         "dynamic_requests": [{"id": data["dynamic_requests"][0]["id"], "template_id": TEMPLATE_ID}],
+        "purpose_category": None,
     }
 
 
@@ -375,6 +376,7 @@ async def test_dynamic_only_stages_provision_requested_cloud(client):
         "topology_id": None,
         "topology_type": "CLOUD",
         "dynamic_requests": [{"id": data["dynamic_requests"][0]["id"], "template_id": TEMPLATE_ID}],
+        "purpose_category": None,
     }
     assert await _outbox_rows("herd.reservations.created") == []
 

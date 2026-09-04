@@ -40,7 +40,7 @@ async def _poll_for_notification(
     return None
 
 
-async def _create_reservation(client, device_id: str) -> dict:
+async def _create_reservation(client, device_id: str, purpose_category: str | None = None) -> dict:
     now = datetime.now(timezone.utc)
     body = {
         "device_ids": [device_id],
@@ -48,6 +48,8 @@ async def _create_reservation(client, device_id: str) -> dict:
         "start_time": now.isoformat(),
         "end_time": (now + timedelta(hours=1)).isoformat(),
     }
+    if purpose_category is not None:
+        body["purpose_category"] = purpose_category
     resp = await client.post("/reservations/", json=body)
     resp.raise_for_status()
     return resp.json()
@@ -59,13 +61,19 @@ async def test_reservation_created_produces_in_app_notification(user_client, vis
     The device is exposed via `visible_fresh_device` so the non-admin caller
     passes the reservations create-route visibility check.
     """
-    reservation = await _create_reservation(user_client, visible_fresh_device["id"])
+    reservation = await _create_reservation(
+        user_client, visible_fresh_device["id"], purpose_category="qa_regression"
+    )
     try:
         matched = await _poll_for_notification(
             user_client, "reservation.created", reservation["id"]
         )
         assert matched is not None, "reservation.created notification did not arrive"
         assert matched["read_at"] is None
+        # The notification's data is the outbox event payload verbatim
+        # (issue #646 phase 1: purpose_category rides every reservation.*
+        # lifecycle event, additive).
+        assert matched["data"]["purpose_category"] == "qa_regression"
     finally:
         await user_client.delete(f"/reservations/{reservation['id']}")
 

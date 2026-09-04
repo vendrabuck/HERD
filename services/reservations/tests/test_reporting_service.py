@@ -7,7 +7,14 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from app.models.reservation import Base, Reservation, ReservationStatus
-from app.schemas.reservation import DeviceBucket, UserBucket, UtilizationReport
+from app.schemas.reservation import (
+    DeviceBucket,
+    DevicePurposeBucket,
+    PurposeBucket,
+    UserBucket,
+    UserPurposeBucket,
+    UtilizationReport,
+)
 from app.services.reporting_service import (
     build_utilization_report,
     fetch_execution_run_count,
@@ -46,6 +53,7 @@ def _reservation(
     end: datetime,
     status: ReservationStatus = ReservationStatus.COMPLETED,
     topology_type: TopologyType = TopologyType.PHYSICAL,
+    purpose_category: str | None = None,
 ) -> Reservation:
     return Reservation(
         id=uuid.uuid4(),
@@ -57,6 +65,7 @@ def _reservation(
         start_time=start,
         end_time=end,
         status=status,
+        purpose_category=purpose_category,
     )
 
 
@@ -318,6 +327,83 @@ async def test_build_report_aggregates_by_topology_type(db_session):
     assert report.by_topology_type[0].topology_type == TopologyType.PHYSICAL
 
 
+@pytest.mark.asyncio
+async def test_build_report_aggregates_by_purpose(db_session):
+    """by_purpose/by_user_purpose/by_device_purpose (issue #646 phase 1):
+    device_hours is actual device-hours (reservation hours times device
+    count), and a null purpose_category buckets under the literal
+    "unclassified" string, never a null value."""
+    # Alice, 2 devices, 2h, classified: 4 device-hours into qa_regression.
+    db_session.add(
+        _reservation(
+            USER_A,
+            "alice",
+            [DEVICE_X, DEVICE_Y],
+            NOW - timedelta(hours=10),
+            NOW - timedelta(hours=8),
+            purpose_category="qa_regression",
+        )
+    )
+    # Bob, 1 device, 1h, unclassified.
+    db_session.add(
+        _reservation(
+            USER_B,
+            "bob",
+            [DEVICE_X],
+            NOW - timedelta(hours=6),
+            NOW - timedelta(hours=5),
+            purpose_category=None,
+        )
+    )
+    # Alice again, 1 device, 1h, same classification: adds 1 more device-hour
+    # and one more reservation to the qa_regression bucket.
+    db_session.add(
+        _reservation(
+            USER_A,
+            "alice",
+            [DEVICE_Y],
+            NOW - timedelta(hours=4),
+            NOW - timedelta(hours=3),
+            purpose_category="qa_regression",
+        )
+    )
+    await db_session.commit()
+
+    report = await build_utilization_report(
+        db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
+    )
+
+    by_purpose = {b.purpose_category: b for b in report.by_purpose}
+    assert by_purpose["qa_regression"].reservations == 2
+    assert by_purpose["qa_regression"].device_hours == pytest.approx(5.0, abs=0.01)
+    assert by_purpose["unclassified"].reservations == 1
+    assert by_purpose["unclassified"].device_hours == pytest.approx(1.0, abs=0.01)
+
+    by_user_purpose = {(b.user_id, b.purpose_category): b for b in report.by_user_purpose}
+    alice_qa = by_user_purpose[(USER_A, "qa_regression")]
+    assert alice_qa.reservations == 2
+    assert alice_qa.device_hours == pytest.approx(5.0, abs=0.01)
+    bob_unclassified = by_user_purpose[(USER_B, "unclassified")]
+    assert bob_unclassified.reservations == 1
+    assert bob_unclassified.device_hours == pytest.approx(1.0, abs=0.01)
+
+    device_x_uid = uuid.UUID(DEVICE_X)
+    device_y_uid = uuid.UUID(DEVICE_Y)
+    by_device_purpose = {(b.device_id, b.purpose_category): b for b in report.by_device_purpose}
+    assert by_device_purpose[(device_x_uid, "qa_regression")].reservations == 1
+    assert by_device_purpose[(device_x_uid, "qa_regression")].device_hours == pytest.approx(
+        2.0, abs=0.01
+    )
+    assert by_device_purpose[(device_x_uid, "unclassified")].reservations == 1
+    assert by_device_purpose[(device_x_uid, "unclassified")].device_hours == pytest.approx(
+        1.0, abs=0.01
+    )
+    assert by_device_purpose[(device_y_uid, "qa_regression")].reservations == 2
+    assert by_device_purpose[(device_y_uid, "qa_regression")].device_hours == pytest.approx(
+        3.0, abs=0.01
+    )
+
+
 def _report_fixture() -> UtilizationReport:
     uid = uuid.uuid4()
     did = uuid.uuid4()
@@ -331,6 +417,19 @@ def _report_fixture() -> UtilizationReport:
         ],
         by_device=[
             DeviceBucket(device_id=did, reservation_count=2, hours=5.0),
+        ],
+        by_purpose=[
+            PurposeBucket(purpose_category="qa_regression", reservations=2, device_hours=5.0),
+        ],
+        by_user_purpose=[
+            UserPurposeBucket(
+                user_id=uid, purpose_category="qa_regression", reservations=2, device_hours=5.0
+            ),
+        ],
+        by_device_purpose=[
+            DevicePurposeBucket(
+                device_id=did, purpose_category="qa_regression", reservations=2, device_hours=5.0
+            ),
         ],
     )
 
@@ -349,6 +448,30 @@ def test_report_to_csv_device_section():
     lines = csv_text.strip().splitlines()
     assert lines[0] == "device_id,hours,reservation_count"
     assert lines[1].endswith(",5.0000,2")
+
+
+def test_report_to_csv_purpose_section():
+    report = _report_fixture()
+    csv_text = report_to_csv(report, "purpose")
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == "purpose_category,reservations,device_hours"
+    assert lines[1] == "qa_regression,2,5.0000"
+
+
+def test_report_to_csv_user_purpose_section():
+    report = _report_fixture()
+    csv_text = report_to_csv(report, "user_purpose")
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == "user_id,purpose_category,reservations,device_hours"
+    assert lines[1].endswith(",qa_regression,2,5.0000")
+
+
+def test_report_to_csv_device_purpose_section():
+    report = _report_fixture()
+    csv_text = report_to_csv(report, "device_purpose")
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == "device_id,purpose_category,reservations,device_hours"
+    assert lines[1].endswith(",qa_regression,2,5.0000")
 
 
 def test_report_to_csv_rejects_unknown_section():

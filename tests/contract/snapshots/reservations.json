@@ -42,6 +42,10 @@
     ],
     [
       "GET",
+      "/purpose-categories"
+    ],
+    [
+      "GET",
       "/reports/utilization"
     ],
     [
@@ -81,6 +85,10 @@
       "/{reservation_id}/fork/versions/{version_id}/restore"
     ],
     [
+      "PATCH",
+      "/{reservation_id}/purpose-category"
+    ],
+    [
       "PUT",
       "/{reservation_id}/release"
     ],
@@ -117,6 +125,21 @@
         "device_id",
         "hours",
         "reservation_count"
+      ],
+      "type": "object"
+    },
+    "DevicePurposeBucket": {
+      "properties": {
+        "device_hours": "number",
+        "device_id": "string",
+        "purpose_category": "string",
+        "reservations": "integer"
+      },
+      "required": [
+        "device_hours",
+        "device_id",
+        "purpose_category",
+        "reservations"
       ],
       "type": "object"
     },
@@ -259,12 +282,42 @@
       ],
       "type": "object"
     },
+    "PurposeBucket": {
+      "properties": {
+        "device_hours": "number",
+        "purpose_category": "string",
+        "reservations": "integer"
+      },
+      "required": [
+        "device_hours",
+        "purpose_category",
+        "reservations"
+      ],
+      "type": "object"
+    },
+    "PurposeCategoriesResponse": {
+      "properties": {
+        "categories": "array"
+      },
+      "required": [
+        "categories"
+      ],
+      "type": "object"
+    },
+    "PurposeCategoryUpdate": {
+      "properties": {
+        "purpose_category": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
     "ReservationCreate": {
       "properties": {
         "device_ids": "array",
         "dynamic_requests": "array",
         "end_time": "string",
         "purpose": "anyOf",
+        "purpose_category": "anyOf",
         "start_time": "string",
         "topology_id": "anyOf"
       },
@@ -303,6 +356,8 @@
         "modified_by": "anyOf",
         "owner_name": "string",
         "purpose": "anyOf",
+        "purpose_category": "anyOf",
+        "purpose_category_set_at": "anyOf",
         "start_time": "string",
         "status": "#/components/schemas/ReservationStatus",
         "topology_id": "anyOf",
@@ -372,13 +427,31 @@
       ],
       "type": "object"
     },
+    "UserPurposeBucket": {
+      "properties": {
+        "device_hours": "number",
+        "purpose_category": "string",
+        "reservations": "integer",
+        "user_id": "string"
+      },
+      "required": [
+        "device_hours",
+        "purpose_category",
+        "reservations",
+        "user_id"
+      ],
+      "type": "object"
+    },
     "UtilizationReport": {
       "properties": {
         "by_day": "array",
         "by_device": "array",
+        "by_device_purpose": "array",
         "by_group": "array",
+        "by_purpose": "array",
         "by_topology_type": "array",
         "by_user": "array",
+        "by_user_purpose": "array",
         "execution_run_count": "anyOf",
         "fleet": "anyOf",
         "total_hours": "number",

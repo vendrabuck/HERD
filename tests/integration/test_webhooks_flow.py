@@ -48,14 +48,17 @@ if not _nats_reachable():
     pytest.skip("NATS not reachable on localhost:4222; stack not up", allow_module_level=True)
 
 
-def _reservation_body(device_id: str) -> dict:
+def _reservation_body(device_id: str, purpose_category: str | None = None) -> dict:
     now = datetime.now(timezone.utc)
-    return {
+    body = {
         "device_ids": [device_id],
         "purpose": "webhook delivery integration test",
         "start_time": now.isoformat(),
         "end_time": (now + timedelta(hours=1)).isoformat(),
     }
+    if purpose_category is not None:
+        body["purpose_category"] = purpose_category
+    return body
 
 
 async def _register_webhook(admin_client, target_url: str) -> dict:
@@ -104,10 +107,14 @@ async def test_webhook_delivered_exactly_once(admin_client, fresh_device):
     reservation_id = None
     try:
         create = await admin_client.post(
-            "/v1/reservations", json=_reservation_body(fresh_device["id"])
+            "/v1/reservations",
+            json=_reservation_body(fresh_device["id"], purpose_category="qa_regression"),
         )
         assert create.status_code == 201, create.text
         reservation_id = create.json()["id"]
+        # purpose_category (issue #646 phase 1) round-trips through the v1
+        # facade create response.
+        assert create.json()["purpose_category"] == "qa_regression"
 
         # Scope the assertion to THIS test's event. Other tests create
         # reservations against the same stack, and a neighboring
@@ -121,7 +128,11 @@ async def test_webhook_delivered_exactly_once(admin_client, fresh_device):
             reservation_id, "reservation.created", timeout=POLL_TIMEOUT_SECONDS
         )
         assert raw_event is not None, "reservation.created never appeared on the stream"
-        expected_event_id = json.loads(raw_event)["event_id"]
+        raw_event_body = json.loads(raw_event)
+        expected_event_id = raw_event_body["event_id"]
+        # The outbox payload itself carries purpose_category (issue #646
+        # phase 1), additive on every reservation.* lifecycle event.
+        assert raw_event_body["purpose_category"] == "qa_regression"
 
         rows = await _poll_for_status(
             admin_client, webhook_id, {"delivered"}, event_id=expected_event_id

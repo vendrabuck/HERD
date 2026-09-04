@@ -2603,6 +2603,7 @@ async def _seed_reservation(
     start: datetime,
     end: datetime,
     res_status: ReservationStatus = ReservationStatus.COMPLETED,
+    purpose_category: str | None = None,
 ) -> None:
     async with TestSessionLocal() as session:
         session.add(
@@ -2616,6 +2617,7 @@ async def _seed_reservation(
                 start_time=start,
                 end_time=end,
                 status=res_status,
+                purpose_category=purpose_category,
             )
         )
         await session.commit()
@@ -2839,6 +2841,64 @@ async def test_utilization_report_csv_device_section(admin_client):
     body = resp.text
     assert body.splitlines()[0] == "device_id,hours,reservation_count"
     assert DEVICE_A in body
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_includes_by_purpose(admin_client):
+    """The JSON report's by_purpose breakdown (issue #646 phase 1) includes a
+    literal "unclassified" bucket for a reservation with no purpose_category."""
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+        purpose_category="qa_regression",
+    )
+    await _seed_reservation(
+        OTHER_USER_ID,
+        "bob",
+        [DEVICE_B],
+        NOW - timedelta(days=1, hours=1),
+        NOW - timedelta(days=1),
+        purpose_category=None,
+    )
+    resp = await admin_client.get(
+        "/reports/utilization",
+        params={"start": window_start.isoformat(), "end": window_end.isoformat()},
+    )
+    assert resp.status_code == 200
+    by_purpose = {b["purpose_category"]: b for b in resp.json()["by_purpose"]}
+    assert by_purpose["qa_regression"]["reservations"] == 1
+    assert by_purpose["unclassified"]["reservations"] == 1
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_csv_purpose_section(admin_client):
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+        purpose_category="qa_regression",
+    )
+    resp = await admin_client.get(
+        "/reports/utilization.csv",
+        params={
+            "start": window_start.isoformat(),
+            "end": window_end.isoformat(),
+            "section": "purpose",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.text
+    assert body.splitlines()[0] == "purpose_category,reservations,device_hours"
+    assert "qa_regression" in body
 
 
 @pytest.mark.asyncio

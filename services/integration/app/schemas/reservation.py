@@ -21,6 +21,10 @@ class V1ReservationRequest(BaseModel):
     end_time: datetime
     purpose: str | None = Field(default=None, max_length=2000)
     topology_id: uuid.UUID | None = None
+    # Lab purpose classification (issue #646 phase 1), additive. Validated
+    # downstream by the reservations service against its configured taxonomy;
+    # an unknown value is relayed as the same 422 an interactive create gets.
+    purpose_category: str | None = None
 
 
 class V1ReservationResponse(BaseModel):
@@ -37,6 +41,8 @@ class V1ReservationResponse(BaseModel):
     start_time: datetime
     end_time: datetime
     created_at: datetime
+    # Additive (issue #646 phase 1); None when unclassified.
+    purpose_category: str | None = None
 
 
 class V1ReservationList(BaseModel):

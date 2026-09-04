@@ -59,6 +59,20 @@ class Reservation(Base):
         Enum(TopologyType, schema=_schema), nullable=False
     )
     purpose: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Lab purpose classification (issue #646 phase 1). A plain string, not a
+    # Postgres enum or a categories table (ADR 0013): validated against
+    # settings.purpose_categories at write time, but a row keeps whatever
+    # value it was written with even if that value later drops out of the
+    # configured list. set_by/set_at record who classified it and when;
+    # clearing the category (PATCH with a null body) clears all three
+    # together. Owner or admin may set it in any status, including terminal.
+    purpose_category: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    purpose_category_set_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    purpose_category_set_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     start_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )

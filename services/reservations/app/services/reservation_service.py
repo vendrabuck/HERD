@@ -35,6 +35,7 @@ from app.models.reservation import (
     TopologyType,
 )
 from app.schemas.reservation import ReservationCreate, ReservationUpdate
+from app.services.purpose_service import validate_purpose_category
 
 logger = logging.getLogger(__name__)
 
@@ -998,6 +999,7 @@ def _reservation_created_event(reservation: Reservation) -> dict:
         "topology_type": reservation.topology_type.value,
         "start_time": reservation.start_time.isoformat(),
         "end_time": reservation.end_time.isoformat(),
+        "purpose_category": reservation.purpose_category,
     }
 
 
@@ -1020,6 +1022,7 @@ def _provision_requested_event(reservation: Reservation) -> dict:
             {"id": str(r.id), "template_id": str(r.template_id)}
             for r in reservation.dynamic_requests
         ],
+        "purpose_category": reservation.purpose_category,
     }
 
 
@@ -1037,6 +1040,7 @@ def _reservation_failed_event(reservation: Reservation) -> dict:
         "device_ids": [str(d) for d in reservation.device_ids],
         "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
         "topology_type": reservation.topology_type.value,
+        "purpose_category": reservation.purpose_category,
     }
 
 
@@ -1111,6 +1115,10 @@ async def create_reservation(
     token: str,
     username: str = "",
 ) -> Reservation:
+    # 0. Validate the purpose category against the configured taxonomy (issue
+    # #646 phase 1) before doing any inventory work, so a bad value fails fast.
+    validate_purpose_category(data.purpose_category)
+
     # 1. Fetch all devices from inventory (concurrently)
     try:
         devices = await _fetch_devices(data.device_ids, token)
@@ -1217,6 +1225,11 @@ async def create_reservation(
         topology_id=data.topology_id,
         topology_type=topology_type,
         purpose=data.purpose,
+        purpose_category=data.purpose_category,
+        purpose_category_set_by=user_id if data.purpose_category is not None else None,
+        purpose_category_set_at=(
+            datetime.now(timezone.utc) if data.purpose_category is not None else None
+        ),
         start_time=data.start_time,
         end_time=data.end_time,
         status=initial_status,
@@ -1840,6 +1853,7 @@ async def update_reservation(
             # edit (e.g. purpose) must not advertise an unchanged "ends <time>".
             "end_time_changed": end_time_changed,
             "end_time": reservation.end_time.isoformat() if end_time_changed else None,
+            "purpose_category": reservation.purpose_category,
         },
     )
     await db.commit()
@@ -1867,6 +1881,51 @@ async def update_reservation(
     )
 
     return reservation
+
+
+async def set_purpose_category(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    user_id: uuid.UUID,
+    role: str,
+    purpose_category: str | None,
+) -> tuple[Reservation | None, bool]:
+    """Set or clear a reservation's purpose_category (issue #646 phase 1).
+
+    Owner or admin, allowed in any status including terminal (unlike most
+    mutations here, which are gated to a live reservation): classification is
+    metadata about what the reservation was for, not a change to what it
+    provisions, so it stays editable after the reservation ends.
+
+    Returns (reservation, forbidden). reservation is None for an unknown id
+    (the router maps that to 404). forbidden is True when the reservation
+    exists but the caller is neither its owner nor an admin: unlike the fork
+    routes' existence-hiding _load_owned_or_admin idiom, this endpoint's
+    contract pins a distinct 403 for a wrong-owner caller, so the lookup here
+    is by id alone and ownership is checked separately.
+
+    A null purpose_category clears the classification and its set_by/set_at
+    together; a non-null value is validated against the configured taxonomy
+    (ValueError, mapped to 422 by the router) before anything is written, so
+    a bad value never partially applies.
+    """
+    validate_purpose_category(purpose_category)
+
+    result = await db.execute(select(Reservation).where(Reservation.id == reservation_id))
+    reservation = result.scalar_one_or_none()
+    if reservation is None:
+        return None, False
+    if reservation.user_id != user_id and role not in ("admin", "superadmin"):
+        return reservation, True
+
+    reservation.purpose_category = purpose_category
+    reservation.purpose_category_set_by = user_id if purpose_category is not None else None
+    reservation.purpose_category_set_at = (
+        datetime.now(timezone.utc) if purpose_category is not None else None
+    )
+    await db.commit()
+    await db.refresh(reservation)
+    return reservation, False
 
 
 async def cancel_reservation(
@@ -1926,6 +1985,7 @@ async def cancel_reservation(
             "device_ids": [str(d) for d in reservation.device_ids],
             "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
             "topology_type": reservation.topology_type.value,
+            "purpose_category": reservation.purpose_category,
         },
     )
     await db.commit()
@@ -1988,6 +2048,7 @@ async def release_reservation(
             "device_ids": [str(d) for d in reservation.device_ids],
             "topology_id": str(reservation.topology_id) if reservation.topology_id else None,
             "topology_type": reservation.topology_type.value,
+            "purpose_category": reservation.purpose_category,
         },
     )
     await db.commit()

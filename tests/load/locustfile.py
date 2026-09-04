@@ -147,6 +147,9 @@ class ReservationUser(HerdUser):
                 "purpose": f"load-test-{uuid.uuid4().hex[:8]}",
                 "start_time": now.isoformat(),
                 "end_time": (now + timedelta(minutes=5)).isoformat(),
+                # Issue #646 phase 1: exercise the classification write path
+                # under load too, not just the unclassified default.
+                "purpose_category": "qa_regression",
             },
         ) as resp:
             # 409 (time-window conflict) and 422 (availability precheck) are the

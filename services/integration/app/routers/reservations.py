@@ -92,6 +92,7 @@ def _to_v1(data: dict[str, Any]) -> V1ReservationResponse:
         start_time=data["start_time"],
         end_time=data["end_time"],
         created_at=data["created_at"],
+        purpose_category=data.get("purpose_category"),
     )
 
 
@@ -112,6 +113,7 @@ async def create_reservation(
         "end_time": body.end_time.isoformat(),
         "purpose": body.purpose,
         "topology_id": str(body.topology_id) if body.topology_id else None,
+        "purpose_category": body.purpose_category,
     }
     resp = await _forward("POST", "/", token=credentials.credentials, json=upstream_body)
     _propagate_if_error(resp)

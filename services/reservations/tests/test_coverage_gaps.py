@@ -899,6 +899,7 @@ async def test_build_report_skips_malformed_device_id_defensively():
     fake.start_time = NOW + timedelta(hours=1)
     fake.end_time = NOW + timedelta(hours=2)
     fake.device_ids = ["not-a-uuid", str(DEVICE_A)]
+    fake.purpose_category = None
 
     scalars = MagicMock()
     scalars.all.return_value = [fake]
