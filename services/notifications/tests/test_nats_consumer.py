@@ -505,8 +505,10 @@ class _FakeSubscription:
     def __init__(self, msgs):
         self._msgs = list(msgs)
         self._drained = False
+        self.batch_calls = []
 
     async def fetch(self, batch, timeout=None):
+        self.batch_calls.append(batch)
         if not self._drained and self._msgs:
             self._drained = True
             return self._msgs
@@ -674,6 +676,62 @@ async def test_start_nats_consumer_loop_processes_a_message(monkeypatch):
             .all()
         )
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_nats_consumer_loop_fetches_one_message_at_a_time(monkeypatch):
+    """Pins the issue #648 fix: the consumer loop must call fetch with batch == 1
+    on every call, never a larger batch.
+
+    nats-py's multi-message fetch (`_fetch_n`) holds already-received messages
+    until the batch fills or the fetch's deadline expires, so a batch of 10 with
+    fewer than 10 events in flight added up to NATS_FETCH_TIMEOUT_SECONDS of
+    latency to every event before it was processed (measured on CI: a 4.995s
+    hold stacked with a 4.74s outbox tick against a 10s test budget). The
+    batch=1 path (`_fetch_one`) drains the client's pending queue and returns
+    the first processable message immediately. If a future change reintroduces
+    a batch > 1 here, it must first confront why #648 moved off it."""
+    user_id = str(uuid.uuid4())
+    payload = json.dumps(
+        {
+            "event": "reservation.created",
+            "user_id": user_id,
+            "device_ids": [str(uuid.uuid4())],
+            "end_time": "2026-04-21T00:00:00+00:00",
+        }
+    ).encode()
+    msg = _FakeMsg(payload, stream_seq=12)
+
+    res_sub = _FakeSubscription([msg])
+    js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: res_sub})
+    conn = _FakeNatsConn(js)
+
+    async def _connect(url, **kwargs):
+        return conn
+
+    _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
+
+    import app.database as app_db
+
+    monkeypatch.setattr(app_db, "AsyncSessionLocal", _SessionLocal)
+
+    app = _FakeApp()
+    await nats_consumer.start_nats_consumer(app)
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if msg.ack.await_count:
+                break
+        msg.ack.assert_awaited_once()
+        # A few more idle-fetch cycles so we have several recorded calls, not
+        # just the one that returned the message.
+        await asyncio.sleep(0.05)
+    finally:
+        await nats_consumer.stop_nats_consumer(app)
+
+    assert res_sub.batch_calls, "fetch was never called"
+    assert all(batch == 1 for batch in res_sub.batch_calls)
 
 
 @pytest.mark.asyncio

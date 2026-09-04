@@ -60,8 +60,10 @@ class _StubPullSub:
     def __init__(self, msgs):
         self._msgs = list(msgs)
         self._drained = False
+        self.batch_calls = []
 
     async def fetch(self, batch, timeout=None):
+        self.batch_calls.append(batch)
         if not self._drained and self._msgs:
             self._drained = True
             return self._msgs
@@ -201,6 +203,66 @@ async def test_start_nats_consumer_success():
         await task
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_start_nats_consumer_loop_fetches_one_message_at_a_time():
+    """Pins the issue #648 fix: the consumer loop must call fetch with batch == 1
+    on every call, never a larger batch.
+
+    nats-py's multi-message fetch (`_fetch_n`) holds already-received messages
+    until the batch fills or the fetch's deadline expires, so a batch of 10 with
+    fewer than 10 events in flight added up to NATS_FETCH_TIMEOUT_SECONDS of
+    latency to every event before it was processed (measured on CI: a 4.995s
+    hold stacked with a 4.74s outbox tick against a 10s test budget). The
+    batch=1 path (`_fetch_one`) drains the client's pending queue and returns
+    the first processable message immediately. If a future change reintroduces
+    a batch > 1 here, it must first confront why #648 moved off it."""
+    from app.services.nats_consumer import start_nats_consumer
+
+    mock_app = MagicMock()
+    mock_app.state = MagicMock()
+
+    mock_js = AsyncMock()
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
+
+    mock_msg = MagicMock()
+    mock_msg.data = json.dumps(
+        {
+            "event": "reservation.created",
+            "reservation_id": str(uuid.uuid4()),
+            "user_id": str(uuid.uuid4()),
+            "device_ids": [],
+        }
+    ).encode()
+    mock_msg.ack = AsyncMock()
+
+    stub_sub = _StubPullSub([mock_msg])
+    mock_js.pull_subscribe = AsyncMock(return_value=stub_sub)
+
+    mock_nats_module = MagicMock()
+    mock_nats_module.connect = AsyncMock(return_value=mock_nc)
+
+    ensure_stream_exists_mock = AsyncMock()
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
+        patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_exists_mock),
+    ):
+        await start_nats_consumer(mock_app)
+
+    task = mock_app.state.nats_consumer_task
+    # Give the loop several turns: one that returns the message, and a few
+    # idle-timeout cycles after, so more than one call is recorded.
+    await asyncio.sleep(0.1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert stub_sub.batch_calls, "fetch was never called"
+    assert all(batch == 1 for batch in stub_sub.batch_calls)
 
 
 @pytest.mark.asyncio

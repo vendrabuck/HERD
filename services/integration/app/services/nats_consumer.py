@@ -31,7 +31,6 @@ NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
 # 4-token DLQ subject, deliberately outside the 3-token consumer filter so a
 # dead-lettered message is not re-consumed in a poison loop.
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.integration"
-NATS_FETCH_BATCH = 10
 NATS_FETCH_TIMEOUT_SECONDS = 5
 
 
@@ -182,7 +181,14 @@ async def start_nats_consumer(app) -> None:
         async def _consumer_loop():
             while True:
                 try:
-                    msgs = await psub.fetch(NATS_FETCH_BATCH, timeout=NATS_FETCH_TIMEOUT_SECONDS)
+                    # batch is deliberately 1: nats-py's multi-message fetch holds
+                    # already-received messages until the batch fills or the
+                    # deadline expires, which added up to NATS_FETCH_TIMEOUT_SECONDS
+                    # of latency to every event (issue #648); the batch=1 path
+                    # returns the first message immediately. Do not "optimize"
+                    # this back to a batch without a pull API that returns
+                    # partial batches promptly.
+                    msgs = await psub.fetch(1, timeout=NATS_FETCH_TIMEOUT_SECONDS)
                 except asyncio.CancelledError:
                     raise
                 except (nats.errors.TimeoutError, asyncio.TimeoutError):
