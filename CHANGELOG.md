@@ -12,6 +12,16 @@
   fetch one message per pull instead of a batch of 10, so nats-py can no
   longer hold an already-delivered message for up to the fetch timeout while
   waiting for the rest of a batch that never fills (issue #648).
+- Added lab purpose classification, phase 1 (issue #646): reservations gain an
+  optional `purpose_category` validated against a configured taxonomy
+  (`PURPOSE_CATEGORIES`), settable by the owner or an admin in any status
+  including terminal via `PATCH /{id}/purpose-category`, listed via
+  `GET /purpose-categories`, and carried additively on every
+  `reservation.*` lifecycle event and the `/api/v1` facade. The utilization
+  report and its CSV export gain `by_purpose`, `by_user_purpose`, and
+  `by_device_purpose` breakdowns, with an explicit `unclassified` bucket for
+  reservations with no category. Device-level classification counts reserved
+  devices only; transit-gear inheritance is deferred to phase 3.
 
 ## [0.3.0] - 2026-08-30
 

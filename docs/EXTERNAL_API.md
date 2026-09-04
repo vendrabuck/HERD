@@ -124,10 +124,16 @@ Request fields:
 - `end_time` (ISO 8601 datetime, required).
 - `purpose` (string, optional, up to 2000 characters).
 - `topology_id` (UUID, optional).
+- `purpose_category` (string, optional): a lab purpose classification (issue
+  #646 phase 1). Must be one of the server's configured categories, a list not
+  currently enumerated by any `/api/v1` endpoint; an unrecognized value is
+  rejected with `422` (`Unknown purpose_category '<value>'; allowed: <list>`).
+  Omit it, or pass `null`, to leave the reservation unclassified.
 
 Response (`V1ReservationResponse`): `id`, `status`, `device_ids`, `topology_id`,
-`start_time`, `end_time`, `created_at`. `status` is a plain string so the v1
-contract does not couple to the internal status enum.
+`start_time`, `end_time`, `created_at`, `purpose_category`. `status` is a plain
+string so the v1 contract does not couple to the internal status enum.
+`purpose_category` is `null` when the reservation is unclassified.
 
 ### GET /api/v1/reservations
 
@@ -281,7 +287,8 @@ Example `reservation.created`:
   "topology_id": "44444444-4444-4444-4444-444444444444",
   "topology_type": "PHYSICAL",
   "start_time": "2026-07-01T09:00:00+00:00",
-  "end_time": "2026-07-01T17:00:00+00:00"
+  "end_time": "2026-07-01T17:00:00+00:00",
+  "purpose_category": null
 }
 ```
 
@@ -295,15 +302,21 @@ Example `reservation.failed`:
   "user_id": "00000000-0000-0000-0000-000000000001",
   "device_ids": ["22222222-2222-2222-2222-222222222222"],
   "topology_id": "44444444-4444-4444-4444-444444444444",
-  "topology_type": "PHYSICAL"
+  "topology_type": "PHYSICAL",
+  "purpose_category": null
 }
 ```
 
 Field sets vary by event. For example `reservation.updated` adds
 `added_device_ids` and `removed_device_ids`, and `reservation.expiring_soon`
-carries `reservation_id`, `user_id`, `device_ids`, and `end_time`. Treat the
-payload as additive: read the fields you need by name and ignore any you do not
-recognize.
+carries `reservation_id`, `user_id`, `device_ids`, and `end_time`. Every
+`reservation.*` lifecycle event additionally carries `purpose_category` (issue
+#646 phase 1): the reservation's lab purpose classification at the moment the
+event was staged, or `null` when unclassified. There is no dedicated event for
+a purpose_category edit made through the interactive UI (the PATCH endpoint is
+not part of this v1 API); an edit rides the next lifecycle event for that
+reservation instead. Treat the payload as additive: read the fields you need
+by name and ignore any you do not recognize.
 
 ### Verifying the signature
 

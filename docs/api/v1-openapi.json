@@ -76,6 +76,17 @@
             ],
             "title": "Purpose"
           },
+          "purpose_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purpose Category"
+          },
           "start_time": {
             "format": "date-time",
             "title": "Start Time",
@@ -127,6 +138,17 @@
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "purpose_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purpose Category"
           },
           "start_time": {
             "format": "date-time",
