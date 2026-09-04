@@ -183,18 +183,40 @@ async def dismiss_purpose_suggestion(
 
 
 async def backfill_purpose_classification(db: AsyncSession) -> int:
-    """Mark every terminal reservation with no suggestion yet as eligible.
+    """Mark every terminal reservation with no suggestion yet as eligible, and
+    reset any row the sweep has already given up on so it gets another run.
 
-    Sets purpose_classify_requested_at = now() on rows in COMPLETED,
-    CANCELLED, or FAILED where it is still null AND purpose_suggestion is
-    still null. Idempotent: a second call marks zero rows, since every row
-    the first call touched now carries a non-null
-    purpose_classify_requested_at (and any row the sweep already classified in
-    between now also fails the purpose_suggestion IS NULL half). Returns the
-    count marked; the sweep reconciler picks these up on its own schedule.
+    Two independent updates, both counted into the single returned total:
+
+    1. Sets purpose_classify_requested_at = now() on rows in COMPLETED,
+       CANCELLED, or FAILED where it is still null AND purpose_suggestion is
+       still null. Idempotent on its own: a second call marks zero of these,
+       since every row the first call touched now carries a non-null
+       purpose_classify_requested_at (and any row the sweep already
+       classified in between now also fails the purpose_suggestion IS NULL
+       half).
+    2. Resets purpose_classify_attempts to 0 on rows that hit the sweep's
+       attempt cap (purpose_classify_attempts >= purpose_classify_max_attempts)
+       and still have no suggestion. A capped row already carries a non-null
+       purpose_classify_requested_at from whenever it was first picked up, so
+       resetting only the attempt counter (not the timestamp) is enough to
+       make the reconciler's `attempts < max_attempts` filter select it again,
+       and it keeps its place in the oldest-requested-first ordering rather
+       than jumping to the back of the queue. This closes the gap where a
+       stack running a mismatched orchestrator image (see
+       _classify_purpose_one's 403-vs-404 handling) could burn every
+       historical row's attempts to the cap within a few sweep ticks, with no
+       way to retry them short of a manual database edit.
+
+    The two updates target disjoint rows (the first requires
+    purpose_classify_requested_at IS NULL, the second requires attempts at or
+    over the cap, which only happens after that column is set), so the
+    combined count never double-counts a row. Returns the total rows touched
+    by either update; the sweep reconciler picks all of them up on its own
+    schedule.
     """
     now = datetime.now(timezone.utc)
-    result = await db.execute(
+    newly_marked = await db.execute(
         update(Reservation)
         .where(
             Reservation.status.in_(TERMINAL_STATUSES),
@@ -204,5 +226,16 @@ async def backfill_purpose_classification(db: AsyncSession) -> int:
         .values(purpose_classify_requested_at=now)
         .execution_options(synchronize_session=False)
     )
+    reset_capped = await db.execute(
+        update(Reservation)
+        .where(
+            Reservation.status.in_(TERMINAL_STATUSES),
+            Reservation.purpose_classify_requested_at.is_not(None),
+            Reservation.purpose_suggestion.is_(None),
+            Reservation.purpose_classify_attempts >= settings.purpose_classify_max_attempts,
+        )
+        .values(purpose_classify_attempts=0)
+        .execution_options(synchronize_session=False)
+    )
     await db.commit()
-    return result.rowcount
+    return newly_marked.rowcount + reset_capped.rowcount

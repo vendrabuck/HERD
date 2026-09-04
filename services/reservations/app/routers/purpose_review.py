@@ -130,10 +130,20 @@ async def backfill_purpose_review(
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
-    """Mark every terminal reservation with no suggestion yet as eligible for the sweep.
+    """Mark every terminal reservation with no suggestion yet as eligible for the
+    sweep, and reset any row that hit the sweep's attempt cap so it gets
+    another run.
 
-    Idempotent: a second call returns {"marked": 0} once the first call's rows
-    have all picked up a purpose_classify_requested_at timestamp.
+    Two things happen under one count: rows never requested get
+    purpose_classify_requested_at stamped, and rows already at
+    purpose_classify_attempts >= the configured max (and still without a
+    suggestion) have their attempt counter reset to 0, which is what un-sticks
+    a row after a transient outage (e.g. a mixed-version deployment where the
+    orchestrator did not yet expose the classify endpoint) burned through its
+    retries. Idempotent: a second call returns {"marked": 0} once the first
+    call's rows have all either picked up a purpose_classify_requested_at
+    timestamp or (for the capped case) gone on to either get classified or
+    exhaust the cap again on their own.
     """
     marked = await backfill_purpose_classification(db)
     return PurposeBackfillResponse(marked=marked)

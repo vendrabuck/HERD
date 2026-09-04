@@ -137,6 +137,43 @@ async def test_reconcile_403_ends_tick_without_touching_any_row():
 
 
 @pytest.mark.asyncio
+async def test_reconcile_404_ends_tick_without_touching_any_row():
+    """A 404 means the orchestrator image predates the classify endpoint (a
+    mixed-version deployment); this is "not available yet", the same as a
+    403, not a per-row failure, so it must not burn any row's attempts.
+    """
+    rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
+    rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(return_value=httpx.Response(404, json={"detail": "not found"}))
+    with patch("app.tasks.expiration.call_service", call):
+        await _run_purpose_classify_reconcile()
+
+    call.assert_awaited_once()
+    for rid in (rid_first, rid_second):
+        res = await _get(rid)
+        assert res.purpose_suggestion is None
+        assert res.purpose_classify_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_404_then_later_tick_still_untouched():
+    """Three sweep ticks against a 404-returning orchestrator must never push
+    a row toward the attempt cap (the defect this test guards against: before
+    the fix, a 404 was treated as an ordinary failure and bumped attempts on
+    every tick).
+    """
+    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(return_value=httpx.Response(404, json={"detail": "not found"}))
+    with patch("app.tasks.expiration.call_service", call):
+        for _ in range(3):
+            await _run_purpose_classify_reconcile()
+
+    res = await _get(rid)
+    assert res.purpose_suggestion is None
+    assert res.purpose_classify_attempts == 0
+
+
+@pytest.mark.asyncio
 async def test_reconcile_5xx_increments_attempts():
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(503, text="unavailable"))

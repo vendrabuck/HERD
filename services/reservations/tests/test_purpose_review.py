@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
@@ -55,6 +56,8 @@ async def _insert_reservation(
     purpose_category: str | None = None,
     purpose_suggestion: dict | None = None,
     purpose_suggestion_dismissed_at: datetime | None = None,
+    purpose_classify_requested_at: datetime | None = None,
+    purpose_classify_attempts: int = 0,
 ) -> uuid.UUID:
     async with TestSessionLocal() as db:
         res = Reservation(
@@ -70,6 +73,8 @@ async def _insert_reservation(
             purpose_suggestion=purpose_suggestion,
             purpose_suggested_at=NOW if purpose_suggestion else None,
             purpose_suggestion_dismissed_at=purpose_suggestion_dismissed_at,
+            purpose_classify_requested_at=purpose_classify_requested_at,
+            purpose_classify_attempts=purpose_classify_attempts,
         )
         db.add(res)
         await db.commit()
@@ -309,6 +314,65 @@ async def test_backfill_is_idempotent():
         second = await ac.post("/admin/purpose/backfill")
     assert first.json() == {"marked": 1}
     assert second.json() == {"marked": 0}
+
+
+@pytest.mark.asyncio
+async def test_backfill_resets_capped_rows_without_suggestion():
+    """A row that hit the sweep's attempt cap must not be permanently stuck
+    (the defect this guards: before the fix, backfill only touched rows with
+    purpose_classify_requested_at still null, so a capped row, which already
+    has that column set from its first sweep pickup, was never selected).
+    """
+    max_attempts = settings.purpose_classify_max_attempts
+    capped = await _insert_reservation(
+        status=ReservationStatus.COMPLETED,
+        purpose_classify_requested_at=NOW - timedelta(hours=1),
+        purpose_classify_attempts=max_attempts,
+    )
+    # A row that has retried but is not yet at the cap must be left alone.
+    not_yet_capped = await _insert_reservation(
+        status=ReservationStatus.COMPLETED,
+        purpose_classify_requested_at=NOW - timedelta(hours=1),
+        purpose_classify_attempts=max_attempts - 1,
+    )
+    # A capped row that already carries a suggestion (classified on its last
+    # attempt before the counter was read) must not be reset either.
+    capped_but_suggested = await _insert_reservation(
+        status=ReservationStatus.COMPLETED,
+        purpose_suggestion=_suggestion("training"),
+        purpose_classify_requested_at=NOW - timedelta(hours=1),
+        purpose_classify_attempts=max_attempts,
+    )
+
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        resp = await ac.post("/admin/purpose/backfill")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"marked": 1}
+
+    res_capped = await _get_reservation(capped)
+    assert res_capped.purpose_classify_attempts == 0
+    assert res_capped.purpose_classify_requested_at is not None
+
+    res_not_yet_capped = await _get_reservation(not_yet_capped)
+    assert res_not_yet_capped.purpose_classify_attempts == max_attempts - 1
+
+    res_capped_but_suggested = await _get_reservation(capped_but_suggested)
+    assert res_capped_but_suggested.purpose_classify_attempts == max_attempts
+
+
+@pytest.mark.asyncio
+async def test_backfill_counts_newly_marked_and_reset_rows_together():
+    max_attempts = settings.purpose_classify_max_attempts
+    await _insert_reservation(status=ReservationStatus.CANCELLED)
+    await _insert_reservation(
+        status=ReservationStatus.FAILED,
+        purpose_classify_requested_at=NOW - timedelta(hours=1),
+        purpose_classify_attempts=max_attempts,
+    )
+
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        resp = await ac.post("/admin/purpose/backfill")
+    assert resp.json() == {"marked": 2}
 
 
 @pytest.mark.asyncio
