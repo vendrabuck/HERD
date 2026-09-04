@@ -50,6 +50,29 @@ export interface FleetSection {
   devices: FleetDeviceBucket[];
 }
 
+// Purpose classification breakdowns (issue #646 phase 1). A null category
+// arrives from the backend as the literal string "unclassified" (see
+// lib/purposeCategories.ts), so `purpose_category` here is never null.
+export interface PurposeBucket {
+  purpose_category: string;
+  reservations: number;
+  device_hours: number;
+}
+
+export interface UserPurposeBucket {
+  user_id: string;
+  purpose_category: string;
+  reservations: number;
+  device_hours: number;
+}
+
+export interface DevicePurposeBucket {
+  device_id: string;
+  purpose_category: string;
+  reservations: number;
+  device_hours: number;
+}
+
 export interface UtilizationReport {
   window_start: string;
   window_end: string;
@@ -63,6 +86,11 @@ export interface UtilizationReport {
   execution_run_count: number | null;
   // null when the inventory service was unreachable server-side.
   fleet: FleetSection | null;
+  // Optional: absent on a backend build that predates purpose classification.
+  // The Purpose reporting section is gated on `by_purpose` alone.
+  by_purpose?: PurposeBucket[];
+  by_user_purpose?: UserPurposeBucket[];
+  by_device_purpose?: DevicePurposeBucket[];
 }
 
 export interface UtilizationQuery {

@@ -7,6 +7,7 @@ import type {
   ForkSaveResult,
   ForkVersionDetail,
   ForkVersionRestoreResult,
+  PurposeCategoriesResponse,
   Reservation,
   ReservationCreate,
   ReservationFork,
@@ -130,6 +131,49 @@ export function useUpdateReservation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: updateReservation,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["reservations"] }),
+  });
+}
+
+// --- Lab purpose classification (issue #646 phase 1) -----------------------
+// The taxonomy is server-configured (default list, or its PURPOSE_CATEGORIES
+// env override), so it is fetched rather than hardcoded and cached with a
+// long staleTime since it changes only on a backend redeploy. The PATCH is
+// owner-or-admin gated server-side and allowed in any reservation status,
+// including terminal ones; callers that need an optimistic update with
+// revert-on-error (ReservationDetailModal) drive that from `mutateAsync`
+// themselves rather than from onSuccess/onError here.
+
+async function fetchPurposeCategories(): Promise<PurposeCategoriesResponse> {
+  const resp = await apiClient.get<PurposeCategoriesResponse>(
+    "/reservations/purpose-categories",
+  );
+  return resp.data;
+}
+
+export function usePurposeCategories() {
+  return useQuery({
+    queryKey: ["reservations", "purpose-categories"],
+    queryFn: fetchPurposeCategories,
+    staleTime: 30 * 60 * 1000,
+  });
+}
+
+async function setPurposeCategory(
+  id: string,
+  purposeCategory: string | null,
+): Promise<Reservation> {
+  const resp = await apiClient.patch<Reservation>(`/reservations/${id}/purpose-category`, {
+    purpose_category: purposeCategory,
+  });
+  return resp.data;
+}
+
+export function useSetPurposeCategory() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, purposeCategory }: { id: string; purposeCategory: string | null }) =>
+      setPurposeCategory(id, purposeCategory),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["reservations"] }),
   });
 }

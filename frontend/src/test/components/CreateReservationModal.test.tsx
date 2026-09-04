@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
@@ -43,6 +43,22 @@ const DYNAMIC_TEMPLATE = {
   name: "Ubuntu VM",
   template_type: "dynamic",
 };
+
+function mockPurposeCategories(categories: string[] = ["qa_regression", "training"]) {
+  server.use(
+    http.get("/api/reservations/purpose-categories", () =>
+      HttpResponse.json({ categories }),
+    ),
+  );
+}
+
+function mockPurposeCategoriesError() {
+  server.use(
+    http.get("/api/reservations/purpose-categories", () =>
+      HttpResponse.json({ detail: "unavailable" }, { status: 500 }),
+    ),
+  );
+}
 
 function mockDynamicTemplates(items: Array<Record<string, unknown>> = [DYNAMIC_TEMPLATE]) {
   server.use(
@@ -359,5 +375,95 @@ describe("CreateReservationModal", () => {
       expect(screen.getByText("No dynamic templates available")).toBeInTheDocument(),
     );
     expect(screen.getByRole("button", { name: "Add dynamic instance" })).toBeDisabled();
+  });
+});
+
+// Lab purpose classification (issue #646 phase 1).
+describe("CreateReservationModal purpose category", () => {
+  it("renders labels for the fetched categories, humanizing an unrecognized one", async () => {
+    mockPurposeCategories(["qa_regression", "network_debug"]);
+    renderWithProviders(
+      <CreateReservationModal open deviceIds={DEVICE_IDS} onClose={() => {}} />,
+    );
+
+    const select = screen.getByLabelText("Purpose category (optional)");
+    expect(within(select).getByText("Unclassified")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(select).getByText("QA and regression")).toBeInTheDocument(),
+    );
+    // "network_debug" is not one of the seven shipped defaults; it is
+    // humanized client-side from its snake_case value instead of hardcoded.
+    expect(within(select).getByText("Network Debug")).toBeInTheDocument();
+  });
+
+  it("defaults to Unclassified and sends purpose_category: null", async () => {
+    mockPurposeCategories();
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/api/reservations/", async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ id: "r-1" });
+      }),
+    );
+
+    renderWithProviders(
+      <CreateReservationModal open deviceIds={DEVICE_IDS} onClose={() => {}} />,
+    );
+    fillTimes("2026-06-01T10:00", "2026-06-01T12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Reservation created"));
+    expect(body).toMatchObject({ purpose_category: null });
+  });
+
+  it("sends the chosen category when one is picked", async () => {
+    mockPurposeCategories(["qa_regression", "training"]);
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/api/reservations/", async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ id: "r-1" });
+      }),
+    );
+
+    renderWithProviders(
+      <CreateReservationModal open deviceIds={DEVICE_IDS} onClose={() => {}} />,
+    );
+    const select = screen.getByLabelText("Purpose category (optional)");
+    await waitFor(() => expect(within(select).getByText("Training")).toBeInTheDocument());
+    fireEvent.change(select, { target: { value: "training" } });
+    fillTimes("2026-06-01T10:00", "2026-06-01T12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Reservation created"));
+    expect(body).toMatchObject({ purpose_category: "training" });
+  });
+
+  it("stays submittable, with Unclassified disabled, while the category fetch is loading", async () => {
+    // A handler that never resolves keeps the query in its loading state for
+    // the assertions below.
+    server.use(
+      http.get("/api/reservations/purpose-categories", () => new Promise(() => {})),
+    );
+    renderWithProviders(
+      <CreateReservationModal open deviceIds={DEVICE_IDS} onClose={() => {}} />,
+    );
+
+    const select = screen.getByLabelText("Purpose category (optional)");
+    expect(select).toBeDisabled();
+    expect(within(select).getByText("Unclassified")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
+  });
+
+  it("stays submittable, with Unclassified disabled, when the category fetch fails", async () => {
+    mockPurposeCategoriesError();
+    renderWithProviders(
+      <CreateReservationModal open deviceIds={DEVICE_IDS} onClose={() => {}} />,
+    );
+
+    const select = screen.getByLabelText("Purpose category (optional)");
+    await waitFor(() => expect(select).toBeDisabled());
+    expect(within(select).getByText("Unclassified")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
   });
 });
