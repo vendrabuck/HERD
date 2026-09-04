@@ -793,12 +793,14 @@ async def _classify_purpose_one(reservation_id: uuid.UUID) -> str:
 
     Returns "ok" (a suggestion was stored, or the row was already resolved by
     a concurrent writer), "feature_off" (the orchestrator answered 403,
-    meaning AI_PURPOSE_CLASSIFICATION_ENABLED is off; the row is left
-    untouched, no attempt counted), or "failed" (any other non-200, a bad
-    body, or a transport error/timeout; purpose_classify_attempts is
-    incremented). Each outcome that mutates the row does so in its own
-    session/commit, so one row's failure never affects another row in the
-    same batch.
+    meaning AI_PURPOSE_CLASSIFICATION_ENABLED is off, or answered 404,
+    meaning the running orchestrator image predates POST
+    /internal/classify-purpose (a mixed-version deployment where only
+    reservations has been upgraded); either way the row is left untouched,
+    no attempt counted), or "failed" (any other non-200, a bad body, or a
+    transport error/timeout; purpose_classify_attempts is incremented). Each
+    outcome that mutates the row does so in its own session/commit, so one
+    row's failure never affects another row in the same batch.
     """
     async with AsyncSessionLocal() as db:
         res = await db.get(Reservation, reservation_id)
@@ -842,7 +844,38 @@ async def _classify_purpose_one(reservation_id: uuid.UUID) -> str:
         await _bump_purpose_classify_attempts(reservation_id)
         return "failed"
 
-    if resp.status_code == 403:
+    if resp.status_code in (403, 404):
+        # 403 means AI_PURPOSE_CLASSIFICATION_ENABLED is off on the
+        # orchestrator; 404 means the running orchestrator image predates
+        # this endpoint entirely (a mixed-version deployment mid-upgrade, or
+        # a stack where only reservations was updated). Both are "not
+        # available yet", not a per-row failure, so neither counts an
+        # attempt; the two are kept distinguishable in the log message so an
+        # operator can tell a flag flip from a stale image.
+        if resp.status_code == 403:
+            logger.info(
+                "Purpose classify reconcile: the orchestrator answered 403 for %s "
+                "(AI_PURPOSE_CLASSIFICATION_ENABLED is off there); treating this as "
+                "feature-off for this tick",
+                reservation_id,
+                extra={
+                    "action": "purpose_classify_feature_off",
+                    "reservation_id": str(reservation_id),
+                    "status_code": 403,
+                },
+            )
+        else:
+            logger.info(
+                "Purpose classify reconcile: the orchestrator answered 404 for %s "
+                "(it does not expose POST /internal/classify-purpose yet); treating "
+                "this as feature-off for this tick",
+                reservation_id,
+                extra={
+                    "action": "purpose_classify_feature_off",
+                    "reservation_id": str(reservation_id),
+                    "status_code": 404,
+                },
+            )
         return "feature_off"
 
     if resp.status_code != 200:
@@ -896,13 +929,16 @@ async def _run_purpose_classify_reconcile() -> None:
     behind it), and classifies each in turn via _classify_purpose_one.
 
     A "feature_off" outcome (the orchestrator answered 403, meaning
-    AI_PURPOSE_CLASSIFICATION_ENABLED is off there) ends the WHOLE tick
-    immediately without touching any row, including ones later in the batch:
-    there is no point spending N more round trips confirming the same flag is
-    off, and none of them should count as a consumed attempt. Any other
-    failure only affects its own row; the loop continues to the next
-    candidate. This function never raises: every per-row failure is caught
-    inside _classify_purpose_one.
+    AI_PURPOSE_CLASSIFICATION_ENABLED is off there, or answered 404, meaning
+    the running orchestrator image does not expose POST
+    /internal/classify-purpose yet, e.g. a mixed-version deployment mid
+    upgrade) ends the WHOLE tick immediately without touching any row,
+    including ones later in the batch: there is no point spending N more
+    round trips confirming the same not-available condition, and none of
+    them should count as a consumed attempt. Any other failure only affects
+    its own row; the loop continues to the next candidate. This function
+    never raises: every per-row failure is caught inside
+    _classify_purpose_one.
     """
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -922,10 +958,12 @@ async def _run_purpose_classify_reconcile() -> None:
     for reservation_id in reservation_ids:
         outcome = await _classify_purpose_one(reservation_id)
         if outcome == "feature_off":
+            # _classify_purpose_one already logged the specific reason (403
+            # vs 404); this is just the tick-level "stopped here" note.
             logger.info(
-                "Purpose classify reconcile: AI purpose classification is off on the "
-                "orchestrator; ending this tick",
-                extra={"action": "purpose_classify_feature_off"},
+                "Purpose classify reconcile: orchestrator classification is not "
+                "available; ending this tick",
+                extra={"action": "purpose_classify_feature_off_tick_end"},
             )
             break
 
