@@ -321,9 +321,23 @@ class UserBucket(BaseModel):
 
 
 class DeviceBucket(BaseModel):
+    """One device's row of the report's by_device breakdown.
+
+    reservation_count and hours are INCLUSIVE as of issue #646 phase 3 (ADR
+    0013): they cover the device's own reservations plus every reservation
+    whose fork wiring merely passed through it (transit gear, e.g. a switch on
+    a path). transit_reservations/transit_hours report the transit share
+    alone; a purely reserved device (no transit) has both at 0. Both fields
+    default to 0 so a client reading a report built with
+    include_transit=False, or served by a backend that predates phase 3,
+    still parses.
+    """
+
     device_id: uuid.UUID
     reservation_count: int
     hours: float
+    transit_reservations: int = 0
+    transit_hours: float = 0.0
 
 
 class TopologyTypeBucket(BaseModel):
@@ -370,14 +384,22 @@ class UserPurposeBucket(BaseModel):
 class DevicePurposeBucket(BaseModel):
     """One (device, purpose_category) row of the report's by_device_purpose breakdown.
 
-    Reserved devices only (issue #646 phase 1 scope); transit-gear inheritance
-    is deferred to phase 3 alongside the device rollups.
+    reservations and device_hours are INCLUSIVE as of issue #646 phase 3 (ADR
+    0013): a transit device (one that was never reserved in this row's
+    reservations, only on a fork wiring path) inherits the reservation's
+    confirmed category (or the literal "unclassified") exactly as a reserved
+    device does, and is folded into these totals. transit_reservations/
+    transit_device_hours report the transit share alone; both default to 0 so
+    a report built with include_transit=False, or served by a backend that
+    predates phase 3, still parses.
     """
 
     device_id: uuid.UUID
     purpose_category: str
     reservations: int
     device_hours: float
+    transit_reservations: int = 0
+    transit_device_hours: float = 0.0
 
 
 class FleetDeviceBucket(BaseModel):
@@ -416,8 +438,7 @@ class UtilizationReport(BaseModel):
     # report is still served (same degrade contract as execution_run_count).
     fleet: FleetSection | None = None
     # Lab purpose classification breakdowns (issue #646 phase 1). Honor the
-    # same status_filter as by_user/by_device/by_topology_type/by_day; count
-    # reserved devices only (transit gear is phase 3).
+    # same status_filter as by_user/by_device/by_topology_type/by_day.
     by_purpose: list[PurposeBucket] = []
     by_user_purpose: list[UserPurposeBucket] = []
     by_device_purpose: list[DevicePurposeBucket] = []
@@ -429,3 +450,9 @@ class UtilizationReport(BaseModel):
     # category, the row moves out of this list and into by_purpose under its
     # confirmed value, even if it still carries a suggestion.
     by_purpose_suggested: list[PurposeBucket] = []
+    # Echoes the effective include_transit query param (issue #646 phase 3,
+    # ADR 0013 D4): True means by_device/by_device_purpose are inclusive of
+    # transit gear, False means the cabling call was skipped and their
+    # transit_* fields are all zero (phase-1 semantics). Lets a consumer tell
+    # which semantics a given report carries without re-reading the request.
+    transit_included: bool = True

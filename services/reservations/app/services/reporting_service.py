@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from herd_common.enums import TopologyType
+from herd_common.internal_client import InternalTokenAuth, call_service
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +35,22 @@ logger = logging.getLogger(__name__)
 # by_purpose_suggested instead (keyed by the suggestion's top_category), never
 # under this label: a suggestion is progress, not absence.
 UNCLASSIFIED_PURPOSE = "unclassified"
+
+# The batch endpoint's request cap (services/cabling/app/schemas/fork.py
+# ForkDevicesBatchRequest); the window's reservation ids are chunked to this
+# size before each cabling call (issue #646 phase 3, D3).
+_TRANSIT_BATCH_CHUNK_SIZE = 500
+
+
+class TransitGearUnavailable(RuntimeError):
+    """Cabling was unreachable, or returned a non-200, fetching transit devices.
+
+    Raised by ``_fetch_transit_devices`` and caught at the router to produce the
+    pinned 503 ``{"error": "transit_gear_unavailable"}`` (ADR 0013 phase 3, D4):
+    an unreadable path graph must fail closed rather than silently reporting
+    zero transit devices, which would look identical to "this reservation truly
+    touched nothing but its reserved devices."
+    """
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -65,6 +82,72 @@ def _split_hours_per_day(start: datetime, end: datetime) -> list[tuple[str, floa
     return out
 
 
+async def _cabling_fork_devices_batch(reservation_ids: list[uuid.UUID]) -> httpx.Response:
+    """One X-Internal-Token call to POST /internal/forks/devices/batch.
+
+    Built exactly like reservation_service._cabling_fork_call: raises
+    RuntimeError on transport failure; a returned Response carries cabling's own
+    status so the caller (``_fetch_transit_devices``) decides what a non-200
+    means. ``reservation_ids`` must not exceed cabling's 500-id cap; the caller
+    is responsible for chunking (issue #646 phase 3, D3).
+    """
+    try:
+        return await call_service(
+            settings.cabling_service_url,
+            "POST",
+            "/internal/forks/devices/batch",
+            json_body={"reservation_ids": [str(rid) for rid in reservation_ids]},
+            timeout=10.0,
+            auth=InternalTokenAuth(
+                token=settings.internal_api_token,
+                missing_token_message=(
+                    "internal_api_token not configured; cannot reach cabling forks"
+                ),
+            ),
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
+
+
+async def _fetch_transit_devices(
+    reservation_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """Chunk reservation_ids by 500 and merge cabling's per-reservation device lists.
+
+    Fails CLOSED: a transport failure or any non-200 response from any chunk
+    raises TransitGearUnavailable rather than degrading to an empty transit set
+    for the reservations in that chunk (D4). A reservation absent from a
+    successful response's ``devices`` map has no fork and contributes nothing.
+    """
+    if not reservation_ids:
+        return {}
+    devices: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for i in range(0, len(reservation_ids), _TRANSIT_BATCH_CHUNK_SIZE):
+        chunk = reservation_ids[i : i + _TRANSIT_BATCH_CHUNK_SIZE]
+        try:
+            resp = await _cabling_fork_devices_batch(chunk)
+        except RuntimeError as exc:
+            raise TransitGearUnavailable(str(exc)) from exc
+        if resp.status_code != 200:
+            raise TransitGearUnavailable(
+                f"cabling /internal/forks/devices/batch returned {resp.status_code}"
+            )
+        data = resp.json() or {}
+        for rid_str, device_id_strs in (data.get("devices") or {}).items():
+            try:
+                rid = uuid.UUID(rid_str)
+            except (ValueError, TypeError):
+                continue
+            parsed: list[uuid.UUID] = []
+            for did_str in device_id_strs or []:
+                try:
+                    parsed.append(uuid.UUID(did_str))
+                except (ValueError, TypeError):
+                    continue
+            devices[rid] = parsed
+    return devices
+
+
 async def build_utilization_report(
     db: AsyncSession,
     window_start: datetime,
@@ -72,6 +155,7 @@ async def build_utilization_report(
     status_filter: list[ReservationStatus] | None,
     fleet_status_filter: list[ReservationStatus] | None = None,
     fleet_devices: list[dict] | None = None,
+    include_transit: bool = True,
 ) -> UtilizationReport:
     """Aggregate reservation hours over a window.
 
@@ -89,6 +173,15 @@ async def build_utilization_report(
     LIMIT and no pagination, so an unbounded client-controlled window would
     otherwise load and hold an unbounded result set in memory. 0 disables
     the cap.
+
+    include_transit (issue #646 phase 3, ADR 0013): when True (the default),
+    by_device and by_device_purpose become INCLUSIVE of transit gear, the
+    switches and routers a reservation's fork wiring touched but did not
+    reserve, fetched in bulk from cabling. Raises TransitGearUnavailable
+    (caught at the router, mapped to 503) when cabling cannot answer; the
+    caller passes include_transit=False to skip that call entirely and get
+    back the phase-1, reserved-devices-only semantics with the transit fields
+    all zero.
     """
     if window_end <= window_start:
         raise ValueError("window_end must be after window_start")
@@ -143,9 +236,9 @@ async def build_utilization_report(
     # Lab purpose classification breakdowns (issue #646 phase 1). device_hours
     # here means actual device-hours (a reservation's hours times how many
     # devices it reserved), not the per-reservation hours the other legacy
-    # buckets track, matching the report's `device_hours` field name.
-    # Reserved devices only: there is no transit-gear tracking to exclude yet
-    # (phase 3), so every id in r.device_ids already qualifies.
+    # buckets track, matching the report's `device_hours` field name. These
+    # dicts stay RESERVED-devices-only; transit is folded in separately below
+    # (phase 3) so the two can be reported as distinct fields.
     purpose_hours: dict[str, float] = defaultdict(float)
     purpose_count: dict[str, int] = defaultdict(int)
     user_purpose_hours: dict[tuple[uuid.UUID, str], float] = defaultdict(float)
@@ -158,6 +251,20 @@ async def build_utilization_report(
     # above or counted as unclassified.
     purpose_suggested_hours: dict[str, float] = defaultdict(float)
     purpose_suggested_count: dict[str, int] = defaultdict(int)
+
+    # Transit-gear inheritance inputs (issue #646 phase 3, ADR 0013 D1/D3):
+    # one entry per in_legacy reservation, gathered in the same pass so the
+    # cabling batch call below can run once, after the loop, rather than per
+    # reservation. legacy_reserved_device_ids seeds the set the fork's device
+    # union is diffed against ("reserved and on a path counts once, as
+    # reserved"); legacy_reservation_hours is the reservation's window-overlap
+    # hours a transit device inherits verbatim; legacy_reservation_category is
+    # present only for a CONFIRMED reservation (category, or the literal
+    # "unclassified"), mirroring exactly which reservations feed
+    # device_purpose_hours/device_purpose_count above.
+    legacy_reserved_device_ids: dict[uuid.UUID, set[uuid.UUID]] = {}
+    legacy_reservation_hours: dict[uuid.UUID, float] = {}
+    legacy_reservation_category: dict[uuid.UUID, str] = {}
 
     window_start = _as_utc(window_start)
     window_end = _as_utc(window_end)
@@ -214,6 +321,15 @@ async def build_utilization_report(
             else:
                 purpose_suggested_count[suggested_category] += 1
 
+            # Register this reservation for transit inheritance even if it
+            # reserved zero devices (a dynamic-only booking can still have a
+            # fork whose paths touched real gear); the set starts empty and
+            # the device loop below fills in the reserved ids to diff against.
+            legacy_reserved_device_ids[r.id] = set()
+            legacy_reservation_hours[r.id] = hours
+            if is_confirmed:
+                legacy_reservation_category[r.id] = category
+
         if not in_legacy and not in_fleet:
             continue
         for raw_id in r.device_ids or []:
@@ -224,6 +340,7 @@ async def build_utilization_report(
             if in_legacy:
                 device_hours[device_id] += hours
                 device_count[device_id] += 1
+                legacy_reserved_device_ids[r.id].add(device_id)
                 if is_confirmed:
                     purpose_hours[category] += hours
                     user_purpose_hours[(r.user_id, category)] += hours
@@ -234,6 +351,37 @@ async def build_utilization_report(
             if in_fleet:
                 fleet_device_hours[device_id] += hours
                 fleet_device_count[device_id] += 1
+
+    # Fold transit gear into the device breakdowns (issue #646 phase 3, D1/D3):
+    # for each in_legacy reservation, the fork's device union minus the
+    # reservation's own reserved ids is the transit set; a transit device
+    # inherits the reservation's window-overlap hours verbatim and, for the
+    # purpose breakdown, the reservation's confirmed category exactly as a
+    # reserved device would (an ai_suggested-only reservation contributes to
+    # by_device's transit fields but never to by_device_purpose, mirroring the
+    # reserved-device is_confirmed gate above). Kept in separate dicts rather
+    # than folded into device_hours/device_purpose_hours in place, so the
+    # per-device transit_* fields can be reported alongside the now-inclusive
+    # totals without a second pass over the reservations.
+    transit_device_hours: dict[uuid.UUID, float] = defaultdict(float)
+    transit_device_count: dict[uuid.UUID, int] = defaultdict(int)
+    transit_device_purpose_hours: dict[tuple[uuid.UUID, str], float] = defaultdict(float)
+    transit_device_purpose_count: dict[tuple[uuid.UUID, str], int] = defaultdict(int)
+
+    if include_transit and legacy_reserved_device_ids:
+        fork_devices = await _fetch_transit_devices(list(legacy_reserved_device_ids.keys()))
+        for rid, reserved_ids in legacy_reserved_device_ids.items():
+            transit_ids = set(fork_devices.get(rid, [])) - reserved_ids
+            if not transit_ids:
+                continue
+            r_hours = legacy_reservation_hours[rid]
+            r_category = legacy_reservation_category.get(rid)
+            for device_id in transit_ids:
+                transit_device_hours[device_id] += r_hours
+                transit_device_count[device_id] += 1
+                if r_category is not None:
+                    transit_device_purpose_hours[(device_id, r_category)] += r_hours
+                    transit_device_purpose_count[(device_id, r_category)] += 1
 
     by_user = sorted(
         (
@@ -248,14 +396,22 @@ async def build_utilization_report(
         key=lambda b: b.hours,
         reverse=True,
     )
+    # INCLUSIVE totals (issue #646 phase 3, D3): reservation_count and hours now
+    # cover reserved plus transit; transit_reservations/transit_hours report the
+    # transit share alone. The comprehension iterates the union of both dicts'
+    # keys so a device that is transit-only (never reserved in this window)
+    # still gets a row, since device_hours/device_count are defaultdicts and
+    # would otherwise silently omit it.
     by_device = sorted(
         (
             DeviceBucket(
                 device_id=did,
-                reservation_count=device_count[did],
-                hours=round(device_hours[did], 4),
+                reservation_count=device_count[did] + transit_device_count.get(did, 0),
+                hours=round(device_hours[did] + transit_device_hours.get(did, 0.0), 4),
+                transit_reservations=transit_device_count.get(did, 0),
+                transit_hours=round(transit_device_hours.get(did, 0.0), 4),
             )
-            for did in device_hours
+            for did in set(device_hours) | set(transit_device_hours)
         ),
         key=lambda b: b.hours,
         reverse=True,
@@ -303,10 +459,19 @@ async def build_utilization_report(
             DevicePurposeBucket(
                 device_id=did,
                 purpose_category=category,
-                reservations=device_purpose_count[(did, category)],
-                device_hours=round(device_purpose_hours[(did, category)], 4),
+                reservations=device_purpose_count[(did, category)]
+                + transit_device_purpose_count.get((did, category), 0),
+                device_hours=round(
+                    device_purpose_hours[(did, category)]
+                    + transit_device_purpose_hours.get((did, category), 0.0),
+                    4,
+                ),
+                transit_reservations=transit_device_purpose_count.get((did, category), 0),
+                transit_device_hours=round(
+                    transit_device_purpose_hours.get((did, category), 0.0), 4
+                ),
             )
-            for did, category in device_purpose_count
+            for did, category in set(device_purpose_count) | set(transit_device_purpose_count)
         ),
         key=lambda b: b.device_hours,
         reverse=True,
@@ -350,6 +515,7 @@ async def build_utilization_report(
         by_user_purpose=by_user_purpose,
         by_device_purpose=by_device_purpose,
         by_purpose_suggested=by_purpose_suggested,
+        transit_included=include_transit,
     )
 
 
@@ -570,7 +736,10 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
     phase 1, "purpose_suggested" added phase 2) are standalone sections
     rather than an added column on "user"/"device": a user or device can span
     multiple purpose categories, so a per-user or per-device row cannot carry
-    a single category value without losing information.
+    a single category value without losing information. "device" and
+    "device_purpose" gained transit_reservations/transit_hours (transit_
+    device_hours on the latter) columns in phase 3 (ADR 0013); the existing
+    columns keep their original order.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -579,9 +748,25 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
         for b in report.by_user:
             writer.writerow([str(b.user_id), b.owner_name, f"{b.hours:.4f}", b.reservation_count])
     elif section == "device":
-        writer.writerow(["device_id", "hours", "reservation_count"])
+        writer.writerow(
+            [
+                "device_id",
+                "hours",
+                "reservation_count",
+                "transit_reservations",
+                "transit_hours",
+            ]
+        )
         for b in report.by_device:
-            writer.writerow([str(b.device_id), f"{b.hours:.4f}", b.reservation_count])
+            writer.writerow(
+                [
+                    str(b.device_id),
+                    f"{b.hours:.4f}",
+                    b.reservation_count,
+                    b.transit_reservations,
+                    f"{b.transit_hours:.4f}",
+                ]
+            )
     elif section == "fleet":
         if report.fleet is None:
             raise ValueError("fleet section is not populated on this report")
@@ -610,10 +795,26 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
                 [str(b.user_id), b.purpose_category, b.reservations, f"{b.device_hours:.4f}"]
             )
     elif section == "device_purpose":
-        writer.writerow(["device_id", "purpose_category", "reservations", "device_hours"])
+        writer.writerow(
+            [
+                "device_id",
+                "purpose_category",
+                "reservations",
+                "device_hours",
+                "transit_reservations",
+                "transit_device_hours",
+            ]
+        )
         for b in report.by_device_purpose:
             writer.writerow(
-                [str(b.device_id), b.purpose_category, b.reservations, f"{b.device_hours:.4f}"]
+                [
+                    str(b.device_id),
+                    b.purpose_category,
+                    b.reservations,
+                    f"{b.device_hours:.4f}",
+                    b.transit_reservations,
+                    f"{b.transit_device_hours:.4f}",
+                ]
             )
     elif section == "purpose_suggested":
         writer.writerow(["purpose_category", "reservations", "device_hours"])

@@ -11,6 +11,12 @@ export interface DeviceBucket {
   device_id: string;
   reservation_count: number;
   hours: number;
+  // Transit-gear inheritance (issue #646 phase 3): reservation_count/hours
+  // above are INCLUSIVE of transit gear (switches/routers a reservation's
+  // fork wiring touched but did not reserve); these two report the transit
+  // share alone. Optional: absent on a backend build that predates phase 3.
+  transit_reservations?: number;
+  transit_hours?: number;
 }
 
 export interface TopologyTypeBucket {
@@ -71,6 +77,11 @@ export interface DevicePurposeBucket {
   purpose_category: string;
   reservations: number;
   device_hours: number;
+  // Transit-gear inheritance (issue #646 phase 3): reservations/device_hours
+  // above are INCLUSIVE of transit gear; these two report the transit share
+  // alone. Optional: absent on a backend build that predates phase 3.
+  transit_reservations?: number;
+  transit_device_hours?: number;
 }
 
 export interface UtilizationReport {
@@ -98,6 +109,11 @@ export interface UtilizationReport {
   // excluded from by_purpose's unclassified count. Optional: absent on a
   // backend build that predates phase 2.
   by_purpose_suggested?: PurposeBucket[];
+  // Issue #646 phase 3: echoes the effective include_transit query param.
+  // True means by_device/by_device_purpose are inclusive of transit gear;
+  // false means the transit_* fields on both are all zero. Optional: absent
+  // on a backend build that predates phase 3 (treat as phase-1 semantics).
+  transit_included?: boolean;
 }
 
 export interface UtilizationQuery {

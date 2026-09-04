@@ -164,7 +164,7 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   (ADR 0009 Decision 6); removing a device releases its wiring via the fork prune.
 - **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,
   status filters, and click-to-view details.
-- **Lab purpose classification** (Shipped, phases 1 and 2): an optional purpose
+- **Lab purpose classification** (Shipped, all three phases): an optional purpose
   category alongside the existing free-text purpose field, drawn from a
   configurable taxonomy (`PURPOSE_CATEGORIES`, default qa_regression,
   support_case_replication, feature_development, customer_demo_poc, training,
@@ -190,8 +190,12 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   reporting page's chart, never mixed into the confirmed totals; the
   `unclassified` bucket now means genuinely untouched, not merely unconfirmed.
   Both AI features are dark by default behind `AI_PURPOSE_CLASSIFICATION_ENABLED`
-  and require the AI provider to be configured. Phase 3 (transit-gear device
-  rollups) remains planned; see
+  and require the AI provider to be configured. Phase 3 folds transit gear
+  into the device breakdowns: `by_device` and `by_device_purpose` now count a
+  reservation's fork-connected switches and routers, not just its reserved
+  devices, inheriting the reservation's category and reported additively
+  alongside a `transit_reservations`/transit-hours pair, with a fail-closed
+  `include_transit` toggle to fall back to reserved-devices-only; see
   [docs/design/0013-lab-purpose-classification.md](docs/design/0013-lab-purpose-classification.md)
   (issue #646).
 

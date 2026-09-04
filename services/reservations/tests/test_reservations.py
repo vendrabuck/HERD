@@ -7,12 +7,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus
 from app.routers.reservations import bearer_scheme
+from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
 
@@ -2839,8 +2841,207 @@ async def test_utilization_report_csv_device_section(admin_client):
     )
     assert resp.status_code == 200
     body = resp.text
-    assert body.splitlines()[0] == "device_id,hours,reservation_count"
+    assert (
+        body.splitlines()[0]
+        == "device_id,hours,reservation_count,transit_reservations,transit_hours"
+    )
     assert DEVICE_A in body
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_cabling_unreachable_is_503(admin_client):
+    """Cabling transport failure fails CLOSED with the pinned detail (D4)."""
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+    )
+    with (
+        patch(
+            "app.services.reporting_service._fetch_transit_devices",
+            new=_real_fetch_transit_devices,
+        ),
+        patch(
+            "app.services.reporting_service._cabling_fork_devices_batch",
+            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+        ),
+    ):
+        resp = await admin_client.get(
+            "/reports/utilization",
+            params={"start": window_start.isoformat(), "end": window_end.isoformat()},
+        )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == {"error": "transit_gear_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_cabling_non_200_is_503(admin_client):
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+    )
+    with (
+        patch(
+            "app.services.reporting_service._fetch_transit_devices",
+            new=_real_fetch_transit_devices,
+        ),
+        patch(
+            "app.services.reporting_service._cabling_fork_devices_batch",
+            new=AsyncMock(return_value=httpx.Response(500, text="boom")),
+        ),
+    ):
+        resp = await admin_client.get(
+            "/reports/utilization",
+            params={"start": window_start.isoformat(), "end": window_end.isoformat()},
+        )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == {"error": "transit_gear_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_csv_cabling_unreachable_is_503(admin_client):
+    """The CSV route fails closed the same way as the JSON route."""
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+    )
+    with (
+        patch(
+            "app.services.reporting_service._fetch_transit_devices",
+            new=_real_fetch_transit_devices,
+        ),
+        patch(
+            "app.services.reporting_service._cabling_fork_devices_batch",
+            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+        ),
+    ):
+        resp = await admin_client.get(
+            "/reports/utilization.csv",
+            params={
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+                "section": "device",
+            },
+        )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == {"error": "transit_gear_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_csv_cabling_non_200_is_503(admin_client):
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+    )
+    with (
+        patch(
+            "app.services.reporting_service._fetch_transit_devices",
+            new=_real_fetch_transit_devices,
+        ),
+        patch(
+            "app.services.reporting_service._cabling_fork_devices_batch",
+            new=AsyncMock(return_value=httpx.Response(503, text="down")),
+        ),
+    ):
+        resp = await admin_client.get(
+            "/reports/utilization.csv",
+            params={
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+                "section": "device",
+            },
+        )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == {"error": "transit_gear_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_include_transit_false_parses(admin_client):
+    """?include_transit=false skips the cabling call entirely (D4)."""
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+    )
+    fetch_mock = AsyncMock(return_value={})
+    with patch("app.services.reporting_service._fetch_transit_devices", new=fetch_mock):
+        resp = await admin_client.get(
+            "/reports/utilization",
+            params={
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+                "include_transit": "false",
+            },
+        )
+    assert resp.status_code == 200
+    fetch_mock.assert_not_called()
+    data = resp.json()
+    assert data["transit_included"] is False
+    by_device = {b["device_id"]: b for b in data["by_device"]}
+    assert by_device[DEVICE_A]["transit_reservations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_include_transit_zero_parses(admin_client):
+    """?include_transit=0 is accepted the same way as "false" (FastAPI bool coercion)."""
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    await _seed_reservation(
+        USER_ID,
+        "alice",
+        [DEVICE_A],
+        NOW - timedelta(days=1, hours=2),
+        NOW - timedelta(days=1),
+    )
+    fetch_mock = AsyncMock(return_value={})
+    with patch("app.services.reporting_service._fetch_transit_devices", new=fetch_mock):
+        resp = await admin_client.get(
+            "/reports/utilization",
+            params={
+                "start": window_start.isoformat(),
+                "end": window_end.isoformat(),
+                "include_transit": "0",
+            },
+        )
+    assert resp.status_code == 200
+    fetch_mock.assert_not_called()
+    assert resp.json()["transit_included"] is False
+
+
+@pytest.mark.asyncio
+async def test_utilization_report_default_include_transit_is_true(admin_client):
+    """No ?include_transit param defaults to True (echoed on the report)."""
+    window_start = NOW - timedelta(days=7)
+    window_end = NOW
+    resp = await admin_client.get(
+        "/reports/utilization",
+        params={"start": window_start.isoformat(), "end": window_end.isoformat()},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["transit_included"] is True
 
 
 @pytest.mark.asyncio

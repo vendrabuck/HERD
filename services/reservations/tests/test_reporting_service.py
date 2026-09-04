@@ -517,8 +517,8 @@ def test_report_to_csv_device_section():
     report = _report_fixture()
     csv_text = report_to_csv(report, "device")
     lines = csv_text.strip().splitlines()
-    assert lines[0] == "device_id,hours,reservation_count"
-    assert lines[1].endswith(",5.0000,2")
+    assert lines[0] == "device_id,hours,reservation_count,transit_reservations,transit_hours"
+    assert lines[1].endswith(",5.0000,2,0,0.0000")
 
 
 def test_report_to_csv_purpose_section():
@@ -541,8 +541,65 @@ def test_report_to_csv_device_purpose_section():
     report = _report_fixture()
     csv_text = report_to_csv(report, "device_purpose")
     lines = csv_text.strip().splitlines()
-    assert lines[0] == "device_id,purpose_category,reservations,device_hours"
-    assert lines[1].endswith(",qa_regression,2,5.0000")
+    assert lines[0] == (
+        "device_id,purpose_category,reservations,device_hours,"
+        "transit_reservations,transit_device_hours"
+    )
+    assert lines[1].endswith(",qa_regression,2,5.0000,0,0.0000")
+
+
+def test_report_to_csv_device_section_carries_transit_columns():
+    """The device CSV section's new columns (issue #646 phase 3)."""
+    did = uuid.uuid4()
+    report = UtilizationReport(
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        total_hours=5.0,
+        total_reservations=2,
+        by_user=[],
+        by_device=[
+            DeviceBucket(
+                device_id=did,
+                reservation_count=3,
+                hours=8.0,
+                transit_reservations=1,
+                transit_hours=3.0,
+            ),
+        ],
+    )
+    csv_text = report_to_csv(report, "device")
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == "device_id,hours,reservation_count,transit_reservations,transit_hours"
+    assert lines[1] == f"{did},8.0000,3,1,3.0000"
+
+
+def test_report_to_csv_device_purpose_section_carries_transit_columns():
+    did = uuid.uuid4()
+    report = UtilizationReport(
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        total_hours=5.0,
+        total_reservations=2,
+        by_user=[],
+        by_device=[],
+        by_device_purpose=[
+            DevicePurposeBucket(
+                device_id=did,
+                purpose_category="training",
+                reservations=3,
+                device_hours=8.0,
+                transit_reservations=1,
+                transit_device_hours=3.0,
+            ),
+        ],
+    )
+    csv_text = report_to_csv(report, "device_purpose")
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == (
+        "device_id,purpose_category,reservations,device_hours,"
+        "transit_reservations,transit_device_hours"
+    )
+    assert lines[1] == f"{did},training,3,8.0000,1,3.0000"
 
 
 def test_report_to_csv_purpose_suggested_section():

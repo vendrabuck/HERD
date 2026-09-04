@@ -41,6 +41,10 @@
       "/internal/forks"
     ],
     [
+      "POST",
+      "/internal/forks/devices/batch"
+    ],
+    [
       "GET",
       "/internal/forks/{reservation_id}"
     ],
@@ -426,6 +430,22 @@
         "updated_at",
         "versions"
       ],
+      "type": "object"
+    },
+    "ForkDevicesBatchRequest": {
+      "properties": {
+        "reservation_ids": "array"
+      },
+      "required": [
+        "reservation_ids"
+      ],
+      "type": "object"
+    },
+    "ForkDevicesBatchResponse": {
+      "properties": {
+        "devices": "object"
+      },
+      "required": [],
       "type": "object"
     },
     "ForkPruneRequest": {

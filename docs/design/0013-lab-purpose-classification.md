@@ -289,6 +289,54 @@ than the JSON literal `"null"`; the reconciler's and review queue's
 `purpose_classify_requested_at` (indexed), `purpose_classify_attempts`
 (default 0), and `purpose_suggestion_dismissed_at`.
 
+## Amendment 2026-09-04 (phase 3 delivery)
+
+Phase 3 (device rollups) shipped the same day as phases 1 and 2, closing out
+point 6's deferral. Five decisions over the "Phase 3, remaining" line below:
+
+1. **Source of truth is cabling's fork connections, not execution's ledger.**
+   For a reservation, the devices it consumed are the union of
+   `device_a_id`/`device_b_id` over every one of its `fork_connections` rows
+   (both layers, ACTIVE and ARCHIVED forks alike); its TRANSIT set is that
+   union minus its own reserved `device_ids`. A device both reserved and on a
+   path counts once, as reserved. A reservation with no fork (never
+   activated, or dynamic-only) has an empty transit set.
+2. **One new batch endpoint, no per-reservation fetch loop.** Cabling gained
+   `POST /internal/forks/devices/batch` (1 to 500 reservation ids per call,
+   the same cap idiom as the existing 200-item connections-bulk cap),
+   returning, per reservation that has a fork, the sorted distinct device ids
+   across its fork connections. Reservations' report calls it in chunks of
+   500 through a `_cabling_fork_devices_batch`/`_fetch_transit_devices` pair
+   built on the same `call_service`/`InternalTokenAuth` transport as the
+   fork's existing calls, never one call per reservation.
+3. **Totals become inclusive; transit is reported as an additive delta.**
+   `DeviceBucket` and `DevicePurposeBucket` both gained
+   `transit_reservations` and a transit-hours field (`transit_hours` on the
+   former, `transit_device_hours` on the latter); the existing
+   `reservation_count`/`hours` and `reservations`/`device_hours` fields
+   became INCLUSIVE of transit gear. A transit device inherits the
+   reservation's confirmed category (or the literal `unclassified`) exactly
+   as a reserved device does, so an ai_suggested-but-unconfirmed reservation
+   folds into `by_device`'s transit fields but never into
+   `by_device_purpose`, mirroring the reserved-device confirmation gate from
+   phase 2. `by_purpose_suggested` and every reservation- and user-level
+   bucket are unchanged; they never multiplied by device count.
+4. **Fail closed, with an escape hatch.** If cabling is unreachable or
+   returns a non-200, both utilization report endpoints (JSON and CSV) return
+   503 with the pinned detail `{"error": "transit_gear_unavailable"}`, the
+   same closed-by-default posture as the other cross-service guards in
+   CLAUDE.md: an unreadable path graph must not silently report zero transit
+   devices, which would look identical to genuine absence. A new
+   `include_transit` query parameter (default `true`) on both endpoints
+   skips the cabling call entirely when `false`, reproducing phase-1
+   semantics with every transit field at zero; `UtilizationReport.
+   transit_included` echoes the effective value so a consumer can tell which
+   semantics it received.
+5. **CSV columns are additive and append-only.** The `device` section gained
+   `transit_reservations, transit_hours`, and `device_purpose` gained
+   `transit_reservations, transit_device_hours`, both after the existing
+   columns; column order for the pre-existing columns is unchanged.
+
 ## Delivery phases
 
 1. Phase 1, delivered (schema, API, manual dropdown, reporting): the three columns and
@@ -312,10 +360,13 @@ than the JSON literal `"null"`; the reconciler's and review queue's
    marks terminal rows without a suggestion as eligible for the same
    reconciler (bounded, idempotent, pausable by turning the flag off); the
    ai_suggested bucket in reporting.
-3. Phase 3, remaining (device rollups): transit-gear inheritance through
-   cabling's fork hops so device-level breakdowns include the switches and
-   routers a reservation consumed on its paths; a per-device category mix
-   that answers which devices are the support-replication workhorses.
+3. Phase 3, delivered 2026-09-04 (device rollups; see the amendment above for
+   the five decisions): transit-gear inheritance through cabling's fork hops
+   so device-level breakdowns include the switches and routers a reservation
+   consumed on its paths, folded additively into `by_device` and
+   `by_device_purpose` alongside the existing reserved-device totals; a
+   per-device category mix that answers which devices are the
+   support-replication workhorses.
 
 ## Testing
 

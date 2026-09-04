@@ -37,6 +37,8 @@ from app.schemas.fork import (
     ForkCreate,
     ForkCreateResponse,
     ForkDetailResponse,
+    ForkDevicesBatchRequest,
+    ForkDevicesBatchResponse,
     ForkPruneRequest,
     ForkPruneResponse,
     ForkRestoreResponse,
@@ -203,6 +205,51 @@ async def list_active_forks_internal(
         total=total,
         skip=skip,
         limit=limit,
+    )
+
+
+@router.post("/devices/batch", response_model=ForkDevicesBatchResponse)
+async def get_fork_devices_batch_internal(
+    body: ForkDevicesBatchRequest,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Devices a batch of reservations consumed, for transit-gear reporting (#646 P3).
+
+    For each reservation_id that has a fork (ACTIVE or ARCHIVED), returns the
+    sorted distinct union of device_a_id/device_b_id across all of its
+    fork_connections rows, both layers. A reservation with no fork (never
+    activated, or dynamic-only) is absent from the map; the caller (reservations'
+    utilization report) treats absence as "no path data" and reports zero transit
+    devices for it. One join query, no per-reservation loop, so the 500-id cap on
+    the request keeps this to a single bounded round trip regardless of how many
+    reservations a report window covers.
+    """
+    _check_internal_token(x_internal_token)
+
+    rows = (
+        await db.execute(
+            select(
+                ReservationFork.reservation_id,
+                ForkConnection.device_a_id,
+                ForkConnection.device_b_id,
+            )
+            .join(ForkConnection, ForkConnection.fork_id == ReservationFork.id)
+            .where(ReservationFork.reservation_id.in_(body.reservation_ids))
+        )
+    ).all()
+
+    devices_by_reservation: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for reservation_id, device_a_id, device_b_id in rows:
+        bucket = devices_by_reservation.setdefault(reservation_id, set())
+        bucket.add(device_a_id)
+        bucket.add(device_b_id)
+
+    return ForkDevicesBatchResponse(
+        devices={
+            str(reservation_id): sorted(device_ids, key=str)
+            for reservation_id, device_ids in devices_by_reservation.items()
+        }
     )
 
 

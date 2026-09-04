@@ -135,7 +135,9 @@
       "properties": {
         "device_id": "string",
         "hours": "number",
-        "reservation_count": "integer"
+        "reservation_count": "integer",
+        "transit_hours": "number",
+        "transit_reservations": "integer"
       },
       "required": [
         "device_id",
@@ -149,7 +151,9 @@
         "device_hours": "number",
         "device_id": "string",
         "purpose_category": "string",
-        "reservations": "integer"
+        "reservations": "integer",
+        "transit_device_hours": "number",
+        "transit_reservations": "integer"
       },
       "required": [
         "device_hours",
@@ -534,6 +538,7 @@
         "fleet": "anyOf",
         "total_hours": "number",
         "total_reservations": "integer",
+        "transit_included": "boolean",
         "window_end": "string",
         "window_start": "string"
       },
