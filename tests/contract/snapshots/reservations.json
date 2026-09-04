@@ -10,6 +10,22 @@
     ],
     [
       "GET",
+      "/admin/purpose-review"
+    ],
+    [
+      "POST",
+      "/admin/purpose-review/{reservation_id}/accept"
+    ],
+    [
+      "POST",
+      "/admin/purpose-review/{reservation_id}/dismiss"
+    ],
+    [
+      "POST",
+      "/admin/purpose/backfill"
+    ],
+    [
+      "GET",
       "/calendar"
     ],
     [
@@ -282,6 +298,15 @@
       ],
       "type": "object"
     },
+    "PurposeBackfillResponse": {
+      "properties": {
+        "marked": "integer"
+      },
+      "required": [
+        "marked"
+      ],
+      "type": "object"
+    },
     "PurposeBucket": {
       "properties": {
         "device_hours": "number",
@@ -309,6 +334,55 @@
         "purpose_category": "anyOf"
       },
       "required": [],
+      "type": "object"
+    },
+    "PurposeReviewAcceptBody": {
+      "properties": {
+        "purpose_category": "anyOf"
+      },
+      "required": [],
+      "type": "object"
+    },
+    "PurposeReviewItem": {
+      "properties": {
+        "device_count": "integer",
+        "end_time": "string",
+        "purpose": "anyOf",
+        "purpose_category": "anyOf",
+        "purpose_suggested_at": "anyOf",
+        "purpose_suggestion": "object",
+        "reservation_id": "string",
+        "start_time": "string",
+        "status": "#/components/schemas/ReservationStatus",
+        "user_id": "string"
+      },
+      "required": [
+        "device_count",
+        "end_time",
+        "purpose",
+        "purpose_category",
+        "purpose_suggested_at",
+        "purpose_suggestion",
+        "reservation_id",
+        "start_time",
+        "status",
+        "user_id"
+      ],
+      "type": "object"
+    },
+    "PurposeReviewListResponse": {
+      "properties": {
+        "items": "array",
+        "limit": "integer",
+        "skip": "integer",
+        "total": "integer"
+      },
+      "required": [
+        "items",
+        "limit",
+        "skip",
+        "total"
+      ],
       "type": "object"
     },
     "ReservationCreate": {
@@ -358,6 +432,9 @@
         "purpose": "anyOf",
         "purpose_category": "anyOf",
         "purpose_category_set_at": "anyOf",
+        "purpose_suggested_at": "anyOf",
+        "purpose_suggestion": "anyOf",
+        "purpose_suggestion_dismissed_at": "anyOf",
         "start_time": "string",
         "status": "#/components/schemas/ReservationStatus",
         "topology_id": "anyOf",
@@ -449,6 +526,7 @@
         "by_device_purpose": "array",
         "by_group": "array",
         "by_purpose": "array",
+        "by_purpose_suggested": "array",
         "by_topology_type": "array",
         "by_user": "array",
         "by_user_purpose": "array",

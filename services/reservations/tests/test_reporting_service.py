@@ -54,6 +54,7 @@ def _reservation(
     status: ReservationStatus = ReservationStatus.COMPLETED,
     topology_type: TopologyType = TopologyType.PHYSICAL,
     purpose_category: str | None = None,
+    purpose_suggestion: dict | None = None,
 ) -> Reservation:
     return Reservation(
         id=uuid.uuid4(),
@@ -66,6 +67,7 @@ def _reservation(
         end_time=end,
         status=status,
         purpose_category=purpose_category,
+        purpose_suggestion=purpose_suggestion,
     )
 
 
@@ -404,6 +406,72 @@ async def test_build_report_aggregates_by_purpose(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_build_report_by_purpose_suggested_split(db_session):
+    """Three-way split (issue #646 phase 2, ADR 0013 point 9): a row with a
+    suggestion but no confirmed category reports under by_purpose_suggested,
+    keyed by the suggestion's top_category, and drops out of by_purpose's
+    "unclassified" bucket entirely; a confirmed row that ALSO carries a
+    suggestion still reports only under its confirmed category, never
+    double-counted into by_purpose_suggested."""
+    # Bob: 1 device, 2h, no confirmed category, an AI suggestion of "training".
+    db_session.add(
+        _reservation(
+            USER_B,
+            "bob",
+            [DEVICE_X],
+            NOW - timedelta(hours=6),
+            NOW - timedelta(hours=4),
+            purpose_category=None,
+            purpose_suggestion={"top_category": "training"},
+        )
+    )
+    # Alice: 1 device, 1h, genuinely unclassified (no category, no suggestion).
+    db_session.add(
+        _reservation(
+            USER_A,
+            "alice",
+            [DEVICE_Y],
+            NOW - timedelta(hours=3),
+            NOW - timedelta(hours=2),
+            purpose_category=None,
+            purpose_suggestion=None,
+        )
+    )
+    # Alice again: confirmed qa_regression, but ALSO carries a (disagreeing)
+    # suggestion; must count only under the confirmed category.
+    db_session.add(
+        _reservation(
+            USER_A,
+            "alice",
+            [DEVICE_X],
+            NOW - timedelta(hours=10),
+            NOW - timedelta(hours=9),
+            purpose_category="qa_regression",
+            purpose_suggestion={"top_category": "training"},
+        )
+    )
+    await db_session.commit()
+
+    report = await build_utilization_report(
+        db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
+    )
+
+    by_purpose = {b.purpose_category: b for b in report.by_purpose}
+    # Only the genuinely-unclassified row (Alice's second one) lands here.
+    assert by_purpose["unclassified"].reservations == 1
+    assert by_purpose["unclassified"].device_hours == pytest.approx(1.0, abs=0.01)
+    assert by_purpose["qa_regression"].reservations == 1
+    assert by_purpose["qa_regression"].device_hours == pytest.approx(1.0, abs=0.01)
+    # Bob's suggested-but-unconfirmed row never reaches by_purpose at all.
+    assert "training" not in by_purpose
+
+    by_suggested = {b.purpose_category: b for b in report.by_purpose_suggested}
+    assert list(by_suggested.keys()) == ["training"]
+    assert by_suggested["training"].reservations == 1
+    assert by_suggested["training"].device_hours == pytest.approx(2.0, abs=0.01)
+
+
 def _report_fixture() -> UtilizationReport:
     uid = uuid.uuid4()
     did = uuid.uuid4()
@@ -430,6 +498,9 @@ def _report_fixture() -> UtilizationReport:
             DevicePurposeBucket(
                 device_id=did, purpose_category="qa_regression", reservations=2, device_hours=5.0
             ),
+        ],
+        by_purpose_suggested=[
+            PurposeBucket(purpose_category="training", reservations=1, device_hours=2.0),
         ],
     )
 
@@ -472,6 +543,14 @@ def test_report_to_csv_device_purpose_section():
     lines = csv_text.strip().splitlines()
     assert lines[0] == "device_id,purpose_category,reservations,device_hours"
     assert lines[1].endswith(",qa_regression,2,5.0000")
+
+
+def test_report_to_csv_purpose_suggested_section():
+    report = _report_fixture()
+    csv_text = report_to_csv(report, "purpose_suggested")
+    lines = csv_text.strip().splitlines()
+    assert lines[0] == "purpose_category,reservations,device_hours"
+    assert lines[1] == "training,1,2.0000"
 
 
 def test_report_to_csv_rejects_unknown_section():

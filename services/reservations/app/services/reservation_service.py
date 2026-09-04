@@ -35,7 +35,10 @@ from app.models.reservation import (
     TopologyType,
 )
 from app.schemas.reservation import ReservationCreate, ReservationUpdate
-from app.services.purpose_service import validate_purpose_category
+from app.services.purpose_service import (
+    stamp_purpose_classify_requested,
+    validate_purpose_category,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1513,7 +1516,12 @@ async def apply_provision_result(
         return reservation, True
 
     # The CAS already wrote FAILED; stage reservation.failed in the same
-    # transaction so the event commits atomically with the transition.
+    # transaction so the event commits atomically with the transition. Also
+    # stamp the purpose-classification marker in this transaction (issue #646
+    # phase 2, ADR 0013 point 8): this is one of the five terminal-transition
+    # sites, alongside cancel_reservation, release_reservation, and the
+    # expiration task's auto-complete and dynamic-timeout-failure branches.
+    stamp_purpose_classify_requested(reservation)
     enqueue_event(
         db,
         OutboxEvent,
@@ -1967,6 +1975,9 @@ async def cancel_reservation(
     # self-cancel leaves cancelled_by NULL (issue #340 audit invariant).
     if admin_override:
         reservation.cancelled_by = user_id
+    # One of the five terminal-transition sites (issue #646 phase 2, ADR 0013
+    # point 8): marks the row eligible for background purpose classification.
+    stamp_purpose_classify_requested(reservation)
     # Stage reservation.cancelled in the same transaction that lands CANCELLED
     # (issue #21). The inventory device release below is best-effort and runs
     # after the commit; the event is durable regardless of NATS availability.
@@ -2034,6 +2045,9 @@ async def release_reservation(
         return reservation
     reservation.status = ReservationStatus.COMPLETED
     reservation.modified_by = user_id
+    # One of the five terminal-transition sites (issue #646 phase 2, ADR 0013
+    # point 8): marks the row eligible for background purpose classification.
+    stamp_purpose_classify_requested(reservation)
     # Stage reservation.completed in the same transaction that lands COMPLETED
     # (issue #21), mirroring the auto-expiry path. Inventory device release below
     # is best-effort; the event is durable regardless of NATS availability.

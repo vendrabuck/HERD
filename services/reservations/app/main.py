@@ -13,6 +13,7 @@ from herd_common.schema_init import create_all_and_stamp
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.models.outbox import OutboxEvent
+from app.routers.purpose_review import router as purpose_review_router
 from app.routers.reservations import router as reservations_router
 
 setup_logging("reservations", level=settings.log_level)
@@ -117,3 +118,4 @@ async def health():
 
 
 app.include_router(reservations_router)
+app.include_router(purpose_review_router)

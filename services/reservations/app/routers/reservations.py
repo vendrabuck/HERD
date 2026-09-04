@@ -202,7 +202,8 @@ async def get_utilization_report_csv(
     start: datetime = Query(...),
     end: datetime = Query(...),
     section: str = Query(
-        "user", pattern="^(user|device|fleet|purpose|user_purpose|device_purpose)$"
+        "user",
+        pattern="^(user|device|fleet|purpose|user_purpose|device_purpose|purpose_suggested)$",
     ),
     status: list[ReservationStatus] | None = Query(None),
     db: AsyncSession = Depends(get_db),
