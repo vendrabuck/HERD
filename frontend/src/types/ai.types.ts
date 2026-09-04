@@ -39,6 +39,12 @@ export interface AIStatusResponse {
   // Exception class name only, never present with message text (may carry a
   // base URL or key material). Null when not degraded.
   reason?: string | null;
+  // Lab purpose classification (issue #646 phase 2). True only when
+  // AI_PURPOSE_CLASSIFICATION_ENABLED is set AND the provider is usable;
+  // gates both the create-modal preview call and its rendered suggestion.
+  // Optional so cached/fixture responses from before this field existed
+  // still type-check; treat a missing value as false.
+  purpose_classification?: boolean;
 }
 
 export interface RecipeValidationSection {

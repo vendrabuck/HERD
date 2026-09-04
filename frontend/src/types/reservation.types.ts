@@ -16,6 +16,26 @@ export interface DynamicRequestSpec {
   template_id: string;
 }
 
+// AI purpose-classification distribution and metadata (issue #646 phase 2,
+// ADR 0013 point 9). Shared by the interactive creation-pass preview
+// (POST /ai/classify-purpose/preview) and the background end-of-reservation
+// pass stored as Reservation.purpose_suggestion; `pass` is the only field
+// that distinguishes which one produced a given value.
+export interface PurposeDistributionEntry {
+  category: string;
+  probability: number;
+}
+
+export interface PurposeClassification {
+  distribution: PurposeDistributionEntry[];
+  top_category: string;
+  pass: "creation" | "end";
+  model: string;
+  rationale: string;
+  generated_at: string;
+  signals_used: string[];
+}
+
 // A booked dynamic instance request; id is the execution-side request_id.
 // Mirrors the backend DynamicRequestResponse.
 export interface DynamicRequestResponse {
@@ -47,6 +67,15 @@ export interface Reservation {
   // here so fixtures and cached responses that predate the feature stay valid.
   purpose_category?: string | null;
   purpose_category_set_at?: string | null;
+  // AI purpose suggestion (issue #646 phase 2, ADR 0013 points 8-9). Null
+  // when no pass has produced one yet. `purpose_suggestion_dismissed_at` is
+  // set only by the admin review page's Dismiss action; a dismissed
+  // suggestion stays on the reservation (ai_suggested state persists) but
+  // is excluded from the review queue. Optional so fixtures and cached
+  // responses that predate the feature stay valid.
+  purpose_suggestion?: PurposeClassification | null;
+  purpose_suggested_at?: string | null;
+  purpose_suggestion_dismissed_at?: string | null;
 }
 
 export interface ReservationCreate {
@@ -76,6 +105,45 @@ export interface ReservationUpdate {
   end_time?: string;
   purpose?: string;
   device_ids?: string[];
+}
+
+// POST /ai/classify-purpose/preview request body (issue #646 phase 2). Sent
+// from the create-reservation modal; every optional signal is null rather
+// than omitted when unavailable, matching the fixed contract.
+export interface PurposePreviewRequest {
+  categories: string[];
+  purpose: string | null;
+  topology_id: string | null;
+  device_ids: string[] | null;
+  dynamic_requests: { template_id: string; count: number }[] | null;
+}
+
+// GET /reservations/admin/purpose-review item and list envelope (issue #646
+// phase 2, ADR 0013 point 10). Admin-only; rows are reservations that carry a
+// suggestion still awaiting accept/dismiss.
+export interface PurposeReviewItem {
+  reservation_id: string;
+  user_id: string;
+  purpose: string | null;
+  start_time: string;
+  end_time: string;
+  status: ReservationStatus;
+  purpose_category: string | null;
+  purpose_suggestion: PurposeClassification | null;
+  purpose_suggested_at: string | null;
+  device_count: number;
+}
+
+export interface PurposeReviewResponse {
+  items: PurposeReviewItem[];
+  total: number;
+  skip: number;
+  limit: number;
+}
+
+// POST /reservations/admin/purpose/backfill response.
+export interface PurposeBackfillResponse {
+  marked: number;
 }
 
 export interface CalendarQueryParams {
