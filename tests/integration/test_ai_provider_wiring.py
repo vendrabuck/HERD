@@ -66,7 +66,9 @@ async def test_ai_status_payload_shape_is_stable(base_url):
     when settings look configured but the provider failed to CONSTRUCT;
     reason is the exception class name only, never present as the exception
     message (which can carry a base URL or key material), so it is always
-    None or a str, never anything richer."""
+    None or a str, never anything richer. purpose_classification joined in
+    issue #646 phase 2 (additive): true only when
+    AI_PURPOSE_CLASSIFICATION_ENABLED is set AND the provider is enabled."""
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
         body = (await client.get(f"{base_url}/ai/status")).json()
     assert set(body.keys()) == {
@@ -76,6 +78,7 @@ async def test_ai_status_payload_shape_is_stable(base_url):
         "recipe_authoring",
         "degraded",
         "reason",
+        "purpose_classification",
     }, f"unexpected keys in status: {sorted(body.keys())}"
     assert isinstance(body["degraded"], bool)
     assert body["reason"] is None or isinstance(body["reason"], str)

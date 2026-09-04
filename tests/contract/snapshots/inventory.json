@@ -106,6 +106,10 @@
     ],
     [
       "GET",
+      "/devices/{device_id}/apply-jobs/internal"
+    ],
+    [
+      "GET",
       "/devices/{device_id}/config-versions"
     ],
     [
@@ -310,6 +314,17 @@
       },
       "required": [
         "scheduled_for"
+      ],
+      "type": "object"
+    },
+    "ApplyJobsInternalSummary": {
+      "properties": {
+        "count": "integer",
+        "names": "array"
+      },
+      "required": [
+        "count",
+        "names"
       ],
       "type": "object"
     },
