@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 
 from herd_common.jetstream import ensure_stream_exists
 from herd_common.outbox import event_dedupe_key
@@ -209,8 +211,50 @@ async def start_nats_consumer(app) -> None:
                 ),
             )
 
+            # THROWAWAY diagnostics for issue #648 (do not merge). Trace every frame
+            # the inbox subscription hands back so a stall can be placed as either
+            # "the message sat in the client, unseen" or "the message did not reach
+            # the client until a later fetch".
+            _diag_sub = getattr(psub, "_sub", None)
+            if _diag_sub is not None:
+                _diag_orig_next_msg = _diag_sub.next_msg
+
+                async def _diag_next_msg(timeout=None, _orig=_diag_orig_next_msg):
+                    m = await _orig(timeout=timeout)
+                    try:
+                        status = m.headers.get("Status") if m.headers else None
+                        if status is not None:
+                            pending = m.headers.get("Nats-Pending-Messages")
+                            description = m.headers.get("Description")
+                            logger.info(
+                                "nats_diag frame subject=%s status=%s pending=%s description=%s",
+                                subject_pattern,
+                                status,
+                                pending,
+                                description,
+                                extra={"action": "nats_diag"},
+                            )
+                        else:
+                            logger.info(
+                                "nats_diag frame subject=%s stream_seq=%s",
+                                subject_pattern,
+                                m.metadata.sequence.stream,
+                                extra={"action": "nats_diag"},
+                            )
+                    except Exception:
+                        pass
+                    return m
+
+                _diag_sub.next_msg = _diag_next_msg
+
             async def _consumer_loop():
                 while True:
+                    fetch_start = time.monotonic()
+                    logger.info(
+                        "nats_diag fetch_start subject=%s",
+                        subject_pattern,
+                        extra={"action": "nats_diag"},
+                    )
                     try:
                         msgs = await psub.fetch(
                             NATS_FETCH_BATCH, timeout=NATS_FETCH_TIMEOUT_SECONDS
@@ -218,6 +262,13 @@ async def start_nats_consumer(app) -> None:
                     except asyncio.CancelledError:
                         raise
                     except (nats.errors.TimeoutError, asyncio.TimeoutError):
+                        elapsed_ms = (time.monotonic() - fetch_start) * 1000
+                        logger.info(
+                            "nats_diag fetch_timeout subject=%s elapsed_ms=%.1f",
+                            subject_pattern,
+                            elapsed_ms,
+                            extra={"action": "nats_diag"},
+                        )
                         # No messages this cycle; fetch again. The fetch also
                         # re-establishes delivery after a broker reconnect.
                         continue
@@ -230,7 +281,37 @@ async def start_nats_consumer(app) -> None:
                         )
                         await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
                         continue
+                    elapsed_ms = (time.monotonic() - fetch_start) * 1000
+                    logger.info(
+                        "nats_diag fetch_return subject=%s count=%d elapsed_ms=%.1f",
+                        subject_pattern,
+                        len(msgs),
+                        elapsed_ms,
+                        extra={"action": "nats_diag"},
+                    )
                     for msg in msgs:
+                        try:
+                            meta = msg.metadata
+                            age_ms = (
+                                datetime.now(timezone.utc) - meta.timestamp
+                            ).total_seconds() * 1000
+                            event_id = None
+                            try:
+                                event_id = json.loads(msg.data.decode()).get("event_id")
+                            except Exception:
+                                pass
+                            logger.info(
+                                "nats_diag msg subject=%s stream_seq=%s num_delivered=%s "
+                                "age_ms=%.1f event_id=%s",
+                                subject_pattern,
+                                meta.sequence.stream,
+                                meta.num_delivered,
+                                age_ms,
+                                event_id,
+                                extra={"action": "nats_diag"},
+                            )
+                        except Exception:
+                            pass
                         try:
                             await process_message(
                                 msg,

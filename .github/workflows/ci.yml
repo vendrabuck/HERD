@@ -194,11 +194,11 @@ jobs:
       # _collect-stack-diagnostics target, shared with nightly.yml, so the
       # two cannot drift apart.
       - name: Collect stack diagnostics
-        if: failure()
+        if: always()
         run: make _collect-stack-diagnostics
 
       - name: Upload stack diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: integration-stack-logs
