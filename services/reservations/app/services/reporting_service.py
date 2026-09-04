@@ -15,15 +15,23 @@ from app.models.reservation import Reservation, ReservationStatus
 from app.schemas.reservation import (
     DayBucket,
     DeviceBucket,
+    DevicePurposeBucket,
     FleetDeviceBucket,
     FleetSection,
     GroupBucket,
+    PurposeBucket,
     TopologyTypeBucket,
     UserBucket,
+    UserPurposeBucket,
     UtilizationReport,
 )
 
 logger = logging.getLogger(__name__)
+
+# Literal bucket label for a reservation with no purpose_category (issue #646
+# phase 1). Never a null value in the report, so a client can group on the
+# field without a null-handling special case.
+UNCLASSIFIED_PURPOSE = "unclassified"
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -130,6 +138,19 @@ async def build_utilization_report(
     fleet_device_count: dict[uuid.UUID, int] = defaultdict(int)
     total_hours = 0.0
 
+    # Lab purpose classification breakdowns (issue #646 phase 1). device_hours
+    # here means actual device-hours (a reservation's hours times how many
+    # devices it reserved), not the per-reservation hours the other legacy
+    # buckets track, matching the report's `device_hours` field name.
+    # Reserved devices only: there is no transit-gear tracking to exclude yet
+    # (phase 3), so every id in r.device_ids already qualifies.
+    purpose_hours: dict[str, float] = defaultdict(float)
+    purpose_count: dict[str, int] = defaultdict(int)
+    user_purpose_hours: dict[tuple[uuid.UUID, str], float] = defaultdict(float)
+    user_purpose_count: dict[tuple[uuid.UUID, str], int] = defaultdict(int)
+    device_purpose_hours: dict[tuple[uuid.UUID, str], float] = defaultdict(float)
+    device_purpose_count: dict[tuple[uuid.UUID, str], int] = defaultdict(int)
+
     window_start = _as_utc(window_start)
     window_end = _as_utc(window_end)
 
@@ -158,6 +179,10 @@ async def build_utilization_report(
                     day_count[day] += 1
                     seen_days.add(day)
 
+            category = r.purpose_category or UNCLASSIFIED_PURPOSE
+            purpose_count[category] += 1
+            user_purpose_count[(r.user_id, category)] += 1
+
         if not in_legacy and not in_fleet:
             continue
         for raw_id in r.device_ids or []:
@@ -168,6 +193,10 @@ async def build_utilization_report(
             if in_legacy:
                 device_hours[device_id] += hours
                 device_count[device_id] += 1
+                purpose_hours[category] += hours
+                user_purpose_hours[(r.user_id, category)] += hours
+                device_purpose_hours[(device_id, category)] += hours
+                device_purpose_count[(device_id, category)] += 1
             if in_fleet:
                 fleet_device_hours[device_id] += hours
                 fleet_device_count[device_id] += 1
@@ -195,6 +224,45 @@ async def build_utilization_report(
             for did in device_hours
         ),
         key=lambda b: b.hours,
+        reverse=True,
+    )
+
+    by_purpose = sorted(
+        (
+            PurposeBucket(
+                purpose_category=category,
+                reservations=purpose_count[category],
+                device_hours=round(purpose_hours[category], 4),
+            )
+            for category in purpose_count
+        ),
+        key=lambda b: b.device_hours,
+        reverse=True,
+    )
+    by_user_purpose = sorted(
+        (
+            UserPurposeBucket(
+                user_id=uid,
+                purpose_category=category,
+                reservations=user_purpose_count[(uid, category)],
+                device_hours=round(user_purpose_hours[(uid, category)], 4),
+            )
+            for uid, category in user_purpose_count
+        ),
+        key=lambda b: b.device_hours,
+        reverse=True,
+    )
+    by_device_purpose = sorted(
+        (
+            DevicePurposeBucket(
+                device_id=did,
+                purpose_category=category,
+                reservations=device_purpose_count[(did, category)],
+                device_hours=round(device_purpose_hours[(did, category)], 4),
+            )
+            for did, category in device_purpose_count
+        ),
+        key=lambda b: b.device_hours,
         reverse=True,
     )
 
@@ -232,6 +300,9 @@ async def build_utilization_report(
         by_topology_type=by_topology_type,
         by_day=by_day,
         fleet=fleet,
+        by_purpose=by_purpose,
+        by_user_purpose=by_user_purpose,
+        by_device_purpose=by_device_purpose,
     )
 
 
@@ -444,10 +515,14 @@ async def fetch_execution_run_count(
 def report_to_csv(report: UtilizationReport, section: str) -> str:
     """Render one section of a UtilizationReport as CSV text.
 
-    Supported sections: "user", "device", "fleet". "template" is a client-side
-    rollup because it requires joining against the inventory service. "fleet"
-    requires report.fleet to be populated; the route turns an unpopulated
-    fleet into a 503 before calling this.
+    Supported sections: "user", "device", "fleet", "purpose", "user_purpose",
+    "device_purpose". "template" is a client-side rollup because it requires
+    joining against the inventory service. "fleet" requires report.fleet to be
+    populated; the route turns an unpopulated fleet into a 503 before calling
+    this. The three purpose sections (issue #646 phase 1) are new, standalone
+    sections rather than an added column on "user"/"device": a user or device
+    can span multiple purpose categories, so a per-user or per-device row
+    cannot carry a single category value without losing information.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -475,6 +550,22 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
                     f"{b.utilization_pct:.2f}",
                     b.reservation_count,
                 ]
+            )
+    elif section == "purpose":
+        writer.writerow(["purpose_category", "reservations", "device_hours"])
+        for b in report.by_purpose:
+            writer.writerow([b.purpose_category, b.reservations, f"{b.device_hours:.4f}"])
+    elif section == "user_purpose":
+        writer.writerow(["user_id", "purpose_category", "reservations", "device_hours"])
+        for b in report.by_user_purpose:
+            writer.writerow(
+                [str(b.user_id), b.purpose_category, b.reservations, f"{b.device_hours:.4f}"]
+            )
+    elif section == "device_purpose":
+        writer.writerow(["device_id", "purpose_category", "reservations", "device_hours"])
+        for b in report.by_device_purpose:
+            writer.writerow(
+                [str(b.device_id), b.purpose_category, b.reservations, f"{b.device_hours:.4f}"]
             )
     else:
         raise ValueError(f"Unsupported CSV section: {section}")

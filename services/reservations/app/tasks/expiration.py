@@ -98,6 +98,7 @@ async def _run_reminder_cycle() -> None:
                     "user_id": str(res.user_id),
                     "device_ids": [str(d) for d in res.device_ids],
                     "end_time": res.end_time.isoformat(),
+                    "purpose_category": res.purpose_category,
                 },
             )
             res.expiry_reminder_sent_at = now
@@ -293,6 +294,7 @@ async def _run_expiration_cycle() -> None:
                     "device_ids": [str(d) for d in res.device_ids],
                     "topology_id": str(res.topology_id) if res.topology_id else None,
                     "topology_type": res.topology_type.value,
+                    "purpose_category": res.purpose_category,
                 },
             )
             logger.info(

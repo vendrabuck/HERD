@@ -21,6 +21,8 @@ from app.schemas.reservation import (
     PaginatedReservationResponse,
     ProvisionResultRequest,
     ProvisionResultResponse,
+    PurposeCategoriesResponse,
+    PurposeCategoryUpdate,
     ReservationCreate,
     ReservationInternalStatus,
     ReservationResponse,
@@ -47,6 +49,7 @@ from app.services.reservation_service import (
     list_calendar_reservations,
     list_user_reservations,
     release_reservation,
+    set_purpose_category,
     stage_wiring_changed,
     update_reservation,
 )
@@ -198,7 +201,9 @@ async def get_utilization_report_csv(
     request: Request,
     start: datetime = Query(...),
     end: datetime = Query(...),
-    section: str = Query("user", pattern="^(user|device|fleet)$"),
+    section: str = Query(
+        "user", pattern="^(user|device|fleet|purpose|user_purpose|device_purpose)$"
+    ),
     status: list[ReservationStatus] | None = Query(None),
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
@@ -231,6 +236,18 @@ async def get_utilization_report_csv(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/purpose-categories", response_model=PurposeCategoriesResponse)
+async def get_purpose_categories(
+    _payload: dict = Depends(get_current_user_payload),
+):
+    """The configured lab purpose taxonomy, in order (issue #646 phase 1).
+
+    Any authenticated user; registered ahead of GET /{reservation_id} so
+    "purpose-categories" is never swallowed by that path parameter.
+    """
+    return PurposeCategoriesResponse(categories=list(settings.purpose_categories))
 
 
 @router.get("/internal/active", response_model=OwnsActiveResponse)
@@ -559,6 +576,36 @@ async def release_reservation_early(
     )
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
+    return reservation
+
+
+@router.patch("/{reservation_id}/purpose-category", response_model=ReservationResponse)
+async def set_reservation_purpose_category(
+    reservation_id: uuid.UUID,
+    body: PurposeCategoryUpdate,
+    db: AsyncSession = Depends(get_db),
+    payload: dict = Depends(get_current_user_payload),
+):
+    """Set or clear a reservation's lab purpose classification (issue #646 phase 1).
+
+    Owner or admin, allowed in any status including terminal. A null body
+    clears the classification and its set_by/set_at together.
+    """
+    user_id = uuid.UUID(payload["sub"])
+    role = payload.get("role", "user")
+    try:
+        reservation, forbidden = await set_purpose_category(
+            db, reservation_id, user_id, role, body.purpose_category
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if forbidden:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the reservation owner or an admin may set its purpose category",
+        )
     return reservation
 
 

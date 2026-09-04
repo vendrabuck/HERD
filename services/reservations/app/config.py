@@ -1,4 +1,8 @@
+from typing import Annotated
+
 from herd_common.base_settings import HerdBaseSettings
+from pydantic import field_validator
+from pydantic_settings import NoDecode
 
 
 class Settings(HerdBaseSettings):
@@ -63,7 +67,31 @@ class Settings(HerdBaseSettings):
     # with 422 rather than silently loading everything. 0 disables the cap.
     utilization_max_span_days: int = 366
 
+    # Lab purpose classification (issue #646 phase 1). The taxonomy is a plain
+    # string list validated at write time, not a Postgres enum and not a
+    # categories table (decision recorded for ADR 0013): a row keeps whatever
+    # value it was written with even if that value is later dropped from this
+    # list. PURPOSE_CATEGORIES overrides the whole list as a comma-separated
+    # string; NoDecode stops pydantic-settings from trying to JSON-decode the
+    # env value before the validator below can split it.
+    purpose_categories: Annotated[list[str], NoDecode] = [
+        "qa_regression",
+        "support_case_replication",
+        "feature_development",
+        "customer_demo_poc",
+        "training",
+        "performance_benchmark",
+        "other",
+    ]
+
     log_level: str = "INFO"
+
+    @field_validator("purpose_categories", mode="before")
+    @classmethod
+    def _split_purpose_categories(cls, v: object) -> object:
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
 
 
 settings = Settings()
