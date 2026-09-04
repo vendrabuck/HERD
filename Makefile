@@ -609,6 +609,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_ldap_sync_service_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_advisory_lock_live_pg.py -v) && \
+	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_outbox_wake_live_pg.py -v) && \
 	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_fork_restore_save_race_live_pg.py -v)
 

@@ -90,7 +90,7 @@ async def _run_reminder_cycle() -> None:
         # eager-loaded devices are still attached here, so the payload is built
         # before the commit.
         for res in due:
-            enqueue_event(
+            await enqueue_event(
                 db,
                 OutboxEvent,
                 EXPIRING_SOON_SUBJECT,
@@ -192,7 +192,7 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
             # reservation.created follow in the callback path. Publishing after
             # the flip (not at the claim) keeps the retry-next-tick revert
             # above from orphaning instances against a PENDING reservation.
-            enqueue_event(
+            await enqueue_event(
                 db, OutboxEvent, PROVISION_REQUESTED_SUBJECT, _provision_requested_event(res)
             )
             await db.commit()
@@ -206,7 +206,7 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
             )
             return True
         res.status = ReservationStatus.ACTIVE
-        enqueue_event(db, OutboxEvent, CREATED_SUBJECT, _reservation_created_event(res))
+        await enqueue_event(db, OutboxEvent, CREATED_SUBJECT, _reservation_created_event(res))
         await db.commit()
 
     # Editable per-reservation fork (best-effort, never raises), mirroring
@@ -289,7 +289,7 @@ async def _run_expiration_cycle() -> None:
             # ADR 0013 point 8): marks the row eligible for background purpose
             # classification.
             stamp_purpose_classify_requested(res)
-            enqueue_event(
+            await enqueue_event(
                 db,
                 OutboxEvent,
                 COMPLETED_SUBJECT,
@@ -348,7 +348,7 @@ async def _run_expiration_cycle() -> None:
                 # in-memory status sync, but this column is untouched by it, so
                 # setting it here on `res` and committing below is safe.
                 stamp_purpose_classify_requested(res)
-                enqueue_event(db, OutboxEvent, FAILED_SUBJECT, _reservation_failed_event(res))
+                await enqueue_event(db, OutboxEvent, FAILED_SUBJECT, _reservation_failed_event(res))
                 logger.error(
                     "Provisioning timed out for reservation %s; failing it",
                     res.id,

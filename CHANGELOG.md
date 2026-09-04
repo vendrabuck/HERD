@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Changed the transactional outbox relay to wake on write instead of only
+  polling a fixed tick (issue #682): `enqueue_event` now issues
+  `SELECT pg_notify(channel, '')` on the committing session (a no-op on
+  SQLite), on a per-service-schema channel named `herd_outbox_<schema>`
+  (`herd_outbox_reservations`, `herd_outbox_execution`); `run_outbox_relay`
+  (started by both the reservations and execution services, the only two
+  outbox producers) starts a supervised Postgres LISTEN task and drains
+  immediately on a notification instead of waiting out the rest of the
+  tick, live-measured at low single-digit milliseconds from commit to
+  publish. The tick remains the fallback cadence, unchanged outage
+  backoff: a missed notification, a not-yet-reconnected listener, or any
+  non-Postgres dialect still drains on the next tick exactly as before.
+  New `OUTBOX_WAKE_ON_WRITE` setting (default true, both services) is the
+  ops escape hatch back to tick-only behavior; execution also gains the
+  three existing outbox tick/batch/retention overrides reservations
+  already had, closing the gap where execution exposed none of them.
 - Added AI-proposed network elements (issue #632): the topology generator's
   `propose_topology` tool gains an optional `elements` array (role,
   `element_type` from the ADR 0012 vocabulary, label, and an allowlisted

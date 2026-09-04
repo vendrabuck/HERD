@@ -263,6 +263,12 @@ async def test_outbox_survives_nats_outage(user_client, visible_fresh_device, na
         # 5. The relay drains the buffered row (5s default tick) and the consumer
         #    creates the notification. Generous timeout for relay tick plus
         #    consumer catch-up. Delivered exactly once (not lost, not duplicated).
+        #    Note (issue #682): the row was staged BEFORE this NATS outage began,
+        #    so its pg_notify already fired (and was consumed, or missed while
+        #    disconnected) long before we brought NATS back up here; the relay is
+        #    in outage backoff throughout this wait, which always sleeps rather
+        #    than waiting on a wake, so the tick (not a wake) is what drains it.
+        #    The generous timeout stays as-is.
         items = await _poll_for_notification(user_client, reservation_id, timeout=60.0)
         assert items, (
             "the buffered reservation.created event was never delivered after NATS "

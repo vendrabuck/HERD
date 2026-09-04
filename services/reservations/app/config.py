@@ -30,6 +30,11 @@ class Settings(HerdBaseSettings):
     outbox_relay_tick_seconds: float = 5.0
     outbox_batch_size: int = 100
     outbox_retention_seconds: float = 7 * 24 * 3600
+    # Issue #682: wake the relay on a committed write (Postgres LISTEN/NOTIFY)
+    # instead of waiting out the rest of the tick. True by default; the tick
+    # stays the fallback cadence regardless. False is the ops escape hatch
+    # back to tick-only behavior.
+    outbox_wake_on_write: bool = True
     # ROADMAP #40: lead window before end_time in which the expiration task
     # emits a reservation.expiring_soon reminder onto HERD_RESERVATIONS. An
     # ACTIVE reservation whose end_time is within this many seconds of now (and

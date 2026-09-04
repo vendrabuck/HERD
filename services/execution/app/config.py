@@ -125,6 +125,18 @@ class Settings(HerdBaseSettings):
     wiring_retry_batch_size: int = 20
     wiring_retry_max_attempts: int = 10
 
+    # Transactional outbox relay (issue #21). The relay drains unpublished outbox
+    # rows to JetStream every tick and prunes published rows past the retention
+    # window. Defaults match herd_common.outbox.run_outbox_relay. Issue #682 adds
+    # outbox_wake_on_write: wake the relay on a committed write (Postgres
+    # LISTEN/NOTIFY) instead of waiting out the rest of the tick; the tick stays
+    # the fallback cadence regardless, and False is the ops escape hatch back to
+    # tick-only behavior.
+    outbox_relay_tick_seconds: float = 5.0
+    outbox_batch_size: int = 100
+    outbox_retention_seconds: float = 7 * 24 * 3600
+    outbox_wake_on_write: bool = True
+
     log_level: str = "INFO"
 
 
