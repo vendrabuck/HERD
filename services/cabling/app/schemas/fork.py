@@ -4,7 +4,7 @@ from typing import Any
 
 from app.schemas._types import OptionalUUIDStr, UUIDStr, UUIDStrList
 from app.schemas.topology import InvalidEdge
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ForkCreate(BaseModel):
@@ -230,3 +230,27 @@ class ActiveForkListResponse(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class ForkDevicesBatchRequest(BaseModel):
+    """Body for POST /internal/forks/devices/batch (issue #646 phase 3).
+
+    1 to 500 reservation ids, mirroring ConnectionBulkCreate's cap idiom
+    (services/cabling/app/schemas/connection.py).
+    """
+
+    reservation_ids: UUIDStrList = Field(min_length=1, max_length=500)
+
+
+class ForkDevicesBatchResponse(BaseModel):
+    """POST .../devices/batch result: sorted distinct device ids per reservation.
+
+    Keyed by reservation_id (as a string, since a JSON object key cannot be a
+    UUID); a reservation with no fork row is absent from the map rather than
+    mapped to an empty list, so the caller can tell "no path data" from "a path
+    that touched zero devices" (which cannot happen, since a fork_connections row
+    always has two device ids). Both ACTIVE and ARCHIVED forks are included: a
+    terminal reservation's transit gear is still real history for reporting.
+    """
+
+    devices: dict[str, UUIDStrList] = Field(default_factory=dict)

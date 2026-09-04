@@ -30,6 +30,7 @@ from app.schemas.reservation import (
     UtilizationReport,
 )
 from app.services.reporting_service import (
+    TransitGearUnavailable,
     build_utilization_report,
     fetch_execution_run_count,
     fetch_fleet_devices,
@@ -168,6 +169,15 @@ async def get_utilization_report(
     start: datetime = Query(...),
     end: datetime = Query(...),
     status: list[ReservationStatus] | None = Query(None),
+    include_transit: bool = Query(
+        True,
+        description=(
+            "Fold transit gear (switches/routers on a reservation's fork "
+            "wiring paths, not just its reserved devices) into by_device and "
+            "by_device_purpose. False skips the cabling call entirely and "
+            "reproduces phase-1, reserved-devices-only semantics."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
@@ -186,9 +196,12 @@ async def get_utilization_report(
             status_filter,
             fleet_status_filter=fleet_filter,
             fleet_devices=fleet_devices,
+            include_transit=include_transit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except TransitGearUnavailable:
+        raise HTTPException(status_code=503, detail={"error": "transit_gear_unavailable"})
     report.execution_run_count = await fetch_execution_run_count(start, end, auth_header)
     user_ids = [b.user_id for b in report.by_user]
     user_groups = await fetch_user_groups_map(user_ids, auth_header)
@@ -206,6 +219,7 @@ async def get_utilization_report_csv(
         pattern="^(user|device|fleet|purpose|user_purpose|device_purpose|purpose_suggested)$",
     ),
     status: list[ReservationStatus] | None = Query(None),
+    include_transit: bool = Query(True),
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
@@ -227,9 +241,12 @@ async def get_utilization_report_csv(
             status_filter,
             fleet_status_filter=fleet_filter,
             fleet_devices=fleet_devices,
+            include_transit=include_transit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except TransitGearUnavailable:
+        raise HTTPException(status_code=503, detail={"error": "transit_gear_unavailable"})
     body = report_to_csv(report, section)
     filename = f"utilization-{section}-{start.date().isoformat()}-to-{end.date().isoformat()}.csv"
     return Response(

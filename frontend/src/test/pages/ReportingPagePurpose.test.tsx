@@ -236,3 +236,102 @@ describe("ReportingPage Purpose section, AI-suggested bucket", () => {
     expect(screen.queryByText("Device-hours by purpose")).not.toBeInTheDocument();
   });
 });
+
+// Transit-gear inheritance in the by-device purpose mix (issue #646 phase 3,
+// ADR 0013 "Delivery phases" point 3). dev-1 is transit-only (transit_device_hours
+// equals device_hours); dev-2 is mixed (some reserved, some transit).
+describe("ReportingPage Purpose section, transit-gear inheritance", () => {
+  const REPORT_WITH_TRANSIT = {
+    ...REPORT_WITH_PURPOSE,
+    transit_included: true,
+    by_device_purpose: [
+      {
+        device_id: "dev-1",
+        purpose_category: "qa_regression",
+        reservations: 3,
+        device_hours: 12.0,
+        transit_reservations: 3,
+        transit_device_hours: 12.0,
+      },
+      {
+        device_id: "dev-2",
+        purpose_category: "unclassified",
+        reservations: 4,
+        device_hours: 20.0,
+        transit_reservations: 1,
+        transit_device_hours: 5.0,
+      },
+    ],
+  };
+
+  it("shows the Transit column, the mixed-row percentage, and the transit-only tag", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT_WITH_TRANSIT),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const deviceMixHeading = await screen.findByText("Purpose Mix - By Device");
+    const deviceMixCard = deviceMixHeading.closest("div")?.parentElement as HTMLElement;
+
+    await waitFor(() => expect(within(deviceMixCard).getByText("fw-edge-01")).toBeInTheDocument());
+    expect(within(deviceMixCard).getByText("Transit")).toBeInTheDocument();
+
+    // dev-1 (fw-edge-01): transit-only, transit_device_hours == device_hours,
+    // so it carries the "transit" tag; Hours (12.0) and the Transit column's
+    // hours (also 12.0) both render on this row, alongside the 100% share.
+    const dev1Row = within(deviceMixCard).getByText("fw-edge-01").closest("tr") as HTMLElement;
+    expect(within(dev1Row).getByText("transit")).toBeInTheDocument();
+    expect(within(dev1Row).getAllByText("12.0")).toHaveLength(2);
+    expect(within(dev1Row).getByText("(100%)")).toBeInTheDocument();
+
+    // dev-2 (fw-edge-02): mixed, 5 of 20 hours transit = 25%.
+    const dev2Row = within(deviceMixCard).getByText("fw-edge-02").closest("tr") as HTMLElement;
+    expect(within(dev2Row).queryByText("transit")).not.toBeInTheDocument();
+    expect(within(dev2Row).getByText("(25%)")).toBeInTheDocument();
+
+    // Helper text when transit_included is true.
+    expect(
+      within(deviceMixCard).getByText("Includes transit gear on the reservation's paths"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the reserved-devices-only helper text when transit_included is false", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json({ ...REPORT_WITH_TRANSIT, transit_included: false }),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const deviceMixHeading = await screen.findByText("Purpose Mix - By Device");
+    const deviceMixCard = deviceMixHeading.closest("div")?.parentElement as HTMLElement;
+    await waitFor(() => expect(within(deviceMixCard).getByText("fw-edge-01")).toBeInTheDocument());
+    expect(within(deviceMixCard).getByText("Reserved devices only")).toBeInTheDocument();
+  });
+
+  it("renders cleanly, with no crash and no NaN, when a backend predates the transit fields", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT_WITH_PURPOSE),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const deviceMixHeading = await screen.findByText("Purpose Mix - By Device");
+    const deviceMixCard = deviceMixHeading.closest("div")?.parentElement as HTMLElement;
+    await waitFor(() => expect(within(deviceMixCard).getByText("fw-edge-01")).toBeInTheDocument());
+
+    // The Transit column still renders (showTransitColumn is unconditional on
+    // the by-device table) but every cell reads 0.0, with no percentage, no
+    // tag, and no helper line since transit_included is absent.
+    expect(within(deviceMixCard).getAllByText("0.0").length).toBeGreaterThan(0);
+    expect(deviceMixCard.textContent).not.toMatch(/NaN/);
+    expect(within(deviceMixCard).queryByText("transit")).not.toBeInTheDocument();
+    expect(
+      within(deviceMixCard).queryByText("Includes transit gear on the reservation's paths"),
+    ).not.toBeInTheDocument();
+    expect(within(deviceMixCard).queryByText("Reserved devices only")).not.toBeInTheDocument();
+  });
+});

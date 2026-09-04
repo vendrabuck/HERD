@@ -333,7 +333,7 @@ def test_report_to_csv_user_section_header_only_when_empty():
 def test_report_to_csv_device_section_header_only_when_empty():
     csv_text = report_to_csv(_empty_report(), "device")
     lines = csv_text.strip().splitlines()
-    assert lines == ["device_id,hours,reservation_count"]
+    assert lines == ["device_id,hours,reservation_count,transit_reservations,transit_hours"]
 
 
 def test_report_to_csv_decimal_formatting_four_places():

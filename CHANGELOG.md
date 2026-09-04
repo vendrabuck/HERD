@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- Added lab purpose classification, phase 3 (issue #646): device-level
+  utilization reporting now inherits transit gear from cabling's fork
+  wiring. Cabling gains `POST /internal/forks/devices/batch`
+  (X-Internal-Token, 1 to 500 reservation ids) returning, per reservation
+  with a fork (ACTIVE or ARCHIVED), the sorted distinct device ids across
+  its `fork_connections` rows. Reservations' utilization report calls it in
+  chunks of 500 and folds each reservation's fork-connected devices minus
+  its own reserved `device_ids` into `by_device` and `by_device_purpose`: a
+  transit device inherits the reservation's confirmed category (or
+  `unclassified`) exactly as a reserved device does, and a device both
+  reserved and on a path counts once, as reserved. `reservation_count`/
+  `hours` and `reservations`/`device_hours` are now INCLUSIVE of transit
+  gear; both buckets gain `transit_reservations` and a transit-hours field
+  (`transit_hours` on `DeviceBucket`, `transit_device_hours` on
+  `DevicePurposeBucket`) reporting the transit share alone. A new
+  `include_transit` query parameter (default true) on both
+  `GET /reports/utilization` and its CSV twin skips the cabling call
+  entirely when false, reproducing phase-1 semantics; `UtilizationReport`
+  gains `transit_included` echoing the effective value. Cabling being
+  unreachable, or returning a non-200, fails CLOSED with 503
+  `{"error": "transit_gear_unavailable"}` on both routes rather than
+  silently reporting zero transit devices. The `device`/`device_purpose`
+  CSV sections gain trailing `transit_reservations`/transit-hours columns.
+  The reporting page's by-device Purpose Mix table gains a Transit column
+  (hours plus a percentage for a mixed row, a small tag for a transit-only
+  row) and a helper line naming which semantics are in effect.
+
 - Changed the transactional outbox relay to wake on write instead of only
   polling a fixed tick (issue #682): `enqueue_event` now issues
   `SELECT pg_notify(channel, '')` on the committing session (a no-op on

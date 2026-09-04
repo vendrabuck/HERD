@@ -13,6 +13,8 @@ than here, because importing a fixture out of conftest.py into a test module is 
 pytest anti-pattern; fixtures stay here where pytest's own discovery finds them.
 """
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload
@@ -31,6 +33,31 @@ async def setup_db():
     yield
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.fixture(autouse=True)
+def _no_transit_gear_by_default():
+    """Stub cabling's transit-gear lookup for every test in this directory.
+
+    Issue #646 phase 3: build_utilization_report defaults include_transit=True
+    and, when the window has an in_legacy reservation, calls cabling's
+    /internal/forks/devices/batch. This sandbox has no reachable cabling
+    service, so without this fixture every router-level utilization test that
+    seeds an in-window reservation would 503 (transit_gear_unavailable)
+    instead of exercising its own assertions, and every direct
+    build_utilization_report call in test_reporting_service.py /
+    test_fleet_report.py / test_reporting_edges.py would hit the network.
+    Directory-scoped and autouse, matching setup_db above; the small number of
+    tests that specifically cover transit-gear behavior patch
+    app.services.reporting_service._fetch_transit_devices (or the lower-level
+    _cabling_fork_devices_batch, for the chunking and failure-mode cases)
+    inside their own body, which overrides this mock for their duration.
+    """
+    with patch(
+        "app.services.reporting_service._fetch_transit_devices",
+        new=AsyncMock(return_value={}),
+    ):
+        yield
 
 
 @pytest.fixture

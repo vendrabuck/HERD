@@ -217,7 +217,10 @@ export function ReportingPage() {
                   category: r.purpose_category,
                   hours: r.device_hours,
                   count: r.reservations,
+                  transitHours: r.transit_device_hours,
                 }))}
+                showTransitColumn
+                transitIncluded={report.data.transit_included}
               />
             </div>
           </div>
@@ -899,20 +902,33 @@ interface PurposeMixRow {
   category: string;
   hours: number;
   count: number;
+  // Transit-gear inheritance (issue #646 phase 3): the row's transit share of
+  // `hours`. Undefined when the caller has no transit data for this row
+  // (the per-user mix, or a backend build that predates phase 3); the
+  // Transit column and its percentage/tag only render when at least one
+  // visible row carries this field.
+  transitHours?: number;
 }
 
 // Flat (entity, category) rows sorted by device-hours descending, top 10 by
 // default with a "show all" toggle (issue #646 phase 1). Used for both the
 // per-user and per-device purpose mix; the two differ only in title, column
-// header, and which id-to-name lookup the caller resolved the rows with.
+// header, which id-to-name lookup the caller resolved the rows with, and
+// (per-device only) the transit-gear column/footer added in phase 3.
 function PurposeMixTable({
   title,
   entityHeader,
   rows,
+  showTransitColumn = false,
+  transitIncluded,
 }: {
   title: string;
   entityHeader: string;
   rows: PurposeMixRow[];
+  showTransitColumn?: boolean;
+  // Echoes UtilizationReport.transit_included; undefined (a backend build
+  // that predates phase 3) renders no footer line at all.
+  transitIncluded?: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
   const sorted = useMemo(() => [...rows].sort((a, b) => b.hours - a.hours), [rows]);
@@ -940,22 +956,53 @@ function PurposeMixTable({
             <th className="px-4 py-3">Category</th>
             <th className="px-4 py-3 text-right">Hours</th>
             <th className="px-4 py-3 text-right">Count</th>
+            {showTransitColumn && <th className="px-4 py-3 text-right">Transit</th>}
           </tr>
         </thead>
         <tbody className="divide-y divide-gray-100">
-          {visible.map((r) => (
-            <tr key={r.key} className="hover:bg-gray-50">
-              <td className="px-4 py-2 font-medium text-gray-900">{r.entityLabel}</td>
-              <td className="px-4 py-2">
-                <PurposeCategoryTag category={r.category} />
-              </td>
-              <td className="px-4 py-2 text-right tabular-nums">{formatHours(r.hours)}</td>
-              <td className="px-4 py-2 text-right tabular-nums">{r.count}</td>
-            </tr>
-          ))}
-          {sorted.length === 0 && <EmptyRow colSpan={4} />}
+          {visible.map((r) => {
+            const transitHours = r.transitHours ?? 0;
+            const isTransitOnly = showTransitColumn && r.hours > 0 && transitHours === r.hours;
+            const transitPct =
+              showTransitColumn && transitHours > 0 && r.hours > 0
+                ? Math.round((transitHours / r.hours) * 100)
+                : null;
+            return (
+              <tr key={r.key} className="hover:bg-gray-50">
+                <td className="px-4 py-2 font-medium text-gray-900">
+                  {r.entityLabel}
+                  {isTransitOnly && (
+                    <span className="ml-2 inline-block align-middle text-[10px] uppercase tracking-wide text-purple-600 bg-purple-50 border border-purple-200 rounded px-1.5 py-0.5">
+                      transit
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-2">
+                  <PurposeCategoryTag category={r.category} />
+                </td>
+                <td className="px-4 py-2 text-right tabular-nums">{formatHours(r.hours)}</td>
+                <td className="px-4 py-2 text-right tabular-nums">{r.count}</td>
+                {showTransitColumn && (
+                  <td className="px-4 py-2 text-right tabular-nums">
+                    {formatHours(transitHours)}
+                    {transitPct !== null && (
+                      <span className="ml-1 text-gray-400">({transitPct}%)</span>
+                    )}
+                  </td>
+                )}
+              </tr>
+            );
+          })}
+          {sorted.length === 0 && <EmptyRow colSpan={showTransitColumn ? 5 : 4} />}
         </tbody>
       </table>
+      {showTransitColumn && transitIncluded !== undefined && (
+        <p className="px-4 py-2 text-xs text-gray-500 border-t border-gray-100">
+          {transitIncluded
+            ? "Includes transit gear on the reservation's paths"
+            : "Reserved devices only"}
+        </p>
+      )}
     </TableCard>
   );
 }
