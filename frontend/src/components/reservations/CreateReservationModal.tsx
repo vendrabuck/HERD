@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import toast from "react-hot-toast";
 import { useCreateReservation, usePurposeCategories } from "@/api/reservations";
 import { useTemplates } from "@/api/templates";
+import { useAIStatus } from "@/api/ai";
+import { usePurposeSuggestion } from "@/hooks/usePurposeSuggestion";
 import { Modal } from "@/components/ui/Modal";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import type { DynamicRequestSpec } from "@/types/reservation.types";
@@ -45,6 +47,9 @@ export function CreateReservationModal({
   // "" is the "Unclassified" sentinel (a <select> value can't be null); it
   // maps to purpose_category: null on submit.
   const [purposeCategory, setPurposeCategory] = useState("");
+  // Once the user picks a value by hand, an AI suggestion never overwrites
+  // it again, even a fresher one (issue #646 phase 2, ADR 0013 point 8).
+  const [categoryTouchedByUser, setCategoryTouchedByUser] = useState(false);
   const [dynamicEntries, setDynamicEntries] = useState<DynamicEntry[]>(() =>
     (initialDynamicEntries ?? []).map((entry) => ({
       templateId: entry.templateId,
@@ -59,6 +64,35 @@ export function CreateReservationModal({
   // select just stays disabled at its "Unclassified" default (issue #646).
   const purposeCategories = usePurposeCategories();
   const categoryOptions = purposeCategories.data?.categories ?? [];
+
+  const { data: aiStatus } = useAIStatus();
+  const purposeClassificationEnabled = !!aiStatus?.purpose_classification;
+  const { suggestion, failed: suggestionFailed } = usePurposeSuggestion({
+    enabled: open && purposeClassificationEnabled,
+    categories: categoryOptions,
+    purpose,
+    topologyId,
+    deviceIds,
+    dynamicEntries,
+  });
+
+  // Prefill the still-untouched select from a fresh suggestion (issue #646
+  // phase 2, point 8): fires again on a later, different suggestion as long
+  // as the user has not manually changed the select in between.
+  useEffect(() => {
+    if (!suggestion || categoryTouchedByUser) return;
+    // Intentional state sync: prefilling the select from an external
+    // suggestion value, not a derived-from-props render calculation.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPurposeCategory(suggestion.top_category);
+  }, [suggestion, categoryTouchedByUser]);
+
+  const handlePurposeCategorySelect = (value: string) => {
+    setPurposeCategory(value);
+    setCategoryTouchedByUser(true);
+  };
+
+  const topSuggestions = suggestion?.distribution.slice(0, 3) ?? [];
 
   const totalDynamic = dynamicEntries.reduce((sum, e) => sum + e.count, 0);
   const overCap = totalDynamic > MAX_DYNAMIC_REQUESTS;
@@ -244,7 +278,7 @@ export function CreateReservationModal({
             id="res-purpose-category"
             value={purposeCategory}
             disabled={purposeCategories.isLoading || purposeCategories.isError}
-            onChange={(e) => setPurposeCategory(e.target.value)}
+            onChange={(e) => handlePurposeCategorySelect(e.target.value)}
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
           >
             <option value="">Unclassified</option>
@@ -254,6 +288,32 @@ export function CreateReservationModal({
               </option>
             ))}
           </select>
+          {purposeClassificationEnabled && (
+            <div className="mt-1.5">
+              {suggestion ? (
+                <div className="flex flex-wrap items-center gap-1.5" title={suggestion.rationale}>
+                  <span className="text-xs text-gray-500">
+                    Suggested: {purposeCategoryLabel(suggestion.top_category)}{" "}
+                    {Math.round((suggestion.distribution[0]?.probability ?? 0) * 100)}%
+                  </span>
+                  {topSuggestions.map((d, i) => (
+                    <span
+                      key={d.category}
+                      className={`text-xs px-1.5 py-0.5 rounded ${
+                        i === 0 ? "bg-blue-100 text-blue-800 font-medium" : "bg-blue-50 text-blue-700"
+                      }`}
+                    >
+                      {purposeCategoryLabel(d.category)} {Math.round(d.probability * 100)}%
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                suggestionFailed && (
+                  <span className="text-xs text-gray-400">Suggestion unavailable</span>
+                )
+              )}
+            </div>
+          )}
         </div>
 
         <div className="flex justify-end gap-3 pt-2">

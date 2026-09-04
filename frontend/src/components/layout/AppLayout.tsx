@@ -181,6 +181,19 @@ export function AppLayout() {
                       LDAP Sync
                     </NavLink>
                     <NavLink
+                      to="/admin/purpose-review"
+                      onClick={() => setAdminOpen(false)}
+                      className={({ isActive }) =>
+                        `block px-4 py-2 text-sm transition-colors ${
+                          isActive
+                            ? "bg-gray-700 text-white"
+                            : "text-gray-300 hover:text-white hover:bg-gray-700"
+                        }`
+                      }
+                    >
+                      Purpose Review
+                    </NavLink>
+                    <NavLink
                       to="/admin/users"
                       onClick={() => setAdminOpen(false)}
                       className={({ isActive }) =>
