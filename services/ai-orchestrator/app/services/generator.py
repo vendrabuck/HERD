@@ -127,7 +127,9 @@ def _repair_feedback(error_message: str, template_names: list[str]) -> str:
         f"{error_message}\n"
         f"Use ONLY these template_name values, spelled exactly: {allowed}. "
         "Do not exceed the available count for any template, keep role names "
-        "unique, and ensure every edge references a device role you defined."
+        "unique across devices and elements, ensure every edge references a "
+        "device or element role you defined, and never connect two elements "
+        "directly to each other."
     )
 
 
@@ -152,20 +154,33 @@ def _validate_against_inventory(response: GenerateResponse, inventory: Inventory
             f"AI proposed more devices than are available: {over}",
         )
 
-    roles = [d.role for d in response.devices]
-    dup_roles = [r for r, c in Counter(roles).items() if c > 1]
+    # Roles are unique across devices AND elements (D1): a device and an
+    # element sharing a role name is just as ambiguous to the committer's
+    # role_to_node_id map as two devices sharing one.
+    device_roles = [d.role for d in response.devices]
+    element_roles = [e.role for e in response.elements]
+    dup_roles = [r for r, c in Counter(device_roles + element_roles).items() if c > 1]
     if dup_roles:
         raise GeneratorError(
             502,
             f"AI returned duplicate role names: {sorted(dup_roles)}",
         )
 
-    role_set = set(roles)
+    device_role_set = set(device_roles)
+    element_role_set = set(element_roles)
+    role_set = device_role_set | element_role_set
     for edge in response.edges:
         if edge.source_role not in role_set or edge.target_role not in role_set:
             raise GeneratorError(
                 502,
                 f"Edge references unknown role: {edge.source_role} -> {edge.target_role}",
+            )
+        if edge.source_role in element_role_set and edge.target_role in element_role_set:
+            raise GeneratorError(
+                502,
+                "AI proposed an element_to_element edge, which is not allowed: "
+                f"{edge.source_role} -> {edge.target_role}. Attach each element to a "
+                "device instead.",
             )
 
 

@@ -64,6 +64,20 @@ const PROPOSAL: AIGenerateResponse = {
     },
   ],
   edges: [],
+  elements: [],
+};
+
+const PROPOSAL_WITH_ELEMENT: AIGenerateResponse = {
+  ...PROPOSAL,
+  edges: [{ source_role: "fw1", target_role: "mgmt-seg", layer: "L2" }],
+  elements: [
+    {
+      role: "mgmt-seg",
+      element_type: "vlan_segment",
+      label: "Mgmt VLAN",
+      attrs: { vlan_id: 100 },
+    },
+  ],
 };
 
 function renderDialog(
@@ -147,6 +161,34 @@ describe("AICommitDialog", () => {
     expect(toastSuccess).toHaveBeenCalledWith(
       "Topology and reservation created",
     );
+  });
+
+  it("forwards elements and their attachment edges in the commit body", async () => {
+    let capturedBody: unknown;
+    server.use(
+      http.post("/api/ai/commit", async ({ request }) => {
+        capturedBody = await request.json();
+        return HttpResponse.json({
+          topology_id: "t-new",
+          reservation_id: "r-new",
+          config_results: [],
+        });
+      }),
+    );
+    renderDialog(PROPOSAL_WITH_ELEMENT);
+    fireEvent.click(screen.getByRole("button", { name: "Commit" }));
+    await waitFor(() => expect(capturedBody).toBeDefined());
+    expect(capturedBody).toMatchObject({
+      elements: [
+        {
+          role: "mgmt-seg",
+          element_type: "vlan_segment",
+          label: "Mgmt VLAN",
+          attrs: { vlan_id: 100 },
+        },
+      ],
+      edges: [{ source_role: "fw1", target_role: "mgmt-seg", layer: "L2" }],
+    });
   });
 
   it("toasts the backend detail when commit fails", async () => {

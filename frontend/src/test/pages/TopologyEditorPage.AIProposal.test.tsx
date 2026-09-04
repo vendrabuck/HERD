@@ -279,6 +279,126 @@ describe("TopologyEditorPage handleAIProposal node-type safety", () => {
   });
 });
 
+describe("TopologyEditorPage handleAIProposal network elements (issue #632)", () => {
+  it("renders a ghost element node and a device-sourced ghost attachment edge", async () => {
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([]);
+
+    fireAIProposal(
+      proposalResponse({
+        devices: [
+          {
+            role: "leaf1",
+            device: {
+              id: "d-new-1",
+              name: "leaf1-dev",
+              topology_type: "PHYSICAL",
+              status: "AVAILABLE",
+            },
+          },
+        ] as unknown as AIGenerateResponse["devices"],
+        elements: [
+          {
+            role: "mgmt-seg",
+            element_type: "vlan_segment",
+            label: "Mgmt VLAN",
+            attrs: { vlan_id: 100 },
+          },
+        ] as unknown as AIGenerateResponse["elements"],
+        edges: [
+          { source_role: "leaf1", target_role: "mgmt-seg", layer: "L2" },
+        ] as unknown as AIGenerateResponse["edges"],
+      }),
+    );
+
+    await waitFor(() => {
+      const elementNode = useTopologyStore
+        .getState()
+        .nodes.find((n) => n.type === "networkElementNode");
+      expect(elementNode).toBeDefined();
+    });
+
+    const state = useTopologyStore.getState();
+    const deviceGhost = state.nodes.find((n) => n.type === "deviceNode");
+    const elementGhost = state.nodes.find((n) => n.type === "networkElementNode");
+    expect((elementGhost?.data as { isProposal?: boolean }).isProposal).toBe(true);
+    expect(
+      (elementGhost?.data as { element?: Record<string, unknown> }).element,
+    ).toMatchObject({
+      element_type: "vlan_segment",
+      label: "Mgmt VLAN",
+      attrs: { vlan_id: 100 },
+    });
+
+    // The store's addEnrichedEdge direction normalization must land the
+    // device as source and the element as target, exactly like a
+    // user-drawn attachment (ElementAttachDialog); the ghost carries no
+    // port fields (the committer picks the port on accept, D2).
+    const attachmentEdge = state.edges.find((e) => e.target === elementGhost?.id);
+    expect(attachmentEdge).toBeDefined();
+    expect(attachmentEdge?.source).toBe(deviceGhost?.id);
+    const edgeData = attachmentEdge?.data as {
+      isProposal?: boolean;
+      layer?: string;
+      source_port_name?: string;
+    };
+    expect(edgeData?.isProposal).toBe(true);
+    expect(edgeData?.layer).toBe("L2");
+    expect(edgeData?.source_port_name).toBeUndefined();
+  });
+
+  it("does not throw when a proposed element shares its role with a proposed device", async () => {
+    // The backend rejects a duplicate role across a device and an element
+    // (D4), but a hand-crafted or stale response could still reach the
+    // frontend; handleAIProposal must not throw regardless of which node
+    // wins the shared roleToNodeId entry.
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([]);
+
+    expect(() =>
+      fireAIProposal(
+        proposalResponse({
+          devices: [
+            {
+              role: "dup-role",
+              device: {
+                id: "d-new-1",
+                name: "leaf1-dev",
+                topology_type: "PHYSICAL",
+                status: "AVAILABLE",
+              },
+            },
+          ] as unknown as AIGenerateResponse["devices"],
+          elements: [
+            { role: "dup-role", element_type: "vlan_segment", label: "Dup", attrs: {} },
+          ] as unknown as AIGenerateResponse["elements"],
+          edges: [],
+        }),
+      ),
+    ).not.toThrow();
+
+    await waitFor(() => {
+      const nodes = useTopologyStore.getState().nodes;
+      expect(nodes.some((n) => n.type === "deviceNode")).toBe(true);
+      expect(nodes.some((n) => n.type === "networkElementNode")).toBe(true);
+    });
+  });
+
+  it("a device-only proposal (no elements field) renders no element node", async () => {
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([]);
+
+    expect(() => fireAIProposal(proposalResponse())).not.toThrow();
+
+    await waitFor(() => {
+      expect(useTopologyStore.getState().nodes.some((n) => n.type === "deviceNode")).toBe(true);
+    });
+    expect(
+      useTopologyStore.getState().nodes.some((n) => n.type === "networkElementNode"),
+    ).toBe(false);
+  });
+});
+
 describe("TopologyEditorPage proposal accept/modify/reject", () => {
   it("modify accepts the ghost nodes for editing, shows a toast, and clears the proposal bar", async () => {
     server.use(...baseHandlers());

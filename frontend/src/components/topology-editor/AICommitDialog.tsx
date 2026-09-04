@@ -87,6 +87,12 @@ function CommitForm({ proposal, onClose, onCommitted }: FormProps) {
         target_role: edge.target_role,
         layer: edge.layer,
       })),
+      elements: proposal.elements.map((element) => ({
+        role: element.role,
+        element_type: element.element_type,
+        label: element.label,
+        attrs: element.attrs,
+      })),
       apply_configs: applyConfigs,
     };
 

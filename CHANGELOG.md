@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- Added AI-proposed network elements (issue #632): the topology generator's
+  `propose_topology` tool gains an optional `elements` array (role,
+  `element_type` from the ADR 0012 vocabulary, label, and an allowlisted
+  `attrs` object), and the model may attach a device to an element with one
+  edge from the device role to the element role; an element-to-element edge
+  or a role reused across a device and an element is rejected by the
+  existing validate-and-repair loop. The committer, not the model, picks
+  the device-side attachment port on commit, in natural port-name order,
+  skipping ports already claimed by another attachment of the same device
+  in the proposal. `GenerateResponse`/`CommitRequest` gain the matching
+  additive `elements` field; a device-only proposal is unaffected. See
+  `docs/AI_GENERATE.md`.
 - Added lab purpose classification, phase 2 (issue #646): the AI orchestrator
   gains `POST /api/ai/classify-purpose/preview` (user JWT, creation pass) and
   `POST /api/ai/internal/classify-purpose` (X-Internal-Token, end-of-

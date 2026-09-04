@@ -235,7 +235,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   optional PDFs, tarballs, or text files generate topology proposals as ghost
   nodes for human review. Accept transactionally creates the topology and books
   the reservation, with optional per-device config push. Feature-gated by the
-  presence of an AI provider configuration.
+  presence of an AI provider configuration. The model can also propose shared
+  network elements (VLAN segment, subnet, external cloud, patch trunk) and
+  attach devices to them, with the committer choosing the actual device port
+  on commit (issue #632).
 - **Reservation assistant** (Shipped): a multi-turn tool-use loop lets the
   reservation owner ask read-only questions about a running reservation
   (device state, config history, paths, recent executions) and, when
