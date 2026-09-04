@@ -90,7 +90,10 @@ async def test_utilization_report_csv_download(admin_client, fresh_device):
             params={**params, "section": "device"},
         )
         assert device_resp.status_code == 200
-        assert device_resp.text.splitlines()[0] == "device_id,hours,reservation_count"
+        assert (
+            device_resp.text.splitlines()[0]
+            == "device_id,hours,reservation_count,transit_reservations,transit_hours"
+        )
         assert fresh_device["id"] in device_resp.text
     finally:
         await admin_client.delete(f"/reservations/{reservation['id']}")
