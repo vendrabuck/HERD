@@ -20,7 +20,10 @@ import {
   useCreateReservation,
   useCancelReservation,
   useReleaseReservation,
+  usePurposeCategories,
+  useSetPurposeCategory,
 } from "@/api/reservations";
+import { purposeCategoryLabel } from "@/lib/purposeCategories";
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
@@ -177,5 +180,79 @@ describe("cancel / release reservation hooks", () => {
     result.current.mutate(RESV.id);
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(toastError).toHaveBeenCalledWith("Failed to release reservation");
+  });
+});
+
+// --- Lab purpose classification (issue #646 phase 1) ------------------------
+
+describe("purpose category hooks", () => {
+  it("usePurposeCategories fetches the server-configured category list", async () => {
+    const categories = ["qa_regression", "other"];
+    server.use(
+      http.get("/api/reservations/purpose-categories", () =>
+        HttpResponse.json({ categories }),
+      ),
+    );
+    const { result } = renderHook(() => usePurposeCategories(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual({ categories });
+  });
+
+  it("useSetPurposeCategory PATCHes the reservation with the chosen category", async () => {
+    let captured: unknown;
+    let method = "";
+    server.use(
+      http.patch("/api/reservations/:id/purpose-category", async ({ request }) => {
+        method = request.method;
+        captured = await request.json();
+        return HttpResponse.json({ ...RESV, purpose_category: "training" });
+      }),
+    );
+    const { result } = renderHook(() => useSetPurposeCategory(), { wrapper });
+    result.current.mutate({ id: RESV.id, purposeCategory: "training" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(method).toBe("PATCH");
+    expect(captured).toEqual({ purpose_category: "training" });
+  });
+
+  it("useSetPurposeCategory sends null to clear the category", async () => {
+    let captured: unknown;
+    server.use(
+      http.patch("/api/reservations/:id/purpose-category", async ({ request }) => {
+        captured = await request.json();
+        return HttpResponse.json({ ...RESV, purpose_category: null });
+      }),
+    );
+    const { result } = renderHook(() => useSetPurposeCategory(), { wrapper });
+    result.current.mutate({ id: RESV.id, purposeCategory: null });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(captured).toEqual({ purpose_category: null });
+  });
+});
+
+describe("purposeCategoryLabel", () => {
+  it("maps each of the seven shipped defaults to its human label", () => {
+    expect(purposeCategoryLabel("qa_regression")).toBe("QA and regression");
+    expect(purposeCategoryLabel("support_case_replication")).toBe(
+      "Support case replication",
+    );
+    expect(purposeCategoryLabel("feature_development")).toBe("Feature development");
+    expect(purposeCategoryLabel("customer_demo_poc")).toBe("Customer demo or POC");
+    expect(purposeCategoryLabel("training")).toBe("Training");
+    expect(purposeCategoryLabel("performance_benchmark")).toBe("Performance benchmark");
+    expect(purposeCategoryLabel("other")).toBe("Other");
+  });
+
+  it("renders null and the literal 'unclassified' bucket key the same way", () => {
+    expect(purposeCategoryLabel(null)).toBe("Unclassified");
+    expect(purposeCategoryLabel(undefined)).toBe("Unclassified");
+    expect(purposeCategoryLabel("unclassified")).toBe("Unclassified");
+  });
+
+  it("humanizes a category outside the shipped defaults from its snake_case value", () => {
+    // Configurable via the backend's PURPOSE_CATEGORIES override; never hardcoded
+    // here, so an admin-added category still renders as a readable label.
+    expect(purposeCategoryLabel("network_debug")).toBe("Network Debug");
+    expect(purposeCategoryLabel("chaos_testing")).toBe("Chaos Testing");
   });
 });
