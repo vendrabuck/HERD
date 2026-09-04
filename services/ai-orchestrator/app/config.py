@@ -95,6 +95,23 @@ class Settings(HerdBaseSettings):
     # JWTs only, so the token is new here and must match the stack-wide value.
     internal_api_token: str = ""
 
+    # Lab purpose classification (issue #646 phase 2, ADR 0013 points 8-11).
+    # Default off: both classify endpoints 403 with a pinned detail when this
+    # is false, enforced at the route boundary exactly like
+    # ai_recipe_authoring_enabled. The reservations service's end-of-
+    # reservation reconciler treats that 403 as "feature off" and skips the
+    # tick without counting an attempt.
+    ai_purpose_classification_enabled: bool = False
+    # Whether the end-of-reservation pass includes reservation assistant
+    # transcripts as a classifier signal (default true, per the ADR
+    # decision to use them). Privacy note (ADR 0013 point 11): assistant
+    # transcripts are user-authored chat already sent to the configured
+    # provider once; the classifier sends them again, to the same provider,
+    # alongside the reservation's own metadata. A deployment that must not
+    # resend user text sets this false. Never affects the preview pass,
+    # which has no reservation yet and therefore no transcript to send.
+    ai_purpose_include_transcripts: bool = True
+
     inventory_service_url: str = "http://inventory:8000"
     cabling_service_url: str = "http://cabling:8000"
     reservations_service_url: str = "http://reservations:8000"

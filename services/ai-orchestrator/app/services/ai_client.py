@@ -615,6 +615,51 @@ class AIClient:
 
         raise AIError("AI did not return a draft_recipe tool_use block")
 
+    async def classify_purpose(
+        self,
+        *,
+        categories: list[str],
+        signals_block: str,
+    ) -> tuple[dict[str, Any], Usage]:
+        """Force a single classify_purpose tool call; return the parsed dict
+        and token usage (issue #646 phase 2, ADR 0013 points 8-11).
+
+        Mirrors draft_recipe's shape: single forced tool_use, structured
+        output via input_schema, with the enum of allowed categories baked
+        into the tool schema per call (this service is taxonomy-agnostic,
+        so the category list always comes from the caller). Post-processing
+        (dropping unknown categories, normalizing, capping the rationale)
+        lives in app/services/purpose_classifier.py, not here.
+        """
+        from app.services.purpose_classifier import (
+            CLASSIFY_PURPOSE_SYSTEM_PROMPT,
+            build_classify_purpose_tool,
+        )
+
+        resp = await self._call_provider(
+            system=CLASSIFY_PURPOSE_SYSTEM_PROMPT,
+            messages=[Message(role="user", content=[TextBlock(text=signals_block)])],
+            tools=[build_classify_purpose_tool(categories)],
+            tool_choice=ToolChoiceTool(name="classify_purpose"),
+            max_tokens=self._max_tokens,
+            timeout_s=None,
+        )
+
+        for block in resp.content:
+            if isinstance(block, ToolUseBlock) and block.name == "classify_purpose":
+                logger.info(
+                    "ai_purpose_classification",
+                    extra={
+                        "model": resp.raw_model,
+                        "input_tokens": resp.usage.input_tokens,
+                        "output_tokens": resp.usage.output_tokens,
+                        "stop_reason": resp.stop_reason,
+                    },
+                )
+                return dict(block.input), resp.usage
+
+        raise AIError("AI did not return a classify_purpose tool_use block")
+
     async def answer_reservation_question_with_tools(
         self,
         *,
