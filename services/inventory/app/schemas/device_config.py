@@ -110,3 +110,19 @@ class PaginatedApplyJobs(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class ApplyJobsInternalSummary(BaseModel):
+    """Config-apply job summary for one device: names and a count only.
+
+    Feeds the AI orchestrator's purpose classifier (issue #646 phase 2, ADR
+    0013 point 11), which is explicit that config-apply jobs contribute
+    names and counts only, never job contents or configs. `names` is the
+    deduplicated, non-null set of the associated config versions' free-text
+    `description` (a human label the author wrote), never the version's
+    `config` JSON; it is capped so a device with many jobs cannot balloon
+    the response.
+    """
+
+    count: int
+    names: list[str]

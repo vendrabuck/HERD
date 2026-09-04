@@ -12,9 +12,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload
 from app.models.device import Device
@@ -25,9 +27,12 @@ from app.models.template import DeviceTemplate
 from app.schemas.device_config import (
     ApplyJobResponse,
     ApplyJobScheduleRequest,
+    ApplyJobsInternalSummary,
     PaginatedApplyJobs,
 )
 from app.services.manage_guard import _is_admin, _user_can_manage_device
+
+APPLY_JOBS_SUMMARY_NAME_CAP = 20
 
 logger = logging.getLogger(__name__)
 
@@ -281,3 +286,57 @@ async def cancel_apply_job(
         )
     job.status = "cancelled"
     await db.commit()
+
+
+@router.get(
+    "/devices/{device_id}/apply-jobs/internal",
+    response_model=ApplyJobsInternalSummary,
+)
+async def get_apply_jobs_summary_internal(
+    device_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Config-apply job summary for one device. Internal token only.
+
+    Feeds the AI orchestrator's end-of-reservation purpose classifier (issue
+    #646 phase 2): `count` is the total number of apply jobs ever scheduled
+    against the device, `names` is the deduplicated, non-null set of the
+    associated config versions' free-text `description` field, capped at
+    APPLY_JOBS_SUMMARY_NAME_CAP. `description` is a human label the
+    scheduling user wrote, never the version's `config` JSON, so this
+    endpoint cannot leak device configuration contents or credentials by
+    construction; see docs/AI_PURPOSE_CLASSIFICATION.md.
+    """
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+
+    count = (
+        await db.execute(
+            select(func.count())
+            .select_from(DeviceConfigApplyJob)
+            .where(DeviceConfigApplyJob.device_id == device_id)
+        )
+    ).scalar() or 0
+
+    names = (
+        (
+            await db.execute(
+                select(DeviceConfigVersion.description)
+                .join(
+                    DeviceConfigApplyJob,
+                    DeviceConfigApplyJob.version_id == DeviceConfigVersion.id,
+                )
+                .where(
+                    DeviceConfigApplyJob.device_id == device_id,
+                    DeviceConfigVersion.description.is_not(None),
+                )
+                .distinct()
+                .limit(APPLY_JOBS_SUMMARY_NAME_CAP)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return ApplyJobsInternalSummary(count=count, names=[n for n in names if n])
