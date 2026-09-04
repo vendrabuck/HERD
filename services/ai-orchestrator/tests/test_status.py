@@ -85,6 +85,43 @@ async def test_status_enabled_for_openai_compat_with_base_url(async_client, monk
 
 
 @pytest.mark.asyncio
+async def test_status_purpose_classification_true_only_when_flag_and_enabled(
+    async_client, monkeypatch
+):
+    """issue #646 phase 2: purpose_classification is additive and true only
+    when the flag is on AND the provider is configured (enabled)."""
+    monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-ant-real")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+
+    monkeypatch.setattr(config_module.settings, "ai_purpose_classification_enabled", False)
+    async with async_client as client:
+        resp = await client.get("/status")
+        assert resp.json()["purpose_classification"] is False
+
+        monkeypatch.setattr(config_module.settings, "ai_purpose_classification_enabled", True)
+        resp = await client.get("/status")
+        body = resp.json()
+        assert body["enabled"] is True
+        assert body["purpose_classification"] is True
+
+
+@pytest.mark.asyncio
+async def test_status_purpose_classification_false_when_unconfigured_even_with_flag_on(
+    async_client, monkeypatch
+):
+    monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    monkeypatch.setattr(config_module.settings, "ai_purpose_classification_enabled", True)
+    async with async_client as client:
+        resp = await client.get("/status")
+    body = resp.json()
+    assert body["enabled"] is False
+    assert body["purpose_classification"] is False
+
+
+@pytest.mark.asyncio
 async def test_status_disabled_for_unknown_provider(async_client, monkeypatch):
     """An unrecognized ai_provider (typo) reports enabled=false, the same
     unconfigured state get_ai_client degrades to a 503 (issue #245). Proves the
