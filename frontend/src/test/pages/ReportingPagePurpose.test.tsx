@@ -335,3 +335,142 @@ describe("ReportingPage Purpose section, transit-gear inheritance", () => {
     expect(within(deviceMixCard).queryByText("Reserved devices only")).not.toBeInTheDocument();
   });
 });
+
+// CSV export for the purpose sections (issue #696): the backend has served
+// these sections (purpose, user_purpose, device_purpose, purpose_suggested)
+// since #646 phases 1-2; this wires Download CSV buttons to them. Each
+// button's presence is gated on the corresponding field actually being in
+// the report payload, matching the rest of this page's "hide cleanly on an
+// older backend" convention, not on the underlying array being non-empty.
+describe("ReportingPage Purpose section, CSV downloads", () => {
+  const REPORT_WITH_SUGGESTED = {
+    ...REPORT_WITH_PURPOSE,
+    by_purpose_suggested: [
+      { purpose_category: "qa_regression", reservations: 2, device_hours: 6.0 },
+    ],
+  };
+
+  function mockCsvEndpoint(requestedSections: string[]) {
+    server.use(
+      http.get("/api/reservations/reports/utilization.csv", ({ request }) => {
+        const section = new URL(request.url).searchParams.get("section") ?? "";
+        requestedSections.push(section);
+        return new HttpResponse(`section,${section}\n`, {
+          headers: {
+            "content-type": "text/csv",
+            "content-disposition": `attachment; filename="utilization-${section}.csv"`,
+          },
+        });
+      }),
+    );
+  }
+
+  it("renders a Download CSV button on the bar chart and both mix tables when their sections are present", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT_WITH_PURPOSE),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const chartHeading = await screen.findByText("Device-hours by purpose");
+    const chartHeader = chartHeading.closest("div") as HTMLElement;
+    expect(within(chartHeader).getByRole("button", { name: "Download CSV" })).toBeInTheDocument();
+    // by_purpose_suggested is absent from this fixture, so no suggested button.
+    expect(
+      within(chartHeader).queryByRole("button", { name: "Download CSV (suggested)" }),
+    ).not.toBeInTheDocument();
+
+    const userMixHeading = screen.getByText("Purpose Mix - By User");
+    const userMixCard = userMixHeading.closest("div")?.parentElement as HTMLElement;
+    expect(
+      within(userMixCard).getByRole("button", { name: "Download CSV" }),
+    ).toBeInTheDocument();
+
+    const deviceMixHeading = screen.getByText("Purpose Mix - By Device");
+    const deviceMixCard = deviceMixHeading.closest("div")?.parentElement as HTMLElement;
+    await waitFor(() =>
+      expect(
+        within(deviceMixCard).getByRole("button", { name: "Download CSV" }),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("adds the suggested-bucket Download CSV button once by_purpose_suggested is present", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT_WITH_SUGGESTED),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const chartHeading = await screen.findByText("Device-hours by purpose");
+    const chartHeader = chartHeading.closest("div") as HTMLElement;
+    expect(
+      within(chartHeader).getByRole("button", { name: "Download CSV (suggested)" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not render any purpose CSV buttons when by_purpose is absent (older backend)", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () => HttpResponse.json(BASE_REPORT)),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    await screen.findByText("Platform Eng");
+    expect(screen.queryByText("Device-hours by purpose")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Download CSV (suggested)" })).not.toBeInTheDocument();
+  });
+
+  it("clicking each purpose CSV button downloads with that section's own name", async () => {
+    const requestedSections: string[] = [];
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT_WITH_SUGGESTED),
+      ),
+    );
+    mockCsvEndpoint(requestedSections);
+
+    // jsdom has no Blob-URL support; patch the two methods triggerCsvDownload
+    // calls, matching ReportingPage.test.tsx's download test.
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:mock-url");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    renderWithProviders(<ReportingPage />);
+
+    const chartHeading = await screen.findByText("Device-hours by purpose");
+    const chartHeader = chartHeading.closest("div") as HTMLElement;
+    const purposeButton = within(chartHeader).getByRole("button", { name: "Download CSV" });
+    await waitFor(() => expect(purposeButton).toBeEnabled());
+    fireEvent.click(purposeButton);
+    await waitFor(() => expect(requestedSections).toEqual(["purpose"]));
+
+    fireEvent.click(
+      within(chartHeader).getByRole("button", { name: "Download CSV (suggested)" }),
+    );
+    await waitFor(() => expect(requestedSections).toEqual(["purpose", "purpose_suggested"]));
+
+    const userMixHeading = screen.getByText("Purpose Mix - By User");
+    const userMixCard = userMixHeading.closest("div")?.parentElement as HTMLElement;
+    fireEvent.click(within(userMixCard).getByRole("button", { name: "Download CSV" }));
+    await waitFor(() =>
+      expect(requestedSections).toEqual(["purpose", "purpose_suggested", "user_purpose"]),
+    );
+
+    const deviceMixHeading = screen.getByText("Purpose Mix - By Device");
+    const deviceMixCard = deviceMixHeading.closest("div")?.parentElement as HTMLElement;
+    await waitFor(() =>
+      expect(within(deviceMixCard).getByText("fw-edge-01")).toBeInTheDocument(),
+    );
+    fireEvent.click(within(deviceMixCard).getByRole("button", { name: "Download CSV" }));
+    await waitFor(() =>
+      expect(requestedSections).toEqual([
+        "purpose",
+        "purpose_suggested",
+        "user_purpose",
+        "device_purpose",
+      ]),
+    );
+  });
+});

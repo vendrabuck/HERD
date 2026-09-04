@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- Added Download CSV buttons for the four purpose reporting sections (issue
+  #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
+  join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a
+  button on the purpose bar chart (confirmed data), a second button next to
+  it for the AI-suggested bucket (shown only once `by_purpose_suggested` is
+  in the report payload), and one on each purpose mix table (By User, By
+  Device), all calling the existing `downloadUtilizationCsv` with the
+  page's current window. The server has served these sections since #646
+  phases 1-2; only the frontend wiring was missing.
+
 - Added lab purpose classification, phase 3 (issue #646): device-level
   utilization reporting now inherits transit gear from cabling's fork
   wiring. Cabling gains `POST /internal/forks/devices/batch`
