@@ -290,8 +290,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   idle-device view (devices with zero bookings in the window), and fleet-wide
   summary numbers, counting active plus completed reservations by default. A
   Purpose section breaks device-hours down by lab purpose category, by user and
-  category, and by device and category (three additional CSV sections), counting
-  COMPLETED reservations by default like the rest of the report.
+  category, and by device and category (three additional CSV sections). Like the
+  per-user and per-device sections it counts COMPLETED reservations by default,
+  so a live reservation's category appears once the reservation ends; only the
+  fleet section also counts ACTIVE by default.
 - **Notifications and dispatch channels** (Shipped): durable NATS consumers turn
   reservation lifecycle and device-health events into per-user notifications. The
   in-app bell ships alongside opt-in email, chat (Slack-style), and outbound-webhook
