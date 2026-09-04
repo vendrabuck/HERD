@@ -1,12 +1,12 @@
 """Playwright e2e: AdminGuard redirects a non-admin off every guarded route.
 
 Issue #575 item 2. `tests/e2e/test_register_and_roles.py` (Selenium) already
-covers the live redirect for 2 of the 14 AdminGuard-guarded paths
+covers the live redirect for 2 of the 15 AdminGuard-guarded paths
 (`/admin/users`, `/reporting`); `frontend/src/test/routes.test.tsx` pins the
-full 14-path set structurally (route-table membership, no render). This
-module covers the live redirect behavior for the remaining 12 paths in one
+full 15-path set structurally (route-table membership, no render). This
+module covers the live redirect behavior for the remaining 13 paths in one
 Playwright test, logging in once as a seeded non-admin and iterating them,
-since a fresh module-scoped Selenium browser per path would be 12x the
+since a fresh module-scoped Selenium browser per path would be 13x the
 browser-startup cost for the same assertion the existing pattern already
 makes once.
 
@@ -36,7 +36,7 @@ import pytest
 
 from .conftest import HOST_BASE_URL, pw_login
 
-# The 14 AdminGuard-guarded paths pinned in frontend/src/test/routes.test.tsx's
+# The 15 AdminGuard-guarded paths pinned in frontend/src/test/routes.test.tsx's
 # EXPECTED_ADMIN_GUARDED_PATHS, minus the 2 already covered live by the
 # Selenium test_register_and_roles.py (/admin/users, /reporting). The two
 # :id placeholders below stand in for /admin/groups/:id and
@@ -54,6 +54,7 @@ REMAINING_GUARDED_PATHS = [
     "/admin/grants",
     "/admin/hypervisors",
     "/admin/ldap-sync",
+    "/admin/purpose-review",
 ]
 
 
@@ -76,7 +77,7 @@ def _register_non_admin() -> tuple[str, str]:
 
 
 def test_non_admin_redirected_from_remaining_admin_guarded_paths(pw_page):
-    """A role="user" account visiting any of the 12 remaining guarded paths
+    """A role="user" account visiting any of the 13 remaining guarded paths
     lands on /topology, never on the admin path it requested."""
     email, password = _register_non_admin()
     pw_login(pw_page, email, password)
