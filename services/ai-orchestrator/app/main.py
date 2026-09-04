@@ -29,6 +29,7 @@ from app.config import settings, warn_if_anthropic_api_key_unused
 from app.database import Base, engine
 from app.routes.commit import router as commit_router
 from app.routes.generate import router as generate_router
+from app.routes.purpose_classification import router as purpose_classification_router
 from app.routes.quota import router as quota_router
 from app.routes.recipes import router as recipes_router
 from app.routes.reservation_assistant import router as reservation_assistant_router
@@ -93,6 +94,7 @@ app.include_router(template_identity_router)
 app.include_router(quota_router)
 app.include_router(usage_router)
 app.include_router(recipes_router)
+app.include_router(purpose_classification_router)
 
 
 @app.get("/health")
@@ -126,4 +128,11 @@ async def ai_status():
         # material. Always present so the frontend/docs shape is stable.
         "degraded": degraded,
         "reason": reason,
+        # Additive (issue #646 phase 2): conditional-UI signal for the create
+        # modal's AI-suggested purpose preview. True only when the flag is on
+        # AND the provider is configured and not degraded, i.e. exactly
+        # `enabled and ai_purpose_classification_enabled` (a caller checking
+        # only this field never needs to also check `enabled`).
+        "purpose_classification": (configured and not degraded)
+        and settings.ai_purpose_classification_enabled,
     }

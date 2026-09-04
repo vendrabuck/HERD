@@ -45,7 +45,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
    Expected:
 
    ```json
-   {"enabled": true, "provider": "openai_compat", "model": "your-model-identifier", "recipe_authoring": false, "degraded": false, "reason": null}
+   {"enabled": true, "provider": "openai_compat", "model": "your-model-identifier", "recipe_authoring": false, "degraded": false, "reason": null, "purpose_classification": false}
    ```
 
 4. Make a real call to confirm end-to-end wiring. The cheapest one is `suggest-identity`; it is a single round trip and exercises tool-use:
@@ -92,7 +92,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
    Expected:
 
    ```json
-   {"enabled": true, "provider": "anthropic", "model": "claude-sonnet-4-6", "recipe_authoring": false, "degraded": false, "reason": null}
+   {"enabled": true, "provider": "anthropic", "model": "claude-sonnet-4-6", "recipe_authoring": false, "degraded": false, "reason": null, "purpose_classification": false}
    ```
 
 4. Same smoke call (`suggest-identity`).
@@ -104,7 +104,7 @@ To disable AI without removing the configuration, blank the credential for the a
 - Under `anthropic`: set both `AI_API_KEY=` and `AI_BASE_URL=` (empty); either one alone keeps the provider configured and AI enabled.
 - Under `openai_compat`: set `AI_BASE_URL=` (empty).
 
-Recreate `ai-orchestrator` and `config`. `GET /api/ai/status` will then return `{"enabled": false, "provider": "...", "model": "...", "recipe_authoring": ..., "degraded": false, "reason": null}`, the frontend will hide the **Use AI** button, the **AI Assistant** tab, and the **Draft with AI** panel, and the guarded endpoints will return 503.
+Recreate `ai-orchestrator` and `config`. `GET /api/ai/status` will then return `{"enabled": false, "provider": "...", "model": "...", "recipe_authoring": ..., "degraded": false, "reason": null, "purpose_classification": false}`, the frontend will hide the **Use AI** button, the **AI Assistant** tab, and the **Draft with AI** panel, and the guarded endpoints will return 503.
 
 ## Choosing a model
 
