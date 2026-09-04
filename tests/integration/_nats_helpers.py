@@ -86,6 +86,63 @@ async def fetch_reservation_event(
         await nc.close()
 
 
+async def fetch_events_for_reservation(
+    reservation_id: str, subject: str, *, timeout: float = 5.0
+) -> list[dict]:
+    """Return every decoded payload on `subject` (HERD_RESERVATIONS) whose
+    `reservation_id` field matches, in stream order.
+
+    Deterministic alternative to a sleep-then-assert-absence guard: instead of
+    settling for a window and hoping nothing landed yet, this reads the whole
+    history for the subject once the outcome under test is already final, so
+    the count and shape of what happened is asserted directly rather than
+    inferred from timing. The consumer:
+
+    - is EPHEMERAL (no `durable` name passed to `pull_subscribe`), so it never
+      creates, competes with, or advances the services' own durable consumers
+      (execution's, notifications', integration's) and needs no cleanup;
+    - uses `DeliverPolicy.ALL`, so it starts at the stream's first sequence and
+      sees every matching message regardless of when this consumer was created;
+    - filters server-side to `subject` via the `pull_subscribe` subject arg, the
+      same pattern `fetch_reservation_event` above uses;
+    - stops as soon as one `fetch()` call times out (or returns nothing to
+      fetch), treating that as "caught up to the head of the stream", not as an
+      error.
+
+    Only calls `stream_info`, never `add_stream`/`update_stream` (CLAUDE.md's
+    #611 rule: consumers confirm a stream exists, they do not declare it).
+    """
+    nc = await nats.connect(NATS_URL_HOST, connect_timeout=5)
+    try:
+        js = nc.jetstream()
+        # Confirm the stream exists rather than re-declaring it (see publish_raw).
+        await js.stream_info(_RESERVATIONS_STREAM)
+        sub = await js.pull_subscribe(
+            subject,
+            stream=_RESERVATIONS_STREAM,
+            config=nats.js.api.ConsumerConfig(deliver_policy=nats.js.api.DeliverPolicy.ALL),
+        )
+        events: list[dict] = []
+        while True:
+            try:
+                msgs = await sub.fetch(100, timeout=timeout)
+            except (nats.errors.TimeoutError, asyncio.TimeoutError):
+                break
+            if not msgs:
+                break
+            for m in msgs:
+                await m.ack()
+                try:
+                    body = json.loads(m.data)
+                except Exception:  # noqa: BLE001 - skip non-JSON
+                    continue
+                if body.get("reservation_id") == reservation_id:
+                    events.append(body)
+        return events
+    finally:
+        await nc.close()
+
+
 async def find_in_execution_dlq(marker: bytes, *, timeout: float = 15.0) -> bytes | None:
     """Poll HERD_DLQ for a message on the execution DLQ subject whose body
     contains `marker`. Returns the message bytes, or None on timeout."""

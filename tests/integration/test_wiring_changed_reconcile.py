@@ -48,7 +48,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ._nats_helpers import probe_nats, publish_raw
+from ._nats_helpers import fetch_events_for_reservation, probe_nats, publish_raw
 
 pytestmark = pytest.mark.asyncio
 
@@ -778,9 +778,10 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
     admin_client, l1_template, fresh_devices
 ):
     """Issue #573: force the activation-time wiring_changed staging to fail via
-    reservations' fault-injection seam, prove the reservation activates genuinely
-    unwired (vacuity guard), then poll until the sweep's delta-less heal stages the
-    reconcile and execution converges the intended L1 cross-connect to ACTIVE.
+    reservations' fault-injection seam, then poll until the sweep's delta-less heal
+    stages the reconcile and execution converges the intended L1 cross-connect to
+    ACTIVE, then prove the seam actually fired by reading the wiring_changed events
+    JetStream recorded for this reservation (vacuity guard).
 
     The reservation's purpose carries __herd_fault_stage_wiring__, so with
     HERD_FAULT_INJECTION set (dev/test compose override) reservations'
@@ -792,6 +793,28 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
     event. Only the expiration sweep's _heal_wiring_staging (5s interval here)
     notices cabling's fork version has outrun the ledger and stages the
     delta-less (released/built both None) heal that execution full-reconciles.
+
+    The vacuity guard used to sleep 1.0s and assert execution's wiring status showed
+    no ACTIVE rows and no last_applied_fork_version, reasoning that gave the
+    (unfired) activation staging every chance to have landed before the check. That
+    reasoning broke with issue #682: the expiration sweep also runs on a 5s interval,
+    so the sleep window (or the time spent polling for activation before it) could
+    itself contain a sweep tick. Once the outbox relay started delivering in
+    milliseconds instead of after the old ~5s tick, a sweep tick landing inside the
+    guard's window converged the heal before the assertion ran, and CI run
+    33924512021 failed with "the initial wiring_changed staging was NOT actually
+    blocked by the fault seam" even though the seam DID fire correctly; the guard was
+    racing a periodic background process, not observing a fact about the seam.
+    Any assertion timed to run "before the heal" has the same flaw for as long as a
+    sweep runs on a fixed interval, so the fix does not tighten the sleep: it removes
+    the before/after ordering dependency entirely. Instead, after convergence (once
+    the outcome is already final), read every reservation.wiring_changed event
+    JetStream actually recorded for this reservation. If the seam had NOT fired, the
+    activation-time staging would have produced one event carrying the built wires
+    directly; because the seam DID fire, the only event on the stream is the sweep's
+    delta-less heal (released and built both None). That is a fact about what was
+    published, not about what has happened by a given moment, so it holds regardless
+    of how many sweep ticks ran, or how fast the outbox relay delivers.
     """
     nats_err = await probe_nats()
     if nats_err:
@@ -813,32 +836,8 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
         reservation_id = reservation["id"]
         assert await _poll_active(admin_client, reservation_id), "reservation never activated"
 
-        # --- Vacuity guard ---------------------------------------------------
-        # Prove the fault actually fired before waiting on the heal: the fork was
-        # created (cabling-side create precedes the staging call, so the seam
-        # never touches it) at version 1, but execution's wiring ledger never
-        # received a reconcile for it, so there must be no ACTIVE L1 assignment
-        # row and last_applied_fork_version must still be null. A short settle
-        # window gives the (unfired) activation staging every chance to have
-        # landed if the seam had NOT fired, so this assertion is a genuine
-        # negative, not a race won by asserting too early.
         fork_version = await _fork_version(admin_client, reservation_id)
         assert fork_version >= 1, "fork was never created"
-
-        await asyncio.sleep(1.0)
-        pre_heal_status = await _wiring_status(admin_client, reservation_id)
-        pre_heal_active = [
-            c for c in pre_heal_status.get("connections", []) if c["status"] == "ACTIVE"
-        ]
-        assert pre_heal_active == [], (
-            "the initial wiring_changed staging was NOT actually blocked by the fault "
-            f"seam: found ACTIVE rows before the heal ran: {pre_heal_status}"
-        )
-        assert pre_heal_status.get("last_applied_fork_version") is None, (
-            "execution's ledger already reflects a fork version before any heal ran; "
-            f"the fault seam did not fire: {pre_heal_status}"
-        )
-        # --- end vacuity guard -------------------------------------------------
 
         # Poll until the 5s sweep's _heal_wiring_staging notices the ledger is
         # behind cabling's fork version, stages the delta-less heal event, and
@@ -872,6 +871,33 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
         assert len(active_rows) == 1, (
             f"expected exactly one converged L1 cross-connect, got: {active_rows}"
         )
+
+        # --- Vacuity guard (deterministic) ------------------------------------
+        # Now that the outcome is final, prove the fault seam actually fired by
+        # reading what reservations published, rather than by timing an
+        # assertion to land before some background process ran (see the
+        # docstring for why the old sleep-then-assert-absence version raced the
+        # 5s expiration sweep and broke under #682). If the seam had NOT fired,
+        # the activation-time staging would have gone through cleanly and put a
+        # SECOND event on the stream carrying the built wires directly; the
+        # sweep's heal would then be a redundant no-op delta-less event on top
+        # of it. Since the seam DID fire, the stream must carry exactly the
+        # sweep's one delta-less heal.
+        wiring_events = await fetch_events_for_reservation(reservation_id, _WIRING_CHANGED_SUBJECT)
+        assert len(wiring_events) == 1, (
+            "expected exactly one reservation.wiring_changed event for this "
+            "reservation (the sweep's delta-less heal); an unblocked "
+            "activation-time staging would have published a second event "
+            f"carrying the built wires directly: {wiring_events}"
+        )
+        heal_event = wiring_events[0]
+        assert heal_event.get("released") is None and heal_event.get("built") is None, (
+            "the recorded wiring_changed event was not delta-less: the "
+            "activation-time staging was NOT actually blocked by the fault seam "
+            f"(it published built wires directly instead of the sweep healing "
+            f"with released/built both None): {heal_event}"
+        )
+        # --- end vacuity guard -------------------------------------------------
     finally:
         # Restore baseline: cancel the reservation and confirm the terminal
         # transition landed.
