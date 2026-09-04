@@ -257,7 +257,7 @@ async def _listen_for_wakeups(
                 await conn.add_listener(channel, _on_notify)
                 conn.add_termination_listener(_on_terminate)
                 wake.set()
-                logger.info("%s: listening for outbox writes on channel %s", channel, channel)
+                logger.info("outbox listener: listening for writes on channel %s", channel)
                 await closed.wait()
                 logger.warning(
                     "outbox listener: lost the listen connection for channel %s", channel
