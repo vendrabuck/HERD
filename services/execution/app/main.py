@@ -106,6 +106,11 @@ async def start_outbox_relay(app: FastAPI) -> None:
             lambda: getattr(app.state, "nats", None),
             OutboxEvent,
             name="execution-outbox",
+            tick_seconds=settings.outbox_relay_tick_seconds,
+            batch_size=settings.outbox_batch_size,
+            retention_seconds=settings.outbox_retention_seconds,
+            engine=engine,
+            wake_on_write=settings.outbox_wake_on_write,
         )
     )
 

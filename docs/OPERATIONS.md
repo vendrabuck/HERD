@@ -264,7 +264,7 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 
 - Reservations service still accepts writes. Lifecycle events are written to the transactional outbox in the same transaction as the state change (issue #21), so nothing is lost while NATS is unreachable; the relay just cannot publish them yet.
 - Execution service can't consume events during the outage, so L1/L2 driver operations are NOT triggered yet; a reservation goes `ACTIVE` but its devices are not configured on real hardware until events flow again. Health-transition events are likewise buffered in the execution outbox.
-- Recover: bring NATS up. The per-service outbox relays reconnect and drain their unpublished rows on the next tick, so reservation and health events are delivered once (not lost), just delayed. No manual catch-up event is needed for these streams.
+- Recover: bring NATS up. The per-service outbox relays reconnect and drain their unpublished rows on the next tick after NATS is reachable again (at most `OUTBOX_RELAY_TICK_SECONDS` later; the issue #682 wake path is deliberately ignored while the relay is waiting out an outage), so reservation and health events are delivered once (not lost), just delayed. No manual catch-up event is needed for these streams.
 
 ### Config volume is wiped
 

@@ -23,7 +23,7 @@ Producer:
         __tablename__ = "outbox"
 
     # in the same transaction as the state change:
-    enqueue_event(session, OutboxEvent, "herd.reservations.created", payload)
+    await enqueue_event(session, OutboxEvent, "herd.reservations.created", payload)
     await session.commit()
 
 Consumer (at-least-once, so dedupe on the stable id):
@@ -40,10 +40,12 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, String, Uuid, delete, func, select
+from sqlalchemy import JSON, DateTime, Integer, String, Uuid, delete, func, select, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
+
+from herd_common.advisory_lock import is_postgres_dialect
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,18 @@ class OutboxMixin:
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
 
-def enqueue_event(
+def outbox_channel(model: type) -> str:
+    """Postgres NOTIFY channel for `model`'s outbox table: herd_outbox_<schema>.
+
+    Derived from the model's table schema (or "public" when unset), so the
+    notify side (enqueue_event) and the listen side (_listen_for_wakeups) call
+    this same helper and cannot drift apart.
+    """
+    schema = model.__table__.schema or "public"
+    return f"herd_outbox_{schema}"
+
+
+async def enqueue_event(
     session: AsyncSession,
     model: type,
     subject: str,
@@ -102,6 +115,16 @@ def enqueue_event(
     `event_id` so consumers can dedupe on a stable key that survives a relay
     republish under a new stream sequence. Returns the event id.
 
+    On Postgres, also issues `SELECT pg_notify(channel, '')` on the same
+    session so a running relay can wake immediately instead of waiting for its
+    next tick (issue #682). This stays inside the caller's transaction:
+    Postgres only delivers the notification once that transaction commits,
+    and drops it if the transaction rolls back, so a wake is never sent for a
+    write that never happened. Postgres also dedupes identical (channel,
+    payload) notifies within one transaction, so N events staged in one
+    commit produce a single wake. On any other dialect (SQLite unit tests)
+    this is a no-op beyond the add.
+
     This is the only sanctioned way for request/handler code to raise a
     state-change event: publishing straight to NATS from that code path
     reopens the dual-write gap this module exists to close (see the module
@@ -111,6 +134,10 @@ def enqueue_event(
     eid = event_id or uuid.uuid4()
     body = {**payload, EVENT_ID_FIELD: str(eid)}
     session.add(model(id=eid, subject=subject, payload=body))
+    if is_postgres_dialect(session.bind.dialect.name):
+        await session.execute(
+            text("SELECT pg_notify(:channel, '')"), {"channel": outbox_channel(model)}
+        )
     return eid
 
 
@@ -183,6 +210,76 @@ async def prune_published(
     return result.rowcount or 0
 
 
+async def _listen_for_wakeups(
+    engine: AsyncEngine,
+    channel: str,
+    wake: asyncio.Event,
+    *,
+    retry_seconds: float,
+) -> None:
+    """Background task: LISTEN on `channel`, setting `wake` on every NOTIFY.
+
+    Runs on a dedicated asyncpg connection held for the process lifetime: a
+    LISTEN connection must not cycle through a SQLAlchemy pool's
+    reset-on-return, and holding one out of the pool that long would starve
+    other callers. asyncpg is imported lazily: herd_common has no asyncpg
+    dependency of its own and must not gain one; the two services that run
+    the relay already depend on it as their SQLAlchemy driver.
+
+    A connect or registration failure, or a lost connection, is logged and
+    retried after `retry_seconds`: the outer relay keeps draining on its own
+    tick throughout, so a lost or never-established listener costs at most
+    one tick, exactly as if wake_on_write were off. On every successful
+    (re)connect, `wake` is set once before waiting, so anything committed
+    while we were disconnected (including before the first connect) drains
+    on the relay's very next pass instead of waiting for a NOTIFY that will
+    never come for an already-committed row.
+    """
+    import asyncpg
+
+    dsn = engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
+    conn = None
+    try:
+        while True:
+            try:
+                conn = await asyncpg.connect(dsn)
+
+                closed = asyncio.Event()
+
+                def _on_notify(
+                    connection: Any, pid: Any, notify_channel: Any, payload: Any
+                ) -> None:
+                    wake.set()
+
+                def _on_terminate(connection: Any) -> None:
+                    closed.set()
+
+                await conn.add_listener(channel, _on_notify)
+                conn.add_termination_listener(_on_terminate)
+                wake.set()
+                logger.info("outbox listener: listening for writes on channel %s", channel)
+                await closed.wait()
+                logger.warning(
+                    "outbox listener: lost the listen connection for channel %s", channel
+                )
+            except Exception as exc:
+                logger.warning(
+                    "outbox listener: %s: %s (channel %s); retrying in %ss",
+                    type(exc).__name__,
+                    exc,
+                    channel,
+                    retry_seconds,
+                )
+                await asyncio.sleep(retry_seconds)
+    except asyncio.CancelledError:
+        if conn is not None:
+            try:
+                await asyncio.wait_for(conn.close(), 5)
+            except Exception:
+                pass
+        raise
+
+
 async def run_outbox_relay(
     session_factory: async_sessionmaker[AsyncSession],
     get_nats: Callable[[], Any],
@@ -194,6 +291,9 @@ async def run_outbox_relay(
     retention_seconds: float = 7 * 24 * 3600,
     prune_every_seconds: float = 3600.0,
     publish_timeout: float = 10.0,
+    engine: AsyncEngine | None = None,
+    wake_on_write: bool = True,
+    wake: asyncio.Event | None = None,
 ) -> None:
     """Background relay: drain unpublished rows to JetStream, prune old ones.
 
@@ -206,52 +306,112 @@ async def run_outbox_relay(
     reconnects, then drains all buffered rows on the first healthy tick. That
     drain-on-recovery is what makes restart-recovery work. An unexpected error
     backs off exponentially to a cap. Cancellable via task.cancel().
+
+    Issue #682: on Postgres, `enqueue_event` also does `pg_notify` on the
+    committing transaction. When `wake_on_write` is set (the default) and
+    `engine` is a Postgres engine, this relay starts a supervised
+    `_listen_for_wakeups` task that sets `wake` on every notification, and a
+    healthy tick waits on `wake` (bounded by `tick_seconds`) instead of
+    sleeping blindly, so a committed write is drained immediately instead of
+    waiting out the rest of the tick. The tick remains the fallback cadence:
+    a missed or delayed notification, a listener that has not (re)connected
+    yet, or any dialect other than Postgres still drains on the next tick.
+    `wake_on_write=False` is the ops escape hatch back to tick-only behavior.
+    `wake` is a test seam: passing one in (even with no `engine`) tells the
+    relay to honor it on a healthy tick exactly as it would a live listener,
+    which is how the SQLite unit tests exercise the wake path without a real
+    Postgres LISTEN connection; when omitted, the relay creates its own
+    Event and only a real listener task can ever set it.
     """
+    wake_provided = wake is not None
+    if wake is None:
+        wake = asyncio.Event()
+
+    channel = outbox_channel(model)
+    listener_task: asyncio.Task | None = None
+    if wake_on_write and engine is not None and is_postgres_dialect(engine.dialect.name):
+        listener_task = asyncio.create_task(
+            _listen_for_wakeups(engine, channel, wake, retry_seconds=tick_seconds)
+        )
+
     max_backoff = max(tick_seconds * 10, 300)
     current_backoff = tick_seconds
     last_prune = datetime.now(timezone.utc)
     logger.info("%s relay started; tick=%ss batch=%s", name, tick_seconds, batch_size)
-    while True:
-        tick_failed = False
-        waiting_for_nats = False
-        try:
-            nc = get_nats()
-            if nc is None or not nc.is_connected:
-                # Not connected (startup, or an outage we are waiting out). Retry
-                # at the base cadence so reconnection is picked up promptly, and
-                # do not call publish on a dead client.
-                waiting_for_nats = True
-            else:
-                js = nc.jetstream()
-                async with session_factory() as session:
-                    count = await _publish_pending(
-                        session, js, model, batch_size=batch_size, publish_timeout=publish_timeout
-                    )
-                if count:
-                    logger.info("%s relay published %s event(s)", name, count)
-                now = datetime.now(timezone.utc)
-                if (now - last_prune).total_seconds() >= prune_every_seconds:
-                    cutoff = now - timedelta(seconds=retention_seconds)
+    try:
+        while True:
+            # Clear BEFORE the drain (the lost-wakeup rule): a notify that
+            # arrives during this iteration's drain sets the event again, so
+            # the wait below returns immediately and the row that triggered
+            # it is picked up on the very next pass rather than waiting a
+            # full tick.
+            wake.clear()
+            tick_failed = False
+            waiting_for_nats = False
+            try:
+                nc = get_nats()
+                if nc is None or not nc.is_connected:
+                    # Not connected (startup, or an outage we are waiting out). Retry
+                    # at the base cadence so reconnection is picked up promptly, and
+                    # do not call publish on a dead client.
+                    waiting_for_nats = True
+                else:
+                    js = nc.jetstream()
                     async with session_factory() as session:
-                        removed = await prune_published(session, model, older_than=cutoff)
-                    last_prune = now
-                    if removed:
-                        logger.info("%s relay pruned %s published event(s)", name, removed)
-        except asyncio.CancelledError:
-            logger.info("%s relay cancelled; exiting loop", name)
-            raise
-        except Exception:
-            logger.exception("%s relay tick failed", name)
-            tick_failed = True
+                        count = await _publish_pending(
+                            session,
+                            js,
+                            model,
+                            batch_size=batch_size,
+                            publish_timeout=publish_timeout,
+                        )
+                    if count:
+                        logger.info("%s relay published %s event(s)", name, count)
+                    now = datetime.now(timezone.utc)
+                    if (now - last_prune).total_seconds() >= prune_every_seconds:
+                        cutoff = now - timedelta(seconds=retention_seconds)
+                        async with session_factory() as session:
+                            removed = await prune_published(session, model, older_than=cutoff)
+                        last_prune = now
+                        if removed:
+                            logger.info("%s relay pruned %s published event(s)", name, removed)
+            except asyncio.CancelledError:
+                logger.info("%s relay cancelled; exiting loop", name)
+                raise
+            except Exception:
+                logger.exception("%s relay tick failed", name)
+                tick_failed = True
 
-        if waiting_for_nats:
-            current_backoff = tick_seconds
-        else:
-            current_backoff = min(current_backoff * 2, max_backoff) if tick_failed else tick_seconds
-        try:
-            await asyncio.sleep(current_backoff)
-        except asyncio.CancelledError:
-            raise
+            if waiting_for_nats:
+                current_backoff = tick_seconds
+            else:
+                current_backoff = (
+                    min(current_backoff * 2, max_backoff) if tick_failed else tick_seconds
+                )
+
+            # A healthy tick with a wake mechanism in play (a live listener
+            # task, or the wake seam) waits on the event so a write can cut
+            # the wait short; otherwise (NATS down, or a failed tick in
+            # exponential backoff) sleep plainly, so a burst of writes during
+            # an outage cannot turn the backoff into a hot loop.
+            listener_active = wake_provided or listener_task is not None
+            try:
+                if not waiting_for_nats and not tick_failed and listener_active:
+                    try:
+                        await asyncio.wait_for(wake.wait(), timeout=current_backoff)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(current_backoff)
+            except asyncio.CancelledError:
+                raise
+    finally:
+        if listener_task is not None:
+            listener_task.cancel()
+            try:
+                await listener_task
+            except asyncio.CancelledError:
+                pass
 
 
 def _stream_sequence_key(msg: Any) -> str | None:
@@ -281,6 +441,7 @@ def event_dedupe_key(event_data: dict[str, Any] | None, msg: Any) -> str | None:
 __all__ = [
     "OutboxMixin",
     "enqueue_event",
+    "outbox_channel",
     "prune_published",
     "run_outbox_relay",
     "event_dedupe_key",

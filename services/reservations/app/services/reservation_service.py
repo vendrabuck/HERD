@@ -844,7 +844,7 @@ async def stage_wiring_changed(
     A failure between the two writes commits neither. Used by both the save handler
     (released/built are the cabling delta arrays) and the sweeper heal (both None).
     """
-    enqueue_event(
+    await enqueue_event(
         db,
         OutboxEvent,
         WIRING_CHANGED_SUBJECT,
@@ -1251,7 +1251,7 @@ async def create_reservation(
         # row. flush() first to populate the python-side uuid default used in the
         # payload and to materialize the device memberships.
         await db.flush()
-        enqueue_event(
+        await enqueue_event(
             db,
             OutboxEvent,
             "herd.reservations.created",
@@ -1272,7 +1272,7 @@ async def create_reservation(
         # materialized by the association-proxy creator, so it needs no refresh.
         if not data.device_ids:
             await db.refresh(reservation)
-        enqueue_event(
+        await enqueue_event(
             db,
             OutboxEvent,
             "herd.reservations.provision_requested",
@@ -1325,7 +1325,7 @@ async def create_reservation(
             # in FAILED (issue #21), so the event exists iff the failure committed.
             # This is the webhook/notification signal that provisioning gave up
             # (issue #33 lists reservation.failed among the delivered events).
-            enqueue_event(
+            await enqueue_event(
                 db,
                 OutboxEvent,
                 "herd.reservations.failed",
@@ -1372,7 +1372,7 @@ async def create_reservation(
             # service posts the provision result. Stage provision_requested now
             # that the flip committed cleanly; the callback (or the timeout
             # backstop) owns the next transition.
-            enqueue_event(
+            await enqueue_event(
                 db,
                 OutboxEvent,
                 "herd.reservations.provision_requested",
@@ -1384,7 +1384,7 @@ async def create_reservation(
             # in ACTIVE (issue #21), so the event exists iff provisioning
             # committed. The old fire-and-forget post-commit publish could drop it
             # if NATS was down.
-            enqueue_event(
+            await enqueue_event(
                 db,
                 OutboxEvent,
                 "herd.reservations.created",
@@ -1494,7 +1494,7 @@ async def apply_provision_result(
                 existing.add(did)
         # The CAS already wrote ACTIVE; stage reservation.created in the same
         # transaction so the event commits atomically with the transition.
-        enqueue_event(
+        await enqueue_event(
             db,
             OutboxEvent,
             "herd.reservations.created",
@@ -1522,7 +1522,7 @@ async def apply_provision_result(
     # sites, alongside cancel_reservation, release_reservation, and the
     # expiration task's auto-complete and dynamic-timeout-failure branches.
     stamp_purpose_classify_requested(reservation)
-    enqueue_event(
+    await enqueue_event(
         db,
         OutboxEvent,
         "herd.reservations.failed",
@@ -1846,7 +1846,7 @@ async def update_reservation(
     # Stage reservation.updated in the same transaction as the edit (issue #21).
     # The device membership diff (added/removed) and any inventory flips above are
     # already applied to the session; this commits the event atomically with them.
-    enqueue_event(
+    await enqueue_event(
         db,
         OutboxEvent,
         "herd.reservations.updated",
@@ -1985,7 +1985,7 @@ async def cancel_reservation(
     # notification fan-out reaches the owner even on an admin override. On the
     # owner path reservation.user_id == user_id, so this is byte-for-byte
     # identical to the prior behavior.
-    enqueue_event(
+    await enqueue_event(
         db,
         OutboxEvent,
         "herd.reservations.cancelled",
@@ -2051,7 +2051,7 @@ async def release_reservation(
     # Stage reservation.completed in the same transaction that lands COMPLETED
     # (issue #21), mirroring the auto-expiry path. Inventory device release below
     # is best-effort; the event is durable regardless of NATS availability.
-    enqueue_event(
+    await enqueue_event(
         db,
         OutboxEvent,
         "herd.reservations.completed",

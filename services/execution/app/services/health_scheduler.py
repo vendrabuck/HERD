@@ -630,7 +630,7 @@ async def fire_poll(
                     "last_run_id": str(last_run_id) if last_run_id else None,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
-                enqueue_event(status_session, OutboxEvent, HEALTH_NATS_SUBJECT, payload)
+                await enqueue_event(status_session, OutboxEvent, HEALTH_NATS_SUBJECT, payload)
 
         await status_session.commit()
 

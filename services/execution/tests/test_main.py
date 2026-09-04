@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from app import main as main_module
 from app.config import settings
+from app.database import engine
 from app.main import _ensure_dlq_stream, start_outbox_relay, stop_outbox_relay
 
 
@@ -71,11 +72,18 @@ async def test_ensure_dlq_stream_swallows_broker_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_start_outbox_relay_starts_task_and_stop_cancels(monkeypatch):
-    """start_outbox_relay schedules the relay; stop_outbox_relay cancels it."""
+    """start_outbox_relay schedules the relay; stop_outbox_relay cancels it.
+
+    Also pins (issue #682) that the relay's engine and the four outbox
+    settings (tick/batch/retention/wake_on_write) are forwarded, closing the
+    gap docs/ENV_VARS.md used to flag: execution previously passed only `name`.
+    """
     started = asyncio.Event()
+    captured: dict = {}
 
     async def _idle_relay(session_factory, get_nats, model, **kwargs):
         # Stand in for run_outbox_relay: confirm wiring, then idle until cancel.
+        captured.update(kwargs)
         started.set()
         assert get_nats() is None  # reads app.state.nats lazily
         await asyncio.Event().wait()
@@ -89,6 +97,12 @@ async def test_start_outbox_relay_starts_task_and_stop_cancels(monkeypatch):
     assert task is not None
     await asyncio.wait_for(started.wait(), timeout=1.0)
     assert not task.done()
+
+    assert captured["tick_seconds"] == settings.outbox_relay_tick_seconds
+    assert captured["batch_size"] == settings.outbox_batch_size
+    assert captured["retention_seconds"] == settings.outbox_retention_seconds
+    assert captured["engine"] is engine
+    assert captured["wake_on_write"] == settings.outbox_wake_on_write
 
     await stop_outbox_relay(app)
     assert task.cancelled()

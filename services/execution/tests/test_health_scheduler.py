@@ -468,10 +468,10 @@ async def test_enqueue_shares_transaction_with_status_update(monkeypatch):
     captured: dict = {}
     real_enqueue = health_scheduler.enqueue_event
 
-    def _spy(session, model, subject, payload, **kwargs):
+    async def _spy(session, model, subject, payload, **kwargs):
         dirty = [o for o in session.dirty if isinstance(o, DeviceHealthStatus)]
         captured["dirty_failures"] = [o.consecutive_failures for o in dirty]
-        return real_enqueue(session, model, subject, payload, **kwargs)
+        return await real_enqueue(session, model, subject, payload, **kwargs)
 
     monkeypatch.setattr(health_scheduler, "enqueue_event", _spy)
     await fire_poll(TestSessionLocal, device_id, 60)
