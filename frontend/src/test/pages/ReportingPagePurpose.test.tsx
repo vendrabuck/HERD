@@ -168,3 +168,71 @@ describe("ReportingPage Purpose section", () => {
     expect(within(userMixCard).queryByText("user-10")).not.toBeInTheDocument();
   });
 });
+
+// AI-suggested bucket in the purpose bar chart (issue #646 phase 2, ADR 0013
+// point 9). by_purpose_suggested rows are separate from by_purpose: same
+// category strings can appear in both, since one is confirmed rows and the
+// other is unconfirmed-but-suggested rows.
+describe("ReportingPage Purpose section, AI-suggested bucket", () => {
+  const REPORT_WITH_SUGGESTED = {
+    ...REPORT_WITH_PURPOSE,
+    by_purpose_suggested: [
+      { purpose_category: "qa_regression", reservations: 2, device_hours: 6.0 },
+      { purpose_category: "customer_demo_poc", reservations: 1, device_hours: 3.0 },
+    ],
+  };
+
+  it("renders suggested rows as additional, distinctly labeled bars with a legend", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT_WITH_SUGGESTED),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const chartHeading = await screen.findByText("Device-hours by purpose");
+    const chartHeader = chartHeading.closest("div") as HTMLElement;
+    expect(screen.getByText("QA and regression (suggested)")).toBeInTheDocument();
+    expect(screen.getByText("Customer demo or POC (suggested)")).toBeInTheDocument();
+    // The confirmed row for the same category string still renders on its
+    // own, undisturbed, under its plain (non-suggested) label.
+    expect(screen.getAllByText("QA and regression").length).toBeGreaterThan(0);
+
+    // Legend: three distinct classes are named, not left to color alone.
+    // Scoped to the chart's own header (which holds the legend) since
+    // "Unclassified" also appears as a bar-row label and a mix-table tag.
+    expect(within(chartHeader).getByText("Confirmed")).toBeInTheDocument();
+    expect(within(chartHeader).getByText("AI-suggested")).toBeInTheDocument();
+    expect(within(chartHeader).getByText("Unclassified")).toBeInTheDocument();
+  });
+
+  it("omits the AI-suggested legend entry when there are no suggested rows", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(REPORT_WITH_PURPOSE),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    const chartHeading = await screen.findByText("Device-hours by purpose");
+    const chartHeader = chartHeading.closest("div") as HTMLElement;
+    expect(within(chartHeader).getByText("Confirmed")).toBeInTheDocument();
+    expect(within(chartHeader).getByText("Unclassified")).toBeInTheDocument();
+    expect(within(chartHeader).queryByText("AI-suggested")).not.toBeInTheDocument();
+    expect(screen.queryByText(/\(suggested\)/)).not.toBeInTheDocument();
+  });
+
+  it("stays gated on by_purpose alone: an older backend with only by_purpose_suggested still hides", async () => {
+    const { by_purpose: _omit, by_user_purpose: _omit2, by_device_purpose: _omit3, ...withoutConfirmed } =
+      REPORT_WITH_SUGGESTED;
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json(withoutConfirmed),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+
+    await screen.findByText("Platform Eng");
+    expect(screen.queryByText("Device-hours by purpose")).not.toBeInTheDocument();
+  });
+});

@@ -25,6 +25,7 @@ const EXPECTED_ADMIN_GUARDED_PATHS = [
   "/admin/grants",
   "/admin/hypervisors",
   "/admin/ldap-sync",
+  "/admin/purpose-review",
 ];
 
 interface GuardAncestry {

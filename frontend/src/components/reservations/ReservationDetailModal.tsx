@@ -239,6 +239,18 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
                 <PurposeCategoryTag category={localPurposeCategory} />
               )}
             </div>
+            {reservation.purpose_suggestion && (
+              <div className="flex justify-end -mt-2">
+                <span
+                  className="text-xs text-gray-400"
+                  title={reservation.purpose_suggestion.rationale}
+                >
+                  AI suggested: {purposeCategoryLabel(reservation.purpose_suggestion.top_category)}{" "}
+                  {Math.round((reservation.purpose_suggestion.distribution[0]?.probability ?? 0) * 100)}%
+                  {reservation.purpose_suggestion_dismissed_at ? " (dismissed)" : ""}
+                </span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span className="text-gray-500">Topology</span>
               <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">

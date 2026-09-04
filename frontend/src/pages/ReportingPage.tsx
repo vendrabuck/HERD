@@ -192,7 +192,10 @@ export function ReportingPage() {
             the whole section cleanly rather than rendering empty tables. */}
         {report.data?.by_purpose !== undefined && (
           <div className="space-y-6">
-            <PurposeBarChart data={report.data.by_purpose} />
+            <PurposeBarChart
+              data={report.data.by_purpose}
+              suggested={report.data.by_purpose_suggested ?? []}
+            />
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <PurposeMixTable
                 title="Purpose Mix - By User"
@@ -762,20 +765,64 @@ function DailyTrendChart({ data, loading }: { data: DayBucket[]; loading: boolea
   );
 }
 
-// Ranked device-hours per purpose category (issue #646 phase 1). Color here is
-// binary rather than a categorical hue per category: a bar's own row label
-// already carries category identity, so blue-600 vs the muted gray-400 marks
-// only the one distinction that matters for reading this chart at a glance -
-// classified data (a real signal) versus the unclassified bucket (an absence
-// of one) - without inventing an N-way palette this ranking does not need.
-function PurposeBarChart({ data }: { data: PurposeBucket[] }) {
-  const rows = useMemo(() => [...data].sort((a, b) => b.device_hours - a.device_hours), [data]);
+// A muted, tone-on-tone 45-degree hatch on the blue ramp (dataviz skill's
+// "Lines" texture treatment): the accessibility-safe way to add a third
+// visual class to a chart that otherwise reserves color for exactly two
+// meanings (see the comment below), without inventing a new hue for it.
+const SUGGESTED_HATCH =
+  "repeating-linear-gradient(45deg, #93c5fd, #93c5fd 4px, #dbeafe 4px, #dbeafe 8px)";
+
+type PurposeBarKind = "confirmed" | "unclassified" | "suggested";
+
+interface PurposeBarRow {
+  key: string;
+  label: string;
+  kind: PurposeBarKind;
+  device_hours: number;
+  reservations: number;
+}
+
+// Ranked device-hours per purpose category (issue #646 phases 1-2). Color is
+// binary for the confirmed data (blue-600 vs the muted gray-400 unclassified
+// bucket) - a bar's own row label already carries category identity, so
+// hue only needs to mark the one distinction that matters there: classified
+// (a real signal) versus unclassified (an absence of one). Phase 2 adds a
+// third class, ai_suggested rows with no confirmed category yet: a hatch on
+// the same blue rather than a fourth hue, since these are still "leaning
+// classified," just unconfirmed, and a legend makes the three classes
+// unambiguous without relying on color alone.
+function PurposeBarChart({
+  data,
+  suggested,
+}: {
+  data: PurposeBucket[];
+  suggested: PurposeBucket[];
+}) {
+  const rows = useMemo<PurposeBarRow[]>(() => {
+    const confirmedRows: PurposeBarRow[] = data.map((r) => ({
+      key: `confirmed:${r.purpose_category}`,
+      label: purposeCategoryLabel(r.purpose_category),
+      kind: isUnclassifiedCategory(r.purpose_category) ? "unclassified" : "confirmed",
+      device_hours: r.device_hours,
+      reservations: r.reservations,
+    }));
+    const suggestedRows: PurposeBarRow[] = suggested.map((r) => ({
+      key: `suggested:${r.purpose_category}`,
+      label: `${purposeCategoryLabel(r.purpose_category)} (suggested)`,
+      kind: "suggested",
+      device_hours: r.device_hours,
+      reservations: r.reservations,
+    }));
+    return [...confirmedRows, ...suggestedRows].sort((a, b) => b.device_hours - a.device_hours);
+  }, [data, suggested]);
   const maxHours = Math.max(1, ...rows.map((r) => r.device_hours));
+  const hasSuggested = suggested.length > 0;
 
   return (
     <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-      <div className="px-4 py-3 border-b border-gray-200">
+      <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between flex-wrap gap-2">
         <h3 className="text-sm font-semibold text-gray-900">Device-hours by purpose</h3>
+        <PurposeBarLegend showSuggested={hasSuggested} />
       </div>
       <div className="p-4 space-y-2">
         {rows.length === 0 ? (
@@ -784,18 +831,24 @@ function PurposeBarChart({ data }: { data: PurposeBucket[] }) {
           </div>
         ) : (
           rows.map((r) => {
-            const unclassified = isUnclassifiedCategory(r.purpose_category);
-            const label = purposeCategoryLabel(r.purpose_category);
             const pct = Math.max(2, (r.device_hours / maxHours) * 100);
             return (
-              <div key={r.purpose_category} className="flex items-center gap-3">
-                <div className="w-48 shrink-0 text-xs text-gray-600 truncate" title={label}>
-                  {label}
+              <div key={r.key} className="flex items-center gap-3">
+                <div className="w-48 shrink-0 text-xs text-gray-600 truncate" title={r.label}>
+                  {r.label}
                 </div>
                 <div className="flex-1 h-3 bg-gray-100 rounded-full overflow-hidden">
                   <div
-                    className={`h-full rounded-full ${unclassified ? "bg-gray-400" : "bg-blue-600"}`}
-                    style={{ width: `${pct}%` }}
+                    className={`h-full rounded-full ${
+                      r.kind === "unclassified"
+                        ? "bg-gray-400"
+                        : r.kind === "confirmed"
+                          ? "bg-blue-600"
+                          : ""
+                    }`}
+                    style={
+                      r.kind === "suggested" ? { width: `${pct}%`, backgroundImage: SUGGESTED_HATCH } : { width: `${pct}%` }
+                    }
                     title={`${formatHours(r.device_hours)}h across ${r.reservations} reservation${
                       r.reservations === 1 ? "" : "s"
                     }`}
@@ -809,6 +862,33 @@ function PurposeBarChart({ data }: { data: PurposeBucket[] }) {
           })
         )}
       </div>
+    </div>
+  );
+}
+
+// Text labels beside every swatch: identity never rests on color alone
+// (dataviz skill's accessibility pass). Suggested only appears once there is
+// suggested data to explain.
+function PurposeBarLegend({ showSuggested }: { showSuggested: boolean }) {
+  return (
+    <div className="flex items-center gap-3 text-xs text-gray-600">
+      <span className="flex items-center gap-1.5">
+        <span className="w-2.5 h-2.5 rounded-sm bg-blue-600" />
+        Confirmed
+      </span>
+      {showSuggested && (
+        <span className="flex items-center gap-1.5">
+          <span
+            className="w-2.5 h-2.5 rounded-sm border border-blue-300"
+            style={{ backgroundImage: SUGGESTED_HATCH }}
+          />
+          AI-suggested
+        </span>
+      )}
+      <span className="flex items-center gap-1.5">
+        <span className="w-2.5 h-2.5 rounded-sm bg-gray-400" />
+        Unclassified
+      </span>
     </div>
   );
 }

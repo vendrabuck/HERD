@@ -91,6 +91,13 @@ export interface UtilizationReport {
   by_purpose?: PurposeBucket[];
   by_user_purpose?: UserPurposeBucket[];
   by_device_purpose?: DevicePurposeBucket[];
+  // Issue #646 phase 2: the top suggested category of rows that carry an AI
+  // suggestion but no confirmed purpose_category (ADR 0013 point 9). Same
+  // shape as PurposeBucket; `purpose_category` here is a suggested category,
+  // never the literal "unclassified" bucket key, and these rows are already
+  // excluded from by_purpose's unclassified count. Optional: absent on a
+  // backend build that predates phase 2.
+  by_purpose_suggested?: PurposeBucket[];
 }
 
 export interface UtilizationQuery {

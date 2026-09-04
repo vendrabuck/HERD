@@ -7,7 +7,9 @@ import type {
   ForkSaveResult,
   ForkVersionDetail,
   ForkVersionRestoreResult,
+  PurposeBackfillResponse,
   PurposeCategoriesResponse,
+  PurposeReviewResponse,
   Reservation,
   ReservationCreate,
   ReservationFork,
@@ -175,6 +177,89 @@ export function useSetPurposeCategory() {
     mutationFn: ({ id, purposeCategory }: { id: string; purposeCategory: string | null }) =>
       setPurposeCategory(id, purposeCategory),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["reservations"] }),
+  });
+}
+
+// --- Lab purpose classification, admin review (issue #646 phase 2, ADR 0013
+// point 10) ------------------------------------------------------------
+// The review queue, its accept/dismiss actions, and the backfill trigger.
+// Optimistic removal-with-revert on accept/dismiss is owned by the page
+// component (PurposeReviewPage), not these hooks, the same split the
+// reservation detail modal uses for the phase 1 category PATCH: the hook
+// stays a thin mutation, the caller drives the local list state it can see.
+
+export const purposeReviewQueryKey = ["reservations", "admin", "purpose-review"] as const;
+
+async function fetchPurposeReview(
+  skip: number,
+  limit: number,
+  category?: string,
+): Promise<PurposeReviewResponse> {
+  const resp = await apiClient.get<PurposeReviewResponse>(
+    "/reservations/admin/purpose-review",
+    { params: { skip, limit, ...(category ? { category } : {}) } },
+  );
+  return resp.data;
+}
+
+export function usePurposeReview(skip: number, limit: number, category?: string) {
+  return useQuery({
+    queryKey: [...purposeReviewQueryKey, skip, limit, category ?? ""],
+    queryFn: () => fetchPurposeReview(skip, limit, category),
+    placeholderData: keepPreviousData,
+  });
+}
+
+async function acceptPurposeSuggestion(
+  id: string,
+  purposeCategory: string | null,
+): Promise<Reservation> {
+  const resp = await apiClient.post<Reservation>(
+    `/reservations/admin/purpose-review/${id}/accept`,
+    { purpose_category: purposeCategory },
+  );
+  return resp.data;
+}
+
+export function useAcceptPurposeSuggestion() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, purposeCategory }: { id: string; purposeCategory: string | null }) =>
+      acceptPurposeSuggestion(id, purposeCategory),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: purposeReviewQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["reservations"] });
+    },
+  });
+}
+
+async function dismissPurposeSuggestion(id: string): Promise<Reservation> {
+  const resp = await apiClient.post<Reservation>(
+    `/reservations/admin/purpose-review/${id}/dismiss`,
+  );
+  return resp.data;
+}
+
+export function useDismissPurposeSuggestion() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => dismissPurposeSuggestion(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: purposeReviewQueryKey }),
+  });
+}
+
+async function backfillPurposeClassification(): Promise<PurposeBackfillResponse> {
+  const resp = await apiClient.post<PurposeBackfillResponse>(
+    "/reservations/admin/purpose/backfill",
+  );
+  return resp.data;
+}
+
+export function useBackfillPurposeClassification() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: backfillPurposeClassification,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: purposeReviewQueryKey }),
   });
 }
 

@@ -11,6 +11,7 @@ import type {
   IdentitySuggestion,
   SuggestIdentityRequest,
 } from "@/types/ai.types";
+import type { PurposeClassification, PurposePreviewRequest } from "@/types/reservation.types";
 
 async function generateTopology(req: AIGenerateRequest): Promise<AIGenerateResponse> {
   const formData = new FormData();
@@ -232,4 +233,24 @@ export function useSuggestTemplateIdentity() {
   return useMutation({
     mutationFn: suggestTemplateIdentity,
   });
+}
+
+// --- Lab purpose classification, creation pass (issue #646 phase 2, ADR 0013
+// point 8) -------------------------------------------------------------
+// Interactive preview called from the create-reservation modal. Gated on
+// useAIStatus().purpose_classification; the caller (hooks/usePurposeSuggestion)
+// owns debouncing, in-flight cancellation, and silent-failure handling, so
+// this stays a plain signal-aware POST rather than a useMutation: a mutation
+// hook's own pending/error state does not compose with "one in flight, cancel
+// the rest" the way a caller-supplied AbortSignal does.
+export async function classifyPurposePreview(
+  body: PurposePreviewRequest,
+  signal?: AbortSignal,
+): Promise<PurposeClassification> {
+  const resp = await apiClient.post<PurposeClassification>(
+    "/ai/classify-purpose/preview",
+    body,
+    { signal },
+  );
+  return resp.data;
 }
