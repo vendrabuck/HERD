@@ -195,6 +195,10 @@ export function ReportingPage() {
             <PurposeBarChart
               data={report.data.by_purpose}
               suggested={report.data.by_purpose_suggested ?? []}
+              canDownload={canDownload}
+              onDownload={() => handleServerCsv("purpose")}
+              suggestedAvailable={report.data.by_purpose_suggested !== undefined}
+              onDownloadSuggested={() => handleServerCsv("purpose_suggested")}
             />
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <PurposeMixTable
@@ -207,6 +211,9 @@ export function ReportingPage() {
                   hours: r.device_hours,
                   count: r.reservations,
                 }))}
+                sectionAvailable={report.data.by_user_purpose !== undefined}
+                canDownload={canDownload}
+                onDownload={() => handleServerCsv("user_purpose")}
               />
               <PurposeMixTable
                 title="Purpose Mix - By Device"
@@ -221,6 +228,9 @@ export function ReportingPage() {
                 }))}
                 showTransitColumn
                 transitIncluded={report.data.transit_included}
+                sectionAvailable={report.data.by_device_purpose !== undefined}
+                canDownload={canDownload}
+                onDownload={() => handleServerCsv("device_purpose")}
               />
             </div>
           </div>
@@ -797,9 +807,22 @@ interface PurposeBarRow {
 function PurposeBarChart({
   data,
   suggested,
+  canDownload,
+  onDownload,
+  suggestedAvailable,
+  onDownloadSuggested,
 }: {
   data: PurposeBucket[];
   suggested: PurposeBucket[];
+  canDownload: boolean;
+  onDownload: () => void;
+  // Gates the suggested-bucket CSV button on the field's presence in the
+  // report payload (issue #696), not on `suggested.length`: an older
+  // backend that predates phase 2 omits by_purpose_suggested entirely, so
+  // there is no `purpose_suggested` CSV section to fetch even though the
+  // bar chart itself still renders with an empty suggested array.
+  suggestedAvailable: boolean;
+  onDownloadSuggested: () => void;
 }) {
   const rows = useMemo<PurposeBarRow[]>(() => {
     const confirmedRows: PurposeBarRow[] = data.map((r) => ({
@@ -825,7 +848,17 @@ function PurposeBarChart({
     <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
       <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between flex-wrap gap-2">
         <h3 className="text-sm font-semibold text-gray-900">Device-hours by purpose</h3>
-        <PurposeBarLegend showSuggested={hasSuggested} />
+        <div className="flex items-center gap-3 flex-wrap">
+          <PurposeBarLegend showSuggested={hasSuggested} />
+          <CsvButton onClick={onDownload} disabled={!canDownload} label="Download CSV" />
+          {suggestedAvailable && (
+            <CsvButton
+              onClick={onDownloadSuggested}
+              disabled={!canDownload}
+              label="Download CSV (suggested)"
+            />
+          )}
+        </div>
       </div>
       <div className="p-4 space-y-2">
         {rows.length === 0 ? (
@@ -921,6 +954,9 @@ function PurposeMixTable({
   rows,
   showTransitColumn = false,
   transitIncluded,
+  sectionAvailable,
+  canDownload,
+  onDownload,
 }: {
   title: string;
   entityHeader: string;
@@ -929,23 +965,41 @@ function PurposeMixTable({
   // Echoes UtilizationReport.transit_included; undefined (a backend build
   // that predates phase 3) renders no footer line at all.
   transitIncluded?: boolean;
+  // Gates the CSV button on the backing field's presence in the report
+  // payload (issue #696): by_user_purpose/by_device_purpose are each
+  // optional, so a backend build that predates them still renders this
+  // table (empty, via the `?? []` fallback at the call site) with no
+  // download button, since there is no server section to fetch.
+  sectionAvailable: boolean;
+  canDownload: boolean;
+  onDownload: () => void;
 }) {
   const [showAll, setShowAll] = useState(false);
   const sorted = useMemo(() => [...rows].sort((a, b) => b.hours - a.hours), [rows]);
   const visible = showAll ? sorted : sorted.slice(0, 10);
 
+  const showAllToggle =
+    sorted.length > 10 ? (
+      <button
+        type="button"
+        onClick={() => setShowAll((v) => !v)}
+        className="text-xs text-blue-600 hover:text-blue-800"
+      >
+        {showAll ? "Show top 10" : `Show all (${sorted.length})`}
+      </button>
+    ) : null;
+
   return (
     <TableCard
       title={title}
       action={
-        sorted.length > 10 ? (
-          <button
-            type="button"
-            onClick={() => setShowAll((v) => !v)}
-            className="text-xs text-blue-600 hover:text-blue-800"
-          >
-            {showAll ? "Show top 10" : `Show all (${sorted.length})`}
-          </button>
+        showAllToggle || sectionAvailable ? (
+          <div className="flex items-center gap-3">
+            {showAllToggle}
+            {sectionAvailable && (
+              <CsvButton onClick={onDownload} disabled={!canDownload} label="Download CSV" />
+            )}
+          </div>
         ) : undefined
       }
     >
