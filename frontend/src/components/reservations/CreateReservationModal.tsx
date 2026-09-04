@@ -1,8 +1,9 @@
 import { useState } from "react";
 import toast from "react-hot-toast";
-import { useCreateReservation } from "@/api/reservations";
+import { useCreateReservation, usePurposeCategories } from "@/api/reservations";
 import { useTemplates } from "@/api/templates";
 import { Modal } from "@/components/ui/Modal";
+import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import type { DynamicRequestSpec } from "@/types/reservation.types";
 
 // Mirrors the backend cap: ReservationCreate.dynamic_requests has max_length=50.
@@ -41,6 +42,9 @@ export function CreateReservationModal({
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
   const [purpose, setPurpose] = useState("");
+  // "" is the "Unclassified" sentinel (a <select> value can't be null); it
+  // maps to purpose_category: null on submit.
+  const [purposeCategory, setPurposeCategory] = useState("");
   const [dynamicEntries, setDynamicEntries] = useState<DynamicEntry[]>(() =>
     (initialDynamicEntries ?? []).map((entry) => ({
       templateId: entry.templateId,
@@ -51,6 +55,10 @@ export function CreateReservationModal({
   // Only fetch dynamic templates while the modal is open; this component stays
   // mounted (closed) on pages like the topology editor.
   const { data: dynamicTemplates } = useTemplates("dynamic", { enabled: open });
+  // A loading or failed category fetch must never block submission: the
+  // select just stays disabled at its "Unclassified" default (issue #646).
+  const purposeCategories = usePurposeCategories();
+  const categoryOptions = purposeCategories.data?.categories ?? [];
 
   const totalDynamic = dynamicEntries.reduce((sum, e) => sum + e.count, 0);
   const overCap = totalDynamic > MAX_DYNAMIC_REQUESTS;
@@ -102,6 +110,9 @@ export function CreateReservationModal({
         start_time: new Date(startTime).toISOString(),
         end_time: new Date(endTime).toISOString(),
         purpose: purpose || undefined,
+        // Sent explicitly (never omitted) so "Unclassified" always clears any
+        // stale value rather than falling back to a server-side default.
+        purpose_category: purposeCategory === "" ? null : purposeCategory,
         // Absent and [] behave the same server-side, but omit when empty so
         // device-only requests keep their pre-dynamic wire shape.
         ...(dynamicRequests.length > 0 ? { dynamic_requests: dynamicRequests } : {}),
@@ -223,6 +234,26 @@ export function CreateReservationModal({
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             placeholder="Testing, deployment, etc."
           />
+        </div>
+
+        <div>
+          <label htmlFor="res-purpose-category" className="block text-sm font-medium text-gray-700 mb-1">
+            Purpose category (optional)
+          </label>
+          <select
+            id="res-purpose-category"
+            value={purposeCategory}
+            disabled={purposeCategories.isLoading || purposeCategories.isError}
+            onChange={(e) => setPurposeCategory(e.target.value)}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+          >
+            <option value="">Unclassified</option>
+            {categoryOptions.map((c) => (
+              <option key={c} value={c}>
+                {purposeCategoryLabel(c)}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div className="flex justify-end gap-3 pt-2">

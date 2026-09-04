@@ -5,11 +5,13 @@ import {
   type UtilizationCsvSection,
 } from "@/api/reporting";
 import { useDevices } from "@/api/inventory";
-import type { DayBucket, DeviceBucket, FleetSection } from "@/types/reporting.types";
+import type { DayBucket, DeviceBucket, FleetSection, PurposeBucket } from "@/types/reporting.types";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatCard } from "@/components/ui/StatCard";
 import { EmptyRow } from "@/components/ui/EmptyState";
 import { SkeletonRows } from "@/components/ui/Skeleton";
+import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
+import { isUnclassifiedCategory, purposeCategoryLabel } from "@/lib/purposeCategories";
 
 function triggerCsvDownload(filename: string, body: string): void {
   const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
@@ -92,6 +94,17 @@ export function ReportingPage() {
     return map;
   }, [devices.data]);
 
+  // Purpose classification (issue #646 phase 1) reports users/devices by id
+  // only; resolve names from the report's own by_user bucket and the device
+  // index above rather than a second fetch.
+  const userNameIndex = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const u of report.data?.by_user ?? []) {
+      map.set(u.user_id, u.owner_name);
+    }
+    return map;
+  }, [report.data]);
+
   const byTemplate = useMemo(() => {
     if (!report.data) return [];
     const rollup = new Map<string, { template_name: string; hours: number; count: number }>();
@@ -173,6 +186,39 @@ export function ReportingPage() {
           canDownload={canDownload && Boolean(report.data?.fleet)}
           onDownload={() => handleServerCsv("fleet")}
         />
+
+        {/* Purpose classification (issue #646 phase 1). Gated on by_purpose
+            alone so an older backend build that predates the feature hides
+            the whole section cleanly rather than rendering empty tables. */}
+        {report.data?.by_purpose !== undefined && (
+          <div className="space-y-6">
+            <PurposeBarChart data={report.data.by_purpose} />
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <PurposeMixTable
+                title="Purpose Mix - By User"
+                entityHeader="User"
+                rows={(report.data.by_user_purpose ?? []).map((r) => ({
+                  key: `${r.user_id}:${r.purpose_category}`,
+                  entityLabel: userNameIndex.get(r.user_id) ?? r.user_id.slice(0, 8),
+                  category: r.purpose_category,
+                  hours: r.device_hours,
+                  count: r.reservations,
+                }))}
+              />
+              <PurposeMixTable
+                title="Purpose Mix - By Device"
+                entityHeader="Device"
+                rows={(report.data.by_device_purpose ?? []).map((r) => ({
+                  key: `${r.device_id}:${r.purpose_category}`,
+                  entityLabel: deviceIndex.get(r.device_id)?.name ?? r.device_id.slice(0, 8),
+                  category: r.purpose_category,
+                  hours: r.device_hours,
+                  count: r.reservations,
+                }))}
+              />
+            </div>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-4 gap-6">
           <TableCard
@@ -713,5 +759,123 @@ function DailyTrendChart({ data, loading }: { data: DayBucket[]; loading: boolea
         )}
       </div>
     </div>
+  );
+}
+
+// Ranked device-hours per purpose category (issue #646 phase 1). Color here is
+// binary rather than a categorical hue per category: a bar's own row label
+// already carries category identity, so blue-600 vs the muted gray-400 marks
+// only the one distinction that matters for reading this chart at a glance -
+// classified data (a real signal) versus the unclassified bucket (an absence
+// of one) - without inventing an N-way palette this ranking does not need.
+function PurposeBarChart({ data }: { data: PurposeBucket[] }) {
+  const rows = useMemo(() => [...data].sort((a, b) => b.device_hours - a.device_hours), [data]);
+  const maxHours = Math.max(1, ...rows.map((r) => r.device_hours));
+
+  return (
+    <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-200">
+        <h3 className="text-sm font-semibold text-gray-900">Device-hours by purpose</h3>
+      </div>
+      <div className="p-4 space-y-2">
+        {rows.length === 0 ? (
+          <div className="h-16 flex items-center justify-center text-sm text-gray-500">
+            No data in this window
+          </div>
+        ) : (
+          rows.map((r) => {
+            const unclassified = isUnclassifiedCategory(r.purpose_category);
+            const label = purposeCategoryLabel(r.purpose_category);
+            const pct = Math.max(2, (r.device_hours / maxHours) * 100);
+            return (
+              <div key={r.purpose_category} className="flex items-center gap-3">
+                <div className="w-48 shrink-0 text-xs text-gray-600 truncate" title={label}>
+                  {label}
+                </div>
+                <div className="flex-1 h-3 bg-gray-100 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${unclassified ? "bg-gray-400" : "bg-blue-600"}`}
+                    style={{ width: `${pct}%` }}
+                    title={`${formatHours(r.device_hours)}h across ${r.reservations} reservation${
+                      r.reservations === 1 ? "" : "s"
+                    }`}
+                  />
+                </div>
+                <div className="w-16 shrink-0 text-right text-xs tabular-nums text-gray-700">
+                  {formatHours(r.device_hours)}h
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface PurposeMixRow {
+  key: string;
+  entityLabel: string;
+  category: string;
+  hours: number;
+  count: number;
+}
+
+// Flat (entity, category) rows sorted by device-hours descending, top 10 by
+// default with a "show all" toggle (issue #646 phase 1). Used for both the
+// per-user and per-device purpose mix; the two differ only in title, column
+// header, and which id-to-name lookup the caller resolved the rows with.
+function PurposeMixTable({
+  title,
+  entityHeader,
+  rows,
+}: {
+  title: string;
+  entityHeader: string;
+  rows: PurposeMixRow[];
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const sorted = useMemo(() => [...rows].sort((a, b) => b.hours - a.hours), [rows]);
+  const visible = showAll ? sorted : sorted.slice(0, 10);
+
+  return (
+    <TableCard
+      title={title}
+      action={
+        sorted.length > 10 ? (
+          <button
+            type="button"
+            onClick={() => setShowAll((v) => !v)}
+            className="text-xs text-blue-600 hover:text-blue-800"
+          >
+            {showAll ? "Show top 10" : `Show all (${sorted.length})`}
+          </button>
+        ) : undefined
+      }
+    >
+      <table className="w-full text-sm text-left">
+        <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
+          <tr>
+            <th className="px-4 py-3">{entityHeader}</th>
+            <th className="px-4 py-3">Category</th>
+            <th className="px-4 py-3 text-right">Hours</th>
+            <th className="px-4 py-3 text-right">Count</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-100">
+          {visible.map((r) => (
+            <tr key={r.key} className="hover:bg-gray-50">
+              <td className="px-4 py-2 font-medium text-gray-900">{r.entityLabel}</td>
+              <td className="px-4 py-2">
+                <PurposeCategoryTag category={r.category} />
+              </td>
+              <td className="px-4 py-2 text-right tabular-nums">{formatHours(r.hours)}</td>
+              <td className="px-4 py-2 text-right tabular-nums">{r.count}</td>
+            </tr>
+          ))}
+          {sorted.length === 0 && <EmptyRow colSpan={4} />}
+        </tbody>
+      </table>
+    </TableCard>
   );
 }

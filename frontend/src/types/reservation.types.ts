@@ -41,6 +41,12 @@ export interface Reservation {
   // Always present in backend responses (defaults to []); optional here so
   // fixtures and cached responses that predate dynamic requests stay valid.
   dynamic_requests?: DynamicRequestResponse[];
+  // Lab purpose classification (issue #646 phase 1). A plain string column
+  // validated at write time against the server's configurable category list
+  // (GET /reservations/purpose-categories); null means unclassified. Optional
+  // here so fixtures and cached responses that predate the feature stay valid.
+  purpose_category?: string | null;
+  purpose_category_set_at?: string | null;
 }
 
 export interface ReservationCreate {
@@ -54,6 +60,16 @@ export interface ReservationCreate {
   // Send only when non-empty; the backend defaults an absent field to [].
   // Capped at 50 entries server-side (tighter than the 200-device cap).
   dynamic_requests?: DynamicRequestSpec[];
+  // Optional purpose classification (issue #646 phase 1); null or omitted
+  // means unclassified.
+  purpose_category?: string | null;
+}
+
+// GET /reservations/purpose-categories: the server-configured taxonomy
+// (default list, or its PURPOSE_CATEGORIES env override). Never hardcode this
+// list for validation or rendering; it can change without a frontend deploy.
+export interface PurposeCategoriesResponse {
+  categories: string[];
 }
 
 export interface ReservationUpdate {

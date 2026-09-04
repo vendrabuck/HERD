@@ -1,11 +1,20 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import toast from "react-hot-toast";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { useCancelReservation, useReleaseReservation } from "@/api/reservations";
+import {
+  useCancelReservation,
+  usePurposeCategories,
+  useReleaseReservation,
+  useSetPurposeCategory,
+} from "@/api/reservations";
 import { useTemplates } from "@/api/templates";
 import { useAIStatus } from "@/api/ai";
 import { useAuthStore } from "@/stores/authStore";
+import { errorDetail } from "@/lib/errors";
+import { isAdminRole } from "@/lib/roles";
+import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import { ReservationInventoryTab } from "./ReservationInventoryTab";
 import { ReservationRoutesTab } from "./ReservationRoutesTab";
 import { ReservationStatusTab } from "./ReservationStatusTab";
@@ -13,6 +22,7 @@ import { ReservationWiringTab } from "./ReservationWiringTab";
 import { AIApplyConfirmModal } from "./AIApplyConfirmModal";
 import { AIAssistantTab } from "./AIAssistantTab";
 import { EditDevicesModal } from "./EditDevicesModal";
+import { PurposeCategoryTag } from "./PurposeCategoryTag";
 import type { PendingApply, ToolCall } from "@/types/ai.types";
 import type { DynamicRequestResponse, Reservation } from "@/types/reservation.types";
 
@@ -65,12 +75,42 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
   const { data: dynamicTemplates } = useTemplates("dynamic", {
     enabled: dynamicRequests.length > 0,
   });
+  // Lab purpose classification (issue #646 phase 1). `value` is the optimistic
+  // display value; it reverts on a failed PATCH. Keyed on reservation id
+  // (adjusting state during render, not an effect) so switching to a
+  // different reservation resets it to that reservation's server value,
+  // while staying on the same one preserves an in-flight local edit across
+  // unrelated prop refetches (e.g. another reservation's list invalidation).
+  const [purposeCategoryState, setPurposeCategoryState] = useState(() => ({
+    id: reservation?.id,
+    value: reservation?.purpose_category ?? null,
+  }));
+  if (reservation && purposeCategoryState.id !== reservation.id) {
+    setPurposeCategoryState({ id: reservation.id, value: reservation.purpose_category ?? null });
+  }
+  const localPurposeCategory = purposeCategoryState.value;
+  const setLocalPurposeCategory = (value: string | null) =>
+    setPurposeCategoryState((s) => ({ ...s, value }));
+  const { data: purposeCategoriesData } = usePurposeCategories();
+  const setPurposeCategory = useSetPurposeCategory();
 
   if (!reservation) return null;
 
   const templateNames = new Map((dynamicTemplates ?? []).map((t) => [t.id, t.name]));
 
   const isOwner = user?.id === reservation.user_id;
+  const canEditPurposeCategory = isOwner || isAdminRole(user?.role);
+  const handlePurposeCategoryChange = async (value: string) => {
+    const next = value === "" ? null : value;
+    const previous = localPurposeCategory;
+    setLocalPurposeCategory(next);
+    try {
+      await setPurposeCategory.mutateAsync({ id: reservation.id, purposeCategory: next });
+    } catch (err) {
+      setLocalPurposeCategory(previous);
+      toast.error(errorDetail(err, "Failed to update purpose category"));
+    }
+  };
   const canAct = isOwner && reservation.status === "ACTIVE";
   const canEdit = isOwner && (reservation.status === "ACTIVE" || reservation.status === "PENDING");
   // The fork is editable only while the reservation is ACTIVE (ADR 0006); after
@@ -177,6 +217,27 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
             <div className="flex justify-between">
               <span className="text-gray-500">Purpose</span>
               <span>{reservation.purpose || "-"}</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-gray-500">Purpose category</span>
+              {canEditPurposeCategory ? (
+                <select
+                  aria-label="Purpose category"
+                  value={localPurposeCategory ?? ""}
+                  disabled={setPurposeCategory.isPending}
+                  onChange={(e) => handlePurposeCategoryChange(e.target.value)}
+                  className="border border-gray-300 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                >
+                  <option value="">Unclassified</option>
+                  {(purposeCategoriesData?.categories ?? []).map((c) => (
+                    <option key={c} value={c}>
+                      {purposeCategoryLabel(c)}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <PurposeCategoryTag category={localPurposeCategory} />
+              )}
             </div>
             <div className="flex justify-between">
               <span className="text-gray-500">Topology</span>

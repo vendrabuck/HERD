@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useCancelReservation, useReleaseReservation, useReservations } from "@/api/reservations";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { StatusBadge } from "@/components/ui/StatusBadge";
+import { PurposeCategoryTag } from "./PurposeCategoryTag";
 import type { Reservation } from "@/types/reservation.types";
 
 function ReservationRow({ reservation }: { reservation: Reservation }) {
@@ -16,7 +17,7 @@ function ReservationRow({ reservation }: { reservation: Reservation }) {
   return (
     <div className="flex items-center gap-3 px-4 py-2 border-b border-gray-100 hover:bg-gray-50">
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="text-sm font-mono text-gray-500">
             {reservation.id.slice(0, 8)}
           </span>
@@ -24,6 +25,7 @@ function ReservationRow({ reservation }: { reservation: Reservation }) {
           <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">
             {reservation.topology_type}
           </span>
+          <PurposeCategoryTag category={reservation.purpose_category} />
         </div>
         <p className="text-xs text-gray-500 mt-0.5">
           {reservation.device_ids.length} device{reservation.device_ids.length !== 1 ? "s" : ""},{" "}

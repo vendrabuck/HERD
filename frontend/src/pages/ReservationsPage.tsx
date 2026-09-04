@@ -8,6 +8,7 @@ import { Pagination } from "@/components/ui/Pagination";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
 import { CreateReservationModal } from "@/components/reservations/CreateReservationModal";
+import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { EmptyState } from "@/components/ui/EmptyState";
 import type { Reservation } from "@/types/reservation.types";
@@ -46,7 +47,12 @@ function ReservationRow({
         {reservation.device_ids.length} device{reservation.device_ids.length !== 1 ? "s" : ""}
       </td>
       <td className="px-4 py-3 text-sm text-gray-500 tabular-nums">{start} to {end}</td>
-      <td className="px-4 py-3 text-sm text-gray-500">{reservation.purpose ?? "-"}</td>
+      <td className="px-4 py-3 text-sm text-gray-500">
+        <div className="flex items-center gap-2">
+          <span>{reservation.purpose ?? "-"}</span>
+          <PurposeCategoryTag category={reservation.purpose_category} />
+        </div>
+      </td>
       <td className="px-4 py-3 text-sm" onClick={(e) => e.stopPropagation()}>
         {reservation.status === "ACTIVE" && (
           <div className="flex gap-1">
