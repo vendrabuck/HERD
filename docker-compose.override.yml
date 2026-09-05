@@ -42,6 +42,11 @@ services:
       # Mirrors the WEBHOOK_TEST_SINK_ENABLED test-knob pattern below; make prod
       # excludes this override.
       EXPIRATION_INTERVAL_SECONDS: "5"
+      # Same reason for the purpose-classify loop, which has its own task and
+      # interval since issue #702: the AI-gated purpose-review integration test
+      # waits under the same --timeout=30 cap for a cancelled reservation to be
+      # classified, and the production default of 60s cannot meet it.
+      PURPOSE_CLASSIFY_INTERVAL_SECONDS: "5"
       # Dev/test-only fault-injection seam (issue #573), mirroring inventory's
       # HERD_FAULT_INJECTION seam above. Enables the double-gated hook in
       # _create_reservation_fork_best_effort's initial wiring_changed staging;
