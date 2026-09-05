@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Fixed the base compose file publishing the unauthenticated Traefik
+  dashboard and API (`api.insecure: true`) on all interfaces, so `make prod`
+  exposed `/api/rawdata` (every router rule, backend container address,
+  middleware chain) to anyone who could reach port 8080 (issue #708).
+  `docker-compose.yml` now binds it `127.0.0.1:8080:8080`; the dev override
+  deliberately adds no second binding, since compose merges port lists and
+  nothing in dev, CI, or QA reaches the dashboard off-host. `FRESH_SETUP.md`
+  describes the SSH tunnel for remote viewing, and a repo-root unit test
+  (`tests/unit/test_compose_ports.py`) yaml-parses both compose files and
+  pins the loopback-only publish.
+
 - Fixed an admin being able to deactivate the superadmin through
   `POST /users/{id}/deactivate` (issue #715). The endpoint now refuses a
   superadmin target with 400 `Cannot deactivate the superadmin`, mirroring
