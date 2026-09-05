@@ -279,14 +279,49 @@ async def test_reconcile_sustained_429_three_ticks_leave_attempts_at_zero():
 
 
 @pytest.mark.asyncio
-async def test_reconcile_timeout_is_transient_no_bump():
+async def test_reconcile_timeout_bumps_attempts_and_does_not_end_tick():
+    """2026-09-05 amendment (issue #706 follow-up): a timeout is per-row
+    evidence, not provider-wide evidence, unlike the other transient
+    outcomes. The first (oldest-requested) row's call times out and must
+    have its attempts bumped, but the reconciler keeps going: the second row
+    is still classified in the SAME tick.
+    """
+    rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
+    rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(side_effect=[httpx.TimeoutException("timed out"), _suggestion_response()])
+    with patch("app.tasks.expiration.call_service", call):
+        await _run_purpose_classify_reconcile()
+
+    assert call.await_count == 2
+    first = await _get(rid_first)
+    assert first.purpose_suggestion is None
+    assert first.purpose_classify_attempts == 1
+    second = await _get(rid_second)
+    assert second.purpose_suggestion is not None
+    assert second.purpose_classify_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_timeout_head_of_line_row_stops_blocking_after_cap():
+    """The literal defect this fix closes: before it, a row whose call always
+    timed out was classed "transient" and ended every tick at the head of the
+    queue, so it blocked every row behind it forever (observed: the same
+    reservation timed out on seven consecutive ticks with attempts still 0
+    while 45 eligible rows waited behind it). Now each timeout bumps that
+    row's own attempts, so after purpose_classify_max_attempts ticks the row
+    falls out of the eligible set (attempts < max_attempts) and the next tick
+    skips it without calling the orchestrator again.
+    """
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
     with patch("app.tasks.expiration.call_service", call):
-        await _run_purpose_classify_reconcile()
+        for _ in range(settings.purpose_classify_max_attempts + 1):
+            await _run_purpose_classify_reconcile()
+
+    assert call.await_count == settings.purpose_classify_max_attempts
     res = await _get(rid)
     assert res.purpose_suggestion is None
-    assert res.purpose_classify_attempts == 0
+    assert res.purpose_classify_attempts == settings.purpose_classify_max_attempts
 
 
 @pytest.mark.asyncio

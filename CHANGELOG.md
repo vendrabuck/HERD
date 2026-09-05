@@ -183,6 +183,19 @@
   exception, and `_release_exclusive_devices_best_effort` drops that id from
   the release set with an INFO log instead of assuming it is exclusive and
   re-releasing it.
+- Fixed the purpose-classify reconciler treating a per-call timeout as
+  provider-wide evidence (issue #706 follow-up, release-gate catch, proven
+  live on the dev stack): a timeout ended the whole sweep tick without
+  bumping the row's attempt count, so one reservation whose classification
+  call ran past `purpose_classify_timeout_seconds` blocked every older-queued
+  row behind it forever, since the reconciler orders oldest-requested-first.
+  Observed: the same reservation timed out on seven consecutive ticks with
+  `purpose_classify_attempts` still 0 while 45 eligible rows waited behind
+  it. A timeout now counts as its own outcome, bumps that row's own attempt
+  count, and lets the tick continue to the next row, since a timeout is
+  evidence about that row's call, not the whole provider; any other
+  transport error (a connection error, for example) is unchanged and still
+  ends the tick.
 
 #### Cabling and forks
 
@@ -510,6 +523,17 @@
   honored; `fetchAllDeviceNames` is a map over it). The server cap is
   unchanged; the page-0-of-500 idiom in the other API modules is left for a
   follow-up.
+
+#### Developer platform, CI, and tests
+
+- Added a `classify_sweep_first` pytest marker (issue #706 follow-up), read
+  by a new `pytest_collection_modifyitems` hook in
+  `tests/integration/conftest.py` that moves any item carrying it to the
+  front of collection. The purpose-classify sweep classifies its backlog
+  oldest-first and serially at model speed, so `test_purpose_review_flow.py`'s
+  AI-gated test now runs before the rest of `tests/integration/` has a
+  chance to queue its own cancelled/completed reservations ahead of it and
+  push it past its poll budget on ordering alone, not a reconciler defect.
 
 ## [0.3.0] - 2026-08-30
 

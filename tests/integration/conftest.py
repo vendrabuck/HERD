@@ -23,6 +23,26 @@ sys.path.insert(0, str(Path(__file__).parent))
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def pytest_collection_modifyitems(config: pytest.Config, items: list) -> None:
+    """Run @pytest.mark.classify_sweep_first items before the rest (issue #706).
+
+    The purpose-classify sweep classifies its backlog oldest-requested-first
+    and serially, at model speed (see test_purpose_review_flow.py's module
+    docstring for the full rationale). If the rest of this suite runs first,
+    it fills the queue with its own cancelled/completed reservations ahead of
+    the ones the sweep test cares about, so that test can time out on a
+    reused stack without any reconciler defect. Moving marked items to the
+    front removes that ordering dependency; every other item keeps its
+    original relative order (a stable partition, not a sort), so this is a
+    no-op for a suite with no marked items.
+    """
+    marked = [item for item in items if item.get_closest_marker("classify_sweep_first")]
+    if not marked:
+        return
+    unmarked = [item for item in items if item not in marked]
+    items[:] = marked + unmarked
+
+
 def _load_repo_env() -> None:
     """Populate os.environ from the repo-root .env, matching docker-compose.
 

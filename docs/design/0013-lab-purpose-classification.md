@@ -403,6 +403,36 @@ neither changing storage, the eligibility marker, or any response shape.
      token is not a per-row problem either and will not resolve on retry),
      but logged at WARNING instead of INFO, since this is a configuration
      problem an operator needs to see and fix.
+3. **Timeout is per-row, not provider-wide (same-day follow-up, proven live
+   on the dev stack 2026-09-05).** Point 2 above lumped a per-call timeout
+   into the new `transient` outcome, on the reasoning that "the caller could
+   not get an answer" reads the same whether the cause is a rate limit, an
+   outage, or a slow response. Live observation on the dev stack showed that
+   reasoning was wrong for a timeout specifically: the local model's median
+   answer was 5s but ran up to 55s under load, so a single reservation
+   whose classification call happened to exceed
+   `purpose_classify_timeout_seconds` (default 30s) repeatedly timed out and,
+   as a `transient` outcome, ended the tick before reaching any row behind
+   it, oldest-requested-first. Observed: the same reservation timed out on
+   seven consecutive ticks with `purpose_classify_attempts` still 0 while 45
+   eligible rows waited behind it, a permanent head-of-line stall rather than
+   the sustained-429 case's bounded until-midnight one. A timeout costs the
+   provider up to `purpose_classify_timeout_seconds` trying to answer for
+   THIS row specifically; that is per-row evidence, not evidence about every
+   other row's provider, so a timeout is now its own outcome, `"timeout"`,
+   excluded from `_PURPOSE_CLASSIFY_TICK_ENDING_OUTCOMES`: it increments the
+   row's own `purpose_classify_attempts` and the reconciler continues to the
+   next row in the same tick. `httpx.TransportError` cases other than a
+   timeout (a connection error, most likely) are unchanged and still class as
+   `transient`, since those really are evidence the whole provider is
+   unreachable right now. Trade-off, stated honestly: a provider that is
+   uniformly slower than the timeout for every row now burns every eligible
+   row's attempts before any of them finish, which the admin backfill
+   endpoint (`POST /admin/purpose/backfill`, point 8) recovers from: it
+   resets any capped-out row's `purpose_classify_attempts` to 0 so the sweep
+   picks it up again; the alternative, this amendment's original point 2
+   behavior, instead stalled the whole queue behind one slow row
+   indefinitely, which is worse.
 
    Owner-based metering of the internal pass (phase 2 amendment, unchanged
    from ADR text: "there is no other acting user for a background call") was
