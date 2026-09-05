@@ -74,17 +74,24 @@ class Settings(HerdBaseSettings):
     utilization_max_span_days: int = 366
 
     # Background purpose-classification sweep (issue #646 phase 2, ADR 0013
-    # point 8's end-of-reservation pass). The reconciler in
-    # app/tasks/expiration.py picks up to this many eligible rows (
+    # point 8's end-of-reservation pass). Since issue #702 it runs on its own
+    # asyncio task (purpose_classify_loop in app/main.py), independent of
+    # expiration_interval_seconds above: it is the only reconciler bound by an
+    # LLM call rather than a DB or fast HTTP round trip, so a slow or hung
+    # orchestrator must not delay the other sweep reconcilers behind it. Each
+    # tick of that loop picks up to this many eligible rows (
     # purpose_classify_requested_at set, no purpose_suggestion yet, under the
     # attempt cap) per tick, oldest requested first, and calls the AI
     # orchestrator's internal classify-purpose endpoint for each.
+    purpose_classify_interval_seconds: int = 60
     purpose_classify_batch_size: int = 20
-    # Per-row cap on sweep attempts (a 5xx, a timeout, or a transport error
-    # increments this; a 403 from the orchestrator, meaning the feature is
-    # off, does NOT count as an attempt). A row at the cap is skipped until an
-    # admin backfill or a taxonomy/config change makes it worth retrying by
-    # hand; there is no automatic reset.
+    # Per-row cap on sweep attempts. A "failed" outcome (a non-transient
+    # non-200 status, or an unparseable 200 body) increments this. Issue
+    # #706: a "transient" outcome (429/502/503/504, a timeout, or a transport
+    # error) and a "feature_off" or "forbidden" 403/404 do NOT count as an
+    # attempt, since none of those are per-row problems. A row at the cap is
+    # skipped until an admin backfill or a taxonomy/config change makes it
+    # worth retrying by hand; there is no automatic reset.
     purpose_classify_max_attempts: int = 3
     # Per-call timeout for the orchestrator's classify-purpose call.
     purpose_classify_timeout_seconds: float = 30.0
