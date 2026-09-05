@@ -10,6 +10,9 @@ import {
   useDevices,
   usePaginatedDevices,
   useAllDeviceNames,
+  useAllDevices,
+  useDevicesByIds,
+  fetchDevicesByIds,
   hydrateCanvasNodes,
 } from "@/api/inventory";
 import type { CanvasData, DeviceNodeData } from "@/types/topology.types";
@@ -99,6 +102,105 @@ describe("inventory api hooks", () => {
     expect(calls).toBe(1);
     expect(result.current.data?.get("a")).toBe("aa");
     expect(result.current.data?.get("b")).toBe("bb");
+  });
+
+  // Issue #703: a full page with total > items.length means more rows exist,
+  // so the walker must issue a second request at skip=500 and return all of
+  // them rather than silently stopping at the server's page cap.
+  it("useAllDevices walks past a full page when total exceeds the page", async () => {
+    const requests: Array<{ skip: string | null; limit: string | null }> = [];
+    const page0 = Array.from({ length: 500 }, (_, i) => device({ id: `d${i}`, name: `n${i}` }));
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        const url = new URL(request.url);
+        const skip = url.searchParams.get("skip");
+        requests.push({ skip, limit: url.searchParams.get("limit") });
+        const items = skip === "500" ? [device({ id: "d500", name: "oldest" })] : page0;
+        return HttpResponse.json({ items, total: 501, skip: Number(skip), limit: 500 });
+      }),
+    );
+    const { result } = renderHook(() => useAllDevices(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(requests).toEqual([
+      { skip: "0", limit: "500" },
+      { skip: "500", limit: "500" },
+    ]);
+    expect(result.current.data).toHaveLength(501);
+    expect(result.current.data?.[500].name).toBe("oldest");
+  });
+
+  it("useAllDevices forwards server-side filters on every page", async () => {
+    const urls: string[] = [];
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        urls.push(request.url);
+        return HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 });
+      }),
+    );
+    const { result } = renderHook(
+      () => useAllDevices({ template_id: "tpl-1", topology_type: "CLOUD", dut_only: true, search: "foo" }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toMatch(/template_id=tpl-1/);
+    expect(urls[0]).toMatch(/topology_type=CLOUD/);
+    expect(urls[0]).toMatch(/dut_only=true/);
+    expect(urls[0]).toMatch(/search=foo/);
+    expect(result.current.data).toEqual([]);
+  });
+
+  it("useDevicesByIds is disabled with no ids and issues no request", () => {
+    const { result } = renderHook(() => useDevicesByIds([]), { wrapper });
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(result.current.data).toBeUndefined();
+  });
+
+  it("useDevicesByIds resolves the requested ids through the batch endpoint", async () => {
+    const bodies = mockBatch([device({ id: "x", name: "xx" }), device({ id: "y", name: "yy" })]);
+    const { result } = renderHook(() => useDevicesByIds(["y", "x", "y"]), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // Duplicates collapse before the request goes out.
+    expect(bodies).toEqual([["y", "x"]]);
+    expect(result.current.data?.map((d) => d.name)).toEqual(["xx", "yy"]);
+  });
+});
+
+describe("fetchDevicesByIds", () => {
+  it("chunks past the 500-id server cap into multiple batch requests", async () => {
+    const ids = Array.from({ length: 501 }, (_, i) => `dev-${i}`);
+    const bodies: string[][] = [];
+    server.use(
+      http.post("/api/inventory/devices/batch", async ({ request }) => {
+        const body = (await request.json()) as { device_ids: string[] };
+        bodies.push(body.device_ids);
+        return HttpResponse.json({ items: body.device_ids.map((id) => device({ id, name: id })) });
+      }),
+    );
+    const devices = await fetchDevicesByIds(ids);
+    expect(bodies.map((b) => b.length)).toEqual([500, 1]);
+    expect(bodies[1]).toEqual(["dev-500"]);
+    expect(devices).toHaveLength(501);
+  });
+
+  it("rejects when any chunk fails rather than returning a partial set", async () => {
+    let n = 0;
+    server.use(
+      http.post("/api/inventory/devices/batch", async ({ request }) => {
+        const body = (await request.json()) as { device_ids: string[] };
+        n += 1;
+        if (n === 2) return new HttpResponse(null, { status: 500 });
+        return HttpResponse.json({ items: body.device_ids.map((id) => device({ id, name: id })) });
+      }),
+    );
+    const ids = Array.from({ length: 501 }, (_, i) => `dev-${i}`);
+    await expect(fetchDevicesByIds(ids)).rejects.toThrow();
+  });
+
+  it("returns an empty list for no ids without a request", async () => {
+    const bodies = mockBatch([]);
+    await expect(fetchDevicesByIds([])).resolves.toEqual([]);
+    expect(bodies).toEqual([]);
   });
 });
 

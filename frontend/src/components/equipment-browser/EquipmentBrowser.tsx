@@ -1,6 +1,6 @@
 import { useState, useDeferredValue, useMemo } from "react";
 import type { LucideIcon } from "lucide-react";
-import { useDevices } from "@/api/inventory";
+import { useAllDevices } from "@/api/inventory";
 import { useTemplates } from "@/api/templates";
 import { NETWORK_ELEMENT_TYPES } from "@/lib/networkElements";
 import type { Device, TopologyType } from "@/types/device.types";
@@ -162,7 +162,7 @@ export function EquipmentBrowser({ canvasDeviceIds = [] }: EquipmentBrowserProps
   const { data: templates } = useTemplates("device");
   // Separate query on purpose: the device list's dut_only shape stays untouched.
   const { data: dynamicTemplates } = useTemplates("dynamic");
-  const { data: devices, isLoading, isError } = useDevices({
+  const { data: devices, isLoading, isError } = useAllDevices({
     template_id: templateFilter || undefined,
     topology_type: topoFilter || undefined,
     dut_only: true,
