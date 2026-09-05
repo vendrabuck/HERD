@@ -22,11 +22,13 @@ from sqlalchemy import (
     JSON,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,6 +40,22 @@ _schema = settings.db_schema or None
 ForkStatus_ACTIVE = "ACTIVE"
 ForkStatus_ARCHIVED = "ARCHIVED"
 
+# Partial index for GET /internal/forks (routes/forks.py): filters status = 'ACTIVE'
+# and orders by created_at, and reservations' expiration sweep drains every page of
+# it every tick (issue #710). fork rows are never deleted (an archived fork is the
+# as-built record the transit report reads), so the table grows without bound while
+# the listing stayed unindexed. `(created_at, id)` rather than created_at alone: id
+# is the listing's stable pagination tie-breaker for rows sharing a created_at.
+# Declared here (not only in the migration) so Base.metadata.create_all builds it
+# for the SQLite unit-test DB; SQLite honors partial indexes too.
+_active_fork_created_at = Index(
+    "ix_reservation_fork_active_created_at",
+    "created_at",
+    "id",
+    sqlite_where=text("status = 'ACTIVE'"),
+    postgresql_where=text("status = 'ACTIVE'"),
+)
+
 # Computed ahead of ReservationFork so its draft_restored_from_id FK (added issue
 # #622) can reference fork_versions.id even though the ForkVersion class is defined
 # later in this module; SQLAlchemy resolves string-based ForeignKey targets against
@@ -48,7 +66,9 @@ _fork_version_fk = f"{_schema}.fork_versions.id" if _schema else "fork_versions.
 
 class ReservationFork(Base):
     __tablename__ = "reservation_fork"
-    __table_args__ = {"schema": _schema} if _schema else {}
+    __table_args__ = (
+        (_active_fork_created_at, {"schema": _schema}) if _schema else (_active_fork_created_at,)
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Bare UUID over the service boundary; no FK into the reservations schema.

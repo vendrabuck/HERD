@@ -910,6 +910,12 @@ async def _fetch_active_forks() -> list[tuple[uuid.UUID, int]]:
     ACTIVE fork whose latest version outran its wiring ledger. Raises on a transport or
     error status; the caller treats a fetch failure as non-fatal to the rest of the
     sweep.
+
+    Stops on a short page (fewer rows than requested) as well as on reaching
+    `total` (issue #710): a short page is definitive proof no more rows exist,
+    cheaper than one extra round-trip to confirm it via `total`, and does not
+    depend on `total` staying consistent across pages for a set that a concurrent
+    save or archive can mutate mid-walk.
     """
     if not settings.internal_api_token:
         return []
@@ -933,7 +939,7 @@ async def _fetch_active_forks() -> list[tuple[uuid.UUID, int]]:
             forks.extend(page)
             total = body.get("total", len(forks))
             skip += limit
-            if not page or skip >= total:
+            if not page or len(page) < limit or skip >= total:
                 break
     return forks
 

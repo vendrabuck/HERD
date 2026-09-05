@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+- Performance fix: the expiration sweep's per-tick ACTIVE fork reconcile no
+  longer scans or reads without an index (issue #710, 2026-09-04 review sweep
+  finding, medium and low severity). `reservation_fork` carried indexes only
+  on `reservation_id`; nothing covered `status` or `created_at`, yet fork rows
+  are never deleted by design (archived forks are the as-built record the
+  transit report reads), so `GET /internal/forks`'s unconditional `COUNT(*)`
+  plus filtered `ORDER BY created_at OFFSET`, drained fully every tick (60s in
+  prod, 5s in dev), ran two unindexed passes over a table that grows forever.
+  Cabling migration 0010 adds a partial index,
+  `ix_reservation_fork_active_created_at` on `(created_at, id) WHERE status =
+  'ACTIVE'`, mirrored in `ReservationFork.__table_args__` so the SQLite
+  unit-test schema matches; no retention added, `total` stays in the listing
+  response. Reservations' `_fetch_active_forks` now also stops paging on a
+  page shorter than the requested limit, not only on reaching `total`, which
+  is cheaper and does not depend on `total` staying consistent across pages
+  against a live set. Separately, an ACTIVE fork whose reservation is unknown
+  to reservations used to log a WARNING and re-warn every tick forever with no
+  path to resolution; it now warns once per reservation id per process,
+  pruned against each tick's known-fork-id set the same way the fork-backstop
+  give-up counter is pruned. Finally, the wiring-staging heal's ledger read
+  (one `db.get(ForkWiringLedger, id)` per ACTIVE fork per tick) is now a
+  single column-only preload of `(reservation_id, last_staged_fork_version)`
+  in chunks of 500, with the fresh per-row `db.get` kept only for forks that
+  actually need healing so the read-to-write window for those rows is
+  unchanged.
+
 - Reliability fix: the purpose-classification reconciler now runs on its own
   background task instead of riding the reservations expiration sweep (issue
   #702, 2026-09-04 review sweep finding). The reconciler awaits one
