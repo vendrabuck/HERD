@@ -4,7 +4,7 @@ import {
   useUtilizationReport,
   type UtilizationCsvSection,
 } from "@/api/reporting";
-import { useDevices } from "@/api/inventory";
+import { useDevicesByIds } from "@/api/inventory";
 import type { DayBucket, DeviceBucket, FleetSection, PurposeBucket } from "@/types/reporting.types";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatCard } from "@/components/ui/StatCard";
@@ -84,7 +84,20 @@ export function ReportingPage() {
     { start: toIso(window.start), end: toIso(window.end) },
     windowValid,
   );
-  const devices = useDevices();
+  // Resolve names and templates for exactly the devices the report mentions,
+  // through the batch endpoint, instead of a page-0-of-500 device list
+  // (issue #703): report.by_device is unbounded server-side, so a list index
+  // silently sent every device past the page cap to the "Unknown" template
+  // bucket. by_device_purpose ids are a subset of by_device today (same
+  // reservation rows, further gated on a confirmed category); the union
+  // costs nothing and keeps the index complete if that ever drifts.
+  const reportDeviceIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const b of report.data?.by_device ?? []) ids.add(b.device_id);
+    for (const r of report.data?.by_device_purpose ?? []) ids.add(r.device_id);
+    return Array.from(ids);
+  }, [report.data]);
+  const devices = useDevicesByIds(reportDeviceIds);
 
   const deviceIndex = useMemo(() => {
     const map = new Map<string, { name: string; template_name: string }>();

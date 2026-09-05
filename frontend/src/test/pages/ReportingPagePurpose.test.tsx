@@ -45,19 +45,23 @@ function renderWithProviders(node: ReactNode) {
   );
 }
 
+// The page resolves report device names through the batch endpoint (issue
+// #703); the list handler stays for parity with the real service.
+const DEVICES = [
+  { id: "dev-1", name: "fw-edge-01", template_name: "FW-3200" },
+  { id: "dev-2", name: "fw-edge-02", template_name: "FW-3200" },
+];
+
 function mockDevices() {
   server.use(
     http.get("/api/inventory/devices", () =>
-      HttpResponse.json({
-        items: [
-          { id: "dev-1", name: "fw-edge-01", template_name: "FW-3200" },
-          { id: "dev-2", name: "fw-edge-02", template_name: "FW-3200" },
-        ],
-        total: 2,
-        skip: 0,
-        limit: 500,
-      }),
+      HttpResponse.json({ items: DEVICES, total: DEVICES.length, skip: 0, limit: 500 }),
     ),
+    http.post("/api/inventory/devices/batch", async ({ request }) => {
+      const { device_ids } = (await request.json()) as { device_ids: string[] };
+      const wanted = new Set(device_ids);
+      return HttpResponse.json({ items: DEVICES.filter((d) => wanted.has(d.id)) });
+    }),
   );
 }
 
