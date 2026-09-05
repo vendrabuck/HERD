@@ -8,6 +8,9 @@ class Settings(HerdBaseSettings):
     algorithm: str = "HS256"
     cors_origins: str = ""
     auth_service_url: str = "http://auth:8000"
+    # Shared with other services for service-to-service calls with no acting
+    # user. Empty disables the internal-token endpoints (issue #704).
+    internal_api_token: str = ""
 
     log_level: str = "INFO"
 

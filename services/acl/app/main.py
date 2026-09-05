@@ -10,6 +10,7 @@ from app.config import settings
 from app.database import Base, engine
 from app.models.grant import ResourceGrant  # noqa: F401
 from app.routers.grants import router as grants_router
+from app.routers.internal import router as internal_router
 
 setup_logging("acl", level=settings.log_level)
 
@@ -37,6 +38,7 @@ add_cors_middleware(app, settings.cors_origins)
 app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(grants_router)
+app.include_router(internal_router)
 
 
 @app.get("/health")
