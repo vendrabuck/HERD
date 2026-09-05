@@ -173,6 +173,13 @@ async def teardown_templates(base_url, admin_token, teardown_drivers):
                 "name": f"{package}-failed-tmpl-{uuid.uuid4().hex[:8]}",
                 "template_type": "device",
                 "driver_id": driver["id"],
+                # mock_l3 is non-exclusive: the L3 redelivery test below books
+                # the SAME switch as a canvas endpoint device into two
+                # overlapping reservations (res_a, res_b), which a still-
+                # exclusive switch would 409 as a time conflict (issue #701
+                # phase 2's membership check now requires every canvas
+                # endpoint device to be booked).
+                "exclusive": package != "mock_l3",
                 "vendor": "IntegrationVendor",
                 "model": f"FailedTeardown-{package}",
                 "sections": [
@@ -309,7 +316,7 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
         # stages the wiring_changed reconcile that pins and configures the routes.
         topo_a = await _create_topology(admin_client, _canvas([(dut_a["id"], switch["id"])]))
         topology_ids.append(topo_a)
-        res_a = await _reserve(admin_client, [dut_a["id"]], topo_a)
+        res_a = await _reserve(admin_client, [dut_a["id"], switch["id"]], topo_a)
         reservations.append(res_a)
         res_id = res_a["id"]
         assert len(
@@ -337,7 +344,7 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
         )
         topo_b = await _create_topology(admin_client, _canvas([(dut_b["id"], switch["id"])]))
         topology_ids.append(topo_b)
-        res_b = await _reserve(admin_client, [dut_b["id"]], topo_b)
+        res_b = await _reserve(admin_client, [dut_b["id"], switch["id"]], topo_b)
         reservations.append(res_b)
         assert await _poll_runs(admin_client, res_b["id"], "configure_route"), (
             "anchor reservation was never provisioned"

@@ -191,7 +191,7 @@ async def test_standing_reconciler_archives_zombie_fork(admin_client, base_url, 
         # Manufacture the zombie: an ACTIVE fork for the already-COMPLETED reservation.
         created = await raw.post(
             "/cabling/internal/forks",
-            json={"reservation_id": reservation_id},
+            json={"reservation_id": reservation_id, "member_device_ids": [a_id]},
             headers=headers,
         )
         assert created.status_code == 201, created.text
