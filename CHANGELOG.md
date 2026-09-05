@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- Fixed `PATCH /preferences` in the user-profile service validating only the
+  incoming dict, never the merged result, so repeated patches could grow one
+  JSONB row past every cap (issue #714). The service now validates each
+  merged dict (the 200-key and 64 KB caps on `saved_filters` and `extras`,
+  the key cap and page-size range on `page_sizes`) before assigning anything
+  and answers 422 with a `merged <field> ...` detail; a rejected PATCH
+  leaves the row exactly as it was. `PUT` and `DELETE` remain the shrink
+  paths.
+
 - Added Download CSV buttons for the four purpose reporting sections (issue
   #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
   join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a

@@ -1,10 +1,12 @@
 import uuid
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.preferences import UserPreferences
+from app.schemas.preferences import _validate_blob, _validate_page_sizes
 
 
 async def _select_prefs(db: AsyncSession, user_id: uuid.UUID) -> UserPreferences | None:
@@ -69,22 +71,45 @@ async def patch(
     page_sizes: dict | None,
     extras: dict | None,
 ) -> UserPreferences:
+    """Shallow-merge each supplied dict into the stored one.
+
+    The request schema caps only the INCOMING dict; the caps must also hold on
+    the MERGED result, or repeated patches grow one JSONB row without bound
+    (issue #714). Every merge is validated before any attribute is assigned,
+    so a rejected PATCH leaves the row exactly as it was. The router does not
+    translate a service ValueError, so the 422 is raised here explicitly.
+    """
     prefs = await get_or_create(db, user_id)
-    if saved_filters is not None:
-        merged = dict(prefs.saved_filters)
-        merged.update(saved_filters)
-        prefs.saved_filters = merged
-    if page_sizes is not None:
-        merged = dict(prefs.page_sizes)
-        merged.update(page_sizes)
-        prefs.page_sizes = merged
-    if extras is not None:
-        merged = dict(prefs.extras)
-        merged.update(extras)
-        prefs.extras = merged
+    merged_filters = _merge(prefs.saved_filters, saved_filters)
+    merged_sizes = _merge(prefs.page_sizes, page_sizes)
+    merged_extras = _merge(prefs.extras, extras)
+    try:
+        _validate_blob(merged_filters, "saved_filters")
+        _validate_page_sizes(merged_sizes)
+        _validate_blob(merged_extras, "extras")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"merged {exc}",
+        ) from exc
+    if merged_filters is not None:
+        prefs.saved_filters = merged_filters
+    if merged_sizes is not None:
+        prefs.page_sizes = merged_sizes
+    if merged_extras is not None:
+        prefs.extras = merged_extras
     await db.commit()
     await db.refresh(prefs)
     return prefs
+
+
+def _merge(current: dict, incoming: dict | None) -> dict | None:
+    """Return current updated by incoming, or None when incoming is None (no change)."""
+    if incoming is None:
+        return None
+    merged = dict(current)
+    merged.update(incoming)
+    return merged
 
 
 async def reset(db: AsyncSession, user_id: uuid.UUID) -> UserPreferences:
