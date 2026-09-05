@@ -58,9 +58,19 @@ async def lifespan(app: FastAPI):
         logger.warning("NATS unavailable at %s, events will be skipped", settings.nats_url)
 
     # Start expiration background task
-    from app.tasks.expiration import expiration_loop
+    from app.tasks.expiration import expiration_loop, purpose_classify_loop
 
     expiration_task = asyncio.create_task(expiration_loop(settings.expiration_interval_seconds))
+
+    # Start the purpose-classify reconciler on its own task, at its own
+    # interval (issue #702): it is the only sweep reconciler bound by an LLM
+    # call rather than a DB or fast HTTP round trip, so a slow or hung
+    # orchestrator must not delay expiration_task's other reconcilers
+    # (activation, auto-completion, both provisioning-timeout backstops, fork
+    # archiving, wiring heal, and pending prune) behind it.
+    purpose_classify_task = asyncio.create_task(
+        purpose_classify_loop(settings.purpose_classify_interval_seconds)
+    )
 
     # Start the transactional-outbox relay (issue #21): drain unpublished outbox
     # rows to JetStream and prune old ones. get_nats is read each tick so a
@@ -85,6 +95,12 @@ async def lifespan(app: FastAPI):
     expiration_task.cancel()
     try:
         await expiration_task
+    except asyncio.CancelledError:
+        pass
+
+    purpose_classify_task.cancel()
+    try:
+        await purpose_classify_task
     except asyncio.CancelledError:
         pass
 

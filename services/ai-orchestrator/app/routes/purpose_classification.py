@@ -11,6 +11,16 @@ daily quota gates with 429. Both run BEFORE the signal gather (issue #709):
 the gather fans out to inventory and cabling, so an unconfigured provider
 or an over-quota caller must not be able to drive that fan-out.
 
+Issue #706: the flag-off 403 carries a structured detail,
+`{"error": "purpose_classification_disabled", "message": <the readable
+string below>}`, the same `{"error": ...}` shape other closed-by-default
+cross-service guards in this codebase already use (see CLAUDE.md's
+device_in_use/secret_in_use guards). `/internal/classify-purpose` can also
+403 on an internal-token mismatch (`_check_internal_token` below), a
+different problem with the same status code; the reservations-service
+caller distinguishes the two by this marker rather than by status code
+alone, so a bad token is never misread as the feature being off.
+
 One forced classify_purpose tool call per request, through the LLMProvider
 abstraction (app/services/purpose_classifier.py). A signal-fetch failure
 (inventory, cabling, or the transcript read) never fails the request: see
@@ -48,7 +58,18 @@ from app.services.purpose_classifier import PurposeClassifierError, classify_pur
 
 logger = logging.getLogger(__name__)
 
-PURPOSE_CLASSIFICATION_DISABLED_DETAIL = "Purpose classification is disabled"
+# Structured marker (issue #706): the reservations-service caller checks
+# `detail["error"]` for this exact value to distinguish "the feature is off"
+# from any other 403 this route can answer (an internal-token mismatch, most
+# likely). `message` keeps the original human-readable string available
+# under a stable key, since a plain string body is what a pre-#706 caller
+# (or a human hitting this route directly) still expects to read.
+PURPOSE_CLASSIFICATION_DISABLED_MARKER = "purpose_classification_disabled"
+PURPOSE_CLASSIFICATION_DISABLED_MESSAGE = "Purpose classification is disabled"
+PURPOSE_CLASSIFICATION_DISABLED_DETAIL = {
+    "error": PURPOSE_CLASSIFICATION_DISABLED_MARKER,
+    "message": PURPOSE_CLASSIFICATION_DISABLED_MESSAGE,
+}
 AI_CLASSIFICATION_FAILED_DETAIL = "AI classification failed"
 
 _get_current_user, _require_admin = make_auth_dependencies(
@@ -62,7 +83,14 @@ router = APIRouter(tags=["purpose-classification"])
 def require_purpose_classification() -> None:
     """Boundary enforcement of the default-off flag (the issue #113
     discipline): the routes are refused, not merely undocumented, when the
-    flag is off. Mirrors app/routes/recipes.py's require_recipe_authoring."""
+    flag is off. Mirrors app/routes/recipes.py's require_recipe_authoring.
+
+    The detail is the structured PURPOSE_CLASSIFICATION_DISABLED_DETAIL
+    (issue #706), not a plain string, so the reservations-service reconciler
+    can tell this 403 apart from an internal-token mismatch on
+    /internal/classify-purpose (see _check_internal_token below), which
+    answers the same status code for an unrelated reason.
+    """
     if not settings.ai_purpose_classification_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, PURPOSE_CLASSIFICATION_DISABLED_DETAIL)
 

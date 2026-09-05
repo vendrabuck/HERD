@@ -1,8 +1,10 @@
 """The end-of-reservation purpose-classification sweep reconciler (issue #646
-phase 2, ADR 0013 point 8's second pass): app.tasks.expiration._run_purpose_
-classify_reconcile and its per-row helper _classify_purpose_one.
+phase 2, ADR 0013 point 8's second pass; issue #706's outcome-taxonomy fix):
+app.tasks.expiration._run_purpose_classify_reconcile and its per-row helper
+_classify_purpose_one.
 """
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -19,6 +21,20 @@ from app.models.reservation import (
 )
 from app.tasks.expiration import _run_purpose_classify_reconcile
 from sqlalchemy.ext.asyncio import async_sessionmaker
+
+# The structured 403 detail the orchestrator's flag refusal carries (issue
+# #706), matching services/ai-orchestrator/app/routes/purpose_classification.py's
+# PURPOSE_CLASSIFICATION_DISABLED_DETAIL. Reservations does not import across
+# the service boundary (HTTP only), so this is duplicated deliberately, the
+# same way the two services' contracts are pinned independently everywhere
+# else in this codebase.
+_FEATURE_OFF_DETAIL = {
+    "error": "purpose_classification_disabled",
+    "message": "Purpose classification is disabled",
+}
+# The exact string a pre-#706 orchestrator image answers for the same
+# refusal; the fallback the fix must still recognize as feature-off.
+_LEGACY_FEATURE_OFF_DETAIL = "Purpose classification is disabled"
 
 # The reconciler opens its own AsyncSessionLocal against the app engine
 # (mirrors test_expiration.py and test_fork_archive_reconcile.py).
@@ -120,10 +136,13 @@ async def test_reconcile_no_dynamic_requests_sends_null():
 
 
 @pytest.mark.asyncio
-async def test_reconcile_403_ends_tick_without_touching_any_row():
+async def test_reconcile_403_structured_marker_ends_tick_without_touching_any_row():
+    """The structured {"error": "purpose_classification_disabled"} 403 (issue
+    #706) is feature-off: the tick ends at the first row without touching any
+    row, including later ones in the same batch."""
     rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
     rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
-    call = AsyncMock(return_value=httpx.Response(403, json={"detail": "off"}))
+    call = AsyncMock(return_value=httpx.Response(403, json={"detail": _FEATURE_OFF_DETAIL}))
     with patch("app.tasks.expiration.call_service", call):
         await _run_purpose_classify_reconcile()
 
@@ -134,6 +153,44 @@ async def test_reconcile_403_ends_tick_without_touching_any_row():
         res = await _get(rid)
         assert res.purpose_suggestion is None
         assert res.purpose_classify_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_403_legacy_string_detail_is_still_feature_off():
+    """A pre-#706 orchestrator image answers the exact legacy plain-string
+    detail instead of the structured marker; the reconciler must still read
+    that as feature-off (the documented fallback), not burn an attempt."""
+    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(return_value=httpx.Response(403, json={"detail": _LEGACY_FEATURE_OFF_DETAIL}))
+    with patch("app.tasks.expiration.call_service", call):
+        await _run_purpose_classify_reconcile()
+    res = await _get(rid)
+    assert res.purpose_suggestion is None
+    assert res.purpose_classify_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_403_bad_token_is_not_feature_off(caplog):
+    """Issue #706: a 403 that is NOT the feature-off marker (an internal-token
+    mismatch, in practice) is a different problem. Observably it still ends
+    the tick without bumping any row's attempts (like feature-off), but it
+    must be logged at WARNING, not the feature-off case's INFO, since this is
+    a configuration problem an operator needs to see and fix.
+    """
+    rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
+    rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(return_value=httpx.Response(403, json={"detail": "Invalid internal token"}))
+    with patch("app.tasks.expiration.call_service", call), caplog.at_level(logging.WARNING):
+        await _run_purpose_classify_reconcile()
+
+    call.assert_awaited_once()
+    for rid in (rid_first, rid_second):
+        res = await _get(rid)
+        assert res.purpose_suggestion is None
+        assert res.purpose_classify_attempts == 0
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(getattr(r, "action", None) == "purpose_classify_forbidden" for r in warnings)
 
 
 @pytest.mark.asyncio
@@ -174,9 +231,11 @@ async def test_reconcile_404_then_later_tick_still_untouched():
 
 
 @pytest.mark.asyncio
-async def test_reconcile_5xx_increments_attempts():
+async def test_reconcile_500_increments_attempts():
+    """A 500 is not in the transient set (429/502/503/504): it is an ordinary
+    per-row failure and bumps attempts, unlike the transient codes below."""
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
-    call = AsyncMock(return_value=httpx.Response(503, text="unavailable"))
+    call = AsyncMock(return_value=httpx.Response(500, text="internal error"))
     with patch("app.tasks.expiration.call_service", call):
         await _run_purpose_classify_reconcile()
     res = await _get(rid)
@@ -185,34 +244,61 @@ async def test_reconcile_5xx_increments_attempts():
 
 
 @pytest.mark.asyncio
-async def test_reconcile_502_no_usable_distribution_increments_attempts():
-    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
-    call = AsyncMock(return_value=httpx.Response(502, json={"detail": "no usable distribution"}))
+@pytest.mark.parametrize("status_code", [429, 502, 503, 504])
+async def test_reconcile_transient_status_ends_tick_without_bump(status_code):
+    """Issue #706: 429 (rate limit), 502/503/504 (misconfiguration or an
+    outage, including the AI_NOT_CONFIGURED_DETAIL 503 case) are all
+    transient: the tick ends at the first row, no attempt is counted, and a
+    later row in the same batch is left untouched, exactly like feature_off.
+    """
+    rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
+    rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(return_value=httpx.Response(status_code, text="unavailable"))
     with patch("app.tasks.expiration.call_service", call):
         await _run_purpose_classify_reconcile()
-    res = await _get(rid)
-    assert res.purpose_suggestion is None
-    assert res.purpose_classify_attempts == 1
+
+    call.assert_awaited_once()
+    for rid in (rid_first, rid_second):
+        res = await _get(rid)
+        assert res.purpose_suggestion is None
+        assert res.purpose_classify_attempts == 0
 
 
 @pytest.mark.asyncio
-async def test_reconcile_timeout_increments_attempts():
+async def test_reconcile_sustained_429_three_ticks_leave_attempts_at_zero():
+    """The literal issue #706 regression case: a quota 429 can last until UTC
+    midnight, hundreds of ticks; none of them may burn this row's attempt cap."""
+    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(return_value=httpx.Response(429, text="rate limited"))
+    with patch("app.tasks.expiration.call_service", call):
+        for _ in range(3):
+            await _run_purpose_classify_reconcile()
+    res = await _get(rid)
+    assert res.purpose_suggestion is None
+    assert res.purpose_classify_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_timeout_is_transient_no_bump():
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
     with patch("app.tasks.expiration.call_service", call):
         await _run_purpose_classify_reconcile()
     res = await _get(rid)
     assert res.purpose_suggestion is None
-    assert res.purpose_classify_attempts == 1
+    assert res.purpose_classify_attempts == 0
 
 
 @pytest.mark.asyncio
-async def test_reconcile_transport_error_never_raises():
-    await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+async def test_reconcile_transport_error_never_raises_and_is_transient():
+    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(side_effect=httpx.ConnectError("down"))
     with patch("app.tasks.expiration.call_service", call):
         # Must not raise.
         await _run_purpose_classify_reconcile()
+    res = await _get(rid)
+    assert res.purpose_suggestion is None
+    assert res.purpose_classify_attempts == 0
 
 
 @pytest.mark.asyncio

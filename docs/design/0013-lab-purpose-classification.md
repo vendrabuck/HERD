@@ -337,6 +337,86 @@ point 6's deferral. Five decisions over the "Phase 3, remaining" line below:
    `transit_reservations, transit_device_hours`, both after the existing
    columns; column order for the pre-existing columns is unchanged.
 
+## Amendment 2026-09-05 (issues #702, #706: reconciler task and outcome taxonomy)
+
+Found by the 2026-09-04 review sweep, shipped 2026-09-05. Two fixes to the
+end-of-reservation reconciler from point 8 and the phase 2 amendment above,
+neither changing storage, the eligibility marker, or any response shape.
+
+1. **The reconciler runs on its own asyncio task, not the expiration sweep
+   (issue #702).** Point 8 and the phase 2 amendment describe the reconciler
+   as "a new reservations sweep reconciler" riding the same loop as
+   activation, auto-completion, both provisioning-timeout backstops, fork
+   archiving, wiring heal, and pending prune. That coupling was a latent
+   defect: this is the only reconciler in that loop bound by an LLM call
+   rather than a DB or fast HTTP round trip. With `purpose_classify_batch_size`
+   rows (default 20) each allowed up to `purpose_classify_timeout_seconds`
+   (default 30s), a single tick could run for minutes against a slow or
+   degraded orchestrator, delaying every other reconciler in the loop behind
+   it. `services/reservations/app/main.py` now starts a second task,
+   `purpose_classify_loop`, at its own interval
+   (`purpose_classify_interval_seconds`, env `PURPOSE_CLASSIFY_INTERVAL_SECONDS`,
+   default 60s, see `docs/ENV_VARS.md`), cancelled alongside `expiration_task`
+   at shutdown. The reconciler's body is unchanged and stays sequential
+   inside its own loop (no `asyncio.gather` over the batch): one provider
+   account fanning out to inventory and cabling per call, so running the
+   batch concurrently would multiply that fan-out for no benefit.
+   `expiration_loop` no longer calls `_run_purpose_classify_reconcile` at
+   all.
+2. **A `transient` outcome class, and an unambiguous flag-off signal (issue
+   #706).** The phase 2 amendment's point 2 already carved out 403 (the
+   disabled flag) and 404 (a pre-upgrade orchestrator image) as "not
+   available yet, do not count an attempt". Two gaps remained in the
+   reconciler's outcome taxonomy (`_classify_purpose_one` in
+   `services/reservations/app/tasks/expiration.py`):
+   - Every non-403/404 failure, including a 429 (a rate limit, this
+     caller's own or the shared daily-quota one), a 502/503/504
+     (misconfiguration or an outage, including the `AI_NOT_CONFIGURED_DETAIL`
+     503 the orchestrator answers when its own provider is unconfigured), a
+     timeout, or a transport error, incremented `purpose_classify_attempts`
+     exactly like a genuine per-row rejection. A quota 429 lasts until UTC
+     midnight, hundreds of sweep ticks; that composition meant a rate-limited
+     owner's rows deterministically capped out well before the quota reset,
+     invisible in aggregate metrics since only that owner's rows were
+     affected. A new `transient` outcome for exactly those cases (429, 502,
+     503, 504, a timeout, or any other transport error) ends the tick without
+     incrementing any row's attempts, the same "not a per-row problem, do not
+     spend the batch confirming it" treatment `feature_off` already had.
+   - A 403 from `POST /internal/classify-purpose` is reachable two ways
+     (`services/ai-orchestrator/app/routes/purpose_classification.py`): the
+     flag-off refusal, and an internal-token mismatch
+     (`_check_internal_token`). The reconciler read any 403 as flag-off,
+     which meant a rotated `INTERNAL_API_TOKEN` that only one service picked
+     up (the repo's own documented gotcha: rotating the token and rebuilding
+     only the orchestrator container) silently stalled the whole backlog
+     while the only greppable log line named the wrong cause, and
+     `GET /api/ai/status` kept reporting `purpose_classification: true` the
+     whole time. The fix is a structured marker on the flag refusal only:
+     `PURPOSE_CLASSIFICATION_DISABLED_DETAIL` is now
+     `{"error": "purpose_classification_disabled", "message": "Purpose
+     classification is disabled"}` instead of the bare string; the
+     reconciler treats a 403 as `feature_off` only when it carries that
+     marker (with a fallback to the exact legacy plain-string detail, so a
+     pre-#706 orchestrator image is still read correctly during a rolling
+     upgrade). Any other 403 is a new `forbidden` outcome: same observable
+     effect as `feature_off` (ends the tick, no attempt counted, since a bad
+     token is not a per-row problem either and will not resolve on retry),
+     but logged at WARNING instead of INFO, since this is a configuration
+     problem an operator needs to see and fix.
+
+   Owner-based metering of the internal pass (phase 2 amendment, unchanged
+   from ADR text: "there is no other acting user for a background call") was
+   explicitly out of scope for this amendment; a system-principal alternative
+   is a separate decision the docs still record as owner metering with its
+   original rationale.
+
+   No storage change: this amendment touches only the reconciler's control
+   flow and the orchestrator's 403 body shape, not `purpose_classify_attempts`'
+   column, `purpose_classify_requested_at`'s semantics, or any response
+   schema. The ai-orchestrator contract snapshot (`tests/contract/snapshots/
+   ai.json`) is unaffected, since HTTPException detail bodies are not part of
+   the OpenAPI schema FastAPI generates.
+
 ## Delivery phases
 
 1. Phase 1, delivered (schema, API, manual dropdown, reporting): the three columns and

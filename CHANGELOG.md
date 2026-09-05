@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+- Reliability fix: the purpose-classification reconciler now runs on its own
+  background task instead of riding the reservations expiration sweep (issue
+  #702, 2026-09-04 review sweep finding). The reconciler awaits one
+  orchestrator LLM call per eligible row, serially, up to
+  `purpose_classify_batch_size` rows (default 20) each bounded by
+  `purpose_classify_timeout_seconds` (default 30s); a single tick could
+  therefore run for minutes, delaying every other reconciler that shared the
+  loop (scheduled activation, auto-completion, both provisioning-timeout
+  backstops, fork archiving, wiring heal, and pending prune) behind a slow or
+  hung orchestrator. `services/reservations/app/main.py` now starts a second
+  task, `purpose_classify_loop`, at its own interval
+  (`PURPOSE_CLASSIFY_INTERVAL_SECONDS`, default 60s), cancelled alongside the
+  expiration task at shutdown; the reconciler's body stays sequential (no
+  concurrent LLM calls). `expiration_loop` no longer calls the reconciler.
+- Bug fix: the purpose-classification reconciler gains a `transient` outcome
+  class and stops misreading an internal-token failure as the feature being
+  off (issue #706, 2026-09-04 review sweep finding). Previously every
+  non-403/404 failure, a 429 rate limit, a 502/503/504, a timeout, or a
+  transport error, incremented a row's `purpose_classify_attempts` exactly
+  like a genuine per-row rejection; a quota 429 lasts until UTC midnight
+  (hundreds of sweep ticks), so a rate-limited owner's rows deterministically
+  capped out, invisible in aggregate metrics. A new `transient` outcome for
+  those cases ends the tick without touching any row's attempts, the same
+  treatment `feature_off` already had. Separately, `POST
+  /internal/classify-purpose` can 403 for two unrelated reasons
+  (`AI_PURPOSE_CLASSIFICATION_ENABLED` off, or an internal-token mismatch),
+  and the reconciler read either as "the feature is off", silently stalling
+  the backlog after a token rotation while logging the wrong cause. The
+  orchestrator's flag-off refusal now carries a structured detail,
+  `{"error": "purpose_classification_disabled", "message": "Purpose
+  classification is disabled"}`; the reconciler treats a 403 as feature-off
+  only when that marker is present (falling back to the exact legacy
+  plain-string detail for a pre-fix orchestrator image during a rolling
+  upgrade), and logs any other 403 at WARNING as a likely internal-token
+  problem instead. See the ADR 0013 amendment for the full outcome taxonomy.
 - Security fix: fork saves and activation snapshots now check the canvas's
   endpoint devices against the reservation's membership (2026-09-04 review
   sweep finding, security/HIGH). Since ADR 0009 phase 7 made the fork the sole
