@@ -1,10 +1,11 @@
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload, require_admin
 from app.main import app
+from app.services.visible_devices import VisibleDevicesUnavailableError
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -136,8 +137,17 @@ async def test_delete_connection_not_found(admin_client):
 
 @pytest.mark.asyncio
 async def test_user_can_list(user_client):
-    resp = await user_client.get("/connections")
+    """A non-admin caller with an empty visible set still gets 200 + [] (issue #719)."""
+    fetch = AsyncMock(return_value=set())
+    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+        resp = await user_client.get(
+            "/connections", headers={"Authorization": "Bearer viewer-token"}
+        )
     assert resp.status_code == 200
+    data = resp.json()
+    assert data["items"] == []
+    assert data["total"] == 0
+    fetch.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -586,3 +596,156 @@ async def test_create_duplicate_connection(admin_client):
     assert resp2.status_code == 201
     # Different IDs
     assert resp1.json()["id"] != resp2.json()["id"]
+
+
+# --- Non-admin visibility filter on GET /connections (issue #719) ---
+#
+# Fleet-wide GET /connections was flagged as the reconnaissance step behind
+# the fork-membership exploit (#701): a non-admin could enumerate device ids
+# and port names for gear they cannot otherwise see. These tests pin the fix:
+# a non-admin sees only connections touching a device visible to them, an
+# admin is never filtered (and never calls inventory), and an unreachable
+# inventory fails closed rather than falling back to an unfiltered list.
+
+
+@pytest.mark.asyncio
+async def test_non_admin_sees_only_connections_touching_visible_device(admin_client, user_client):
+    """A connection between two non-visible devices is absent from the non-admin's list."""
+    visible_dev = str(uuid.uuid4())
+    hidden_dev = str(uuid.uuid4())
+    other_hidden_dev = str(uuid.uuid4())
+
+    # Connection 1: touches the visible device.
+    resp1 = await admin_client.post(
+        "/connections",
+        json={
+            "device_a_id": visible_dev,
+            "port_a": "eth0",
+            "device_b_id": hidden_dev,
+            "port_b": "eth1",
+            "connection_type": "ethernet",
+        },
+    )
+    assert resp1.status_code == 201
+    visible_conn_id = resp1.json()["id"]
+
+    # Connection 2: between two devices the caller cannot see at all.
+    resp2 = await admin_client.post(
+        "/connections",
+        json={
+            "device_a_id": hidden_dev,
+            "port_a": "eth2",
+            "device_b_id": other_hidden_dev,
+            "port_b": "eth3",
+            "connection_type": "ethernet",
+        },
+    )
+    assert resp2.status_code == 201
+
+    fetch = AsyncMock(return_value={uuid.UUID(visible_dev)})
+    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+        resp = await user_client.get(
+            "/connections", headers={"Authorization": "Bearer viewer-token"}
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    ids = [c["id"] for c in data["items"]]
+    assert ids == [visible_conn_id]
+    fetch.assert_awaited_once()
+    # The caller's own sub is what gets resolved, forwarding their own token.
+    called_caller_id, called_auth = fetch.await_args.args
+    assert str(called_caller_id) == USER_PAYLOAD["sub"]
+    assert called_auth == "Bearer viewer-token"
+
+
+@pytest.mark.asyncio
+async def test_non_admin_visible_set_total_matches_filtered_count(admin_client, user_client):
+    """total reflects the SQL-filtered set, not a post-filtered page (pagination-correct)."""
+    visible_dev = str(uuid.uuid4())
+    for i in range(3):
+        resp = await admin_client.post(
+            "/connections",
+            json={
+                "device_a_id": visible_dev,
+                "port_a": f"eth{i}",
+                "device_b_id": str(uuid.uuid4()),
+                "port_b": "eth0",
+                "connection_type": "ethernet",
+            },
+        )
+        assert resp.status_code == 201
+    # A connection with neither endpoint visible.
+    resp = await admin_client.post(
+        "/connections",
+        json={
+            "device_a_id": str(uuid.uuid4()),
+            "port_a": "eth0",
+            "device_b_id": str(uuid.uuid4()),
+            "port_b": "eth1",
+            "connection_type": "ethernet",
+        },
+    )
+    assert resp.status_code == 201
+
+    fetch = AsyncMock(return_value={uuid.UUID(visible_dev)})
+    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+        resp = await user_client.get(
+            "/connections?limit=2", headers={"Authorization": "Bearer viewer-token"}
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 3
+    assert len(data["items"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_admin_list_connections_never_calls_inventory(admin_client):
+    """Admins stay unfiltered and the visibility lookup is never invoked."""
+    await admin_client.post("/connections", json=_connection_body())
+    fetch = AsyncMock(return_value=set())
+    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+        resp = await admin_client.get("/connections")
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 1
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_admin_empty_visible_set_returns_empty_page(admin_client, user_client):
+    """An empty visible-device set answers [] / total 0, no query against real data."""
+    await admin_client.post("/connections", json=_connection_body())
+    fetch = AsyncMock(return_value=set())
+    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+        resp = await user_client.get(
+            "/connections", headers={"Authorization": "Bearer viewer-token"}
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["items"] == []
+    assert data["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_non_admin_list_connections_inventory_unreachable_503(admin_client, user_client):
+    """Inventory unreachable answers 503 for a non-admin and returns nothing."""
+    await admin_client.post("/connections", json=_connection_body())
+    fetch = AsyncMock(side_effect=VisibleDevicesUnavailableError("boom"))
+    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+        resp = await user_client.get(
+            "/connections", headers={"Authorization": "Bearer viewer-token"}
+        )
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_non_admin_list_connections_missing_authorization_header(user_client):
+    """No Authorization header on the non-admin path is a contract violation (500).
+
+    The user_client fixture overrides get_current_user_payload directly, so
+    this can happen in practice only if the header is dropped somewhere
+    upstream; mirrors inventory's _fetch_user_group_ids guard for the same
+    case.
+    """
+    resp = await user_client.get("/connections")
+    assert resp.status_code == 500

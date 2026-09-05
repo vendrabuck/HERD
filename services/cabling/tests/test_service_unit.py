@@ -528,11 +528,21 @@ async def test_connections_route_create_direct():
 
 @pytest.mark.asyncio
 async def test_connections_route_list_direct():
+    """Admin payload: exercises the unfiltered path directly, no inventory call.
+
+    Non-admin filtering (issue #719) is covered in test_connections.py, where
+    the visibility lookup can be patched at the HTTP-client level.
+    """
     from app.routes.connections import list_connections_endpoint
 
     async with TestSession() as db:
         result = await list_connections_endpoint(
-            device_id=None, skip=0, limit=50, db=db, _={"sub": str(USER_ID)}
+            device_id=None,
+            skip=0,
+            limit=50,
+            db=db,
+            payload={"sub": str(USER_ID), "role": "admin"},
+            authorization=None,
         )
         assert result.total == 0
 

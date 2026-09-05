@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.auth import ADMIN_ROLES
 from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +22,10 @@ from app.services.connection_service import (
     delete_connection,
     get_connection,
     list_connections,
+)
+from app.services.visible_devices import (
+    VisibleDevicesUnavailableError,
+    fetch_visible_device_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,11 +50,54 @@ async def list_connections_endpoint(
     device_id: uuid.UUID | None = Query(None, description="Filter by device on either side"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
-    _: dict = Depends(get_current_user_payload),
+    payload: dict = Depends(get_current_user_payload),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all backend connections. Available to all authenticated users (read-only)."""
-    items, total = await list_connections(db, device_id=device_id, skip=skip, limit=limit)
+    """List backend connections, available to all authenticated users.
+
+    Admins (admin or superadmin) see every connection, unfiltered. A
+    non-admin caller is restricted to connections where at least one
+    endpoint device is visible to them (issue #719): the fleet-wide dump
+    was a reconnaissance step for the fork-membership exploit (#701),
+    exposing device ids and port names for gear the caller could not
+    otherwise see. Visibility is resolved from inventory by forwarding the
+    caller's own JWT; this fails CLOSED for non-admins (503, nothing
+    returned) if inventory cannot answer, since a broken visibility check
+    must never fall back to an unfiltered list. An empty visible set is a
+    legitimate "sees nothing" and short-circuits to an empty page without
+    querying the database.
+    """
+    if payload.get("role") in ADMIN_ROLES:
+        items, total = await list_connections(db, device_id=device_id, skip=skip, limit=limit)
+        return PaginatedConnectionResponse(items=items, total=total, skip=skip, limit=limit)
+
+    if authorization is None:
+        raise HTTPException(
+            status_code=500,
+            detail="internal: missing Authorization header while resolving device visibility",
+        )
+    try:
+        visible_ids = await fetch_visible_device_ids(uuid.UUID(payload["sub"]), authorization)
+    except VisibleDevicesUnavailableError as exc:
+        logger.warning(
+            "connections_visibility_unavailable",
+            extra={"caller_id": payload.get("sub"), "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not verify device visibility; connections were not "
+                "returned. Retry the request."
+            ),
+        ) from exc
+
+    if not visible_ids:
+        return PaginatedConnectionResponse(items=[], total=0, skip=skip, limit=limit)
+
+    items, total = await list_connections(
+        db, device_id=device_id, skip=skip, limit=limit, visible_device_ids=visible_ids
+    )
     return PaginatedConnectionResponse(items=items, total=total, skip=skip, limit=limit)
 
 

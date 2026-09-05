@@ -1312,12 +1312,23 @@ Backend connections are physical cables or virtual links between device ports.
 They are managed by administrators and are not exposed to end-users as raw data.
 The topology canvas reflects them, but users cannot create or delete them.
 
-### List all connections
+### List connections
 
 ```
 GET /api/cabling/connections
 Authorization: Bearer <any-authenticated-token>
 ```
+
+Admin and superadmin callers see every connection in the fleet, unfiltered. A
+non-admin caller is restricted to connections where at least one endpoint device is
+visible to them (the same device-group visibility that gates `GET /api/inventory/devices`);
+a connection between two devices the caller cannot see is omitted entirely, and
+`total` reflects the filtered count. This closes a reconnaissance path that fed the
+fork-membership finding (issue #701): before this filter, any authenticated user could
+enumerate device ids and port names for gear outside their device-group visibility.
+If the device-visibility lookup cannot be answered, a non-admin's request fails closed
+with a 503 rather than falling back to an unfiltered list; admins never trigger this
+lookup at all.
 
 ### Create a connection
 
