@@ -271,6 +271,14 @@ export interface ForkConflictDetail {
   conflicts: ForkPortConflict[];
 }
 
+// The structured detail of a fork endpoint-membership 409 (issue #701): a save
+// or create whose canvas names a device outside the reservation's device set,
+// relayed verbatim through reservations from cabling.
+export interface ForkDeviceNotMemberDetail {
+  error: "fork_device_not_member";
+  device_ids: string[];
+}
+
 // --- Layered per-connection wiring status (ADR 0007 / ADR 0009) -------------
 // After a fork save reconciles the intended wiring, execution applies each layer
 // connection-by-connection and records the applied state in its wiring ledgers

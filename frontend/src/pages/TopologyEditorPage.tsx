@@ -24,7 +24,9 @@ import {
   useReservationFork,
   useSaveReservationFork,
   forkConflictDetail,
+  forkDeviceNotMemberDetail,
 } from "@/api/reservations";
+import { errorDetail } from "@/lib/errors";
 import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
@@ -73,7 +75,7 @@ import { resolveEdgeStroke } from "@/components/topology-editor/edges/edgeStatus
 import { genId } from "@/lib/id";
 import type { Device, TopologyType } from "@/types/device.types";
 import type { AIGenerateResponse } from "@/types/ai.types";
-import type { ForkConflictDetail } from "@/types/reservation.types";
+import type { ForkConflictDetail, ForkSaveResult } from "@/types/reservation.types";
 import type {
   CanvasData,
   DeviceNodeData,
@@ -978,12 +980,21 @@ function TopologyEditorInner() {
     }
   };
 
-  // Live-edit commit (ADR 0006 Decision 6): reconcile the reservation's FORK
-  // against the canvas, then re-point the reservation's device set. The fork save
-  // replaces the old parent-topology PUT: it appends a fork version and leaves the
-  // parent's TopologyVersion history byte-for-byte unchanged. The device PATCH is
-  // unchanged and is still what triggers incremental provisioning
-  // (reservation.updated: connect/disconnect ports, add/remove from VLAN).
+  // Live-edit commit (ADR 0006 Decision 6): re-point the reservation's device
+  // set for any device newly drawn onto the canvas, THEN reconcile the
+  // reservation's FORK against the canvas. Ordering is load-bearing (issue
+  // #701): cabling's fork endpoint-membership check 409s a save whose canvas
+  // names a device outside the reservation's device set, and reservations
+  // computes that set from the reservation row at call time, so a device
+  // drawn onto the canvas must join the reservation BEFORE the save runs, or
+  // the very first commit that adds it would be refused. A removed device is
+  // the opposite ordering and stays there: the device-set PATCH for a
+  // removal runs AFTER a successful save, because PATCH-remove prunes wiring
+  // off the SAVED intended set (docs/design/0006-fork-reconcile-and-as-built.md),
+  // never the draft canvas, so pruning before the save would prune against a
+  // set that has not yet caught up with this canvas. The fork save replaces
+  // the old parent-topology PUT: it appends a fork version and leaves the
+  // parent's TopologyVersion history byte-for-byte unchanged.
   // Blocked when any edge is unreachable; the backend enforces the same rule.
   const handleCommitToReservation = useCallback(async () => {
     if (!reservationId) return;
@@ -991,45 +1002,83 @@ function TopologyEditorInner() {
       toast.error("Fix unreachable edges before committing");
       return;
     }
+    const currentDeviceIds = liveReservation?.device_ids ?? [];
+    const addedDeviceIds = allDeviceIds.filter((deviceId) => !currentDeviceIds.includes(deviceId));
+    const removedDeviceIds = currentDeviceIds.filter(
+      (deviceId) => !allDeviceIds.includes(deviceId),
+    );
     setIsCommitting(true);
     try {
-      const result = await saveFork.mutateAsync({
-        reservationId,
-        canvasData: persistableCanvas,
-      });
+      if (addedDeviceIds.length > 0) {
+        // A pure add: union with the current set so a device the user has not
+        // yet removed from the canvas is never dropped early. A PATCH failure
+        // here must block the save outright, since saving now would still 409.
+        try {
+          await updateReservation.mutateAsync({
+            id: reservationId,
+            data: { device_ids: [...new Set([...currentDeviceIds, ...allDeviceIds])] },
+          });
+        } catch (err) {
+          toast.error(errorDetail(err, "Failed to update the reservation's device set"));
+          return;
+        }
+      }
+
+      let result: ForkSaveResult;
+      try {
+        result = await saveFork.mutateAsync({
+          reservationId,
+          canvasData: persistableCanvas,
+        });
+      } catch (err) {
+        // A structured 409 (cross-reservation port claim) opens the conflict
+        // dialog and keeps the drawing so the user can rework it. A
+        // fork_device_not_member 409 (a device the PATCH above could not add,
+        // or a race with a concurrent removal) names the offending devices.
+        // Any other error (a plain 409 for a non-ACTIVE or ARCHIVED fork, a
+        // transport failure) toasts generically.
+        const conflict = forkConflictDetail(err);
+        const notMember = forkDeviceNotMemberDetail(err);
+        if (conflict) {
+          setSaveConflict(conflict);
+        } else if (notMember) {
+          toast.error(
+            `These devices are not part of the reservation: ${notMember.device_ids.join(", ")}`,
+          );
+        } else {
+          const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
+            ?.detail;
+          const message =
+            typeof detail === "string"
+              ? detail
+              : (detail as { message?: string } | undefined)?.message ??
+                "Failed to save the reservation fork";
+          toast.error(message);
+        }
+        return;
+      }
+
       // The reconcile captured this canvas, so cancel any pending draft flush.
       autosave.markClean();
       toast.custom((t) => (
         <ForkSaveResultToast result={result} onDismiss={() => toast.dismiss(t.id)} />
       ));
-      // The fork version is already committed at this point; a device-set PATCH
-      // failure must not be reported as a failed save, it gets its own message.
-      try {
-        await updateReservation.mutateAsync({
-          id: reservationId,
-          data: { device_ids: allDeviceIds },
-        });
-      } catch {
-        toast.error(
-          "Fork saved, but updating the reservation's device set failed; commit again to retry",
-        );
-      }
-    } catch (err) {
-      // A structured 409 (cross-reservation port claim) opens the conflict dialog
-      // and keeps the drawing so the user can rework it. Any other error (a plain
-      // 409 for a non-ACTIVE or ARCHIVED fork, a transport failure) toasts.
-      const conflict = forkConflictDetail(err);
-      if (conflict) {
-        setSaveConflict(conflict);
-      } else {
-        const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-          ?.detail;
-        const message =
-          typeof detail === "string"
-            ? detail
-            : (detail as { message?: string } | undefined)?.message ??
-              "Failed to save the reservation fork";
-        toast.error(message);
+      // Settle the device set to exactly the canvas's, dropping any removed
+      // device now that the save is durable. Skipped when the pre-save add
+      // above already left the set at exactly allDeviceIds (no removal
+      // pending), so a pure addition does not PATCH twice. A failure here
+      // must not be reported as a failed save, it gets its own message.
+      if (removedDeviceIds.length > 0 || addedDeviceIds.length === 0) {
+        try {
+          await updateReservation.mutateAsync({
+            id: reservationId,
+            data: { device_ids: allDeviceIds },
+          });
+        } catch {
+          toast.error(
+            "Fork saved, but updating the reservation's device set failed; commit again to retry",
+          );
+        }
       }
     } finally {
       setIsCommitting(false);
@@ -1037,6 +1086,7 @@ function TopologyEditorInner() {
   }, [
     reservationId,
     hasInvalidEdges,
+    liveReservation,
     saveFork,
     autosave,
     persistableCanvas,
