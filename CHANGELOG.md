@@ -161,6 +161,11 @@
 
 #### Reservations and provisioning
 
+- Pinned `PURPOSE_CLASSIFY_INTERVAL_SECONDS` to 5 in the dev/test compose
+  override beside `EXPIRATION_INTERVAL_SECONDS` (release-gate catch): the
+  purpose-review integration test, which only runs where an AI provider is
+  configured, waits under the 30-second suite cap for the classifier loop
+  that issue #702 moved onto its own 60-second default interval.
 - Fixed reservations' cancel/release inventory cleanup treating a 404 from
   inventory as a hard failure (issue #716). Since #682 execution's terminal
   teardown starts roughly a millisecond after a cancel or release commits,
