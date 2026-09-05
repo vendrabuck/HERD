@@ -6,7 +6,7 @@ import pytest
 from app import config as config_module
 from app.database import Base, engine
 from app.main import app
-from app.routes.generate import _inventory_provider
+from app.routes.generate import _inventory_provider, _read_uploads
 from app.services import generator as generator_module
 from app.services import usage_repo
 from app.services.ai_client import (
@@ -18,6 +18,7 @@ from app.services.ai_client import (
 )
 from app.services.inventory_client import InventorySummary
 from app.services.llm_provider import Usage
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -647,6 +648,64 @@ async def test_generate_rejects_oversized_upload(async_client, monkeypatch):
         )
     assert resp.status_code == 400
     assert "exceeds limit" in resp.json()["detail"]
+
+
+class _CountingUploadFile:
+    """A minimal UploadFile stand-in that counts .read() calls and serves
+    its data in chunks, for pinning _read_uploads' streaming behavior
+    directly (issue #705) without a full multipart round-trip."""
+
+    def __init__(self, filename: str, data: bytes) -> None:
+        self.filename = filename
+        self._data = data
+        self._pos = 0
+        self.read_calls = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        self.read_calls += 1
+        if size is None or size < 0:
+            chunk = self._data[self._pos :]
+        else:
+            chunk = self._data[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+
+async def test_read_uploads_rejects_too_many_files_without_reading_any(monkeypatch):
+    """The count cap is checked before any part is read (issue #705): a
+    request with too many files must not buffer a single byte of any of
+    them, oversized or not."""
+    monkeypatch.setattr(config_module.settings, "upload_max_files", 2)
+    files = [_CountingUploadFile(f"f{i}.txt", b"x") for i in range(3)]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _read_uploads(files)
+
+    assert exc_info.value.status_code == 400
+    assert "Too many files" in exc_info.value.detail
+    assert all(f.read_calls == 0 for f in files)
+
+
+async def test_read_uploads_aborts_streaming_read_past_the_per_file_cap(monkeypatch):
+    """A part is read in chunks, not fully buffered first (issue #705):
+    crossing the per-file cap aborts immediately, pulling no more than the
+    one 64 KiB chunk that crossed it. The underlying file here is deliberately
+    far larger than one chunk (and than the cap), so the old unchunked
+    `await f.read()` would read the entire thing into memory before the
+    downstream size check ever ran; asserting on `_pos` (bytes actually
+    consumed from the file), not just the call count, is what catches that:
+    a single unbounded read() call also reports read_calls == 1."""
+    monkeypatch.setattr(config_module.settings, "upload_max_file_bytes", 10)
+    data = b"x" * (200 * 1024)  # cap + far more than one 64 KiB chunk
+    f = _CountingUploadFile("big.txt", data)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _read_uploads([f])
+
+    assert exc_info.value.status_code == 400
+    assert "exceeds limit" in exc_info.value.detail
+    assert f.read_calls == 1
+    assert f._pos <= 64 * 1024
 
 
 async def test_generate_works_without_files(async_client, monkeypatch):

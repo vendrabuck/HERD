@@ -9,6 +9,15 @@
   portless device (a 404 is still "no ports"). The fetch already runs before
   the topology is created, so the commit fails closed with nothing to roll
   back rather than silently omitting the user's approved attachment.
+- Security: `/api/ai/generate` no longer buffers a whole multipart upload
+  into memory before its file-count and size caps run (issue #705):
+  `_read_uploads` rejects a too-many-files request before reading a single
+  byte, then reads each remaining part in 64 KiB chunks with a running
+  per-file and aggregate total, aborting with 400 the instant either cap is
+  crossed instead of after the whole part is buffered. `UploadFile.size` is
+  treated as an untrusted hint only, never load-bearing for the check.
+  `extract_files`'s own caps are unchanged and still re-run as defense in
+  depth on the now-bounded upload.
 - Added Download CSV buttons for the four purpose reporting sections (issue
   #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
   join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a
