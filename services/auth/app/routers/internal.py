@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_db
 from app.models.user import Role, User
+from app.schemas.group import GroupResponse
+from app.services.group_service import get_user_groups
 
 
 class UserContact(BaseModel):
@@ -85,3 +87,27 @@ async def get_user_contact(
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return UserContact(user_id=user.id, email=user.email, username=user.username)
+
+
+@router.get("/internal/users/{user_id}/groups", response_model=list[GroupResponse])
+async def get_user_groups_internal(
+    user_id: uuid.UUID,
+    _: None = Depends(_require_internal_token),
+    db: AsyncSession = Depends(get_db),
+) -> list[GroupResponse]:
+    """Return a user's group memberships for service-to-service callers.
+
+    Same response shape as GET /groups/user/{id}, but token-guarded instead
+    of JWT-guarded: the acl service's internal permission check (issue #704)
+    calls here to resolve group membership for a fire-time authority
+    re-check, where there is no user JWT to forward. Scoped to active users
+    only, unlike get_user_contact above: 404 for an unknown OR a deactivated
+    user, since an authority re-check must never resolve group membership
+    for an account that has since been disabled.
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=404, detail="User not found")
+    groups = await get_user_groups(db, user_id)
+    return [GroupResponse.model_validate(g) for g in groups]

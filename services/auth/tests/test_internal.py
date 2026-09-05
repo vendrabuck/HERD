@@ -9,6 +9,7 @@ admin-targeted events without a real admin JWT.
 import uuid
 
 import pytest
+from app.models.group import GroupMember, UserGroup
 from app.models.user import Role, User
 
 from tests._harness import TestSessionLocal
@@ -144,6 +145,67 @@ async def test_internal_user_contact_requires_valid_token(internal_client):
     uid = await _seed_user(role=Role.USER)
     resp = await internal_client.get(
         f"/internal/users/{uid}/contact", headers={"X-Internal-Token": "wrong"}
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_internal_user_groups_returns_same_shape_as_groups_user_endpoint(internal_client):
+    """#704: GET /internal/users/{id}/groups feeds acl's internal permission
+    check. Same shape as GET /groups/user/{id} (a list of group summaries)."""
+    uid = await _seed_user(role=Role.USER)
+    async with TestSessionLocal() as session:
+        group = UserGroup(name=f"g-{uid}", created_by=uid)
+        session.add(group)
+        await session.flush()
+        session.add(GroupMember(group_id=group.id, user_id=uid))
+        await session.commit()
+        group_id = group.id
+
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/groups", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["id"] == str(group_id)
+
+
+@pytest.mark.asyncio
+async def test_internal_user_groups_empty_for_user_with_no_groups(internal_client):
+    uid = await _seed_user(role=Role.USER)
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/groups", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_internal_user_groups_404_for_unknown_user(internal_client):
+    resp = await internal_client.get(
+        f"/internal/users/{uuid.uuid4()}/groups",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_internal_user_groups_404_for_inactive_user(internal_client):
+    """A deactivated user must read as absent to a fire-time authority
+    re-check, not as "present with whatever groups it last held" (#704)."""
+    uid = await _seed_user(role=Role.USER, is_active=False)
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/groups", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_internal_user_groups_requires_valid_token(internal_client):
+    uid = await _seed_user(role=Role.USER)
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/groups", headers={"X-Internal-Token": "wrong"}
     )
     assert resp.status_code == 403
 

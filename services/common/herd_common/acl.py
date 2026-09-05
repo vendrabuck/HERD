@@ -119,6 +119,99 @@ async def _owns_active_reservation(
         return False
 
 
+async def _explicit_acl_manage_internal(
+    user_id: str,
+    device_id: str,
+    acl_service_url: str,
+    internal_api_token: str,
+) -> bool:
+    """Ask the ACL service's internal-token route (POST /internal/check)
+    whether the user has an explicit `manage` grant, for a caller with no
+    user JWT to forward.
+    """
+    if not internal_api_token:
+        return False
+    body = {
+        "user_id": user_id,
+        "resource_type": "device",
+        "resource_id": device_id,
+        "permission": "manage",
+    }
+    try:
+        resp = await call_service(
+            acl_service_url.rstrip("/"),
+            "POST",
+            "/internal/check",
+            json_body=body,
+            timeout=_ACL_HTTP_TIMEOUT_SECONDS,
+            auth=InternalTokenAuth(token=internal_api_token),
+        )
+    except httpx.HTTPError as exc:
+        logger.info("acl_check_internal_unreachable", extra={"error": str(exc)})
+        return False
+    if resp.status_code != 200:
+        return False
+    try:
+        return bool(resp.json().get("allowed", False))
+    except ValueError:
+        return False
+
+
+async def user_has_manage_internal(
+    *,
+    user_id: str,
+    device_id: str,
+    acl_service_url: str,
+    internal_api_token: str,
+) -> bool:
+    """True iff the user has an explicit `manage` ACL grant on this device,
+    resolved with no user JWT (issue #704).
+
+    Used at fire time by a scheduled job re-checking its creator's
+    authority: the scheduler holds only the job's created_by user_id, not a
+    bearer token, so the JWT-guarded user_has_grant/POST /check path is not
+    available. Closed-by-default on any failure (see
+    _explicit_acl_manage_internal).
+    """
+    return await _explicit_acl_manage_internal(
+        str(user_id), str(device_id), acl_service_url, internal_api_token
+    )
+
+
+async def user_has_manage_or_owns_active_reservation_internal(
+    *,
+    user_id: str,
+    device_id: str,
+    acl_service_url: str,
+    reservations_service_url: str,
+    internal_api_token: str,
+) -> bool:
+    """Internal-token counterpart of user_has_manage_or_owns_active_reservation
+    (issue #704), for a caller with no user JWT to forward.
+
+    True iff the user has an explicit `manage` grant (via ACL's
+    POST /internal/check) OR owns an ACTIVE reservation containing the
+    device (via reservations' existing GET /internal/active, unchanged).
+    Both checks run under INTERNAL_API_TOKEN. Closed-by-default: any
+    failure on either leg is treated as "no", not propagated.
+    """
+    user_id_str = str(user_id)
+    device_id_str = str(device_id)
+    if await user_has_manage_internal(
+        user_id=user_id_str,
+        device_id=device_id_str,
+        acl_service_url=acl_service_url,
+        internal_api_token=internal_api_token,
+    ):
+        return True
+    return await _owns_active_reservation(
+        user_id_str,
+        device_id_str,
+        reservations_service_url,
+        internal_api_token,
+    )
+
+
 async def user_has_manage_or_owns_active_reservation(
     *,
     user_id: str,

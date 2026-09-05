@@ -414,6 +414,28 @@ Authorization: Bearer <any-authenticated-token>
 
 Returns resource IDs the user can access with the given permission level.
 
+### Check a permission (internal)
+
+```
+POST /api/acl/internal/check
+X-Internal-Token: <internal-api-token>
+Content-Type: application/json
+
+{
+  "user_id": "uuid-of-user",
+  "resource_type": "device",
+  "resource_id": "uuid-of-device",
+  "permission": "manage"
+}
+```
+
+Same evaluation and response shape as `POST /check`, for a caller with no user JWT to
+forward (issue #704): inventory's apply-job scheduler re-checks a job creator's
+authority at fire time with only the creator's user_id. Group membership is resolved
+through auth's `GET /internal/users/{user_id}/groups` (below) instead of the
+forwarded-JWT `GET /groups/user/{id}`. Closed by default: a transport failure or
+non-200 from auth yields `allowed: false`. Internal-token only.
+
 ### Reservation-owner widening for device-config writes
 
 Inventory's config-version and apply-job write endpoints (`POST /devices/{id}/config-versions`,
@@ -435,6 +457,19 @@ the device cannot be reserved in the first place.
 
 Read paths (list config versions, get version detail, diff) are not gated by this
 widening; they remain authenticated-user-visible as they were before iter 3.
+
+A scheduled (`POST .../schedule`) apply job's authorization is not evaluated once and
+forgotten: issue #704 re-checks the creator's authority at fire time, using the same
+two grounds (explicit `manage` grant, or reservation-owner of an active reservation
+containing the device) via ACL's and reservations' internal-token routes, since the
+scheduler has no user JWT to re-forward. If the creator's authority has lapsed by fire
+time (grant revoked, reservation ended), the job resolves `skipped` with the error
+`creator no longer authorized for this device` rather than firing. This closes the gap
+where a job scheduled far in advance could still fire once its creator no longer
+qualifies. `scheduled_for` is also bounded (`apply_job_max_horizon_days`, default 30
+days) so a job cannot sit queued indefinitely before this re-check ever runs, and a
+caller-supplied `reservation_id` on the schedule request is validated up front (must
+be an active reservation the caller owns that contains the device; 422 otherwise).
 
 ---
 
@@ -1147,6 +1182,20 @@ X-Internal-Token: <internal-api-token>
 Returns user-ids for users with role admin or superadmin (active accounts only).
 Used by the notifications service to fan out `device.health_transition` events
 to all admins. Internal-token only.
+
+### Get a user's groups (internal)
+
+```
+GET /api/auth/internal/users/{user_id}/groups
+X-Internal-Token: <internal-api-token>
+```
+
+Same response shape as `GET /groups/user/{id}`, for a caller with no user JWT to
+forward. Used by ACL's `POST /internal/check` (issue #704) to resolve group
+membership for inventory's apply-job fire-time authority re-check. Scoped to active
+users only, unlike `/internal/users/{id}/contact` above: 404 for an unknown OR a
+deactivated user, since an authority re-check must never resolve group membership
+for an account that has since been disabled. Internal-token only.
 
 ### List active reservation users for a device (internal)
 
