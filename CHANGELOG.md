@@ -90,6 +90,23 @@
   portless device (a 404 is still "no ports"). The fetch already runs before
   the topology is created, so the commit fails closed with nothing to roll
   back rather than silently omitting the user's approved attachment.
+- Fixed reservations' cancel/release inventory cleanup treating a 404 from
+  inventory as a hard failure (issue #716). Since #682 execution's terminal
+  teardown starts roughly a millisecond after a cancel or release commits,
+  and for a dynamic-only booking it deletes the materialized device; if that
+  landed first, `_update_device_statuses` raised on the resulting 404,
+  triggering retries and an ERROR log for a device that was correctly gone,
+  and `_fetch_devices_best_effort` turned that same 404 into "assume
+  exclusive", so the retry loop re-POSTed a status update against a device
+  reservations had just been told did not exist. A 404 on the AVAILABLE
+  (release) direction of `_update_device_statuses` now counts as success
+  with no retry and no ERROR log; the RESERVED (booking) direction is
+  unchanged and still raises, since inventory not recognizing a device being
+  booked is a real failure. `_fetch_devices_best_effort` now surfaces a 404
+  as the distinct `_DeviceGoneFromInventory` rather than a generic
+  exception, and `_release_exclusive_devices_best_effort` drops that id from
+  the release set with an INFO log instead of assuming it is exclusive and
+  re-releasing it.
 - Security: `/api/ai/generate` no longer buffers a whole multipart upload
   into memory before its file-count and size caps run (issue #705):
   `_read_uploads` rejects a too-many-files request before reading a single
