@@ -15,7 +15,12 @@ const deviceKeys = {
     [...deviceKeys.lists(), "paginated", filters, skip, limit] as const,
   simpleList: (filters: DeviceFilters | undefined) =>
     [...deviceKeys.lists(), "simple", filters] as const,
+  allList: (filters: DeviceFilters | undefined) =>
+    [...deviceKeys.lists(), "all", filters] as const,
   allNames: () => [...deviceKeys.lists(), "all-names"] as const,
+  // Sorted so the key is order-independent: the same id set from two callers
+  // shares one cache entry.
+  byIds: (ids: string[]) => [...deviceKeys.lists(), "by-ids", [...ids].sort()] as const,
   details: () => [...deviceKeys.all, "detail"] as const,
   detail: (id: string) => [...deviceKeys.details(), id] as const,
 };
@@ -35,6 +40,12 @@ async function fetchPaginatedDevices(
   return resp.data;
 }
 
+// Page 0 of the server's 500-row cap, `total` dropped. This is the repo-wide
+// "simple list" convention (admin.ts, groups.ts, templates.ts, and others use
+// the same shape) and it is only correct while the collection fits in one
+// page. Anything that must see EVERY device goes through fetchAllDevices (the
+// page walker below) or fetchDevicesByIds (the batch endpoint); issue #703
+// moved the device consumers there and left the other modules to a follow-up.
 async function fetchDevices(filters?: DeviceFilters): Promise<Device[]> {
   const resp = await fetchPaginatedDevices(filters, 0, 500);
   return resp.items;
@@ -57,6 +68,23 @@ async function fetchDevicesBatch(ids: string[]): Promise<Device[]> {
     device_ids: ids,
   });
   return resp.data.items;
+}
+
+// Fetch an arbitrary id set through the batch endpoint, chunked past the
+// server cap so the caller never trips it. Ids are deduplicated first; an id
+// the server omits (deleted, or not visible to this user) is simply absent
+// from the result. Rejects if ANY chunk fails: a partial index is exactly the
+// silent-truncation defect this helper exists to prevent (issue #703), so a
+// consumer sees an error state rather than a quietly incomplete map.
+export async function fetchDevicesByIds(ids: string[]): Promise<Device[]> {
+  const unique = Array.from(new Set(ids));
+  if (unique.length === 0) return [];
+  const chunks: string[][] = [];
+  for (let i = 0; i < unique.length; i += DEVICE_BATCH_LIMIT) {
+    chunks.push(unique.slice(i, i + DEVICE_BATCH_LIMIT));
+  }
+  const results = await Promise.all(chunks.map(fetchDevicesBatch));
+  return results.flat();
 }
 
 // Re-fetch each referenced device and rebuild the canvas nodes' device payload
@@ -84,19 +112,12 @@ export async function hydrateCanvasNodes(data: CanvasData): Promise<CanvasData> 
   );
   if (ids.length === 0) return data;
 
-  const chunks: string[][] = [];
-  for (let i = 0; i < ids.length; i += DEVICE_BATCH_LIMIT) {
-    chunks.push(ids.slice(i, i + DEVICE_BATCH_LIMIT));
-  }
-  // allSettled: a failed batch request (outage, 5xx) hydrates nothing for its
-  // chunk but never throws, so every affected node just keeps its existing
-  // data, same as the old per-device catch behavior.
-  const results = await Promise.allSettled(chunks.map(fetchDevicesBatch));
+  // A failed batch request (outage, 5xx) hydrates nothing but never throws,
+  // so every node just keeps its existing data, same as the old per-device
+  // catch behavior. The chunking itself lives in fetchDevicesByIds.
+  const fetched = await fetchDevicesByIds(ids).catch((): Device[] => []);
   const fresh = new Map<string, Device>();
-  for (const result of results) {
-    if (result.status !== "fulfilled") continue;
-    for (const device of result.value) fresh.set(device.id, device);
-  }
+  for (const device of fetched) fresh.set(device.id, device);
 
   const hydratedNodes = nodes.map((node) => {
     const nodeData = node.data as DeviceNodeData | undefined;
@@ -135,23 +156,32 @@ async function createDevice(data: DeviceCreate): Promise<Device> {
   return resp.data;
 }
 
-// Walk every page of /inventory/devices and return an id to name map.
-// Exit conditions (in order): short page from the server, or skip meeting/exceeding
-// the reported total. A MAX_PAGES cap prevents an infinite loop if the server
+// Walk every page of /inventory/devices (server-side filters honored) and
+// return the full row set, so a consumer that must see the whole collection
+// is not silently cut at the 500-row page cap (issue #703). Exit conditions
+// (in order): short page from the server, or skip meeting/exceeding the
+// reported total. A MAX_PAGES cap prevents an infinite loop if the server
 // ever returns overlapping pages (e.g., from a mid-fetch write).
-async function fetchAllDeviceNames(): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
+export async function fetchAllDevices(filters?: DeviceFilters): Promise<Device[]> {
+  const all: Device[] = [];
   const limit = 500;
   const MAX_PAGES = 200;
   let skip = 0;
   for (let page = 0; page < MAX_PAGES; page++) {
-    const resp = await fetchPaginatedDevices(undefined, skip, limit);
-    for (const d of resp.items) map.set(d.id, d.name);
+    const resp = await fetchPaginatedDevices(filters, skip, limit);
+    all.push(...resp.items);
     if (resp.items.length === 0) break;
     skip += resp.items.length;
     if (resp.items.length < limit) break;
     if (skip >= resp.total) break;
   }
+  return all;
+}
+
+// Id to name map over the whole (unfiltered) collection.
+async function fetchAllDeviceNames(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  for (const d of await fetchAllDevices()) map.set(d.id, d.name);
   return map;
 }
 
@@ -160,6 +190,25 @@ export function useAllDeviceNames() {
     queryKey: deviceKeys.allNames(),
     queryFn: fetchAllDeviceNames,
     staleTime: 5 * 60 * 1000,
+  });
+}
+
+// Every device matching `filters`, across all pages. Use this (not useDevices)
+// wherever the list feeds a picker or an index that must be complete.
+export function useAllDevices(filters?: DeviceFilters) {
+  return useQuery({
+    queryKey: deviceKeys.allList(filters),
+    queryFn: () => fetchAllDevices(filters),
+  });
+}
+
+// The devices behind a known id set, via the batch endpoint. Disabled (no
+// request, `data` undefined) while `ids` is empty.
+export function useDevicesByIds(ids: string[]) {
+  return useQuery({
+    queryKey: deviceKeys.byIds(ids),
+    queryFn: () => fetchDevicesByIds(ids),
+    enabled: ids.length > 0,
   });
 }
 

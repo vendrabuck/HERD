@@ -111,16 +111,29 @@ const REPORT = {
   },
 };
 
-function mockDevices() {
+// Serve the device inventory the way the real service does: the list
+// endpoint answers page 0 capped at 500 rows with the true `total`, and the
+// batch endpoint answers every requested id it knows. The page resolves
+// report devices through the batch path (issue #703), so a fixture larger
+// than one page is visible only through the batch handler.
+function mockDevices(devices: Array<{ id: string; name: string; template_name: string }> = [
+  DEVICE_FW1,
+  DEVICE_FW2,
+]) {
   server.use(
     http.get("/api/inventory/devices", () =>
       HttpResponse.json({
-        items: [DEVICE_FW1, DEVICE_FW2],
-        total: 2,
+        items: devices.slice(0, 500),
+        total: devices.length,
         skip: 0,
         limit: 500,
       }),
     ),
+    http.post("/api/inventory/devices/batch", async ({ request }) => {
+      const { device_ids } = (await request.json()) as { device_ids: string[] };
+      const wanted = new Set(device_ids);
+      return HttpResponse.json({ items: devices.filter((d) => wanted.has(d.id)) });
+    }),
   );
 }
 
@@ -206,6 +219,51 @@ describe("ReportingPage", () => {
       expect(within(templateCard).getByText("FW-3200")).toBeInTheDocument(),
     );
     expect(within(templateCard).getByText("42.5")).toBeInTheDocument();
+  });
+
+  it("attributes device 501's hours to its real template, not Unknown (issue #703)", async () => {
+    // 501 devices: the list endpoint's page 0 holds the first 500 and reports
+    // total 501, so an index built from that page would never see dev-501
+    // and would send its 9.0 hours to the literal "Unknown" bucket. The report
+    // mentions dev-501, so the batch-driven index must resolve it.
+    const fleet = Array.from({ length: 500 }, (_, i) => ({
+      id: `dev-${i + 1}`,
+      name: `node-${i + 1}`,
+      template_name: "FW-3200",
+    }));
+    const DEVICE_501 = { id: "dev-501", name: "sw-oldest", template_name: "SW-OLD" };
+    mockDevices([...fleet, DEVICE_501]);
+    let batchIds: string[] = [];
+    server.use(
+      http.post("/api/inventory/devices/batch", async ({ request }) => {
+        const { device_ids } = (await request.json()) as { device_ids: string[] };
+        batchIds = device_ids;
+        return HttpResponse.json({
+          items: [DEVICE_FW1, DEVICE_501].filter((d) => device_ids.includes(d.id)),
+        });
+      }),
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json({
+          ...REPORT,
+          by_device: [
+            { device_id: "dev-fw-1", reservation_count: 5, hours: 25.0 },
+            { device_id: "dev-501", reservation_count: 1, hours: 9.0 },
+          ],
+        }),
+      ),
+    );
+
+    renderWithProviders(<ReportingPage />);
+
+    const templateHeading = await screen.findByText("By Template");
+    const templateCard = templateHeading.closest("div")?.parentElement as HTMLElement;
+    await waitFor(() => expect(within(templateCard).getByText("SW-OLD")).toBeInTheDocument());
+    // dev-501's hours sit under SW-OLD, and nothing fell into the Unknown bucket.
+    const oldRow = within(templateCard).getByText("SW-OLD").closest("tr") as HTMLElement;
+    expect(within(oldRow).getByText("9.0")).toBeInTheDocument();
+    expect(within(templateCard).queryByText("Unknown")).not.toBeInTheDocument();
+    // The index was requested for exactly the report's device ids, not a page.
+    expect([...batchIds].sort()).toEqual(["dev-501", "dev-fw-1"]);
   });
 
   it("renders empty rows when the report has no buckets", async () => {
@@ -359,15 +417,8 @@ describe("ReportingPage", () => {
     // A template name containing a comma exercises escapeCsvCell's quoting
     // branch; two distinct templates exercise the sort-by-hours comparator.
     const DEVICE_COMMA = { id: "dev-comma", name: "sw-comma", template_name: 'Acme, Inc "Switch"' };
+    mockDevices([DEVICE_FW1, DEVICE_FW2, DEVICE_COMMA]);
     server.use(
-      http.get("/api/inventory/devices", () =>
-        HttpResponse.json({
-          items: [DEVICE_FW1, DEVICE_FW2, DEVICE_COMMA],
-          total: 3,
-          skip: 0,
-          limit: 500,
-        }),
-      ),
       http.get("/api/reservations/reports/utilization", () =>
         HttpResponse.json({
           ...REPORT,

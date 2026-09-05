@@ -7,7 +7,7 @@ import {
   useInstantiateTemplate,
 } from "@/api/topologyTemplates";
 import type { TopologyTemplate } from "@/api/topologyTemplates";
-import { useDevices } from "@/api/inventory";
+import { useAllDevices } from "@/api/inventory";
 import { useAuthStore } from "@/stores/authStore";
 import { isAdminRole } from "@/lib/roles";
 import { Modal } from "@/components/ui/Modal";
@@ -159,7 +159,7 @@ function InstantiateTemplateDialog({
   onCreated: (topologyId: string) => void;
 }) {
   const { data: template, isLoading } = useTopologyTemplate(templateId);
-  const { data: devices } = useDevices();
+  const { data: devices } = useAllDevices();
   const instantiate = useInstantiateTemplate();
 
   const [name, setName] = useState("");

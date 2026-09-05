@@ -38,7 +38,7 @@ vi.mock("@/api/topologyTemplates", () => ({
 // Mock devices hook
 const mockUseDevices = vi.fn();
 vi.mock("@/api/inventory", () => ({
-  useDevices: (...args: unknown[]) => mockUseDevices(...args),
+  useAllDevices: (...args: unknown[]) => mockUseDevices(...args),
 }));
 
 import { TopologyTemplatesPage } from "@/pages/TopologyTemplatesPage";
