@@ -21,6 +21,135 @@
   existing fork whose canvas already carries a non-member endpoint will 409 on
   its next save; the detail names the offending devices so the owner can
   PATCH-add or remove them.
+- Changed inventory's `apply_scheduler` to record a config-apply run whose
+  execution response carries no `status` as `failed` instead of `success`
+  (issue #720); unreachable today, since the contract requires `status`.
+
+- Fixed the base compose file publishing the unauthenticated Traefik
+  dashboard and API (`api.insecure: true`) on all interfaces, so `make prod`
+  exposed `/api/rawdata` (every router rule, backend container address,
+  middleware chain) to anyone who could reach port 8080 (issue #708).
+  `docker-compose.yml` now binds it `127.0.0.1:8080:8080`; the dev override
+  deliberately adds no second binding, since compose merges port lists and
+  nothing in dev, CI, or QA reaches the dashboard off-host. `FRESH_SETUP.md`
+  describes the SSH tunnel for remote viewing, and a repo-root unit test
+  (`tests/unit/test_compose_ports.py`) yaml-parses both compose files and
+  pins the loopback-only publish.
+
+- Fixed an admin being able to deactivate the superadmin through
+  `POST /users/{id}/deactivate` (issue #715). The endpoint now refuses a
+  superadmin target with 400 `Cannot deactivate the superadmin`, mirroring
+  the role-change carve-out; `POST /users/{id}/activate` is deliberately
+  unchanged, since it is the recovery direction. A deactivated superadmin
+  could not log in or refresh, was not re-seeded at startup, and the LDAP
+  sync never reactivates a local user.
+
+- Fixed `PATCH /preferences` in the user-profile service validating only the
+  incoming dict, never the merged result, so repeated patches could grow one
+  JSONB row past every cap (issue #714). The service now validates each
+  merged dict (the 200-key and 64 KB caps on `saved_filters` and `extras`,
+  the key cap and page-size range on `page_sizes`) before assigning anything
+  and answers 422 with a `merged <field> ...` detail; a rejected PATCH
+  leaves the row exactly as it was. `PUT` and `DELETE` remain the shrink
+  paths.
+- Fixed the AI commit path silently dropping an approved network-element
+  attachment when inventory's ports fetch failed (issue #717):
+  `_fetch_device_ports` now raises `CommitError(503)` on a transport failure
+  or a 5xx from inventory instead of treating it the same as a genuinely
+  portless device (a 404 is still "no ports"). The fetch already runs before
+  the topology is created, so the commit fails closed with nothing to roll
+  back rather than silently omitting the user's approved attachment.
+- Security: `/api/ai/generate` no longer buffers a whole multipart upload
+  into memory before its file-count and size caps run (issue #705):
+  `_read_uploads` rejects a too-many-files request before reading a single
+  byte, then reads each remaining part in 64 KiB chunks with a running
+  per-file and aggregate total, aborting with 400 the instant either cap is
+  crossed instead of after the whole part is buffered. `UploadFile.size` is
+  treated as an untrusted hint only, never load-bearing for the check.
+  `extract_files`'s own caps are unchanged and still re-run as defense in
+  depth on the now-bounded upload.
+- Stopped four ai-orchestrator routes from returning raw provider or
+  internal exception text in their HTTP `detail` (issue #713). Topology
+  generation (`POST /generate`) now answers a provider `AIError` with the
+  fixed `AI returned no usable response` and any other exception with
+  `AI call failed`; purpose classification answers `AI classification
+  failed`; the admin-only template identity suggestion answers
+  `AI suggestion failed` and recipe drafting `AI recipe drafting failed`.
+  Each site logs the real exception with its traceback server-side
+  (`logger.exception`) so nothing is lost for operators, matching the rule
+  the reservation assistant already applied.
+
+- Indexed `assistant_conversations` on `(reservation_id, created_at)` in
+  ai-orchestrator (issue #712, migration 0005) and bounded the transcript
+  read that purpose classification uses. The read is now two steps: the
+  reservation's conversation ids ordered by `created_at`, then only the
+  newest 200 message rows across those conversations (ordered by
+  conversation `created_at` and `position`, never a bare `position`, which
+  resets per conversation), selecting just `(role, content_blocks,
+  position)` and reversed in Python before the existing role filter and
+  12000-character trim. The old `(user_id, reservation_id)` composite index
+  is kept for now; dropping it is a follow-up.
+
+- Hardened the purpose-classification request path in ai-orchestrator
+  (issue #709). Both `POST /classify-purpose/preview` and
+  `POST /internal/classify-purpose` now bound their bodies: `purpose` at
+  2000 characters, `device_ids` at 200, `dynamic_requests` at 50 (the caps
+  reservations' own `ReservationCreate` already enforces) and `categories`
+  at 64, each rejected with 422. The provider-configured (503) and daily
+  quota (429) gates now run BEFORE the signal gather in both handlers, so an
+  unconfigured provider or an over-quota caller can no longer drive the
+  inventory and cabling fan-out. `dynamic_requests` are deduped by template
+  id before fetching (counts for a repeated template are summed, matching
+  reservations' N-entries-means-N-instances semantic), and the internal
+  pass's per-device inventory reads (device detail and config-apply job
+  summaries) plus the per-template reads run concurrently under a
+  semaphore of 8 instead of strictly one after another; results keep
+  request order and the per-item drop-on-failure contract is unchanged.
+- Fixed outbox LISTEN task hardening (2026-09-04 review sweep, four confirmed
+  findings in `herd_common/outbox.py`'s `_listen_for_wakeups` and
+  `run_outbox_relay`): (1) the lost-connection branch (the registered
+  termination callback firing) now sleeps `retry_seconds` before
+  reconnecting, exactly like the connect/registration-failure branch, so a
+  pooler, `idle_session_timeout`, or reaper that terminates the idle LISTEN
+  session cannot turn into a tight reconnect loop; every iteration also
+  closes the connection it opened (if any) in a `finally`, guarded by a 5s
+  `asyncio.wait_for`, before the next one is opened, so a flapping session
+  cannot leak a backend per cycle, and `wake` is set only after a
+  registration actually succeeds (a failed `add_listener` no longer falsely
+  claims a catch-up). (2) The listener now connects with kwargs from
+  `engine.dialect.create_connect_args(engine.url)` instead of a rendered DSN
+  string: the SQLAlchemy URL's query-string spellings (`ssl`,
+  `prepared_statement_cache_size`) are not the spellings asyncpg's own DSN
+  parser accepts, so a `?ssl=require` or `?prepared_statement_cache_size=0`
+  deployment previously lost wake-on-write silently (a WARNING every tick,
+  no health signal); this was proven live against the gate Postgres before
+  the fix. (3) `run_outbox_relay` now loops immediately, without waiting any
+  part of a tick, when a drain comes back exactly `OUTBOX_BATCH_SIZE` rows:
+  Postgres collapses one committing transaction into a single NOTIFY
+  regardless of how many outbox rows it staged, so a commit that staged more
+  than one batch's worth (the expiration sweep's per-expired-reservation
+  `reservation.completed` events are a real example) previously got one
+  wake and then waited a full tick for the remainder. (4) Added direct test
+  coverage for the termination-then-backoff path and the registration-failure
+  path, neither of which any existing test exercised. Every existing outbox
+  behavior (clear-before-drain, wake honored only on a healthy tick, backoff
+  math, cancellation propagation, `wake_on_write=false` as the tick-only
+  escape hatch, listener cancelled in the relay's `finally`) is unchanged and
+  still pinned by the existing tests.
+- Fixed device lists silently truncating at the inventory service's 500-row
+  page cap (issue #703). `fetchDevices` fetched page 0 of 500 and dropped
+  `total`, so with more than 500 devices the reporting page's device index
+  missed the oldest ones and attributed their hours to the "Unknown"
+  template bucket (and the client-built by-template CSV exported that),
+  while the device-group and topology-template pickers, the equipment
+  browser, and the calendar showed partial lists. `ReportingPage` now
+  resolves exactly the devices the report mentions through the batch
+  endpoint via the new chunked `fetchDevicesByIds` and `useDevicesByIds`
+  (hoisted from `hydrateCanvasNodes`), and the other four consumers use the
+  new `fetchAllDevices`/`useAllDevices` page walker (server-side filters
+  honored; `fetchAllDeviceNames` is a map over it). The server cap is
+  unchanged; the page-0-of-500 idiom in the other API modules is left for a
+  follow-up.
 
 - Added Download CSV buttons for the four purpose reporting sections (issue
   #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`

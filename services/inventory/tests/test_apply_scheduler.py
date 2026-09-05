@@ -547,6 +547,37 @@ async def test_post_internal_execute_non_success_status(monkeypatch):
     assert error == "device unreachable"
 
 
+@pytest.mark.asyncio
+async def test_post_internal_execute_missing_status_records_failed(monkeypatch):
+    """Issue #720: a response body with no status key is never a success. The
+    contract makes status required today, so this pins the safe default for
+    the day it loosens."""
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    run_id = "33333333-3333-3333-3333-333333333333"
+    client = FakeClient(post_responses={"/execute/internal": FakeResponse(200, {"id": run_id})})
+    status, got_run_id, error = await _post_internal_execute(client, _make_job(), {})
+    assert status == "failed"
+    assert got_run_id == uuid.UUID(run_id)
+    assert error == "execution returned non-success status"
+
+
+@pytest.mark.asyncio
+async def test_post_internal_execute_null_status_records_failed(monkeypatch):
+    """An explicit null status takes the same path: str(None) is not SUCCESS."""
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    client = FakeClient(
+        post_responses={"/execute/internal": FakeResponse(200, {"id": None, "status": None})}
+    )
+    status, got_run_id, error = await _post_internal_execute(client, _make_job(), {})
+    assert status == "failed"
+    assert got_run_id is None
+    assert error == "execution returned non-success status"
+
+
 # --- _mark_failed_in_fresh_session swallows secondary errors ----------------
 
 

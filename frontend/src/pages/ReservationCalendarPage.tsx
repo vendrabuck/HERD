@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useCalendarReservations } from "@/api/reservations";
-import { useDevices } from "@/api/inventory";
+import { useAllDevices } from "@/api/inventory";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
 import { getDayRange, getWeekRange, getMonthRange } from "@/utils/dateUtils";
 import type { Reservation, ReservationStatus } from "@/types/reservation.types";
@@ -93,7 +93,7 @@ export function ReservationCalendarPage() {
     status: statusFilter.length < ALL_STATUSES.length ? statusFilter : undefined,
   });
 
-  const { data: devices } = useDevices();
+  const { data: devices } = useAllDevices();
 
   const deviceNames = useMemo(() => {
     const map = new Map<string, string>();

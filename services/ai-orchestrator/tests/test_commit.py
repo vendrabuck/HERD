@@ -223,6 +223,40 @@ async def test_commit_surfaces_topology_create_failure_without_rollback(async_cl
     assert "not authorized" in resp.json()["detail"]
 
 
+async def test_commit_aborts_with_503_when_ports_fetch_hits_5xx(async_client):
+    """A 5xx from inventory's ports endpoint means inventory could not
+    answer, not that the device is portless (issue #717): the commit must
+    fail closed with no topology created, never silently drop the user's
+    approved element attachment. The ports fetch runs before topology
+    creation, so no cabling route is registered here at all; if the
+    committer reached it anyway, respx would raise for the unmocked call."""
+    body = _commit_body(
+        devices=[{"role": "fw-a", "device_id": DEVICE_A, "position": {"x": 100, "y": 100}}],
+        elements=[
+            {
+                "role": "mgmt-seg",
+                "element_type": "vlan_segment",
+                "label": "Mgmt VLAN",
+                "attrs": {"vlan_id": 100},
+            }
+        ],
+        edges=[{"source_role": "fw-a", "target_role": "mgmt-seg", "layer": "L2"}],
+    )
+    inventory_url = config_module.settings.inventory_service_url.rstrip("/")
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{inventory_url}/devices/{DEVICE_A}/ports").respond(
+            503, json={"detail": "inventory unavailable"}
+        )
+
+        headers = {"Authorization": f"Bearer {_user_token()}"}
+        async with async_client as client:
+            resp = await client.post("/commit", json=body, headers=headers)
+
+    assert resp.status_code == 503
+    assert "inventory unavailable" in resp.json()["detail"]
+
+
 async def test_commit_apply_configs_calls_execution_per_device(async_client):
     """When apply_configs=true, /execute is called per device with a config."""
     execute_bodies: list[dict] = []

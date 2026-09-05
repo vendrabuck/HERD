@@ -26,7 +26,8 @@ from herd_common.outbox import (
     prune_published,
     run_outbox_relay,
 )
-from sqlalchemy import select
+from sqlalchemy import make_url, select
+from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -731,18 +732,29 @@ async def test_relay_never_starts_listener_without_a_postgres_engine(session_fac
     assert calls == []
 
 
-# --- _listen_for_wakeups: connect retry and catch-up wake (issue #682) ---
+# --- _listen_for_wakeups: connect retry, reconnect backoff/close, DSN
+# (issue #695 review sweep: reconnect backoff, close-before-reconnect, DSN
+# from connect kwargs) ---
+
+
+def _fake_pg_engine(opts=None):
+    """A fake AsyncEngine stand-in for `_listen_for_wakeups`: it only ever
+    calls `engine.dialect.create_connect_args(engine.url)`, so `url` itself
+    is never inspected here (the real translation is pinned separately by
+    `test_listen_for_wakeups_dsn_from_dialect_connect_args`, which uses a
+    real URL and a real dialect)."""
+    fixed_opts = dict(
+        opts or {"host": "h", "port": 5432, "user": "u", "password": "p", "database": "d"}
+    )
+    dialect = SimpleNamespace(create_connect_args=lambda url: ([], dict(fixed_opts)))
+    return SimpleNamespace(url=SimpleNamespace(), dialect=dialect)
 
 
 async def test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify(monkeypatch):
     """A connect failure retries after retry_seconds; the successful connect
     sets wake once (catch-up), and the registered NOTIFY callback sets wake
     again on a later notification."""
-    engine = SimpleNamespace(
-        url=SimpleNamespace(
-            set=lambda **kw: SimpleNamespace(render_as_string=lambda **kw2: "postgresql://x")
-        )
-    )
+    engine = _fake_pg_engine()
     wake = asyncio.Event()
     channel = "herd_outbox_test"
     registered: dict = {}
@@ -761,7 +773,7 @@ async def test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify(monke
         async def close(self) -> None:
             pass
 
-    async def fake_connect(dsn):
+    async def fake_connect(**kwargs):
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise OSError("connection refused")
@@ -783,3 +795,233 @@ async def test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify(monke
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+async def test_listen_for_wakeups_termination_closes_conn_then_backs_off_before_reconnect(
+    monkeypatch,
+):
+    """The lost-connection branch (the registered termination callback
+    firing) closes the old connection and sleeps retry_seconds BEFORE the
+    next connect, exactly like the exception branch: previously it
+    reconnected immediately with no backoff and never closed the old
+    connection."""
+    engine = _fake_pg_engine()
+    wake = asyncio.Event()
+    channel = "herd_outbox_test"
+    events: list[str] = []
+    term_cbs: list = []
+
+    class _FakeConn:
+        def __init__(self, n: int):
+            self.n = n
+
+        async def add_listener(self, ch, cb) -> None:
+            pass
+
+        def add_termination_listener(self, cb) -> None:
+            term_cbs.append(cb)
+
+        async def close(self) -> None:
+            events.append(f"close-{self.n}")
+
+    conn_n = {"n": 0}
+
+    async def fake_connect(**kwargs):
+        n = conn_n["n"]
+        conn_n["n"] += 1
+        events.append(f"connect-{n}")
+        return _FakeConn(n)
+
+    fake_asyncpg = SimpleNamespace(connect=fake_connect)
+    monkeypatch.setitem(sys.modules, "asyncpg", fake_asyncpg)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        events.append("sleep")
+
+    real_sleep = asyncio.sleep
+
+    task = asyncio.create_task(_listen_for_wakeups(engine, channel, wake, retry_seconds=7.0))
+    try:
+        await asyncio.wait_for(wake.wait(), timeout=2.0)
+        assert events == ["connect-0"]
+
+        with patch("herd_common.outbox.asyncio.sleep", new=fake_sleep):
+            # Fire termination on the first (only) connection.
+            term_cbs[0](None)
+
+            # Wait for the loop to come all the way back around: close the
+            # old connection, back off, and open a second one.
+            deadline = time.monotonic() + 2.0
+            while len(term_cbs) < 2 and time.monotonic() < deadline:
+                await real_sleep(0.01)
+            assert len(term_cbs) == 2, "listener never reconnected after termination"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Close-before-reconnect, and the sleep (retry_seconds) landed strictly
+    # between the close and the next connect on this branch too. The trailing
+    # close-1 is cancellation closing the live second connection.
+    assert events == ["connect-0", "close-0", "sleep", "connect-1", "close-1"]
+    assert sleeps == [7.0]
+
+
+async def test_listen_for_wakeups_registration_failure_closes_conn_and_leaks_none(monkeypatch):
+    """add_listener raising leaves the just-opened connection closed (not
+    leaked), wake is never set for that failed attempt, and only one live
+    connection is ever open at a time."""
+    engine = _fake_pg_engine()
+    wake = asyncio.Event()
+    channel = "herd_outbox_test"
+    conns: list = []
+
+    class _FakeConn:
+        def __init__(self, n: int, fail_registration: bool):
+            self.n = n
+            self.fail_registration = fail_registration
+            self.closed = False
+
+        async def add_listener(self, ch, cb) -> None:
+            if self.fail_registration:
+                raise RuntimeError("add_listener failed")
+
+        def add_termination_listener(self, cb) -> None:
+            pass
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def fake_connect(**kwargs):
+        conn = _FakeConn(len(conns), fail_registration=len(conns) == 0)
+        conns.append(conn)
+        return conn
+
+    fake_asyncpg = SimpleNamespace(connect=fake_connect)
+    monkeypatch.setitem(sys.modules, "asyncpg", fake_asyncpg)
+
+    task = asyncio.create_task(_listen_for_wakeups(engine, channel, wake, retry_seconds=0.01))
+    try:
+        # wake is set only after a SUCCESSFUL registration, so this proves
+        # the second (successfully-registered) connection was reached.
+        await asyncio.wait_for(wake.wait(), timeout=2.0)
+        assert len(conns) == 2
+        assert conns[0].closed, "the connection from the failed registration attempt leaked"
+        assert not conns[1].closed
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert conns[1].closed  # cancellation closes the live connection too
+
+    # No further reconnects: exactly one failed + one live connection.
+    assert len(conns) == 2
+
+
+async def test_listen_for_wakeups_dsn_from_dialect_connect_args(monkeypatch):
+    """The connection is opened from `engine.dialect.create_connect_args`
+    kwargs, not a rendered DSN string: `ssl` and
+    `prepared_statement_cache_size` reach asyncpg as kwargs (the spellings
+    its own DSN parser rejects), no `dsn` kwarg is passed, and the
+    asyncpg-only pool-wrapper keys the dialect adds are stripped."""
+    url = make_url("postgresql+asyncpg://u:p@h:5432/d?ssl=require&prepared_statement_cache_size=0")
+    engine = SimpleNamespace(url=url, dialect=PGDialect_asyncpg())
+
+    wake = asyncio.Event()
+    channel = "herd_outbox_test"
+    captured: dict = {}
+
+    class _FakeConn:
+        async def add_listener(self, ch, cb) -> None:
+            pass
+
+        def add_termination_listener(self, cb) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    async def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return _FakeConn()
+
+    fake_asyncpg = SimpleNamespace(connect=fake_connect)
+    monkeypatch.setitem(sys.modules, "asyncpg", fake_asyncpg)
+
+    task = asyncio.create_task(_listen_for_wakeups(engine, channel, wake, retry_seconds=0.01))
+    try:
+        await asyncio.wait_for(wake.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert captured["ssl"] == "require"
+    assert captured["host"] == "h"
+    assert captured["port"] == 5432
+    assert captured["user"] == "u"
+    assert captured["password"] == "p"
+    assert captured["database"] == "d"
+    assert "prepared_statement_cache_size" not in captured
+    assert "dsn" not in captured
+
+
+# --- run_outbox_relay: saturated batch loops immediately (issue #695 review
+# sweep item 3) ---
+
+
+async def test_relay_saturated_batch_drains_remainder_without_waiting_a_tick(session_factory):
+    """150 staged rows with batch_size=100: Postgres collapses the whole
+    commit into one NOTIFY, so the drain that comes back exactly `batch_size`
+    must loop immediately for the remaining 50 instead of waiting out
+    tick_seconds=60 first."""
+    async with session_factory() as session:
+        for i in range(150):
+            await enqueue_event(session, OutboxEvent, "s", {"n": i})
+        await session.commit()
+
+    real_publish_pending = _publish_pending
+    drain_times: list[float] = []
+    drain_counts: list[int] = []
+
+    async def counting_publish_pending(session, js, model, *, batch_size, publish_timeout=10.0):
+        drain_times.append(time.monotonic())
+        count = await real_publish_pending(
+            session, js, model, batch_size=batch_size, publish_timeout=publish_timeout
+        )
+        drain_counts.append(count)
+        return count
+
+    js = _js_ok()
+    nc = SimpleNamespace(is_connected=True)
+    nc.jetstream = lambda: js
+
+    async def _driver():
+        with patch("herd_common.outbox._publish_pending", new=counting_publish_pending):
+            await run_outbox_relay(
+                session_factory,
+                lambda: nc,
+                OutboxEvent,
+                tick_seconds=60.0,
+                batch_size=100,
+                prune_every_seconds=10_000.0,
+            )
+
+    task = asyncio.create_task(_driver())
+    try:
+        deadline = time.monotonic() + 5.0
+        while len(drain_counts) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert drain_counts == [100, 50]
+        # The second drain followed the first back-to-back, nowhere near the
+        # 60s tick.
+        assert drain_times[1] - drain_times[0] < 1.0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert js.publish.await_count == 150

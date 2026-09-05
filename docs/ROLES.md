@@ -187,6 +187,9 @@ Rules enforced by the API:
 - The `superadmin` role value cannot be set via the API.
 - The superadmin cannot change their own role.
 - The superadmin's role cannot be changed by anyone through the API.
+- The superadmin cannot be deactivated by anyone through the API
+  (`POST /users/{id}/deactivate` answers 400); `activate` has no such
+  carve-out, so an inactive superadmin row is always recoverable in one call.
 
 ---
 

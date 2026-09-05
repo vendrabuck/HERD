@@ -127,6 +127,12 @@ async def deactivate_user(
 
     Always clears deactivated_by_sync: a manually deactivated user is
     invisible to the sweep's automatic reactivation.
+
+    The superadmin is refused (issue #715), mirroring the role-change
+    carve-out: a deactivated superadmin cannot log in or refresh, is not
+    re-seeded at startup, and the LDAP sync never reactivates a local user.
+    activate_user deliberately has NO matching carve-out; that is the
+    recovery direction.
     """
     if user_id == current_user.id:
         raise HTTPException(
@@ -137,6 +143,12 @@ async def deactivate_user(
     target = await get_user_by_id(db, user_id)
     if not target:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if target.role == Role.SUPERADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot deactivate the superadmin",
+        )
 
     updated = await set_user_active(db, user_id, False)
     logger.info(

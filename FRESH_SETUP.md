@@ -109,7 +109,7 @@ make logs
 
 - Web UI: `https://<your-host-ip>` (or `https://localhost`)
 - HTTP auto-redirects to HTTPS
-- Traefik dashboard: `http://<your-host-ip>:8080`
+- Traefik dashboard: bound to loopback only (`127.0.0.1:8080` on the Docker host, issue #708). The dashboard and its `/api` have no authentication, so it is never published on a routable interface under `make prod`. To view it from another machine, open an SSH tunnel and browse the local end: `ssh -L 8080:127.0.0.1:8080 <user>@<your-host-ip>`, then `http://localhost:8080`. This applies to `make up` as well; on the Docker host itself `http://localhost:8080` works directly.
 - API endpoints: `https://<your-host-ip>/api/auth`, `/api/inventory`, `/api/reservations`, `/api/cabling`, `/api/acl`, `/api/execution`, `/api/ai`, `/api/config`, `/api/notifications`, `/api/user-profile`, `/api/v1`, `/api/secrets`
 
 Log in with the superadmin credentials you set in `.env`.
