@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Hardened the purpose-classification request path in ai-orchestrator
+  (issue #709). Both `POST /classify-purpose/preview` and
+  `POST /internal/classify-purpose` now bound their bodies: `purpose` at
+  2000 characters, `device_ids` at 200, `dynamic_requests` at 50 (the caps
+  reservations' own `ReservationCreate` already enforces) and `categories`
+  at 64, each rejected with 422. The provider-configured (503) and daily
+  quota (429) gates now run BEFORE the signal gather in both handlers, so an
+  unconfigured provider or an over-quota caller can no longer drive the
+  inventory and cabling fan-out. `dynamic_requests` are deduped by template
+  id before fetching (counts for a repeated template are summed, matching
+  reservations' N-entries-means-N-instances semantic), and the internal
+  pass's per-device inventory reads (device detail and config-apply job
+  summaries) plus the per-template reads run concurrently under a
+  semaphore of 8 instead of strictly one after another; results keep
+  request order and the per-item drop-on-failure contract is unchanged.
+
 - Added Download CSV buttons for the four purpose reporting sections (issue
   #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
   join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a

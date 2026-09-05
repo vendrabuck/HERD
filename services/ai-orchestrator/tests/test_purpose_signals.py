@@ -1,10 +1,13 @@
 """Unit tests for app/services/purpose_signals.py (issue #646 phase 2).
 
 Covers prompt assembly for both passes, transcript inclusion gated by
-ai_purpose_include_transcripts, and that a signal-fetch failure is
-tolerated (logged, omitted from signals_used) rather than raised.
+ai_purpose_include_transcripts, that a signal-fetch failure is tolerated
+(logged, omitted from signals_used) rather than raised, and (issue #709)
+that per-item fetches are deduped and fanned out under a concurrency bound
+without changing rendering order.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
@@ -423,3 +426,99 @@ async def test_transcripts_skip_tool_role_and_truncate_keeping_most_recent(monke
     assert sig_module.SIGNAL_TRANSCRIPTS in used
     assert "tool_result_should_never_appear" not in block
     assert "newest turn kept" in block
+
+
+# --- dedupe and bounded fan-out (issue #709) ---
+
+
+@pytest.mark.asyncio
+async def test_dynamic_templates_fetch_count_equals_distinct_templates():
+    """Three entries over two distinct templates issue two fetches, in
+    first-seen order, and the repeated template's counts are summed."""
+    other = uuid.uuid4()
+    fetched: list[uuid.UUID] = []
+
+    async def fetch_template(template_id):
+        fetched.append(template_id)
+        return {"name": "tpl-" + ("a" if template_id == TEMPLATE_ID else "b")}
+
+    block = await sig_module._gather_dynamic_templates_block(
+        fetch_template,
+        [
+            DynamicRequestItem(template_id=TEMPLATE_ID, count=1),
+            DynamicRequestItem(template_id=other, count=5),
+            DynamicRequestItem(template_id=TEMPLATE_ID, count=2),
+        ],
+    )
+
+    assert fetched == [TEMPLATE_ID, other]
+    assert block == "<dynamic_templates>\n  - tpl-a x3\n  - tpl-b x5\n</dynamic_templates>"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_templates_untolerated_exception_still_propagates():
+    """The drop-on-failure contract covers transport and body errors only; a
+    defect inside a fetch is not swallowed by the fan-out."""
+
+    async def fetch_template(template_id):
+        raise RuntimeError("bug")
+
+    with pytest.raises(RuntimeError, match="bug"):
+        await sig_module._gather_dynamic_templates_block(
+            fetch_template, [DynamicRequestItem(template_id=TEMPLATE_ID, count=1)]
+        )
+
+
+@pytest.mark.asyncio
+async def test_internal_device_fanout_is_bounded_and_order_preserving(monkeypatch):
+    """Twenty devices: never more than FANOUT_CONCURRENCY requests in
+    flight, every device rendered in device_ids order even though responses
+    complete out of order, one failing device dropped rather than fatal."""
+    device_ids = [uuid.uuid4() for _ in range(20)]
+    failing = device_ids[7]
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        path = request.url.path
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            # Yield so other fan-out tasks get scheduled while this one is
+            # "waiting"; later devices finish first to exercise ordering.
+            for did in reversed(device_ids):
+                if path.endswith(f"/devices/{did}/internal"):
+                    await asyncio.sleep(0.001 * (20 - device_ids.index(did)))
+                    if did == failing:
+                        return httpx.Response(500, json={"detail": "boom"})
+                    return httpx.Response(200, json=_device_payload(did, f"dev-{did}"))
+                if path.endswith(f"/devices/{did}/apply-jobs/internal"):
+                    await asyncio.sleep(0)
+                    return httpx.Response(200, json={"count": 0, "names": []})
+            return httpx.Response(404, json={"detail": "unmocked"})
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(config_module.settings, "internal_api_token", "internal-secret")
+    _patch_httpx(monkeypatch, handler)
+
+    block, used = await sig_module.gather_internal_signals(
+        db=None,
+        reservation_id=RESERVATION_ID,
+        purpose=None,
+        device_ids=device_ids,
+        dynamic_requests=None,
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end_time=datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+        status="COMPLETED",
+    )
+
+    assert sig_module.SIGNAL_TOPOLOGY in used
+    assert peak <= sig_module.FANOUT_CONCURRENCY
+    assert peak > 1, "the fan-out ran sequentially"
+    rendered = [line for line in block.splitlines() if line.startswith("  - dev-")]
+    expected = [
+        f"  - dev-{did}: template=switch (Arista 7050)" for did in device_ids if did != failing
+    ]
+    assert rendered == expected

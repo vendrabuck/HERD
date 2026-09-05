@@ -30,10 +30,12 @@ there is nothing to fetch. See docs/AI_PURPOSE_CLASSIFICATION.md.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from sqlalchemy import select
@@ -48,6 +50,22 @@ logger = logging.getLogger(__name__)
 HTTP_TIMEOUT_SECONDS = 15.0
 TRANSCRIPT_CHAR_BUDGET = 12_000
 APPLY_JOB_NAME_DISPLAY_CAP = 20
+# Per-item fetches (one inventory call per device or template) run
+# concurrently under this bound (issue #709): the internal pass at the
+# 200-device schema cap was 401 strictly sequential calls, each with its own
+# 15 s ceiling inside the caller's 30 s budget. Eight keeps a burst well
+# inside inventory's pool while collapsing the wall-clock to a few
+# round-trips.
+FANOUT_CONCURRENCY = 8
+
+# The exceptions a single signal fetch may raise and be dropped for (a
+# non-2xx response, a transport error, or a malformed body). Anything else
+# is a programming error and still propagates, exactly as it did when the
+# fetches ran in a sequential loop.
+_TOLERATED_FETCH_ERRORS = (httpx.HTTPError, ValueError)
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 # Canonical signal names surfaced on PurposeClassification.signals_used.
 SIGNAL_PURPOSE_TEXT = "purpose_text"
@@ -98,6 +116,36 @@ def _layers_from_canvas(canvas_data: dict[str, Any] | None) -> list[str]:
         layer = (edge.get("data") or {}).get("layer")
         layers.append(str(layer) if layer else "unknown")
     return layers
+
+
+async def _bounded_map(
+    fn: Callable[[_T], Awaitable[_R]], items: Iterable[_T]
+) -> list[_R | BaseException]:
+    """Apply `fn` to every item concurrently, at most FANOUT_CONCURRENCY at a
+    time, returning results in input order. A raised exception becomes the
+    exception object in its slot (`return_exceptions=True`) so a caller can
+    keep the per-item drop-on-failure contract; `asyncio.gather` preserves
+    order, so rendering is unchanged from the sequential loops it replaces.
+    """
+    semaphore = asyncio.Semaphore(FANOUT_CONCURRENCY)
+
+    async def _one(item: _T) -> _R:
+        async with semaphore:
+            return await fn(item)
+
+    return await asyncio.gather(*(_one(item) for item in items), return_exceptions=True)
+
+
+def _dropped(result: object, event: str) -> bool:
+    """True when `result` is a tolerated fetch failure (logged and dropped).
+    Any other exception is re-raised: it is not a signal-fetch failure but a
+    defect, and the sequential loops never swallowed those either."""
+    if isinstance(result, _TOLERATED_FETCH_ERRORS):
+        logger.warning("%s: %s", event, result)
+        return True
+    if isinstance(result, BaseException):
+        raise result
+    return False
 
 
 class _SignalBuilder:
@@ -203,18 +251,27 @@ async def _gather_dynamic_templates_block(
 ) -> str | None:
     if not dynamic_requests:
         return None
+    # Dedupe by template id before fetching (issue #709): one fetch per
+    # distinct template, in first-seen order. Counts for a repeated template
+    # are summed, matching reservations' own semantic that N entries of one
+    # template request N instances of it (its ReservationCreate has no
+    # per-entry count), so the rendered "x<count>" stays truthful.
+    counts: dict[uuid.UUID, int] = {}
+    for item in dynamic_requests:
+        counts[item.template_id] = counts.get(item.template_id, 0) + item.count
+    template_ids = list(counts)
+
+    results = await _bounded_map(fetch_template, template_ids)
+
     lines = ["<dynamic_templates>"]
     any_resolved = False
-    for item in dynamic_requests:
-        try:
-            template = await fetch_template(item.template_id)
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("purpose_signal_dynamic_template_fetch_failed: %s", exc)
+    for template_id, template in zip(template_ids, results, strict=True):
+        if _dropped(template, "purpose_signal_dynamic_template_fetch_failed"):
             continue
         if not template:
             continue
-        name = template.get("name") or str(item.template_id)
-        lines.append(f"  - {name} x{item.count}")
+        name = template.get("name") or str(template_id)
+        lines.append(f"  - {name} x{counts[template_id]}")
         any_resolved = True
     if not any_resolved:
         return None
@@ -314,12 +371,13 @@ async def _fetch_fork_internal(
 async def _gather_topology_block_internal(
     client: httpx.AsyncClient, device_ids: list[uuid.UUID]
 ) -> str | None:
+    async def _fetch(device_id: uuid.UUID) -> dict[str, Any] | None:
+        return await _fetch_device_internal(client, device_id)
+
+    results = await _bounded_map(_fetch, device_ids)
     devices: list[dict[str, Any]] = []
-    for device_id in device_ids:
-        try:
-            device = await _fetch_device_internal(client, device_id)
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("purpose_signal_device_fetch_failed: %s", exc)
+    for device in results:
+        if _dropped(device, "purpose_signal_device_fetch_failed"):
             continue
         if device:
             devices.append(device)
@@ -343,13 +401,14 @@ async def _gather_dynamic_templates_block_internal(
 async def _gather_config_apply_jobs_block(
     client: httpx.AsyncClient, device_ids: list[uuid.UUID]
 ) -> str | None:
+    async def _fetch(device_id: uuid.UUID) -> dict[str, Any] | None:
+        return await _fetch_apply_jobs_summary_internal(client, device_id)
+
+    results = await _bounded_map(_fetch, device_ids)
     lines = ["<config_apply_jobs>"]
     any_job = False
-    for device_id in device_ids:
-        try:
-            summary = await _fetch_apply_jobs_summary_internal(client, device_id)
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("purpose_signal_apply_jobs_fetch_failed: %s", exc)
+    for device_id, summary in zip(device_ids, results, strict=True):
+        if _dropped(summary, "purpose_signal_apply_jobs_fetch_failed"):
             continue
         if not summary or not summary.get("count"):
             continue

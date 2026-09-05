@@ -16,6 +16,19 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Request bounds (issue #709). The purpose, device_ids, and dynamic_requests
+# caps mirror the owning schema in
+# services/reservations/app/schemas/reservation.py (ReservationCreate:
+# purpose max_length=2000, device_ids max_length=200, dynamic_requests
+# max_length=50); a body this service accepts must never be larger than the
+# reservation it describes. categories has no reservations-side twin (the
+# taxonomy is caller-supplied, see the module docstring); 64 comfortably
+# exceeds any real taxonomy while bounding the forced-tool schema size.
+PURPOSE_MAX_LENGTH = 2000
+DEVICE_IDS_MAX_LENGTH = 200
+DYNAMIC_REQUESTS_MAX_LENGTH = 50
+CATEGORIES_MAX_LENGTH = 64
+
 
 class DynamicRequestItem(BaseModel):
     template_id: uuid.UUID
@@ -25,11 +38,13 @@ class DynamicRequestItem(BaseModel):
 class PreviewClassifyRequest(BaseModel):
     """Body for POST /classify-purpose/preview (creation pass, user JWT)."""
 
-    categories: list[str] = Field(min_length=1)
-    purpose: str | None = None
+    categories: list[str] = Field(min_length=1, max_length=CATEGORIES_MAX_LENGTH)
+    purpose: str | None = Field(default=None, max_length=PURPOSE_MAX_LENGTH)
     topology_id: uuid.UUID | None = None
-    device_ids: list[uuid.UUID] | None = None
-    dynamic_requests: list[DynamicRequestItem] | None = None
+    device_ids: list[uuid.UUID] | None = Field(default=None, max_length=DEVICE_IDS_MAX_LENGTH)
+    dynamic_requests: list[DynamicRequestItem] | None = Field(
+        default=None, max_length=DYNAMIC_REQUESTS_MAX_LENGTH
+    )
 
 
 class InternalClassifyRequest(BaseModel):
@@ -38,12 +53,14 @@ class InternalClassifyRequest(BaseModel):
     enriches it with its own transcripts plus inventory/cabling signals."""
 
     reservation_id: uuid.UUID
-    categories: list[str] = Field(min_length=1)
-    purpose: str | None = None
+    categories: list[str] = Field(min_length=1, max_length=CATEGORIES_MAX_LENGTH)
+    purpose: str | None = Field(default=None, max_length=PURPOSE_MAX_LENGTH)
     user_id: uuid.UUID
-    device_ids: list[uuid.UUID]
+    device_ids: list[uuid.UUID] = Field(max_length=DEVICE_IDS_MAX_LENGTH)
     topology_id: uuid.UUID | None = None
-    dynamic_requests: list[DynamicRequestItem] | None = None
+    dynamic_requests: list[DynamicRequestItem] | None = Field(
+        default=None, max_length=DYNAMIC_REQUESTS_MAX_LENGTH
+    )
     start_time: datetime
     end_time: datetime
     status: str

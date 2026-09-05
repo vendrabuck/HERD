@@ -4,8 +4,9 @@
 Pins the boundary gate in order (flag 403 with the pinned wording, then
 503 unconfigured), the happy-path response shape for both passes
 (including the forced classify_purpose tool call and signals_used), usage
-metering, and the 502 wording when the classifier never returns a usable
-distribution.
+metering, the 502 wording when the classifier never returns a usable
+distribution, and (issue #709) the request bounds plus the rule that the
+provider and quota gates run BEFORE the signal gather.
 """
 
 import uuid
@@ -17,12 +18,21 @@ from app import config as config_module
 from app.database import Base, engine
 from app.main import app
 from app.routes.purpose_classification import PURPOSE_CLASSIFICATION_DISABLED_DETAIL
-from app.services import purpose_signals
+from app.schemas.purpose import (
+    CATEGORIES_MAX_LENGTH,
+    DEVICE_IDS_MAX_LENGTH,
+    DYNAMIC_REQUESTS_MAX_LENGTH,
+    PURPOSE_MAX_LENGTH,
+)
+from app.services import purpose_signals, usage_repo
 from app.services.ai_client import AI_NOT_CONFIGURED_DETAIL, get_ai_client
 from app.services.llm_provider import Usage
 from app.services.purpose_classifier import NO_USABLE_DISTRIBUTION_DETAIL
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+_TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 _USER_ID = str(uuid.uuid4())
 
@@ -271,3 +281,148 @@ async def test_preview_meters_usage(async_client, monkeypatch):
     usage_arg = record_usage_mock.call_args.args[2]
     assert usage_arg.input_tokens == 100
     assert usage_arg.output_tokens == 20
+
+
+# --- request bounds (issue #709) ---
+
+
+def _oversize(field: str):
+    """One-past-the-cap value for each bounded field; the cap constants are
+    the schema's own, so a cap change here is a deliberate schema change."""
+    if field == "purpose":
+        return "x" * (PURPOSE_MAX_LENGTH + 1)
+    if field == "device_ids":
+        return [str(uuid.uuid4()) for _ in range(DEVICE_IDS_MAX_LENGTH + 1)]
+    if field == "dynamic_requests":
+        return [
+            {"template_id": str(uuid.uuid4()), "count": 1}
+            for _ in range(DYNAMIC_REQUESTS_MAX_LENGTH + 1)
+        ]
+    if field == "categories":
+        return [f"c{i}" for i in range(CATEGORIES_MAX_LENGTH + 1)]
+    raise AssertionError(field)
+
+
+_BOUNDED_FIELDS = ["purpose", "device_ids", "dynamic_requests", "categories"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", _BOUNDED_FIELDS)
+async def test_preview_422_when_field_oversize(async_client, field, monkeypatch):
+    gather = AsyncMock()
+    monkeypatch.setattr(purpose_signals, "gather_preview_signals", gather)
+    _stub_ai()
+    body = dict(PREVIEW_BODY)
+    body[field] = _oversize(field)
+    async with async_client as client:
+        resp = await client.post("/classify-purpose/preview", json=body, headers=_headers())
+    assert resp.status_code == 422, resp.text
+    assert field in str(resp.json()["detail"])
+    gather.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", _BOUNDED_FIELDS)
+async def test_internal_422_when_field_oversize(async_client, field, monkeypatch):
+    gather = AsyncMock()
+    monkeypatch.setattr(purpose_signals, "gather_internal_signals", gather)
+    _stub_ai()
+    body = dict(INTERNAL_BODY)
+    body[field] = _oversize(field)
+    async with async_client as client:
+        resp = await client.post(
+            "/internal/classify-purpose",
+            json=body,
+            headers={"X-Internal-Token": "internal-secret"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert field in str(resp.json()["detail"])
+    gather.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preview_at_cap_is_accepted(async_client, monkeypatch):
+    """The caps are inclusive: exactly-at-cap bodies validate. Pins the
+    boundary so an off-by-one in the schema cannot hide behind the 422 tests."""
+    _stub_ai([{"distribution": [{"category": "c0", "probability": 1.0}], "rationale": "r"}])
+    body = dict(PREVIEW_BODY)
+    body["purpose"] = "x" * PURPOSE_MAX_LENGTH
+    body["device_ids"] = [str(uuid.uuid4()) for _ in range(DEVICE_IDS_MAX_LENGTH)]
+    body["dynamic_requests"] = [
+        {"template_id": str(uuid.uuid4()), "count": 1} for _ in range(DYNAMIC_REQUESTS_MAX_LENGTH)
+    ]
+    body["categories"] = [f"c{i}" for i in range(CATEGORIES_MAX_LENGTH)]
+    async with async_client as client:
+        resp = await client.post("/classify-purpose/preview", json=body, headers=_headers())
+    assert resp.status_code == 200, resp.text
+
+
+# --- gate ordering: provider and quota before the gather (issue #709) ---
+
+
+async def _put_user_over_quota(monkeypatch, user_id: str) -> None:
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    async with _TestSessionLocal() as db:
+        await usage_repo.record_usage(db, uuid.UUID(user_id), Usage(input_tokens=150))
+
+
+@pytest.mark.asyncio
+async def test_preview_over_quota_429_never_awaits_gatherer(async_client, monkeypatch):
+    await _put_user_over_quota(monkeypatch, _USER_ID)
+    gather = AsyncMock()
+    monkeypatch.setattr(purpose_signals, "gather_preview_signals", gather)
+    stub = _stub_ai()
+    async with async_client as client:
+        resp = await client.post("/classify-purpose/preview", json=PREVIEW_BODY, headers=_headers())
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["detail"]["remaining"] == 0
+    gather.assert_not_awaited()
+    assert stub.calls == []
+
+
+@pytest.mark.asyncio
+async def test_internal_over_quota_429_never_awaits_gatherer(async_client, monkeypatch):
+    await _put_user_over_quota(monkeypatch, INTERNAL_BODY["user_id"])
+    gather = AsyncMock()
+    monkeypatch.setattr(purpose_signals, "gather_internal_signals", gather)
+    stub = _stub_ai()
+    async with async_client as client:
+        resp = await client.post(
+            "/internal/classify-purpose",
+            json=INTERNAL_BODY,
+            headers={"X-Internal-Token": "internal-secret"},
+        )
+    assert resp.status_code == 429, resp.text
+    gather.assert_not_awaited()
+    assert stub.calls == []
+
+
+@pytest.mark.asyncio
+async def test_preview_unconfigured_503_never_awaits_gatherer(async_client, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    gather = AsyncMock()
+    monkeypatch.setattr(purpose_signals, "gather_preview_signals", gather)
+    _stub_ai()
+    async with async_client as client:
+        resp = await client.post("/classify-purpose/preview", json=PREVIEW_BODY, headers=_headers())
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_NOT_CONFIGURED_DETAIL
+    gather.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_internal_unconfigured_503_never_awaits_gatherer(async_client, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    gather = AsyncMock()
+    monkeypatch.setattr(purpose_signals, "gather_internal_signals", gather)
+    _stub_ai()
+    async with async_client as client:
+        resp = await client.post(
+            "/internal/classify-purpose",
+            json=INTERNAL_BODY,
+            headers={"X-Internal-Token": "internal-secret"},
+        )
+    assert resp.status_code == 503
+    gather.assert_not_awaited()
