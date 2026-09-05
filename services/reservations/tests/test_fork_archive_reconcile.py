@@ -223,6 +223,70 @@ async def test_reconcile_archives_terminal_skips_active_and_unknown():
 
 
 @pytest.mark.asyncio
+async def test_unknown_reservation_warns_once_per_process_across_ticks(caplog):
+    """An unresolved unknown-reservation fork warns on tick one, stays silent on
+    tick two (issue #710): re-warning every tick forever is pure noise once the
+    condition has been observed, since it never resolves on its own.
+    """
+    unknown = uuid.uuid4()
+    listed = [(unknown, 1)]
+
+    with (
+        patch("app.tasks.expiration._fetch_active_forks", AsyncMock(return_value=listed)),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+        caplog.at_level("WARNING", logger="app.tasks.expiration"),
+    ):
+        await _run_fork_archive_reconcile()
+        await _run_fork_archive_reconcile()
+
+    warnings = [
+        r
+        for r in caplog.records
+        if getattr(r, "action", None) == "fork_reconcile_unknown_reservation"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].reservation_id == str(unknown)
+
+
+@pytest.mark.asyncio
+async def test_unknown_reservation_warning_resets_once_reservation_stops_reporting():
+    """The seen-set is pruned against each tick's row set (issue #710): once cabling
+    stops reporting a reservation_id, a LATER unrelated occurrence of the same id
+    (e.g. a re-created reservation with the same UUID is astronomically unlikely, but
+    a stale in-memory entry outliving its usefulness is the real risk this guards)
+    warns again rather than being silenced forever.
+    """
+    import app.tasks.expiration as expiration_module
+
+    first_unknown = uuid.uuid4()
+    second_unknown = uuid.uuid4()
+
+    with (
+        patch(
+            "app.tasks.expiration._fetch_active_forks",
+            AsyncMock(return_value=[(first_unknown, 1)]),
+        ),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+    ):
+        await _run_fork_archive_reconcile()
+
+    assert first_unknown in expiration_module._unknown_reservation_warned
+
+    # A later tick no longer reports first_unknown at all: its entry is pruned.
+    with (
+        patch(
+            "app.tasks.expiration._fetch_active_forks",
+            AsyncMock(return_value=[(second_unknown, 1)]),
+        ),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+    ):
+        await _run_fork_archive_reconcile()
+
+    assert first_unknown not in expiration_module._unknown_reservation_warned
+    assert second_unknown in expiration_module._unknown_reservation_warned
+
+
+@pytest.mark.asyncio
 async def test_reconcile_survives_fetch_failure():
     archive = AsyncMock()
     with (

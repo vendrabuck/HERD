@@ -276,6 +276,62 @@ async def test_no_heal_when_in_sync():
 
 
 @pytest.mark.asyncio
+async def test_heal_mixed_batch_stages_only_the_behind_reservation(monkeypatch):
+    """One reservation behind, one in sync, one with no ledger row at all (issue #710).
+
+    Pins the bulk column-only ledger preload's behavior across a single tick: exactly
+    the behind reservation's heal event is staged (and its ledger advanced), the
+    in-sync reservation's ledger is untouched, and the no-ledger-row reservation heals
+    to cabling's reported version (a missing row counts as 0, unchanged from before
+    the preload). Also proves the preload issues one query per chunk rather than one
+    per reservation: with _LEDGER_PRELOAD_CHUNK patched down to 2, three ACTIVE
+    reservations must take exactly two chunked SELECTs against fork_wiring_ledger,
+    not three (one per row, the pre-#710 shape).
+    """
+    import app.tasks.expiration as expiration_module
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr(expiration_module, "_LEDGER_PRELOAD_CHUNK", 2)
+
+    behind = await _insert(ReservationStatus.ACTIVE)
+    in_sync = await _insert(ReservationStatus.ACTIVE)
+    no_ledger = await _insert(ReservationStatus.ACTIVE)
+
+    async with TestSessionLocal() as db:
+        db.add(ForkWiringLedger(reservation_id=behind, last_staged_fork_version=1))
+        db.add(ForkWiringLedger(reservation_id=in_sync, last_staged_fork_version=5))
+        await db.commit()
+
+    real_execute = AsyncSession.execute
+    ledger_query_count = 0
+
+    async def _counting_execute(self, statement, *args, **kwargs):
+        nonlocal ledger_query_count
+        if "fork_wiring_ledger" in str(statement).lower():
+            ledger_query_count += 1
+        return await real_execute(self, statement, *args, **kwargs)
+
+    with (
+        _forks((behind, 3), (in_sync, 5), (no_ledger, 7)),
+        patch("app.tasks.expiration._archive_reservation_fork_best_effort", AsyncMock()),
+        patch.object(AsyncSession, "execute", _counting_execute),
+    ):
+        await _run_fork_archive_reconcile()
+
+    # Three reservations, chunk size 2: two chunked preload SELECTs (2 + 1), not 3.
+    assert ledger_query_count == 2
+
+    rows = await _wiring_rows()
+    staged_ids = {row.payload["reservation_id"] for row in rows}
+    assert staged_ids == {str(behind), str(no_ledger)}
+    assert str(in_sync) not in staged_ids
+
+    assert (await _ledger(behind)).last_staged_fork_version == 3
+    assert (await _ledger(in_sync)).last_staged_fork_version == 5
+    assert (await _ledger(no_ledger)).last_staged_fork_version == 7
+
+
+@pytest.mark.asyncio
 async def test_terminal_reservation_is_not_healed():
     """A terminal (COMPLETED) reservation is archived, never wiring-healed."""
     rid = await _insert(ReservationStatus.COMPLETED)

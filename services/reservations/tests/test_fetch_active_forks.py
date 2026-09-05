@@ -65,6 +65,44 @@ async def test_fetch_active_forks_pages_through_multiple_pages():
 
 
 @pytest.mark.asyncio
+async def test_fetch_active_forks_stops_on_short_page_even_if_total_claims_more():
+    """A page shorter than `limit` stops the walk immediately (issue #710), even
+    when the server's `total` claims more rows remain. The set the sweep is
+    walking is live (a concurrent save or archive can change it mid-walk), so a
+    short page is definitive proof no more rows exist and is cheaper and more
+    robust than trusting `total` to stay consistent across pages.
+    """
+    only_page = [(uuid4(), 1) for _ in range(5)]  # far short of limit=200
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        skip = int(request.url.params["skip"])
+        limit = int(request.url.params["limit"])
+        calls.append({"skip": skip, "limit": limit})
+        # A stale/inconsistent total that would otherwise imply another page.
+        return httpx.Response(200, json=_forks_page(only_page, total=999))
+
+    transport = httpx.MockTransport(handler)
+
+    with (
+        patch("app.services.reservation_service.settings") as mock_settings,
+        patch(
+            "app.services.reservation_service.httpx.AsyncClient",
+            return_value=httpx.AsyncClient(transport=transport),
+        ),
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cabling"
+        result = await _fetch_active_forks()
+
+    expected = [(rid, v) for rid, v in only_page]
+    assert result == expected
+    # Exactly one fetch: the short page (5 rows on a 200 limit) stops the walk
+    # even though total=999 would otherwise imply skip=200 is still < total.
+    assert [c["skip"] for c in calls] == [0]
+
+
+@pytest.mark.asyncio
 async def test_fetch_active_forks_error_status_raises():
     """A non-2xx status raises via raise_for_status rather than returning partial data."""
 

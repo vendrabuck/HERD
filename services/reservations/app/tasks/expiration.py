@@ -465,6 +465,16 @@ async def _run_expiration_cycle() -> None:
         await _archive_reservation_fork_best_effort(res.id)
 
 
+# Issue #710: an ACTIVE fork whose reservation_id this DB does not know (cabling
+# reports it, but the row is gone or never existed here) is logged and skipped
+# forever, never archived, so unguarded it would re-warn at WARNING every tick for
+# the life of the process. Process-local, mirroring _fork_backstop_attempts and
+# _fork_membership_refused above: pruned against each tick's known-fork-id set so a
+# reservation cabling later stops reporting (its fork archives, or the row simply
+# leaves the ACTIVE set) does not leak its entry forever.
+_unknown_reservation_warned: set[uuid.UUID] = set()
+
+
 async def _run_fork_archive_reconcile() -> None:
     """Reconcile ACTIVE forks against reservation state each tick (ADR 0006, ADR 0007).
 
@@ -522,20 +532,29 @@ async def _run_fork_archive_reconcile() -> None:
     else:
         status_by_id = {}
 
+    known_ids = set(reservation_ids)
+    for stale_id in _unknown_reservation_warned - known_ids:
+        _unknown_reservation_warned.discard(stale_id)
+
     active_ids: list[uuid.UUID] = []
     for reservation_id in reservation_ids:
         status = status_by_id.get(reservation_id)
         if status is None:
             # Cabling holds an ACTIVE fork for a reservation this service does not
-            # know. Do not touch it blind: log it for investigation and skip.
-            logger.warning(
-                "Fork archive reconcile: ACTIVE fork for unknown reservation %s; skipping",
-                reservation_id,
-                extra={
-                    "action": "fork_reconcile_unknown_reservation",
-                    "reservation_id": str(reservation_id),
-                },
-            )
+            # know. Do not touch it blind: log it for investigation and skip. Warn
+            # once per reservation id per process (issue #710): an unresolved case
+            # never goes away on its own, so re-warning every tick forever is pure
+            # noise once the first warning has been seen.
+            if reservation_id not in _unknown_reservation_warned:
+                logger.warning(
+                    "Fork archive reconcile: ACTIVE fork for unknown reservation %s; skipping",
+                    reservation_id,
+                    extra={
+                        "action": "fork_reconcile_unknown_reservation",
+                        "reservation_id": str(reservation_id),
+                    },
+                )
+                _unknown_reservation_warned.add(reservation_id)
             continue
         if status in TERMINAL_STATUSES:
             await _archive_reservation_fork_best_effort(reservation_id)
@@ -556,6 +575,13 @@ async def _run_fork_archive_reconcile() -> None:
     await _backstop_missing_forks(set(version_by_id.keys()))
 
 
+# Cap on the IN-clause size for the ledger preload below (issue #710): keeps any
+# one query's parameter list bounded regardless of how many ACTIVE forks a tick
+# sees, mirroring _PENDING_PRUNE_BATCH's role of bounding per-tick fan-out
+# elsewhere in this file.
+_LEDGER_PRELOAD_CHUNK = 500
+
+
 async def _heal_wiring_staging(
     active_ids: list[uuid.UUID], version_by_id: dict[uuid.UUID, int]
 ) -> None:
@@ -568,14 +594,34 @@ async def _heal_wiring_staging(
     load-bearing full-reconcile marker) carrying that version and advance the ledger,
     atomically per reservation, exactly as the save path does. In-sync forks stage
     nothing.
+
+    The "is this fork behind" check (issue #710) is a single column-only preload of
+    (reservation_id, last_staged_fork_version) per _LEDGER_PRELOAD_CHUNK ids, rather
+    than one db.get(ForkWiringLedger, id) per ACTIVE fork every tick. Only rows that
+    turn out to actually need healing then go through stage_wiring_changed's own
+    fresh db.get (via _upsert_wiring_ledger): reusing the preloaded, possibly-stale
+    entity here would land it in the session identity map and be the row
+    _upsert_wiring_ledger mutates, silently widening the read-to-write window between
+    "decided to heal" and "advanced the ledger" for every other row read in the same
+    preload batch.
     """
     if not active_ids:
         return
     async with AsyncSessionLocal() as db:
+        last_staged_by_id: dict[uuid.UUID, int] = {}
+        for offset in range(0, len(active_ids), _LEDGER_PRELOAD_CHUNK):
+            chunk = active_ids[offset : offset + _LEDGER_PRELOAD_CHUNK]
+            result = await db.execute(
+                select(
+                    ForkWiringLedger.reservation_id,
+                    ForkWiringLedger.last_staged_fork_version,
+                ).where(ForkWiringLedger.reservation_id.in_(chunk))
+            )
+            last_staged_by_id.update(dict(result.all()))
+
         for reservation_id in active_ids:
             cabling_version = version_by_id.get(reservation_id, 0)
-            ledger = await db.get(ForkWiringLedger, reservation_id)
-            last_staged = ledger.last_staged_fork_version if ledger is not None else 0
+            last_staged = last_staged_by_id.get(reservation_id, 0)
             if cabling_version <= last_staged:
                 continue
             await stage_wiring_changed(
