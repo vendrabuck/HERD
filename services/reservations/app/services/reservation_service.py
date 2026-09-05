@@ -274,18 +274,27 @@ async def _validate_topology_connectivity(
 
 
 class ForkMembershipRefused(Exception):
-    """Cabling refused a fork create/save with 409 fork_device_not_member (D2/D3 of
-    the 2026-09-04 fork endpoint-membership fix).
+    """Cabling refused a fork create with a definitive 409 (D2/D3 of the 2026-09-04
+    fork endpoint-membership fix, generalized to any 409 by issue #721).
 
-    Deliberately NOT a RuntimeError: a 409 here is cabling's definitive answer that
-    the canvas names a device outside the reservation, not a transient failure, so
-    it must never be retried the way a transport error or a 5xx is. Carries the
-    offending device ids (as strings) so the caller can log them.
+    Originally raised only for the endpoint-membership shape
+    (``fork_device_not_member``); issue #721 (ADR 0006 Decision 4's activation-path
+    port-claim check) generalized this to ANY 409 cabling's fork-create route
+    returns, membership or a cross-reservation port claim alike: both are cabling's
+    definitive answer that this canvas cannot be forked as submitted, not a
+    transient failure, so neither must ever be retried the way a transport error or
+    a 5xx is. ``device_ids`` is populated only for the membership shape (empty for
+    a port-claim conflict, which names ports and reservations instead); ``detail``
+    carries whatever structured detail body cabling actually returned, for a
+    caller that wants the full shape regardless of which 409 it was.
     """
 
-    def __init__(self, device_ids: list[str]):
-        super().__init__(f"fork create refused: devices not in reservation: {device_ids}")
+    def __init__(self, device_ids: list[str], detail: dict | str | None = None):
+        super().__init__(
+            f"fork create refused (409): {detail if detail is not None else device_ids}"
+        )
         self.device_ids = device_ids
+        self.detail = detail
 
 
 # Per-process, in-memory set of reservations whose fork create was definitively
@@ -347,10 +356,12 @@ async def _create_reservation_fork(
     Fail-open for transient failures: a transport error or a 5xx must NOT strand a
     successfully-provisioned reservation. The caller wraps this in retry_with_backoff
     (retryable only on RuntimeError/httpx.HTTPError) and, on exhaustion, logs and
-    continues, leaving fork_id null. A 409 (ForkMembershipRefused) is different: it
-    is cabling's definitive refusal, not a transient failure, so it is raised as a
-    type retry_with_backoff's retryable tuple deliberately excludes, and propagates
-    on the first attempt with no retry.
+    continues, leaving fork_id null. ANY 409 (ForkMembershipRefused, generalized by
+    issue #721) is different: it is cabling's definitive refusal, whether the
+    canvas names a foreign device or claims a port another ACTIVE fork already
+    holds, not a transient failure, so it is raised as a type retry_with_backoff's
+    retryable tuple deliberately excludes, and propagates on the first attempt with
+    no retry.
     """
     if topology_id is None:
         # Decision 3 Case A: no parent topology, create the fork lazily on first
@@ -377,14 +388,19 @@ async def _create_reservation_fork(
             timeout=10.0,
         )
     if resp.status_code == 409:
-        device_ids: list[str] = []
+        # Generalized by issue #721: ANY 409 from fork-create is cabling's
+        # definitive refusal, not just the endpoint-membership shape. device_ids
+        # is populated only when the detail is actually that shape; a port-claim
+        # conflict (or anything else) still raises, just with an empty list, and
+        # the raw detail is carried alongside for a caller that wants it.
         try:
             detail = resp.json().get("detail") or {}
         except ValueError:
             detail = {}
+        device_ids: list[str] = []
         if isinstance(detail, dict) and detail.get("error") == "fork_device_not_member":
             device_ids = detail.get("device_ids") or []
-        raise ForkMembershipRefused(device_ids)
+        raise ForkMembershipRefused(device_ids, detail)
     if resp.status_code >= 400:
         raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
     body = resp.json()
@@ -413,16 +429,20 @@ async def _create_reservation_fork_best_effort(
     wiring_changed staging that follows a successful create is itself independently
     best-effort and does not affect this return value.
 
-    D3 of the 2026-09-04 fork endpoint-membership fix: a cabling 409
-    (ForkMembershipRefused) is caught separately, BEFORE the generic except, and
-    treated as definitive, not retried. It is logged at WARNING (not ERROR) with the
-    offending device ids, creates no fork, leaves the reservation ACTIVE unwired
-    exactly like the existing "fork creation failed" posture, and marks the
-    reservation in the process-local ``_fork_membership_refused`` set so the
-    expiration sweep's backstop (``_backstop_missing_forks``) stops re-attempting it
-    every tick. Returns True (not the retry-exhausted False) because looping the
-    give-up counter on a refusal that will never succeed on its own serves no
-    purpose; the marker itself is what stops the backstop, not this return value.
+    D3 of the 2026-09-04 fork endpoint-membership fix, generalized to ANY 409 by
+    issue #721: a cabling 409 (ForkMembershipRefused) is caught separately, BEFORE
+    the generic except, and treated as definitive, not retried, regardless of which
+    409 it was, endpoint membership or a cross-reservation port claim (ADR 0006
+    Decision 4's activation-path check) alike. It is logged at WARNING (not ERROR)
+    with whatever detail cabling returned, creates no fork, leaves the reservation
+    ACTIVE unwired exactly like the existing "fork creation failed" posture, and
+    marks the reservation in the process-local ``_fork_membership_refused`` set so
+    the expiration sweep's backstop (``_backstop_missing_forks``) stops
+    re-attempting it every tick: a port claim a retry cannot resolve either, since
+    the port is still claimed on the next tick. Returns True (not the
+    retry-exhausted False) because looping the give-up counter on a refusal that
+    will never succeed on its own serves no purpose; the marker itself is what
+    stops the backstop, not this return value.
 
     ADR 0009 phase 7 unifies initial provisioning through the fork: instead of the
     execution service driving legacy device-set resolvers off reservation.created,
@@ -472,15 +492,17 @@ async def _create_reservation_fork_best_effort(
         )
     except ForkMembershipRefused as exc:
         logger.warning(
-            "Fork creation refused for reservation %s: canvas endpoint device(s) "
-            "not in reservation membership: %s",
+            "Fork creation refused for reservation %s (cabling 409, definitive, "
+            "not retried): device_ids=%s detail=%s",
             reservation_id,
             exc.device_ids,
+            exc.detail,
             extra={
                 "action": "reservation_fork_membership_refused",
                 "reservation_id": str(reservation_id),
                 "topology_id": str(topology_id),
                 "device_ids": exc.device_ids,
+                "detail": exc.detail,
             },
         )
         _fork_membership_refused.add(reservation_id)
