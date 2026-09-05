@@ -33,6 +33,22 @@ not be claimed here, and a hit fails the save with 409. Both the reconcile stagi
 and the port-claim query re-run inside the version-allocation retry loop (ADR open
 risk 2), so a save that lost the version race recomputes against the winner's
 now-committed rows rather than half-applying.
+
+Issue #721 (2026-09-04 review sweep) found that the plain claim SELECT alone is not
+enough: two concurrent saves on two different forks run at Postgres READ COMMITTED,
+so neither's claim query sees the other's uncommitted inserts, textbook write skew,
+and the version-allocation retry that was meant to catch the residual window only
+ever fires for a same-fork conflict, which this check never flags in the first
+place (its own rows are excluded). ``lock_port_claims`` closes the window: it takes
+a transaction-scoped Postgres advisory lock over every claimed ``(device_id, port)``
+pair, keyed exactly like reservations' ``_acquire_device_locks``, immediately before
+``assert_no_port_claims`` runs. The loser blocks until the winner's transaction
+commits or rolls back, so its own claim check then reads the winner's committed
+rows and 409s correctly instead of racing past it. Both helpers are shared with
+``fork_service.create_fork``, whose activation-time snapshot never ran this check at
+all (ADR 0006 amendment): the same collision was reachable there with zero
+concurrency, since two reservations forking the same topology simply both
+materialize the same hops with nothing to object.
 """
 
 import logging
@@ -40,6 +56,7 @@ import uuid
 from dataclasses import dataclass
 
 from fastapi import HTTPException
+from herd_common import advisory_lock
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -460,7 +477,37 @@ def reconcile_connection_sets(
     return to_release, to_build, unchanged_count
 
 
-async def _assert_no_port_claims(
+async def lock_port_claims(db: AsyncSession, to_build: list[WireSpec]) -> None:
+    """Acquire transaction-scoped Postgres advisory locks over every ``to_build``
+    wire's physical ``(device_id, port)`` endpoints, immediately before
+    ``assert_no_port_claims`` (ADR 0006 Decision 4 amendment, issue #721).
+
+    Closes the write-skew window a plain SELECT claim check cannot: two concurrent
+    writers (two saves, or a save racing an activation snapshot) each see no
+    conflict against the other's uncommitted rows under Postgres READ COMMITTED.
+    The lock serializes them instead: the second caller blocks here until the first
+    caller's transaction commits or rolls back, so its own claim-check SELECT then
+    reads the winner's committed rows and 409s correctly. Keyed by the canonical
+    string ``f"forkport:{device_id}:{port}"``, sorted before acquisition (stable
+    ordering avoids deadlocks between two writers claiming overlapping port sets in
+    different orders) and hashed via ``advisory_key_from_string``, the exact idiom
+    reservations' ``_acquire_device_locks`` uses, so both call sites derive the same
+    lock key for the same physical port. Transaction-scoped: auto-releases on the
+    caller's next commit or rollback, no explicit unlock. No-op on SQLite
+    (``xact_lock``'s own dialect gate; the unit suite runs in-memory with no
+    advisory-lock support).
+    """
+    if not to_build:
+        return
+    keys: set[str] = set()
+    for spec in to_build:
+        keys.add(f"forkport:{spec.device_a_id}:{spec.port_a}")
+        keys.add(f"forkport:{spec.device_b_id}:{spec.port_b}")
+    for key in sorted(keys):
+        await advisory_lock.xact_lock(db, advisory_lock.advisory_key_from_string(key))
+
+
+async def assert_no_port_claims(
     db: AsyncSession,
     fork_id: uuid.UUID,
     to_build: list[WireSpec],
@@ -472,7 +519,10 @@ async def _assert_no_port_claims(
     claimed, the save is refused with 409 naming every blocking reservation and port;
     the fork is left unchanged. ARCHIVED forks never block (their wiring is history,
     not a claim), and the fork's own rows are excluded. Re-run inside the version-retry
-    loop so a save that lost the race sees the winner's committed claims.
+    loop so a save that lost the race sees the winner's committed claims. Callers must
+    call ``lock_port_claims`` on the same ``to_build`` immediately before this (issue
+    #721): the lock, not this SELECT alone, is what closes the concurrent-writer race.
+    Shared with ``fork_service.create_fork``'s activation-time snapshot.
     """
     if not to_build:
         return
@@ -534,11 +584,11 @@ async def save_fork(
 
     Resolves the canvas once to the intended set, then reconciles and commits under
     the version-allocation retry loop. The reconcile (endpoint-membership check,
-    fresh old-set read, port-claim check, release-before-build staging) runs on the
-    first pass here and re-runs inside ``commit_fork_with_new_version``'s reapply hook
-    on every retry, so a lost version race recomputes against committed rows and a
-    mid-reconcile failure rolls back the whole save (no half-apply, no orphan
-    version). The caller has already refused an ARCHIVED fork.
+    fresh old-set read, port-claim lock plus check, release-before-build staging)
+    runs on the first pass here and re-runs inside ``commit_fork_with_new_version``'s
+    reapply hook on every retry, so a lost version race recomputes against committed
+    rows and a mid-reconcile failure rolls back the whole save (no half-apply, no
+    orphan version). The caller has already refused an ARCHIVED fork.
 
     ``member_device_ids`` is the reservation's device set (D2, the 2026-09-04 fork
     endpoint-membership fix): ``assert_endpoints_are_members`` runs first inside
@@ -563,7 +613,8 @@ async def save_fork(
             .all()
         )
         to_release, to_build, unchanged_count = reconcile_connection_sets(old_rows, new_specs)
-        await _assert_no_port_claims(db, fork_id, to_build)
+        await lock_port_claims(db, to_build)
+        await assert_no_port_claims(db, fork_id, to_build)
 
         # Release before build: delete and flush the freed rows first so a moved wire
         # cannot collide with its own prior row on the unique constraint.
@@ -826,7 +877,9 @@ __all__ = [
     "ForkSaveResult",
     "WireSpec",
     "assert_endpoints_are_members",
+    "assert_no_port_claims",
     "connection_identity",
+    "lock_port_claims",
     "node_to_device_map",
     "node_to_element_map",
     "prune_canvas_for_devices",

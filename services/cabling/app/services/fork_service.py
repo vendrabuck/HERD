@@ -12,6 +12,14 @@ shortest path and record each physical hop as an L1 fork_connection carrying its
 backing physical connection id. Edges with no path are skipped (the booking is
 already gated on connectivity by validate/internal at create time); they leave no
 wire, exactly as an unreachable physical route would.
+
+Issue #721 (ADR 0006 amendment, 2026-09-04 review sweep): the snapshot above used to
+write fork_connections with no cross-reservation port-claim check at all, so two
+reservations forking the same topology (or two topologies sharing a trunk) could both
+materialize the same physical hops with nothing to object, an invariant violation
+reachable with zero concurrency. ``create_fork`` now runs the same
+``lock_port_claims``/``assert_no_port_claims`` pair ``save_fork`` runs, before any
+fork_connections row is written, sharing both helpers with ``fork_save_service``.
 """
 
 import copy
@@ -24,7 +32,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
 from app.models.topology import Topology, TopologyVersion
-from app.services.fork_save_service import assert_endpoints_are_members, resolve_canvas_wiring
+from app.services.fork_save_service import (
+    WireSpec,
+    assert_endpoints_are_members,
+    assert_no_port_claims,
+    lock_port_claims,
+    resolve_canvas_wiring,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,19 +90,19 @@ async def _resolve_parent_canvas(
 async def _snapshot_connections(
     db: AsyncSession,
     fork_id: uuid.UUID,
-    canvas: dict | None,
+    specs: list[WireSpec],
     created_by: str,
 ) -> None:
-    """Seed fork_connections from parent canvas edges resolved to physical paths.
+    """Materialize already-resolved WireSpecs as fork_connections rows.
 
-    Open risk #1's recommended rule. Delegates to the shared ``resolve_canvas_wiring``
-    resolver (the same one the save-reconcile uses, issue #25 P3a) to turn committed
-    canvas edges into per-hop L1 WireSpecs, then materializes each as a fork_connection
-    row stamped with ``created_by``. Sharing the resolver keeps fork-on-activation and
-    save-time wiring byte-for-byte identical, including multi-hop paths and shared-hop
-    de-duplication.
+    ``create_fork`` resolves the parent canvas via the shared ``resolve_canvas_wiring``
+    resolver (the same one the save-reconcile uses, issue #25 P3a) exactly once and
+    reuses the resulting specs both for the issue #721 port-claim check and here, so
+    the check and what actually gets written can never drift apart. Sharing the
+    resolver keeps fork-on-activation and save-time wiring byte-for-byte identical,
+    including multi-hop paths and shared-hop de-duplication.
     """
-    for spec in (await resolve_canvas_wiring(db, canvas)).specs:
+    for spec in specs:
         db.add(
             ForkConnection(
                 fork_id=fork_id,
@@ -126,6 +140,16 @@ async def create_fork(
     fork_connections, or fork_versions row. The idempotent early-return above skips
     the check entirely: an existing fork was already validated (or predates this
     check) and is not re-validated on a retried create.
+
+    Issue #721 (ADR 0006 amendment): ``lock_port_claims`` then ``assert_no_port_claims``
+    run right after, against the SAME resolved specs ``_snapshot_connections`` goes on
+    to write, also before the fork row is added: a parent canvas whose resolved wiring
+    claims a port another ACTIVE fork already holds raises the same 409 the save path
+    raises, and again writes no row. The fork's own id is pre-generated (rather than
+    left to the model's default) so the claim check's cross-fork exclusion has a real
+    id to compare against even though the row has not been added yet; it cannot
+    exclude any of this fork's own rows regardless, since none exist until
+    ``_snapshot_connections`` runs below.
     """
     existing = (
         await db.execute(
@@ -140,8 +164,13 @@ async def create_fork(
     )
     forked_canvas = None if parent_canvas is None else copy.deepcopy(parent_canvas)
     assert_endpoints_are_members(forked_canvas, member_device_ids)
+    specs = (await resolve_canvas_wiring(db, forked_canvas)).specs
+    fork_id = uuid.uuid4()
+    await lock_port_claims(db, specs)
+    await assert_no_port_claims(db, fork_id, specs)
 
     fork = ReservationFork(
+        id=fork_id,
         reservation_id=reservation_id,
         parent_topology_id=parent_topology_id,
         parent_version_id=pinned_version_id,
@@ -161,7 +190,7 @@ async def create_fork(
     # inside the guard too.
     try:
         await db.flush()
-        await _snapshot_connections(db, fork.id, forked_canvas, created_by)
+        await _snapshot_connections(db, fork.id, specs, created_by)
         db.add(
             ForkVersion(
                 fork_id=fork.id,

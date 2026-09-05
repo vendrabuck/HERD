@@ -198,7 +198,11 @@ async def test_save_holds_lock_so_a_racing_restore_waits_and_wins_last(session_f
         )
 
         # A completes its save while it was the only one holding the lock.
-        await save_fork(db_a, fork_a, canvas_data=SAVE_CANVAS, created_by="race-test-a")
+        # SAVE_CANVAS has no device nodes, so an empty member set is a no-op for
+        # both the endpoint-membership check (#701) and the port-claim lock (#721).
+        await save_fork(
+            db_a, fork_a, canvas_data=SAVE_CANVAS, member_device_ids=set(), created_by="race-test-a"
+        )
         await db_a.close()
 
         await asyncio.wait_for(task_b, timeout=2.0)
@@ -236,8 +240,15 @@ async def test_restore_holds_lock_so_a_racing_save_consumes_the_fresh_marker(ses
         async def _save():
             async with session_factory() as db_a:
                 fork_a = await _load_fork(db_a, reservation_id, for_update=True)
+                # SAVE_CANVAS has no device nodes, so an empty member set is a
+                # no-op for the endpoint-membership check (#701) and the
+                # port-claim lock (#721).
                 return await save_fork(
-                    db_a, fork_a, canvas_data=SAVE_CANVAS, created_by="race-test-b"
+                    db_a,
+                    fork_a,
+                    canvas_data=SAVE_CANVAS,
+                    member_device_ids=set(),
+                    created_by="race-test-b",
                 )
 
         task_a = asyncio.create_task(_save())

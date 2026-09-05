@@ -283,9 +283,15 @@ Each phase is independently mergeable, matching the #32 delivery pattern.
    path than activation resolved (graph changed underneath). The save records
    what it resolves; P3b must treat path drift explicitly when it starts
    driving hardware.
-2. The port-claim check's contention story relies on the version-allocation
+2. CLOSED by issue #721 (see the amendment below). This risk originally read:
+   "the port-claim check's contention story relies on the version-allocation
    retry loop re-running the conflict query; a direct test of two concurrent
-   conflicting saves is required, not optional.
+   conflicting saves is required, not optional." That mitigation was never
+   real: the version-allocation retry loop only ever serializes a SAME-fork
+   version collision, which the claim check excludes by construction, so it
+   never closed the cross-fork write-skew window this risk named. The required
+   direct test now exists (`test_fork_port_claim_race_live_pg.py`) and, more to
+   the point, so does the actual fix (`lock_port_claims`).
 3. `version_service` generalization touches the shipped topology-version path;
    its existing tests must pass unchanged, and the refactor lands in phase 1
    where the blast radius is smallest.
@@ -499,3 +505,102 @@ create a reservation, a fork, or any row at all.
   (naming a foreign device at reserve time) is refused immediately with a
   clearer, request-scoped error instead of surfacing later as a fork 409 on
   activation.
+
+## Amendment: the port-claim check gets a lock, and runs at activation too (issue #721, 2026-09-05)
+
+The 2026-09-04 review sweep found that Decision 4's port-claim check was a
+save-boundary guard in practice, not the invariant the decision claims, in two
+independent ways.
+
+**A plain SELECT cannot see an uncommitted conflict.** `save_fork` locked only
+its own `reservation_fork` row and ran the claim check as a bare SELECT against
+other ACTIVE forks' committed rows. The engine runs at Postgres default READ
+COMMITTED with no override, so two concurrent saves on two DIFFERENT forks each
+run that SELECT against the other's still-uncommitted insert: textbook write
+skew, and `uq_fork_connections_endpoints` is scoped to `fork_id`, so nothing
+fails at commit either. Decision 4's own text named the version-allocation
+retry loop as the backstop for this, but that mitigation was void from the
+start: the retry only fires on `uq_fork_versions_fork_version`, a SAME-fork
+collision, and the claim check explicitly excludes the fork's own rows
+(`ReservationFork.id != fork_id`), so the one collision the retry loop
+serializes is exactly the one the claim check never flags. Open risk 2's
+"required, not optional" concurrent-saves test was consequently never written,
+because the mitigation it would have exercised was never real.
+
+**Activation snapshots never ran the check at all.** `fork_service.create_fork`
+snapshotted the parent canvas's resolved wiring into `fork_connections` with no
+call to the claim check whatsoever. Two reservations forking the same topology,
+or two topologies sharing a trunk, both materialize the same physical hops at
+activation, unchecked, with ZERO concurrency involved: this is not a race, it
+is a straightforward gap.
+
+**The fix** closes both. `fork_save_service.lock_port_claims` acquires a
+transaction-scoped, blocking Postgres advisory lock
+(`herd_common.advisory_lock.xact_lock`) over the sorted canonical strings
+`f"forkport:{device_id}:{port}"` for both endpoints of every `to_build` wire,
+keyed via `advisory_key_from_string` exactly like reservations'
+`_acquire_device_locks` (issue #513): sorted order avoids deadlocks between two
+writers claiming overlapping port sets in different orders, and the shared key
+derivation means both a save and an activation snapshot lock the same physical
+port identically regardless of which code path is doing the locking. It runs
+immediately before `assert_no_port_claims` (the renamed `_assert_no_port_claims`,
+promoted out of module-private status so both call sites below can share it)
+inside `save_fork`'s `reconcile()` closure, so it re-runs on the
+version-allocation retry path exactly like the claim query itself: the second
+writer blocks at the database until the first writer's transaction commits or
+rolls back, and its own claim-check SELECT then reads the winner's committed
+rows and 409s correctly instead of racing past it. Since the lock is
+transaction-scoped it auto-releases on commit or rollback with no explicit
+unlock, and self-gates to a no-op on SQLite (`xact_lock`'s own dialect check),
+so the unit suite needs no branch.
+
+`fork_service.create_fork` now runs the identical `lock_port_claims` then
+`assert_no_port_claims` pair, against the SAME resolved `WireSpec` list
+`_snapshot_connections` goes on to materialize (resolved once via
+`resolve_canvas_wiring` and threaded through, rather than re-resolved), before
+any `reservation_fork`, `fork_connections`, or `fork_versions` row is written.
+A parent canvas whose resolved wiring claims a port another ACTIVE fork already
+holds gets the same 409 shape the save path returns, and the create writes
+nothing, mirroring the endpoint-membership check's existing refusal posture
+(`assert_endpoints_are_members`, the 2026-09-04 amendment above). The fork's id
+is pre-generated (`uuid.uuid4()`, matching the model's own default) rather than
+left to flush, so the claim check's cross-fork exclusion has a real id to
+compare against before the row is added to the session; this changes nothing
+observable, since a brand-new fork has no `fork_connections` rows to exclude
+regardless of what id it is given.
+
+Reservations' `_create_reservation_fork` and `_create_reservation_fork_best_effort`
+generalize accordingly: `ForkMembershipRefused` (D3 of the 2026-09-04 fix) is no
+longer raised only for the `fork_device_not_member` detail shape, it is raised
+for ANY 409 cabling's fork-create route returns, activation's port-claim
+conflict included. `device_ids` stays populated only for the membership shape
+(empty for a port-claim conflict, which names ports and reservations instead);
+the exception now also carries the raw structured `detail` body so the caller
+can log whatever shape it actually got. The best-effort wrapper's treatment is
+unchanged in substance for either 409: definitive, not retried, logged at
+WARNING, the reservation stays ACTIVE with `fork_id` null, and the reservation
+is marked in the process-local `_fork_membership_refused` set so the expiration
+sweep's backstop stops re-attempting a conflict a retry cannot resolve (a
+claimed port is still claimed on the next tick, exactly like a foreign device
+is still foreign).
+
+**Test.** `services/cabling/tests/test_fork_port_claim_race_live_pg.py`
+(wired into the Makefile's `_gate-pg-live-tests`, alongside the issue #626 fork
+row lock test it is modeled on) is the concurrent-saves proof open risk 2
+called for: two ACTIVE forks, one shared physical hop, and an
+`asyncio.Barrier` instrumenting the claim check so that if it ever runs with
+nothing blocking it, it waits briefly for a second concurrent check to also
+land before either save proceeds, deterministically forcing the write-skew
+window rather than leaving it to scheduler luck. Confirmed to fail on main
+(both saves succeed, and a third session finds two `fork_connections` rows for
+the contested port instead of one) with `lock_port_claims`'s call temporarily
+commented out, and to pass with it restored. `services/cabling/tests/test_forks.py`
+adds the zero-concurrency create-time proof (a parent canvas resolving to an
+already-claimed port 409s with no row written), the ARCHIVED-does-not-block
+mirror for `create_fork`, and a pure unit test pinning `lock_port_claims`'s
+call order over the sorted, de-duplicated canonical key set (SQLite, `xact_lock`
+patched). `services/reservations/tests/test_reservation_service_unit.py` adds
+the generalized-409 proof at both `_create_reservation_fork` (raises with an
+empty `device_ids` and the raw conflict detail) and
+`_create_reservation_fork_best_effort` (same definitive, not-retried, marked-
+and-True-returned treatment as the membership shape).

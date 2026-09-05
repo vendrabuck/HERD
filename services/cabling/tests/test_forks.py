@@ -1951,6 +1951,139 @@ async def test_save_fork_archived_other_fork_does_not_block(client):
     assert len(resp.json()["built"]) == 1
 
 
+# --- create_fork port-claim enforcement (ADR 0006 amendment, issue #721) ---
+
+
+async def _make_parent_topology(db, canvas: dict) -> uuid.UUID:
+    """Persist a parent Topology with the given canvas, no TopologyVersion.
+
+    ``_resolve_parent_canvas`` falls back to the live topology canvas when the
+    parent has no versions yet, which is all this file's create_fork tests need.
+    """
+    topo = Topology(name="parent", created_by=uuid.uuid4(), canvas_data=canvas)
+    db.add(topo)
+    await db.commit()
+    return topo.id
+
+
+@pytest.mark.asyncio
+async def test_create_fork_409_on_cross_reservation_port_claim():
+    """Fork-on-activation (create_fork) runs the SAME cross-reservation port-claim
+    check save_fork runs, before any fork_connections row is written: the parent
+    canvas's resolved wiring claims a port another ACTIVE fork already holds, so
+    zero concurrency is needed to hit this, exactly the ADR 0006 amendment's
+    "activation snapshots never run the check at all" gap (issue #721)."""
+    from fastapi import HTTPException
+
+    a, b, z = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    other_rid = uuid.uuid4()
+    await _make_active_fork_claiming(other_rid, a, "a0", z, "z0")
+
+    rid = uuid.uuid4()
+    canvas = _canvas([a, b], [(0, 1)])
+    async with TestSessionLocal() as db:
+        topo_id = await _make_parent_topology(db, canvas)
+
+    async with TestSessionLocal() as db:
+        with pytest.raises(HTTPException) as excinfo:
+            await create_fork(
+                db,
+                reservation_id=rid,
+                parent_topology_id=topo_id,
+                parent_version_id=None,
+                member_device_ids={a, b},
+            )
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.detail["conflicts"] == [
+        {"reservation_id": str(other_rid), "device_id": str(a), "port": "a0"}
+    ]
+    # The refused create wrote no reservation_fork, fork_connections, or
+    # fork_versions row for `rid` (mirrors the membership-check refusal posture).
+    async with TestSessionLocal() as db:
+        existing = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one_or_none()
+        assert existing is None
+
+
+@pytest.mark.asyncio
+async def test_create_fork_archived_other_fork_does_not_block():
+    """Mirrors test_save_fork_archived_other_fork_does_not_block for create_fork:
+    an ARCHIVED fork's wiring is history, not a claim."""
+    a, b, z = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    other_rid = uuid.uuid4()
+    await _make_active_fork_claiming(other_rid, a, "a0", z, "z0", status_=ForkStatus_ARCHIVED)
+
+    rid = uuid.uuid4()
+    canvas = _canvas([a, b], [(0, 1)])
+    async with TestSessionLocal() as db:
+        topo_id = await _make_parent_topology(db, canvas)
+
+    async with TestSessionLocal() as db:
+        fork = await create_fork(
+            db,
+            reservation_id=rid,
+            parent_topology_id=topo_id,
+            parent_version_id=None,
+            member_device_ids={a, b},
+        )
+    conns = await _fork_connections(fork.id)
+    assert len(conns) == 1
+
+
+@pytest.mark.asyncio
+async def test_lock_port_claims_locks_sorted_deduped_canonical_keys(monkeypatch):
+    """The lock helper (issue #721) acquires one xact_lock per DISTINCT claimed
+    (device, port) endpoint across every to_build spec, keyed by the canonical
+    ``forkport:{device_id}:{port}`` string, in SORTED order (stable ordering avoids
+    deadlocks between two writers claiming overlapping port sets in different
+    orders), hashed via advisory_key_from_string exactly like reservations'
+    _acquire_device_locks. Device `a`'s port `p0` is shared by both specs below to
+    also pin de-duplication: three distinct keys, not four."""
+    from app.services.fork_save_service import WireSpec, lock_port_claims
+    from herd_common import advisory_lock
+
+    calls: list[int] = []
+
+    async def fake_xact_lock(db, key):
+        calls.append(key)
+
+    monkeypatch.setattr(advisory_lock, "xact_lock", fake_xact_lock)
+
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    specs = [
+        WireSpec(device_a_id=b, port_a="p1", device_b_id=a, port_b="p0", layer="L1"),
+        WireSpec(device_a_id=c, port_a="p2", device_b_id=a, port_b="p0", layer="L1"),
+    ]
+    async with TestSessionLocal() as db:
+        await lock_port_claims(db, specs)
+
+    expected_keys = sorted({f"forkport:{a}:p0", f"forkport:{b}:p1", f"forkport:{c}:p2"})
+    assert calls == [advisory_lock.advisory_key_from_string(k) for k in expected_keys]
+
+
+@pytest.mark.asyncio
+async def test_lock_port_claims_noop_on_empty_to_build(monkeypatch):
+    """An empty to_build (e.g. a pure release) acquires no locks at all."""
+    from app.services.fork_save_service import lock_port_claims
+    from herd_common import advisory_lock
+
+    calls: list[int] = []
+
+    async def fake_xact_lock(db, key):
+        calls.append(key)
+
+    monkeypatch.setattr(advisory_lock, "xact_lock", fake_xact_lock)
+
+    async with TestSessionLocal() as db:
+        await lock_port_claims(db, [])
+
+    assert calls == []
+
+
 # --- Concurrent conflicting saves (ADR open risk 2, REQUIRED) ---
 
 
