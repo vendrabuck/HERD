@@ -18,6 +18,21 @@
   treated as an untrusted hint only, never load-bearing for the check.
   `extract_files`'s own caps are unchanged and still re-run as defense in
   depth on the now-bounded upload.
+- Fixed device lists silently truncating at the inventory service's 500-row
+  page cap (issue #703). `fetchDevices` fetched page 0 of 500 and dropped
+  `total`, so with more than 500 devices the reporting page's device index
+  missed the oldest ones and attributed their hours to the "Unknown"
+  template bucket (and the client-built by-template CSV exported that),
+  while the device-group and topology-template pickers, the equipment
+  browser, and the calendar showed partial lists. `ReportingPage` now
+  resolves exactly the devices the report mentions through the batch
+  endpoint via the new chunked `fetchDevicesByIds` and `useDevicesByIds`
+  (hoisted from `hydrateCanvasNodes`), and the other four consumers use the
+  new `fetchAllDevices`/`useAllDevices` page walker (server-side filters
+  honored; `fetchAllDeviceNames` is a map over it). The server cap is
+  unchanged; the page-0-of-500 idiom in the other API modules is left for a
+  follow-up.
+
 - Added Download CSV buttons for the four purpose reporting sections (issue
   #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
   join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a
