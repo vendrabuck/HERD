@@ -5,6 +5,22 @@ Assumes a running HERD stack (make up / make everything's ephemeral stack).
 The dev/test override pins EXPIRATION_INTERVAL_SECONDS=5, so the sweep
 reconciler ticks often enough for the AI-gated test's poll loop to fit inside
 a normal test timeout.
+
+Ordering note (2026-09-05, issue #706): the purpose-classify sweep classifies
+its backlog oldest-`purpose_classify_requested_at`-first and serially, at
+model speed, one row per tick. The test below,
+`test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review`,
+carries `@pytest.mark.classify_sweep_first` so
+`tests/integration/conftest.py`'s `pytest_collection_modifyitems` runs it
+before the rest of this suite: every other integration test in this
+directory that cancels or completes a reservation also stamps
+`purpose_classify_requested_at`, and if those ran first they would queue
+ahead of this test's own reservation and push it past this test's poll
+budget purely on ordering, not a reconciler defect. On a REUSED dev stack
+that already carries a purpose-classify backlog from earlier runs, this test
+can still time out even running first: that is stack history, not a
+regression (`make everything` boots a fresh stack per run, so the gate is
+unaffected).
 """
 
 import asyncio
@@ -30,6 +46,8 @@ def _reservation_body(device_id: str) -> dict:
 
 
 @pytest.mark.seeded_skip_ok("needs AI_* env")
+@pytest.mark.classify_sweep_first
+@pytest.mark.timeout(90)
 async def test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review(
     admin_client, fresh_device
 ):
@@ -38,6 +56,16 @@ async def test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review(
     the admin review list (ADR 0013 point 10). Skipped when no AI provider is
     configured on this host (nightly and the plain gate stack have no AI_*
     env): the sweep would otherwise never produce a suggestion to poll for.
+
+    Runs before the rest of this module's suite (see the module docstring's
+    2026-09-05 ordering note, issue #706): `classify_sweep_first` moves it to
+    the front of collection so the sweep's oldest-first, serial, model-speed
+    queue has not already been filled by other tests' own cancelled or
+    completed reservations by the time this one polls for its suggestion.
+    `@pytest.mark.timeout(90)` overrides the suite's global `--timeout=30`
+    (POLL_TIMEOUT_SECONDS below is 60s, plus room for the request/poll
+    overhead around it), the same override pattern used elsewhere in this
+    suite for a test whose legitimate runtime exceeds the default.
     """
     if not ai_provider_configured():
         pytest.skip("AI provider not configured on this host; sweep classifier not exercised")

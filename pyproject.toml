@@ -28,6 +28,7 @@ testpaths = ["tests"]
 filterwarnings = ["error"]
 markers = [
     "seeded_skip_ok(reason): skip is expected even on a seeded stack (issue #629)",
+    "classify_sweep_first: run before the rest of tests/integration/ so the purpose-classify sweep sees no backlog from other tests (issue #706)",
 ]
 
 [dependency-groups]

@@ -131,17 +131,30 @@ The reconciler's outcome taxonomy, all documented in
   attempt counted.
 - `transient`: 429 (a rate limit, including this route's own daily-quota
   429), 502/503/504 (misconfiguration or an outage, including the
-  `AI_NOT_CONFIGURED_DETAIL` 503 from `ai_is_configured()`), a timeout, or
-  any other transport error. Ends the tick; no attempt counted. Without this
+  `AI_NOT_CONFIGURED_DETAIL` 503 from `ai_is_configured()`), or any transport
+  error OTHER than a timeout. Ends the tick; no attempt counted. Without this
   class, a quota 429 that lasts until UTC midnight would burn a row's whole
   `purpose_classify_max_attempts` cap in three ticks despite never having had
   a real classification attempt.
+- `timeout` (2026-09-05 amendment, issue #706 follow-up): the call raised
+  `httpx.TimeoutException`. Unlike the other transient outcomes, a timeout is
+  per-row evidence, not provider-wide evidence: it costs the provider up to
+  `purpose_classify_timeout_seconds` trying to answer THIS row, so it
+  increments `purpose_classify_attempts` and the reconciler continues to the
+  next row in the same tick instead of ending it. Without this distinction,
+  one reservation whose call happened to exceed the timeout could end every
+  tick before reaching any row behind it, oldest-requested-first, a
+  permanent head-of-line stall (observed live: the same row timed out on
+  seven consecutive ticks with attempts still 0 while 45 eligible rows
+  waited behind it). A provider uniformly slower than the timeout still
+  burns every row's attempts, which `POST /admin/purpose/backfill` recovers
+  from by resetting them.
 - `forbidden`: 403 without the disabled marker. Ends the tick; no attempt
   counted, but logged at WARNING (not `feature_off`'s INFO) since this is a
   problem an operator needs to see and fix, not an expected state.
 - `failed`: any other non-200 status, or a 200 with an unparseable body.
-  Increments `purpose_classify_attempts`; only this outcome affects the row's
-  attempt cap.
+  Increments `purpose_classify_attempts`; this and `timeout` are the only
+  outcomes that affect the row's attempt cap.
 
 ## Signals
 

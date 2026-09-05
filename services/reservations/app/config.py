@@ -87,13 +87,20 @@ class Settings(HerdBaseSettings):
     purpose_classify_batch_size: int = 20
     # Per-row cap on sweep attempts. A "failed" outcome (a non-transient
     # non-200 status, or an unparseable 200 body) increments this. Issue
-    # #706: a "transient" outcome (429/502/503/504, a timeout, or a transport
-    # error) and a "feature_off" or "forbidden" 403/404 do NOT count as an
-    # attempt, since none of those are per-row problems. A row at the cap is
-    # skipped until an admin backfill or a taxonomy/config change makes it
-    # worth retrying by hand; there is no automatic reset.
+    # #706: a "transient" outcome (429/502/503/504, or a transport error
+    # OTHER than a timeout) and a "feature_off" or "forbidden" 403/404 do NOT
+    # count as an attempt, since none of those are per-row problems. A
+    # "timeout" outcome (2026-09-05 amendment) DOES count as an attempt: it
+    # is per-row evidence, not a provider-wide outage, so it costs this row
+    # its own try rather than ending the tick for everyone behind it. A row
+    # at the cap is skipped until an admin backfill or a taxonomy/config
+    # change makes it worth retrying by hand; there is no automatic reset.
     purpose_classify_max_attempts: int = 3
-    # Per-call timeout for the orchestrator's classify-purpose call.
+    # Per-call timeout for the orchestrator's classify-purpose call. Exceeding
+    # it raises httpx.TimeoutException, which counts an attempt against the
+    # row being classified (see purpose_classify_max_attempts above) and lets
+    # the reconciler move on to the next row instead of stalling the whole
+    # queue behind one slow answer.
     purpose_classify_timeout_seconds: float = 30.0
 
     # Lab purpose classification (issue #646 phase 1). The taxonomy is a plain

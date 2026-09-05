@@ -5,6 +5,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
@@ -54,11 +55,14 @@ FAILED_SUBJECT = "herd.reservations.failed"
 PROVISION_REQUESTED_SUBJECT = "herd.reservations.provision_requested"
 
 # Purpose-classify reconciler (issue #646 phase 2, ADR 0013; issue #706
-# amendment). Status codes the orchestrator can answer that mean "try again
-# later", never a per-row rejection: a 429 (this caller's or the daily
-# quota's rate limit), a 502/503/504 (misconfiguration or an outage,
-# including the AI_NOT_CONFIGURED_DETAIL 503 from ai_is_configured()), a
-# timeout, or any other transport error.
+# amendment; 2026-09-05 timeout-is-per-row amendment). Status codes the
+# orchestrator can answer that mean "try again later", never a per-row
+# rejection: a 429 (this caller's or the daily quota's rate limit), a
+# 502/503/504 (misconfiguration or an outage, including the
+# AI_NOT_CONFIGURED_DETAIL 503 from ai_is_configured()), or any transport
+# error OTHER than a timeout (a connection error, most likely). A per-call
+# timeout is deliberately excluded from this transient set: see
+# _classify_purpose_one's "timeout" outcome for why.
 _PURPOSE_CLASSIFY_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
 # The structured 403 marker the orchestrator's flag refusal carries (issue
 # #706): only this detail shape (or, for a pre-fix orchestrator image, the
@@ -914,12 +918,28 @@ async def _classify_purpose_one(reservation_id: uuid.UUID) -> str:
       row is left untouched, no attempt counted, but this is logged at
       WARNING (not the feature_off case's INFO) since it is a configuration
       problem an operator needs to see and fix.
+    - "timeout" (2026-09-05 amendment, issue #706 follow-up): the call raised
+      httpx.TimeoutException. A timeout is per-row evidence, not
+      provider-wide evidence: it costs the provider up to
+      purpose_classify_timeout_seconds trying to answer THIS row, so it
+      counts against the row's own attempt cap (purpose_classify_attempts is
+      incremented) and the reconciler loop CONTINUES to the next row rather
+      than ending the tick. A row that never finishes in time stops being
+      retried once purpose_classify_attempts reaches
+      purpose_classify_max_attempts; the admin backfill endpoint resets a
+      row's attempts to give it another try. Trade-off, stated honestly: a
+      provider that is uniformly slower than the timeout burns every eligible
+      row's attempts before ever finishing one, which the backfill endpoint
+      recovers from; the alternative (the pre-fix behavior, treating a
+      timeout as tick-ending) instead let one slow row stall the whole queue
+      behind it forever, which is worse.
     - "transient" (issue #706): the orchestrator answered 429, 502, 503, or
       504 (rate limit, misconfiguration, or an outage, including the
-      AI_NOT_CONFIGURED_DETAIL 503 case), or the call raised a timeout or any
-      other transport error. The row is left untouched and no attempt is
-      counted: a sustained transient condition would otherwise burn a row's
-      whole attempt cap before it ever gets a real classification try.
+      AI_NOT_CONFIGURED_DETAIL 503 case), or the call raised a transport
+      error OTHER than a timeout (e.g. httpx.ConnectError). The row is left
+      untouched and no attempt is counted: a sustained transient condition
+      would otherwise burn a row's whole attempt cap before it ever gets a
+      real classification try.
     - "failed": any other non-200 status, a 200 with an unparseable body,
       purpose_classify_attempts is incremented.
 
@@ -955,11 +975,27 @@ async def _classify_purpose_one(reservation_id: uuid.UUID) -> str:
             timeout=settings.purpose_classify_timeout_seconds,
             auth=InternalTokenAuth(token=settings.internal_api_token),
         )
+    except httpx.TimeoutException:
+        logger.warning(
+            "Purpose classify reconcile: call to the orchestrator timed out for "
+            "%s after %s seconds; a timeout is per-row evidence, not a "
+            "provider-wide outage, so it counts against this row's attempt cap "
+            "and the reconciler continues to the next row",
+            reservation_id,
+            settings.purpose_classify_timeout_seconds,
+            extra={
+                "action": "purpose_classify_timeout",
+                "reservation_id": str(reservation_id),
+                "timeout_seconds": settings.purpose_classify_timeout_seconds,
+            },
+        )
+        await _bump_purpose_classify_attempts(reservation_id)
+        return "timeout"
     except Exception:
         logger.warning(
             "Purpose classify reconcile: call to the orchestrator failed for %s "
-            "(timeout or transport error); treating this as transient for this "
-            "tick, no attempt counted",
+            "(a transport error, not a timeout); treating this as transient for "
+            "this tick, no attempt counted",
             reservation_id,
             exc_info=True,
             extra={
@@ -1079,7 +1115,10 @@ async def _classify_purpose_one(reservation_id: uuid.UUID) -> str:
 # including ones later in the batch (issue #706): all three mean "this is not
 # a per-row problem", so there is no point spending N more round trips
 # confirming the same condition, and none of them should count as a consumed
-# attempt on the rows they never got to.
+# attempt on the rows they never got to. "timeout" (2026-09-05 amendment) is
+# deliberately NOT in this set: a per-call timeout is per-row evidence, not a
+# provider-wide outage, so it counts an attempt on its own row and the loop
+# continues to the next candidate instead of ending the tick.
 _PURPOSE_CLASSIFY_TICK_ENDING_OUTCOMES = frozenset({"feature_off", "transient", "forbidden"})
 
 
@@ -1094,14 +1133,18 @@ async def _run_purpose_classify_reconcile() -> None:
     behind it), and classifies each in turn via _classify_purpose_one.
 
     A "feature_off" outcome (403 carrying the disabled marker, or 404), a
-    "transient" outcome (429/502/503/504, a timeout, or a transport error),
-    or a "forbidden" outcome (403 without the disabled marker, most likely a
-    bad internal token) ends the WHOLE tick immediately without touching any
-    row, including ones later in the batch: none of these are per-row
-    problems, so there is no point spending N more round trips confirming the
-    same condition, and none of them should count as a consumed attempt.
-    Any other failure only affects its own row; the loop continues to the
-    next candidate. This function never raises: every per-row failure is
+    "transient" outcome (429/502/503/504, or a transport error OTHER than a
+    timeout), or a "forbidden" outcome (403 without the disabled marker, most
+    likely a bad internal token) ends the WHOLE tick immediately without
+    touching any row, including ones later in the batch: none of these are
+    per-row problems, so there is no point spending N more round trips
+    confirming the same condition, and none of them should count as a
+    consumed attempt. A "timeout" outcome (2026-09-05 amendment) is
+    different: it is per-row evidence, not provider-wide evidence, so it
+    bumps that row's own attempt count and the loop continues to the next
+    candidate rather than ending the tick. Any other failure (an ordinary
+    per-row rejection) also only affects its own row; the loop continues to
+    the next candidate. This function never raises: every per-row failure is
     caught inside _classify_purpose_one.
     """
     async with AsyncSessionLocal() as db:
