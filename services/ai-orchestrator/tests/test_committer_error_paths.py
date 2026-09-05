@@ -24,6 +24,7 @@ from app.services.committer import (
     _build_canvas_data,
     _delete_topology,
     _detail,
+    _fetch_device_ports,
 )
 
 CABLING_URL = config_module.settings.cabling_service_url.rstrip("/")
@@ -234,6 +235,56 @@ async def test_build_canvas_device_with_no_ports_skips_attachment_with_warning(c
     assert any(n["type"] == "networkElementNode" for n in canvas["nodes"])
     assert canvas["edges"] == []
     assert any(r.message == "ai_commit_element_attachment_skipped_no_port" for r in caplog.records)
+
+
+# --- _fetch_device_ports: fail closed on an unanswerable question (#717) ---
+
+
+async def test_fetch_device_ports_404_is_treated_as_no_ports():
+    """A genuine 404 means the device has no ports: not an error."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(
+            f"{config_module.settings.inventory_service_url.rstrip('/')}/devices/{DEVICE_A}/ports"
+        ).respond(404, json={"detail": "not found"})
+        async with httpx.AsyncClient() as client:
+            ports = await _fetch_device_ports(client, {"Authorization": "Bearer t"}, DEVICE_A)
+    assert ports == []
+
+
+async def test_fetch_device_ports_5xx_raises_commit_error(caplog):
+    """A 5xx from inventory means it could not answer the question at all,
+    which is not the same as a portless device: it must fail the whole
+    commit closed rather than silently drop the attachment."""
+    import logging
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(
+            f"{config_module.settings.inventory_service_url.rstrip('/')}/devices/{DEVICE_A}/ports"
+        ).respond(503, json={"detail": "inventory unavailable"})
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient() as client:
+                with pytest.raises(CommitError) as exc_info:
+                    await _fetch_device_ports(client, {"Authorization": "Bearer t"}, DEVICE_A)
+    assert exc_info.value.status_code == 503
+    assert any(r.message == "ai_commit_device_ports_fetch_failed" for r in caplog.records)
+
+
+async def test_fetch_device_ports_transport_failure_raises_commit_error(caplog):
+    """An unreachable inventory is the same failure class as a 5xx: fail
+    closed, do not treat it as a portless device."""
+    import logging
+
+    async with httpx.AsyncClient() as client:
+        with respx.mock as mock:
+            mock.get(
+                f"{config_module.settings.inventory_service_url.rstrip('/')}"
+                f"/devices/{DEVICE_A}/ports"
+            ).mock(side_effect=httpx.ConnectError("inventory unreachable"))
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(CommitError) as exc_info:
+                    await _fetch_device_ports(client, {"Authorization": "Bearer t"}, DEVICE_A)
+    assert exc_info.value.status_code == 503
+    assert any(r.message == "ai_commit_device_ports_fetch_failed" for r in caplog.records)
 
 
 # --- _delete_topology: rollback delete swallows its own failure (127-128) ---

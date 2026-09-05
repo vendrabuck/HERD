@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Fixed the AI commit path silently dropping an approved network-element
+  attachment when inventory's ports fetch failed (issue #717):
+  `_fetch_device_ports` now raises `CommitError(503)` on a transport failure
+  or a 5xx from inventory instead of treating it the same as a genuinely
+  portless device (a 404 is still "no ports"). The fetch already runs before
+  the topology is created, so the commit fails closed with nothing to roll
+  back rather than silently omitting the user's approved attachment.
 - Added Download CSV buttons for the four purpose reporting sections (issue
   #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
   join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a
