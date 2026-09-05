@@ -3,6 +3,7 @@ import uuid
 import pytest
 from app.models.group import UserGroup
 from app.models.user import Role, User
+from app.services.group_service import add_member
 
 from tests._harness import TestSessionLocal, mock_user
 
@@ -147,19 +148,42 @@ async def test_list_groups_empty(user_client):
 
 
 @pytest.mark.asyncio
-async def test_get_group(user_client):
-    group = await _seed_group()
+async def test_get_group_user_forbidden(user_client):
+    group = await _seed_group(name="Detail Group")
+    async with TestSessionLocal() as session:
+        member = await _seed_user(session, username="detailmember", email="detailmember@test.com")
+        await add_member(session, group.id, member.id)
+
     resp = await user_client.get(f"/groups/{group.id}")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["name"] == "Test Group"
-    assert data["members"] == []
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "You do not have permission to perform this action"
 
 
 @pytest.mark.asyncio
-async def test_get_group_not_found(user_client):
-    resp = await user_client.get(f"/groups/{uuid.uuid4()}")
+async def test_get_group_admin_sees_members_with_email(admin_client):
+    group = await _seed_group(name="Detail Group")
+    async with TestSessionLocal() as session:
+        member = await _seed_user(session, username="detailmember", email="detailmember@test.com")
+        await add_member(session, group.id, member.id)
+
+    resp = await admin_client.get(f"/groups/{group.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["members"]) == 1
+    assert data["members"][0]["email"] == "detailmember@test.com"
+
+
+@pytest.mark.asyncio
+async def test_get_group_not_found_admin(admin_client):
+    resp = await admin_client.get(f"/groups/{uuid.uuid4()}")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_group_not_found_user_forbidden(user_client):
+    # 403 fires before the group lookup, so the group doesn't need to exist.
+    resp = await user_client.get(f"/groups/{uuid.uuid4()}")
+    assert resp.status_code == 403
 
 
 @pytest.mark.asyncio

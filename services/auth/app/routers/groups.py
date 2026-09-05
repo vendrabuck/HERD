@@ -86,7 +86,7 @@ async def list_groups(
 async def get_group(
     group_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    _: User = _admin_or_superadmin,
 ):
     group = await get_group_by_id(db, group_id)
     if not group:
