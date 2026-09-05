@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- Security: inventory's device config-version reads (`GET
+  /devices/{id}/config-versions`, `.../config-versions/diff`, `.../config-
+  versions/{version_id}`) now enforce the same non-admin group-visibility
+  gate as `GET /devices/{id}` and `GET /devices/{id}/ports` (issue #718, a
+  2026-09-04 review sweep decision item). Previously the three reads
+  required only authentication, so any authenticated user could read
+  another group's config history (IPs, hostnames, VLAN maps, routes, author
+  attribution, and any free-form driver config) for a device outside their
+  own visibility, even though the sibling device and port reads already
+  404 a non-visible device. A non-admin caller outside the device's groups
+  now gets 404 with the identical detail as the device read, so the
+  endpoint cannot be used to tell "hidden" from "absent"; admins remain
+  unfiltered. The write endpoints (create, restore, apply, schedule) are
+  unchanged, since they already run the `manage`-or-active-reservation
+  guard. `_resolve_visible_device_ids` moved out of `app/routers/devices.py`
+  into `app/services/device_visibility.py` so device_configs.py can share it
+  without a router-to-router import; ports.py now imports it from the same
+  place. Documented in `docs/ROLES.md`.
 - Performance fix: the expiration sweep's per-tick ACTIVE fork reconcile no
   longer scans or reads without an index (issue #710, 2026-09-04 review sweep
   finding, medium and low severity). `reservation_fork` carried indexes only

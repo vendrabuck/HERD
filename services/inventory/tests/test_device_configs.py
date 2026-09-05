@@ -938,3 +938,233 @@ async def test_latest_internal_unknown_device_404(client):
         headers={"X-Internal-Token": "test-token"},
     )
     assert resp.status_code == 404
+
+
+# --- Group-visibility gate on the three JWT-gated reads (issue #718) ---
+#
+# `list_config_versions`, `diff_config_versions`, and `get_config_version` now
+# apply the same non-admin group-visibility gate as `GET /devices/{id}`: a
+# device outside the caller's groups 404s with the identical detail as the
+# device read, so the two endpoints cannot be used to tell "hidden" from
+# "absent". Admins stay unfiltered. Mirrors
+# test_devices.test_get_device_non_admin_denied_when_not_visible.
+#
+# One shared AsyncClient per test (built directly, not via the `client`/
+# `user_client` fixtures): the device and its versions are seeded as admin,
+# then the identity override is switched to a plain user for the read under
+# test, all against the same app instance. Using both fixtures at once would
+# race their dependency-override setup against each other.
+
+
+async def _seed_device_with_two_versions(ac) -> tuple[str, str, str]:
+    """As admin: create a device with two config versions; return
+    (device_id, version_id_1, version_id_2)."""
+    device_id = await _create_device(ac)
+    v1 = await ac.post(
+        f"/devices/{device_id}/config-versions",
+        json={"config": {"vlan": 10}, "description": "v1"},
+    )
+    assert v1.status_code == 201, v1.text
+    v2 = await ac.post(
+        f"/devices/{device_id}/config-versions",
+        json={"config": {"vlan": 20}, "description": "v2"},
+    )
+    assert v2.status_code == 201, v2.text
+    return device_id, v1.json()["id"], v2.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_list_config_versions_non_admin_denied_when_not_visible():
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        app.dependency_overrides[get_current_user_payload] = override_admin
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            device_id, _, _ = await _seed_device_with_two_versions(ac)
+
+        app.dependency_overrides[get_current_user_payload] = override_user
+        with patch(
+            "app.routers.device_configs._resolve_visible_device_ids",
+            new=AsyncMock(return_value=set()),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.get(f"/devices/{device_id}/config-versions")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Device not found"
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_list_config_versions_non_admin_allowed_when_visible():
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        app.dependency_overrides[get_current_user_payload] = override_admin
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            device_id, _, _ = await _seed_device_with_two_versions(ac)
+
+        app.dependency_overrides[get_current_user_payload] = override_user
+        with patch(
+            "app.routers.device_configs._resolve_visible_device_ids",
+            new=AsyncMock(return_value={uuid.UUID(device_id)}),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.get(f"/devices/{device_id}/config-versions")
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 2
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_list_config_versions_admin_unfiltered(client):
+    device_id, _, _ = await _seed_device_with_two_versions(client)
+
+    # Admin never consults visibility at all; patch it to blow up to prove
+    # the admin path never calls it.
+    with patch(
+        "app.routers.device_configs._resolve_visible_device_ids",
+        new=AsyncMock(side_effect=AssertionError("admin must not check visibility")),
+    ):
+        resp = await client.get(f"/devices/{device_id}/config-versions")
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_diff_config_versions_non_admin_denied_when_not_visible():
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        app.dependency_overrides[get_current_user_payload] = override_admin
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            device_id, v1, v2 = await _seed_device_with_two_versions(ac)
+
+        app.dependency_overrides[get_current_user_payload] = override_user
+        with patch(
+            "app.routers.device_configs._resolve_visible_device_ids",
+            new=AsyncMock(return_value=set()),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.get(f"/devices/{device_id}/config-versions/diff?from={v1}&to={v2}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Device not found"
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_diff_config_versions_non_admin_allowed_when_visible():
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        app.dependency_overrides[get_current_user_payload] = override_admin
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            device_id, v1, v2 = await _seed_device_with_two_versions(ac)
+
+        app.dependency_overrides[get_current_user_payload] = override_user
+        with patch(
+            "app.routers.device_configs._resolve_visible_device_ids",
+            new=AsyncMock(return_value={uuid.UUID(device_id)}),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.get(f"/devices/{device_id}/config-versions/diff?from={v1}&to={v2}")
+        assert resp.status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_diff_config_versions_admin_unfiltered(client):
+    device_id, v1, v2 = await _seed_device_with_two_versions(client)
+
+    with patch(
+        "app.routers.device_configs._resolve_visible_device_ids",
+        new=AsyncMock(side_effect=AssertionError("admin must not check visibility")),
+    ):
+        resp = await client.get(f"/devices/{device_id}/config-versions/diff?from={v1}&to={v2}")
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_get_config_version_non_admin_denied_when_not_visible():
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        app.dependency_overrides[get_current_user_payload] = override_admin
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            device_id, v1, _ = await _seed_device_with_two_versions(ac)
+
+        app.dependency_overrides[get_current_user_payload] = override_user
+        with patch(
+            "app.routers.device_configs._resolve_visible_device_ids",
+            new=AsyncMock(return_value=set()),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.get(f"/devices/{device_id}/config-versions/{v1}")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Device not found"
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_config_version_non_admin_allowed_when_visible():
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        app.dependency_overrides[get_current_user_payload] = override_admin
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            device_id, v1, _ = await _seed_device_with_two_versions(ac)
+
+        app.dependency_overrides[get_current_user_payload] = override_user
+        with patch(
+            "app.routers.device_configs._resolve_visible_device_ids",
+            new=AsyncMock(return_value={uuid.UUID(device_id)}),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.get(f"/devices/{device_id}/config-versions/{v1}")
+        assert resp.status_code == 200
+        assert resp.json()["id"] == v1
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_config_version_admin_unfiltered(client):
+    device_id, v1, _ = await _seed_device_with_two_versions(client)
+
+    with patch(
+        "app.routers.device_configs._resolve_visible_device_ids",
+        new=AsyncMock(side_effect=AssertionError("admin must not check visibility")),
+    ):
+        resp = await client.get(f"/devices/{device_id}/config-versions/{v1}")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == v1
+
+
+@pytest.mark.asyncio
+async def test_config_version_reads_404_detail_matches_device_read():
+    """The config-version-read 404 must be indistinguishable from the device
+    read's 404 (same status, same detail), so the endpoint cannot be used to
+    tell "hidden" from "absent" (issue #718)."""
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        app.dependency_overrides[get_current_user_payload] = override_admin
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            device_id, v1, _ = await _seed_device_with_two_versions(ac)
+
+        app.dependency_overrides[get_current_user_payload] = override_user
+        with patch(
+            "app.routers.device_configs._resolve_visible_device_ids",
+            new=AsyncMock(return_value=set()),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                config_resp = await ac.get(f"/devices/{device_id}/config-versions/{v1}")
+
+        with patch(
+            "app.routers.devices._resolve_visible_device_ids",
+            new=AsyncMock(return_value=set()),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                device_resp = await ac.get(f"/devices/{device_id}")
+
+        assert config_resp.status_code == device_resp.status_code == 404
+        assert config_resp.json()["detail"] == device_resp.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()

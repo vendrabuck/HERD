@@ -20,6 +20,7 @@ from app.schemas.device import (
     InternalDeviceCreate,
     PaginatedDeviceResponse,
 )
+from app.services.device_visibility import _resolve_visible_device_ids
 from app.services.inventory_service import (
     create_device,
     create_dynamic_instance_device,
@@ -579,21 +580,3 @@ async def update_device_status_internal(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     return _device_to_response(device)
-
-
-async def _resolve_visible_device_ids(
-    db: AsyncSession, user_id: uuid.UUID, authorization: str | None
-) -> set[uuid.UUID]:
-    """Resolve the set of device IDs a non-admin user can see via their groups.
-
-    Fails closed: if the auth service is unreachable or errors,
-    `_fetch_user_group_ids` raises HTTPException(503) and that propagates so the
-    request fails rather than falling back to showing every device. A user who
-    legitimately belongs to no groups resolves to an empty set (sees no DUTs),
-    which is distinct from an auth-service outage.
-    """
-    from app.routers.device_groups import _fetch_user_group_ids
-    from app.services.device_group_service import get_visible_device_ids
-
-    user_group_ids = await _fetch_user_group_ids(user_id, authorization)
-    return await get_visible_device_ids(db, user_group_ids)

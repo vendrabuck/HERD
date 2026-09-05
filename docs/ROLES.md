@@ -456,7 +456,14 @@ off-limits for specific devices can revoke device visibility from the topology s
 the device cannot be reserved in the first place.
 
 Read paths (list config versions, get version detail, diff) are not gated by this
-widening; they remain authenticated-user-visible as they were before iter 3.
+manage-or-reservation-ownership widening. As of issue #718, they instead carry the
+same plain group-visibility gate as `GET /devices/{id}` and `GET /devices/{id}/ports`:
+a non-admin caller outside the target device's groups gets 404, identical status and
+detail to the device read, so a config-version read cannot be used to distinguish a
+hidden device from one that does not exist. Admins are unfiltered. This is a narrower
+boundary than the write widening above by design: a user can only book (and therefore
+usefully read the configuration of) a device they can already see, so reservation
+ownership adds nothing a read needs beyond visibility.
 
 A scheduled (`POST .../schedule`) apply job's authorization is not evaluated once and
 forgotten: issue #704 re-checks the creator's authority at fire time, using the same
