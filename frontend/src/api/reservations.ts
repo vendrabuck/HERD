@@ -4,6 +4,7 @@ import type {
   CalendarQueryParams,
   ForkCanvasDraftResult,
   ForkConflictDetail,
+  ForkDeviceNotMemberDetail,
   ForkSaveResult,
   ForkVersionDetail,
   ForkVersionRestoreResult,
@@ -514,6 +515,26 @@ export function forkConflictDetail(err: unknown): ForkConflictDetail | null {
     Array.isArray((detail as { conflicts?: unknown }).conflicts)
   ) {
     return detail as ForkConflictDetail;
+  }
+  return null;
+}
+
+// Narrow an axios error's response detail to the structured fork
+// endpoint-membership 409 (issue #701): a save whose canvas names a device
+// outside the reservation's device set. Returns null for any other shape, so
+// the caller can branch the device-naming toast from the plain error toast.
+export function forkDeviceNotMemberDetail(err: unknown): ForkDeviceNotMemberDetail | null {
+  const response = (err as { response?: { status?: number; data?: { detail?: unknown } } })
+    ?.response;
+  if (response?.status !== 409) return null;
+  const detail = response.data?.detail;
+  if (
+    detail &&
+    typeof detail === "object" &&
+    (detail as { error?: unknown }).error === "fork_device_not_member" &&
+    Array.isArray((detail as { device_ids?: unknown }).device_ids)
+  ) {
+    return detail as ForkDeviceNotMemberDetail;
   }
   return null;
 }

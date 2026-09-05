@@ -22,6 +22,7 @@ from app.models.reservation import (
 )
 from app.schemas.reservation import ReservationUpdate, _as_utc
 from app.services.reservation_service import (
+    TopologyDeviceNotMember,
     _acquire_device_locks,
     _fetch_devices_best_effort,
     _release_exclusive_devices_best_effort,
@@ -132,7 +133,7 @@ async def test_validate_topology_connectivity_valid():
     ):
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
-        await _validate_topology_connectivity(uuid.uuid4())
+        await _validate_topology_connectivity(uuid.uuid4(), [])
 
 
 @pytest.mark.asyncio
@@ -148,7 +149,7 @@ async def test_validate_topology_connectivity_404_is_noop():
     ):
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
-        await _validate_topology_connectivity(uuid.uuid4())
+        await _validate_topology_connectivity(uuid.uuid4(), [])
 
 
 @pytest.mark.asyncio
@@ -164,7 +165,7 @@ async def test_validate_topology_connectivity_server_error_raises_runtime():
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
         with pytest.raises(RuntimeError, match="Cabling validation returned 500"):
-            await _validate_topology_connectivity(uuid.uuid4())
+            await _validate_topology_connectivity(uuid.uuid4(), [])
 
 
 @pytest.mark.asyncio
@@ -180,7 +181,7 @@ async def test_validate_topology_connectivity_transport_error_raises_runtime():
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
         with pytest.raises(RuntimeError, match="Failed to contact cabling service"):
-            await _validate_topology_connectivity(uuid.uuid4())
+            await _validate_topology_connectivity(uuid.uuid4(), [])
 
 
 @pytest.mark.asyncio
@@ -198,10 +199,119 @@ async def test_validate_topology_connectivity_invalid_edges_raises_value_error()
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
         with pytest.raises(ValueError, match="unreachable edges") as excinfo:
-            await _validate_topology_connectivity(uuid.uuid4())
+            await _validate_topology_connectivity(uuid.uuid4(), [])
     # 7 invalid edges -> first 5 listed, "and 2 more" appended.
     assert "and 2 more" in str(excinfo.value)
     assert "e0 (no path)" in str(excinfo.value)
+
+
+# --- _validate_topology_connectivity device membership (issue #701 phase 2) ---
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_partial_device_set_refused():
+    """A canvas naming a device outside the booking raises TopologyDeviceNotMember
+    with every offending device id, sorted."""
+    foreign = str(uuid.uuid4())
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": True,
+        "invalid_edges": [],
+        "device_ids": sorted([str(DEVICE_A), foreign]),
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(TopologyDeviceNotMember) as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [DEVICE_A])
+    assert excinfo.value.device_ids == [foreign]
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_full_device_set_passes():
+    """Booking every canvas device (in any order) never raises."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": True,
+        "invalid_edges": [],
+        "device_ids": sorted(str(d) for d in (DEVICE_A, DEVICE_B)),
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        await _validate_topology_connectivity(uuid.uuid4(), [DEVICE_B, DEVICE_A])
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_membership_checked_before_connectivity():
+    """A canvas that is BOTH missing a booked device and has unreachable edges
+    refuses on membership first: the authorization boundary is checked before the
+    (informational-by-comparison) physical-path check."""
+    foreign = str(uuid.uuid4())
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": False,
+        "invalid_edges": [{"edge_id": "e1", "reason": "no_path"}],
+        "device_ids": [foreign],
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(TopologyDeviceNotMember) as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [DEVICE_A])
+    assert excinfo.value.device_ids == [foreign]
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_element_nodes_never_counted():
+    """A network element node is never a device: cabling's device_ids field
+    already excludes it (mirrored here as a canvas with one real device), so
+    booking only that device passes even though the canvas also carries an
+    element attachment."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"valid": True, "invalid_edges": [], "device_ids": [str(DEVICE_A)]}
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        await _validate_topology_connectivity(uuid.uuid4(), [DEVICE_A])
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_missing_device_ids_field_is_no_violation():
+    """A cabling response with no device_ids key at all (e.g. an older cached
+    schema) is treated as an empty canvas device set, never a violation: the
+    field is additive and its absence must not be read as membership failure."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"valid": True, "invalid_edges": []}
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        await _validate_topology_connectivity(uuid.uuid4(), [DEVICE_A])
 
 
 # --- _acquire_device_locks postgresql branch ---
@@ -519,7 +629,7 @@ async def test_update_reservation_device_change_revalidates_topology():
                 ReservationUpdate(device_ids=[DEVICE_A, DEVICE_B]),
                 token="t",
             )
-        validate_mock.assert_awaited_once_with(topo)
+        validate_mock.assert_awaited_once_with(topo, [DEVICE_A, DEVICE_B])
 
 
 # --- cancel/release exclusive-device selection via fetched dict ---

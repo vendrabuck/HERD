@@ -15,16 +15,19 @@ from app.models.reservation import (
 )
 from app.schemas.reservation import ReservationCreate, ReservationUpdate
 from app.services.reservation_service import (
+    ForkMembershipRefused,
     _acquire_device_locks,
     _check_conflicts,
     _create_reservation_fork,
     _create_reservation_fork_best_effort,
     _fetch_devices,
     _fetch_devices_best_effort,
+    _fork_membership_refused,
     _update_device_statuses,
     cancel_reservation,
     create_reservation,
     get_reservation,
+    is_fork_membership_refused,
     list_all_reservations,
     list_calendar_reservations,
     list_user_reservations,
@@ -1777,6 +1780,36 @@ async def test_fork_best_effort_swallows_exhausted_retries():
     # Exhausted-retries is the one genuine failure the bool contract reports (issue
     # #448 item 1: the sweep's give-up counter relies on this).
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_fork_best_effort_membership_refused_is_not_retried(caplog):
+    """D3 of the 2026-09-04 fork endpoint-membership fix: a cabling 409
+    (ForkMembershipRefused) is treated as definitive, not transient. No retry (the
+    mocked create is awaited exactly once), a WARNING is logged with the offending
+    device ids, no fork is created, and the reservation is marked so the backstop
+    will not retry it either (True is returned: this is a settled outcome, not the
+    retry-exhausted failure)."""
+    refused_ids = [str(uuid.uuid4())]
+    mock_create = AsyncMock(side_effect=ForkMembershipRefused(refused_ids))
+    reservation_id = uuid.uuid4()
+    with (
+        patch("app.services.reservation_service._create_reservation_fork", new=mock_create),
+        caplog.at_level("WARNING", logger="app.services.reservation_service"),
+    ):
+        result = await _create_reservation_fork_best_effort(reservation_id, uuid.uuid4())
+
+    assert result is True
+    mock_create.assert_awaited_once()
+    warning_records = [
+        r
+        for r in caplog.records
+        if getattr(r, "action", None) == "reservation_fork_membership_refused"
+    ]
+    assert len(warning_records) == 1
+    assert warning_records[0].device_ids == refused_ids
+    assert is_fork_membership_refused(reservation_id) is True
+    _fork_membership_refused.discard(reservation_id)
 
 
 @pytest.mark.asyncio

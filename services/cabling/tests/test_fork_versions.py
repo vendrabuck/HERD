@@ -77,6 +77,18 @@ def _canvas(nodes: list[uuid.UUID], edges: list[tuple[int, int]]) -> dict:
     }
 
 
+def _members(canvas: dict) -> list[str]:
+    """Device ids referenced by a canvas's nodes (2026-09-04 fork endpoint-membership
+    fix): the default ``member_device_ids`` for tests that are not exercising the
+    membership check itself, so a create or save succeeds with no restriction."""
+    ids = []
+    for node in canvas.get("nodes") or []:
+        device_id = ((node.get("data") or {}).get("device") or {}).get("id")
+        if device_id:
+            ids.append(device_id)
+    return ids
+
+
 async def _make_physical(da, pa, db_dev, pb) -> uuid.UUID:
     async with TestSessionLocal() as db:
         conn = Connection(
@@ -123,7 +135,11 @@ async def _create_fork_from_parent(client, canvas: dict) -> tuple[uuid.UUID, uui
     rid = uuid.uuid4()
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     return rid, uuid.UUID(resp.json()["fork_id"])
@@ -236,7 +252,11 @@ async def test_restore_404_for_a_foreign_version(client):
 @pytest.mark.asyncio
 async def test_restore_409_when_fork_archived(client):
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
     async with TestSessionLocal() as db:
         fork = (
             await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
@@ -377,7 +397,7 @@ async def test_save_after_restore_carries_marker_and_clears_it(client):
 
     save_resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": v1_canvas},
+        json={"canvas_data": v1_canvas, "member_device_ids": _members(v1_canvas)},
         headers=_hdr(),
     )
     assert save_resp.status_code == 200, save_resp.text
@@ -410,7 +430,7 @@ async def test_second_save_after_restore_carries_no_marker(client):
 
     first_save = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": v1_canvas},
+        json={"canvas_data": v1_canvas, "member_device_ids": _members(v1_canvas)},
         headers=_hdr(),
     )
     assert first_save.status_code == 200, first_save.text
@@ -418,7 +438,10 @@ async def test_second_save_after_restore_carries_no_marker(client):
 
     second_save = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, c], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, c], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, c], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert second_save.status_code == 200, second_save.text
@@ -448,7 +471,10 @@ async def test_restore_does_not_touch_fork_connections(client):
 
     save_resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, c], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, c], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, c], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert save_resp.status_code == 200, save_resp.text

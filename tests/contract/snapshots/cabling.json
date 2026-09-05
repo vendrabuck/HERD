@@ -387,11 +387,13 @@
     "ForkCreate": {
       "properties": {
         "created_by": "anyOf",
+        "member_device_ids": "array",
         "parent_topology_id": "anyOf",
         "parent_version_id": "anyOf",
         "reservation_id": "string"
       },
       "required": [
+        "member_device_ids",
         "reservation_id"
       ],
       "type": "object"
@@ -489,10 +491,12 @@
     "ForkSaveRequest": {
       "properties": {
         "canvas_data": "object",
-        "created_by": "anyOf"
+        "created_by": "anyOf",
+        "member_device_ids": "array"
       },
       "required": [
-        "canvas_data"
+        "canvas_data",
+        "member_device_ids"
       ],
       "type": "object"
     },
@@ -875,6 +879,7 @@
     },
     "TopologyValidationResponse": {
       "properties": {
+        "device_ids": "array",
         "invalid_edges": "array",
         "valid": "boolean"
       },

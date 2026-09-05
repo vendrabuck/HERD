@@ -177,12 +177,12 @@ async def _create_config_version(client, device_id: str, routes: list[dict]) -> 
     return resp.json()
 
 
-async def _create_reservation(client, device_id: str, topology_id: str) -> dict:
+async def _create_reservation(client, device_ids: list[str], topology_id: str) -> dict:
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
-            "device_ids": [device_id],
+            "device_ids": device_ids,
             "topology_id": topology_id,
             "purpose": "l3 route provisioning integration test",
             "start_time": now.isoformat(),
@@ -270,7 +270,9 @@ async def test_routes_configured_on_reservation_create_with_l3_switch(
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
 
         runs = await _poll_success_runs(admin_client, reservation["id"], "configure_route")
         assert runs, "no SUCCESS configure_route run was recorded for the L3 switch"
@@ -306,7 +308,9 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
 
         # Provision first, so there is something to release.
         assert await _poll_success_runs(admin_client, reservation["id"], "configure_route"), (
@@ -350,7 +354,9 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
 
         assert await _poll_success_runs(admin_client, reservation["id"], "configure_route"), (
             "reservation never provisioned routes, cannot test the pinned-set invariant"
@@ -399,7 +405,9 @@ async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_templa
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
 
         # Deterministic anchor: the reservation still activates.
         assert await _poll_reservation_status(admin_client, reservation["id"], "ACTIVE"), (

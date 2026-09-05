@@ -39,6 +39,7 @@ from app.services.reporting_service import (
     rollup_by_group,
 )
 from app.services.reservation_service import (
+    TopologyDeviceNotMember,
     _cabling_fork_call,
     _execution_wiring_call,
     _lazy_create_reservation_fork,
@@ -92,6 +93,11 @@ async def create_new_reservation(
     try:
         reservation = await create_reservation(
             db, body, user_id, credentials.credentials, username=username
+        )
+    except TopologyDeviceNotMember as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "topology_device_not_member", "device_ids": exc.device_ids},
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -545,6 +551,11 @@ async def update_reservation_by_id(
             body,
             token=credentials.credentials,
         )
+    except TopologyDeviceNotMember as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "topology_device_not_member", "device_ids": exc.device_ids},
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
@@ -765,9 +776,16 @@ async def get_reservation_fork(
             if reservation.status != ReservationStatus.ACTIVE:
                 raise HTTPException(status_code=404, detail="Fork not found")
             # Case A lazy-create: build the bench on first read of a live reservation,
-            # even with no parent topology, then re-read.
+            # even with no parent topology, then re-read. member_device_ids is the
+            # reservation's own device set (D5, the 2026-09-04 fork endpoint-
+            # membership fix): fail closed if it cannot be read off the already-
+            # loaded reservation (it always can; the property is a plain in-memory
+            # association proxy over an eager-loaded relationship, never an HTTP call).
             await _lazy_create_reservation_fork(
-                reservation_id, reservation.topology_id, str(reservation.user_id)
+                reservation_id,
+                reservation.topology_id,
+                str(reservation.user_id),
+                list(reservation.device_ids),
             )
             resp = await _cabling_fork_call("GET", f"/internal/forks/{reservation_id}")
     except RuntimeError as exc:
@@ -817,9 +835,15 @@ async def save_reservation_fork(
     """Reconcile the reservation's fork against the submitted canvas (ADR 0006).
 
     Owner-or-admin gated and ACTIVE-only (409 otherwise). Forwards to cabling's
-    save-reconcile, stamping created_by with the authenticated user. Cabling's
-    structured 409 (cross-reservation port conflict naming the blocking reservation,
-    or an ARCHIVED fork) relays to the user verbatim.
+    save-reconcile, stamping created_by with the authenticated user, and
+    member_device_ids from the reservation's own device set (D5, the 2026-09-04
+    fork endpoint-membership fix; admins get the same check, PATCH-add is the way
+    to bring a device into the reservation). Fail closed: the device list comes off
+    the already-loaded `reservation` object (a plain in-memory association proxy,
+    never a second HTTP call), so there is no unreachable-dependency case to guard
+    beyond what loading `reservation` itself already required. Cabling's structured
+    409 (cross-reservation port conflict, an ARCHIVED fork, or fork_device_not_member
+    naming the offending device ids) relays to the user verbatim.
     """
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")
@@ -833,7 +857,11 @@ async def save_reservation_fork(
         resp = await _cabling_fork_call(
             "POST",
             f"/internal/forks/{reservation_id}/save",
-            json_body={"canvas_data": body.canvas_data, "created_by": str(user_id)},
+            json_body={
+                "canvas_data": body.canvas_data,
+                "created_by": str(user_id),
+                "member_device_ids": [str(d) for d in reservation.device_ids],
+            },
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))

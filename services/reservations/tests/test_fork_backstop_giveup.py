@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from app.database import Base, engine
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
+from app.services import reservation_service
 from app.tasks import expiration
 from app.tasks.expiration import _backstop_missing_forks
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -33,12 +34,15 @@ NOW = datetime.now(timezone.utc)
 async def setup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # The attempt counter is module-level, in-memory, per-process state (issue #448
-    # item 1's deliberate design); reset it around every test so tests do not leak
-    # counters into each other.
+    # The attempt counter and the membership-refused set are both module-level,
+    # in-memory, per-process state (issue #448 item 1's deliberate design, extended
+    # by D3 of the 2026-09-04 fork endpoint-membership fix); reset them around every
+    # test so tests do not leak state into each other.
     expiration._fork_backstop_attempts.clear()
+    reservation_service._fork_membership_refused.clear()
     yield
     expiration._fork_backstop_attempts.clear()
+    reservation_service._fork_membership_refused.clear()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 
@@ -138,7 +142,7 @@ async def test_different_reservation_unaffected():
     stuck = await _insert_active()
     healthy = await _insert_active()
 
-    async def fake_create(reservation_id, topology_id, created_by=None):
+    async def fake_create(reservation_id, topology_id, created_by=None, member_device_ids=None):
         return reservation_id == healthy
 
     create = AsyncMock(side_effect=fake_create)
@@ -195,3 +199,42 @@ async def test_stale_counter_pruned_when_reservation_leaves_active():
     # `stays` is still ACTIVE and still forkless, so it is visited, fails again, and
     # its counter is untouched by the prune (it only advances from the normal path).
     assert expiration._fork_backstop_attempts[stays] == 3
+
+
+# --- Endpoint-membership refusal is never retried (D3, 2026-09-04 sweep finding) ---
+
+
+@pytest.mark.asyncio
+async def test_membership_refused_reservation_is_never_retried():
+    """Once a reservation's fork create is marked membership-refused, the backstop
+    skips it on every later tick with no create call at all: unlike a transient
+    failure, a 409 refusal will not resolve itself on a retry, so it bypasses the
+    bounded give-up counter entirely rather than spending attempts on it."""
+    rid = await _insert_active()
+    reservation_service._fork_membership_refused.add(rid)
+    create = AsyncMock(return_value=False)
+    with patch.object(expiration, "_create_reservation_fork_best_effort", create):
+        for _ in range(3):
+            await _backstop_missing_forks(known_fork_ids=set())
+    create.assert_not_awaited()
+    assert rid not in expiration._fork_backstop_attempts
+
+
+@pytest.mark.asyncio
+async def test_membership_refusal_pruned_when_reservation_leaves_active():
+    """The refusal marker is pruned the same way the attempts counter is: a
+    reservation that ends before the conflict is resolved does not leak its
+    marker for the life of the process."""
+    rid = await _insert_active()
+    reservation_service._fork_membership_refused.add(rid)
+
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, rid)
+        res.status = ReservationStatus.CANCELLED
+        await db.commit()
+
+    create = AsyncMock(return_value=False)
+    with patch.object(expiration, "_create_reservation_fork_best_effort", create):
+        await _backstop_missing_forks(known_fork_ids=set())
+
+    assert rid not in reservation_service._fork_membership_refused

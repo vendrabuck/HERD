@@ -33,6 +33,8 @@ from app.services.reservation_service import (
     _reservation_created_event,
     _reservation_failed_event,
     _update_device_statuses,
+    is_fork_membership_refused,
+    prune_fork_membership_refused,
     stage_wiring_changed,
 )
 
@@ -212,7 +214,9 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
     # Editable per-reservation fork (best-effort, never raises), mirroring
     # create_reservation's step 8. The reservation.created event is already
     # staged above and the relay will publish it.
-    await _create_reservation_fork_best_effort(reservation_id, topology_id, created_by=str(user_id))
+    await _create_reservation_fork_best_effort(
+        reservation_id, topology_id, created_by=str(user_id), member_device_ids=device_ids
+    )
     logger.info(
         "Scheduled reservation activated: %s",
         reservation_id,
@@ -623,24 +627,34 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
     fork ever succeeding) is otherwise never visited again, so neither pop site above
     fires and its key would leak for the life of the process. Every key not present in
     this tick's row-id set is pruned up front, before the per-row loop, so the counter
-    dict never outlives the reservations it tracks.
+    dict never outlives the reservations it tracks. The same prune covers
+    _fork_membership_refused (D3, the 2026-09-04 fork endpoint-membership fix).
+
+    D3: a row already marked ``is_fork_membership_refused`` (cabling's prior 409 was
+    a definitive endpoint-membership refusal, not a transient failure) is skipped
+    with no create call and no give-up counter churn: the membership conflict will
+    not resolve itself on a retry, so this bypasses the bounded-retry give-up
+    machinery entirely rather than spending attempts on it.
     """
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(Reservation.id, Reservation.topology_id, Reservation.user_id).where(
+            select(Reservation).where(
                 Reservation.status == ReservationStatus.ACTIVE,
                 Reservation.topology_id.is_not(None),
             )
         )
-        rows = result.all()
+        rows = result.scalars().all()
 
     current_ids = {row.id for row in rows}
     for stale_id in set(_fork_backstop_attempts.keys()) - current_ids:
         _fork_backstop_attempts.pop(stale_id, None)
+    prune_fork_membership_refused(current_ids)
 
     for row in rows:
         if row.id in known_fork_ids:
             _fork_backstop_attempts.pop(row.id, None)
+            continue
+        if is_fork_membership_refused(row.id):
             continue
         if _fork_backstop_attempts.get(row.id, 0) >= _FORK_BACKSTOP_MAX_ATTEMPTS:
             # Already gave up on this reservation; do not re-log or re-attempt.
@@ -654,7 +668,10 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
             },
         )
         created = await _create_reservation_fork_best_effort(
-            row.id, row.topology_id, created_by=str(row.user_id)
+            row.id,
+            row.topology_id,
+            created_by=str(row.user_id),
+            member_device_ids=list(row.device_ids),
         )
         if created:
             _fork_backstop_attempts.pop(row.id, None)

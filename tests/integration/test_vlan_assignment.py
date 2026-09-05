@@ -79,7 +79,16 @@ async def l2_driver(base_url, admin_token):
 
 @pytest.fixture(scope="session")
 async def l2_template(base_url, admin_token, l2_driver):
-    """A device template wired to the mock L2 driver."""
+    """A device template wired to the mock L2 driver.
+
+    non-exclusive, mirroring the real seeded L2 switch templates (shared
+    infrastructure, seed_devices_public.py): the canvas now names the switch as
+    a real endpoint device so every reservation booking it must include it
+    (issue #701 phase 2's membership check), and
+    test_vlan_ids_are_unique_within_same_fabric below books the SAME switch
+    into two overlapping reservations, which a still-exclusive switch would
+    409 as a time conflict.
+    """
     async with httpx.AsyncClient(
         base_url=base_url,
         verify=False,
@@ -90,6 +99,7 @@ async def l2_template(base_url, admin_token, l2_driver):
             "name": f"mock-l2-tmpl-{uuid.uuid4().hex[:8]}",
             "template_type": "device",
             "driver_id": l2_driver["id"],
+            "exclusive": False,
             "vendor": "IntegrationVendor",
             "model": "MockL2Switch",
             "sections": [
@@ -168,12 +178,12 @@ async def _create_topology(client, canvas: dict) -> str:
     return topology_id
 
 
-async def _create_reservation(client, device_id: str, topology_id: str) -> dict:
+async def _create_reservation(client, device_ids: list[str], topology_id: str) -> dict:
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
-            "device_ids": [device_id],
+            "device_ids": device_ids,
             "topology_id": topology_id,
             "purpose": "vlan assignment integration test",
             "start_time": now.isoformat(),
@@ -246,7 +256,9 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
         assert await _poll_active(admin_client, reservation["id"]), "reservation never activated"
 
         add_runs = await _poll_success_runs(admin_client, reservation["id"], "add_to_vlan")
@@ -296,7 +308,9 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
         assert await _poll_active(admin_client, reservation["id"]), "reservation never activated"
 
         # Provision first (activation-staged reconcile), so there is something to release.
@@ -353,9 +367,9 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
         topo_b = await _create_topology(admin_client, _canvas_edge(dut_b["id"], switch["id"]))
         topology_ids.append(topo_b)
 
-        res_a = await _create_reservation(admin_client, dut_a["id"], topo_a)
+        res_a = await _create_reservation(admin_client, [dut_a["id"], switch["id"]], topo_a)
         reservations.append(res_a)
-        res_b = await _create_reservation(admin_client, dut_b["id"], topo_b)
+        res_b = await _create_reservation(admin_client, [dut_b["id"], switch["id"]], topo_b)
         reservations.append(res_b)
         assert await _poll_active(admin_client, res_a["id"]), "reservation A never activated"
         assert await _poll_active(admin_client, res_b["id"]), "reservation B never activated"

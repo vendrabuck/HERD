@@ -93,8 +93,14 @@ def _poll(fn, predicate, *, timeout: float = 30.0, interval: float = 0.5):
 # --------------------------------------------------------------------------- #
 # Seeding helpers.                                                             #
 # --------------------------------------------------------------------------- #
-def _seed_template(page, suffix: str) -> tuple[str, str]:
-    """Upload a driver and create a device template; return (driver_id, template_id)."""
+def _seed_template(page, suffix: str, *, exclusive: bool = True) -> tuple[str, str]:
+    """Upload a driver and create a device template; return (driver_id, template_id).
+
+    exclusive=False (issue #701 phase 2's fork endpoint-membership fix): the
+    two-session port-conflict test books the SAME shared switch/shared devices
+    into two overlapping ACTIVE reservations, which a still-exclusive template
+    would 409 as a time conflict at reservation create.
+    """
     files = {"file": ("t2-driver.tar.gz", driver_tarball(), "application/gzip")}
     data = {
         "name": f"pw-t2-drv-{suffix}",
@@ -110,6 +116,7 @@ def _seed_template(page, suffix: str) -> tuple[str, str]:
             "name": f"pw-t2-tmpl-{suffix}",
             "template_type": "device",
             "driver_id": driver["id"],
+            "exclusive": exclusive,
             "vendor": "PlaywrightVendor",
             "model": "T2",
             "sections": [
@@ -265,7 +272,11 @@ def test_two_session_port_conflict(pw_contexts):
         pw_login(page_b)
 
         # --- Seed shared infra via context A (both principals are the admin). ---
-        driver_id, template_id = _seed_template(page_a, suffix)
+        # Non-exclusive: switch and shared are booked into BOTH reservations below
+        # (issue #701 phase 2 requires every fork canvas endpoint device to be a
+        # reservation member), so an exclusive template would 409 as a time
+        # conflict the moment the second reservation tries to book them.
+        driver_id, template_id = _seed_template(page_a, suffix, exclusive=False)
         switch = _seed_device(page_a, template_id, f"pw-t2-sw-{suffix}")
         shared = _seed_device(page_a, template_id, f"pw-t2-shared-{suffix}")
         dut_a = _seed_device(page_a, template_id, f"pw-t2-duta-{suffix}")
@@ -287,8 +298,12 @@ def test_two_session_port_conflict(pw_contexts):
 
         topology_id = _empty_topology(page_a, suffix)
 
-        # Two reservations over DISJOINT reserved devices (no reservation
-        # conflict); the contended switch/shared devices are unreserved transit.
+        # Two reservations, each starting with only its own DUT (no reservation
+        # conflict on those). The contended switch/shared devices are non-exclusive
+        # shared infrastructure that BOTH principals must book before their forks
+        # can wire them (issue #701 phase 2): B's device set is widened by an
+        # explicit PATCH below, mirroring the frontend's own PATCH-before-save
+        # ordering for A's UI-driven commit further down.
         res_a = _create_active_reservation(
             page_a, [dut_a["id"]], topology_id, f"pw-t2-resA-{suffix}"
         )["id"]
@@ -299,6 +314,13 @@ def test_two_session_port_conflict(pw_contexts):
         # Lazy-create both forks, then B claims the shared port via a fork save.
         _api(page_a, "GET", f"/reservations/{res_a}/fork")
         _api(page_b, "GET", f"/reservations/{res_b}/fork")
+        patch_b = _api(
+            page_b,
+            "PATCH",
+            f"/reservations/{res_b}",
+            json={"device_ids": [dut_b["id"], switch["id"], shared["id"]]},
+        )
+        assert patch_b.status_code == 200, patch_b.text
         save_b = _api(
             page_b,
             "POST",

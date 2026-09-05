@@ -191,7 +191,7 @@ async def test_standing_reconciler_archives_zombie_fork(admin_client, base_url, 
         # Manufacture the zombie: an ACTIVE fork for the already-COMPLETED reservation.
         created = await raw.post(
             "/cabling/internal/forks",
-            json={"reservation_id": reservation_id},
+            json={"reservation_id": reservation_id, "member_device_ids": [a_id]},
             headers=headers,
         )
         assert created.status_code == 201, created.text
@@ -480,3 +480,44 @@ async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
         await admin_client.delete(f"/cabling/topologies/{topology_id}")
         await admin_client.delete(f"/cabling/connections/{connection_ab}")
         await admin_client.delete(f"/cabling/connections/{connection_ac}")
+
+
+async def test_save_fork_non_member_device_refused_409(
+    user_client, admin_client, visible_fresh_device, fresh_devices
+):
+    """A non-admin owner saving a fork that names a device outside the reservation's
+    own membership is refused with 409 fork_device_not_member (D2/D3, the
+    2026-09-04 fork endpoint-membership fix). Afterwards the fork's connections are
+    unchanged and GET shows no new version: the refused save touched nothing.
+    """
+    member_device = visible_fresh_device
+    foreign_device = (await fresh_devices(1))[0]
+
+    reservation_id = await _create_reservation(user_client, [member_device["id"]], None)
+    try:
+        # Case A: no parent topology, so the fork is lazy-created on first read with
+        # an empty canvas and no wiring.
+        got = await user_client.get(f"/reservations/{reservation_id}/fork")
+        assert got.status_code == 200, got.text
+        before = got.json()
+        versions_before = len(before["versions"])
+        connections_before = before["connections"]
+
+        canvas = _canvas_with_edge(member_device["id"], foreign_device["id"])
+        resp = await user_client.post(
+            f"/reservations/{reservation_id}/fork/save",
+            json={"canvas_data": canvas},
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "fork_device_not_member"
+        assert detail["device_ids"] == [foreign_device["id"]]
+
+        # No wiring, no new version: the refused save is a pure no-op.
+        after = await user_client.get(f"/reservations/{reservation_id}/fork")
+        assert after.status_code == 200, after.text
+        after_body = after.json()
+        assert len(after_body["versions"]) == versions_before
+        assert after_body["connections"] == connections_before
+    finally:
+        await user_client.delete(f"/reservations/{reservation_id}")

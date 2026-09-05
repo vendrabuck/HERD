@@ -115,6 +115,35 @@ def node_to_device_map(canvas: dict) -> dict[str, uuid.UUID]:
     return mapping
 
 
+def assert_endpoints_are_members(canvas: dict | None, member_device_ids: set[uuid.UUID]) -> None:
+    """Refuse a canvas whose endpoint devices fall outside the reservation (D2, the
+    2026-09-04 sweep's fork endpoint-membership finding).
+
+    Checks ``node_to_device_map(canvas).values()`` ONLY: a network element node is
+    not a device (``node_to_device_map`` never includes one) and a resolved path's
+    transit devices are never checked here, since transit gear on a resolved path is
+    legitimately non-member. A node whose device id does not parse as a UUID is
+    already dropped by ``node_to_device_map``, so it cannot hide a violation. Raises
+    409 with a stable, machine-readable detail naming every offending device so the
+    caller can PATCH-add or remove it. Admins are not exempt.
+    """
+    if not canvas:
+        return
+    offending = {
+        device_id
+        for device_id in node_to_device_map(canvas).values()
+        if device_id not in member_device_ids
+    }
+    if offending:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "fork_device_not_member",
+                "device_ids": sorted(str(device_id) for device_id in offending),
+            },
+        )
+
+
 def node_to_element_map(canvas: dict) -> dict[str, str]:
     """Map React Flow node ids to network element ids (ADR 0012 phase 1, issue #22).
 
@@ -498,17 +527,23 @@ async def save_fork(
     db: AsyncSession,
     fork: ReservationFork,
     canvas_data: dict,
+    member_device_ids: set[uuid.UUID],
     created_by: str = "system",
 ) -> ForkSaveResult:
     """Reconcile a fork's wiring against a submitted canvas and append a version.
 
     Resolves the canvas once to the intended set, then reconciles and commits under
-    the version-allocation retry loop. The reconcile (fresh old-set read, port-claim
-    check, release-before-build staging) runs on the first pass here and re-runs inside
-    ``commit_fork_with_new_version``'s reapply hook on every retry, so a lost version
-    race recomputes against committed rows and a mid-reconcile failure rolls back the
-    whole save (no half-apply, no orphan version). The caller has already refused an
-    ARCHIVED fork.
+    the version-allocation retry loop. The reconcile (endpoint-membership check,
+    fresh old-set read, port-claim check, release-before-build staging) runs on the
+    first pass here and re-runs inside ``commit_fork_with_new_version``'s reapply hook
+    on every retry, so a lost version race recomputes against committed rows and a
+    mid-reconcile failure rolls back the whole save (no half-apply, no orphan
+    version). The caller has already refused an ARCHIVED fork.
+
+    ``member_device_ids`` is the reservation's device set (D2, the 2026-09-04 fork
+    endpoint-membership fix): ``assert_endpoints_are_members`` runs first inside
+    ``reconcile()``, before the port-claim check, so a canvas naming a foreign device
+    is refused with 409 and leaves fork_connections and fork_versions untouched.
     """
     # Capture the id up front: a version-race rollback expires ``fork``, and a later
     # lazy ``fork.id`` read inside the reconcile closure would attempt synchronous IO
@@ -520,6 +555,7 @@ async def save_fork(
     result: dict = {}
 
     async def reconcile() -> None:
+        assert_endpoints_are_members(canvas_data, member_device_ids)
         fork.canvas_data = canvas_data
         old_rows = (
             (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork_id)))
@@ -789,6 +825,7 @@ __all__ = [
     "ForkPruneResult",
     "ForkSaveResult",
     "WireSpec",
+    "assert_endpoints_are_members",
     "connection_identity",
     "node_to_device_map",
     "node_to_element_map",

@@ -185,12 +185,21 @@ async def slow_l2_driver(base_url, admin_token):
 @pytest.fixture(scope="session")
 async def slow_l2_template(base_url, admin_token, slow_l2_driver):
     """An L2 template that declares the mock_sleep_ms injection field, so a switch
-    device can carry a per-action driver sleep in its field_data."""
+    device can carry a per-action driver sleep in its field_data.
+
+    non-exclusive, mirroring the real seeded L2 switch templates (shared
+    infrastructure, seed_devices_public.py): the redelivery test's canvas names
+    the switch as a real endpoint device, so every reservation booking it must
+    include it (issue #701 phase 2's membership check), and it books the SAME
+    switch into two overlapping reservations, which a still-exclusive switch
+    would 409 as a time conflict.
+    """
     async with _admin_session_client(base_url, admin_token) as client:
         payload = {
             "name": f"mock-l2-slow-tmpl-{uuid.uuid4().hex[:8]}",
             "template_type": "device",
             "driver_id": slow_l2_driver["id"],
+            "exclusive": False,
             "vendor": "IntegrationVendor",
             "model": "MockL2SwitchSlow",
             "sections": [
@@ -278,12 +287,12 @@ async def _create_topology(client, canvas):
     return topology_id
 
 
-async def _reserve(client, device_id, topology_id):
+async def _reserve(client, device_ids, topology_id):
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
-            "device_ids": [device_id],
+            "device_ids": device_ids,
             "topology_id": topology_id,
             "purpose": "redelivery idempotency test",
             "start_time": now.isoformat(),
@@ -340,7 +349,7 @@ async def test_redelivery_does_not_rerun_succeeded_add_to_vlan(
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "eth1"))
         topo_a = await _create_topology(admin_client, _canvas_edge(dut_a["id"], switch["id"]))
         topology_ids.append(topo_a)
-        res_a = await _reserve(admin_client, dut_a["id"], topo_a)
+        res_a = await _reserve(admin_client, [dut_a["id"], switch["id"]], topo_a)
         reservations.append(res_a)
 
         # 1. First delivery provisions normally: wait for add_to_vlan SUCCESS.
@@ -368,7 +377,7 @@ async def test_redelivery_does_not_rerun_succeeded_add_to_vlan(
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "eth2"))
         topo_b = await _create_topology(admin_client, _canvas_edge(dut_b["id"], switch["id"]))
         topology_ids.append(topo_b)
-        res_b = await _reserve(admin_client, dut_b["id"], topo_b)
+        res_b = await _reserve(admin_client, [dut_b["id"], switch["id"]], topo_b)
         reservations.append(res_b)
         deadline = asyncio.get_event_loop().time() + 60
         while asyncio.get_event_loop().time() < deadline:

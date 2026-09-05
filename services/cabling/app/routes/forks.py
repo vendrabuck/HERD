@@ -124,6 +124,7 @@ async def create_fork_internal(
         reservation_id=body.reservation_id,
         parent_topology_id=body.parent_topology_id,
         parent_version_id=body.parent_version_id,
+        member_device_ids=set(body.member_device_ids),
         created_by=body.created_by or "system",
     )
 
@@ -478,6 +479,7 @@ async def save_fork_internal(
         db,
         fork,
         canvas_data=body.canvas_data,
+        member_device_ids=set(body.member_device_ids),
         created_by=body.created_by or "system",
     )
 

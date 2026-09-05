@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+- Security fix: fork saves and activation snapshots now check the canvas's
+  endpoint devices against the reservation's membership (2026-09-04 review
+  sweep finding, security/HIGH). Since ADR 0009 phase 7 made the fork the sole
+  driver of provisioning, nothing compared a fork canvas's endpoint device ids
+  to the reservation's device set, so a user could name a foreign device as a
+  canvas node and drive real provisioning onto it. Cabling's `ForkCreate` and
+  the fork-save request now carry a required `member_device_ids`; `save_fork`
+  and `create_fork`'s activation snapshot both refuse (409
+  `fork_device_not_member`, naming the offending device ids) any canvas node
+  outside that set, checking endpoint devices only, never a resolved path's
+  transit devices or network element nodes. Reservations forwards its own
+  device set (materialized dynamic instances included) on every fork
+  create/save call and fails closed if that set cannot be read. Admins are not
+  exempt: PATCH-add is the way to bring a device into a reservation. A 409 on
+  activation is treated as definitive, not retried, and the expiration sweep's
+  missing-fork backstop stops re-attempting a reservation once refused. An
+  existing fork whose canvas already carries a non-member endpoint will 409 on
+  its next save; the detail names the offending devices so the owner can
+  PATCH-add or remove them.
+  Phase 2 (issue #701) moves the same check to the front door: cabling's
+  `POST /topologies/{id}/validate/internal` gains an additive `device_ids`
+  field (the canvas's device nodes), riding reservations' existing single call
+  to that endpoint at create/update time. Creating a reservation with a
+  `topology_id` whose canvas names a device outside `device_ids` now fails
+  fast with `422` (`topology_device_not_member`, naming the offending device
+  ids) before any row is written, and a PATCH that changes `device_ids` on a
+  topology-bound reservation re-runs the same check (`400`, same detail
+  shape), instead of the mismatch only surfacing later as a fork 409 on
+  activation.
 - Security: scheduled device-config apply jobs re-check the creator's
   authority at fire time instead of relying solely on the schedule-time
   gate (issue #704). A job with no `reservation_id` fired straight into

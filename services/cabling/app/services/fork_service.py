@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
 from app.models.topology import Topology, TopologyVersion
-from app.services.fork_save_service import resolve_canvas_wiring
+from app.services.fork_save_service import assert_endpoints_are_members, resolve_canvas_wiring
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,7 @@ async def create_fork(
     reservation_id: uuid.UUID,
     parent_topology_id: uuid.UUID | None,
     parent_version_id: uuid.UUID | None,
+    member_device_ids: set[uuid.UUID],
     created_by: str = "system",
 ) -> ReservationFork:
     """Create (or return the existing) fork for a reservation.
@@ -117,6 +118,14 @@ async def create_fork(
     created fork rather than building a second one. Deep-copies the pinned parent
     canvas, snapshots its relevant physical wiring into fork_connections, and
     writes fork_versions v1, all in one transaction.
+
+    ``member_device_ids`` is the reservation's device set (D2, the 2026-09-04 fork
+    endpoint-membership fix): ``assert_endpoints_are_members`` runs against the
+    forked canvas BEFORE the fork row is even added to the session, so a parent
+    canvas naming a foreign device raises 409 and writes no reservation_fork,
+    fork_connections, or fork_versions row. The idempotent early-return above skips
+    the check entirely: an existing fork was already validated (or predates this
+    check) and is not re-validated on a retried create.
     """
     existing = (
         await db.execute(
@@ -130,6 +139,7 @@ async def create_fork(
         db, parent_topology_id, parent_version_id
     )
     forked_canvas = None if parent_canvas is None else copy.deepcopy(parent_canvas)
+    assert_endpoints_are_members(forked_canvas, member_device_ids)
 
     fork = ReservationFork(
         reservation_id=reservation_id,

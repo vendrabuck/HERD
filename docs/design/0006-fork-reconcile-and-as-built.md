@@ -389,3 +389,113 @@ in `test_forks.py` is a source-level guard pinning that each of the four
 mutating routes actually passes `for_update=True`, closing the gap a live
 concurrency test alone would leave (it drives the loader directly and would
 keep passing even if a route's own call site regressed).
+
+## Amendment: endpoint-device membership enforcement (2026-09-04 review sweep)
+
+Decision 4's port-claim check is fork-versus-fork only: it stops one reservation
+from claiming a port another ACTIVE fork already holds, but it never compared a
+canvas's endpoint devices to the reservation that owns the fork at all. Since ADR
+0009 phase 7 made the fork the sole driver of provisioning, that gap meant a user
+could name a device they do not hold as a canvas node (`node_to_device_map`
+resolves it, `resolve_canvas_wiring` pathfinds from it over the entire connection
+graph, and nothing objected), and a resolved path through a driver-backed interior
+switch would drive real `connect_ports`/`add_to_vlan` calls onto that device.
+Before ADR 0009 phase 7 the reservation's own device set was the authorization
+boundary; the sink moved to the fork without carrying the constraint with it.
+
+The fix, membership is now an enforced invariant at both fork write entry points:
+
+- Cabling's `ForkCreate` (`POST /internal/forks`) and the save request
+  (`POST /internal/forks/{reservation_id}/save`) both gain a REQUIRED
+  `member_device_ids`. Required, not optional: a caller that omits it gets 422,
+  never a permissive create or save. Reservations is the only caller.
+- `assert_endpoints_are_members` (`fork_save_service.py`) computes
+  `node_to_device_map(canvas).values()` and raises 409
+  `{"error": "fork_device_not_member", "device_ids": [...]}` when any entry falls
+  outside `member_device_ids`. It runs in `save_fork` inside the `reconcile()`
+  closure, BEFORE Decision 4's port-claim check, so it re-runs on the
+  version-allocation retry path exactly like the port-claim query does; and in
+  `create_fork`, before the fork row is even added to the session, so a rejected
+  activation snapshot writes no `reservation_fork`, `fork_connections`, or
+  `fork_versions` row.
+- The check is endpoint-devices-only, by design, and deliberately asymmetric with
+  Decision 4's own reasoning: it NEVER inspects a resolved `WireSpec`'s hop
+  devices. Transit gear on a resolved path is legitimately outside the
+  reservation (an off-canvas patch panel, a shared core switch), exactly as
+  Decision 3's connection-driven reconcile always allowed; widening the check to
+  hop devices would break that legitimate case. A network element node
+  (`networkElementNode`, ADR 0012) is not a device at all: `node_to_device_map`
+  never includes one, so it is never checked, and a canvas node whose device id
+  fails to parse as a UUID is already dropped the same way.
+- Admins are NOT exempt. PATCH-add is the way to bring a device into a
+  reservation; an admin fork save naming a non-member endpoint gets the same 409.
+  An existing fork in the wild whose canvas already carries a non-member endpoint
+  (created before this fix) 409s on its next save; the detail names the
+  offending device ids so the owner can PATCH-add or remove them.
+- Reservations forwards `member_device_ids` from the reservation's own
+  `device_ids` association on every create/save call, which already includes
+  materialized dynamic instances (`apply_provision_result` appends those before
+  the fork-create call that follows). The loose canvas PUT, restore, prune, and
+  archive routes are unchanged: none of them resolve wiring, so none of them
+  need the check. Reservations fails closed too: the device list is read off an
+  already-loaded `Reservation` (a plain in-memory association proxy), so there is
+  no separate unreachable-dependency case to guard against.
+- Activation's fork-create is best-effort (`_create_reservation_fork_best_effort`,
+  Decision 3's phase-7 initial-provisioning path): a cabling 409 here
+  (`ForkMembershipRefused`) is treated as a DEFINITIVE refusal, not a transient
+  failure, so it is never retried the way a transport error or a 5xx is, and the
+  reservation stays ACTIVE with fork_id null exactly like the pre-existing
+  "fork creation failed" posture. The expiration sweep's missing-fork backstop
+  (`_backstop_missing_forks`) marks a refused reservation in a process-local set
+  and skips it on every later tick with no create call, rather than spending its
+  bounded give-up-counter retries (issue #448 item 1) on a conflict a retry
+  cannot resolve.
+
+Execution is unchanged: it keeps applying whatever intent cabling hands it. The
+guard belongs at the two places that write the intent, not at the consumer that
+already trusts it.
+
+## Amendment: early refusal at reservation create/update (issue #701 phase 2)
+
+The fork-write membership check above is the authorization boundary's last line:
+it fires only once a reservation already exists and something tries to fork or
+save wiring against it. Phase 2 moves the same check to the front door, on
+`create_reservation` and `update_reservation`'s device-set path, so a
+`topology_id` naming a device outside the booking never gets far enough to
+create a reservation, a fork, or any row at all.
+
+- Cabling's `POST /topologies/{id}/validate/internal` (already the create path's
+  one call to cabling, used since before this fix to reject unreachable canvas
+  edges) gains an additive `device_ids` field on `TopologyValidationResponse`:
+  the canvas's device node ids, deduplicated and sorted, computed from the same
+  node-to-device resolution `_run_topology_validation` already builds for its
+  edge walk. A dynamic placeholder or network element node never appears (`data`
+  carries no `device.id` for either), so neither is ever miscounted as a device.
+  The field defaults to an empty list rather than being required, so it is
+  purely additive to the contract.
+- Reservations' `_validate_topology_connectivity` (renamed in spirit, not in
+  name) now takes the caller's own device set alongside `topology_id`, and
+  compares it against the response's `device_ids` before looking at `valid`:
+  any canvas device outside the caller's set raises `TopologyDeviceNotMember`
+  (a `ValueError` subclass carrying the sorted offending ids), which the create
+  route maps to `422` and the update route to `400`, both with the pinned
+  `{"error": "topology_device_not_member", "device_ids": [...]}` detail. This
+  rides the existing single validate/internal round trip; it does not add a
+  second cabling call.
+- `create_reservation` checks against `data.device_ids` (the booking being
+  created); `update_reservation` checks against the NEW `data.device_ids` when
+  a PATCH changes the device set, mirroring the create-path check so PATCHing a
+  device out from under a topology-bound reservation cannot reopen the same
+  gap phase 1 closed at the fork.
+- Fail-closed is unchanged: an unreachable cabling service still raises
+  `RuntimeError` -> `503`, exactly as the pre-existing connectivity check does;
+  a 404 (topology deleted between selection and submit) is still treated as no
+  validation, not a hard failure, since there is no canvas left to check
+  membership against.
+- This is a genuine belt-and-suspenders pair, not a duplicate: phase 1 guards
+  every fork write (including a fork re-save against a topology whose canvas
+  changed after the reservation was created, which this create-time check
+  cannot see), while phase 2 guards the booking itself so the common case
+  (naming a foreign device at reserve time) is refused immediately with a
+  clearer, request-scoped error instead of surfacing later as a fork 409 on
+  activation.

@@ -232,8 +232,14 @@ async def _run_topology_validation(
     # and the fork-save resolver agree on which edges are element attachments.
     node_to_element = node_to_element_map(canvas)
 
+    # Issue #701: the canvas's device node ids, deduplicated and sorted, for
+    # reservations' create-time membership check. Computed from node_to_device so a
+    # dynamic placeholder or network element node (neither carries data.device.id)
+    # never appears here regardless of edge presence.
+    device_ids = sorted(set(node_to_device.values()))
+
     if not edges:
-        return TopologyValidationResponse(valid=True, invalid_edges=[])
+        return TopologyValidationResponse(valid=True, invalid_edges=[], device_ids=device_ids)
 
     # Scope the graph to the connected component(s) of the topology's devices.
     # Expansion still loads off-canvas intermediates (a patch panel that
@@ -329,7 +335,9 @@ async def _run_topology_validation(
             )
 
     invalid = [result for result in edge_results if result is not None]
-    return TopologyValidationResponse(valid=not invalid, invalid_edges=invalid)
+    return TopologyValidationResponse(
+        valid=not invalid, invalid_edges=invalid, device_ids=device_ids
+    )
 
 
 @router.post("/{topology_id}/validate/internal", response_model=TopologyValidationResponse)

@@ -8,12 +8,20 @@ from pydantic import BaseModel, Field
 
 
 class ForkCreate(BaseModel):
-    """Body for POST /internal/forks (fork-on-activation)."""
+    """Body for POST /internal/forks (fork-on-activation).
+
+    member_device_ids (2026-09-04 fork endpoint-membership fix) is the reservation's
+    device set, including materialized dynamic instances: the activation snapshot
+    refuses (409) a parent canvas whose endpoint devices fall outside this set.
+    Required, not optional, so a caller that omits it fails closed with 422 instead
+    of a permissive snapshot. Reservations is the only caller.
+    """
 
     reservation_id: uuid.UUID
     parent_topology_id: uuid.UUID | None = None
     parent_version_id: uuid.UUID | None = None
     created_by: str | None = None
+    member_device_ids: UUIDStrList
 
 
 class ForkCreateResponse(BaseModel):
@@ -130,10 +138,19 @@ class ForkCanvasUpdateResponse(BaseModel):
 
 
 class ForkSaveRequest(BaseModel):
-    """Body for POST /internal/forks/{reservation_id}/save (reconcile-on-save)."""
+    """Body for POST /internal/forks/{reservation_id}/save (reconcile-on-save).
+
+    member_device_ids (2026-09-04 fork endpoint-membership fix) is the reservation's
+    device set, including materialized dynamic instances: save_fork refuses (409) a
+    submitted canvas whose endpoint devices fall outside this set. Required, not
+    optional, so a caller that omits it fails closed with 422 instead of a
+    permissive save; admins get the same check (PATCH-add is the way to bring a
+    device into the reservation). Reservations is the only caller.
+    """
 
     canvas_data: dict[str, Any]
     created_by: str | None = None
+    member_device_ids: UUIDStrList
 
 
 class ForkConnectionDelta(BaseModel):

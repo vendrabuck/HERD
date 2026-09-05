@@ -226,12 +226,12 @@ async def _create_topology(client, canvas: dict) -> str:
     return topology_id
 
 
-async def _create_reservation(client, device_id: str, topology_id: str) -> dict:
+async def _create_reservation(client, device_ids: list[str], topology_id: str) -> dict:
     now = datetime.now(timezone.utc)
     resp = await client.post(
         "/reservations/",
         json={
-            "device_ids": [device_id],
+            "device_ids": device_ids,
             "topology_id": topology_id,
             "purpose": "L2/L3 result gating integration test (#393)",
             "start_time": now.isoformat(),
@@ -305,7 +305,9 @@ async def test_l2_add_to_vlan_result_failure_records_failed(
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
 
         failed_add = await _poll_runs(
             admin_client, reservation["id"], "add_to_vlan", status="FAILED"
@@ -349,7 +351,9 @@ async def test_l3_configure_route_result_failure_records_failed(
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
 
         failed_runs = await _poll_runs(
             admin_client, reservation["id"], "configure_route", status="FAILED"
@@ -397,7 +401,9 @@ async def test_l3_remove_route_result_failure_keeps_pin_and_acks(
         topology_id = await _create_topology(
             admin_client, _canvas_edge(fresh_device["id"], switch["id"])
         )
-        reservation = await _create_reservation(admin_client, fresh_device["id"], topology_id)
+        reservation = await _create_reservation(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
 
         assert await _poll_runs(
             admin_client, reservation["id"], "configure_route", status="SUCCESS"

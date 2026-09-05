@@ -106,12 +106,12 @@ const RESERVATION = {
   created_at: "2026-05-01T00:00:00Z",
 };
 
-function baseHandlers(fork: Record<string, unknown>) {
+function baseHandlers(fork: Record<string, unknown>, reservation: Record<string, unknown> = RESERVATION) {
   return [
     http.get(`/api/reservations/${RES_ID}/fork`, () => HttpResponse.json(fork)),
     http.get(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
     http.get("/api/reservations/", () =>
-      HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 500 }),
+      HttpResponse.json({ items: [reservation], total: 1, skip: 0, limit: 500 }),
     ),
     http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
   ];
@@ -201,6 +201,138 @@ describe("TopologyEditorPage live-edit fork mode", () => {
     expect(parentPutHit).toBe(false);
     // The save result is surfaced as a toast.
     await waitFor(() => expect(toastCustom).toHaveBeenCalled());
+  });
+
+  it("PATCH-adds a newly drawn device to the reservation BEFORE saving the fork (issue #701)", async () => {
+    // d-new is on the canvas but not yet in the reservation's device_ids: the
+    // membership check on save would 409 unless the device joins the
+    // reservation first.
+    const calls: string[] = [];
+    const patchBodies: unknown[] = [];
+    let patchCount = 0;
+
+    server.use(
+      ...baseHandlers(
+        makeFork({
+          canvas_data: {
+            nodes: [forkNode("fork-node", "d-fork"), forkNode("new-node", "d-new")],
+            edges: [],
+            selectedEdgeLayer: "L2",
+          },
+        }),
+      ),
+      http.patch(`/api/reservations/${RES_ID}`, async ({ request }) => {
+        calls.push("patch");
+        patchCount += 1;
+        patchBodies.push(await request.json());
+        return HttpResponse.json(RESERVATION);
+      }),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () => {
+        calls.push("save");
+        return HttpResponse.json({
+          fork_id: "fork-1",
+          version_number: 2,
+          released: [],
+          built: [],
+          unchanged_count: 0,
+        });
+      }),
+    );
+
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("new-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() => expect(calls).toEqual(["patch", "save"]));
+    const body = patchBodies[0] as { device_ids: string[] };
+    expect(new Set(body.device_ids)).toEqual(new Set(["d-fork", "d-new"]));
+
+    // Nothing was removed, so the pre-save add already left the reservation's
+    // device set at exactly the canvas's: no redundant settle-PATCH after save.
+    await waitFor(() => expect(toastCustom).toHaveBeenCalled());
+    expect(patchCount).toBe(1);
+  });
+
+  it("a failed device-set PATCH blocks the fork save entirely (issue #701)", async () => {
+    let forkSaveHit = false;
+
+    server.use(
+      ...baseHandlers(
+        makeFork({
+          canvas_data: {
+            nodes: [forkNode("fork-node", "d-fork"), forkNode("new-node", "d-new")],
+            edges: [],
+            selectedEdgeLayer: "L2",
+          },
+        }),
+      ),
+      http.patch(`/api/reservations/${RES_ID}`, () =>
+        HttpResponse.json({ detail: "Cannot add device to a full reservation" }, { status: 409 }),
+      ),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () => {
+        forkSaveHit = true;
+        return HttpResponse.json({});
+      }),
+    );
+
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("new-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Cannot add device to a full reservation"),
+    );
+    // The fork save must never be attempted once the device-set PATCH failed:
+    // saving now would still 409 on membership.
+    expect(forkSaveHit).toBe(false);
+  });
+
+  it("PATCH-removes a device from the reservation only AFTER the fork save succeeds (issue #701)", async () => {
+    // The reservation still holds d-other, but it has been removed from the
+    // canvas: the prune semantics require the settle-PATCH to run after the
+    // save, never before, since it prunes wiring off the SAVED intended set.
+    const calls: string[] = [];
+    const patchBodies: unknown[] = [];
+    let patchCount = 0;
+    const reservationWithExtraDevice = { ...RESERVATION, device_ids: ["d-fork", "d-other"] };
+
+    server.use(
+      ...baseHandlers(makeFork(), reservationWithExtraDevice),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () => {
+        calls.push("save");
+        return HttpResponse.json({
+          fork_id: "fork-1",
+          version_number: 2,
+          released: [],
+          built: [],
+          unchanged_count: 0,
+        });
+      }),
+      http.patch(`/api/reservations/${RES_ID}`, async ({ request }) => {
+        calls.push("patch");
+        patchCount += 1;
+        patchBodies.push(await request.json());
+        return HttpResponse.json(reservationWithExtraDevice);
+      }),
+    );
+
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() => expect(calls).toEqual(["save", "patch"]));
+    const body = patchBodies[0] as { device_ids: string[] };
+    expect(body.device_ids).toEqual(["d-fork"]);
+    expect(patchCount).toBe(1);
   });
 
   it("renders read-only when the fork is archived (ended reservation as-built)", async () => {
@@ -475,6 +607,33 @@ describe("TopologyEditorPage handleCommitToReservation error branches", () => {
     fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
 
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("Fork is not ACTIVE"));
+  });
+
+  it("a fork_device_not_member 409 names the offending devices in plain words (issue #701)", async () => {
+    // The canvas only names d-fork, already a reservation member, so this
+    // pins the save-time refusal (a device the PATCH could not add, or a
+    // race with a concurrent removal), not the pre-save PATCH path.
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json(
+          { detail: { error: "fork_device_not_member", device_ids: ["d-x", "d-y"] } },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "These devices are not part of the reservation: d-x, d-y",
+      ),
+    );
   });
 
   it("a transport failure with no detail falls back to the default save-failed message", async () => {

@@ -7,7 +7,7 @@ imports (_cabling_fork_call, _lazy_create_reservation_fork), so no cabling stack
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import httpx
 import pytest
@@ -132,7 +132,7 @@ async def test_get_fork_lazy_creates_on_active_miss():
             resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 200
     assert resp.json() == created_body
-    lazy.assert_awaited_once_with(rid, topo, OWNER_ID)
+    lazy.assert_awaited_once_with(rid, topo, OWNER_ID, ANY)
     assert call.await_count == 2
 
 
@@ -149,7 +149,7 @@ async def test_get_fork_lazy_creates_with_no_parent_topology():
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 200
-    lazy.assert_awaited_once_with(rid, None, OWNER_ID)
+    lazy.assert_awaited_once_with(rid, None, OWNER_ID, ANY)
 
 
 @pytest.mark.asyncio
@@ -271,6 +271,9 @@ async def test_put_canvas_cabling_unreachable_503():
 @pytest.mark.asyncio
 async def test_save_active_forwards_and_stamps_created_by():
     rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
+    async with TestSessionLocal() as db:
+        reservation = await db.get(Reservation, rid)
+        member_device_ids = [str(d) for d in reservation.device_ids]
     result = {"fork_id": str(uuid.uuid4()), "version_number": 2, "released": [], "built": []}
     with patch(
         "app.routers.reservations._cabling_fork_call",
@@ -282,7 +285,11 @@ async def test_save_active_forwards_and_stamps_created_by():
     call.assert_awaited_once_with(
         "POST",
         f"/internal/forks/{rid}/save",
-        json_body={"canvas_data": {"nodes": []}, "created_by": OWNER_ID},
+        json_body={
+            "canvas_data": {"nodes": []},
+            "created_by": OWNER_ID,
+            "member_device_ids": member_device_ids,
+        },
     )
 
 
@@ -314,6 +321,28 @@ async def test_save_port_conflict_409_structured_passthrough():
             resp = await ac.post(f"/{rid}/fork/save", json={"canvas_data": {}})
     assert resp.status_code == 409
     # The structured detail dict is relayed verbatim, not stringified.
+    assert resp.json()["detail"] == structured["detail"]
+
+
+@pytest.mark.asyncio
+async def test_save_membership_refused_409_structured_passthrough():
+    """Cabling's endpoint-membership 409 (D2/D3 of the 2026-09-04 fix) relays to the
+    user exactly like the other structured save 409s: same passthrough mechanism,
+    proving the new error shape needs no special-casing on the reservations side."""
+    rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
+    structured = {
+        "detail": {
+            "error": "fork_device_not_member",
+            "device_ids": [str(uuid.uuid4())],
+        }
+    }
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(return_value=_resp(409, structured)),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.post(f"/{rid}/fork/save", json={"canvas_data": {}})
+    assert resp.status_code == 409
     assert resp.json()["detail"] == structured["detail"]
 
 
