@@ -105,7 +105,7 @@ async def test_non_admin_connections_filtered_to_visible_devices(
     The "visible" connection must pair two devices sharing a device group, or
     cabling's group-boundary check (test_same_group_cabling_allowed) rejects
     it with 422, so a second device is added to visible_fresh_device's own
-    group rather than pairing it with an invisible "No Pool" device. Three
+    group rather than pairing it with an invisible "No Pool" device. Two
     connections are created: one between the two same-group visible devices
     (should appear for the non-admin), and one between the two invisible
     devices, who share "No Pool" (should be absent for the non-admin, present
