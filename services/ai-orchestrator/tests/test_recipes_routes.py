@@ -19,8 +19,8 @@ import pytest
 from app import config as config_module
 from app.database import Base, engine
 from app.main import app
-from app.routes.recipes import RECIPE_AUTHORING_DISABLED_DETAIL
-from app.services.ai_client import AI_NOT_CONFIGURED_DETAIL, get_ai_client
+from app.routes.recipes import RECIPE_AUTHORING_DISABLED_DETAIL, RECIPE_DRAFT_AI_FAILED_DETAIL
+from app.services.ai_client import AI_NOT_CONFIGURED_DETAIL, AIError, get_ai_client
 from app.services.llm_provider import Usage
 from app.services.recipe_author import RECIPE_VALIDATOR_UNREACHABLE_DETAIL, RecipeAuthorError
 from httpx import ASGITransport, AsyncClient
@@ -139,6 +139,31 @@ async def test_unconfigured_503_pinned(async_client, monkeypatch):
         resp = await client.post("/recipes/draft", json=BODY, headers=_headers("admin"))
     assert resp.status_code == 503
     assert resp.json()["detail"] == AI_NOT_CONFIGURED_DETAIL
+
+
+# --- provider failure (issue #713) ---
+
+
+async def test_draft_502_on_ai_error_never_leaks_provider_text(async_client, caplog):
+    """AIError from the drafting call maps to 502 with the pinned detail; the
+    provider's text is logged with traceback, never returned."""
+    secret = "upstream 500: body mentions host=db-internal user=herd"
+
+    class RaisingAI:
+        async def draft_recipe(self, **kwargs):
+            raise AIError(secret)
+
+    app.dependency_overrides[get_ai_client] = lambda: RaisingAI()
+    with caplog.at_level("ERROR", logger="app.routes.recipes"):
+        async with async_client as client:
+            resp = await client.post("/recipes/draft", json=BODY, headers=_headers("admin"))
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == RECIPE_DRAFT_AI_FAILED_DETAIL
+    assert "db-internal" not in resp.text
+    logged = [r for r in caplog.records if r.getMessage() == "ai_recipe_drafting_failed"]
+    assert len(logged) == 1
+    assert logged[0].exc_info is not None
+    assert str(logged[0].exc_info[1]) == secret
 
 
 # --- draft happy path ---

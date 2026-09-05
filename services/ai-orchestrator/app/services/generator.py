@@ -18,6 +18,13 @@ from app.services.llm_provider import Usage
 
 logger = logging.getLogger(__name__)
 
+# Pinned 502 details for provider failures (issue #713). Never interpolate
+# the exception: app/main.py states the rule that a provider message never
+# leaves the service, and generator.py catches bare Exception, so the text
+# could be anything.
+AI_NO_USABLE_RESPONSE_DETAIL = "AI returned no usable response"
+AI_CALL_FAILED_DETAIL = "AI call failed"
+
 
 class GeneratorError(Exception):
     """Raised for validation failures the caller should surface as 4xx/5xx."""
@@ -85,11 +92,15 @@ async def generate_topology(
             logger.warning("ai_provider_unreachable: %s", e)
             raise GeneratorError(503, AI_PROVIDER_UNREACHABLE_DETAIL) from e
         except AIError as e:
+            # Fixed detail (issue #713): the provider's status/body text stays
+            # in the server log; a client never sees it (CWE-209).
             logger.exception("ai_error")
-            raise GeneratorError(502, f"AI returned no usable response: {e}") from e
+            raise GeneratorError(502, AI_NO_USABLE_RESPONSE_DETAIL) from e
         except Exception as e:  # network / rate-limit / auth errors from the SDK
+            # Bare Exception: arbitrary internal exception text, so the same
+            # rule applies with even more force.
             logger.exception("ai_call_failed")
-            raise GeneratorError(502, f"AI call failed: {e}") from e
+            raise GeneratorError(502, AI_CALL_FAILED_DETAIL) from e
 
         try:
             candidate = GenerateResponse.model_validate(raw)
