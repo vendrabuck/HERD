@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+- Security fix: the cross-reservation port-claim check (ADR 0006 Decision 4)
+  is now an actual invariant instead of a save-boundary guard (2026-09-04
+  review sweep finding, issue #721). Two gaps: `save_fork`'s claim check was a
+  plain SELECT against other ACTIVE forks' committed rows, and the engine
+  runs at Postgres default READ COMMITTED, so two concurrent saves on two
+  different forks each ran that SELECT against the other's still-uncommitted
+  insert, textbook write skew, with `uq_fork_connections_endpoints` scoped
+  per-fork so nothing failed at commit either; the version-allocation retry
+  loop named as the mitigation only ever serializes a same-fork version
+  collision, which the claim check excludes by construction, so it never
+  closed this window. Separately, `fork_service.create_fork`'s activation
+  snapshot never ran the claim check at all, so two reservations forking the
+  same topology, or two topologies sharing a trunk, could both materialize
+  the same physical hops with zero concurrency involved. `save_fork` and
+  `create_fork` now both call the new `fork_save_service.lock_port_claims`
+  immediately before the claim check: a transaction-scoped Postgres advisory
+  lock (`herd_common.advisory_lock.xact_lock`) over the sorted, canonical
+  `forkport:{device_id}:{port}` keys of every claimed endpoint, keyed via
+  `advisory_key_from_string` exactly like reservations'
+  `_acquire_device_locks`. The second writer blocks until the first's
+  transaction commits or rolls back, so its own claim check then reads the
+  winner's committed rows and 409s correctly; the lock self-gates to a no-op
+  on SQLite. Reservations' `ForkMembershipRefused` is generalized from the
+  endpoint-membership 409 shape alone to any 409 cabling's fork-create route
+  returns, so a port-claim conflict at activation gets the same definitive,
+  not-retried treatment (WARNING logged, reservation stays ACTIVE unwired,
+  expiration-sweep backstop skips it) that a foreign-device refusal already
+  got. Documented in the ADR 0006 amendment; proved live against Postgres in
+  `services/cabling/tests/test_fork_port_claim_race_live_pg.py`
+  (`_gate-pg-live-tests`), confirmed to fail on main without the lock.
+
 - Security fix: fork saves and activation snapshots now check the canvas's
   endpoint devices against the reservation's membership (2026-09-04 review
   sweep finding, security/HIGH). Since ADR 0009 phase 7 made the fork the sole

@@ -591,12 +591,13 @@ _gate-ldap-tests:
 # (so port 5433 unambiguously belongs to the gate's postgres) before either
 # gate boots. HERD_TEST_PG_REQUIRED=1 turns "Postgres unreachable" into a
 # hard failure instead of the tests' normal skip, matching _gate-ldap-tests'
-# HERD_TEST_LDAP_REQUIRED=1 discipline. The cabling suite added for issue #626
-# (the fork row lock) is the one exception to "any reachable Postgres works":
-# it exercises the real cabling.reservation_fork/fork_versions tables, so it
-# needs the gate's ALREADY-MIGRATED schema, not a throwaway server; it creates
-# one throwaway fork row per test (a random reservation_id) and deletes it in
-# a finally, so it leaves the gate's seeded data untouched.
+# HERD_TEST_LDAP_REQUIRED=1 discipline. The cabling suites added for issue #626
+# (the fork row lock) and issue #721 (the fork port-claim lock) are the
+# exception to "any reachable Postgres works": they exercise the real
+# cabling.reservation_fork/fork_versions/fork_connections/connections tables, so
+# they need the gate's ALREADY-MIGRATED schema, not a throwaway server; each
+# creates a few throwaway rows per test (random ids) and deletes them in a
+# finally, so they leave the gate's seeded data untouched.
 _gate-pg-live-tests:
 	@pguser=$$(grep -E '^POSTGRES_USER=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
 	pgpass=$$(grep -E '^POSTGRES_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
@@ -612,7 +613,9 @@ _gate-pg-live-tests:
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_outbox_wake_live_pg.py -v) && \
 	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
-		uv run pytest tests/test_fork_restore_save_race_live_pg.py -v)
+		uv run pytest tests/test_fork_restore_save_race_live_pg.py -v) && \
+	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_fork_port_claim_race_live_pg.py -v)
 
 # Gate phase used by master and everything, run after test-e2e (issue #572):
 # proves the STACK, not just the directory, can authenticate against LDAP.

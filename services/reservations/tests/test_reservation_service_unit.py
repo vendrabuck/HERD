@@ -1768,6 +1768,40 @@ async def test_create_reservation_fork_raises_on_4xx():
 
 
 @pytest.mark.asyncio
+async def test_create_reservation_fork_raises_membership_refused_on_any_409():
+    """Issue #721: ANY 409 from cabling's fork-create route raises
+    ForkMembershipRefused now, not just the fork_device_not_member shape. A
+    cross-reservation port-claim conflict (ADR 0006 Decision 4's activation-path
+    check) carries no device_ids at all, so device_ids comes back empty, but the
+    raw detail body is still carried on the exception for the caller to log."""
+    conflict_detail = {
+        "message": "One or more ports are already claimed by another active reservation",
+        "conflicts": [
+            {"reservation_id": str(uuid.uuid4()), "device_id": str(uuid.uuid4()), "port": "eth5"}
+        ],
+    }
+    mock_resp = MagicMock()
+    mock_resp.status_code = 409
+    mock_resp.json.return_value = {"detail": conflict_detail}
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("app.services.reservation_service.settings") as mock_settings,
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cabling:8000"
+        with pytest.raises(ForkMembershipRefused) as excinfo:
+            await _create_reservation_fork(uuid.uuid4(), uuid.uuid4())
+
+    assert excinfo.value.device_ids == []
+    assert excinfo.value.detail == conflict_detail
+
+
+@pytest.mark.asyncio
 async def test_fork_best_effort_swallows_exhausted_retries():
     """A fork-create that fails every retry is logged and swallowed: it must NOT
     raise out and strand the provisioned reservation."""
@@ -1808,6 +1842,43 @@ async def test_fork_best_effort_membership_refused_is_not_retried(caplog):
     ]
     assert len(warning_records) == 1
     assert warning_records[0].device_ids == refused_ids
+    assert is_fork_membership_refused(reservation_id) is True
+    _fork_membership_refused.discard(reservation_id)
+
+
+@pytest.mark.asyncio
+async def test_fork_best_effort_port_claim_409_is_not_retried(caplog):
+    """Issue #721: a cross-reservation port-claim 409 (no device_ids, just a
+    conflicts list) gets EXACTLY the same definitive treatment as the
+    fork_device_not_member shape above: no retry, a WARNING logged, no fork
+    created, the reservation marked so the backstop will not retry it either, and
+    True returned (a settled outcome, not the retry-exhausted failure). This is
+    the generalization the class docstring and issue #721 describe: any 409 from
+    fork-create is definitive, not just the membership one."""
+    conflict_detail = {
+        "message": "One or more ports are already claimed by another active reservation",
+        "conflicts": [
+            {"reservation_id": str(uuid.uuid4()), "device_id": str(uuid.uuid4()), "port": "eth5"}
+        ],
+    }
+    mock_create = AsyncMock(side_effect=ForkMembershipRefused([], conflict_detail))
+    reservation_id = uuid.uuid4()
+    with (
+        patch("app.services.reservation_service._create_reservation_fork", new=mock_create),
+        caplog.at_level("WARNING", logger="app.services.reservation_service"),
+    ):
+        result = await _create_reservation_fork_best_effort(reservation_id, uuid.uuid4())
+
+    assert result is True
+    mock_create.assert_awaited_once()
+    warning_records = [
+        r
+        for r in caplog.records
+        if getattr(r, "action", None) == "reservation_fork_membership_refused"
+    ]
+    assert len(warning_records) == 1
+    assert warning_records[0].device_ids == []
+    assert warning_records[0].detail == conflict_detail
     assert is_fork_membership_refused(reservation_id) is True
     _fork_membership_refused.discard(reservation_id)
 
