@@ -11,6 +11,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import func, select
@@ -34,9 +35,96 @@ from app.services.manage_guard import _is_admin, _user_can_manage_device
 
 APPLY_JOBS_SUMMARY_NAME_CAP = 20
 
+# Pinned (issue #704): tests match on this exact string.
+RESERVATION_MISMATCH_ERROR = (
+    "reservation_id must reference an active reservation you own that includes this device"
+)
+_RESERVATIONS_HTTP_TIMEOUT_SECONDS = 5.0
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["apply-jobs"])
+
+
+async def _validate_reservation_for_job(
+    *, reservation_id: uuid.UUID, user_id: uuid.UUID, device_id: uuid.UUID
+) -> None:
+    """Validate a caller-supplied reservation_id at schedule time (issue #704).
+
+    Must be an ACTIVE reservation owned by the caller that contains the
+    device. reservations' GET /internal/{id} (ReservationInternalStatus) is
+    deliberately minimal ("No PII; no device list", per its own docstring):
+    it has no owner or device_ids field, so it alone cannot answer ownership
+    or containment. This combines two internal calls instead:
+
+    1. GET /internal/{reservation_id}: the id exists and is currently
+       ACTIVE. A 404 or an inactive reservation is a 422.
+    2. GET /internal/active?user_id=&device_id=: the caller owns AT LEAST
+       ONE active reservation containing this device. This is the same
+       check herd_common.acl's reservation-owner free pass already uses
+       elsewhere; it is not itself scoped to reservation_id (that endpoint
+       returns no id to match against).
+
+    Together these are the closest available proxy for "reservation_id IS
+    an active reservation owned by the caller containing the device", but
+    not a airtight one: a caller holding two concurrent active
+    reservations, one containing the device and one not, could in
+    principle pass the id of the wrong one and still clear both checks.
+    Closing that gap would mean widening ReservationInternalStatus with an
+    owner/device_ids field, which is reservations' service boundary and out
+    of scope for this change (another lane owns that service). Fails
+    closed (503) if reservations is unreachable or answers with anything
+    other than a clean 200/404.
+    """
+    if not settings.internal_api_token:
+        raise HTTPException(status_code=503, detail="reservations service unreachable")
+    base = settings.reservations_service_url.rstrip("/")
+    headers = {"X-Internal-Token": settings.internal_api_token}
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(
+                f"{base}/internal/{reservation_id}",
+                headers=headers,
+                timeout=_RESERVATIONS_HTTP_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(
+                status_code=503, detail="reservations service unreachable"
+            ) from None
+        if resp.status_code == 404:
+            raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=503, detail="reservations service unreachable")
+        try:
+            status_data = resp.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=503, detail="reservations service unreachable"
+            ) from None
+        if not status_data.get("is_active"):
+            raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
+
+        try:
+            active_resp = await client.get(
+                f"{base}/internal/active",
+                params={"user_id": str(user_id), "device_id": str(device_id)},
+                headers=headers,
+                timeout=_RESERVATIONS_HTTP_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError:
+            raise HTTPException(
+                status_code=503, detail="reservations service unreachable"
+            ) from None
+        if active_resp.status_code != 200:
+            raise HTTPException(status_code=503, detail="reservations service unreachable")
+        try:
+            active_data = active_resp.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=503, detail="reservations service unreachable"
+            ) from None
+        if not active_data.get("owns_active"):
+            raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
 
 
 @router.post(
@@ -66,6 +154,20 @@ async def schedule_apply_job(
             detail="scheduled_for must be in the future",
         )
 
+    # Horizon guard (issue #704): an unbounded scheduling window lets a job
+    # sit queued far longer than any reservation window or ACL grant is
+    # likely to still be valid by fire time, widening the gap the fire-time
+    # authority re-check has to cover.
+    max_horizon = timedelta(days=settings.apply_job_max_horizon_days)
+    if scheduled_for > now + max_horizon:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"scheduled_for must be within {settings.apply_job_max_horizon_days} "
+                "days from now"
+            ),
+        )
+
     device = await db.get(Device, device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -93,6 +195,19 @@ async def schedule_apply_job(
                     "manage permission required on this device (or active reservation ownership)"
                 ),
             )
+
+    # Reservation-id validation (issue #704): an optional reservation_id must
+    # actually be an active reservation the caller owns that contains this
+    # device. Without this, any caller could attach an arbitrary or foreign
+    # reservation_id (or one that never covered this device) to a job,
+    # which the fire-time reservation-active check would then treat as
+    # legitimate cover.
+    if body.reservation_id is not None:
+        await _validate_reservation_for_job(
+            reservation_id=body.reservation_id,
+            user_id=uuid.UUID(payload["sub"]),
+            device_id=device_id,
+        )
 
     # Dry-run gate: drivers must opt in via driver_metadata.json. Without this
     # check, scheduling a dry-run against an older driver that ignores

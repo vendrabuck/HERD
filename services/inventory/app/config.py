@@ -15,6 +15,11 @@ class Settings(HerdBaseSettings):
     secrets_service_url: str = "http://secrets:8000"
     apply_scheduler_interval_seconds: int = 30
     apply_scheduler_enabled: bool = True
+    # How far into the future a config-apply job may be scheduled (issue
+    # #704). Unbounded scheduling let a job sit queued far longer than any
+    # reservation window or ACL grant is likely to remain valid, widening
+    # the gap the fire-time authority re-check has to cover.
+    apply_job_max_horizon_days: int = 30
     minio_endpoint: str = ""
     minio_access_key: str = ""
     minio_secret_key: str = ""

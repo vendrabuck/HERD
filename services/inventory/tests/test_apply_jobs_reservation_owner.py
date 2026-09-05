@@ -15,10 +15,13 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.config import settings
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
+from app.models.device_config_apply_job import DeviceConfigApplyJob
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -203,4 +206,222 @@ async def test_reservation_owner_can_create_config_version(admin_client):
                 f"/devices/{device_id}/config-versions",
                 json={"config": {"vlan": 200}, "description": "AI proposal"},
             )
+    assert resp.status_code == 201, resp.text
+
+
+# --- reservation_id schedule-time validation (issue #704) -------------------
+
+
+class _FakeResp:
+    def __init__(self, status_code: int, body: dict | None = None):
+        self.status_code = status_code
+        self._body = body or {}
+
+    def json(self):
+        return self._body
+
+
+class _FakeReservationsAsyncClient:
+    """Stand-in for httpx.AsyncClient, routing GETs by a substring match on URL."""
+
+    def __init__(self, get_responses: dict[str, _FakeResp]):
+        self._get = get_responses
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def get(self, url, headers=None, params=None, timeout=None):
+        for key, resp in self._get.items():
+            if key in url:
+                return resp
+        return _FakeResp(404, {})
+
+
+async def _apply_job_row_count() -> int:
+    async with TestSessionLocal() as session:
+        return (
+            await session.execute(select(func.count()).select_from(DeviceConfigApplyJob))
+        ).scalar() or 0
+
+
+@pytest.mark.asyncio
+async def test_foreign_reservation_id_returns_422_and_writes_no_row(admin_client, monkeypatch):
+    """Spec #704 test (5): a reservation_id the caller does not own (or that
+    does not exist) returns 422 and the job row is never written."""
+    device_id, version_id = await _seed_device(admin_client)
+    foreign_reservation_id = uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.settings.internal_api_token", "token", raising=False
+    )
+    fake_client = _FakeReservationsAsyncClient(
+        get_responses={str(foreign_reservation_id): _FakeResp(404, {})}
+    )
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
+    )
+
+    assert await _apply_job_row_count() == 0
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={
+            "scheduled_for": _future_iso(),
+            "reservation_id": str(foreign_reservation_id),
+        },
+    )
+    assert resp.status_code == 422
+    assert "reservation_id" in resp.json()["detail"]
+    assert await _apply_job_row_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_reservation_id_inactive_returns_422_and_writes_no_row(admin_client, monkeypatch):
+    """The reservation exists but is not currently active -> 422, no row."""
+    device_id, version_id = await _seed_device(admin_client)
+    reservation_id = uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.settings.internal_api_token", "token", raising=False
+    )
+    fake_client = _FakeReservationsAsyncClient(
+        get_responses={
+            str(reservation_id): _FakeResp(200, {"id": str(reservation_id), "is_active": False}),
+        }
+    )
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
+    )
+
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={"scheduled_for": _future_iso(), "reservation_id": str(reservation_id)},
+    )
+    assert resp.status_code == 422
+    assert await _apply_job_row_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_reservation_id_active_but_not_owned_by_caller_returns_422(
+    admin_client, monkeypatch
+):
+    """The reservation is active, but the caller does not own an active
+    reservation containing this device -> 422, no row."""
+    device_id, version_id = await _seed_device(admin_client)
+    reservation_id = uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.settings.internal_api_token", "token", raising=False
+    )
+    fake_client = _FakeReservationsAsyncClient(
+        get_responses={
+            str(reservation_id): _FakeResp(200, {"id": str(reservation_id), "is_active": True}),
+            "/internal/active": _FakeResp(200, {"owns_active": False}),
+        }
+    )
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
+    )
+
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={"scheduled_for": _future_iso(), "reservation_id": str(reservation_id)},
+    )
+    assert resp.status_code == 422
+    assert await _apply_job_row_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_reservation_id_valid_and_owned_schedules_successfully(admin_client, monkeypatch):
+    """Positive control: an active reservation the caller owns, containing
+    the device, is accepted."""
+    device_id, version_id = await _seed_device(admin_client)
+    reservation_id = uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.settings.internal_api_token", "token", raising=False
+    )
+    fake_client = _FakeReservationsAsyncClient(
+        get_responses={
+            str(reservation_id): _FakeResp(200, {"id": str(reservation_id), "is_active": True}),
+            "/internal/active": _FakeResp(200, {"owns_active": True}),
+        }
+    )
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
+    )
+
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={"scheduled_for": _future_iso(), "reservation_id": str(reservation_id)},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["reservation_id"] == str(reservation_id)
+
+
+@pytest.mark.asyncio
+async def test_reservation_id_validation_fails_closed_when_unreachable(admin_client, monkeypatch):
+    """Reservations unreachable -> 503, fail closed, no row written."""
+    device_id, version_id = await _seed_device(admin_client)
+    reservation_id = uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.settings.internal_api_token", "token", raising=False
+    )
+
+    class _RaisingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, headers=None, params=None, timeout=None):
+            import httpx
+
+            raise httpx.ConnectError("reservations down")
+
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: _RaisingClient()
+    )
+
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={"scheduled_for": _future_iso(), "reservation_id": str(reservation_id)},
+    )
+    assert resp.status_code == 503
+    assert await _apply_job_row_count() == 0
+
+
+# --- scheduled_for horizon bound (issue #704) --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scheduled_for_beyond_horizon_returns_422(admin_client):
+    """Spec #704 test (6): horizon plus one second is rejected."""
+    device_id, version_id = await _seed_device(admin_client)
+    max_days = settings.apply_job_max_horizon_days
+    too_far = (datetime.now(timezone.utc) + timedelta(days=max_days, seconds=1)).isoformat()
+
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={"scheduled_for": too_far},
+    )
+    assert resp.status_code == 422
+    assert str(max_days) in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_for_just_within_horizon_returns_201(admin_client):
+    """Spec #704 test (6): horizon minus one second is accepted."""
+    device_id, version_id = await _seed_device(admin_client)
+    max_days = settings.apply_job_max_horizon_days
+    just_within = (datetime.now(timezone.utc) + timedelta(days=max_days, seconds=-1)).isoformat()
+
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={"scheduled_for": just_within},
+    )
     assert resp.status_code == 201, resp.text
