@@ -20,6 +20,7 @@ from app.main import app
 from app.routes.purpose_classification import (
     AI_CLASSIFICATION_FAILED_DETAIL,
     PURPOSE_CLASSIFICATION_DISABLED_DETAIL,
+    PURPOSE_CLASSIFICATION_DISABLED_MARKER,
 )
 from app.schemas.purpose import (
     CATEGORIES_MAX_LENGTH,
@@ -177,7 +178,34 @@ async def test_internal_403_wrong_token(async_client):
             headers={"X-Internal-Token": "wrong"},
         )
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "Invalid internal token"
+    detail = resp.json()["detail"]
+    assert detail == "Invalid internal token"
+    # Issue #706: this 403 must NOT carry the flag-off marker, so the
+    # reservations-service reconciler never mistakes a bad internal token for
+    # the feature being off.
+    assert not (
+        isinstance(detail, dict) and detail.get("error") == PURPOSE_CLASSIFICATION_DISABLED_MARKER
+    )
+
+
+@pytest.mark.asyncio
+async def test_flag_off_403_detail_carries_structured_marker(async_client, monkeypatch):
+    """Issue #706: the flag-off 403 is a structured {"error": ...} body, not a
+    bare string, so a caller can tell it apart from any other 403 this route
+    can answer (an internal-token mismatch on the internal route).
+    """
+    monkeypatch.setattr(config_module.settings, "ai_purpose_classification_enabled", False)
+    _stub_ai()
+    async with async_client as client:
+        resp = await client.post(
+            "/internal/classify-purpose",
+            json=INTERNAL_BODY,
+            headers={"X-Internal-Token": "internal-secret"},
+        )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["error"] == PURPOSE_CLASSIFICATION_DISABLED_MARKER
+    assert detail["message"] == "Purpose classification is disabled"
 
 
 @pytest.mark.asyncio
@@ -419,6 +447,10 @@ async def test_internal_over_quota_429_never_awaits_gatherer(async_client, monke
             headers={"X-Internal-Token": "internal-secret"},
         )
     assert resp.status_code == 429, resp.text
+    # Pin the 429 shape (issue #706): the reservations-service reconciler
+    # treats any 429 from this route as transient without reading the body,
+    # but the shape itself is still a contract usage_repo.enforce_quota owns.
+    assert set(resp.json()["detail"].keys()) == {"limit", "used", "remaining", "reset_at"}
     gather.assert_not_awaited()
     assert stub.calls == []
 

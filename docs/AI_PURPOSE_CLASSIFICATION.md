@@ -42,9 +42,14 @@ an owner pick (ADR 0013 point 10), not an AI suggestion.
 
 ### `POST /api/ai/internal/classify-purpose` (end-of-reservation pass)
 
-Called by the reservations service's expiration-sweep reconciler once a
+Called by the reservations service's purpose-classify reconciler once a
 reservation reaches a terminal state, authenticated with `X-Internal-Token`
-(no user JWT: this is a background job). Body:
+(no user JWT: this is a background job). Since issue #702 this reconciler
+runs on its own loop (`PURPOSE_CLASSIFY_INTERVAL_SECONDS`, see
+`docs/ENV_VARS.md`), separate from the reservations expiration sweep: it is
+the only reconciler bound by an LLM call rather than a DB or fast HTTP round
+trip, so it no longer shares a loop with the reconcilers that must not be
+delayed behind a slow or hung orchestrator. Body:
 
 ```json
 {
@@ -96,6 +101,47 @@ absent, never a reason to fail the request.
 A `502` with detail `Purpose classifier returned no usable distribution` means
 the model's answer had no distribution recognizable against the supplied
 categories, even after one retry.
+
+## The internal route's error taxonomy, and how the reconciler reads it (issue #706)
+
+`POST /internal/classify-purpose` can answer 403 for two unrelated reasons:
+`AI_PURPOSE_CLASSIFICATION_ENABLED` is off (`require_purpose_classification`),
+or the caller's `X-Internal-Token` does not match this service's
+`INTERNAL_API_TOKEN` (`_check_internal_token`). Both are the same status
+code, but only the first means "not available yet"; the second is a
+configuration problem (an out-of-sync token after a rotation) that will not
+resolve itself on a later tick or a later row. The two are distinguished by
+body shape, not status code: the flag-off refusal carries the structured
+detail `{"error": "purpose_classification_disabled", "message": "Purpose
+classification is disabled"}` (`PURPOSE_CLASSIFICATION_DISABLED_DETAIL` in
+`app/routes/purpose_classification.py`); the bad-token refusal carries the
+plain string `"Invalid internal token"`. The reservations-service reconciler
+checks for the structured marker (with a fallback to the exact legacy
+plain-string detail, for a pre-#706 orchestrator image) before treating a 403
+as feature-off; any other 403 is logged at WARNING as a likely internal-token
+mismatch, not silently folded into "the feature is off there".
+
+The reconciler's outcome taxonomy, all documented in
+`services/reservations/app/tasks/expiration.py`'s `_classify_purpose_one`:
+
+- `ok`: a suggestion was stored, or the row was already resolved.
+- `feature_off`: 403 with the disabled marker (or the legacy string), or 404
+  (a mixed-version deployment where reservations was upgraded first and the
+  running orchestrator does not expose this route yet). Ends the tick; no
+  attempt counted.
+- `transient`: 429 (a rate limit, including this route's own daily-quota
+  429), 502/503/504 (misconfiguration or an outage, including the
+  `AI_NOT_CONFIGURED_DETAIL` 503 from `ai_is_configured()`), a timeout, or
+  any other transport error. Ends the tick; no attempt counted. Without this
+  class, a quota 429 that lasts until UTC midnight would burn a row's whole
+  `purpose_classify_max_attempts` cap in three ticks despite never having had
+  a real classification attempt.
+- `forbidden`: 403 without the disabled marker. Ends the tick; no attempt
+  counted, but logged at WARNING (not `feature_off`'s INFO) since this is a
+  problem an operator needs to see and fix, not an expected state.
+- `failed`: any other non-200 status, or a 200 with an unparseable body.
+  Increments `purpose_classify_attempts`; only this outcome affects the row's
+  attempt cap.
 
 ## Signals
 

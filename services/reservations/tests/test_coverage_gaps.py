@@ -889,6 +889,64 @@ async def test_expiration_loop_happy_path_single_iteration():
     reminder_cycle.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_expiration_loop_no_longer_drives_purpose_classify_reconcile():
+    """Issue #702: the purpose-classify reconciler moved to its own task
+    (purpose_classify_loop); expiration_loop must never call it, even though
+    it still drives every other standing reconciler (fork archive, pending
+    prune)."""
+    from app.tasks import expiration
+
+    purpose_classify = AsyncMock()
+    with (
+        patch.object(expiration, "_run_expiration_cycle", new=AsyncMock()),
+        patch.object(expiration, "_run_reminder_cycle", new=AsyncMock()),
+        patch.object(expiration, "_run_fork_archive_reconcile", new=AsyncMock()),
+        patch.object(expiration, "_run_pending_prune_reconcile", new=AsyncMock()),
+        patch.object(expiration, "_run_purpose_classify_reconcile", new=purpose_classify),
+        patch.object(expiration.asyncio, "sleep", new=AsyncMock(side_effect=_StopLoop())),
+    ):
+        with pytest.raises(_StopLoop):
+            await expiration.expiration_loop(interval_seconds=5)
+
+    purpose_classify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_purpose_classify_loop_runs_reconcile_and_handles_errors(caplog):
+    """purpose_classify_loop (issue #702) drives the reconciler on its own
+    loop and logs, rather than raises, when a tick fails."""
+    from app.tasks import expiration
+
+    reconcile = AsyncMock(side_effect=RuntimeError("reconcile boom"))
+    with (
+        patch.object(expiration, "_run_purpose_classify_reconcile", new=reconcile),
+        patch.object(expiration.asyncio, "sleep", new=AsyncMock(side_effect=_StopLoop())),
+        caplog.at_level("ERROR", logger="app.tasks.expiration"),
+    ):
+        with pytest.raises(_StopLoop):
+            await expiration.purpose_classify_loop(interval_seconds=1)
+
+    reconcile.assert_awaited_once()
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Purpose classify reconcile cycle failed" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_purpose_classify_loop_happy_path_single_iteration():
+    from app.tasks import expiration
+
+    reconcile = AsyncMock()
+    with (
+        patch.object(expiration, "_run_purpose_classify_reconcile", new=reconcile),
+        patch.object(expiration.asyncio, "sleep", new=AsyncMock(side_effect=_StopLoop())),
+    ):
+        with pytest.raises(_StopLoop):
+            await expiration.purpose_classify_loop(interval_seconds=5)
+
+    reconcile.assert_awaited_once()
+
+
 # --- schema validators ---
 
 
