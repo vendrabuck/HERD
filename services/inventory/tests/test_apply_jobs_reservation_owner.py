@@ -260,9 +260,7 @@ async def test_foreign_reservation_id_returns_422_and_writes_no_row(admin_client
     fake_client = _FakeReservationsAsyncClient(
         get_responses={str(foreign_reservation_id): _FakeResp(404, {})}
     )
-    monkeypatch.setattr(
-        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr("app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client)
 
     assert await _apply_job_row_count() == 0
     resp = await admin_client.post(
@@ -291,9 +289,7 @@ async def test_reservation_id_inactive_returns_422_and_writes_no_row(admin_clien
             str(reservation_id): _FakeResp(200, {"id": str(reservation_id), "is_active": False}),
         }
     )
-    monkeypatch.setattr(
-        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr("app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client)
 
     resp = await admin_client.post(
         f"/devices/{device_id}/config-versions/{version_id}/schedule",
@@ -304,9 +300,7 @@ async def test_reservation_id_inactive_returns_422_and_writes_no_row(admin_clien
 
 
 @pytest.mark.asyncio
-async def test_reservation_id_active_but_not_owned_by_caller_returns_422(
-    admin_client, monkeypatch
-):
+async def test_reservation_id_active_but_not_owned_by_caller_returns_422(admin_client, monkeypatch):
     """The reservation is active, but the caller does not own an active
     reservation containing this device -> 422, no row."""
     device_id, version_id = await _seed_device(admin_client)
@@ -321,9 +315,7 @@ async def test_reservation_id_active_but_not_owned_by_caller_returns_422(
             "/internal/active": _FakeResp(200, {"owns_active": False}),
         }
     )
-    monkeypatch.setattr(
-        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr("app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client)
 
     resp = await admin_client.post(
         f"/devices/{device_id}/config-versions/{version_id}/schedule",
@@ -349,9 +341,7 @@ async def test_reservation_id_valid_and_owned_schedules_successfully(admin_clien
             "/internal/active": _FakeResp(200, {"owns_active": True}),
         }
     )
-    monkeypatch.setattr(
-        "app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr("app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client)
 
     resp = await admin_client.post(
         f"/devices/{device_id}/config-versions/{version_id}/schedule",

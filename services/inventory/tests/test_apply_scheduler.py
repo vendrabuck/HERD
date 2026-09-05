@@ -347,9 +347,7 @@ async def test_fire_job_skips_when_authority_check_unreachable(monkeypatch):
         monkeypatch.setattr(
             "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
         )
-        monkeypatch.setattr(
-            "herd_common.internal_client.httpx.AsyncClient", _RaisingAsyncClient
-        )
+        monkeypatch.setattr("herd_common.internal_client.httpx.AsyncClient", _RaisingAsyncClient)
         client = FakeClient(
             post_responses={
                 "/execute/internal": FakeResponse(201, {"id": "x", "status": "SUCCESS"}),

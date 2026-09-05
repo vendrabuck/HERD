@@ -163,8 +163,7 @@ async def schedule_apply_job(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
-                f"scheduled_for must be within {settings.apply_job_max_horizon_days} "
-                "days from now"
+                f"scheduled_for must be within {settings.apply_job_max_horizon_days} days from now"
             ),
         )
 
