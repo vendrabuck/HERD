@@ -75,8 +75,14 @@ async def schedule_apply_job(
         raise HTTPException(status_code=404, detail="Config version not found")
 
     # ACL gate: non-admins must have `manage` on the device OR own an active
-    # reservation containing it (iter-3 widening for the AI write flow). The
-    # same permission gates the immediate-apply path via the execution service.
+    # reservation containing it (iter-3 widening for the AI write flow). This
+    # is schedule-time authorization only: the execution service's own
+    # immediate-apply /execute path is STRICTER, requiring a hard ACL manage
+    # grant with no reservation widening, so a reservation owner without an
+    # explicit grant can schedule here but would be refused on an immediate
+    # apply (issue #704). The scheduler re-runs this same check at fire time
+    # (apply_scheduler._creator_still_authorized), since a deferred job's
+    # authorization can otherwise go stale between scheduling and firing.
     # Without this check, any authenticated user could queue arbitrary configs.
     if not _is_admin(payload):
         allowed = await _user_can_manage_device(payload["sub"], device_id, authorization)

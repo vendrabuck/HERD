@@ -7,13 +7,17 @@ flipping its status to `running`, then resolved in one of three ways:
 
 - `success` if the execution service returns 2xx with a SUCCESS run.
 - `skipped` if the job had a `reservation_id` and the reservations service
-  reports the reservation is not currently active.
+  reports the reservation is not currently active, OR (issue #704) the
+  creator no longer passes the same authority check schedule_apply_job
+  required (explicit `manage` ACL, or reservation-owner of an active
+  reservation containing the device), re-evaluated at fire time with no
+  user JWT via herd_common.acl's internal-token variants.
 - `failed` for any other outcome (HTTP error, non-2xx, malformed payload).
 
 The loop authenticates to execution via INTERNAL_API_TOKEN at
-`/execute/internal`; the reservations check uses the same token where needed.
-The pipeline never raises out of the loop, so a single bad job cannot stall
-the others.
+`/execute/internal`; the reservations and ACL checks use the same token
+where needed. The pipeline never raises out of the loop, so a single bad
+job cannot stall the others.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from herd_common.acl import user_has_manage_or_owns_active_reservation_internal
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -84,6 +89,36 @@ async def _reservation_active(client: httpx.AsyncClient, reservation_id: uuid.UU
     except ValueError:
         return False
     return bool(data.get("is_active"))
+
+
+# Pinned (issue #704): tests and any future caller match on this exact
+# string, so do not reword without updating both.
+CREATOR_UNAUTHORIZED_ERROR = "creator no longer authorized for this device"
+
+
+async def _creator_still_authorized(job: DeviceConfigApplyJob) -> bool:
+    """Re-check the job creator's authority at fire time (issue #704).
+
+    Schedule time and fire time can be far apart (the horizon is up to
+    apply_job_max_horizon_days), and nothing revokes a queued job when its
+    creator's manage grant is removed or their reservation on the device
+    ends. This re-evaluates the same two grounds schedule_apply_job accepted
+    (explicit `manage` ACL, or reservation-owner-of-an-active-reservation-
+    containing-the-device), using the internal-token variants since the
+    scheduler has no user JWT to forward for job.created_by. Runs
+    unconditionally, independent of whether the job also carries a
+    reservation_id: the reservation_id branch below only re-verifies THAT
+    reservation is still active, it says nothing about whether the creator
+    still has ANY standing to apply configs to this device at all (e.g. a
+    manage grant that never involved a reservation).
+    """
+    return await user_has_manage_or_owns_active_reservation_internal(
+        user_id=job.created_by,
+        device_id=job.device_id,
+        acl_service_url=settings.acl_service_url,
+        reservations_service_url=settings.reservations_service_url,
+        internal_api_token=settings.internal_api_token,
+    )
 
 
 async def _post_internal_execute(
@@ -228,6 +263,17 @@ async def fire_job(
             job.fired_at = datetime.now(timezone.utc)
             await db.commit()
             return
+
+    # Fire-time authority re-check (issue #704), run regardless of whether
+    # reservation_id is set: schedule-time authorization is stale by the
+    # time a deferred job fires, and the reservation_id branch above only
+    # re-verifies that specific reservation, not the creator's standing.
+    if not await _creator_still_authorized(job):
+        job.status = "skipped"
+        job.error = CREATOR_UNAUTHORIZED_ERROR
+        job.fired_at = datetime.now(timezone.utc)
+        await db.commit()
+        return
 
     version = await db.get(DeviceConfigVersion, job.version_id)
     if version is None:
