@@ -1754,6 +1754,7 @@ async def test_fork_create_snapshots_multi_hop_path_and_dedupes():
             reservation_id=rid,
             parent_topology_id=topo_id,
             parent_version_id=None,
+            member_device_ids={dev_a, dev_x, dev_b},
             created_by="booker",
         )
     async with TestSession() as db:
@@ -1808,7 +1809,11 @@ async def test_fork_snapshot_skips_proposal_and_unresolvable_edges():
     async with TestSession() as db:
         topo_id, _ = await _make_parent_topology(db, canvas)
         fork = await create_fork(
-            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+            db,
+            reservation_id=rid,
+            parent_topology_id=topo_id,
+            parent_version_id=None,
+            member_device_ids={dev_a, dev_b},
         )
     async with TestSession() as db:
         conns = (
@@ -1839,7 +1844,11 @@ async def test_fork_snapshot_empty_component_when_no_devices_resolve():
     async with TestSession() as db:
         topo_id, _ = await _make_parent_topology(db, canvas)
         fork = await create_fork(
-            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+            db,
+            reservation_id=rid,
+            parent_topology_id=topo_id,
+            parent_version_id=None,
+            member_device_ids=set(),
         )
     async with TestSession() as db:
         conns = (
@@ -1890,7 +1899,11 @@ async def test_fork_snapshot_skips_hop_with_null_port():
             new=AsyncMock(return_value=doctored),
         ):
             fork = await fork_service.create_fork(
-                db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+                db,
+                reservation_id=rid,
+                parent_topology_id=topo_id,
+                parent_version_id=None,
+                member_device_ids={dev_a, dev_b},
             )
     async with TestSession() as db:
         conns = (
@@ -1914,10 +1927,18 @@ async def test_fork_create_is_idempotent_returns_existing():
     async with TestSession() as db:
         topo_id, _ = await _make_parent_topology(db, canvas)
         first = await create_fork(
-            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+            db,
+            reservation_id=rid,
+            parent_topology_id=topo_id,
+            parent_version_id=None,
+            member_device_ids=set(),
         )
         second = await create_fork(
-            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+            db,
+            reservation_id=rid,
+            parent_topology_id=topo_id,
+            parent_version_id=None,
+            member_device_ids=set(),
         )
     assert first.id == second.id
     async with TestSession() as db:
@@ -1966,7 +1987,11 @@ async def test_fork_create_integrity_error_returns_concurrent_winner():
         with patch.object(db, "commit", new=_commit_collides):
             with patch.object(db, "rollback", new=_rollback_then_seed_winner):
                 result = await fork_service.create_fork(
-                    db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+                    db,
+                    reservation_id=rid,
+                    parent_topology_id=None,
+                    parent_version_id=None,
+                    member_device_ids=set(),
                 )
     assert result.id == winner_holder["id"]
     # Exactly one fork survived: the concurrent winner, not a duplicate.
@@ -1995,7 +2020,11 @@ async def test_fork_create_integrity_error_no_winner_reraises():
         with patch.object(db, "commit", new=_always_fail):
             with pytest.raises(IntegrityError):
                 await fork_service.create_fork(
-                    db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+                    db,
+                    reservation_id=rid,
+                    parent_topology_id=None,
+                    parent_version_id=None,
+                    member_device_ids=set(),
                 )
 
 
@@ -2013,7 +2042,9 @@ async def test_forks_route_handler_returns_version_number():
         topo_id, version_id = await _make_parent_topology(db, canvas)
         with patch.object(settings, "internal_api_token", "tok"):
             resp = await create_fork_internal(
-                body=ForkCreate(reservation_id=rid, parent_topology_id=topo_id),
+                body=ForkCreate(
+                    reservation_id=rid, parent_topology_id=topo_id, member_device_ids=[]
+                ),
                 x_internal_token="tok",
                 db=db,
             )
@@ -2032,7 +2063,7 @@ async def test_forks_route_handler_rejects_bad_token():
         with patch.object(settings, "internal_api_token", "right"):
             with pytest.raises(HTTPException) as exc:
                 await create_fork_internal(
-                    body=ForkCreate(reservation_id=uuid.uuid4()),
+                    body=ForkCreate(reservation_id=uuid.uuid4(), member_device_ids=[]),
                     x_internal_token="wrong",
                     db=db,
                 )
@@ -2051,7 +2082,9 @@ async def test_forks_route_handler_rejects_bad_token():
 # just "it returns".
 
 
-async def _direct_create_fork(db, rid, *, parent_topology_id=None, parent_version_id=None):
+async def _direct_create_fork(
+    db, rid, *, parent_topology_id=None, parent_version_id=None, member_device_ids=frozenset()
+):
     from app.config import settings
     from app.routes.forks import create_fork_internal
     from app.schemas.fork import ForkCreate
@@ -2062,6 +2095,7 @@ async def _direct_create_fork(db, rid, *, parent_topology_id=None, parent_versio
                 reservation_id=rid,
                 parent_topology_id=parent_topology_id,
                 parent_version_id=parent_version_id,
+                member_device_ids=list(member_device_ids),
             ),
             x_internal_token="tok",
             db=db,
@@ -2101,7 +2135,9 @@ async def test_list_active_forks_handler_reports_latest_version_per_fork():
             ],
             "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
         }
-        result = await save_fork(db, saved_fork, canvas_data=canvas, created_by="tester")
+        result = await save_fork(
+            db, saved_fork, canvas_data=canvas, member_device_ids={a, b}, created_by="tester"
+        )
     assert result.version_number == 2
 
     async with TestSession() as db:
@@ -2140,7 +2176,7 @@ async def test_get_fork_handler_returns_full_detail():
             "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
         }
         topo_id, _ = await _make_parent_topology(db, canvas)
-        await _direct_create_fork(db, rid, parent_topology_id=topo_id)
+        await _direct_create_fork(db, rid, parent_topology_id=topo_id, member_device_ids={a, b})
 
     async with TestSession() as db:
         with patch.object(settings, "internal_api_token", "tok"):
@@ -2381,7 +2417,9 @@ async def test_save_fork_handler_builds_wire_and_bumps_version():
         with patch.object(settings, "internal_api_token", "tok"):
             resp = await save_fork_internal(
                 reservation_id=rid,
-                body=ForkSaveRequest(canvas_data=canvas, created_by="tester"),
+                body=ForkSaveRequest(
+                    canvas_data=canvas, member_device_ids=[a, b], created_by="tester"
+                ),
                 x_internal_token="tok",
                 db=db,
             )
@@ -2412,7 +2450,9 @@ async def test_save_fork_handler_refuses_archived():
             with pytest.raises(HTTPException) as exc:
                 await save_fork_internal(
                     reservation_id=rid,
-                    body=ForkSaveRequest(canvas_data={"nodes": [], "edges": []}),
+                    body=ForkSaveRequest(
+                        canvas_data={"nodes": [], "edges": []}, member_device_ids=[]
+                    ),
                     x_internal_token="tok",
                     db=db,
                 )
@@ -2445,7 +2485,9 @@ async def test_prune_fork_devices_handler_releases_wiring():
         with patch.object(settings, "internal_api_token", "tok"):
             await save_fork_internal(
                 reservation_id=rid,
-                body=ForkSaveRequest(canvas_data=canvas, created_by="tester"),
+                body=ForkSaveRequest(
+                    canvas_data=canvas, member_device_ids=[a, b], created_by="tester"
+                ),
                 x_internal_token="tok",
                 db=db,
             )
@@ -2602,7 +2644,9 @@ async def test_prune_fork_devices_no_release_no_draft_change_is_a_pure_replay():
         with patch.object(settings, "internal_api_token", "tok"):
             await save_fork_internal(
                 reservation_id=rid,
-                body=ForkSaveRequest(canvas_data=canvas, created_by="tester"),
+                body=ForkSaveRequest(
+                    canvas_data=canvas, member_device_ids=[a, b], created_by="tester"
+                ),
                 x_internal_token="tok",
                 db=db,
             )

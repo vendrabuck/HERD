@@ -230,7 +230,7 @@ async def _make_topology_with_version(canvas: dict) -> tuple[uuid.UUID, uuid.UUI
 async def test_create_fork_requires_internal_token(client):
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(uuid.uuid4())},
+        json={"reservation_id": str(uuid.uuid4()), "member_device_ids": []},
         headers={"X-Internal-Token": "wrong"},
     )
     assert resp.status_code == 403
@@ -244,7 +244,11 @@ async def test_create_fork_deep_copies_canvas_and_pins_version(client):
 
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 201, resp.text
@@ -277,12 +281,20 @@ async def test_create_fork_is_idempotent(client):
 
     first = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     second = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     assert first.status_code == 201
@@ -304,7 +316,7 @@ async def test_create_fork_no_topology_creates_empty_fork(client):
     rid = uuid.uuid4()
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": None},
+        json={"reservation_id": str(rid), "parent_topology_id": None, "member_device_ids": []},
         headers=_hdr(),
     )
     assert resp.status_code == 201
@@ -360,7 +372,11 @@ async def test_create_fork_snapshots_physical_path(client):
     rid = uuid.uuid4()
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 201, resp.text
@@ -431,6 +447,7 @@ async def test_create_fork_threads_created_by(client):
             "reservation_id": str(rid),
             "parent_topology_id": str(topo_id),
             "created_by": booking_user,
+            "member_device_ids": _members(canvas),
         },
         headers=_hdr(),
     )
@@ -479,7 +496,11 @@ async def test_create_fork_skips_unreachable_edge(client):
     rid = uuid.uuid4()
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 201
@@ -560,6 +581,7 @@ async def test_create_fork_returns_winner_on_commit_integrity_error():
                 reservation_id=rid,
                 parent_topology_id=topo_id,
                 parent_version_id=None,
+                member_device_ids={dev_a, dev_b},
             )
 
         # The loser returned the winner's row, after exactly one commit attempt
@@ -608,6 +630,7 @@ async def test_create_fork_reraises_integrity_error_when_no_winner_exists():
                     reservation_id=rid,
                     parent_topology_id=None,
                     parent_version_id=None,
+                    member_device_ids=set(),
                 )
         # The bare raise propagates the original exception instance.
         assert excinfo.value is err
@@ -662,6 +685,7 @@ async def test_create_fork_returns_winner_on_flush_integrity_error():
                 reservation_id=rid,
                 parent_topology_id=None,
                 parent_version_id=None,
+                member_device_ids=set(),
             )
 
         # One flush attempt, then the handler re-queries and returns the winner; it
@@ -728,7 +752,11 @@ async def test_get_fork_returns_metadata_canvas_connections_versions(client):
     rid = uuid.uuid4()
     await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
 
@@ -755,7 +783,11 @@ async def test_get_fork_returns_metadata_canvas_connections_versions(client):
 async def test_get_fork_empty_fork_has_no_connections(client):
     """A fork with no parent topology returns a null canvas and no wiring."""
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     resp = await client.get(f"/internal/forks/{rid}", headers=_hdr())
     assert resp.status_code == 200
@@ -812,7 +844,11 @@ async def test_update_fork_canvas_stores_draft_without_reconcile_or_version(clie
         await db.commit()
 
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     draft = {
         "nodes": [
@@ -854,7 +890,11 @@ async def test_update_fork_canvas_reports_invalid_without_gating(client):
     """An unreachable edge is reported (valid False, no_path) but the draft still stores."""
     dev_a, dev_b = uuid.uuid4(), uuid.uuid4()
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     draft = {
         "nodes": [
@@ -885,7 +925,11 @@ async def test_update_fork_canvas_reports_invalid_without_gating(client):
 async def test_update_fork_canvas_refuses_archived(client):
     """A frozen (ARCHIVED) fork refuses the loose edit with 409 and stays unchanged."""
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
     async with TestSessionLocal() as db:
         fork = (
             await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
@@ -1222,6 +1266,18 @@ def _canvas_with_edge_data(nodes: list[uuid.UUID], edges: list[tuple[int, int, d
     }
 
 
+def _members(canvas: dict) -> list[str]:
+    """Device ids referenced by a canvas's nodes (2026-09-04 fork endpoint-membership
+    fix): the default ``member_device_ids`` for tests that are not exercising the
+    membership check itself, so a save or create succeeds with no restriction."""
+    ids = []
+    for node in canvas.get("nodes") or []:
+        device_id = ((node.get("data") or {}).get("device") or {}).get("id")
+        if device_id:
+            ids.append(device_id)
+    return ids
+
+
 def _endpoint_set(delta: dict) -> frozenset:
     return frozenset(
         {
@@ -1244,7 +1300,7 @@ async def _fork_connections(fork_id: uuid.UUID) -> list[ForkConnection]:
 async def test_save_fork_requires_internal_token(client):
     resp = await client.post(
         f"/internal/forks/{uuid.uuid4()}/save",
-        json={"canvas_data": {"nodes": [], "edges": []}},
+        json={"canvas_data": {"nodes": [], "edges": []}, "member_device_ids": []},
         headers={"X-Internal-Token": "wrong"},
     )
     assert resp.status_code == 403
@@ -1254,7 +1310,7 @@ async def test_save_fork_requires_internal_token(client):
 async def test_save_fork_404_when_absent(client):
     resp = await client.post(
         f"/internal/forks/{uuid.uuid4()}/save",
-        json={"canvas_data": {"nodes": [], "edges": []}},
+        json={"canvas_data": {"nodes": [], "edges": []}, "member_device_ids": []},
         headers=_hdr(),
     )
     assert resp.status_code == 404
@@ -1265,7 +1321,11 @@ async def test_save_fork_404_when_absent(client):
 async def test_save_fork_refuses_archived(client):
     """An ARCHIVED fork refuses a save with 409, the same wording as the loose PUT."""
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
     async with TestSessionLocal() as db:
         fork = (
             await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
@@ -1275,7 +1335,7 @@ async def test_save_fork_refuses_archived(client):
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": {"nodes": [], "edges": []}},
+        json={"canvas_data": {"nodes": [], "edges": []}, "member_device_ids": []},
         headers=_hdr(),
     )
     assert resp.status_code == 409
@@ -1288,11 +1348,18 @@ async def test_save_fork_builds_new_wire(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1319,13 +1386,20 @@ async def test_save_fork_moves_wire(client):
     rid = uuid.uuid4()
     await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(parent_canvas),
+        },
         headers=_hdr(),
     )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, c], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, c], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, c], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1352,13 +1426,17 @@ async def test_save_fork_unchanged_wire_is_not_rewritten(client):
     rid = uuid.uuid4()
     await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(parent_canvas),
+        },
         headers=_hdr(),
     )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": parent_canvas},
+        json={"canvas_data": parent_canvas, "member_device_ids": _members(parent_canvas)},
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1379,13 +1457,17 @@ async def test_save_fork_removes_all_wiring(client):
     rid = uuid.uuid4()
     await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(parent_canvas),
+        },
         headers=_hdr(),
     )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": {"nodes": [], "edges": []}},
+        json={"canvas_data": {"nodes": [], "edges": []}, "member_device_ids": []},
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1406,12 +1488,19 @@ async def test_save_fork_resolves_multi_hop_path(client):
     await _make_physical(a, "a0", p, "p1")
     await _make_physical(p, "p2", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     # Canvas edge A-B has no direct cable; it resolves over the two-hop path A-P-B.
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1430,12 +1519,19 @@ async def test_save_fork_dedups_shared_hop(client):
     await _make_physical(p, "p2", b, "b0")
     await _make_physical(p, "p3", c, "c0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     # Edges A-B and A-C both route A-P-* and share the A-P cable.
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b, c], [(0, 1), (0, 2)])},
+        json={
+            "canvas_data": _canvas([a, b, c], [(0, 1), (0, 2)]),
+            "member_device_ids": _members(_canvas([a, b, c], [(0, 1), (0, 2)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1462,7 +1558,11 @@ async def test_save_fork_two_same_pair_edges_with_ports_resolve_to_two_wires(cli
     await _make_physical(a, "a0", b, "b0")
     await _make_physical(a, "a1", b, "b1")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     canvas = _canvas_with_edge_data(
         [a, b],
@@ -1472,7 +1572,9 @@ async def test_save_fork_two_same_pair_edges_with_ports_resolve_to_two_wires(cli
         ],
     )
     resp = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
     built = resp.json()["built"]
@@ -1499,11 +1601,18 @@ async def test_save_fork_two_same_pair_edges_without_ports_resolve_to_one_wire(c
     await _make_physical(a, "a0", b, "b0")
     await _make_physical(a, "a1", b, "b1")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1), (0, 1)])},
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1), (0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1), (0, 1)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1522,7 +1631,11 @@ async def test_save_fork_unresolvable_port_pair_does_not_fall_back(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     canvas = _canvas_with_edge_data(
         [a, b],
@@ -1532,7 +1645,9 @@ async def test_save_fork_unresolvable_port_pair_does_not_fall_back(client):
         ],
     )
     resp = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
     built = resp.json()["built"]
@@ -1554,7 +1669,11 @@ async def test_save_fork_distinct_source_ports_share_common_final_hop(client):
     await _make_physical(a, "a1", panel, "pin1")
     await _make_physical(panel, "pout", b, "b0")  # shared final hop
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     canvas = _canvas_with_edge_data(
         [a, b],
@@ -1564,7 +1683,9 @@ async def test_save_fork_distinct_source_ports_share_common_final_hop(client):
         ],
     )
     resp = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
     built = resp.json()["built"]
@@ -1581,7 +1702,11 @@ async def test_save_fork_empty_string_port_names_treated_as_absent(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     canvas = _canvas_with_edge_data(
         [a, b],
@@ -1591,7 +1716,9 @@ async def test_save_fork_empty_string_port_names_treated_as_absent(client):
         ],
     )
     resp = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
     built = resp.json()["built"]
@@ -1611,7 +1738,11 @@ async def test_save_fork_port_distinct_edges_resave_with_new_edge_ids_unchanged(
     await _make_physical(a, "a0", b, "b0")
     await _make_physical(a, "a1", b, "b1")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     first_canvas = _canvas_with_edge_data(
         [a, b],
@@ -1621,7 +1752,9 @@ async def test_save_fork_port_distinct_edges_resave_with_new_edge_ids_unchanged(
         ],
     )
     resp = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": first_canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": first_canvas, "member_device_ids": _members(first_canvas)},
+        headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
     assert len(resp.json()["built"]) == 2
@@ -1646,7 +1779,9 @@ async def test_save_fork_port_distinct_edges_resave_with_new_edge_ids_unchanged(
         ],
     }
     resp2 = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": renamed_canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": renamed_canvas, "member_device_ids": _members(renamed_canvas)},
+        headers=_hdr(),
     )
     assert resp2.status_code == 200, resp2.text
     body2 = resp2.json()
@@ -1681,7 +1816,11 @@ async def test_save_fork_rolls_back_between_release_and_build():
     # Create the fork with its A-B wiring through an independent session.
     async with TestSessionLocal() as db:
         fork = await create_fork(
-            db, reservation_id=rid, parent_topology_id=topo_id, parent_version_id=None
+            db,
+            reservation_id=rid,
+            parent_topology_id=topo_id,
+            parent_version_id=None,
+            member_device_ids={a, b, c},
         )
         fork_id = fork.id
 
@@ -1692,7 +1831,12 @@ async def test_save_fork_rolls_back_between_release_and_build():
         # and the build.
         with patch.object(db, "add", side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError):
-                await save_fork(db, fork, canvas_data=_canvas([a, c], [(0, 1)]))
+                await save_fork(
+                    db,
+                    fork,
+                    canvas_data=_canvas([a, c], [(0, 1)]),
+                    member_device_ids={a, b, c},
+                )
         await db.rollback()
 
     # The original A-B wiring survives and no version 2 was written.
@@ -1745,11 +1889,18 @@ async def test_save_fork_409_on_cross_reservation_port_claim(client):
     await _make_active_fork_claiming(other_rid, a, "a0", z, "z0")
 
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 409, resp.text
@@ -1783,10 +1934,17 @@ async def test_save_fork_archived_other_fork_does_not_block(client):
     await _make_active_fork_claiming(other_rid, a, "a0", z, "z0", status_=ForkStatus_ARCHIVED)
 
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -1813,7 +1971,11 @@ async def test_save_fork_retries_on_version_conflict():
     rid = uuid.uuid4()
     async with TestSessionLocal() as db:
         fork = await create_fork(
-            db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+            db,
+            reservation_id=rid,
+            parent_topology_id=None,
+            parent_version_id=None,
+            member_device_ids=set(),
         )
         fork_id = fork.id
 
@@ -1838,7 +2000,9 @@ async def test_save_fork_retries_on_version_conflict():
             return await real_commit()
 
         with patch.object(db, "commit", side_effect=racing_commit):
-            result = await save_fork(db, fork, canvas_data=_canvas([a, b], [(0, 1)]))
+            result = await save_fork(
+                db, fork, canvas_data=_canvas([a, b], [(0, 1)]), member_device_ids={a, b}
+            )
 
         # Retried onto version 3 after the constraint rejected 2, and our wiring landed.
         assert result.version_number == 3
@@ -1876,7 +2040,11 @@ async def test_save_fork_port_claim_query_reruns_on_retry():
     rid = uuid.uuid4()
     async with TestSessionLocal() as db:
         fork = await create_fork(
-            db, reservation_id=rid, parent_topology_id=None, parent_version_id=None
+            db,
+            reservation_id=rid,
+            parent_topology_id=None,
+            parent_version_id=None,
+            member_device_ids=set(),
         )
         fork_id = fork.id
 
@@ -1917,7 +2085,9 @@ async def test_save_fork_port_claim_query_reruns_on_retry():
 
         with patch.object(db, "commit", side_effect=racing_commit):
             with pytest.raises(HTTPException) as excinfo:
-                await save_fork(db, fork, canvas_data=_canvas([a, b], [(0, 1)]))
+                await save_fork(
+                    db, fork, canvas_data=_canvas([a, b], [(0, 1)]), member_device_ids={a, b}
+                )
         await db.rollback()
 
     assert excinfo.value.status_code == 409
@@ -1950,7 +2120,11 @@ async def test_archive_fork_absent_returns_204(client):
 async def test_archive_fork_freezes_and_is_idempotent(client):
     """Archive flips status to ARCHIVED; a second call is a no-op 200, same state."""
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     first = await client.post(f"/internal/forks/{rid}/archive", headers=_hdr())
     assert first.status_code == 200, first.text
@@ -1973,7 +2147,11 @@ async def test_archive_fork_freezes_and_is_idempotent(client):
 async def test_archive_fork_appends_no_version(client):
     """Archive retains versions read-only and appends no new one (Decision 5)."""
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
     await client.post(f"/internal/forks/{rid}/archive", headers=_hdr())
 
     async with TestSessionLocal() as db:
@@ -2018,7 +2196,11 @@ async def test_list_active_forks_excludes_archived(client):
     active_b = uuid.uuid4()
     archived = uuid.uuid4()
     for rid in (active_a, active_b, archived):
-        await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+        await client.post(
+            "/internal/forks",
+            json={"reservation_id": str(rid), "member_device_ids": []},
+            headers=_hdr(),
+        )
     # Freeze one so it drops out of the ACTIVE listing.
     await client.post(f"/internal/forks/{archived}/archive", headers=_hdr())
 
@@ -2035,7 +2217,11 @@ async def test_list_active_forks_excludes_archived(client):
 async def test_list_active_forks_pagination(client):
     rids = [uuid.uuid4() for _ in range(3)]
     for rid in rids:
-        await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+        await client.post(
+            "/internal/forks",
+            json={"reservation_id": str(rid), "member_device_ids": []},
+            headers=_hdr(),
+        )
 
     first = await client.get("/internal/forks", params={"skip": 0, "limit": 2}, headers=_hdr())
     assert first.status_code == 200, first.text
@@ -2067,10 +2253,17 @@ async def test_list_active_forks_reports_latest_fork_version(client):
     saved = uuid.uuid4()  # fork gets a save, advancing to v2
     fresh = uuid.uuid4()  # fork stays at v1
     for rid in (saved, fresh):
-        await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+        await client.post(
+            "/internal/forks",
+            json={"reservation_id": str(rid), "member_device_ids": []},
+            headers=_hdr(),
+        )
     save_resp = await client.post(
         f"/internal/forks/{saved}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert save_resp.status_code == 200, save_resp.text
@@ -2098,11 +2291,18 @@ async def test_save_fork_delta_carries_physical_connection_id(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     physical_id = await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -2130,7 +2330,11 @@ async def test_create_fork_snapshot_persists_edge_key(client):
     rid = uuid.uuid4()
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 201, resp.text
@@ -2145,11 +2349,18 @@ async def test_save_persists_edge_key_on_built_wire(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},  # _canvas numbers edges "e0"
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },  # _canvas numbers edges "e0"
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -2176,12 +2387,19 @@ async def test_save_groups_hops_per_edge(client):
     await _make_physical(p, "p2", b, "b0")
     await _make_physical(c, "c0", d, "d0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     # nodes n0..n3 -> a,b,c,d; edges e0 = A-B (multi-hop via P), e1 = C-D (single hop).
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b, c, d], [(0, 1), (2, 3)])},
+        json={
+            "canvas_data": _canvas([a, b, c, d], [(0, 1), (2, 3)]),
+            "member_device_ids": _members(_canvas([a, b, c, d], [(0, 1), (2, 3)])),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -2209,7 +2427,11 @@ async def test_save_edge_id_only_change_reconciles_as_unchanged(client):
     rid = uuid.uuid4()
     await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(parent_canvas),
+        },
         headers=_hdr(),
     )
 
@@ -2223,7 +2445,7 @@ async def test_save_edge_id_only_change_reconciles_as_unchanged(client):
     }
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": renamed},
+        json={"canvas_data": renamed, "member_device_ids": _members(renamed)},
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -2245,7 +2467,11 @@ async def test_save_tolerates_edge_without_id(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     no_id_canvas = {
         "nodes": [
@@ -2256,7 +2482,7 @@ async def test_save_tolerates_edge_without_id(client):
     }
     resp = await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": no_id_canvas},
+        json={"canvas_data": no_id_canvas, "member_device_ids": _members(no_id_canvas)},
         headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
@@ -2279,10 +2505,17 @@ async def test_get_fork_connections_carry_edge_key(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
     await client.post(
         f"/internal/forks/{rid}/save",
-        json={"canvas_data": _canvas([a, b], [(0, 1)])},  # edge id "e0"
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": _members(_canvas([a, b], [(0, 1)])),
+        },  # edge id "e0"
         headers=_hdr(),
     )
 
@@ -2511,7 +2744,11 @@ async def test_save_fork_element_attachment_reports_skip_count_and_builds_nothin
     """
     device_id = uuid.uuid4()
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     canvas = {
         "nodes": [
@@ -2535,7 +2772,9 @@ async def test_save_fork_element_attachment_reports_skip_count_and_builds_nothin
         ],
     }
     resp = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -2556,7 +2795,11 @@ async def test_save_fork_mixed_canvas_wire_plus_attachments(client):
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
-    await client.post("/internal/forks", json={"reservation_id": str(rid)}, headers=_hdr())
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
 
     canvas = {
         "nodes": [
@@ -2589,7 +2832,9 @@ async def test_save_fork_mixed_canvas_wire_plus_attachments(client):
         ],
     }
     resp = await client.post(
-        f"/internal/forks/{rid}/save", json={"canvas_data": canvas}, headers=_hdr()
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -2671,7 +2916,11 @@ async def test_create_fork_skips_element_attachment_in_parent_canvas(client):
     rid = uuid.uuid4()
     resp = await client.post(
         "/internal/forks",
-        json={"reservation_id": str(rid), "parent_topology_id": str(topo_id)},
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": _members(canvas),
+        },
         headers=_hdr(),
     )
     assert resp.status_code == 201, resp.text
@@ -2686,3 +2935,195 @@ async def test_create_fork_skips_element_attachment_in_parent_canvas(client):
             .all()
         )
         assert conns == []
+
+
+# --- Endpoint-membership enforcement (2026-09-04 sweep finding, D2) -------------
+#
+# Fork saves and activation snapshots must check the canvas's endpoint devices
+# against the reservation's membership, or a user can drive provisioning onto
+# devices they do not hold. assert_endpoints_are_members checks canvas ENDPOINT
+# nodes only (node_to_device_map), never WireSpec/hop devices: transit gear on a
+# resolved path is legitimately non-member, and a network element node is not a
+# device at all.
+
+
+@pytest.mark.asyncio
+async def test_save_fork_non_member_endpoint_409(client):
+    """A canvas naming a device outside member_device_ids is refused with 409 and
+    leaves fork_connections and fork_versions untouched."""
+    a, b, foreign = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", foreign, "f0")
+    rid = uuid.uuid4()
+    create_resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(a), str(b)]},
+        headers=_hdr(),
+    )
+    fork_id = uuid.UUID(create_resp.json()["fork_id"])
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={
+            "canvas_data": _canvas([a, foreign], [(0, 1)]),
+            "member_device_ids": [str(a), str(b)],
+        },
+        headers=_hdr(),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "fork_device_not_member",
+        "device_ids": [str(foreign)],
+    }
+
+    # No wiring and no new version: the refused save touched nothing.
+    assert await _fork_connections(fork_id) == []
+    async with TestSessionLocal() as db:
+        versions = (
+            (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+        assert len(versions) == 1
+        assert versions[0].version_number == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fork_transit_device_need_not_be_member(client):
+    """A resolved path's transit device need not be a reservation member: only
+    canvas ENDPOINT nodes are checked, never a resolved hop's interior devices.
+
+    Mirrors test_save_fork_resolves_multi_hop_path, but member_device_ids is
+    deliberately narrowed to just the two canvas endpoints, proving the asymmetry:
+    widening the check to WireSpec/hop devices would break this legitimate case.
+    """
+    a, transit, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", transit, "t1")
+    await _make_physical(transit, "t2", b, "b0")
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(a), str(b)]},
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={
+            "canvas_data": _canvas([a, b], [(0, 1)]),
+            "member_device_ids": [str(a), str(b)],
+        },
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    built = resp.json()["built"]
+    assert len(built) == 2
+    got = {_endpoint_set(d) for d in built}
+    assert frozenset({(str(a), "a0"), (str(transit), "t1")}) in got
+    assert frozenset({(str(transit), "t2"), (str(b), "b0")}) in got
+
+
+@pytest.mark.asyncio
+async def test_create_fork_non_member_endpoint_409_writes_nothing(client):
+    """create_fork refuses a parent canvas naming a foreign device before the fork
+    row is even added: no reservation_fork, fork_connections, or fork_versions row
+    survives."""
+    a, foreign = uuid.uuid4(), uuid.uuid4()
+    canvas = _canvas([a, foreign], [(0, 1)])
+    topo_id, _ = await _make_topology_with_version(canvas)
+    rid = uuid.uuid4()
+
+    resp = await client.post(
+        "/internal/forks",
+        json={
+            "reservation_id": str(rid),
+            "parent_topology_id": str(topo_id),
+            "member_device_ids": [str(a)],
+        },
+        headers=_hdr(),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "fork_device_not_member",
+        "device_ids": [str(foreign)],
+    }
+
+    async with TestSessionLocal() as db:
+        forks = (
+            (await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid)))
+            .scalars()
+            .all()
+        )
+        assert forks == []
+        assert (await db.execute(select(ForkConnection))).scalars().all() == []
+        assert (await db.execute(select(ForkVersion))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_create_fork_missing_member_device_ids_422(client):
+    """member_device_ids is required, not optional: omitting it fails closed."""
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(uuid.uuid4())},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_save_fork_missing_member_device_ids_422(client):
+    """member_device_ids is required, not optional: omitting it fails closed."""
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": {"nodes": [], "edges": []}},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_save_fork_element_node_ignored_by_membership_check(client):
+    """A network element node is not a device (node_to_device_map never includes
+    one), so it is never checked against member_device_ids even though its own id
+    is never itself a reservation member."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(a), str(b)]},
+        headers=_hdr(),
+    )
+
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(a)}}},
+            {"id": "n1", "data": {"device": {"id": str(b)}}},
+            {
+                "id": "elem",
+                "type": "networkElementNode",
+                "data": {"element": {"id": "some-element-id"}},
+            },
+        ],
+        "edges": [
+            {"id": "e0", "source": "n0", "target": "n1"},
+            {
+                "id": "e1",
+                "source": "n0",
+                "target": "elem",
+                "data": {"source_port_name": "a0"},
+            },
+        ],
+    }
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": [str(a), str(b)]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["element_attachments_skipped"] == 1
