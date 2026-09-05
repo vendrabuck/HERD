@@ -462,7 +462,9 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
         topology_id = await _create_topology(
             admin_client, _canvas([(fresh_device["id"], switch["id"])])
         )
-        reservation = await _reserve(admin_client, [fresh_device["id"]], topology_id)
+        reservation = await _reserve(
+            admin_client, [fresh_device["id"], switch["id"]], topology_id
+        )
         provisioned_res_id = reservation["id"]
         add_runs = await _poll_runs(admin_client, provisioned_res_id, "add_to_vlan")
         assert add_runs, "anchor provisioning never completed"
