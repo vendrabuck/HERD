@@ -303,13 +303,31 @@ async def list_connections(
     device_id: uuid.UUID | None = None,
     skip: int = 0,
     limit: int = 50,
+    visible_device_ids: set[uuid.UUID] | None = None,
 ) -> tuple[list[Connection], int]:
+    """List connections, optionally filtered to a device and/or a visible set.
+
+    visible_device_ids restricts the result to rows where at least one
+    endpoint is in that set (issue #719's non-admin filter). It is applied in
+    SQL, alongside device_id, so `total` and pagination reflect the filtered
+    set rather than a page filtered after the fact. Passing an empty set here
+    is the caller's job to short-circuit before calling this at all (see
+    list_connections_endpoint); this function does not special-case it, and
+    an empty set here would correctly, if uselessly, match nothing.
+    """
     query = select(Connection)
     if device_id is not None:
         query = query.where(
             or_(
                 Connection.device_a_id == device_id,
                 Connection.device_b_id == device_id,
+            )
+        )
+    if visible_device_ids is not None:
+        query = query.where(
+            or_(
+                Connection.device_a_id.in_(visible_device_ids),
+                Connection.device_b_id.in_(visible_device_ids),
             )
         )
 

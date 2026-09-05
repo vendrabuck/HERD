@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- Security: `GET /api/cabling/connections` no longer hands every authenticated
+  user the whole fleet's cabling graph (issue #719, surfaced by the 2026-09-04
+  review sweep while verifying the fork-membership finding, #701; the
+  fleet-wide dump was the reconnaissance step that made that exploit
+  turnkey). A non-admin caller is now filtered in SQL to connections where at
+  least one endpoint device is visible to them, resolved by forwarding the
+  caller's own JWT to inventory's `GET /device-groups/visible-devices`
+  self-service lookup; `total` and pagination reflect the filtered set, not a
+  post-filtered page, and an empty visible set short-circuits to an empty page
+  with no query at all. Admin and superadmin callers stay unfiltered and never
+  trigger the inventory lookup. Fails closed for non-admins: an unreachable or
+  non-2xx inventory answer returns 503 with nothing, rather than falling back
+  to an unfiltered list. `docs/ROLES.md` documents the filter and the admin
+  passthrough.
 - Security: inventory's device config-version reads (`GET
   /devices/{id}/config-versions`, `.../config-versions/diff`, `.../config-
   versions/{version_id}`) now enforce the same non-admin group-visibility
