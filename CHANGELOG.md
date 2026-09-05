@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Fixed the AI commit path silently dropping an approved network-element
+  attachment when inventory's ports fetch failed (issue #717):
+  `_fetch_device_ports` now raises `CommitError(503)` on a transport failure
+  or a 5xx from inventory instead of treating it the same as a genuinely
+  portless device (a 404 is still "no ports"). The fetch already runs before
+  the topology is created, so the commit fails closed with nothing to roll
+  back rather than silently omitting the user's approved attachment.
+- Security: `/api/ai/generate` no longer buffers a whole multipart upload
+  into memory before its file-count and size caps run (issue #705):
+  `_read_uploads` rejects a too-many-files request before reading a single
+  byte, then reads each remaining part in 64 KiB chunks with a running
+  per-file and aggregate total, aborting with 400 the instant either cap is
+  crossed instead of after the whole part is buffered. `UploadFile.size` is
+  treated as an untrusted hint only, never load-bearing for the check.
+  `extract_files`'s own caps are unchanged and still re-run as defense in
+  depth on the now-bounded upload.
 - Stopped four ai-orchestrator routes from returning raw provider or
   internal exception text in their HTTP `detail` (issue #713). Topology
   generation (`POST /generate`) now answers a provider `AIError` with the

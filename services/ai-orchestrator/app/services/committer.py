@@ -75,16 +75,29 @@ async def _fetch_device_ports(
     CommitDevice.device (the raw inventory DeviceResponse payload the
     frontend forwards) carries no ports field (services/inventory/app/schemas
     /device.py's DeviceResponse has none), so port selection needs its own
-    call to inventory's dedicated ports listing endpoint. Never raises: a
-    fetch failure (unreachable inventory, 404, etc.) is logged and treated as
-    "no ports", which the caller already handles by skipping the attachment.
+    call to inventory's dedicated ports listing endpoint. A 404 means a
+    genuinely portless device and is treated as "no ports", which the caller
+    already handles by skipping the attachment. A transport failure or a 5xx
+    means inventory could not answer the question at all, which is not the
+    same thing: silently treating it as portless would drop a user-approved
+    element attachment on a mere blip (issue #717), so it raises
+    CommitError(503) instead, failing the whole commit closed before any
+    topology is created.
     """
     url = f"{settings.inventory_service_url.rstrip('/')}/devices/{device_id}/ports"
     try:
         resp = await client.get(url, headers=headers)
-    except Exception:
+    except Exception as e:
         logger.warning("ai_commit_device_ports_fetch_failed", extra={"device_id": device_id})
+        raise CommitError(503, f"Failed to fetch ports for device {device_id}: {e}") from e
+    if resp.status_code == 404:
         return []
+    if resp.status_code >= 500:
+        logger.warning(
+            "ai_commit_device_ports_fetch_failed",
+            extra={"device_id": device_id, "status_code": resp.status_code},
+        )
+        raise CommitError(503, f"Failed to fetch ports for device {device_id}: {_detail(resp)}")
     if resp.status_code >= 400:
         logger.warning(
             "ai_commit_device_ports_fetch_failed",

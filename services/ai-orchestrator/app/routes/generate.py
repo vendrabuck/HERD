@@ -48,17 +48,65 @@ async def _inventory_provider(
         ) from e
 
 
+_UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+
+
 async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
+    """Read the uploaded parts, enforcing the count and size caps before
+    anything is fully buffered (issue #705).
+
+    The count cap is checked before any part is read at all. Each part is
+    then read in 64 KiB chunks with a running per-file total (against
+    `upload_max_file_bytes`) and a running aggregate total across every part
+    read so far in this request (against `upload_max_files *
+    upload_max_file_bytes`); the read loop aborts the instant either is
+    exceeded, so a malicious part is never read past the chunk that first
+    crosses its cap. `UploadFile.size` (a client-reported Content-Length on
+    the part, when present) is not trusted for enforcement: it is only ever a
+    hint, since a caller controls it independently of the bytes actually
+    sent. `extract_files` still re-checks the same caps on the fully read
+    data as defense in depth; this function's job is only to stop an
+    oversized or excessive upload from being buffered in memory in the first
+    place.
+    """
     if not files:
         return []
+    if len(files) > settings.upload_max_files:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Too many files: limit is {settings.upload_max_files}, got {len(files)}",
+        )
+
+    max_file_bytes = settings.upload_max_file_bytes
+    max_aggregate_bytes = settings.upload_max_files * max_file_bytes
+    aggregate_total = 0
     uploads: list[tuple[str, bytes]] = []
+
     for f in files:
         if not f.filename:
             continue
-        data = await f.read()
-        if not data:
+        chunks: list[bytes] = []
+        file_total = 0
+        while True:
+            chunk = await f.read(_UPLOAD_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            file_total += len(chunk)
+            aggregate_total += len(chunk)
+            if file_total > max_file_bytes:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"File '{f.filename}' exceeds limit of {max_file_bytes} bytes",
+                )
+            if aggregate_total > max_aggregate_bytes:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"Upload total exceeds limit of {max_aggregate_bytes} bytes",
+                )
+        if not chunks:
             continue
-        uploads.append((f.filename, data))
+        uploads.append((f.filename, b"".join(chunks)))
     if not uploads:
         return []
     try:

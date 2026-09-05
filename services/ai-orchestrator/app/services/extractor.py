@@ -116,7 +116,16 @@ def _extract_one(raw: _Raw, remaining_budget: int) -> str:
 
 
 def extract_files(uploads: list[tuple[str, bytes]]) -> list[ExtractedFile]:
-    """Extract text from each upload. Caller is responsible for size pre-checks."""
+    """Extract text from each already-fully-read upload.
+
+    Re-checks the file-count and per-file size caps here as defense in
+    depth. The caller is expected to have already enforced both, incrementally,
+    while reading the request body (routes/generate.py's chunked
+    `_read_uploads`, issue #705), so an oversized or excessive upload is
+    rejected before it is ever fully buffered in memory; this function does
+    not defend against that on its own, since by the time it runs, every
+    upload in `uploads` is already fully read into memory.
+    """
     if len(uploads) > settings.upload_max_files:
         raise ExtractionError(
             f"Too many files: limit is {settings.upload_max_files}, got {len(uploads)}"
