@@ -17,7 +17,10 @@ import pytest
 from app import config as config_module
 from app.database import Base, engine
 from app.main import app
-from app.routes.purpose_classification import PURPOSE_CLASSIFICATION_DISABLED_DETAIL
+from app.routes.purpose_classification import (
+    AI_CLASSIFICATION_FAILED_DETAIL,
+    PURPOSE_CLASSIFICATION_DISABLED_DETAIL,
+)
 from app.schemas.purpose import (
     CATEGORIES_MAX_LENGTH,
     DEVICE_IDS_MAX_LENGTH,
@@ -25,7 +28,7 @@ from app.schemas.purpose import (
     PURPOSE_MAX_LENGTH,
 )
 from app.services import purpose_signals, usage_repo
-from app.services.ai_client import AI_NOT_CONFIGURED_DETAIL, get_ai_client
+from app.services.ai_client import AI_NOT_CONFIGURED_DETAIL, AIError, get_ai_client
 from app.services.llm_provider import Usage
 from app.services.purpose_classifier import NO_USABLE_DISTRIBUTION_DETAIL
 from httpx import ASGITransport, AsyncClient
@@ -101,9 +104,10 @@ def _stub_signal_gatherers(monkeypatch):
     monkeypatch.setattr(purpose_signals, "gather_internal_signals", _internal)
 
 
-def _stub_ai(distributions=None):
+def _stub_ai(distributions=None, *, raises: Exception | None = None):
     """A stub AIClient whose classify_purpose returns each queued response
-    in turn (defaulting to a single always-usable distribution)."""
+    in turn (defaulting to a single always-usable distribution), or raises
+    `raises` on every call."""
 
     class StubAI:
         def __init__(self):
@@ -115,6 +119,8 @@ def _stub_ai(distributions=None):
 
         async def classify_purpose(self, *, categories, signals_block):
             self.calls.append({"categories": categories, "signals_block": signals_block})
+            if raises is not None:
+                raise raises
             return self._queue.pop(0), Usage(input_tokens=100, output_tokens=20)
 
     stub = StubAI()
@@ -259,6 +265,26 @@ async def test_preview_502_when_no_usable_distribution_after_retry(async_client)
         resp = await client.post("/classify-purpose/preview", json=PREVIEW_BODY, headers=_headers())
     assert resp.status_code == 502
     assert resp.json()["detail"] == NO_USABLE_DISTRIBUTION_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_preview_502_on_ai_error_never_leaks_provider_text(async_client, caplog):
+    """AIError maps to 502 with the pinned detail (issue #713); the
+    provider's status/body text is logged with traceback, never returned."""
+    secret = "upstream 500: body mentions host=db-internal user=herd"
+    _stub_ai(raises=AIError(secret))
+    with caplog.at_level("ERROR", logger="app.routes.purpose_classification"):
+        async with async_client as client:
+            resp = await client.post(
+                "/classify-purpose/preview", json=PREVIEW_BODY, headers=_headers()
+            )
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == AI_CLASSIFICATION_FAILED_DETAIL
+    assert "db-internal" not in resp.text
+    logged = [r for r in caplog.records if r.getMessage() == "ai_purpose_classification_failed"]
+    assert len(logged) == 1
+    assert logged[0].exc_info is not None
+    assert str(logged[0].exc_info[1]) == secret
 
 
 # --- usage metering ---

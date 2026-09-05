@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Stopped four ai-orchestrator routes from returning raw provider or
+  internal exception text in their HTTP `detail` (issue #713). Topology
+  generation (`POST /generate`) now answers a provider `AIError` with the
+  fixed `AI returned no usable response` and any other exception with
+  `AI call failed`; purpose classification answers `AI classification
+  failed`; the admin-only template identity suggestion answers
+  `AI suggestion failed` and recipe drafting `AI recipe drafting failed`.
+  Each site logs the real exception with its traceback server-side
+  (`logger.exception`) so nothing is lost for operators, matching the rule
+  the reservation assistant already applied.
+
 - Indexed `assistant_conversations` on `(reservation_id, created_at)` in
   ai-orchestrator (issue #712, migration 0005) and bounded the transcript
   read that purpose classification uses. The read is now two steps: the

@@ -49,6 +49,7 @@ from app.services.purpose_classifier import PurposeClassifierError, classify_pur
 logger = logging.getLogger(__name__)
 
 PURPOSE_CLASSIFICATION_DISABLED_DETAIL = "Purpose classification is disabled"
+AI_CLASSIFICATION_FAILED_DETAIL = "AI classification failed"
 
 _get_current_user, _require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -108,8 +109,10 @@ async def _run_classification(
             status.HTTP_503_SERVICE_UNAVAILABLE, AI_PROVIDER_UNREACHABLE_DETAIL
         ) from e
     except AIError as e:
-        logger.warning("ai_purpose_classification_failed: %s", e)
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"AI classification failed: {e}") from e
+        # Fixed detail (issue #713): the provider's status/body text is logged
+        # server-side with the traceback and never reaches the client.
+        logger.exception("ai_purpose_classification_failed")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, AI_CLASSIFICATION_FAILED_DETAIL) from e
 
     await usage_repo.record_usage(db, user_id, usage, fallback_text=signals_block)
 
