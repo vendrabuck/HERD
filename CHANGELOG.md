@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+- Changed inventory's `apply_scheduler` to record a config-apply run whose
+  execution response carries no `status` as `failed` instead of `success`
+  (issue #720); unreachable today, since the contract requires `status`.
+
+- Fixed the base compose file publishing the unauthenticated Traefik
+  dashboard and API (`api.insecure: true`) on all interfaces, so `make prod`
+  exposed `/api/rawdata` (every router rule, backend container address,
+  middleware chain) to anyone who could reach port 8080 (issue #708).
+  `docker-compose.yml` now binds it `127.0.0.1:8080:8080`; the dev override
+  deliberately adds no second binding, since compose merges port lists and
+  nothing in dev, CI, or QA reaches the dashboard off-host. `FRESH_SETUP.md`
+  describes the SSH tunnel for remote viewing, and a repo-root unit test
+  (`tests/unit/test_compose_ports.py`) yaml-parses both compose files and
+  pins the loopback-only publish.
+
+- Fixed an admin being able to deactivate the superadmin through
+  `POST /users/{id}/deactivate` (issue #715). The endpoint now refuses a
+  superadmin target with 400 `Cannot deactivate the superadmin`, mirroring
+  the role-change carve-out; `POST /users/{id}/activate` is deliberately
+  unchanged, since it is the recovery direction. A deactivated superadmin
+  could not log in or refresh, was not re-seeded at startup, and the LDAP
+  sync never reactivates a local user.
+
+- Fixed `PATCH /preferences` in the user-profile service validating only the
+  incoming dict, never the merged result, so repeated patches could grow one
+  JSONB row past every cap (issue #714). The service now validates each
+  merged dict (the 200-key and 64 KB caps on `saved_filters` and `extras`,
+  the key cap and page-size range on `page_sizes`) before assigning anything
+  and answers 422 with a `merged <field> ...` detail; a rejected PATCH
+  leaves the row exactly as it was. `PUT` and `DELETE` remain the shrink
+  paths.
 - Fixed the AI commit path silently dropping an approved network-element
   attachment when inventory's ports fetch failed (issue #717):
   `_fetch_device_ports` now raises `CommitError(503)` on a transport failure

@@ -82,7 +82,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"  # Traefik dashboard
+      - "127.0.0.1:8080:8080"  # Traefik dashboard, unauthenticated: loopback only (issue #708)
     volumes:
       - ./infra/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro

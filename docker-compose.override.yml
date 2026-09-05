@@ -97,6 +97,14 @@ services:
     command:
       - "--configFile=/etc/traefik/traefik.yml"
       - "--log.level=DEBUG"
+    # The dashboard (port 8080, api.insecure: true, no auth) is published on
+    # loopback only by the base file (issue #708) and is NOT widened here:
+    # compose MERGES port lists, so a second "8080:8080" entry would leave
+    # the dev stack binding container port 8080 twice, and nothing in dev,
+    # CI, or QA reaches it on a non-loopback address. To widen it locally,
+    # replace the whole list with `ports: !override` (compose >= 2.24) and
+    # verify with `docker compose config`; tests/unit/test_compose_ports.py
+    # pins that this file adds no second 8080 binding.
 
   selenium:
     image: selenium/standalone-chrome:latest

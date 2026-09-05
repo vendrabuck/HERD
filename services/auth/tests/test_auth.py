@@ -699,6 +699,67 @@ async def test_cannot_deactivate_own_account(superadmin_client):
     assert resp.json()["detail"] == "Cannot deactivate your own account"
 
 
+async def _promote_to_superadmin_in_db(user_id: str) -> None:
+    """The API refuses to assign superadmin, so the second superadmin row a
+    carve-out test needs is written straight to the DB."""
+    from sqlalchemy import update
+
+    async with TestSessionLocal() as session:
+        await session.execute(
+            update(User).where(User.id == uuid.UUID(user_id)).values(role=Role.SUPERADMIN)
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_deactivate_superadmin(admin_client):
+    """Issue #715: the role-change carve-out is mirrored on deactivate. An
+    admin gets the pinned 400 and the superadmin row stays active."""
+    target = await _register_and_get(admin_client, "sa-deact@test.com", "sadeact")
+    await _promote_to_superadmin_in_db(target["id"])
+
+    resp = await admin_client.post(f"/users/{target['id']}/deactivate")
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Cannot deactivate the superadmin"
+
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uuid.UUID(target["id"]))
+        assert user.is_active is True
+        assert user.role == Role.SUPERADMIN
+
+
+@pytest.mark.asyncio
+async def test_superadmin_cannot_deactivate_another_superadmin(superadmin_client):
+    """The carve-out keys on the TARGET's role, not the caller's."""
+    target = await _register_and_get(superadmin_client, "sa-deact2@test.com", "sadeact2")
+    await _promote_to_superadmin_in_db(target["id"])
+
+    resp = await superadmin_client.post(f"/users/{target['id']}/deactivate")
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Cannot deactivate the superadmin"
+
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uuid.UUID(target["id"]))
+        assert user.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_activate_superadmin_has_no_carve_out(admin_client):
+    """activate is the recovery direction (issue #715): a superadmin row that
+    is somehow inactive (a pre-fix deactivation, a DB edit) must be
+    reactivatable by any admin in one call."""
+    target = await _register_and_get(admin_client, "sa-react@test.com", "sareact")
+    await _promote_to_superadmin_in_db(target["id"])
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uuid.UUID(target["id"]))
+        user.is_active = False
+        await session.commit()
+
+    resp = await admin_client.post(f"/users/{target['id']}/activate")
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is True
+
+
 @pytest.mark.asyncio
 async def test_regular_user_cannot_activate_or_deactivate(regular_client):
     some_id = uuid.uuid4()

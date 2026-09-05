@@ -424,3 +424,87 @@ async def test_internal_endpoint_isolates_users(user_client, no_auth_client):
     data = resp.json()
     assert data["user_id"] == str(other_user)
     assert data["extras"] == {}
+
+
+# --- PATCH validates the MERGED result, not just the request (issue #714) ---
+
+
+@pytest.mark.asyncio
+async def test_patch_past_blob_cap_returns_422_and_leaves_row_unchanged(user_client):
+    """Two PATCHes each under the 64 KB cap must not combine into a row over
+    it. The second PATCH is refused with 422 and the stored row is exactly
+    what the first PATCH left."""
+    big = "x" * 40_000  # 40 KB serialized, under the 64 KB per-field cap
+    first = await user_client.patch("/preferences", json={"saved_filters": {"a": big}})
+    assert first.status_code == 200
+    second = await user_client.patch("/preferences", json={"saved_filters": {"b": big}})
+    assert second.status_code == 422
+    assert second.json()["detail"] == (
+        "merged saved_filters is too large (max 65536 bytes serialized)"
+    )
+    stored = (await user_client.get("/preferences")).json()
+    assert stored["saved_filters"] == {"a": big}
+
+
+@pytest.mark.asyncio
+async def test_patch_merge_past_key_cap_returns_422(user_client):
+    """150 stored keys plus 100 fresh keys would be 250 against a cap of 200."""
+    base = {f"k{i}": i for i in range(150)}
+    first = await user_client.put(
+        "/preferences", json={"saved_filters": base, "page_sizes": {}, "extras": {}}
+    )
+    assert first.status_code == 200
+    fresh = {f"n{i}": i for i in range(100)}
+    resp = await user_client.patch("/preferences", json={"saved_filters": fresh})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "merged saved_filters has too many keys (max 200)"
+    stored = (await user_client.get("/preferences")).json()
+    assert stored["saved_filters"] == base
+
+
+@pytest.mark.asyncio
+async def test_patch_merge_past_page_sizes_key_cap_returns_422(user_client):
+    """page_sizes goes through its own validator; the merged result is capped too."""
+    base = {f"p{i}": 25 for i in range(150)}
+    await user_client.put(
+        "/preferences", json={"saved_filters": {}, "page_sizes": base, "extras": {}}
+    )
+    fresh = {f"q{i}": 25 for i in range(100)}
+    resp = await user_client.patch("/preferences", json={"page_sizes": fresh})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "merged page_sizes has too many keys (max 200)"
+    stored = (await user_client.get("/preferences")).json()
+    assert stored["page_sizes"] == base
+
+
+@pytest.mark.asyncio
+async def test_patch_rejection_leaves_other_fields_untouched(user_client):
+    """A single PATCH carrying a valid extras merge AND an over-cap saved_filters
+    merge is rejected as a whole: no field is partially applied."""
+    big = "x" * 40_000
+    await user_client.put(
+        "/preferences",
+        json={"saved_filters": {"a": big}, "page_sizes": {}, "extras": {"theme": "light"}},
+    )
+    resp = await user_client.patch(
+        "/preferences",
+        json={"saved_filters": {"b": big}, "extras": {"theme": "dark"}},
+    )
+    assert resp.status_code == 422
+    stored = (await user_client.get("/preferences")).json()
+    assert stored["saved_filters"] == {"a": big}
+    assert stored["extras"] == {"theme": "light"}
+
+
+@pytest.mark.asyncio
+async def test_patch_overwriting_existing_keys_stays_within_cap(user_client):
+    """Overwriting a key does not grow the key count, so a merge that lands
+    exactly at the cap is accepted."""
+    base = {f"k{i}": i for i in range(200)}
+    await user_client.put(
+        "/preferences", json={"saved_filters": base, "page_sizes": {}, "extras": {}}
+    )
+    resp = await user_client.patch("/preferences", json={"saved_filters": {"k0": "changed"}})
+    assert resp.status_code == 200
+    assert resp.json()["saved_filters"]["k0"] == "changed"
+    assert len(resp.json()["saved_filters"]) == 200
