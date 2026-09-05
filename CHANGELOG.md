@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- Fixed an admin being able to deactivate the superadmin through
+  `POST /users/{id}/deactivate` (issue #715). The endpoint now refuses a
+  superadmin target with 400 `Cannot deactivate the superadmin`, mirroring
+  the role-change carve-out; `POST /users/{id}/activate` is deliberately
+  unchanged, since it is the recovery direction. A deactivated superadmin
+  could not log in or refresh, was not re-seeded at startup, and the LDAP
+  sync never reactivates a local user.
+
 - Fixed `PATCH /preferences` in the user-profile service validating only the
   incoming dict, never the merged result, so repeated patches could grow one
   JSONB row past every cap (issue #714). The service now validates each
