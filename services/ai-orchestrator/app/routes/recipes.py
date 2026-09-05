@@ -40,6 +40,8 @@ from app.services.recipe_author import (
 
 logger = logging.getLogger(__name__)
 
+RECIPE_DRAFT_AI_FAILED_DETAIL = "AI recipe drafting failed"
+
 RECIPE_AUTHORING_DISABLED_DETAIL = "AI recipe authoring is disabled"
 
 _get_current_user, require_admin = make_auth_dependencies(
@@ -141,7 +143,9 @@ async def _run_authoring(
             status.HTTP_503_SERVICE_UNAVAILABLE, AI_PROVIDER_UNREACHABLE_DETAIL
         ) from e
     except AIError as e:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e)) from e
+        # Fixed detail (issue #713): provider text stays in the server log.
+        logger.exception("ai_recipe_drafting_failed")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, RECIPE_DRAFT_AI_FAILED_DETAIL) from e
 
     await usage_repo.record_usage(db, user_id, usage, fallback_text=prompt + draft.driver_py)
     return _to_response(draft)

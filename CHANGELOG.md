@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+- Stopped four ai-orchestrator routes from returning raw provider or
+  internal exception text in their HTTP `detail` (issue #713). Topology
+  generation (`POST /generate`) now answers a provider `AIError` with the
+  fixed `AI returned no usable response` and any other exception with
+  `AI call failed`; purpose classification answers `AI classification
+  failed`; the admin-only template identity suggestion answers
+  `AI suggestion failed` and recipe drafting `AI recipe drafting failed`.
+  Each site logs the real exception with its traceback server-side
+  (`logger.exception`) so nothing is lost for operators, matching the rule
+  the reservation assistant already applied.
+
+- Indexed `assistant_conversations` on `(reservation_id, created_at)` in
+  ai-orchestrator (issue #712, migration 0005) and bounded the transcript
+  read that purpose classification uses. The read is now two steps: the
+  reservation's conversation ids ordered by `created_at`, then only the
+  newest 200 message rows across those conversations (ordered by
+  conversation `created_at` and `position`, never a bare `position`, which
+  resets per conversation), selecting just `(role, content_blocks,
+  position)` and reversed in Python before the existing role filter and
+  12000-character trim. The old `(user_id, reservation_id)` composite index
+  is kept for now; dropping it is a follow-up.
+
+- Hardened the purpose-classification request path in ai-orchestrator
+  (issue #709). Both `POST /classify-purpose/preview` and
+  `POST /internal/classify-purpose` now bound their bodies: `purpose` at
+  2000 characters, `device_ids` at 200, `dynamic_requests` at 50 (the caps
+  reservations' own `ReservationCreate` already enforces) and `categories`
+  at 64, each rejected with 422. The provider-configured (503) and daily
+  quota (429) gates now run BEFORE the signal gather in both handlers, so an
+  unconfigured provider or an over-quota caller can no longer drive the
+  inventory and cabling fan-out. `dynamic_requests` are deduped by template
+  id before fetching (counts for a repeated template are summed, matching
+  reservations' N-entries-means-N-instances semantic), and the internal
+  pass's per-device inventory reads (device detail and config-apply job
+  summaries) plus the per-template reads run concurrently under a
+  semaphore of 8 instead of strictly one after another; results keep
+  request order and the per-item drop-on-failure contract is unchanged.
 - Fixed outbox LISTEN task hardening (2026-09-04 review sweep, four confirmed
   findings in `herd_common/outbox.py`'s `_listen_for_wakeups` and
   `run_outbox_relay`): (1) the lost-connection branch (the registered

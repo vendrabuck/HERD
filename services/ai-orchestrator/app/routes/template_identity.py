@@ -30,6 +30,8 @@ from app.services.ai_client import (
 
 logger = logging.getLogger(__name__)
 
+AI_SUGGESTION_FAILED_DETAIL = "AI suggestion failed"
+
 _get_current_user, require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
     algorithm=settings.algorithm,
@@ -83,10 +85,11 @@ async def suggest_identity(
             AI_PROVIDER_UNREACHABLE_DETAIL,
         ) from e
     except AIError as e:
-        logger.warning("ai_template_identity_suggestion_failed: %s", e)
+        # Fixed detail (issue #713): provider text stays in the server log.
+        logger.exception("ai_template_identity_suggestion_failed")
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
-            f"AI suggestion failed: {e}",
+            AI_SUGGESTION_FAILED_DETAIL,
         ) from e
 
     await usage_repo.record_usage(
