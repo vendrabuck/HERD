@@ -102,17 +102,35 @@ async def test_non_admin_connections_filtered_to_visible_devices(
     visible_fresh_device is granted to the shared intuser via a device group;
     fresh_devices(2) produces two throwaway devices that stay in "No Pool"
     (no user-group permission), so they are invisible to that same intuser.
-    Three connections are created: one touching the visible device (should
-    appear for the non-admin), and one between the two invisible devices
-    (should be absent for the non-admin, present for the admin).
+    The "visible" connection must pair two devices sharing a device group, or
+    cabling's group-boundary check (test_same_group_cabling_allowed) rejects
+    it with 422, so a second device is added to visible_fresh_device's own
+    group rather than pairing it with an invisible "No Pool" device. Three
+    connections are created: one between the two same-group visible devices
+    (should appear for the non-admin), and one between the two invisible
+    devices, who share "No Pool" (should be absent for the non-admin, present
+    for the admin).
     """
     invisible_devices = await fresh_devices(2)
+    visible_devices = await fresh_devices(1)
     connection_visible_id = None
     connection_invisible_id = None
     try:
+        groups_resp = await admin_client.get(
+            f"/inventory/device-groups/device/{visible_fresh_device['id']}"
+        )
+        groups_resp.raise_for_status()
+        visible_group_id = groups_resp.json()[0]["id"]
+
+        add_resp = await admin_client.post(
+            f"/inventory/device-groups/{visible_group_id}/devices/bulk",
+            json={"device_ids": [visible_devices[0]["id"]]},
+        )
+        add_resp.raise_for_status()
+
         resp = await admin_client.post(
             "/cabling/connections",
-            json=_connect_body(visible_fresh_device, invisible_devices[0]),
+            json=_connect_body(visible_fresh_device, visible_devices[0]),
         )
         assert resp.status_code == 201, resp.text
         connection_visible_id = resp.json()["id"]
@@ -130,7 +148,7 @@ async def test_non_admin_connections_filtered_to_visible_devices(
         assert resp.status_code == 201, resp.text
         connection_invisible_id = resp.json()["id"]
 
-        # Non-admin: only the connection touching the visible device appears.
+        # Non-admin: only the connection between same-group visible devices appears.
         user_resp = await user_client.get("/cabling/connections", params={"limit": 500})
         user_resp.raise_for_status()
         user_ids = {c["id"] for c in user_resp.json()["items"]}
