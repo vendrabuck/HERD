@@ -24,7 +24,7 @@ the app engine, so this suite shares that engine (mirrors test_fork_archive_reco
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -508,7 +508,7 @@ async def test_sweep_creates_missing_fork_and_stages_initial_wiring():
     ):
         await _run_fork_archive_reconcile()
 
-    create.assert_awaited_once_with(rid, topology_id, str(USER_ID))
+    create.assert_awaited_once_with(rid, topology_id, str(USER_ID), ANY)
     rows = await _wiring_rows()
     assert len(rows) == 1
     payload = rows[0].payload
@@ -564,7 +564,7 @@ async def test_sweep_backstop_one_failure_does_not_block_the_rest():
     rid_a = await _insert(ReservationStatus.ACTIVE, topology_id=topo_a)
     rid_b = await _insert(ReservationStatus.ACTIVE, topology_id=topo_b)
 
-    async def _create(reservation_id, topology_id, created_by=None):
+    async def _create(reservation_id, topology_id, created_by=None, member_device_ids=None):
         if reservation_id == rid_a:
             raise RuntimeError("cabling down for a")
         return 1

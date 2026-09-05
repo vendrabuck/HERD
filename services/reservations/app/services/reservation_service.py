@@ -221,10 +221,54 @@ async def _validate_topology_connectivity(topology_id: uuid.UUID) -> None:
     )
 
 
+class ForkMembershipRefused(Exception):
+    """Cabling refused a fork create/save with 409 fork_device_not_member (D2/D3 of
+    the 2026-09-04 fork endpoint-membership fix).
+
+    Deliberately NOT a RuntimeError: a 409 here is cabling's definitive answer that
+    the canvas names a device outside the reservation, not a transient failure, so
+    it must never be retried the way a transport error or a 5xx is. Carries the
+    offending device ids (as strings) so the caller can log them.
+    """
+
+    def __init__(self, device_ids: list[str]):
+        super().__init__(f"fork create refused: devices not in reservation: {device_ids}")
+        self.device_ids = device_ids
+
+
+# Per-process, in-memory set of reservations whose fork create was definitively
+# refused for endpoint-membership reasons (D3): a 409 is not a transient failure,
+# so once seen the backstop must stop re-attempting it every tick, unlike the
+# bounded-retry give-up counter (_fork_backstop_attempts in tasks/expiration.py)
+# that exists for genuinely transient failures. Cleared only by a process restart
+# or by the reservation leaving the backstop's ACTIVE-with-topology row set (see
+# prune_fork_membership_refused, called from the same prune site as the attempts
+# counter).
+_fork_membership_refused: set[uuid.UUID] = set()
+
+
+def is_fork_membership_refused(reservation_id: uuid.UUID) -> bool:
+    """Whether this reservation's fork create was already refused for endpoint-
+    membership reasons (409) and should not be retried this process lifetime."""
+    return reservation_id in _fork_membership_refused
+
+
+def prune_fork_membership_refused(current_ids: set[uuid.UUID]) -> None:
+    """Drop refusal entries for reservations no longer in the backstop's row set.
+
+    Mirrors the _fork_backstop_attempts prune in _backstop_missing_forks: a
+    reservation that ends before its membership conflict is ever resolved must not
+    leak its entry for the life of the process.
+    """
+    for stale_id in _fork_membership_refused - current_ids:
+        _fork_membership_refused.discard(stale_id)
+
+
 async def _create_reservation_fork(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
+    member_device_ids: list[uuid.UUID] | None = None,
 ) -> int | None:
     """Create the editable per-reservation fork in cabling at activation (issue #25).
 
@@ -237,15 +281,24 @@ async def _create_reservation_fork(
     Authenticated as a service-to-service call via X-Internal-Token: the booking
     user does not necessarily own the parent topology.
 
+    ``member_device_ids`` is the reservation's device set (D5, the 2026-09-04 fork
+    endpoint-membership fix), forwarded as cabling's required ``member_device_ids``;
+    a caller with no real device list (there is none in this module's unit tests
+    that exercise unrelated behavior) gets the fail-closed empty list, which makes
+    cabling refuse any real canvas endpoint rather than accept one permissively.
+
     Returns the created fork's version_number (v1 for a fresh fork; the current max
     for an idempotent re-create), which the caller uses to stage the initial
     reservation.wiring_changed reconcile (ADR 0009 phase 7). Returns None when no
     fork was created (no parent topology, or no internal token).
 
-    Fail-open: a fork-create failure must NOT strand a successfully-provisioned
-    reservation. The caller wraps this in retry_with_backoff and, on exhaustion,
-    logs and continues, leaving fork_id null. The reservation is still usable; the
-    editable bench is created lazily on first edit or by the sweep heal.
+    Fail-open for transient failures: a transport error or a 5xx must NOT strand a
+    successfully-provisioned reservation. The caller wraps this in retry_with_backoff
+    (retryable only on RuntimeError/httpx.HTTPError) and, on exhaustion, logs and
+    continues, leaving fork_id null. A 409 (ForkMembershipRefused) is different: it
+    is cabling's definitive refusal, not a transient failure, so it is raised as a
+    type retry_with_backoff's retryable tuple deliberately excludes, and propagates
+    on the first attempt with no retry.
     """
     if topology_id is None:
         # Decision 3 Case A: no parent topology, create the fork lazily on first
@@ -267,9 +320,19 @@ async def _create_reservation_fork(
                 "parent_topology_id": str(topology_id),
                 "parent_version_id": None,
                 "created_by": created_by,
+                "member_device_ids": [str(d) for d in (member_device_ids or [])],
             },
             timeout=10.0,
         )
+    if resp.status_code == 409:
+        device_ids: list[str] = []
+        try:
+            detail = resp.json().get("detail") or {}
+        except ValueError:
+            detail = {}
+        if isinstance(detail, dict) and detail.get("error") == "fork_device_not_member":
+            device_ids = detail.get("device_ids") or []
+        raise ForkMembershipRefused(device_ids)
     if resp.status_code >= 400:
         raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
     body = resp.json()
@@ -280,6 +343,7 @@ async def _create_reservation_fork_best_effort(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
     created_by: str | None = None,
+    member_device_ids: list[uuid.UUID] | None = None,
 ) -> bool:
     """Create the fork with bounded retry, then stage the initial wiring reconcile.
 
@@ -296,6 +360,17 @@ async def _create_reservation_fork_best_effort(
     True; only the retry-exhausted except branch returns False. The best-effort
     wiring_changed staging that follows a successful create is itself independently
     best-effort and does not affect this return value.
+
+    D3 of the 2026-09-04 fork endpoint-membership fix: a cabling 409
+    (ForkMembershipRefused) is caught separately, BEFORE the generic except, and
+    treated as definitive, not retried. It is logged at WARNING (not ERROR) with the
+    offending device ids, creates no fork, leaves the reservation ACTIVE unwired
+    exactly like the existing "fork creation failed" posture, and marks the
+    reservation in the process-local ``_fork_membership_refused`` set so the
+    expiration sweep's backstop (``_backstop_missing_forks``) stops re-attempting it
+    every tick. Returns True (not the retry-exhausted False) because looping the
+    give-up counter on a refusal that will never succeed on its own serves no
+    purpose; the marker itself is what stops the backstop, not this return value.
 
     ADR 0009 phase 7 unifies initial provisioning through the fork: instead of the
     execution service driving legacy device-set resolvers off reservation.created,
@@ -330,12 +405,34 @@ async def _create_reservation_fork_best_effort(
         return True
     try:
         fork_version = await retry_with_backoff(
-            lambda: _create_reservation_fork(reservation_id, topology_id, created_by),
+            lambda: _create_reservation_fork(
+                reservation_id, topology_id, created_by, member_device_ids
+            ),
             attempts=3,
             initial_delay=0.5,
             factor=2.0,
             max_delay=5.0,
+            # Excludes ForkMembershipRefused deliberately (D3): it is not a
+            # RuntimeError or an httpx transport/status error, so it is never caught
+            # here and propagates on the first attempt with no retry, straight to
+            # the dedicated except clause below.
+            retryable=(RuntimeError, httpx.HTTPError),
         )
+    except ForkMembershipRefused as exc:
+        logger.warning(
+            "Fork creation refused for reservation %s: canvas endpoint device(s) "
+            "not in reservation membership: %s",
+            reservation_id,
+            exc.device_ids,
+            extra={
+                "action": "reservation_fork_membership_refused",
+                "reservation_id": str(reservation_id),
+                "topology_id": str(topology_id),
+                "device_ids": exc.device_ids,
+            },
+        )
+        _fork_membership_refused.add(reservation_id)
+        return True
     except Exception:
         logger.error(
             "Fork creation failed for reservation %s; leaving fork_id null",
@@ -673,6 +770,7 @@ async def _lazy_create_reservation_fork(
     reservation_id: uuid.UUID,
     topology_id: uuid.UUID | None,
     created_by: str,
+    member_device_ids: list[uuid.UUID],
 ) -> None:
     """Create the fork on a GET-miss for an ACTIVE reservation (ADR 0006 Decision 2).
 
@@ -681,9 +779,12 @@ async def _lazy_create_reservation_fork(
     with no parent topology: a read/edit of the bench is exactly ADR 0001 Decision 3
     Case A's "start wiring this reservation" trigger. Same idempotent
     POST /internal/forks; cabling builds a null-canvas fork when parent_topology_id
-    is null. Raises RuntimeError on a transport failure or a cabling error so the
-    caller maps it to 503. Not best-effort: the user asked to see the fork, so a
-    creation failure must surface, not silently yield a 404.
+    is null. Raises RuntimeError on a transport failure or a cabling error (including
+    a 409 endpoint-membership refusal, D5 of the 2026-09-04 fix: this path forwards
+    the reservation's real device set so cabling's check runs, but its own error
+    mapping stays the existing generic one) so the caller maps it to 503. Not
+    best-effort: the user asked to see the fork, so a creation failure must surface,
+    not silently yield a 404.
     """
     resp = await _cabling_fork_call(
         "POST",
@@ -693,6 +794,7 @@ async def _lazy_create_reservation_fork(
             "parent_topology_id": str(topology_id) if topology_id else None,
             "parent_version_id": None,
             "created_by": created_by,
+            "member_device_ids": [str(d) for d in member_device_ids],
         },
     )
     if resp.status_code >= 400:
@@ -1401,7 +1503,10 @@ async def create_reservation(
     #    provision-result callback when it activates.
     if reservation.status == ReservationStatus.ACTIVE:
         await _create_reservation_fork_best_effort(
-            reservation.id, reservation.topology_id, created_by=str(user_id)
+            reservation.id,
+            reservation.topology_id,
+            created_by=str(user_id),
+            member_device_ids=list(reservation.device_ids),
         )
 
     return reservation
@@ -1511,7 +1616,10 @@ async def apply_provision_result(
             },
         )
         await _create_reservation_fork_best_effort(
-            reservation.id, reservation.topology_id, created_by=str(reservation.user_id)
+            reservation.id,
+            reservation.topology_id,
+            created_by=str(reservation.user_id),
+            member_device_ids=list(reservation.device_ids),
         )
         return reservation, True
 
