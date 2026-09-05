@@ -2,6 +2,330 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-05
+
+- Shipped lab purpose classification end to end (ADR 0013, issue #646, phases 1
+  to 3): a closed taxonomy per reservation, an AI-suggested category the owner
+  or an admin confirms on the new Administration > Purpose Review page, a
+  background reconciler that classifies reservations as they end, and device-
+  and user-level purpose reporting that counts transit gear on a reservation's
+  paths, with CSV downloads for every purpose section.
+- Ran a full multi-pass code review of the codebase (the 2026-09-04 review
+  sweep) and closed all 21 resulting issues (#701 to #721). The headline fixes:
+  fork saves and activation snapshots now refuse a canvas endpoint device
+  outside the reservation's membership (cross-tenant provisioning was reachable
+  before), port claims across forks are serialized with transaction-scoped
+  advisory locks at both fork write paths, scheduled config-apply jobs re-check
+  the creator's authority at fire time, and three read surfaces are gated (group
+  member emails are admin-only, device config-version reads follow device
+  visibility, the connections list is filtered to the caller's visible devices).
+- Made the transactional outbox wake on write (issue #682) through Postgres
+  NOTIFY/LISTEN, so a staged event publishes within milliseconds instead of
+  waiting for the relay tick; hardened the listener for reconnects, TLS and
+  pooler DSNs, and saturated batches (#707). NATS pull consumers now fetch one
+  message per pull, which fixed the first-run notification flake at its source
+  (#648).
+- Moved the purpose-classification reconciler onto its own background task with
+  a transient outcome class, so a slow orchestrator no longer delays the
+  expiration sweep and a rate limit no longer burns a row's attempts (#702,
+  #706).
+- Added AI-proposed network elements (#632): the topology generator can place
+  the four element types and the commit path keeps them.
+- Closed the fork restore-versus-save race with a row lock (#626), indexed the
+  ACTIVE fork listing and preloaded the wiring ledger (#710), and stopped device
+  lists from truncating at 500 rows (#703).
+- Hardening batch from the sweep: Traefik's dashboard bound to loopback,
+  superadmin deactivation refused, user-profile preference validation, bounded
+  upload buffering that rejects an over-cap request before it is fully read,
+  provider error text kept out of responses, and a fail-closed AI commit path
+  for network elements.
+
+### Delivery detail
+
+#### Purpose classification and reporting
+
+- Reliability fix: the purpose-classification reconciler now runs on its own
+  background task instead of riding the reservations expiration sweep (issue
+  #702, 2026-09-04 review sweep finding). The reconciler awaits one
+  orchestrator LLM call per eligible row, serially, up to
+  `purpose_classify_batch_size` rows (default 20) each bounded by
+  `purpose_classify_timeout_seconds` (default 30s); a single tick could
+  therefore run for minutes, delaying every other reconciler that shared the
+  loop (scheduled activation, auto-completion, both provisioning-timeout
+  backstops, fork archiving, wiring heal, and pending prune) behind a slow or
+  hung orchestrator. `services/reservations/app/main.py` now starts a second
+  task, `purpose_classify_loop`, at its own interval
+  (`PURPOSE_CLASSIFY_INTERVAL_SECONDS`, default 60s), cancelled alongside the
+  expiration task at shutdown; the reconciler's body stays sequential (no
+  concurrent LLM calls). `expiration_loop` no longer calls the reconciler.
+- Bug fix: the purpose-classification reconciler gains a `transient` outcome
+  class and stops misreading an internal-token failure as the feature being
+  off (issue #706, 2026-09-04 review sweep finding). Previously every
+  non-403/404 failure, a 429 rate limit, a 502/503/504, a timeout, or a
+  transport error, incremented a row's `purpose_classify_attempts` exactly
+  like a genuine per-row rejection; a quota 429 lasts until UTC midnight
+  (hundreds of sweep ticks), so a rate-limited owner's rows deterministically
+  capped out, invisible in aggregate metrics. A new `transient` outcome for
+  those cases ends the tick without touching any row's attempts, the same
+  treatment `feature_off` already had. Separately, `POST
+  /internal/classify-purpose` can 403 for two unrelated reasons
+  (`AI_PURPOSE_CLASSIFICATION_ENABLED` off, or an internal-token mismatch),
+  and the reconciler read either as "the feature is off", silently stalling
+  the backlog after a token rotation while logging the wrong cause. The
+  orchestrator's flag-off refusal now carries a structured detail,
+  `{"error": "purpose_classification_disabled", "message": "Purpose
+  classification is disabled"}`; the reconciler treats a 403 as feature-off
+  only when that marker is present (falling back to the exact legacy
+  plain-string detail for a pre-fix orchestrator image during a rolling
+  upgrade), and logs any other 403 at WARNING as a likely internal-token
+  problem instead. See the ADR 0013 amendment for the full outcome taxonomy.
+- Added Download CSV buttons for the four purpose reporting sections (issue
+  #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
+  join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a
+  button on the purpose bar chart (confirmed data), a second button next to
+  it for the AI-suggested bucket (shown only once `by_purpose_suggested` is
+  in the report payload), and one on each purpose mix table (By User, By
+  Device), all calling the existing `downloadUtilizationCsv` with the
+  page's current window. The server has served these sections since #646
+  phases 1-2; only the frontend wiring was missing.
+- Added lab purpose classification, phase 3 (issue #646): device-level
+  utilization reporting now inherits transit gear from cabling's fork
+  wiring. Cabling gains `POST /internal/forks/devices/batch`
+  (X-Internal-Token, 1 to 500 reservation ids) returning, per reservation
+  with a fork (ACTIVE or ARCHIVED), the sorted distinct device ids across
+  its `fork_connections` rows. Reservations' utilization report calls it in
+  chunks of 500 and folds each reservation's fork-connected devices minus
+  its own reserved `device_ids` into `by_device` and `by_device_purpose`: a
+  transit device inherits the reservation's confirmed category (or
+  `unclassified`) exactly as a reserved device does, and a device both
+  reserved and on a path counts once, as reserved. `reservation_count`/
+  `hours` and `reservations`/`device_hours` are now INCLUSIVE of transit
+  gear; both buckets gain `transit_reservations` and a transit-hours field
+  (`transit_hours` on `DeviceBucket`, `transit_device_hours` on
+  `DevicePurposeBucket`) reporting the transit share alone. A new
+  `include_transit` query parameter (default true) on both
+  `GET /reports/utilization` and its CSV twin skips the cabling call
+  entirely when false, reproducing phase-1 semantics; `UtilizationReport`
+  gains `transit_included` echoing the effective value. Cabling being
+  unreachable, or returning a non-200, fails CLOSED with 503
+  `{"error": "transit_gear_unavailable"}` on both routes rather than
+  silently reporting zero transit devices. The `device`/`device_purpose`
+  CSV sections gain trailing `transit_reservations`/transit-hours columns.
+  The reporting page's by-device Purpose Mix table gains a Transit column
+  (hours plus a percentage for a mixed row, a small tag for a transit-only
+  row) and a helper line naming which semantics are in effect.
+- Added lab purpose classification, phase 2 (issue #646): the AI orchestrator
+  gains `POST /api/ai/classify-purpose/preview` (user JWT, creation pass) and
+  `POST /api/ai/internal/classify-purpose` (X-Internal-Token, end-of-
+  reservation pass), both behind `AI_PURPOSE_CLASSIFICATION_ENABLED`
+  (default off, enforced at the route boundary like recipe authoring). Each
+  makes one forced `classify_purpose` tool call against a caller-supplied
+  category list, assembling a prompt from purpose text, topology device/
+  template/wiring signals, dynamic template names, config-apply job names
+  and counts, fork version count, duration/status, and, when
+  `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is set (default on), the reservation
+  assistant's own transcripts; a signal-fetch failure is logged and dropped
+  rather than failing the request, reflected in the response's
+  `signals_used`. `GET /api/ai/status` gains `purpose_classification`.
+  Inventory gains one small additive internal endpoint,
+  `GET /devices/{device_id}/apply-jobs/internal`, to feed the config-apply
+  signal without a user JWT. See `docs/AI_PURPOSE_CLASSIFICATION.md`.
+- Added lab purpose classification, phase 1 (issue #646): reservations gain an
+  optional `purpose_category` validated against a configured taxonomy
+  (`PURPOSE_CATEGORIES`), settable by the owner or an admin in any status
+  including terminal via `PATCH /{id}/purpose-category`, listed via
+  `GET /purpose-categories`, and carried additively on every
+  `reservation.*` lifecycle event and the `/api/v1` facade. The utilization
+  report and its CSV export gain `by_purpose`, `by_user_purpose`, and
+  `by_device_purpose` breakdowns, with an explicit `unclassified` bucket for
+  reservations with no category. Device-level classification counts reserved
+  devices only; transit-gear inheritance is deferred to phase 3.
+- Added lab purpose classification, phase 2 reservations-side pieces (issue
+  #646, ADR 0013 points 8-11): a reservation transitioning into COMPLETED,
+  CANCELLED, or FAILED now stamps `purpose_classify_requested_at`, the sole
+  trigger for a new expiration-sweep reconciler that calls the AI
+  orchestrator's internal classify-purpose endpoint in bounded batches
+  (`PURPOSE_CLASSIFY_BATCH_SIZE`, capped at `PURPOSE_CLASSIFY_MAX_ATTEMPTS`
+  retries per row) and stores the result verbatim as `purpose_suggestion`. New
+  admin endpoints: `GET /admin/purpose-review` (paginated, filterable by
+  suggested category) lists undismissed suggestions still worth a look,
+  `POST /admin/purpose-review/{id}/accept` writes a suggestion (or a chosen
+  override) into the confirmed `purpose_category`, `POST
+  /admin/purpose-review/{id}/dismiss` drops a suggestion from the queue
+  without touching the confirmed value, and `POST /admin/purpose/backfill`
+  marks every terminal reservation with no suggestion yet as eligible
+  (idempotent). The utilization report gains `by_purpose_suggested` (and a
+  matching CSV section) for reservations with a suggestion but no confirmed
+  category; `unclassified` now means neither a category nor a suggestion.
+  Suggestions are internal review state, not exposed on the `/api/v1` facade.
+
+#### Reservations and provisioning
+
+- Fixed reservations' cancel/release inventory cleanup treating a 404 from
+  inventory as a hard failure (issue #716). Since #682 execution's terminal
+  teardown starts roughly a millisecond after a cancel or release commits,
+  and for a dynamic-only booking it deletes the materialized device; if that
+  landed first, `_update_device_statuses` raised on the resulting 404,
+  triggering retries and an ERROR log for a device that was correctly gone,
+  and `_fetch_devices_best_effort` turned that same 404 into "assume
+  exclusive", so the retry loop re-POSTed a status update against a device
+  reservations had just been told did not exist. A 404 on the AVAILABLE
+  (release) direction of `_update_device_statuses` now counts as success
+  with no retry and no ERROR log; the RESERVED (booking) direction is
+  unchanged and still raises, since inventory not recognizing a device being
+  booked is a real failure. `_fetch_devices_best_effort` now surfaces a 404
+  as the distinct `_DeviceGoneFromInventory` rather than a generic
+  exception, and `_release_exclusive_devices_best_effort` drops that id from
+  the release set with an INFO log instead of assuming it is exclusive and
+  re-releasing it.
+
+#### Cabling and forks
+
+- Performance fix: the expiration sweep's per-tick ACTIVE fork reconcile no
+  longer scans or reads without an index (issue #710, 2026-09-04 review sweep
+  finding, medium and low severity). `reservation_fork` carried indexes only
+  on `reservation_id`; nothing covered `status` or `created_at`, yet fork rows
+  are never deleted by design (archived forks are the as-built record the
+  transit report reads), so `GET /internal/forks`'s unconditional `COUNT(*)`
+  plus filtered `ORDER BY created_at OFFSET`, drained fully every tick (60s in
+  prod, 5s in dev), ran two unindexed passes over a table that grows forever.
+  Cabling migration 0010 adds a partial index,
+  `ix_reservation_fork_active_created_at` on `(created_at, id) WHERE status =
+  'ACTIVE'`, mirrored in `ReservationFork.__table_args__` so the SQLite
+  unit-test schema matches; no retention added, `total` stays in the listing
+  response. Reservations' `_fetch_active_forks` now also stops paging on a
+  page shorter than the requested limit, not only on reaching `total`, which
+  is cheaper and does not depend on `total` staying consistent across pages
+  against a live set. Separately, an ACTIVE fork whose reservation is unknown
+  to reservations used to log a WARNING and re-warn every tick forever with no
+  path to resolution; it now warns once per reservation id per process,
+  pruned against each tick's known-fork-id set the same way the fork-backstop
+  give-up counter is pruned. Finally, the wiring-staging heal's ledger read
+  (one `db.get(ForkWiringLedger, id)` per ACTIVE fork per tick) is now a
+  single column-only preload of `(reservation_id, last_staged_fork_version)`
+  in chunks of 500, with the fresh per-row `db.get` kept only for forks that
+  actually need healing so the read-to-write window for those rows is
+  unchanged.
+- Fixed a race where a fork restore committing between a save's read and its
+  commit could have its restore-to-draft marker silently dropped by the
+  save's stale in-memory copy: every fork-mutating route (restore, the loose
+  canvas PUT, save, and prune-devices) now loads the fork row under
+  `SELECT ... FOR UPDATE`, held through its own commit or rollback, so the
+  writers serialize instead of racing (issue #626).
+
+#### Outbox and events
+
+- Fixed outbox LISTEN task hardening (2026-09-04 review sweep, four confirmed
+  findings in `herd_common/outbox.py`'s `_listen_for_wakeups` and
+  `run_outbox_relay`): (1) the lost-connection branch (the registered
+  termination callback firing) now sleeps `retry_seconds` before
+  reconnecting, exactly like the connect/registration-failure branch, so a
+  pooler, `idle_session_timeout`, or reaper that terminates the idle LISTEN
+  session cannot turn into a tight reconnect loop; every iteration also
+  closes the connection it opened (if any) in a `finally`, guarded by a 5s
+  `asyncio.wait_for`, before the next one is opened, so a flapping session
+  cannot leak a backend per cycle, and `wake` is set only after a
+  registration actually succeeds (a failed `add_listener` no longer falsely
+  claims a catch-up). (2) The listener now connects with kwargs from
+  `engine.dialect.create_connect_args(engine.url)` instead of a rendered DSN
+  string: the SQLAlchemy URL's query-string spellings (`ssl`,
+  `prepared_statement_cache_size`) are not the spellings asyncpg's own DSN
+  parser accepts, so a `?ssl=require` or `?prepared_statement_cache_size=0`
+  deployment previously lost wake-on-write silently (a WARNING every tick,
+  no health signal); this was proven live against the gate Postgres before
+  the fix. (3) `run_outbox_relay` now loops immediately, without waiting any
+  part of a tick, when a drain comes back exactly `OUTBOX_BATCH_SIZE` rows:
+  Postgres collapses one committing transaction into a single NOTIFY
+  regardless of how many outbox rows it staged, so a commit that staged more
+  than one batch's worth (the expiration sweep's per-expired-reservation
+  `reservation.completed` events are a real example) previously got one
+  wake and then waited a full tick for the remainder. (4) Added direct test
+  coverage for the termination-then-backoff path and the registration-failure
+  path, neither of which any existing test exercised. Every existing outbox
+  behavior (clear-before-drain, wake honored only on a healthy tick, backoff
+  math, cancellation propagation, `wake_on_write=false` as the tick-only
+  escape hatch, listener cancelled in the relay's `finally`) is unchanged and
+  still pinned by the existing tests.
+- Changed the transactional outbox relay to wake on write instead of only
+  polling a fixed tick (issue #682): `enqueue_event` now issues
+  `SELECT pg_notify(channel, '')` on the committing session (a no-op on
+  SQLite), on a per-service-schema channel named `herd_outbox_<schema>`
+  (`herd_outbox_reservations`, `herd_outbox_execution`); `run_outbox_relay`
+  (started by both the reservations and execution services, the only two
+  outbox producers) starts a supervised Postgres LISTEN task and drains
+  immediately on a notification instead of waiting out the rest of the
+  tick, live-measured at low single-digit milliseconds from commit to
+  publish. The tick remains the fallback cadence, unchanged outage
+  backoff: a missed notification, a not-yet-reconnected listener, or any
+  non-Postgres dialect still drains on the next tick exactly as before.
+  New `OUTBOX_WAKE_ON_WRITE` setting (default true, both services) is the
+  ops escape hatch back to tick-only behavior; execution also gains the
+  three existing outbox tick/batch/retention overrides reservations
+  already had, closing the gap where execution exposed none of them.
+- Fixed the notifications, execution, and integration NATS pull consumers to
+  fetch one message per pull instead of a batch of 10, so nats-py can no
+  longer hold an already-delivered message for up to the fetch timeout while
+  waiting for the rest of a batch that never fills (issue #648).
+
+#### AI orchestrator
+
+- Fixed the AI commit path silently dropping an approved network-element
+  attachment when inventory's ports fetch failed (issue #717):
+  `_fetch_device_ports` now raises `CommitError(503)` on a transport failure
+  or a 5xx from inventory instead of treating it the same as a genuinely
+  portless device (a 404 is still "no ports"). The fetch already runs before
+  the topology is created, so the commit fails closed with nothing to roll
+  back rather than silently omitting the user's approved attachment.
+- Stopped four ai-orchestrator routes from returning raw provider or
+  internal exception text in their HTTP `detail` (issue #713). Topology
+  generation (`POST /generate`) now answers a provider `AIError` with the
+  fixed `AI returned no usable response` and any other exception with
+  `AI call failed`; purpose classification answers `AI classification
+  failed`; the admin-only template identity suggestion answers
+  `AI suggestion failed` and recipe drafting `AI recipe drafting failed`.
+  Each site logs the real exception with its traceback server-side
+  (`logger.exception`) so nothing is lost for operators, matching the rule
+  the reservation assistant already applied.
+- Indexed `assistant_conversations` on `(reservation_id, created_at)` in
+  ai-orchestrator (issue #712, migration 0005) and bounded the transcript
+  read that purpose classification uses. The read is now two steps: the
+  reservation's conversation ids ordered by `created_at`, then only the
+  newest 200 message rows across those conversations (ordered by
+  conversation `created_at` and `position`, never a bare `position`, which
+  resets per conversation), selecting just `(role, content_blocks,
+  position)` and reversed in Python before the existing role filter and
+  12000-character trim. The old `(user_id, reservation_id)` composite index
+  is kept for now; dropping it is a follow-up.
+- Hardened the purpose-classification request path in ai-orchestrator
+  (issue #709). Both `POST /classify-purpose/preview` and
+  `POST /internal/classify-purpose` now bound their bodies: `purpose` at
+  2000 characters, `device_ids` at 200, `dynamic_requests` at 50 (the caps
+  reservations' own `ReservationCreate` already enforces) and `categories`
+  at 64, each rejected with 422. The provider-configured (503) and daily
+  quota (429) gates now run BEFORE the signal gather in both handlers, so an
+  unconfigured provider or an over-quota caller can no longer drive the
+  inventory and cabling fan-out. `dynamic_requests` are deduped by template
+  id before fetching (counts for a repeated template are summed, matching
+  reservations' N-entries-means-N-instances semantic), and the internal
+  pass's per-device inventory reads (device detail and config-apply job
+  summaries) plus the per-template reads run concurrently under a
+  semaphore of 8 instead of strictly one after another; results keep
+  request order and the per-item drop-on-failure contract is unchanged.
+- Added AI-proposed network elements (issue #632): the topology generator's
+  `propose_topology` tool gains an optional `elements` array (role,
+  `element_type` from the ADR 0012 vocabulary, label, and an allowlisted
+  `attrs` object), and the model may attach a device to an element with one
+  edge from the device role to the element role; an element-to-element edge
+  or a role reused across a device and an element is rejected by the
+  existing validate-and-repair loop. The committer, not the model, picks
+  the device-side attachment port on commit, in natural port-name order,
+  skipping ports already claimed by another attachment of the same device
+  in the proposal. `GenerateResponse`/`CommitRequest` gain the matching
+  additive `elements` field; a device-only proposal is unaffected. See
+  `docs/AI_GENERATE.md`.
+
+#### Security
+
 - Security: `GET /api/cabling/connections` no longer hands every authenticated
   user the whole fleet's cabling graph (issue #719, surfaced by the 2026-09-04
   review sweep while verifying the fork-membership finding, #701; the
@@ -45,31 +369,6 @@
   unchanged: they carry no member payload and gating them would break ACL
   checks and device-group visibility for plain users. `docs/ROLES.md` is
   corrected to stop claiming a user can read group member details.
-- Performance fix: the expiration sweep's per-tick ACTIVE fork reconcile no
-  longer scans or reads without an index (issue #710, 2026-09-04 review sweep
-  finding, medium and low severity). `reservation_fork` carried indexes only
-  on `reservation_id`; nothing covered `status` or `created_at`, yet fork rows
-  are never deleted by design (archived forks are the as-built record the
-  transit report reads), so `GET /internal/forks`'s unconditional `COUNT(*)`
-  plus filtered `ORDER BY created_at OFFSET`, drained fully every tick (60s in
-  prod, 5s in dev), ran two unindexed passes over a table that grows forever.
-  Cabling migration 0010 adds a partial index,
-  `ix_reservation_fork_active_created_at` on `(created_at, id) WHERE status =
-  'ACTIVE'`, mirrored in `ReservationFork.__table_args__` so the SQLite
-  unit-test schema matches; no retention added, `total` stays in the listing
-  response. Reservations' `_fetch_active_forks` now also stops paging on a
-  page shorter than the requested limit, not only on reaching `total`, which
-  is cheaper and does not depend on `total` staying consistent across pages
-  against a live set. Separately, an ACTIVE fork whose reservation is unknown
-  to reservations used to log a WARNING and re-warn every tick forever with no
-  path to resolution; it now warns once per reservation id per process,
-  pruned against each tick's known-fork-id set the same way the fork-backstop
-  give-up counter is pruned. Finally, the wiring-staging heal's ledger read
-  (one `db.get(ForkWiringLedger, id)` per ACTIVE fork per tick) is now a
-  single column-only preload of `(reservation_id, last_staged_fork_version)`
-  in chunks of 500, with the fresh per-row `db.get` kept only for forks that
-  actually need healing so the read-to-write window for those rows is
-  unchanged.
 - Security fix: the cross-reservation port-claim check (ADR 0006 Decision 4)
   is now an actual invariant instead of a save-boundary guard (2026-09-04
   review sweep finding, issue #721). Two gaps: `save_fork`'s claim check was a
@@ -100,42 +399,6 @@
   got. Documented in the ADR 0006 amendment; proved live against Postgres in
   `services/cabling/tests/test_fork_port_claim_race_live_pg.py`
   (`_gate-pg-live-tests`), confirmed to fail on main without the lock.
-
-- Reliability fix: the purpose-classification reconciler now runs on its own
-  background task instead of riding the reservations expiration sweep (issue
-  #702, 2026-09-04 review sweep finding). The reconciler awaits one
-  orchestrator LLM call per eligible row, serially, up to
-  `purpose_classify_batch_size` rows (default 20) each bounded by
-  `purpose_classify_timeout_seconds` (default 30s); a single tick could
-  therefore run for minutes, delaying every other reconciler that shared the
-  loop (scheduled activation, auto-completion, both provisioning-timeout
-  backstops, fork archiving, wiring heal, and pending prune) behind a slow or
-  hung orchestrator. `services/reservations/app/main.py` now starts a second
-  task, `purpose_classify_loop`, at its own interval
-  (`PURPOSE_CLASSIFY_INTERVAL_SECONDS`, default 60s), cancelled alongside the
-  expiration task at shutdown; the reconciler's body stays sequential (no
-  concurrent LLM calls). `expiration_loop` no longer calls the reconciler.
-- Bug fix: the purpose-classification reconciler gains a `transient` outcome
-  class and stops misreading an internal-token failure as the feature being
-  off (issue #706, 2026-09-04 review sweep finding). Previously every
-  non-403/404 failure, a 429 rate limit, a 502/503/504, a timeout, or a
-  transport error, incremented a row's `purpose_classify_attempts` exactly
-  like a genuine per-row rejection; a quota 429 lasts until UTC midnight
-  (hundreds of sweep ticks), so a rate-limited owner's rows deterministically
-  capped out, invisible in aggregate metrics. A new `transient` outcome for
-  those cases ends the tick without touching any row's attempts, the same
-  treatment `feature_off` already had. Separately, `POST
-  /internal/classify-purpose` can 403 for two unrelated reasons
-  (`AI_PURPOSE_CLASSIFICATION_ENABLED` off, or an internal-token mismatch),
-  and the reconciler read either as "the feature is off", silently stalling
-  the backlog after a token rotation while logging the wrong cause. The
-  orchestrator's flag-off refusal now carries a structured detail,
-  `{"error": "purpose_classification_disabled", "message": "Purpose
-  classification is disabled"}`; the reconciler treats a 403 as feature-off
-  only when that marker is present (falling back to the exact legacy
-  plain-string detail for a pre-fix orchestrator image during a rolling
-  upgrade), and logs any other 403 at WARNING as a likely internal-token
-  problem instead. See the ADR 0013 amendment for the full outcome taxonomy.
 - Security fix: fork saves and activation snapshots now check the canvas's
   endpoint devices against the reservation's membership (2026-09-04 review
   sweep finding, security/HIGH). Since ADR 0009 phase 7 made the fork the sole
@@ -185,11 +448,6 @@
   contains the device) and bounds `scheduled_for` with a new
   `apply_job_max_horizon_days` setting (default 30 days, 422 beyond it).
   Documented in `docs/ROLES.md` and `docs/ENV_VARS.md`.
-
-- Changed inventory's `apply_scheduler` to record a config-apply run whose
-  execution response carries no `status` as `failed` instead of `success`
-  (issue #720); unreachable today, since the contract requires `status`.
-
 - Fixed the base compose file publishing the unauthenticated Traefik
   dashboard and API (`api.insecure: true`) on all interfaces, so `make prod`
   exposed `/api/rawdata` (every router rule, backend container address,
@@ -200,47 +458,6 @@
   describes the SSH tunnel for remote viewing, and a repo-root unit test
   (`tests/unit/test_compose_ports.py`) yaml-parses both compose files and
   pins the loopback-only publish.
-
-- Fixed an admin being able to deactivate the superadmin through
-  `POST /users/{id}/deactivate` (issue #715). The endpoint now refuses a
-  superadmin target with 400 `Cannot deactivate the superadmin`, mirroring
-  the role-change carve-out; `POST /users/{id}/activate` is deliberately
-  unchanged, since it is the recovery direction. A deactivated superadmin
-  could not log in or refresh, was not re-seeded at startup, and the LDAP
-  sync never reactivates a local user.
-
-- Fixed `PATCH /preferences` in the user-profile service validating only the
-  incoming dict, never the merged result, so repeated patches could grow one
-  JSONB row past every cap (issue #714). The service now validates each
-  merged dict (the 200-key and 64 KB caps on `saved_filters` and `extras`,
-  the key cap and page-size range on `page_sizes`) before assigning anything
-  and answers 422 with a `merged <field> ...` detail; a rejected PATCH
-  leaves the row exactly as it was. `PUT` and `DELETE` remain the shrink
-  paths.
-- Fixed the AI commit path silently dropping an approved network-element
-  attachment when inventory's ports fetch failed (issue #717):
-  `_fetch_device_ports` now raises `CommitError(503)` on a transport failure
-  or a 5xx from inventory instead of treating it the same as a genuinely
-  portless device (a 404 is still "no ports"). The fetch already runs before
-  the topology is created, so the commit fails closed with nothing to roll
-  back rather than silently omitting the user's approved attachment.
-- Fixed reservations' cancel/release inventory cleanup treating a 404 from
-  inventory as a hard failure (issue #716). Since #682 execution's terminal
-  teardown starts roughly a millisecond after a cancel or release commits,
-  and for a dynamic-only booking it deletes the materialized device; if that
-  landed first, `_update_device_statuses` raised on the resulting 404,
-  triggering retries and an ERROR log for a device that was correctly gone,
-  and `_fetch_devices_best_effort` turned that same 404 into "assume
-  exclusive", so the retry loop re-POSTed a status update against a device
-  reservations had just been told did not exist. A 404 on the AVAILABLE
-  (release) direction of `_update_device_statuses` now counts as success
-  with no retry and no ERROR log; the RESERVED (booking) direction is
-  unchanged and still raises, since inventory not recognizing a device being
-  booked is a real failure. `_fetch_devices_best_effort` now surfaces a 404
-  as the distinct `_DeviceGoneFromInventory` rather than a generic
-  exception, and `_release_exclusive_devices_best_effort` drops that id from
-  the release set with an INFO log instead of assuming it is exclusive and
-  re-releasing it.
 - Security: `/api/ai/generate` no longer buffers a whole multipart upload
   into memory before its file-count and size caps run (issue #705):
   `_read_uploads` rejects a too-many-files request before reading a single
@@ -250,74 +467,30 @@
   treated as an untrusted hint only, never load-bearing for the check.
   `extract_files`'s own caps are unchanged and still re-run as defense in
   depth on the now-bounded upload.
-- Stopped four ai-orchestrator routes from returning raw provider or
-  internal exception text in their HTTP `detail` (issue #713). Topology
-  generation (`POST /generate`) now answers a provider `AIError` with the
-  fixed `AI returned no usable response` and any other exception with
-  `AI call failed`; purpose classification answers `AI classification
-  failed`; the admin-only template identity suggestion answers
-  `AI suggestion failed` and recipe drafting `AI recipe drafting failed`.
-  Each site logs the real exception with its traceback server-side
-  (`logger.exception`) so nothing is lost for operators, matching the rule
-  the reservation assistant already applied.
+- Fixed `PATCH /preferences` in the user-profile service validating only the
+  incoming dict, never the merged result, so repeated patches could grow one
+  JSONB row past every cap (issue #714). The service now validates each
+  merged dict (the 200-key and 64 KB caps on `saved_filters` and `extras`,
+  the key cap and page-size range on `page_sizes`) before assigning anything
+  and answers 422 with a `merged <field> ...` detail; a rejected PATCH
+  leaves the row exactly as it was. `PUT` and `DELETE` remain the shrink
+  paths.
 
-- Indexed `assistant_conversations` on `(reservation_id, created_at)` in
-  ai-orchestrator (issue #712, migration 0005) and bounded the transcript
-  read that purpose classification uses. The read is now two steps: the
-  reservation's conversation ids ordered by `created_at`, then only the
-  newest 200 message rows across those conversations (ordered by
-  conversation `created_at` and `position`, never a bare `position`, which
-  resets per conversation), selecting just `(role, content_blocks,
-  position)` and reversed in Python before the existing role filter and
-  12000-character trim. The old `(user_id, reservation_id)` composite index
-  is kept for now; dropping it is a follow-up.
+#### Inventory and auth
 
-- Hardened the purpose-classification request path in ai-orchestrator
-  (issue #709). Both `POST /classify-purpose/preview` and
-  `POST /internal/classify-purpose` now bound their bodies: `purpose` at
-  2000 characters, `device_ids` at 200, `dynamic_requests` at 50 (the caps
-  reservations' own `ReservationCreate` already enforces) and `categories`
-  at 64, each rejected with 422. The provider-configured (503) and daily
-  quota (429) gates now run BEFORE the signal gather in both handlers, so an
-  unconfigured provider or an over-quota caller can no longer drive the
-  inventory and cabling fan-out. `dynamic_requests` are deduped by template
-  id before fetching (counts for a repeated template are summed, matching
-  reservations' N-entries-means-N-instances semantic), and the internal
-  pass's per-device inventory reads (device detail and config-apply job
-  summaries) plus the per-template reads run concurrently under a
-  semaphore of 8 instead of strictly one after another; results keep
-  request order and the per-item drop-on-failure contract is unchanged.
-- Fixed outbox LISTEN task hardening (2026-09-04 review sweep, four confirmed
-  findings in `herd_common/outbox.py`'s `_listen_for_wakeups` and
-  `run_outbox_relay`): (1) the lost-connection branch (the registered
-  termination callback firing) now sleeps `retry_seconds` before
-  reconnecting, exactly like the connect/registration-failure branch, so a
-  pooler, `idle_session_timeout`, or reaper that terminates the idle LISTEN
-  session cannot turn into a tight reconnect loop; every iteration also
-  closes the connection it opened (if any) in a `finally`, guarded by a 5s
-  `asyncio.wait_for`, before the next one is opened, so a flapping session
-  cannot leak a backend per cycle, and `wake` is set only after a
-  registration actually succeeds (a failed `add_listener` no longer falsely
-  claims a catch-up). (2) The listener now connects with kwargs from
-  `engine.dialect.create_connect_args(engine.url)` instead of a rendered DSN
-  string: the SQLAlchemy URL's query-string spellings (`ssl`,
-  `prepared_statement_cache_size`) are not the spellings asyncpg's own DSN
-  parser accepts, so a `?ssl=require` or `?prepared_statement_cache_size=0`
-  deployment previously lost wake-on-write silently (a WARNING every tick,
-  no health signal); this was proven live against the gate Postgres before
-  the fix. (3) `run_outbox_relay` now loops immediately, without waiting any
-  part of a tick, when a drain comes back exactly `OUTBOX_BATCH_SIZE` rows:
-  Postgres collapses one committing transaction into a single NOTIFY
-  regardless of how many outbox rows it staged, so a commit that staged more
-  than one batch's worth (the expiration sweep's per-expired-reservation
-  `reservation.completed` events are a real example) previously got one
-  wake and then waited a full tick for the remainder. (4) Added direct test
-  coverage for the termination-then-backoff path and the registration-failure
-  path, neither of which any existing test exercised. Every existing outbox
-  behavior (clear-before-drain, wake honored only on a healthy tick, backoff
-  math, cancellation propagation, `wake_on_write=false` as the tick-only
-  escape hatch, listener cancelled in the relay's `finally`) is unchanged and
-  still pinned by the existing tests.
+- Changed inventory's `apply_scheduler` to record a config-apply run whose
+  execution response carries no `status` as `failed` instead of `success`
+  (issue #720); unreachable today, since the contract requires `status`.
+- Fixed an admin being able to deactivate the superadmin through
+  `POST /users/{id}/deactivate` (issue #715). The endpoint now refuses a
+  superadmin target with 400 `Cannot deactivate the superadmin`, mirroring
+  the role-change carve-out; `POST /users/{id}/activate` is deliberately
+  unchanged, since it is the recovery direction. A deactivated superadmin
+  could not log in or refresh, was not re-seeded at startup, and the LDAP
+  sync never reactivates a local user.
+
+#### Frontend
+
 - Fixed device lists silently truncating at the inventory service's 500-row
   page cap (issue #703). `fetchDevices` fetched page 0 of 500 and dropped
   `total`, so with more than 500 devices the reporting page's device index
@@ -332,126 +505,6 @@
   honored; `fetchAllDeviceNames` is a map over it). The server cap is
   unchanged; the page-0-of-500 idiom in the other API modules is left for a
   follow-up.
-
-- Added Download CSV buttons for the four purpose reporting sections (issue
-  #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
-  join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a
-  button on the purpose bar chart (confirmed data), a second button next to
-  it for the AI-suggested bucket (shown only once `by_purpose_suggested` is
-  in the report payload), and one on each purpose mix table (By User, By
-  Device), all calling the existing `downloadUtilizationCsv` with the
-  page's current window. The server has served these sections since #646
-  phases 1-2; only the frontend wiring was missing.
-
-- Added lab purpose classification, phase 3 (issue #646): device-level
-  utilization reporting now inherits transit gear from cabling's fork
-  wiring. Cabling gains `POST /internal/forks/devices/batch`
-  (X-Internal-Token, 1 to 500 reservation ids) returning, per reservation
-  with a fork (ACTIVE or ARCHIVED), the sorted distinct device ids across
-  its `fork_connections` rows. Reservations' utilization report calls it in
-  chunks of 500 and folds each reservation's fork-connected devices minus
-  its own reserved `device_ids` into `by_device` and `by_device_purpose`: a
-  transit device inherits the reservation's confirmed category (or
-  `unclassified`) exactly as a reserved device does, and a device both
-  reserved and on a path counts once, as reserved. `reservation_count`/
-  `hours` and `reservations`/`device_hours` are now INCLUSIVE of transit
-  gear; both buckets gain `transit_reservations` and a transit-hours field
-  (`transit_hours` on `DeviceBucket`, `transit_device_hours` on
-  `DevicePurposeBucket`) reporting the transit share alone. A new
-  `include_transit` query parameter (default true) on both
-  `GET /reports/utilization` and its CSV twin skips the cabling call
-  entirely when false, reproducing phase-1 semantics; `UtilizationReport`
-  gains `transit_included` echoing the effective value. Cabling being
-  unreachable, or returning a non-200, fails CLOSED with 503
-  `{"error": "transit_gear_unavailable"}` on both routes rather than
-  silently reporting zero transit devices. The `device`/`device_purpose`
-  CSV sections gain trailing `transit_reservations`/transit-hours columns.
-  The reporting page's by-device Purpose Mix table gains a Transit column
-  (hours plus a percentage for a mixed row, a small tag for a transit-only
-  row) and a helper line naming which semantics are in effect.
-
-- Changed the transactional outbox relay to wake on write instead of only
-  polling a fixed tick (issue #682): `enqueue_event` now issues
-  `SELECT pg_notify(channel, '')` on the committing session (a no-op on
-  SQLite), on a per-service-schema channel named `herd_outbox_<schema>`
-  (`herd_outbox_reservations`, `herd_outbox_execution`); `run_outbox_relay`
-  (started by both the reservations and execution services, the only two
-  outbox producers) starts a supervised Postgres LISTEN task and drains
-  immediately on a notification instead of waiting out the rest of the
-  tick, live-measured at low single-digit milliseconds from commit to
-  publish. The tick remains the fallback cadence, unchanged outage
-  backoff: a missed notification, a not-yet-reconnected listener, or any
-  non-Postgres dialect still drains on the next tick exactly as before.
-  New `OUTBOX_WAKE_ON_WRITE` setting (default true, both services) is the
-  ops escape hatch back to tick-only behavior; execution also gains the
-  three existing outbox tick/batch/retention overrides reservations
-  already had, closing the gap where execution exposed none of them.
-- Added AI-proposed network elements (issue #632): the topology generator's
-  `propose_topology` tool gains an optional `elements` array (role,
-  `element_type` from the ADR 0012 vocabulary, label, and an allowlisted
-  `attrs` object), and the model may attach a device to an element with one
-  edge from the device role to the element role; an element-to-element edge
-  or a role reused across a device and an element is rejected by the
-  existing validate-and-repair loop. The committer, not the model, picks
-  the device-side attachment port on commit, in natural port-name order,
-  skipping ports already claimed by another attachment of the same device
-  in the proposal. `GenerateResponse`/`CommitRequest` gain the matching
-  additive `elements` field; a device-only proposal is unaffected. See
-  `docs/AI_GENERATE.md`.
-- Added lab purpose classification, phase 2 (issue #646): the AI orchestrator
-  gains `POST /api/ai/classify-purpose/preview` (user JWT, creation pass) and
-  `POST /api/ai/internal/classify-purpose` (X-Internal-Token, end-of-
-  reservation pass), both behind `AI_PURPOSE_CLASSIFICATION_ENABLED`
-  (default off, enforced at the route boundary like recipe authoring). Each
-  makes one forced `classify_purpose` tool call against a caller-supplied
-  category list, assembling a prompt from purpose text, topology device/
-  template/wiring signals, dynamic template names, config-apply job names
-  and counts, fork version count, duration/status, and, when
-  `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is set (default on), the reservation
-  assistant's own transcripts; a signal-fetch failure is logged and dropped
-  rather than failing the request, reflected in the response's
-  `signals_used`. `GET /api/ai/status` gains `purpose_classification`.
-  Inventory gains one small additive internal endpoint,
-  `GET /devices/{device_id}/apply-jobs/internal`, to feed the config-apply
-  signal without a user JWT. See `docs/AI_PURPOSE_CLASSIFICATION.md`.
-- Fixed a race where a fork restore committing between a save's read and its
-  commit could have its restore-to-draft marker silently dropped by the
-  save's stale in-memory copy: every fork-mutating route (restore, the loose
-  canvas PUT, save, and prune-devices) now loads the fork row under
-  `SELECT ... FOR UPDATE`, held through its own commit or rollback, so the
-  writers serialize instead of racing (issue #626).
-- Fixed the notifications, execution, and integration NATS pull consumers to
-  fetch one message per pull instead of a batch of 10, so nats-py can no
-  longer hold an already-delivered message for up to the fetch timeout while
-  waiting for the rest of a batch that never fills (issue #648).
-- Added lab purpose classification, phase 1 (issue #646): reservations gain an
-  optional `purpose_category` validated against a configured taxonomy
-  (`PURPOSE_CATEGORIES`), settable by the owner or an admin in any status
-  including terminal via `PATCH /{id}/purpose-category`, listed via
-  `GET /purpose-categories`, and carried additively on every
-  `reservation.*` lifecycle event and the `/api/v1` facade. The utilization
-  report and its CSV export gain `by_purpose`, `by_user_purpose`, and
-  `by_device_purpose` breakdowns, with an explicit `unclassified` bucket for
-  reservations with no category. Device-level classification counts reserved
-  devices only; transit-gear inheritance is deferred to phase 3.
-- Added lab purpose classification, phase 2 reservations-side pieces (issue
-  #646, ADR 0013 points 8-11): a reservation transitioning into COMPLETED,
-  CANCELLED, or FAILED now stamps `purpose_classify_requested_at`, the sole
-  trigger for a new expiration-sweep reconciler that calls the AI
-  orchestrator's internal classify-purpose endpoint in bounded batches
-  (`PURPOSE_CLASSIFY_BATCH_SIZE`, capped at `PURPOSE_CLASSIFY_MAX_ATTEMPTS`
-  retries per row) and stores the result verbatim as `purpose_suggestion`. New
-  admin endpoints: `GET /admin/purpose-review` (paginated, filterable by
-  suggested category) lists undismissed suggestions still worth a look,
-  `POST /admin/purpose-review/{id}/accept` writes a suggestion (or a chosen
-  override) into the confirmed `purpose_category`, `POST
-  /admin/purpose-review/{id}/dismiss` drops a suggestion from the queue
-  without touching the confirmed value, and `POST /admin/purpose/backfill`
-  marks every terminal reservation with no suggestion yet as eligible
-  (idempotent). The utilization report gains `by_purpose_suggested` (and a
-  matching CSV section) for reservations with a suggestion but no confirmed
-  category; `unclassified` now means neither a category nor a suggestion.
-  Suggestions are internal review state, not exposed on the `/api/v1` facade.
 
 ## [0.3.0] - 2026-08-30
 
