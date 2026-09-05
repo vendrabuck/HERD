@@ -11,7 +11,7 @@ import {
   useBulkAddUserGroups,
   useBulkRemoveUserGroups,
 } from "@/api/deviceGroups";
-import { useDevices } from "@/api/inventory";
+import { useAllDevices } from "@/api/inventory";
 import { useGroups } from "@/api/groups";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -31,7 +31,7 @@ export function DeviceGroupDetailPage() {
   const bulkRemoveDevices = useBulkRemoveDevices();
   const bulkAddUG = useBulkAddUserGroups();
   const bulkRemoveUG = useBulkRemoveUserGroups();
-  const { data: allDevices } = useDevices();
+  const { data: allDevices } = useAllDevices();
   const { data: allUserGroups } = useGroups();
 
   const [name, setName] = useState("");
