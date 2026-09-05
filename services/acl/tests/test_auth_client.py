@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from app.services.auth_client import fetch_user_groups
+from app.services.auth_client import fetch_user_groups, fetch_user_groups_internal
 
 _user_id = uuid.uuid4()
 _group_id_1 = uuid.uuid4()
@@ -146,3 +146,74 @@ async def test_fetch_user_groups_single_group(mock_client_cls):
 
     assert len(result) == 1
     assert result[0] == _group_id_1
+
+
+# --- fetch_user_groups_internal (issue #704) --------------------------------
+
+
+@pytest.mark.asyncio
+@patch("app.services.auth_client.httpx.AsyncClient")
+async def test_fetch_user_groups_internal_success(mock_client_cls):
+    """Successful response returns list of group UUIDs, calling the
+    internal-token route with X-Internal-Token, not Authorization."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = [
+        {"id": str(_group_id_1), "name": "Group 1"},
+    ]
+
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client_cls.return_value = mock_client
+
+    result = await fetch_user_groups_internal(_auth_url, _user_id, _token)
+
+    assert result == [_group_id_1]
+    mock_client.get.assert_called_once_with(
+        f"{_auth_url}/internal/users/{_user_id}/groups",
+        headers={"X-Internal-Token": _token},
+        timeout=10.0,
+    )
+
+
+@pytest.mark.asyncio
+@patch("app.services.auth_client.httpx.AsyncClient")
+async def test_fetch_user_groups_internal_404_returns_empty(mock_client_cls):
+    """A deactivated or unknown user (404 from auth) returns an empty list."""
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client_cls.return_value = mock_client
+
+    result = await fetch_user_groups_internal(_auth_url, _user_id, _token)
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+@patch("app.services.auth_client.httpx.AsyncClient")
+async def test_fetch_user_groups_internal_connection_error_returns_empty(mock_client_cls):
+    mock_client = AsyncMock()
+    mock_client.get.side_effect = httpx.ConnectError("connection refused")
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client_cls.return_value = mock_client
+
+    result = await fetch_user_groups_internal(_auth_url, _user_id, _token)
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_groups_internal_no_token_returns_empty_without_calling():
+    """A missing internal token skips the HTTP call entirely (closed-by-default)."""
+    with patch("app.services.auth_client.httpx.AsyncClient") as mock_client_cls:
+        result = await fetch_user_groups_internal(_auth_url, _user_id, "")
+        mock_client_cls.assert_not_called()
+    assert result == []

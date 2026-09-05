@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- Security: scheduled device-config apply jobs re-check the creator's
+  authority at fire time instead of relying solely on the schedule-time
+  gate (issue #704). A job with no `reservation_id` fired straight into
+  execution's internal-token path with no further check, and a caller-
+  supplied `reservation_id` was never validated as active, owned, or
+  containing the device; nothing revoked a queued job when its creator's
+  ACL grant was removed or their reservation ended. Adds two internal-token
+  routes (auth's `GET /internal/users/{id}/groups`, acl's
+  `POST /internal/check`) and `herd_common.acl.user_has_manage_internal` /
+  `user_has_manage_or_owns_active_reservation_internal` so the same
+  schedule-time authorization (explicit `manage` grant, or reservation-
+  owner of an active reservation containing the device) can be re-evaluated
+  with only the job creator's user_id, no user JWT. `fire_job` now runs this
+  check unconditionally before dispatching to execution and resolves
+  `skipped` with `creator no longer authorized for this device` on failure.
+  `schedule_apply_job` also now validates an optional `reservation_id`
+  up front (422 if it is not an active reservation the caller owns that
+  contains the device) and bounds `scheduled_for` with a new
+  `apply_job_max_horizon_days` setting (default 30 days, 422 beyond it).
+  Documented in `docs/ROLES.md` and `docs/ENV_VARS.md`.
+
 - Changed inventory's `apply_scheduler` to record a config-apply run whose
   execution response carries no `status` as `failed` instead of `success`
   (issue #720); unreachable today, since the contract requires `status`.

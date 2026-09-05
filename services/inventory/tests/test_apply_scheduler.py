@@ -10,12 +10,14 @@ import contextlib
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from app.database import Base
 from app.models.device_config_apply_job import DeviceConfigApplyJob
 from app.models.device_config_version import DeviceConfigVersion
 from app.services import apply_scheduler
 from app.services.apply_scheduler import (
+    CREATOR_UNAUTHORIZED_ERROR,
     _due_jobs,
     _mark_failed_in_fresh_session,
     _post_internal_execute,
@@ -27,6 +29,22 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+def _patch_creator_authorized(monkeypatch, allowed: bool = True):
+    """Stub the issue #704 fire-time authority re-check.
+
+    Every fire_job test that exercises the pipeline PAST the reservation
+    branch needs this: the real check calls out to acl/reservations over
+    HTTP, which is not reachable from a unit test. Tests that specifically
+    exercise the re-check's own skip/closed-failure behavior patch it
+    differently (or not at all, to prove the real function fails closed).
+    """
+
+    async def _fake(job):
+        return allowed
+
+    monkeypatch.setattr(apply_scheduler, "_creator_still_authorized", _fake)
 
 
 @pytest.fixture(autouse=True)
@@ -131,6 +149,7 @@ async def test_fire_job_success(monkeypatch):
         monkeypatch.setattr(
             "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
         )
+        _patch_creator_authorized(monkeypatch)
         run_id = "11111111-1111-1111-1111-111111111111"
         client = FakeClient(
             post_responses={
@@ -153,6 +172,7 @@ async def test_fire_job_failed_when_execution_returns_500(monkeypatch):
         monkeypatch.setattr(
             "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
         )
+        _patch_creator_authorized(monkeypatch)
         client = FakeClient(
             post_responses={
                 "/execute/internal": FakeResponse(500, {"detail": "boom"}),
@@ -197,6 +217,7 @@ async def test_fire_job_proceeds_when_reservation_active(monkeypatch):
         monkeypatch.setattr(
             "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
         )
+        _patch_creator_authorized(monkeypatch)
         client = FakeClient(
             get_responses={
                 str(reservation_id): FakeResponse(
@@ -213,6 +234,130 @@ async def test_fire_job_proceeds_when_reservation_active(monkeypatch):
         await fire_job(db, job, client)
         await db.refresh(job)
         assert job.status == "success"
+
+
+# --- Fire-time creator authority re-check (issue #704) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_fire_job_skips_when_creator_no_longer_authorized(monkeypatch):
+    """Spec #704 test (1): null reservation_id, creator no longer qualifies
+    -> skipped with the pinned error and no execution call attempted."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now)
+
+        monkeypatch.setattr(
+            "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+        )
+        _patch_creator_authorized(monkeypatch, allowed=False)
+        client = FakeClient(
+            post_responses={
+                "/execute/internal": FakeResponse(201, {"id": "x", "status": "SUCCESS"}),
+            }
+        )
+        await fire_job(db, job, client)
+        await db.refresh(job)
+        assert job.status == "skipped"
+        assert job.error == CREATOR_UNAUTHORIZED_ERROR
+        assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_fire_job_skips_when_reservation_active_but_creator_unauthorized(monkeypatch):
+    """Spec #704 test (2): the reservation_id branch passing (reservation is
+    active) does not substitute for the creator's own standing; the job
+    still skips on the pinned authority error, not the reservation error."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        reservation_id = uuid.uuid4()
+        _, job = await _seed_version_and_job(db, scheduled_for=now, reservation_id=reservation_id)
+
+        monkeypatch.setattr(
+            "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+        )
+        _patch_creator_authorized(monkeypatch, allowed=False)
+        client = FakeClient(
+            get_responses={
+                str(reservation_id): FakeResponse(
+                    200, {"id": str(reservation_id), "status": "ACTIVE", "is_active": True}
+                )
+            },
+            post_responses={
+                "/execute/internal": FakeResponse(201, {"id": "x", "status": "SUCCESS"}),
+            },
+        )
+        await fire_job(db, job, client)
+        await db.refresh(job)
+        assert job.status == "skipped"
+        assert job.error == CREATOR_UNAUTHORIZED_ERROR
+        assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_fire_job_positive_control_authorized_creator_fires(monkeypatch):
+    """Spec #704 test (3): positive control, an authorized creator's job
+    still fires and resolves success once the new gate is satisfied."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now)
+
+        monkeypatch.setattr(
+            "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+        )
+        _patch_creator_authorized(monkeypatch, allowed=True)
+        run_id = "44444444-4444-4444-4444-444444444444"
+        client = FakeClient(
+            post_responses={
+                "/execute/internal": FakeResponse(201, {"id": run_id, "status": "SUCCESS"}),
+            }
+        )
+        await fire_job(db, job, client)
+        await db.refresh(job)
+        assert job.status == "success"
+        assert str(job.run_id) == run_id
+
+
+@pytest.mark.asyncio
+async def test_fire_job_skips_when_authority_check_unreachable(monkeypatch):
+    """Spec #704 test (4): the authority check itself failing closed (auth
+    or acl unreachable) skips the job, exercised end to end through the
+    real herd_common helper rather than a stubbed _creator_still_authorized,
+    by making the underlying httpx.AsyncClient raise a connection error for
+    every call the helper makes.
+    """
+
+    class _RaisingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            raise httpx.ConnectError("acl/auth unreachable")
+
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now)
+
+        monkeypatch.setattr(
+            "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+        )
+        monkeypatch.setattr("herd_common.internal_client.httpx.AsyncClient", _RaisingAsyncClient)
+        client = FakeClient(
+            post_responses={
+                "/execute/internal": FakeResponse(201, {"id": "x", "status": "SUCCESS"}),
+            }
+        )
+        await fire_job(db, job, client)
+        await db.refresh(job)
+        assert job.status == "skipped"
+        assert job.error == CREATOR_UNAUTHORIZED_ERROR
+        assert client.posts == []
 
 
 @pytest.mark.asyncio
@@ -333,6 +478,7 @@ async def test_fire_job_fails_when_version_was_deleted(monkeypatch):
         monkeypatch.setattr(
             "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
         )
+        _patch_creator_authorized(monkeypatch)
         client = FakeClient()
         await fire_job(db, job, client)
         await db.refresh(job)

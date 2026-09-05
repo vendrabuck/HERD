@@ -9,7 +9,11 @@ import uuid
 
 import httpx
 import pytest
-from herd_common.acl import user_has_manage_or_owns_active_reservation
+from herd_common.acl import (
+    user_has_manage_internal,
+    user_has_manage_or_owns_active_reservation,
+    user_has_manage_or_owns_active_reservation_internal,
+)
 
 ACL_URL = "http://acl"
 RES_URL = "http://reservations"
@@ -270,5 +274,147 @@ async def test_no_internal_token_skips_reservation_lookup(monkeypatch):
         acl_service_url=ACL_URL,
         reservations_service_url=RES_URL,
         internal_api_token="",
+    )
+    assert result is False
+
+
+# --- user_has_manage_internal / *_internal (issue #704, no user JWT) --------
+
+
+@pytest.mark.asyncio
+async def test_manage_internal_allowed(monkeypatch):
+    """ACL's internal-token route says allowed=True -> True."""
+    _patch_http(monkeypatch, acl_response=_Resp(200, {"allowed": True}))
+    result = await user_has_manage_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_manage_internal_denied(monkeypatch):
+    _patch_http(monkeypatch, acl_response=_Resp(200, {"allowed": False}))
+    result = await user_has_manage_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_manage_internal_transport_failure_returns_false(monkeypatch):
+    _patch_http(monkeypatch, acl_exception=httpx.ConnectError("acl down"))
+    result = await user_has_manage_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_manage_internal_non_200_returns_false(monkeypatch):
+    _patch_http(monkeypatch, acl_response=_Resp(503, {"error": "boom"}))
+    result = await user_has_manage_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_manage_internal_no_token_returns_false_without_calling(monkeypatch):
+    """No internal token configured -> cannot call ACL, so False without a
+    network attempt (closed-by-default, mirrors the reservation-owner leg)."""
+
+    class _NeverCalled:
+        def __init__(self, *a, **kw):
+            raise AssertionError("must not attempt an HTTP call with no internal token")
+
+    monkeypatch.setattr("herd_common.internal_client.httpx.AsyncClient", _NeverCalled)
+    result = await user_has_manage_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        internal_api_token="",
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_manage_or_reservation_internal_true_on_explicit_manage(monkeypatch):
+    """Manage grant true short-circuits; the OR is satisfied without needing
+    the reservation leg to also say yes."""
+    _patch_http(
+        monkeypatch,
+        acl_response=_Resp(200, {"allowed": True}),
+        res_response=_Resp(200, {"owns_active": False}),
+    )
+    result = await user_has_manage_or_owns_active_reservation_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_manage_or_reservation_internal_true_via_reservation_fallback(monkeypatch):
+    """No explicit manage grant, but the reservation-owner leg says yes."""
+    _patch_http(
+        monkeypatch,
+        acl_response=_Resp(200, {"allowed": False}),
+        res_response=_Resp(200, {"owns_active": True}),
+    )
+    result = await user_has_manage_or_owns_active_reservation_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_manage_or_reservation_internal_false_when_both_deny(monkeypatch):
+    _patch_http(
+        monkeypatch,
+        acl_response=_Resp(200, {"allowed": False}),
+        res_response=_Resp(200, {"owns_active": False}),
+    )
+    result = await user_has_manage_or_owns_active_reservation_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_manage_or_reservation_internal_closed_when_both_unreachable(monkeypatch):
+    _patch_http(
+        monkeypatch,
+        acl_exception=httpx.ConnectError("acl down"),
+        res_exception=httpx.ConnectError("reservations down"),
+    )
+    result = await user_has_manage_or_owns_active_reservation_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
     )
     assert result is False

@@ -387,6 +387,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: acl
       SECRET_KEY: ${AUTH_SECRET_KEY}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
       AUTH_SERVICE_URL: http://auth:8000
