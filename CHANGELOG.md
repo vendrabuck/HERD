@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+- Fixed outbox LISTEN task hardening (2026-09-04 review sweep, four confirmed
+  findings in `herd_common/outbox.py`'s `_listen_for_wakeups` and
+  `run_outbox_relay`): (1) the lost-connection branch (the registered
+  termination callback firing) now sleeps `retry_seconds` before
+  reconnecting, exactly like the connect/registration-failure branch, so a
+  pooler, `idle_session_timeout`, or reaper that terminates the idle LISTEN
+  session cannot turn into a tight reconnect loop; every iteration also
+  closes the connection it opened (if any) in a `finally`, guarded by a 5s
+  `asyncio.wait_for`, before the next one is opened, so a flapping session
+  cannot leak a backend per cycle, and `wake` is set only after a
+  registration actually succeeds (a failed `add_listener` no longer falsely
+  claims a catch-up). (2) The listener now connects with kwargs from
+  `engine.dialect.create_connect_args(engine.url)` instead of a rendered DSN
+  string: the SQLAlchemy URL's query-string spellings (`ssl`,
+  `prepared_statement_cache_size`) are not the spellings asyncpg's own DSN
+  parser accepts, so a `?ssl=require` or `?prepared_statement_cache_size=0`
+  deployment previously lost wake-on-write silently (a WARNING every tick,
+  no health signal); this was proven live against the gate Postgres before
+  the fix. (3) `run_outbox_relay` now loops immediately, without waiting any
+  part of a tick, when a drain comes back exactly `OUTBOX_BATCH_SIZE` rows:
+  Postgres collapses one committing transaction into a single NOTIFY
+  regardless of how many outbox rows it staged, so a commit that staged more
+  than one batch's worth (the expiration sweep's per-expired-reservation
+  `reservation.completed` events are a real example) previously got one
+  wake and then waited a full tick for the remainder. (4) Added direct test
+  coverage for the termination-then-backoff path and the registration-failure
+  path, neither of which any existing test exercised. Every existing outbox
+  behavior (clear-before-drain, wake honored only on a healthy tick, backoff
+  math, cancellation propagation, `wake_on_write=false` as the tick-only
+  escape hatch, listener cancelled in the relay's `finally`) is unchanged and
+  still pinned by the existing tests.
+
 - Added Download CSV buttons for the four purpose reporting sections (issue
   #696): `purpose`, `user_purpose`, `device_purpose`, and `purpose_suggested`
   join `UtilizationCsvSection` on the frontend, and `ReportingPage` gets a
