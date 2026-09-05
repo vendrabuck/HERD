@@ -20,6 +20,17 @@
   into `app/services/device_visibility.py` so device_configs.py can share it
   without a router-to-router import; ports.py now imports it from the same
   place. Documented in `docs/ROLES.md`.
+- Security: `GET /api/auth/groups/{group_id}` is now admin/superadmin only
+  (issue #711, 2026-09-04 review sweep finding). The route returned every
+  member's email to any authenticated user, and since open self-registration
+  under `AUTH_METHOD=local` puts a fresh account in "Not Grouped" and
+  `GET /groups?limit=500` lists every group, one registration plus one
+  detail call per group let a caller enumerate emails wholesale, which is
+  exactly what `/api/auth/register`'s generic 409 exists to prevent. `GET
+  /groups`, `GET /groups/user/{id}`, and `POST /groups/users/groups` are
+  unchanged: they carry no member payload and gating them would break ACL
+  checks and device-group visibility for plain users. `docs/ROLES.md` is
+  corrected to stop claiming a user can read group member details.
 - Performance fix: the expiration sweep's per-tick ACTIVE fork reconcile no
   longer scans or reads without an index (issue #710, 2026-09-04 review sweep
   finding, medium and low severity). `reservation_fork` carried indexes only

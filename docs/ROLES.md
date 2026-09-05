@@ -32,7 +32,8 @@ in their JWT access token and enforced independently by each service.
 | Update, delete topologies (creator or admin) | creator | yes | yes |
 | Bulk export and import devices and templates | | yes | yes |
 | Bulk export and import topologies | yes (import updates: creator only) | yes | yes |
-| View user groups and members | yes | yes | yes |
+| List user groups (no member details) | yes | yes | yes |
+| View group details and member emails | | yes | yes |
 | Create, update, delete groups | | yes | yes |
 | Add and remove group members | | yes | yes |
 | Bulk add and remove group members | | yes | yes |
@@ -195,9 +196,10 @@ Rules enforced by the API:
 
 ## Group Management (Admin Operations)
 
-Groups allow organizing users into teams. Any authenticated user can view groups
-and their members. Creating, updating, deleting groups and managing membership
-requires admin or superadmin role.
+Groups allow organizing users into teams. Any authenticated user can list groups
+by name, but only an admin or superadmin can view a group's details and member
+list (member emails are not exposed to a plain user). Creating, updating,
+deleting groups and managing membership requires admin or superadmin role.
 
 ### List all groups
 
@@ -212,10 +214,11 @@ Returns an array of all groups with id, name, description, created_by, created_a
 
 ```
 GET /api/auth/groups/{group_id}
-Authorization: Bearer <any-authenticated-token>
+Authorization: Bearer <admin-or-superadmin-token>
 ```
 
-Returns group info plus a `members` array with user_id, username, email, added_at.
+Admin or superadmin only. Returns group info plus a `members` array with
+user_id, username, email, added_at.
 
 ### Create a group
 
@@ -1362,7 +1365,7 @@ Authorization: Bearer <admin-token>
 | `/api/auth/logout` | POST | open | open | open |
 | `/api/auth/me` | GET | yes | yes | yes |
 | `/api/auth/groups` | GET | yes | yes | yes |
-| `/api/auth/groups/{id}` | GET | yes | yes | yes |
+| `/api/auth/groups/{id}` | GET | | yes | yes |
 | `/api/auth/groups` | POST | | yes | yes |
 | `/api/auth/groups/{id}` | PUT | | yes | yes |
 | `/api/auth/groups/{id}` | DELETE | | yes | yes |
