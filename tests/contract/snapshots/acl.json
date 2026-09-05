@@ -29,6 +29,10 @@
       "/health"
     ],
     [
+      "POST",
+      "/internal/check"
+    ],
+    [
       "GET",
       "/resources"
     ]
