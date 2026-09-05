@@ -924,7 +924,12 @@ Loosely edit the fork canvas (stored as a draft with no reconcile) and commit a
 reconcile that appends a fork version. Both mutations require the reservation to
 be `ACTIVE`; a fork is editable only while its reservation is live, and either
 returns `409` otherwise. A save whose wiring would claim a port already held by
-another active reservation returns `409` naming the blocking reservation:
+another active reservation returns `409` naming the blocking reservation. Since
+the 2026-09-04 fork endpoint-membership fix, a save (or the activation snapshot)
+naming a canvas endpoint device outside the reservation's own device set also
+returns `409` (`fork_device_not_member`, naming the offending device ids);
+admins are not exempt, and PATCH-add is the way to bring a device into the
+reservation first:
 
 ```
 PUT  /api/reservations/{reservation_id}/fork/canvas    # owner or admin, ACTIVE only
