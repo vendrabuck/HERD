@@ -227,57 +227,80 @@ async def _listen_for_wakeups(
     the relay already depend on it as their SQLAlchemy driver.
 
     A connect or registration failure, or a lost connection, is logged and
-    retried after `retry_seconds`: the outer relay keeps draining on its own
-    tick throughout, so a lost or never-established listener costs at most
-    one tick, exactly as if wake_on_write were off. On every successful
-    (re)connect, `wake` is set once before waiting, so anything committed
-    while we were disconnected (including before the first connect) drains
-    on the relay's very next pass instead of waiting for a NOTIFY that will
-    never come for an already-committed row.
+    retried after `retry_seconds` in BOTH cases: every iteration sleeps that
+    long before its next reconnect attempt, so a pooler, `idle_session_timeout`,
+    or reaper that terminates the idle LISTEN session cannot turn this into a
+    tight reconnect loop (each flap would otherwise re-run a full
+    `_publish_pending`-triggering catch-up wake with no backoff at all). Every
+    iteration also closes the connection it opened (if any) before the next
+    one is opened, whether that iteration ended in a lost connection, a
+    registration failure, or cancellation, so a flapping session cannot leak a
+    backend per cycle. `wake` is set once per iteration, and only after
+    `add_listener`/`add_termination_listener` both succeed (catch-up): so
+    anything committed while we were disconnected (including before the first
+    connect) drains on the relay's very next pass instead of waiting for a
+    NOTIFY that will never come for an already-committed row, and a failed
+    registration never claims a catch-up it did not earn.
+
+    The connection is opened from kwargs derived straight from the engine's
+    own dialect (`engine.dialect.create_connect_args`), not a re-rendered DSN
+    string: the SQLAlchemy URL's query string uses spellings
+    (`ssl`, `prepared_statement_cache_size`) that asyncpg's DSN parser does not
+    accept as startup parameters, so a rendered-string DSN silently breaks any
+    TLS or pgbouncer deployment that sets them. A handful of asyncpg-driver-only
+    keys the dialect adds for its own pool wrapper (`async_fallback`,
+    `async_creator_fn`, `prepared_statement_cache_size`,
+    `prepared_statement_name_func`) are not accepted by `asyncpg.connect`
+    itself and are popped before the call.
     """
     import asyncpg
 
-    dsn = engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
-    conn = None
-    try:
-        while True:
-            try:
-                conn = await asyncpg.connect(dsn)
+    _, opts = engine.dialect.create_connect_args(engine.url)
+    for key in (
+        "async_fallback",
+        "async_creator_fn",
+        "prepared_statement_cache_size",
+        "prepared_statement_name_func",
+    ):
+        opts.pop(key, None)
 
-                closed = asyncio.Event()
+    while True:
+        conn = None
+        try:
+            conn = await asyncpg.connect(**opts)
 
-                def _on_notify(
-                    connection: Any, pid: Any, notify_channel: Any, payload: Any
-                ) -> None:
-                    wake.set()
+            closed = asyncio.Event()
 
-                def _on_terminate(connection: Any) -> None:
-                    closed.set()
-
-                await conn.add_listener(channel, _on_notify)
-                conn.add_termination_listener(_on_terminate)
+            def _on_notify(connection: Any, pid: Any, notify_channel: Any, payload: Any) -> None:
                 wake.set()
-                logger.info("outbox listener: listening for writes on channel %s", channel)
-                await closed.wait()
-                logger.warning(
-                    "outbox listener: lost the listen connection for channel %s", channel
-                )
-            except Exception as exc:
-                logger.warning(
-                    "outbox listener: %s: %s (channel %s); retrying in %ss",
-                    type(exc).__name__,
-                    exc,
-                    channel,
-                    retry_seconds,
-                )
-                await asyncio.sleep(retry_seconds)
-    except asyncio.CancelledError:
-        if conn is not None:
-            try:
-                await asyncio.wait_for(conn.close(), 5)
-            except Exception:
-                pass
-        raise
+
+            def _on_terminate(connection: Any) -> None:
+                closed.set()
+
+            await conn.add_listener(channel, _on_notify)
+            conn.add_termination_listener(_on_terminate)
+            wake.set()
+            logger.info("outbox listener: listening for writes on channel %s", channel)
+            await closed.wait()
+            logger.warning("outbox listener: lost the listen connection for channel %s", channel)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "outbox listener: %s: %s (channel %s); retrying in %ss",
+                type(exc).__name__,
+                exc,
+                channel,
+                retry_seconds,
+            )
+        finally:
+            if conn is not None:
+                try:
+                    await asyncio.wait_for(conn.close(), 5)
+                except Exception:
+                    pass
+
+        await asyncio.sleep(retry_seconds)
 
 
 async def run_outbox_relay(
@@ -348,6 +371,7 @@ async def run_outbox_relay(
             wake.clear()
             tick_failed = False
             waiting_for_nats = False
+            saturated = False
             try:
                 nc = get_nats()
                 if nc is None or not nc.is_connected:
@@ -367,6 +391,7 @@ async def run_outbox_relay(
                         )
                     if count:
                         logger.info("%s relay published %s event(s)", name, count)
+                    saturated = count == batch_size
                     now = datetime.now(timezone.utc)
                     if (now - last_prune).total_seconds() >= prune_every_seconds:
                         cutoff = now - timedelta(seconds=retention_seconds)
@@ -381,6 +406,19 @@ async def run_outbox_relay(
             except Exception:
                 logger.exception("%s relay tick failed", name)
                 tick_failed = True
+
+            if not waiting_for_nats and not tick_failed and saturated:
+                # The drain claimed a full batch: Postgres collapses one
+                # NOTIFY per committing transaction, so a single commit that
+                # staged more than batch_size rows gets exactly one wake and
+                # more rows likely remain behind this one. Loop immediately
+                # rather than waiting out any part of a tick. Skipping
+                # straight to the top of the loop (instead of, say, sleeping
+                # zero) means wake.clear() runs before the next drain exactly
+                # as it does on any other iteration, so the lost-wakeup rule
+                # still holds: a notify arriving during this next drain is
+                # not lost.
+                continue
 
             if waiting_for_nats:
                 current_backoff = tick_seconds
