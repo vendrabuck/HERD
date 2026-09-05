@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Changed inventory's `apply_scheduler` to record a config-apply run whose
+  execution response carries no `status` as `failed` instead of `success`
+  (issue #720); unreachable today, since the contract requires `status`.
+
 - Fixed the base compose file publishing the unauthenticated Traefik
   dashboard and API (`api.insecure: true`) on all interfaces, so `make prod`
   exposed `/api/rawdata` (every router rule, backend container address,

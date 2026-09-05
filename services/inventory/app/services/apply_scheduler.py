@@ -122,7 +122,10 @@ async def _post_internal_execute(
             run_id = uuid.UUID(run_id_str)
         except (ValueError, TypeError):
             run_id = None
-    run_status = str(data.get("status", "SUCCESS")).upper()
+    # Safe default (issue #720): a response with no status is never a success.
+    # Unreachable today (ExecutionRunResponse.status is required over a NOT NULL
+    # column), so this only matters if the contract ever loosens.
+    run_status = str(data.get("status", "FAILED")).upper()
     if run_status == "SUCCESS":
         return "success", run_id, None
     return "failed", run_id, str(data.get("error") or "execution returned non-success status")
