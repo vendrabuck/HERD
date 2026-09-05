@@ -7,12 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.models.port import Port
-from app.routers.devices import (
-    _password_field_keys,
-    _redact_field_data,
-    _resolve_visible_device_ids,
-)
+from app.routers.devices import _password_field_keys, _redact_field_data
 from app.schemas.port import BulkPortCreate, PortCreate, PortResponse, PortUpdate
+from app.services.device_visibility import _resolve_visible_device_ids
 from app.services.port_service import (
     create_port,
     create_ports_bulk,
