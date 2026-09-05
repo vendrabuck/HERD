@@ -92,6 +92,20 @@ async def _fetch_devices(device_ids: list[uuid.UUID], token: str) -> list[dict]:
     return devices
 
 
+class _DeviceGoneFromInventory(ValueError):
+    """Raised by _fetch_devices_best_effort's per-device fetch when inventory
+    answers 404 (issue #716).
+
+    A distinct type from the transport/5xx failures asyncio.gather also
+    collects here: a 404 is inventory affirmatively saying the device is
+    gone (e.g. execution's teardown already deleted a dynamic-only
+    booking's materialized device), not a fetch that could not be
+    completed. _release_exclusive_devices_best_effort tells the two apart:
+    a genuinely-gone device drops out of the exclusive set instead of being
+    assumed exclusive, since a gone device cannot be orphaned RESERVED.
+    """
+
+
 async def _fetch_devices_best_effort(
     device_ids: list[uuid.UUID],
 ) -> list[dict | BaseException]:
@@ -100,7 +114,9 @@ async def _fetch_devices_best_effort(
     fetch. Used by cancel/release/auto-expire which all act as the system
     rather than as the user (the user's permission was checked upstream when
     they invoked the cancel/release; the actual device-release work is
-    service-to-service).
+    service-to-service). A 404 is returned as _DeviceGoneFromInventory rather
+    than a generic ValueError so callers can distinguish "confirmed gone"
+    from "could not be asked" (issue #716).
     """
     if not settings.internal_api_token:
         # Without an internal token, callers should fall back to treating
@@ -122,7 +138,7 @@ async def _fetch_devices_best_effort(
                 timeout=10.0,
             )
             if resp.status_code == 404:
-                raise ValueError(f"Device {device_id} not found in inventory")
+                raise _DeviceGoneFromInventory(f"Device {device_id} not found in inventory")
             resp.raise_for_status()
             return resp.json()
 
@@ -1082,6 +1098,14 @@ async def _update_device_statuses(
     callers on the create/cancel/release paths wrap this in retry_with_backoff
     and convert exhausted retries into a structured failure log.
 
+    A 404 counts as success only when status is "AVAILABLE" (issue #716): a
+    device execution has already deleted (e.g. a dynamic-only booking's
+    materialized device torn down between the reservation's own commit and
+    this release POST) cannot be orphaned RESERVED, so releasing a device
+    inventory says is already gone is not a failure worth retrying or
+    alerting on. A 404 on the RESERVED direction still raises: inventory not
+    recognizing a device we are trying to book IS a real failure.
+
     The per-device POSTs run concurrently, so a partial failure leaves the
     devices that DID succeed already flipped in inventory. Returns the list of
     device ids whose update succeeded. Callers that need to compensate after an
@@ -1101,6 +1125,13 @@ async def _update_device_statuses(
                 headers={"X-Internal-Token": settings.internal_api_token},
                 timeout=10.0,
             )
+            if resp.status_code == 404 and status == "AVAILABLE":
+                logger.info(
+                    "Device %s already gone from inventory during release to AVAILABLE; "
+                    "treating as success",
+                    device_id,
+                )
+                return
             resp.raise_for_status()
 
         results = await asyncio.gather(
@@ -1234,7 +1265,19 @@ async def _release_exclusive_devices_best_effort(
     fetch_results = await _fetch_devices_best_effort(device_ids)
     exclusive_ids: list[uuid.UUID] = []
     for did, result in zip(device_ids, fetch_results):
-        if isinstance(result, BaseException):
+        if isinstance(result, _DeviceGoneFromInventory):
+            # issue #716: inventory affirmatively says this device is gone
+            # (e.g. execution's teardown already deleted a dynamic-only
+            # booking's materialized device). It cannot be orphaned
+            # RESERVED, so drop it from the release set rather than
+            # assuming exclusive and re-POSTing a status update against a
+            # device that no longer exists.
+            logger.info(
+                "Device %s not found in inventory during %s; dropping from release set",
+                did,
+                context_label,
+            )
+        elif isinstance(result, BaseException):
             logger.warning(
                 "Could not fetch device %s during %s; assuming exclusive",
                 did,

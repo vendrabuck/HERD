@@ -20,9 +20,11 @@ from app.services.reservation_service import (
     _check_conflicts,
     _create_reservation_fork,
     _create_reservation_fork_best_effort,
+    _DeviceGoneFromInventory,
     _fetch_devices,
     _fetch_devices_best_effort,
     _fork_membership_refused,
+    _release_exclusive_devices_best_effort,
     _update_device_statuses,
     cancel_reservation,
     create_reservation,
@@ -446,6 +448,77 @@ async def test_update_device_statuses_raises_when_requested():
     with patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(RuntimeError, match="inventory status update failed"):
             await _update_device_statuses([DEVICE_A], "RESERVED", raise_on_failure=True)
+
+
+@pytest.mark.asyncio
+async def test_update_device_statuses_404_on_release_is_success(caplog):
+    """Issue #716: a 404 while releasing a device to AVAILABLE (execution's
+    teardown already deleted it, e.g. a dynamic-only booking's materialized
+    device) counts as success: no retry-triggering failure, no ERROR log."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.raise_for_status = MagicMock(side_effect=AssertionError("should not be called"))
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+        caplog.at_level("INFO", logger="app.services.reservation_service"),
+    ):
+        succeeded = await _update_device_statuses([DEVICE_A], "AVAILABLE", raise_on_failure=True)
+
+    assert succeeded == [DEVICE_A]
+    assert mock_client.post.call_count == 1
+    assert not [rec for rec in caplog.records if rec.levelname == "ERROR"]
+
+
+@pytest.mark.asyncio
+async def test_update_device_statuses_404_on_reserved_still_raises():
+    """A 404 on the RESERVED (booking) direction is a real failure: inventory
+    not recognizing a device we are trying to reserve must not be swallowed."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.raise_for_status = MagicMock(side_effect=Exception("404 Not Found"))
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=mock_resp)
+
+    with patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client):
+        with pytest.raises(RuntimeError, match="inventory status update failed"):
+            await _update_device_statuses([DEVICE_A], "RESERVED", raise_on_failure=True)
+
+
+@pytest.mark.asyncio
+async def test_update_device_statuses_mixed_batch_404_flips_others_once():
+    """A release batch with one 404 (device already gone) and one normal
+    success both land as successes, and the non-404 device's status POST is
+    made exactly once (no retry triggered by the 404 sibling)."""
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    ok_resp.raise_for_status = MagicMock(return_value=None)
+    gone_resp = MagicMock()
+    gone_resp.status_code = 404
+    gone_resp.raise_for_status = MagicMock(side_effect=AssertionError("should not be called"))
+
+    async def fake_post(url, **_):
+        return gone_resp if str(DEVICE_A) in url else ok_resp
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = fake_post
+
+    with patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client):
+        succeeded = await _update_device_statuses(
+            [DEVICE_A, DEVICE_B], "AVAILABLE", raise_on_failure=True
+        )
+
+    assert set(succeeded) == {DEVICE_A, DEVICE_B}
 
 
 # --- _acquire_device_locks ---
@@ -1384,6 +1457,80 @@ async def test_fetch_devices_best_effort_returns_mixed_results():
     assert len(successes) == 2
     assert len(failures) == 1
     assert {d["id"] for d in successes} == {str(DEVICE_A), str(DEVICE_B)}
+
+
+@pytest.mark.asyncio
+async def test_fetch_devices_best_effort_404_excludes_id():
+    """Issue #716: a 404 from inventory is a distinct _DeviceGoneFromInventory
+    result, not a generic exception, so the caller can drop the id instead of
+    assuming exclusive."""
+    gone_id = uuid.uuid4()
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    async def fake_get(url, **_):
+        resp = MagicMock()
+        if str(gone_id) in url:
+            resp.status_code = 404
+        else:
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock(return_value=None)
+            device_id = url.rstrip("/").rsplit("/", 2)[-2]
+            resp.json = MagicMock(return_value=_make_device(device_id))
+        return resp
+
+    mock_client.get = fake_get
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "test-internal-token"
+        mock_settings.inventory_service_url = "http://inv"
+        results = await _fetch_devices_best_effort([DEVICE_A, gone_id])
+
+    by_id = dict(zip([DEVICE_A, gone_id], results))
+    assert isinstance(by_id[DEVICE_A], dict)
+    assert isinstance(by_id[gone_id], _DeviceGoneFromInventory)
+
+
+@pytest.mark.asyncio
+async def test_release_exclusive_devices_drops_404_fetch_result(caplog):
+    """_release_exclusive_devices_best_effort must drop a _DeviceGoneFromInventory
+    result from the release set (logging INFO, not the "assuming exclusive"
+    WARNING) instead of re-POSTing a status update for a device inventory
+    already reports gone, and must still release the other exclusive device."""
+    fetch_results = [
+        _DeviceGoneFromInventory(f"Device {DEVICE_A} not found in inventory"),
+        _make_device(DEVICE_B, exclusive=True),
+    ]
+    update_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices_best_effort",
+            new=AsyncMock(return_value=fetch_results),
+        ),
+        patch("app.services.reservation_service._update_device_statuses", new=update_mock),
+        caplog.at_level("INFO", logger="app.services.reservation_service"),
+    ):
+        await _release_exclusive_devices_best_effort(
+            uuid.uuid4(), [DEVICE_A, DEVICE_B], "test_release", context_label="release"
+        )
+
+    update_mock.assert_awaited_once()
+    assert update_mock.call_args[0][0] == [DEVICE_B]
+    info_logs = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "INFO" and str(DEVICE_A) in rec.getMessage()
+    ]
+    assert info_logs, "expected an INFO log naming the dropped device"
+    assert not [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING" and str(DEVICE_A) in rec.getMessage()
+    ]
 
 
 # --- expiration ---
