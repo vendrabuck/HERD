@@ -123,7 +123,7 @@ Once an edge is added, it renders with one of several badges:
 - **Red stroke + "uncabled port"**: one or both selected ports are not physically cabled. This takes precedence over the path badge.
 - **Default stroke (no badge)**: an edge whose pathfinder request is still resolving, or which sits in a state with no result yet.
 
-A red edge is a hard signal: the **Reserve Topology** button is disabled whenever any edge is red. The reservations service applies the same check server-side, so reserving via the API does not bypass the gate.
+A red edge is a hard signal: the **Reserve Topology** button is disabled whenever any edge is red. The reservations service applies the same check server-side, so reserving via the API does not bypass the gate. It also refuses the booking outright (422 `topology_device_not_member`) if the topology's canvas names a device you have not included in the reservation's device list; add every canvas device to the booking first (issue #701).
 
 ### Connectivity check
 

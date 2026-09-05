@@ -454,3 +454,48 @@ The fix, membership is now an enforced invariant at both fork write entry points
 Execution is unchanged: it keeps applying whatever intent cabling hands it. The
 guard belongs at the two places that write the intent, not at the consumer that
 already trusts it.
+
+## Amendment: early refusal at reservation create/update (issue #701 phase 2)
+
+The fork-write membership check above is the authorization boundary's last line:
+it fires only once a reservation already exists and something tries to fork or
+save wiring against it. Phase 2 moves the same check to the front door, on
+`create_reservation` and `update_reservation`'s device-set path, so a
+`topology_id` naming a device outside the booking never gets far enough to
+create a reservation, a fork, or any row at all.
+
+- Cabling's `POST /topologies/{id}/validate/internal` (already the create path's
+  one call to cabling, used since before this fix to reject unreachable canvas
+  edges) gains an additive `device_ids` field on `TopologyValidationResponse`:
+  the canvas's device node ids, deduplicated and sorted, computed from the same
+  node-to-device resolution `_run_topology_validation` already builds for its
+  edge walk. A dynamic placeholder or network element node never appears (`data`
+  carries no `device.id` for either), so neither is ever miscounted as a device.
+  The field defaults to an empty list rather than being required, so it is
+  purely additive to the contract.
+- Reservations' `_validate_topology_connectivity` (renamed in spirit, not in
+  name) now takes the caller's own device set alongside `topology_id`, and
+  compares it against the response's `device_ids` before looking at `valid`:
+  any canvas device outside the caller's set raises `TopologyDeviceNotMember`
+  (a `ValueError` subclass carrying the sorted offending ids), which the create
+  route maps to `422` and the update route to `400`, both with the pinned
+  `{"error": "topology_device_not_member", "device_ids": [...]}` detail. This
+  rides the existing single validate/internal round trip; it does not add a
+  second cabling call.
+- `create_reservation` checks against `data.device_ids` (the booking being
+  created); `update_reservation` checks against the NEW `data.device_ids` when
+  a PATCH changes the device set, mirroring the create-path check so PATCHing a
+  device out from under a topology-bound reservation cannot reopen the same
+  gap phase 1 closed at the fork.
+- Fail-closed is unchanged: an unreachable cabling service still raises
+  `RuntimeError` -> `503`, exactly as the pre-existing connectivity check does;
+  a 404 (topology deleted between selection and submit) is still treated as no
+  validation, not a hard failure, since there is no canvas left to check
+  membership against.
+- This is a genuine belt-and-suspenders pair, not a duplicate: phase 1 guards
+  every fork write (including a fork re-save against a topology whose canvas
+  changed after the reservation was created, which this create-time check
+  cannot see), while phase 2 guards the booking itself so the common case
+  (naming a foreign device at reserve time) is refused immediately with a
+  clearer, request-scoped error instead of surfacing later as a fork 409 on
+  activation.

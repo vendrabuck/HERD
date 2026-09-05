@@ -21,6 +21,16 @@
   existing fork whose canvas already carries a non-member endpoint will 409 on
   its next save; the detail names the offending devices so the owner can
   PATCH-add or remove them.
+  Phase 2 (issue #701) moves the same check to the front door: cabling's
+  `POST /topologies/{id}/validate/internal` gains an additive `device_ids`
+  field (the canvas's device nodes), riding reservations' existing single call
+  to that endpoint at create/update time. Creating a reservation with a
+  `topology_id` whose canvas names a device outside `device_ids` now fails
+  fast with `422` (`topology_device_not_member`, naming the offending device
+  ids) before any row is written, and a PATCH that changes `device_ids` on a
+  topology-bound reservation re-runs the same check (`400`, same detail
+  shape), instead of the mismatch only surfacing later as a fork 409 on
+  activation.
 - Changed inventory's `apply_scheduler` to record a config-apply run whose
   execution response carries no `status` as `failed` instead of `success`
   (issue #720); unreachable today, since the contract requires `status`.

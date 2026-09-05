@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from app.schemas._types import OptionalUUIDStr, UUIDStr
+from app.schemas._types import OptionalUUIDStr, UUIDStr, UUIDStrList
 from pydantic import BaseModel, Field
 
 
@@ -119,3 +119,10 @@ class InvalidEdge(BaseModel):
 class TopologyValidationResponse(BaseModel):
     valid: bool
     invalid_edges: list[InvalidEdge]
+    # Issue #701 (fork endpoint-membership fix, phase 2): the canvas's device node
+    # ids, deduplicated and sorted, using the same node_to_device resolution as the
+    # edge walk above. A dynamic placeholder or network element node is never a
+    # device (neither carries `data.device.id`) so neither ever appears here.
+    # Additive on this response so reservations' create-time membership check can
+    # ride the existing single validate/internal call instead of a second one.
+    device_ids: UUIDStrList = Field(default_factory=list)

@@ -879,6 +879,7 @@
     },
     "TopologyValidationResponse": {
       "properties": {
+        "device_ids": "array",
         "invalid_edges": "array",
         "valid": "boolean"
       },

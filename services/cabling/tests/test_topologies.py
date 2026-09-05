@@ -819,6 +819,35 @@ async def test_validate_topology_reachable_edge(admin_client, user_client):
 
 
 @pytest.mark.asyncio
+async def test_validate_topology_device_ids_field_lists_canvas_devices(admin_client, user_client):
+    """The additive device_ids field (#701) lists every canvas device node,
+    deduplicated and sorted, regardless of validity."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _seed_connection(admin_client, a, "eth1", b, "eth1")
+
+    create = await user_client.post("/topologies", json={"name": "DeviceIds"})
+    topology_id = create.json()["id"]
+    canvas = _canvas_with_edge("nA", "nB", a, b)
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["device_ids"] == sorted(str(d) for d in (a, b))
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_device_ids_empty_canvas(user_client):
+    """A topology with no edges (and so no device nodes) reports an empty
+    device_ids list rather than omitting the field."""
+    create = await user_client.post("/topologies", json={"name": "EmptyDeviceIds"})
+    topology_id = create.json()["id"]
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    assert resp.json()["device_ids"] == []
+
+
+@pytest.mark.asyncio
 async def test_validate_topology_unreachable_edge(admin_client, user_client):
     """Devices in physically isolated fabrics produce no_path edges."""
     # Two pairs cabled internally but not to each other (mirrors the seed's
@@ -1035,6 +1064,22 @@ async def test_validate_topology_element_attachment_valid_no_bfs(user_client):
     # The batch call, if made at all, must not include the element edge's pair.
     for pairs in seen_pairs:
         assert pairs == []
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_device_ids_excludes_element_nodes(user_client):
+    """A network element node is never a device (#701): device_ids names only the
+    real device endpoint of a device-to-element attachment edge."""
+    device_id = uuid.uuid4()
+    canvas = _element_canvas(device_id=device_id, element_id=str(uuid.uuid4()))
+
+    create = await user_client.post("/topologies", json={"name": "ElementDeviceIds"})
+    topology_id = create.json()["id"]
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    assert resp.json()["device_ids"] == [str(device_id)]
 
 
 @pytest.mark.asyncio

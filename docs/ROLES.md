@@ -932,7 +932,13 @@ the 2026-09-04 fork endpoint-membership fix, a save (or the activation snapshot)
 naming a canvas endpoint device outside the reservation's own device set also
 returns `409` (`fork_device_not_member`, naming the offending device ids);
 admins are not exempt, and PATCH-add is the way to bring a device into the
-reservation first:
+reservation first. Issue #701 phase 2 pushes the same check earlier: creating
+a reservation with a `topology_id` whose canvas names a device outside
+`device_ids` is refused at `422` (`topology_device_not_member`, naming the
+offending device ids) before any row is written, and a PATCH that edits
+`device_ids` on a topology-bound reservation re-runs the same check (`400`,
+same detail shape), so the mismatch never has to wait for the first fork
+write to surface.
 
 ```
 PUT  /api/reservations/{reservation_id}/fork/canvas    # owner or admin, ACTIVE only

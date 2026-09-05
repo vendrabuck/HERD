@@ -39,6 +39,7 @@ from app.services.reporting_service import (
     rollup_by_group,
 )
 from app.services.reservation_service import (
+    TopologyDeviceNotMember,
     _cabling_fork_call,
     _execution_wiring_call,
     _lazy_create_reservation_fork,
@@ -92,6 +93,11 @@ async def create_new_reservation(
     try:
         reservation = await create_reservation(
             db, body, user_id, credentials.credentials, username=username
+        )
+    except TopologyDeviceNotMember as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "topology_device_not_member", "device_ids": exc.device_ids},
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -544,6 +550,11 @@ async def update_reservation_by_id(
             user_id,
             body,
             token=credentials.credentials,
+        )
+    except TopologyDeviceNotMember as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "topology_device_not_member", "device_ids": exc.device_ids},
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -15,6 +15,7 @@ from app.main import app
 from app.models.reservation import Reservation, ReservationStatus
 from app.routers.reservations import bearer_scheme
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
+from app.services.reservation_service import TopologyDeviceNotMember
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
 
@@ -1408,6 +1409,74 @@ async def test_create_reservation_blocked_by_invalid_topology(client):
 
 
 @pytest.mark.asyncio
+async def test_create_reservation_blocked_by_topology_device_not_member(client):
+    """A topology naming a device outside device_ids is rejected at 422 with the
+    pinned topology_device_not_member detail shape (issue #701 phase 2)."""
+    topo_id = str(uuid.uuid4())
+    foreign = str(uuid.uuid4())
+    devices = [make_device_response(DEVICE_A, "PHYSICAL")]
+    body = {
+        "device_ids": [DEVICE_A],
+        "topology_id": topo_id,
+        "purpose": "Foreign device",
+        "start_time": START,
+        "end_time": END,
+    }
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=devices),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=AsyncMock(side_effect=TopologyDeviceNotMember([foreign])),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        resp = await client.post("/", json=body)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "topology_device_not_member",
+        "device_ids": [foreign],
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_cabling_unreachable_is_503(client):
+    """A transport failure talking to cabling's validate/internal (issue #701
+    phase 2's membership check rides the same call) fails closed at 503, never
+    a permissive create."""
+    topo_id = str(uuid.uuid4())
+    devices = [make_device_response(DEVICE_A, "PHYSICAL")]
+    body = {
+        "device_ids": [DEVICE_A],
+        "topology_id": topo_id,
+        "purpose": "Cabling down",
+        "start_time": START,
+        "end_time": END,
+    }
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=devices),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        resp = await client.post("/", json=body)
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
 async def test_create_reservation_validation_called_when_topology_present(client):
     """The cabling validation is invoked exactly once with the topology id."""
     topo_id = str(uuid.uuid4())
@@ -2157,7 +2226,7 @@ async def test_update_reservation_device_change_valid_topology_succeeds(client):
         patch_resp = await client.patch(f"/{res_id}", json={"device_ids": new_ids})
     assert patch_resp.status_code == 200
     assert len(patch_resp.json()["device_ids"]) == 2
-    validate_mock.assert_awaited_once_with(uuid.UUID(topo_id))
+    validate_mock.assert_awaited_once_with(uuid.UUID(topo_id), [uuid.UUID(d) for d in new_ids])
 
 
 @pytest.mark.asyncio

@@ -175,13 +175,42 @@ async def _validate_dynamic_requests(dynamic_requests, token: str) -> None:
         )
 
 
-async def _validate_topology_connectivity(topology_id: uuid.UUID) -> None:
-    """Reject the reservation when the referenced topology has unreachable edges.
+class TopologyDeviceNotMember(ValueError):
+    """Raised when topology_id's canvas names a device outside the reservation's
+    device_ids (issue #701 phase 2, the early-refusal companion to the fork-save
+    membership check).
+
+    Without this, a reservation of one device could reference a topology naming
+    other devices, and the activation-time fork create/save membership check
+    (D2/D4 of the same fix) would then be the FIRST time the mismatch surfaced,
+    after the reservation already exists. Checking it here refuses the booking
+    itself, before any row is written. A plain ValueError subclass so a caller
+    that does not care about the structured detail still catches it as a 422;
+    the router catches this type first to attach the pinned dict detail.
+    """
+
+    def __init__(self, device_ids: list[str]):
+        super().__init__(f"topology references device(s) not in device_ids: {device_ids}")
+        self.device_ids = device_ids
+
+
+async def _validate_topology_connectivity(
+    topology_id: uuid.UUID, device_ids: list[uuid.UUID]
+) -> None:
+    """Reject the reservation when the referenced topology has unreachable edges,
+    or when its canvas names a device outside ``device_ids``.
 
     The cabling service walks the physical Connection graph and returns a list of
     edges with no path between endpoints (e.g., devices in physically isolated
     fabrics). Server-side enforcement is the authority; the editor's red lines
     are informational.
+
+    ``device_ids`` is the reservation's own booked device set (issue #701 phase 2):
+    the same call's additive ``device_ids`` field (the canvas's device nodes) is
+    compared against it, and any canvas device outside the booking raises
+    TopologyDeviceNotMember rather than silently letting the reservation later
+    drive provisioning against a device it never booked. Riding the existing
+    validate/internal response keeps this one cabling round trip rather than two.
 
     Authenticated as a service-to-service call via X-Internal-Token rather than
     forwarding the booking user's JWT: the booking user does not necessarily
@@ -206,6 +235,13 @@ async def _validate_topology_connectivity(topology_id: uuid.UUID) -> None:
         raise RuntimeError(f"Cabling validation returned {resp.status_code}: {resp.text}")
 
     body = resp.json()
+
+    booked_ids = {str(d) for d in device_ids}
+    canvas_device_ids = set(body.get("device_ids") or [])
+    offending = sorted(canvas_device_ids - booked_ids)
+    if offending:
+        raise TopologyDeviceNotMember(offending)
+
     if body.get("valid"):
         return
 
@@ -1247,9 +1283,10 @@ async def create_reservation(
         topology_type = TopologyType.CLOUD
 
     # 2b. If a topology is referenced, validate every edge maps to a real path
-    # in the cabling graph. Reservations without a topology are unaffected.
+    # in the cabling graph, and (issue #701 phase 2) that every canvas device is
+    # part of this booking. Reservations without a topology are unaffected.
     if data.topology_id is not None:
-        await _validate_topology_connectivity(data.topology_id)
+        await _validate_topology_connectivity(data.topology_id, data.device_ids)
 
     # 2c. Validate dynamic requests against inventory (ADR 0004): every
     # template must exist and be a dynamic template. Reservations without
@@ -1866,16 +1903,20 @@ async def update_reservation(
                     f"Found: {', '.join(topology_types)}"
                 )
 
-            # Re-validate topology connectivity when the device set changes on a
-            # reservation that references a topology. The cabling service walks the
-            # canvas edges against the physical Connection graph and raises if any
-            # edge is unreachable, so an edit that strands part of the topology is
-            # rejected here rather than silently breaking a live reservation. Runs
-            # before any inventory status mutation below, so a failure aborts with
-            # no side effects to unwind. Reservations without a topology are
-            # unaffected (this mirrors the create-path check).
+            # Re-validate topology connectivity, and (issue #701 phase 2) device
+            # membership, when the device set changes on a reservation that
+            # references a topology. The cabling service walks the canvas edges
+            # against the physical Connection graph and raises if any edge is
+            # unreachable, so an edit that strands part of the topology is
+            # rejected here rather than silently breaking a live reservation; the
+            # membership check against the NEW device set (data.device_ids) closes
+            # the same bypass the create-path check closes, since PATCHing a
+            # device out from under a topology's canvas would otherwise be the one
+            # remaining way to leave a foreign device wired. Runs before any
+            # inventory status mutation below, so a failure aborts with no side
+            # effects to unwind. Reservations without a topology are unaffected.
             if reservation.topology_id is not None:
-                await _validate_topology_connectivity(reservation.topology_id)
+                await _validate_topology_connectivity(reservation.topology_id, data.device_ids)
 
             # Check added exclusive devices are available and have no conflicts
             if added_ids:
