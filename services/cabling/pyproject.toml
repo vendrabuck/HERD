@@ -1,6 +1,6 @@
 [project]
 name = "herd-cabling"
-version = "0.4.0"
+version = "0.5.0.dev0"
 description = "HERD Cabling Service"
 requires-python = ">=3.12"
 dependencies = [
