@@ -505,13 +505,38 @@ async def test_generate_repair_loop_caps_at_max_repair_attempts_for_element_erro
 
 
 async def test_generate_surfaces_ai_error(async_client, monkeypatch):
+    """AIError maps to 502 with the pinned detail (issue #713): the
+    provider's message is logged, never interpolated into the response."""
     _override_inventory({"EX3400": 1})
     _override_resolver(monkeypatch)
-    _override_ai(raises=AIError("timed out"))
+    _override_ai(raises=AIError("upstream 500: body mentions host=db-internal"))
     headers = {"Authorization": f"Bearer {_user_token()}"}
     async with async_client as client:
         resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
     assert resp.status_code == 502
+    assert resp.json()["detail"] == generator_module.AI_NO_USABLE_RESPONSE_DETAIL
+    assert "db-internal" not in resp.text
+
+
+async def test_generate_bare_exception_never_leaks_text(async_client, monkeypatch, caplog):
+    """generator.py catches bare Exception, so the text could be anything
+    internal; the reproduction from issue #713 must surface only the pinned
+    detail while the real exception lands in the server log with traceback."""
+    _override_inventory({"EX3400": 1})
+    _override_resolver(monkeypatch)
+    secret = "internal state: host=db-internal user=herd"
+    _override_ai(raises=RuntimeError(secret))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    with caplog.at_level("ERROR", logger="app.services.generator"):
+        async with async_client as client:
+            resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == generator_module.AI_CALL_FAILED_DETAIL
+    assert "db-internal" not in resp.text
+    logged = [r for r in caplog.records if r.getMessage() == "ai_call_failed"]
+    assert len(logged) == 1
+    assert logged[0].exc_info is not None
+    assert str(logged[0].exc_info[1]) == secret
 
 
 async def test_generate_rejects_empty_prompt(async_client, monkeypatch):

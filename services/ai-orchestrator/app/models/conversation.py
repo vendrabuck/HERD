@@ -68,6 +68,15 @@ class AssistantConversation(Base):
             "user_id",
             "reservation_id",
         ),
+        # Serves the purpose-classification transcript read, which filters on
+        # reservation_id alone and orders by created_at (issue #712, migration
+        # 0005). The (user_id, reservation_id) composite above cannot serve a
+        # reservation_id-only predicate; it is kept for now, drop is a follow-up.
+        Index(
+            "ix_assistant_conversations_reservation_created",
+            "reservation_id",
+            "created_at",
+        ),
         Index("ix_assistant_conversations_last_used_at", "last_used_at"),
         {"schema": _schema} if _schema else {},
     )

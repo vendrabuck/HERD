@@ -6,7 +6,10 @@ boundary exactly like `ai_recipe_authoring_enabled` (see
 app/routes/recipes.py's `require_recipe_authoring`): the flag dependency is
 declared first, so a disabled feature refuses with the pinned 403 detail
 before auth or provider configuration are even evaluated. `ai_is_configured()`
-then gates with the shared 503, matching every other AI route.
+then gates with the shared 503, matching every other AI route, and the
+daily quota gates with 429. Both run BEFORE the signal gather (issue #709):
+the gather fans out to inventory and cabling, so an unconfigured provider
+or an over-quota caller must not be able to drive that fan-out.
 
 One forced classify_purpose tool call per request, through the LLMProvider
 abstraction (app/services/purpose_classifier.py). A signal-fetch failure
@@ -46,6 +49,7 @@ from app.services.purpose_classifier import PurposeClassifierError, classify_pur
 logger = logging.getLogger(__name__)
 
 PURPOSE_CLASSIFICATION_DISABLED_DETAIL = "Purpose classification is disabled"
+AI_CLASSIFICATION_FAILED_DETAIL = "AI classification failed"
 
 _get_current_user, _require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -74,6 +78,15 @@ def _check_internal_token(x_internal_token: str) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid internal token")
 
 
+async def _gate_before_gather(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """Provider-configured (503) then quota (429), evaluated before any
+    signal fetch is issued (issue #709). Every sibling AI route gates in this
+    order before doing work; the gather is this route's work."""
+    if not ai_is_configured():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AI_NOT_CONFIGURED_DETAIL)
+    await usage_repo.enforce_quota(db, user_id)
+
+
 async def _run_classification(
     ai: AIClient,
     db: AsyncSession,
@@ -84,11 +97,6 @@ async def _run_classification(
     signals_used: list[str],
     classification_pass: str,
 ) -> PurposeClassification:
-    if not ai_is_configured():
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, AI_NOT_CONFIGURED_DETAIL)
-
-    await usage_repo.enforce_quota(db, user_id)
-
     try:
         result, usage = await classify_purpose(
             ai, categories=categories, signals_block=signals_block
@@ -101,8 +109,10 @@ async def _run_classification(
             status.HTTP_503_SERVICE_UNAVAILABLE, AI_PROVIDER_UNREACHABLE_DETAIL
         ) from e
     except AIError as e:
-        logger.warning("ai_purpose_classification_failed: %s", e)
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"AI classification failed: {e}") from e
+        # Fixed detail (issue #713): the provider's status/body text is logged
+        # server-side with the traceback and never reaches the client.
+        logger.exception("ai_purpose_classification_failed")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, AI_CLASSIFICATION_FAILED_DETAIL) from e
 
     await usage_repo.record_usage(db, user_id, usage, fallback_text=signals_block)
 
@@ -126,6 +136,9 @@ async def classify_purpose_preview(
     ai: AIClient = Depends(get_ai_client),
     db: AsyncSession = Depends(get_db),
 ) -> PurposeClassification:
+    user_id = uuid.UUID(user["sub"])
+    await _gate_before_gather(db, user_id)
+
     signals_block, signals_used = await purpose_signals.gather_preview_signals(
         token=token,
         purpose=body.purpose,
@@ -136,7 +149,7 @@ async def classify_purpose_preview(
     return await _run_classification(
         ai,
         db,
-        user_id=uuid.UUID(user["sub"]),
+        user_id=user_id,
         categories=body.categories,
         signals_block=signals_block,
         signals_used=signals_used,
@@ -153,6 +166,7 @@ async def classify_purpose_internal(
     db: AsyncSession = Depends(get_db),
 ) -> PurposeClassification:
     _check_internal_token(x_internal_token)
+    await _gate_before_gather(db, body.user_id)
 
     signals_block, signals_used = await purpose_signals.gather_internal_signals(
         db,
