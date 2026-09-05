@@ -49,6 +49,12 @@ logger = logging.getLogger(__name__)
 
 HTTP_TIMEOUT_SECONDS = 15.0
 TRANSCRIPT_CHAR_BUDGET = 12_000
+# Row bound on the transcript read (issue #712): the newest rows across the
+# reservation's conversations are fetched, then the character budget above
+# trims from the front. A conversation is capped at 40 turns, so 200 rows
+# spans more than one full conversation; the bound exists so the read is
+# never proportional to the table.
+TRANSCRIPT_ROW_CAP = 200
 APPLY_JOB_NAME_DISPLAY_CAP = 20
 # Per-item fetches (one inventory call per device or template) run
 # concurrently under this bound (issue #709): the internal pass at the
@@ -460,13 +466,35 @@ async def _gather_transcripts_block(db: AsyncSession, reservation_id: uuid.UUID)
     raw arguments/results are not the human-authored signal this feature
     wants and may carry device data better summarized elsewhere.
     """
-    stmt = (
-        select(AssistantMessage)
-        .join(AssistantConversation, AssistantMessage.conversation_id == AssistantConversation.id)
+    # Two-step bounded read (issue #712). Step 1 resolves the reservation's
+    # conversation ids through ix_assistant_conversations_reservation_created;
+    # step 2 pulls only the newest TRANSCRIPT_ROW_CAP rows for those ids,
+    # ordered newest-first by (conversation created_at, position) and reversed
+    # in Python back to chronological order. `position` resets per
+    # conversation, so a bare ORDER BY position DESC LIMIT would interleave
+    # conversations wrongly; the conversation ordering must lead. The id
+    # tiebreaks make equal created_at values deterministic in both steps.
+    conv_stmt = (
+        select(AssistantConversation.id)
         .where(AssistantConversation.reservation_id == reservation_id)
-        .order_by(AssistantConversation.created_at, AssistantMessage.position)
+        .order_by(AssistantConversation.created_at, AssistantConversation.id)
     )
-    rows = (await db.execute(stmt)).scalars().all()
+    conversation_ids = list((await db.execute(conv_stmt)).scalars().all())
+    if not conversation_ids:
+        return None
+
+    msg_stmt = (
+        select(AssistantMessage.role, AssistantMessage.content_blocks, AssistantMessage.position)
+        .join(AssistantConversation, AssistantMessage.conversation_id == AssistantConversation.id)
+        .where(AssistantMessage.conversation_id.in_(conversation_ids))
+        .order_by(
+            AssistantConversation.created_at.desc(),
+            AssistantConversation.id.desc(),
+            AssistantMessage.position.desc(),
+        )
+        .limit(TRANSCRIPT_ROW_CAP)
+    )
+    rows = list(reversed((await db.execute(msg_stmt)).all()))
 
     lines: list[str] = []
     for row in rows:

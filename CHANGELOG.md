@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Indexed `assistant_conversations` on `(reservation_id, created_at)` in
+  ai-orchestrator (issue #712, migration 0005) and bounded the transcript
+  read that purpose classification uses. The read is now two steps: the
+  reservation's conversation ids ordered by `created_at`, then only the
+  newest 200 message rows across those conversations (ordered by
+  conversation `created_at` and `position`, never a bare `position`, which
+  resets per conversation), selecting just `(role, content_blocks,
+  position)` and reversed in Python before the existing role filter and
+  12000-character trim. The old `(user_id, reservation_id)` composite index
+  is kept for now; dropping it is a follow-up.
+
 - Hardened the purpose-classification request path in ai-orchestrator
   (issue #709). Both `POST /classify-purpose/preview` and
   `POST /internal/classify-purpose` now bound their bodies: `purpose` at

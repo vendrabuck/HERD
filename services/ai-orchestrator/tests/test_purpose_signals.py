@@ -9,7 +9,7 @@ without changing rendering order.
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -18,6 +18,7 @@ from app.database import Base, engine
 from app.models.conversation import AssistantConversation, AssistantMessage, MessageRole
 from app.schemas.purpose import DynamicRequestItem
 from app.services import purpose_signals as sig_module
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -301,7 +302,7 @@ async def test_internal_signal_fetch_failure_is_tolerated(monkeypatch):
 # --- transcripts ---
 
 
-async def _seed_conversation(user_id, reservation_id, turns):
+async def _seed_conversation(user_id, reservation_id, turns, *, created_at=None):
     async with TestSessionLocal() as db:
         conv = AssistantConversation(
             id=uuid.uuid4(),
@@ -309,6 +310,8 @@ async def _seed_conversation(user_id, reservation_id, turns):
             reservation_id=reservation_id,
             seed_block="<seed/>",
         )
+        if created_at is not None:
+            conv.created_at = created_at
         db.add(conv)
         await db.flush()
         for position, (role, text) in enumerate(turns):
@@ -522,3 +525,133 @@ async def test_internal_device_fanout_is_bounded_and_order_preserving(monkeypatc
         f"  - dev-{did}: template=switch (Arista 7050)" for did in device_ids if did != failing
     ]
     assert rendered == expected
+
+
+# --- bounded transcript read (issue #712) ---
+
+
+async def _unbounded_reference_transcripts(db, reservation_id) -> str | None:
+    """The pre-#712 implementation, kept verbatim as the oracle: an unbounded
+    join ordered by (conversation created_at, position), rendered and then
+    trimmed to TRANSCRIPT_CHAR_BUDGET from the front. The bounded read must
+    render byte-identically whenever the character budget is the binding
+    constraint, which it is for any real conversation."""
+    stmt = (
+        select(AssistantMessage)
+        .join(AssistantConversation, AssistantMessage.conversation_id == AssistantConversation.id)
+        .where(AssistantConversation.reservation_id == reservation_id)
+        .order_by(AssistantConversation.created_at, AssistantMessage.position)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    lines: list[str] = []
+    for row in rows:
+        if row.role not in (MessageRole.USER, MessageRole.ASSISTANT):
+            continue
+        text_parts = [
+            block.get("text", "")
+            for block in (row.content_blocks or [])
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        ]
+        text = " ".join(text_parts).strip()
+        if not text:
+            continue
+        role_label = "user" if row.role == MessageRole.USER else "assistant"
+        lines.append(f"[{role_label}] {text}")
+    if not lines:
+        return None
+    kept: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        total += len(line) + 1
+        if total > sig_module.TRANSCRIPT_CHAR_BUDGET and kept:
+            break
+        kept.append(line)
+    kept.reverse()
+    return "<assistant_transcripts>\n" + "\n".join(kept) + "\n</assistant_transcripts>"
+
+
+def _long_turns(tag: str, n: int):
+    """n alternating USER/ASSISTANT rows of roughly 100 characters each, every
+    text unique so any ordering or membership difference changes the bytes;
+    every tenth row is a TOOL echo that the role filter must drop."""
+    turns = []
+    for i in range(n):
+        if i % 10 == 9:
+            turns.append((MessageRole.TOOL, f"tool-echo-{tag}-{i}"))
+            continue
+        role = MessageRole.USER if i % 2 == 0 else MessageRole.ASSISTANT
+        turns.append((role, f"{tag}-row-{i:03d} " + ("lorem ipsum " * 8).strip()))
+    return turns
+
+
+@pytest.mark.asyncio
+async def test_bounded_transcript_read_matches_unbounded_reference():
+    """Two conversations for one reservation, 300 rows total (over the
+    200-row cap) and about 30 KB of text (over the 12 KB budget): the
+    bounded two-step read renders byte-identically to the old unbounded
+    read, and the render is a real truncation (oldest rows gone, newest
+    kept)."""
+    assert sig_module.TRANSCRIPT_ROW_CAP == 200
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await _seed_conversation(uuid.uuid4(), RESERVATION_ID, _long_turns("older", 150), created_at=t0)
+    await _seed_conversation(
+        uuid.uuid4(),
+        RESERVATION_ID,
+        _long_turns("newer", 150),
+        created_at=t0 + timedelta(hours=1),
+    )
+    # Noise for another reservation, which neither read may pick up.
+    await _seed_conversation(uuid.uuid4(), uuid.uuid4(), _long_turns("other", 5), created_at=t0)
+
+    async with TestSessionLocal() as db:
+        bounded = await sig_module._gather_transcripts_block(db, RESERVATION_ID)
+        reference = await _unbounded_reference_transcripts(db, RESERVATION_ID)
+
+    assert bounded is not None
+    assert bounded == reference
+    assert "newer-row-148" in bounded
+    assert "older-row-000" not in bounded
+    assert "tool-echo" not in bounded
+    assert "other-row" not in bounded
+    assert len(bounded) <= sig_module.TRANSCRIPT_CHAR_BUDGET + len(
+        "<assistant_transcripts>\n\n</assistant_transcripts>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bounded_transcript_read_orders_by_conversation_not_bare_position(monkeypatch):
+    """With the row cap binding (budget generous), the newest rows are chosen
+    by (conversation created_at, position), so the cap takes the newer
+    conversation's rows before the older conversation's high positions. A
+    bare ORDER BY position DESC LIMIT would pick older positions 4, 3, 2."""
+    monkeypatch.setattr(sig_module, "TRANSCRIPT_ROW_CAP", 3)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await _seed_conversation(
+        uuid.uuid4(),
+        RESERVATION_ID,
+        [(MessageRole.USER, f"older-{i}") for i in range(5)],
+        created_at=t0,
+    )
+    await _seed_conversation(
+        uuid.uuid4(),
+        RESERVATION_ID,
+        [(MessageRole.USER, "newer-0"), (MessageRole.ASSISTANT, "newer-1")],
+        created_at=t0 + timedelta(hours=1),
+    )
+
+    async with TestSessionLocal() as db:
+        block = await sig_module._gather_transcripts_block(db, RESERVATION_ID)
+
+    assert block == (
+        "<assistant_transcripts>\n"
+        "[user] older-4\n"
+        "[user] newer-0\n"
+        "[assistant] newer-1\n"
+        "</assistant_transcripts>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_transcript_read_returns_none_without_conversations():
+    async with TestSessionLocal() as db:
+        assert await sig_module._gather_transcripts_block(db, uuid.uuid4()) is None
