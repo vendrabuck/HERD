@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.102.5",
-    "@tanstack/react-query-devtools": "^5.101.2",
+    "@tanstack/react-query-devtools": "^5.102.8",
     "@xyflow/react": "^12.11.6",
     "axios": "^1.19.0",
     "clsx": "^2.1.1",
