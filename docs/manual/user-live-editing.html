@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-3-0.html">Release 0.3.0</a>
+    <a href="release-0-4-0.html">Release 0.4.0</a>
   </nav>
 </header>
 
@@ -193,6 +193,7 @@
     <p class="sectitle">Committing your wiring</p>
     <p>Click <b>Commit to reservation</b>. HERD reconciles the fork in one transaction: connections you removed are <strong>released</strong>, connections you added are <strong>built</strong> (release before build), and a new fork version is appended. The fork is the source of truth for wiring: committing is exactly what reconciles your L1/L2/L3 wiring to the hardware, not a side effect of the reservation's device set.</p>
     <p>A toast reports the result &mdash; <strong>"Fork saved as vN"</strong> with released, built, and unchanged counts &mdash; and expands to list the exact connections released and built.</p>
+    <p>The commit also settles the reservation's membership. A canvas device that is not yet part of the reservation is added to it before the save runs, and a device you removed from the canvas is removed from the reservation after the save lands. If the add is refused, because the device is booked elsewhere or you are not allowed to add it, the commit fails with "These devices are not part of the reservation: &lt;ids&gt;" and nothing is wired. Admins get the same rule: adding a device to the reservation is the only way to wire it.</p>
 
     <div class="callout calm">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>

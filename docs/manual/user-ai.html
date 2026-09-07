@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-3-0.html">Release 0.3.0</a>
+    <a href="release-0-4-0.html">Release 0.4.0</a>
   </nav>
 </header>
 
@@ -121,7 +121,7 @@
           <div class="hd">
             <div style="display:flex;align-items:center;gap:14px;padding:11px 16px;background:#faf5ff;border-bottom:1px solid #e9d5ff;font-size:13px;" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">
               <span style="color:var(--proposal);font-weight:600;">AI proposal</span>
-              <span style="color:var(--gray-600)">HA firewall pair &middot; 4 devices &middot; 4 links</span>
+              <span style="color:var(--gray-600)">HA firewall pair &middot; 4 devices &middot; 1 element &middot; 6 links</span>
               <span style="flex:1"></span>
               <span class="hd-btn primary sm">Accept</span><span class="hd-btn secondary sm">Modify</span><span class="hd-btn danger sm">Reject</span>
             </div>
@@ -130,12 +130,15 @@
                 [{"from":"#gn1","to":"#gn3","layer":"l2"},
                  {"from":"#gn2","to":"#gn3","layer":"l2"},
                  {"from":"#gn1","to":"#gn4","layer":"l2"},
-                 {"from":"#gn2","to":"#gn4","layer":"l2"}]
+                 {"from":"#gn2","to":"#gn4","layer":"l2"},
+                 {"from":"#gn3","to":"#gn5","layer":"l1"},
+                 {"from":"#gn4","to":"#gn5","layer":"l1"}]
               </script>
               <div class="hd-node ghost" id="gn1" style="left:120px;top:40px;width:130px;" data-anno="1" data-anno-pin="l" data-anno-arrow><span class="prop">PROPOSED</span><div class="gl"></div><div class="nm">fw-a</div><div class="sub">Palo PA-460</div></div>
               <div class="hd-node ghost" id="gn2" style="left:120px;top:190px;width:130px;"><span class="prop">PROPOSED</span><div class="gl"></div><div class="nm">fw-b</div><div class="sub">Palo PA-460</div></div>
               <div class="hd-node ghost" id="gn3" style="left:470px;top:40px;width:130px;"><span class="prop">PROPOSED</span><div class="gl"></div><div class="nm">core-sw-1</div><div class="sub">Arista 7050X</div></div>
               <div class="hd-node ghost" id="gn4" style="left:470px;top:190px;width:130px;"><span class="prop">PROPOSED</span><div class="gl"></div><div class="nm">core-sw-2</div><div class="sub">Arista 7050X</div></div>
+              <div class="hd-node ghost" id="gn5" style="left:295px;top:245px;width:140px;background:var(--gray-50);border-color:var(--gray-400);padding:8px 12px;" data-anno="3" data-anno-pin="l" data-anno-arrow><span class="prop">PROPOSED</span><div class="nm">mgmt-vlan</div><div class="sub">VLAN segment</div></div>
             </div>
           </div>
         </div>
@@ -146,7 +149,10 @@
     <ol class="legend">
       <li><b>Ghost nodes.</b> The proposed devices, resolved to real inventory. Dashed border + "PROPOSED" tag = preview only.</li>
       <li><b>The proposal bar.</b> Shows the purpose, device count, link count, and your three choices.</li>
+      <li><b>An element ghost.</b> A proposed VLAN segment with two attachments. Same dashed preview, same verdict; the element side has no ports, so HERD picks the device-side port for each attachment.</li>
     </ol>
+
+    <p>A proposal can also include <b>network elements</b>, the same four types as the canvas palette, with devices attached to them. They arrive as ghost nodes beside the device ghosts, and you review and commit them the same way; committing keeps them. HERD, not the model, picks which device port each attachment uses: ports are taken in port-name order, skipping any the proposal already used on that device. <a href="user-topology.html#elements">Network elements &rarr;</a></p>
 
     <h2 class="sec" id="decide">Your call</h2>
     <p class="sectitle">Accept · Modify · Reject</p>
