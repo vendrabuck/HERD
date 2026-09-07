@@ -29,7 +29,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html" class="active">Glossary</a>
-    <a href="release-0-3-0.html">Release 0.3.0</a>
+    <a href="release-0-4-0.html">Release 0.4.0</a>
   </nav>
 </header>
 
@@ -98,9 +98,13 @@
 
       <div><dt>Directory group sync</dt><dd>The LDAP-to-HERD group mapping reconcile: mapped directory groups drive HERD group membership on an interval or on demand, with an optional sweep that deactivates users the directory no longer lists. <a href="admin-ldap-sync.html">LDAP sync &rarr;</a></dd></div>
 
-      <div><dt>AI-suggested purpose</dt><dd>A lab purpose category the AI orchestrator proposes at reservation creation or at reservation end, with a confidence distribution. It never writes itself into the reservation: it waits on the admin-only Purpose Review page until accepted, overridden, or dismissed. Reports in its own bucket, separate from confirmed categories, until then. <a href="admin-purpose-review.html">Purpose review &rarr;</a></dd></div>
+      <div id="ai-suggested-purpose"><dt>AI-suggested purpose</dt><dd>A lab purpose category the AI orchestrator proposes at reservation creation or at reservation end, with a confidence distribution. It never writes itself into the reservation: it waits on the admin-only Purpose Review page until accepted, overridden, or dismissed. Reports in its own bucket, separate from confirmed categories, until then. <a href="admin-purpose-review.html">Purpose review &rarr;</a></dd></div>
 
-      <div><dt>Release / version<span class="mono">v0.3.0</span></dt><dd>The tagged version of HERD your deployment runs. This manual documents <b>0.3.0</b>; when a screen does not match a page here, check the version first. <a href="release-0-3-0.html">Release 0.3.0 &rarr;</a></dd></div>
+      <div><dt>Purpose category</dt><dd>The confirmed lab purpose on a reservation, from a closed taxonomy your deployment configures. Set by the owner or an admin, or accepted from an <a href="#ai-suggested-purpose">AI-suggested purpose</a>. In reporting, every device in the reservation inherits it, transit gear included. <a href="admin-reporting.html#tables">Purpose reporting &rarr;</a></dd></div>
+
+      <div><dt>Transit gear</dt><dd>A switch or router a reservation's wiring passes through without being reserved. The by-device report counts it under the reservation's purpose, in its own transit columns; a suggested-but-unconfirmed category reports separately (see <a href="#ai-suggested-purpose">AI-suggested purpose</a>). <a href="admin-reporting.html#tables">Purpose reporting &rarr;</a></dd></div>
+
+      <div><dt>Release / version<span class="mono">v0.4.0</span></dt><dd>The tagged version of HERD your deployment runs. This manual documents <b>0.4.0</b>; when a screen does not match a page here, check the version first. <a href="release-0-4-0.html">Release 0.4.0 &rarr;</a></dd></div>
     </dl>
 
     <div class="callout tip" style="margin-top:32px;">

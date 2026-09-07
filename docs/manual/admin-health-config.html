@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-3-0.html">Release 0.3.0</a>
+    <a href="release-0-4-0.html">Release 0.4.0</a>
   </nav>
 </header>
 
@@ -133,7 +133,7 @@
 
     <h2 class="sec" id="config">Every change, kept</h2>
     <p class="sectitle">Device configuration versions</p>
-    <p>Whenever a config is applied to a device &mdash; by hand, by a reservation, or by the <a href="user-assistant.html#write">AI assistant</a> &mdash; HERD snapshots it as a numbered <strong>version</strong>. The device's detail page lists them newest-first: who applied it, when, and its description.</p>
+    <p>Whenever a config is applied to a device &mdash; by hand, by a reservation, or by the <a href="user-assistant.html#write">AI assistant</a> &mdash; HERD snapshots it as a numbered <strong>version</strong>. The device's detail page lists them newest-first: who applied it, when, and its description. The version list, the diff, and a version's detail all follow device visibility: a device outside your groups answers "Device not found", exactly like the device page. Admins see every device.</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -190,6 +190,8 @@
       <li><b>Schedule against a reservation.</b> Queue a config push tied to a reservation; it runs when that reservation activates.</li>
       <li><b>Cancel while it's pending.</b> The owner or an admin can call it off any time before it fires.</li>
       <li><b>Dry-run first.</b> A scheduled (or assistant-proposed) apply can run in <strong>dry-run</strong> mode &mdash; the driver simulates the push and records the exact commands it <em>would</em> have sent, without touching the device. You review those commands, then promote it to a real apply.</li>
+      <li><b>Authority is re-checked when it fires.</b> A scheduled apply confirms, at fire time, that its creator still has manage rights or an active reservation on the device; if not, the job resolves as skipped with the error "creator no longer authorized for this device" instead of applying.</li>
+      <li><b>30 days out, at most.</b> <code>scheduled_for</code> may be at most 30 days in the future (<code>APPLY_JOB_MAX_HORIZON_DAYS</code>); a later time is refused when you schedule.</li>
     </ul>
 
     <div class="callout tip">

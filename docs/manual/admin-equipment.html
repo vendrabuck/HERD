@@ -20,7 +20,7 @@
     <a href="admin-setup.html" class="active">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-3-0.html">Release 0.3.0</a>
+    <a href="release-0-4-0.html">Release 0.4.0</a>
   </nav>
 </header>
 
@@ -142,6 +142,8 @@
     <h2 class="sec" id="cabling">The important part</h2>
     <p class="sectitle">Cabling things up</p>
     <p>Cabling is the physical-layer truth HERD reasons over. A connection record says "port A on device A is physically connected to port B on device B." You record one per real cable in your rack. Go to <b>Administration &rarr; Connections</b> and click <b>Create Connection</b>.</p>
+
+    <p>Who sees what on this page follows device visibility. An admin sees the fleet. A non-admin's list contains only connections touching at least one device they can see, and the page total counts that same set. If HERD cannot verify device visibility, the list fails closed with "Could not verify device visibility; connections were not returned. Retry the request." rather than guessing.</p>
 
     <p>The dialog opens in <b>Multi</b> mode, built for the common case of patching several cables between the same two devices in one pass. Pick a device on each side, then stage one line per cable: drag from a port on the left to a port on the right, or click one port on each side. <b>Connect 1:1 in order</b> pairs every remaining free port down the two columns at once. Picking the same device on both sides works too, for loopbacks: 1:1 pairing then pairs that device's free ports adjacently (first with second, third with fourth), an odd leftover stays unpaired, and with fewer than two free ports the dialog reports "Need at least two free ports to pair". A port you have already staged a line from in this dialog is locked so you cannot double-book it by accident; a port that merely has an existing cable elsewhere is tagged <b>CABLED</b> but stays selectable, since a second cable on it may be exactly what you are recording. Confirming sends the whole batch in a single request.</p>
 
