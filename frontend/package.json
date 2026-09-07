@@ -12,8 +12,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.102.5",
-    "@tanstack/react-query-devtools": "^5.101.2",
+    "@tanstack/react-query": "^5.102.8",
+    "@tanstack/react-query-devtools": "^5.102.8",
     "@xyflow/react": "^12.11.6",
     "axios": "^1.19.0",
     "clsx": "^2.1.1",
@@ -51,7 +51,7 @@
     "msw": "^2.15.0",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.4.5",
-    "typescript-eslint": "^8.64.0",
+    "typescript-eslint": "^8.69.0",
     "vite": "^8.2.1",
     "vitest": "^4.1.11"
   }
