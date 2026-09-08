@@ -262,12 +262,29 @@ async def _validate_topology_connectivity(
         return
 
     invalid = body.get("invalid_edges") or []
-    summaries = []
-    for entry in invalid[:5]:
+    edge_summaries = []
+    for entry in invalid:
         edge_id = entry.get("edge_id") or "?"
         reason = entry.get("reason") or "invalid"
-        summaries.append(f"{edge_id} ({reason})")
-    extra = "" if len(invalid) <= 5 else f" and {len(invalid) - 5} more"
+        edge_summaries.append(f"{edge_id} ({reason})")
+
+    # ADR 0014 phase 1 (issue #34): fold invalid_routes into the same summary,
+    # additively, so an edge-only failure's message (and the tests pinning it) is
+    # byte-for-byte unchanged. Format matches the ADR's contract summary:
+    # "<device_id first 8>[<index or '-'>] (<reason>)".
+    invalid_routes = body.get("invalid_routes") or []
+    route_summaries = []
+    for entry in invalid_routes:
+        device_id = entry.get("device_id")
+        short_id = str(device_id)[:8] if device_id else "?"
+        index = entry.get("index")
+        index_str = str(index) if index is not None else "-"
+        reason = entry.get("reason") or "invalid"
+        route_summaries.append(f"{short_id}[{index_str}] ({reason})")
+
+    all_summaries = edge_summaries + route_summaries
+    summaries = all_summaries[:5]
+    extra = "" if len(all_summaries) <= 5 else f" and {len(all_summaries) - 5} more"
     raise ValueError(
         "Topology has unreachable edges in the cabling graph: " + ", ".join(summaries) + extra
     )

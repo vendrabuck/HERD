@@ -205,6 +205,107 @@ async def test_validate_topology_connectivity_invalid_edges_raises_value_error()
     assert "e0 (no path)" in str(excinfo.value)
 
 
+# --- _validate_topology_connectivity: invalid_routes folding (ADR 0014 phase 1,
+# issue #34) ---
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_invalid_routes_folded_into_summary():
+    """invalid_routes entries are summarized as
+    "<device_id first 8>[<index or '-'>] (<reason>)", same message prefix as the
+    edge-only failure so existing edge-only tests keep matching."""
+    device_id = str(uuid.uuid4())
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": False,
+        "invalid_edges": [],
+        "invalid_routes": [{"device_id": device_id, "index": 0, "reason": "l3_bad_destination"}],
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(ValueError, match="unreachable edges") as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+    assert f"{device_id[:8]}[0] (l3_bad_destination)" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_invalid_routes_switch_level_reason_uses_dash_index():
+    """A switch-level refusal (index null) renders as "[-]", not "[None]"."""
+    device_id = str(uuid.uuid4())
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": False,
+        "invalid_edges": [],
+        "invalid_routes": [
+            {"device_id": device_id, "index": None, "reason": "l3_switch_unattached"}
+        ],
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(ValueError) as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+    assert f"{device_id[:8]}[-] (l3_switch_unattached)" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_invalid_edges_and_routes_combined_first_five():
+    """Edge and route problems combine into one first-five-summaries list, edges
+    first, so an edge-only failure's message shape (and the tests pinning it) is
+    unaffected when no route problems exist."""
+    device_id = str(uuid.uuid4())
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": False,
+        "invalid_edges": [{"edge_id": f"e{i}", "reason": "no_path"} for i in range(4)],
+        "invalid_routes": [{"device_id": device_id, "index": 0, "reason": "l3_bad_destination"}],
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(ValueError) as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+    message = str(excinfo.value)
+    assert "e0 (no_path)" in message
+    assert f"{device_id[:8]}[0] (l3_bad_destination)" in message
+    assert "and" not in message  # 5 total (4 edges + 1 route): no truncation suffix
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_503_from_cabling_raises_runtime():
+    """A 503 (ADR 0014 Decision 5's l3_config_unavailable refusal) is refused the
+    same way any other cabling >=400 status is: RuntimeError, which the reservation
+    create route maps to a refused booking."""
+    resp = MagicMock()
+    resp.status_code = 503
+    resp.text = '{"error": "l3_config_unavailable"}'
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(RuntimeError, match="Cabling validation returned 503"):
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+
+
 # --- _validate_topology_connectivity device membership (issue #701 phase 2) ---
 
 

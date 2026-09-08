@@ -30,15 +30,23 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
+from app.models.fork import (
+    ForkConnection,
+    ForkL3Route,
+    ForkStatus_ACTIVE,
+    ForkVersion,
+    ReservationFork,
+)
 from app.models.topology import Topology, TopologyVersion
 from app.services.fork_save_service import (
     WireSpec,
     assert_endpoints_are_members,
     assert_no_port_claims,
+    gate_l3_intent,
     lock_port_claims,
     resolve_canvas_wiring,
 )
+from app.services.l3_intent import parse_l3_intent
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +177,14 @@ async def create_fork(
     await lock_port_claims(db, specs)
     await assert_no_port_claims(db, fork_id, specs)
 
+    # ADR 0014 phase 1 (issue #34): run the L3 validation pass and refuse (422 for a
+    # malformed data.l3 shape, 409 for any other invalid_routes entry) before the
+    # fork row or any fork_l3_routes row is written, mirroring the port-claim check
+    # just above. Resolving intent here (rather than inside the try/flush block
+    # below) means a refusal never even reaches the IntegrityError-guarded region.
+    await gate_l3_intent(db, forked_canvas)
+    intended_routes = parse_l3_intent(forked_canvas)
+
     fork = ReservationFork(
         id=fork_id,
         reservation_id=reservation_id,
@@ -190,6 +206,23 @@ async def create_fork(
     # inside the guard too.
     try:
         await db.flush()
+        # ADR 0014 phase 1 (issue #34): insert the resolved L3 routing intent
+        # before _snapshot_connections, sharing this try block so an activation
+        # race's IntegrityError rolls both back together with the wiring snapshot.
+        for device_id, routes in intended_routes.items():
+            for route in routes:
+                db.add(
+                    ForkL3Route(
+                        fork_id=fork.id,
+                        device_id=device_id,
+                        destination=route.destination,
+                        next_hop=route.next_hop,
+                        interface=route.interface,
+                        virtual_router=route.virtual_router,
+                        route_key=route.route_key,
+                        created_by=created_by,
+                    )
+                )
         await _snapshot_connections(db, fork.id, specs, created_by)
         db.add(
             ForkVersion(

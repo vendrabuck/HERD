@@ -341,3 +341,60 @@ batching rule `docs/DRIVERS.md` already documents.
 - Bulk import and export of routing intent: the topology importer and
   exporter carry `canvas_data` whole, so intent rides along; a CSV column
   is not added.
+
+## Amendment: phase 1 delivery (2026-09-08)
+
+Phase 1 (cabling model and validate) shipped as designed, with three points
+worth recording against the Decision and Contract summary sections above,
+none of which change the shape decided there.
+
+**A ninth validation reason, `l3_malformed`.** Decision 5 lists eight reasons
+and calls the canvas shape itself out of scope for enumeration ("`data.l3`
+must be an object whose only key is `routes`..." lives in the canvas parser,
+not the validation reason list). Implementation surfaced that a malformed
+`data.l3` shape needs its own reason so it can be reported alongside every
+other switch, rather than raised as an exception that would abort validating
+the rest of the topology: `l3_malformed` (index null, `detail` carrying the
+parser's message) is evaluated first, before `l3_not_a_router`, and stops
+further evaluation for that switch, exactly like the other switch-level
+reasons. It is also the 422 the two fork write paths (save, create_fork) map
+a malformed shape to, distinct from the 409 every other `invalid_routes`
+entry produces (see the write-path refusal shape below).
+
+**The route identity is a stored column, `route_key`.** The Contract summary
+names the `fork_l3_routes` unique constraint as
+`(fork_id, device_id, destination, interface, next_hop)`. The shipped schema
+instead stores the packed identity `f"{destination}|{interface}|{next_hop or
+''}"` as its own `route_key` column (`String(200)`) and uniques on
+`(fork_id, device_id, route_key)`. This is the same three-field identity
+Decision 3 already points at (`_route_run_identity`'s
+`(destination, interface, next_hop)`), packed into one string instead of
+three columns so the set-reconcile's identity tuple and the database
+constraint are the same value, never three columns that could drift out of
+sync with the reconcile's own notion of identity. `RouteSpec.route_key` (the
+canvas parser's dataclass) and the stored column are the same string by
+construction.
+
+**The inventory internal batch route was added.** Decision 5 says device type
+comes from inventory "batched per validation call"; inventory had a
+single-device internal read (`GET /devices/{id}/internal`) but no batch form,
+so `POST /internal/devices/batch` was added (`X-Internal-Token`, body
+`{"device_ids": [...]}` capped at 500, returning
+`[{id, name, connection_type, status}]`), with its own unit tests and an
+additive inventory contract snapshot entry. The L3 validation pass batches
+every L3-carrying switch's device-type lookup into one call per validation
+request and memoizes both device type and each switch's latest config version
+per device id for the rest of that call.
+
+Two more implementation notes, neither a deviation: the fork write paths'
+refusal shape (save and create_fork both run the validation pass first and
+refuse before writing any `fork_l3_routes` row: 422
+`{"error": "l3_intent_malformed", "node_id", "message"}` for a malformed
+switch, otherwise 409 `{"error": "l3_intent_invalid", "invalid_routes": [...]}`
+for any other refusal) was implementable directly from Decision 5's reason
+vocabulary plus the Contract summary's write-path sketch, so it needed no
+separate decision. And device-removal pruning (`prune_fork_devices`) releases
+a removed device's `fork_l3_routes` rows outright rather than reasoning about
+edge incidence the way wiring hops do: a route belongs to the switch itself,
+not to any particular canvas edge, so there is no "through-hop" case to
+preserve.

@@ -126,6 +126,27 @@ class DeviceBatchResponse(BaseModel):
     items: list[DeviceResponse]
 
 
+# Cap on ids per internal batch-fetch request (ADR 0014 phase 1, issue #34). Mirrors
+# DEVICE_BATCH_MAX_IDS; kept as its own constant since the two routes serve
+# different callers and the cap is not otherwise a contract coupling.
+INTERNAL_DEVICE_BATCH_MAX_IDS = 500
+
+
+class InternalDeviceBatchRequest(BaseModel):
+    device_ids: list[uuid.UUID] = Field(max_length=INTERNAL_DEVICE_BATCH_MAX_IDS)
+
+
+class InternalDeviceBatchEntry(BaseModel):
+    """One device's identity and type, for a service-to-service caller that needs
+    no field_data, driver, or template detail (ADR 0014 phase 1's cabling L3
+    validation pass is the first consumer: it only needs connection_type)."""
+
+    id: uuid.UUID
+    name: str
+    connection_type: str | None = None
+    status: DeviceStatus
+
+
 def _device_to_response(
     device: Device,
     *,
@@ -430,6 +451,41 @@ async def get_device_by_id(
         # field values while keeping the keys so the response shape is stable.
         return _device_to_response(device, redact_passwords=True)
     return _device_to_response(device)
+
+
+@router.post("/internal/devices/batch", response_model=list[InternalDeviceBatchEntry])
+async def get_devices_batch_internal(
+    body: InternalDeviceBatchRequest,
+    db: AsyncSession = Depends(get_db),
+    x_internal_token: str = Header(...),
+):
+    """Fetch many devices' identity and type in one round-trip. Internal
+    service-to-service endpoint, guarded by token (ADR 0014 phase 1, issue #34).
+
+    Feeds cabling's L3 routing-intent validation pass, which needs each
+    L3-carrying switch node's connection_type and has no acting user to forward.
+    Deliberately thinner than the public `/devices/batch` (no field_data, driver,
+    or template detail): only identity and type. Ids that do not exist are
+    OMITTED from the response, mirroring the public batch route's convention;
+    requesting no ids returns an empty list with no query.
+    """
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    ids = list(dict.fromkeys(body.device_ids))
+    if not ids:
+        return []
+    devices = await get_devices_by_ids(db, ids)
+    return [
+        InternalDeviceBatchEntry(
+            id=d.id,
+            name=d.name,
+            connection_type=(
+                d.template.driver.connection_type if d.template and d.template.driver else None
+            ),
+            status=d.status,
+        )
+        for d in devices
+    ]
 
 
 @router.get("/devices/{device_id}/internal", response_model=DeviceResponse)

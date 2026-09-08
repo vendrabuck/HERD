@@ -19,6 +19,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.fork import (
     ForkConnection,
+    ForkL3Route,
     ForkStatus_ACTIVE,
     ForkStatus_ARCHIVED,
     ForkVersion,
@@ -39,6 +40,7 @@ from app.schemas.fork import (
     ForkDetailResponse,
     ForkDevicesBatchRequest,
     ForkDevicesBatchResponse,
+    ForkL3RouteResponse,
     ForkPruneRequest,
     ForkPruneResponse,
     ForkRestoreResponse,
@@ -290,6 +292,20 @@ async def get_fork_internal(
         .scalars()
         .all()
     )
+    # ADR 0014 phase 1 (issue #34): the fork's resolved L3 routing intent, sorted
+    # by (device_id, route_key) so the response is deterministic regardless of
+    # insertion order.
+    l3_routes = (
+        (
+            await db.execute(
+                select(ForkL3Route)
+                .where(ForkL3Route.fork_id == fork.id)
+                .order_by(ForkL3Route.device_id, ForkL3Route.route_key)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     return ForkDetailResponse(
         id=fork.id,
@@ -303,6 +319,7 @@ async def get_fork_internal(
         updated_at=fork.updated_at,
         connections=[ForkConnectionResponse.model_validate(c) for c in connections],
         versions=[ForkVersionSummary.model_validate(v) for v in versions],
+        l3_routes=[ForkL3RouteResponse.model_validate(r) for r in l3_routes],
     )
 
 
@@ -490,6 +507,8 @@ async def save_fork_internal(
         built=[_to_delta(spec) for spec in result.built],
         unchanged_count=result.unchanged_count,
         element_attachments_skipped=result.element_attachments_skipped,
+        l3_routes_built=result.l3_routes_built,
+        l3_routes_released=result.l3_routes_released,
     )
 
 

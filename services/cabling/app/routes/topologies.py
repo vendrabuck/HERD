@@ -12,6 +12,7 @@ from app.dependencies import get_current_user_payload
 from app.models.topology import Topology, TopologyVersion
 from app.schemas.topology import (
     InvalidEdge,
+    InvalidRoute,
     PaginatedTopologyResponse,
     TopologyClone,
     TopologyCreate,
@@ -20,6 +21,7 @@ from app.schemas.topology import (
     TopologyValidationResponse,
 )
 from app.services.fork_save_service import classify_element_edge, node_to_element_map
+from app.services.l3_validation import L3ConfigUnavailable, L3InventoryContext, validate_switch_l3
 from app.services.pathfind_service import (
     build_adjacency_graph,
     find_all_shortest_paths_batch_async,
@@ -238,8 +240,31 @@ async def _run_topology_validation(
     # never appears here regardless of edge presence.
     device_ids = sorted(set(node_to_device.values()))
 
+    # ADR 0014 phase 1 (issue #34): every device node carrying data.l3, resolved
+    # through the same node_to_device map. Collected up front so the "no edges"
+    # short-circuit below still runs the L3 pass (a lone switch with routes and no
+    # edges is exactly l3_switch_unattached, not a validation no-op), and so a
+    # topology with no data.l3 anywhere makes no inventory call at all.
+    l3_nodes: list[tuple[str, uuid.UUID, object]] = []
+    for node in nodes:
+        node_id = node.get("id")
+        if node_id is None:
+            continue
+        device_id = node_to_device.get(node_id)
+        if device_id is None:
+            continue
+        l3_data = (node.get("data") or {}).get("l3")
+        if l3_data is not None:
+            l3_nodes.append((node_id, device_id, l3_data))
+
     if not edges:
-        return TopologyValidationResponse(valid=True, invalid_edges=[], device_ids=device_ids)
+        invalid_routes = await _run_l3_validation(l3_nodes, touched_devices=set())
+        return TopologyValidationResponse(
+            valid=not invalid_routes,
+            invalid_edges=[],
+            device_ids=device_ids,
+            invalid_routes=invalid_routes,
+        )
 
     # Scope the graph to the connected component(s) of the topology's devices.
     # Expansion still loads off-canvas intermediates (a patch panel that
@@ -324,6 +349,13 @@ async def _run_topology_validation(
     pairs = [(source_device, target_device) for _, _, _, source_device, target_device in pending]
     all_paths = await find_all_shortest_paths_batch_async(graph, pairs)
 
+    # ADR 0014 phase 1 (issue #34): devices touched by a VALID device-to-device
+    # edge (a resolvable pending pair whose pathfind actually found a path). This
+    # is exactly the "edge pass's outcome" l3_switch_unattached is defined against;
+    # an element attachment never lands in `pending` so it never counts, and a
+    # no_path pair contributes nothing either.
+    touched_devices: set[uuid.UUID] = set()
+
     for (idx, edge_id, layer, source_device, target_device), paths in zip(pending, all_paths):
         if not paths:
             edge_results[idx] = InvalidEdge(
@@ -333,11 +365,47 @@ async def _run_topology_validation(
                 layer=layer,
                 reason="no_path",
             )
+        else:
+            touched_devices.add(source_device)
+            touched_devices.add(target_device)
 
     invalid = [result for result in edge_results if result is not None]
+    invalid_routes = await _run_l3_validation(l3_nodes, touched_devices=touched_devices)
     return TopologyValidationResponse(
-        valid=not invalid, invalid_edges=invalid, device_ids=device_ids
+        valid=not invalid and not invalid_routes,
+        invalid_edges=invalid,
+        device_ids=device_ids,
+        invalid_routes=invalid_routes,
     )
+
+
+async def _run_l3_validation(
+    l3_nodes: list[tuple[str, uuid.UUID, object]],
+    *,
+    touched_devices: set[uuid.UUID],
+) -> list[InvalidRoute]:
+    """Run the L3 validation pass (ADR 0014 Decision 5) over every l3-carrying node.
+
+    A no-op (no inventory call) when `l3_nodes` is empty. Raises HTTPException 503
+    `{"error": "l3_config_unavailable"}` on an inventory transport failure or
+    unexpected non-2xx status (L3ConfigUnavailable), the same posture at both the
+    public and internal validate routes.
+    """
+    if not l3_nodes:
+        return []
+    ctx = L3InventoryContext()
+    try:
+        await ctx.load_device_types([device_id for _, device_id, _ in l3_nodes])
+        invalid_routes: list[InvalidRoute] = []
+        for node_id, device_id, l3_data in l3_nodes:
+            invalid_routes.extend(
+                await validate_switch_l3(
+                    node_id, device_id, l3_data, ctx=ctx, touched_devices=touched_devices
+                )
+            )
+        return invalid_routes
+    except L3ConfigUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"error": "l3_config_unavailable"}) from exc
 
 
 @router.post("/{topology_id}/validate/internal", response_model=TopologyValidationResponse)

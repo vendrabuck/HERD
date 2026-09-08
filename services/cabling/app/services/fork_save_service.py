@@ -61,7 +61,13 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.connection import Connection
-from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
+from app.models.fork import (
+    ForkConnection,
+    ForkL3Route,
+    ForkStatus_ACTIVE,
+    ForkVersion,
+    ReservationFork,
+)
 from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
 from app.services.version_service import commit_fork_with_new_version
 
@@ -99,14 +105,19 @@ class ForkSaveResult:
     # other ForkSaveResult construction site (prune, version-race retries) is
     # unaffected.
     element_attachments_skipped: int = 0
+    # ADR 0014 phase 1 (issue #34): counts from the same save's Layer 3
+    # routing-intent set reconcile (fork_l3_routes). Additive, default 0.
+    l3_routes_built: int = 0
+    l3_routes_released: int = 0
 
 
 @dataclass
 class ForkPruneResult:
     """The device-prune outcome (ADR 0009 Decision 6 REMOVE half, issue #459).
 
-    ``changed`` is True iff wiring was released and a fork_versions row appended;
-    a no-op replay (nothing left to release) returns the current latest version
+    ``changed`` is True iff wiring or Layer 3 routing intent (ADR 0014 phase 1,
+    issue #34) was released and a fork_versions row appended; a no-op replay
+    (nothing left to release on either front) returns the current latest version
     with ``changed`` False so the caller stages nothing.
     """
 
@@ -477,6 +488,77 @@ def reconcile_connection_sets(
     return to_release, to_build, unchanged_count
 
 
+async def gate_l3_intent(db: AsyncSession, canvas: dict | None) -> None:
+    """Run the L3 validation pass (ADR 0014 Decision 5) and refuse on any refusal.
+
+    Both fork write paths (``save_fork``'s reconcile, ``fork_service.create_fork``)
+    call this before touching ``fork_l3_routes``: a malformed ``data.l3`` shape maps
+    to 422 ``{"error": "l3_intent_malformed", "node_id", "message"}`` (the first
+    such entry, matching ``parse_l3_intent``'s own first-malformed-node order); any
+    other ``invalid_routes`` entry maps to 409
+    ``{"error": "l3_intent_invalid", "invalid_routes": [...]}``. Runs the exact
+    ``_run_topology_validation`` the validate routes run, via a disposable
+    ``Topology`` probe carrying only ``canvas_data``, the same technique the loose
+    canvas PUT and restore endpoints in ``routes/forks.py`` already use. A local
+    import avoids a module-level cycle: ``routes/topologies.py`` imports
+    ``classify_element_edge``/``node_to_element_map`` from this module at import
+    time, so this module cannot import back from it at import time too.
+    """
+    from app.models.topology import Topology
+    from app.routes.topologies import _run_topology_validation
+
+    validation = await _run_topology_validation(Topology(canvas_data=canvas), db)
+    if not validation.invalid_routes:
+        return
+    malformed = next(
+        (route for route in validation.invalid_routes if route.reason == "l3_malformed"), None
+    )
+    if malformed is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "l3_intent_malformed",
+                "node_id": malformed.node_id,
+                "message": malformed.detail,
+            },
+        )
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "l3_intent_invalid",
+            "invalid_routes": [route.model_dump() for route in validation.invalid_routes],
+        },
+    )
+
+
+def _l3_row_identity(row: ForkL3Route) -> tuple[uuid.UUID, str]:
+    return row.device_id, row.route_key
+
+
+def reconcile_l3_route_sets(
+    old_rows: list[ForkL3Route],
+    intended: dict,
+) -> tuple[list[ForkL3Route], list[tuple[uuid.UUID, "RouteSpec"]], int]:  # noqa: F821
+    """Pure set arithmetic for the L3 route reconcile, keyed by (device_id, route_key).
+
+    ``intended`` is ``parse_l3_intent``'s return shape (``dict[uuid.UUID,
+    list[RouteSpec]]``). Returns ``(to_release_rows, to_build, unchanged_count)``
+    where ``to_build`` is a list of ``(device_id, RouteSpec)`` pairs, mirroring
+    ``reconcile_connection_sets``'s release-before-build shape exactly.
+    """
+    old_map: dict[tuple[uuid.UUID, str], ForkL3Route] = {_l3_row_identity(r): r for r in old_rows}
+    new_map: dict[tuple[uuid.UUID, str], tuple[uuid.UUID, object]] = {}
+    for device_id, routes in intended.items():
+        for route in routes:
+            new_map[(device_id, route.route_key)] = (device_id, route)
+    old_keys = set(old_map)
+    new_keys = set(new_map)
+    to_release = [old_map[k] for k in old_keys - new_keys]
+    to_build = [new_map[k] for k in new_keys - old_keys]
+    unchanged_count = len(old_keys & new_keys)
+    return to_release, to_build, unchanged_count
+
+
 async def lock_port_claims(db: AsyncSession, to_build: list[WireSpec]) -> None:
     """Acquire transaction-scoped Postgres advisory locks over every ``to_build``
     wire's physical ``(device_id, port)`` endpoints, immediately before
@@ -653,6 +735,42 @@ async def save_fork(
         result["built"] = list(to_build)
         result["unchanged_count"] = unchanged_count
 
+        # ADR 0014 phase 1 (issue #34): Layer 3 routing-intent set reconcile, after
+        # the wiring release/build staging above. Gated FIRST on the L3 validation
+        # pass (D5); a refusal raises here, before any fork_l3_routes row is
+        # touched, so the wiring staged above is rolled back along with it (nothing
+        # in this function has committed yet).
+        from app.services.l3_intent import parse_l3_intent
+
+        await gate_l3_intent(db, canvas_data)
+        intended_routes = parse_l3_intent(canvas_data)
+        old_l3_rows = (
+            (await db.execute(select(ForkL3Route).where(ForkL3Route.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+        l3_to_release, l3_to_build, l3_unchanged_count = reconcile_l3_route_sets(
+            old_l3_rows, intended_routes
+        )
+        for row in l3_to_release:
+            await db.delete(row)
+        await db.flush()
+        for device_id, route in l3_to_build:
+            db.add(
+                ForkL3Route(
+                    fork_id=fork_id,
+                    device_id=device_id,
+                    destination=route.destination,
+                    next_hop=route.next_hop,
+                    interface=route.interface,
+                    virtual_router=route.virtual_router,
+                    route_key=route.route_key,
+                    created_by=created_by,
+                )
+            )
+        result["l3_routes_built"] = len(l3_to_build)
+        result["l3_routes_released"] = len(l3_to_release)
+
     await reconcile()
     # Consume the restore-to-draft marker (issue #622): if the draft being saved was
     # last restored from an earlier version, THIS is the save that finally reconciles
@@ -674,6 +792,8 @@ async def save_fork(
         built=result["built"],
         unchanged_count=result["unchanged_count"],
         element_attachments_skipped=wiring_resolution.element_attachments_skipped,
+        l3_routes_built=result["l3_routes_built"],
+        l3_routes_released=result["l3_routes_released"],
     )
 
 
@@ -802,6 +922,23 @@ async def prune_fork_devices(
             .all()
         )
 
+    async def _current_l3_rows() -> list[ForkL3Route]:
+        # ADR 0014 phase 1 (issue #34): a removed device's L3 routing intent
+        # releases outright, no edge-incidence reasoning needed (a route belongs
+        # to the switch itself, not to any particular edge, unlike a wiring hop
+        # that can be a surviving through-hop of a different edge).
+        return (
+            (
+                await db.execute(
+                    select(ForkL3Route).where(
+                        ForkL3Route.fork_id == fork_id, ForkL3Route.device_id.in_(device_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
     latest = await _latest_version()
     current_version = latest.version_number if latest is not None else 0
     saved_canvas = latest.canvas_data if latest is not None else None
@@ -809,9 +946,10 @@ async def prune_fork_devices(
     to_release = _rows_released_by_prune(
         await _current_rows(), removed, remaining_edge_ids, pruned_edge_ids
     )
+    l3_to_release_precheck = await _current_l3_rows()
     pruned_draft, draft_changed, _, _ = prune_canvas_for_devices(fork.canvas_data, removed)
 
-    if not to_release:
+    if not to_release and not l3_to_release_precheck:
         if draft_changed:
             fork.canvas_data = pruned_draft
             await db.commit()
@@ -846,6 +984,16 @@ async def prune_fork_devices(
         )
         for row in release_rows:
             await db.delete(row)
+
+        # ADR 0014 phase 1 (issue #34): release the removed devices' L3 routing
+        # intent in the same transaction. Re-read fresh (mirroring the wiring
+        # release just above) so a version-race retry recomputes against the
+        # winner's committed rows rather than double-deleting or missing rows a
+        # concurrent writer added.
+        l3_release_rows = await _current_l3_rows()
+        for row in l3_release_rows:
+            await db.delete(row)
+
         await db.flush()
         result["released"] = [
             WireSpec(
@@ -879,12 +1027,14 @@ __all__ = [
     "assert_endpoints_are_members",
     "assert_no_port_claims",
     "connection_identity",
+    "gate_l3_intent",
     "lock_port_claims",
     "node_to_device_map",
     "node_to_element_map",
     "prune_canvas_for_devices",
     "prune_fork_devices",
     "reconcile_connection_sets",
+    "reconcile_l3_route_sets",
     "resolve_canvas_wiring",
     "save_fork",
 ]

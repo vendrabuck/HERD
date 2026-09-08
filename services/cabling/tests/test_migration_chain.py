@@ -59,9 +59,9 @@ def test_chain_is_linear_and_walks_to_base():
     )
 
 
-def test_head_is_0010_active_fork_listing_index():
-    """The current head is 0010 (issue #710's partial-index migration)."""
+def test_head_is_0011_fork_l3_routes():
+    """The current head is 0011 (ADR 0014 phase 1's fork_l3_routes table)."""
     script = _script_directory()
-    assert script.get_heads() == ["0010"]
-    head = script.get_revision("0010")
-    assert head.down_revision == "0009"
+    assert script.get_heads() == ["0011"]
+    head = script.get_revision("0011")
+    assert head.down_revision == "0010"

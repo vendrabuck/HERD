@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- Shipped phase 1 of first-class Layer 3 routing intent (ADR 0014, issue #34):
+  cabling migration 0011 adds `fork_l3_routes`, a canvas parser reads
+  `data.l3.routes` on Layer 3 Switch device nodes, both fork write paths (fork
+  save and fork-on-activation) reconcile the resolved route set under the
+  existing fork row lock, and `/topologies/{id}/validate` and `/validate/internal`
+  gain an `invalid_routes` pass with nine refusal reasons (malformed shape, not a
+  router, unconfigured, unattached, and five per-route IP/interface checks),
+  fail-closed with a 503 `l3_config_unavailable` on an inventory outage.
+  Reservations' create-time gate folds route problems into its existing
+  unreachable-topology error, and the fork's resolved routes ride the internal
+  and user-facing fork GET. Inventory gained an internal batch device-type
+  lookup (`POST /internal/devices/batch`) to serve the validation pass.
+  Editor and execution-side consumption are phases 2 and 3, not yet built.
+
 ## [0.4.0] - 2026-09-05
 
 - Shipped lab purpose classification end to end (ADR 0013, issue #646, phases 1
