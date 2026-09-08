@@ -24,7 +24,13 @@ pytestmark = pytest.mark.asyncio
 
 _MOCK_L3_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l3"
 
-INTERFACES = [{"name": "eth0", "ip": "10.0.0.1/24"}]
+# The Layer 3 Switch config schema (services/common/herd_common/device_config.py)
+# requires "zone" on every interfaces item (additionalProperties: False, "name"
+# and "zone" both required) since the mock_l3 driver publishes no config_schema()
+# of its own and inventory falls back to that registry schema. "ip" stays
+# prefixed (a bare address has no real prefix length, which the L3 validation
+# pass's l3_next_hop_unverifiable check would then correctly refuse).
+INTERFACES = [{"name": "eth0", "ip": "10.0.0.1/24", "zone": "trust"}]
 VALID_ROUTE = {"destination": "10.20.0.0/24", "next_hop": "10.0.0.2", "interface": "eth0"}
 BAD_DESTINATION_ROUTE = {"destination": "not-an-ip", "interface": "eth0"}
 
@@ -154,7 +160,12 @@ async def _create_config_version(client, device_id: str, interfaces: list[dict])
         f"/inventory/devices/{device_id}/config-versions",
         json={"config": {"interfaces": interfaces}, "description": "l3 intent integration config"},
     )
-    resp.raise_for_status()
+    # Explicit over raise_for_status alone: a schema-validation 422 here (the
+    # payload not matching the Layer 3 Switch registry schema in
+    # herd_common/device_config.py, which applies since mock_l3 publishes no
+    # config_schema() of its own) is a test-setup bug, not a driver/network
+    # failure, and deserves its own clear assertion message.
+    assert resp.status_code == 201, f"config-version create failed: {resp.status_code} {resp.text}"
     return resp.json()
 
 
