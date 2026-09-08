@@ -1,8 +1,8 @@
 # Decision: First-Class Layer 3 Routing Intent, Issue #34
 
-Status: Accepted 2026-09-08 (decisions 1 and 2 made by Lane on 2026-09-08,
-3 to 6 proposed the same day and accepted by default pending the phase 1
-PR review; see Decision). No code in this doc. Context verified against the
+Status: Accepted 2026-09-08 (all six decisions made by Lane on 2026-09-08:
+1 and 2 outright, 3, 4, and 6 confirmed as proposed, 5 resolved to the
+strict fail-closed variant; see Decision). No code in this doc. Context verified against the
 live HERD-public tree on 2026-09-08 (main at 4ea94541). Symbols are the
 stable reference; line numbers are as of that commit.
 
@@ -123,7 +123,7 @@ still records exactly what was applied, and teardown still removes exactly
 that. Only the source of the applied list changes, and only when intent is
 present.
 
-### 3. A fork save reconciles the route set on switches with intent (decided)
+### 3. A fork save reconciles the route set on switches with intent (decided by Lane)
 
 On a switch that stays adjacent across a fork save, execution diffs the new
 intended route list against the pinned list: routes that left get
@@ -146,7 +146,7 @@ removals run while frozen, build-direction additions do not (ADR 0009
 decision 5), and the #412 invariant (an ACTIVE row is immutable to failure
 writers) extends to route-set deltas.
 
-### 4. The editor construct is a per-switch Routing panel; the L3 edge layer stays an annotation (decided)
+### 4. The editor construct is a per-switch Routing panel; the L3 edge layer stays an annotation (decided by Lane)
 
 Selecting a device node whose device is a `Layer 3 Switch` exposes a
 Routing panel: the route table (destination, next hop, interface, virtual
@@ -164,28 +164,37 @@ has a destination, a next hop, and an egress interface, and forcing that
 onto a point-to-point edge is the mismatch the issue names. The wiring
 dialog, the quick-connect popover, and the layer palette are untouched.
 
-### 5. Validation is structural and fail-closed only on facts the data can decide (decided)
+### 5. Validation fails closed, on facts and on the undecidable alike (decided by Lane)
 
 `_run_topology_validation` gains an L3 pass over every device node carrying
 `data.l3`, reported in a new additive `invalid_routes` list beside
 `invalid_edges`; `valid` is false when either list is non-empty, so the
 reservations gate (`_validate_topology_connectivity`) agrees with no shape
 change on its side beyond folding `invalid_routes` into its error summary.
-Each entry is `{node_id, device_id, index, reason, detail}`.
+Each entry is `{node_id, device_id, index, reason, detail}`; a switch-level
+refusal uses index `null`.
 
-Reason vocabulary, all fail-closed:
+Lane chose the strict variant, matching the repo's rule for boundaries that
+guard provisioning: anything HERD cannot verify is refused, never assumed.
+Reason vocabulary:
 
 - `l3_not_a_router`: the node's device is not a `Layer 3 Switch`.
+- `l3_switch_unconfigured`: the switch has no latest config version, or its
+  config lists no `interfaces`. A route needs a real egress interface and
+  HERD cannot know one exists without the config, so intent on an
+  unconfigured switch is refused rather than passed unverified. The Routing
+  panel's import action makes this cheap to satisfy: configure the switch
+  first, then express intent.
 - `l3_bad_destination`: `destination` is not a parseable IP prefix
   (`ipaddress.ip_network(strict=False)`).
 - `l3_bad_next_hop`: `next_hop` is present and not a parseable IP address.
-- `l3_unknown_interface`: the switch's latest config version lists
-  `interfaces` and `interface` is not one of their names. When the switch
-  has no config version, or its config lists no interfaces, this check does
-  not run: the data cannot decide it.
-- `l3_next_hop_outside_interface`: the named interface carries an `ip` that
-  parses as a prefixed address and `next_hop` is not inside that network.
-  An `ip` without a prefix, or absent, skips the check.
+- `l3_unknown_interface`: `interface` is not among the config's interface
+  names.
+- `l3_next_hop_unverifiable`: `next_hop` is present and the named interface
+  carries no `ip`, or an `ip` without a prefix length, so subnet membership
+  cannot be checked. Interface routes (no `next_hop`) are exempt.
+- `l3_next_hop_outside_interface`: the interface's prefixed `ip` is present
+  and `next_hop` is not inside that network.
 - `l3_switch_unattached`: the switch node carrying intent has no valid
   device edge in the topology (nothing can reach it, so its routes serve
   nothing). Element attachments do not count as wiring.
@@ -198,14 +207,18 @@ router the device does not describe yet; recorded as a follow-up check.
 
 Cabling fetches the switch's config version through inventory's existing
 internal latest-config route with the internal token, batched per
-validation call and memoized, and treats an inventory outage as "cannot
-decide" (the interface and next-hop checks skip, the structural checks still
-run). The validate response gains no new failure mode for that outage: a
-fail-closed 503 here would make every topology validate fail whenever
-inventory hiccups, which the existing device-group guard deliberately avoids
-for single reads.
+validation call and memoized. An inventory transport error or non-2xx (other
+than the 404 that means "no config version", which is `l3_switch_unconfigured`)
+fails the validate call closed with 503 and a pinned detail
+(`l3_config_unavailable`), on both the user route and the internal route;
+reservations already maps a non-2xx from the internal gate to a refused
+create, so a routed topology cannot commit while inventory is down. This is
+the same posture as cabling's bulk-create device-group check and the secrets
+reverse guard, and deliberately not the single-read device-group guard's
+fail-open: a topology without any `data.l3` never triggers the fetch, so the
+outage only ever blocks topologies that actually need the check.
 
-### 6. Execution consumes fork intent; the driver contract is untouched (decided)
+### 6. Execution consumes fork intent; the driver contract is untouched (decided by Lane)
 
 Execution's intended-wires fetch (`_fetch_fork_intended_wires`) reads the
 additive `l3_routes` list cabling adds to `GET /internal/forks/{rid}` (and
@@ -247,7 +260,7 @@ Cabling table `fork_l3_routes` (migration 0011), written by `save_fork` and
 Cabling API, additive: `GET /internal/forks/{rid}` and the fork listing gain
 `l3_routes: [{device_id, destination, next_hop, interface, virtual_router}]`;
 `POST /topologies/{id}/validate` and `/validate/internal` gain
-`invalid_routes`; `ForkSaveResponse` gains `l3_routes_built` and
+`invalid_routes` and a 503 `l3_config_unavailable` refusal; `ForkSaveResponse` gains `l3_routes_built` and
 `l3_routes_released` counts. Contract snapshots regenerate additively.
 
 Reservations: `_validate_topology_connectivity` folds `invalid_routes` into
@@ -271,7 +284,7 @@ committer's canvas builder (which never emits it in phase 1).
    the canvas-side parser that refuses unknown keys, the resolver in
    `save_fork` and `create_fork` (set reconcile under the fork lock, counts
    on the response), `l3_routes` on the internal fork routes, the L3
-   validation pass with the six reasons, `invalid_routes` on both validate
+   validation pass with the eight reasons and the 503, `invalid_routes` on both validate
    routes, prune and archive handling, reservations' gate folding
    `invalid_routes` into its error, contract snapshots. Unit tests for every
    reason, the resolver's set arithmetic, and the retry-loop reapply path;
