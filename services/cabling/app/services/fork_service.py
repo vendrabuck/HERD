@@ -149,6 +149,12 @@ async def create_fork(
     the check entirely: an existing fork was already validated (or predates this
     check) and is not re-validated on a retried create.
 
+    ADR 0014 phase 1 (issue #34): ``gate_l3_intent`` (which makes inventory HTTP
+    calls) then ``parse_l3_intent`` run right after the membership check, BEFORE
+    wiring is even resolved and before any lock is taken: a malformed shape (422)
+    or any other L3 refusal (409) writes nothing, since neither the fork row nor
+    any lock exists yet at that point.
+
     Issue #721 (ADR 0006 amendment): ``lock_port_claims`` then ``assert_no_port_claims``
     run right after, against the SAME resolved specs ``_snapshot_connections`` goes on
     to write, also before the fork row is added: a parent canvas whose resolved wiring
@@ -172,18 +178,21 @@ async def create_fork(
     )
     forked_canvas = None if parent_canvas is None else copy.deepcopy(parent_canvas)
     assert_endpoints_are_members(forked_canvas, member_device_ids)
+
+    # ADR 0014 phase 1 (issue #34): gate and parse L3 intent BEFORE resolving
+    # wiring or taking any lock. gate_l3_intent makes inventory HTTP calls (a
+    # device-type batch fetch plus per-switch config-version reads); it must never
+    # run while holding a port-claim advisory lock (lock_port_claims, just below),
+    # so it runs here, ahead of that call, mirroring save_fork's own ordering
+    # (gate before any lock is taken). A refusal (422 malformed, 409 invalid)
+    # writes nothing: the fork row does not exist yet at this point either.
+    await gate_l3_intent(db, forked_canvas)
+    intended_routes = parse_l3_intent(forked_canvas)
+
     specs = (await resolve_canvas_wiring(db, forked_canvas)).specs
     fork_id = uuid.uuid4()
     await lock_port_claims(db, specs)
     await assert_no_port_claims(db, fork_id, specs)
-
-    # ADR 0014 phase 1 (issue #34): run the L3 validation pass and refuse (422 for a
-    # malformed data.l3 shape, 409 for any other invalid_routes entry) before the
-    # fork row or any fork_l3_routes row is written, mirroring the port-claim check
-    # just above. Resolving intent here (rather than inside the try/flush block
-    # below) means a refusal never even reaches the IntegrityError-guarded region.
-    await gate_l3_intent(db, forked_canvas)
-    intended_routes = parse_l3_intent(forked_canvas)
 
     fork = ReservationFork(
         id=fork_id,

@@ -21,6 +21,8 @@ from app.database import Base, get_db
 from app.main import app
 from app.models.connection import Connection
 from app.models.fork import ForkL3Route, ForkVersion, ReservationFork
+from app.schemas.topology import TopologyValidationResponse
+from app.services.fork_save_service import gate_l3_intent as _real_gate_l3_intent
 from app.services.fork_save_service import reconcile_l3_route_sets, save_fork
 from app.services.fork_service import create_fork
 from app.services.l3_intent import RouteSpec
@@ -533,6 +535,101 @@ async def test_save_fork_l3_reconcile_reapplies_on_version_race_retry():
     assert result.l3_routes_built == 1
     rows = await _l3_rows(fork_id)
     assert len(rows) == 1  # not double-inserted by the retry
+
+
+# --- gate_l3_intent placement and short-circuit (coordinator review fix on
+# 2ade362c): the gate must run OUTSIDE the fork row lock / port-claim locks and
+# must not repeat inventory calls on a version-race retry, and it must not call
+# _run_topology_validation at all when the canvas carries no L3 intent. These
+# tests use the REAL gate_l3_intent (the module fixture above no-ops it for
+# every other test in this file), restoring it for just their own scope.
+
+
+@pytest.mark.asyncio
+async def test_save_fork_no_l3_data_makes_no_validation_or_inventory_call():
+    """A canvas with no data.l3 anywhere never calls _run_topology_validation:
+    a fork save has never validated physical edge paths and must not start."""
+    switch = uuid.uuid4()
+    fork_id = await _make_active_fork(uuid.uuid4())
+    canvas = _l3_canvas([(switch, None)])
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        with (
+            patch("app.services.fork_save_service.gate_l3_intent", new=_real_gate_l3_intent),
+            patch(
+                "app.routes.topologies._run_topology_validation", new=AsyncMock()
+            ) as validate_mock,
+        ):
+            await save_fork(db, fork, canvas_data=canvas, member_device_ids=_members(canvas))
+
+    validate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_save_fork_malformed_intent_is_422_with_no_validation_call():
+    """A malformed data.l3 shape is refused from the parse alone, with no
+    _run_topology_validation call (and therefore no inventory call)."""
+    switch = uuid.uuid4()
+    fork_id = await _make_active_fork(uuid.uuid4())
+    canvas = _l3_canvas([(switch, {"bad": "shape"})])
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        with (
+            patch("app.services.fork_save_service.gate_l3_intent", new=_real_gate_l3_intent),
+            patch(
+                "app.routes.topologies._run_topology_validation", new=AsyncMock()
+            ) as validate_mock,
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await save_fork(db, fork, canvas_data=canvas, member_device_ids=_members(canvas))
+
+    assert exc.value.status_code == 422
+    assert exc.value.detail["error"] == "l3_intent_malformed"
+    validate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_save_fork_validation_gate_runs_exactly_once_across_version_race_retry():
+    """Valid intent runs _run_topology_validation once per save, even when the
+    version-allocation retry loop reapplies reconcile(): proves the gate sits
+    OUTSIDE reconcile() and is not repeated by the retry."""
+    switch = uuid.uuid4()
+    fork_id = await _make_active_fork(uuid.uuid4())
+    canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
+
+    validate_mock = AsyncMock(
+        return_value=TopologyValidationResponse(valid=True, invalid_edges=[], invalid_routes=[])
+    )
+
+    async with TestSessionLocal() as db:
+        fork = await db.get(ReservationFork, fork_id)
+        state = {"raced": False}
+        real_commit = db.commit
+
+        async def racing_commit():
+            if not state["raced"]:
+                state["raced"] = True
+                await db.rollback()
+                async with TestSessionLocal() as other:
+                    other.add(ForkVersion(fork_id=fork_id, version_number=2))
+                    await other.commit()
+                raise IntegrityError("INSERT", {}, Exception("uq_fork_versions_fork_version"))
+            return await real_commit()
+
+        with (
+            patch("app.services.fork_save_service.gate_l3_intent", new=_real_gate_l3_intent),
+            patch("app.routes.topologies._run_topology_validation", new=validate_mock),
+            patch.object(db, "commit", side_effect=racing_commit),
+        ):
+            result = await save_fork(
+                db, fork, canvas_data=canvas, member_device_ids=_members(canvas)
+            )
+
+    assert result.version_number == 3
+    assert result.l3_routes_built == 1
+    validate_mock.assert_awaited_once()
 
 
 # --- Internal GET carries l3_routes ---

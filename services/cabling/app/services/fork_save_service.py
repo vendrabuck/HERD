@@ -489,39 +489,63 @@ def reconcile_connection_sets(
 
 
 async def gate_l3_intent(db: AsyncSession, canvas: dict | None) -> None:
-    """Run the L3 validation pass (ADR 0014 Decision 5) and refuse on any refusal.
+    """Refuse an invalid L3 intent (ADR 0014 Decision 5), short-circuiting whenever
+    possible so a fork save that carries no routing intent never pays for a
+    validation pass it never needed.
 
-    Both fork write paths (``save_fork``'s reconcile, ``fork_service.create_fork``)
-    call this before touching ``fork_l3_routes``: a malformed ``data.l3`` shape maps
-    to 422 ``{"error": "l3_intent_malformed", "node_id", "message"}`` (the first
-    such entry, matching ``parse_l3_intent``'s own first-malformed-node order); any
-    other ``invalid_routes`` entry maps to 409
-    ``{"error": "l3_intent_invalid", "invalid_routes": [...]}``. Runs the exact
-    ``_run_topology_validation`` the validate routes run, via a disposable
-    ``Topology`` probe carrying only ``canvas_data``, the same technique the loose
-    canvas PUT and restore endpoints in ``routes/forks.py`` already use. A local
-    import avoids a module-level cycle: ``routes/topologies.py`` imports
+    Both fork write paths (``save_fork``, ``fork_service.create_fork``) call this
+    ONCE, before parsing intent for the reconcile and before either takes the fork
+    row lock or a port-claim advisory lock: it makes inventory HTTP calls (a
+    device-type batch fetch plus per-switch config-version reads via
+    ``_run_topology_validation``'s L3 pass) and must never run under a lock, nor
+    repeat on a version-race retry.
+
+    Three outcomes:
+
+    - ``parse_l3_intent(canvas)`` raises ``L3IntentMalformed``: refuse immediately
+      with 422 ``{"error": "l3_intent_malformed", "node_id", "message"}``. No
+      validation call, no inventory call: the shape is already known bad from the
+      parse alone.
+    - The parsed intent is empty (no device node carries ``data.l3`` at all):
+      return with no validation call and no inventory call. A fork save has never
+      validated physical edge paths and must not start validating anything for a
+      canvas that expresses no L3 intent either.
+    - Otherwise, run the exact ``_run_topology_validation`` the validate routes
+      run, via a disposable ``Topology`` probe carrying only ``canvas_data`` (the
+      same technique the loose canvas PUT and restore endpoints in
+      ``routes/forks.py`` already use), and refuse with 409
+      ``{"error": "l3_intent_invalid", "invalid_routes": [...]}`` on any
+      ``invalid_routes`` entry (``invalid_edges`` is deliberately ignored: this
+      gate is L3-intent-only, not a general topology-validity gate). A malformed
+      shape can no longer appear in that list at this point, since our own parse
+      above already proved every l3-carrying node parses cleanly.
+
+    A local import avoids a module-level cycle: ``routes/topologies.py`` imports
     ``classify_element_edge``/``node_to_element_map`` from this module at import
     time, so this module cannot import back from it at import time too.
     """
+    from app.services.l3_intent import L3IntentMalformed, parse_l3_intent
+
+    try:
+        intended = parse_l3_intent(canvas)
+    except L3IntentMalformed as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "l3_intent_malformed",
+                "node_id": exc.node_id,
+                "message": exc.message,
+            },
+        ) from exc
+    if not intended:
+        return
+
     from app.models.topology import Topology
     from app.routes.topologies import _run_topology_validation
 
     validation = await _run_topology_validation(Topology(canvas_data=canvas), db)
     if not validation.invalid_routes:
         return
-    malformed = next(
-        (route for route in validation.invalid_routes if route.reason == "l3_malformed"), None
-    )
-    if malformed is not None:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "l3_intent_malformed",
-                "node_id": malformed.node_id,
-                "message": malformed.detail,
-            },
-        )
     raise HTTPException(
         status_code=409,
         detail={
@@ -676,6 +700,18 @@ async def save_fork(
     endpoint-membership fix): ``assert_endpoints_are_members`` runs first inside
     ``reconcile()``, before the port-claim check, so a canvas naming a foreign device
     is refused with 409 and leaves fork_connections and fork_versions untouched.
+
+    ADR 0014 phase 1 (issue #34): the L3 validation gate (``gate_l3_intent``) and
+    the canvas parse (``parse_l3_intent``) run ONCE here, outside ``reconcile()``
+    and therefore outside the version-allocation retry loop, BEFORE any lock is
+    taken. ``gate_l3_intent`` makes inventory HTTP calls (a device-type batch fetch
+    plus per-switch config-version reads); it must never run while holding the fork
+    row lock or a port-claim advisory lock, and a version-race retry must not repeat
+    those calls. ``reconcile()`` (and its retry reapply) only reads the fork's
+    current ``ForkL3Route`` rows fresh and reconciles them against the
+    ``intended_routes`` computed here once, exactly like the wiring reconcile reads
+    ``new_specs`` (computed once, above) fresh against ``ForkConnection`` on every
+    retry.
     """
     # Capture the id up front: a version-race rollback expires ``fork``, and a later
     # lazy ``fork.id`` read inside the reconcile closure would attempt synchronous IO
@@ -684,6 +720,17 @@ async def save_fork(
     fork_id = fork.id
     wiring_resolution = await resolve_canvas_wiring(db, canvas_data)
     new_specs = wiring_resolution.specs
+
+    # ADR 0014 phase 1 (issue #34): gate and parse once, before reconcile() is even
+    # defined, so neither runs under the fork row lock or a port-claim advisory
+    # lock, and neither re-runs on a version-race retry. A local import: l3_intent
+    # imports node_to_device_map from this module, so a module-level import here
+    # would be a genuine circular import (verified: ImportError at process start).
+    from app.services.l3_intent import parse_l3_intent
+
+    await gate_l3_intent(db, canvas_data)
+    intended_routes = parse_l3_intent(canvas_data)
+
     result: dict = {}
 
     async def reconcile() -> None:
@@ -736,14 +783,12 @@ async def save_fork(
         result["unchanged_count"] = unchanged_count
 
         # ADR 0014 phase 1 (issue #34): Layer 3 routing-intent set reconcile, after
-        # the wiring release/build staging above. Gated FIRST on the L3 validation
-        # pass (D5); a refusal raises here, before any fork_l3_routes row is
-        # touched, so the wiring staged above is rolled back along with it (nothing
-        # in this function has committed yet).
-        from app.services.l3_intent import parse_l3_intent
-
-        await gate_l3_intent(db, canvas_data)
-        intended_routes = parse_l3_intent(canvas_data)
+        # the wiring release/build staging above. The gate already ran, and
+        # ``intended_routes`` was already parsed, once, outside this closure (see
+        # save_fork's docstring); this only re-reads the fork's CURRENT
+        # ForkL3Route rows fresh and reconciles them, so a version-race retry
+        # recomputes the delta against the winner's committed rows without
+        # repeating any inventory call.
         old_l3_rows = (
             (await db.execute(select(ForkL3Route).where(ForkL3Route.fork_id == fork_id)))
             .scalars()
