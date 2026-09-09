@@ -58,6 +58,53 @@ def test_route_key_empty_string_for_null_next_hop_and_virtual_router():
     assert spec.route_key == json.dumps(["10.20.0.0/24", "eth1", "", ""])
 
 
+def test_route_key_worst_case_field_widths_round_trip():
+    """#758: the four fields at their 64-char cap, chosen to stress JSON packing
+    (non-ASCII, all double quotes, all backslashes, a mixed field combining all
+    three plus plain ASCII) round-trip through a real parse. No assertion here
+    pins a byte length to 400 or any other fixed bound: the column is now
+    ``Text`` precisely so width is not the limiting factor; this test only pins
+    that packing and re-parsing is lossless and reports the measured length for
+    visibility.
+    """
+    destination = "é" * 64  # non-ASCII; not a parseable IP network, kept verbatim
+    interface = '"' * 64
+    next_hop = "\\" * 64
+    virtual_router = ('a"b\\' + "é") * 12 + "abcd"  # mixed, exactly 64 chars
+    assert len(virtual_router) == 64
+
+    node = _switch_node(
+        "n1",
+        DEVICE_A,
+        {
+            "routes": [
+                {
+                    "destination": destination,
+                    "interface": interface,
+                    "next_hop": next_hop,
+                    "virtual_router": virtual_router,
+                }
+            ]
+        },
+    )
+    result = parse_l3_intent(_canvas([node]))
+    [spec] = result[DEVICE_A]
+    assert spec.destination == destination
+    assert spec.interface == interface
+    assert spec.next_hop == next_hop
+    assert spec.virtual_router == virtual_router
+
+    key = spec.route_key
+    # ensure_ascii=False (#758 fix): non-ASCII characters are stored as UTF-8,
+    # not \\uXXXX-escaped, so they must appear literally in the packed key.
+    assert destination in key
+    assert json.loads(key) == [destination, interface, next_hop, virtual_router]
+
+    # Reported for visibility only; nothing here asserts a fixed bound.
+    measured_length = len(key.encode("utf-8"))
+    assert measured_length > 0
+
+
 # --- parse_node_l3 / parse_l3_intent: valid shapes ---
 
 

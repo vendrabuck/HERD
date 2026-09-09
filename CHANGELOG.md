@@ -15,6 +15,17 @@
   and user-facing fork GET. Inventory gained an internal batch device-type
   lookup (`POST /internal/devices/batch`) to serve the validation pass.
   Editor and execution-side consumption are phases 2 and 3, not yet built.
+- Fixed issue #758: `fork_l3_routes.route_key` was `String(400)`, which legal
+  routing intent could overflow (a 64-character non-ASCII `virtual_router` and
+  the default `json.dumps` escaping inflated past 400 characters), 500ing a
+  fork save and, on activation, stranding the reservation with no fork at any
+  layer. `route_key` now packs with `ensure_ascii=False` and the column widens
+  to `Text` (cabling migration 0012).
+- Fixed issue #759: the reservations-to-cabling fork SAVE forward used the
+  default 10s timeout while cabling's L3 save gate may run up to its own 12s
+  deadline, so a save could time out on the reservations side and 503 the user
+  while cabling went on to commit it. The save forward now uses a 20s budget,
+  matching the headroom already given to the validate forward.
 
 ## [0.4.0] - 2026-09-05
 

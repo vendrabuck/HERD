@@ -48,6 +48,15 @@ logger = logging.getLogger(__name__)
 # first and misreport a slow-but-answering cabling as a transport failure.
 _VALIDATE_TOPOLOGY_TIMEOUT_SECONDS = 20.0
 
+# Issue #759: the fork SAVE forward has the same timeout-inversion hazard S13
+# fixed for validate. Cabling's save gate (`gate_l3_intent`) runs the identical
+# L3 pass, up to the same 12s `l3_validation._L3_PASS_DEADLINE_SECONDS`, inside
+# the locked reconcile; forwarding the save at the default 10s could time out
+# here while cabling goes on to commit, so the caller sees a 503 for a save
+# that actually landed. Needs the same headroom as
+# `_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS`.
+_FORK_SAVE_TIMEOUT_SECONDS = 20.0
+
 # Test-only fault-injection seam (issue #573), mirroring inventory's
 # HERD_FAULT_INJECTION convention (services/inventory/app/routers/devices.py).
 # Double-gated: active only when HERD_FAULT_INJECTION is set (dev/test compose
@@ -880,6 +889,8 @@ async def _cabling_fork_call(
     method: str,
     path: str,
     json_body: dict | None = None,
+    *,
+    timeout: float = 10.0,
 ) -> httpx.Response:
     """Issue one X-Internal-Token call to a cabling fork endpoint (issue #25 P3a).
 
@@ -894,6 +905,11 @@ async def _cabling_fork_call(
     Authenticated service-to-service, exactly like _create_reservation_fork: the
     booking owner does not necessarily own the parent topology, so a JWT-forward
     would 403 against cabling's fork routes.
+
+    `timeout` defaults to 10s, plenty for GET/PUT/archive/restore, none of which
+    fan out to inventory. The save forward is the one caller that needs more
+    (issue #759): it passes `_FORK_SAVE_TIMEOUT_SECONDS` explicitly, matching
+    `_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS`'s headroom over cabling's L3 pass budget.
     """
     try:
         return await call_service(
@@ -901,7 +917,7 @@ async def _cabling_fork_call(
             method,
             path,
             json_body=json_body,
-            timeout=10.0,
+            timeout=timeout,
             auth=InternalTokenAuth(
                 token=settings.internal_api_token,
                 missing_token_message=(

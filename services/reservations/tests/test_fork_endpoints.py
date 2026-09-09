@@ -20,6 +20,7 @@ from app.routers.reservations import (
     FORK_SAVE_REQUIRES_ACTIVE,
     bearer_scheme,
 )
+from app.services import reservation_service
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
@@ -352,7 +353,29 @@ async def test_save_active_forwards_and_stamps_created_by():
             "created_by": OWNER_ID,
             "member_device_ids": member_device_ids,
         },
+        timeout=reservation_service._FORK_SAVE_TIMEOUT_SECONDS,
     )
+
+
+@pytest.mark.asyncio
+async def test_save_forwards_at_fork_save_timeout_not_default():
+    """Issue #759: the save forward must use the wider
+    ``_FORK_SAVE_TIMEOUT_SECONDS`` (20s), not ``_cabling_fork_call``'s 10s
+    default, since cabling's L3 save gate may run up to its own 12s deadline
+    inside the locked reconcile. Mirrors
+    test_validate_topology_connectivity_uses_20s_timeout for the validate
+    path."""
+    rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
+    result = {"fork_id": str(uuid.uuid4()), "version_number": 2, "released": [], "built": []}
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(return_value=_resp(200, result)),
+    ) as call:
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.post(f"/{rid}/fork/save", json={"canvas_data": {"nodes": []}})
+    assert resp.status_code == 200
+    assert call.call_args.kwargs["timeout"] == 20.0
+    assert reservation_service._FORK_SAVE_TIMEOUT_SECONDS == 20.0
 
 
 @pytest.mark.asyncio

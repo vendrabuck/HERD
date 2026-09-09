@@ -102,7 +102,13 @@ the canvas intent into `fork_l3_routes` (cabling migration 0011): `id`,
 `fork_id`, `device_id`, `destination`, `next_hop` (nullable), `interface`,
 `virtual_router` (nullable), `created_by`, `created_at`, unique on
 `(fork_id, device_id, destination, interface, next_hop)` with the same
-NULL-safe treatment the fork tables use. This is the L3 analogue of
+NULL-safe treatment the fork tables use. **Superseded by the round-2
+amendment below (S4): the shipped schema instead stores the packed identity
+as its own `route_key` column and uniques on `(fork_id, device_id,
+route_key)`, with `route_key` covering all four fields including
+`virtual_router`; see "S4: route identity includes the virtual router" for
+the authoritative shape (and issue #758 for the column's later widening from
+`String(400)` to `Text`).** This is the L3 analogue of
 `fork_connections`: the canvas is what the user edits, the table is what
 execution reads, and the two never disagree because the same reconcile
 writes both under the fork row lock (issue #626 discipline). Its rows are
@@ -172,7 +178,11 @@ dialog, the quick-connect popover, and the layer palette are untouched.
 reservations gate (`_validate_topology_connectivity`) agrees with no shape
 change on its side beyond folding `invalid_routes` into its error summary.
 Each entry is `{node_id, device_id, index, reason, detail}`; a switch-level
-refusal uses index `null`.
+refusal uses index `null`. **Superseded by the round-1 review-fixes amendment
+below (R1): `_run_topology_validation` no longer exists in this form; the
+edge pass and this L3 pass were split into `topology_validation.py`'s
+`validate_canvas_edges` and `l3_validation.py`'s `validate_canvas_l3`,
+composed by `run_full_topology_validation` for the two `/validate` routes.**
 
 Lane chose the strict variant, matching the repo's rule for boundaries that
 guard provisioning: anything HERD cannot verify is refused, never assumed.
@@ -315,9 +325,9 @@ committer's canvas builder (which never emits it in phase 1).
 
 The five QA levels apply to every phase: unit (both services and the
 frontend), functional (route handlers direct), integration (the stack, with
-`mock_l3`), stress (the load profile is unchanged; one locust task validates
-a routed topology), and e2e (the phase 2 Playwright pass, gated on the
-seeded stack). Every validation reason has a unit test that pins the exact
+`mock_l3`), stress (the load profile is unchanged; phase 3 adds a locust task
+that validates a routed topology, not yet delivered as of phase 1), and e2e
+(the phase 2 Playwright pass, gated on the seeded stack). Every validation reason has a unit test that pins the exact
 reason string and a positive control. The set reconcile has the same
 identity tests `fork_connections` has (move, release, build, unchanged,
 duplicate collapse). Execution's delta tests assert driver call order:

@@ -39,6 +39,7 @@ from app.services.reporting_service import (
     rollup_by_group,
 )
 from app.services.reservation_service import (
+    _FORK_SAVE_TIMEOUT_SECONDS,
     TopologyDeviceNotMember,
     TopologyRoutingIntentInvalid,
     _cabling_fork_call,
@@ -898,6 +899,7 @@ async def save_reservation_fork(
                 "created_by": str(user_id),
                 "member_device_ids": [str(d) for d in reservation.device_ids],
             },
+            timeout=_FORK_SAVE_TIMEOUT_SECONDS,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
