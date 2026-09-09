@@ -25,8 +25,6 @@ from app.models.fork import (
     ForkVersion,
     ReservationFork,
 )
-from app.models.topology import Topology
-from app.routes.topologies import _run_topology_validation
 from app.schemas.fork import (
     ActiveForkEntry,
     ActiveForkListResponse,
@@ -49,8 +47,15 @@ from app.schemas.fork import (
     ForkVersionDetailResponse,
     ForkVersionSummary,
 )
-from app.services.fork_save_service import WireSpec, prune_fork_devices, save_fork
+from app.services.fork_save_service import (
+    WireSpec,
+    gate_l3_intent,
+    prune_fork_devices,
+    resolve_canvas_wiring,
+    save_fork,
+)
 from app.services.fork_service import create_fork
+from app.services.topology_validation import validate_canvas_edges
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
 
@@ -389,6 +394,12 @@ async def restore_fork_version_internal(
     fresh marker with the save's stale, already-cleared copy, silently losing it.
     Holding the row lock from this load through commit serializes against a
     concurrent save's own locked load.
+
+    Runs ONLY the edge pass (``validate_canvas_edges``, R1 review fix on
+    2ade362c), never the L3 pass: this endpoint's contract is "the draft stores
+    regardless", so it must never make an inventory call or 503 on an unsaved
+    draft. ``valid``/``invalid_edges`` are therefore edge-only, unchanged in
+    shape and behavior from before ADR 0014.
     """
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id, for_update=True)
@@ -402,15 +413,15 @@ async def restore_fork_version_internal(
     # Same validation the loose canvas PUT runs, on the same terms: reported, not
     # gated on. This also mirrors that endpoint in appending no version and not
     # touching fork_connections.
-    validation = await _run_topology_validation(Topology(canvas_data=restored_canvas), db)
+    edge_validation = await validate_canvas_edges(restored_canvas, db)
     fork_id = fork.id
     draft_restored_from_id = fork.draft_restored_from_id
     await db.commit()
 
     return ForkRestoreResponse(
         id=fork_id,
-        valid=validation.valid,
-        invalid_edges=validation.invalid_edges,
+        valid=not edge_validation.invalid_edges,
+        invalid_edges=edge_validation.invalid_edges,
         draft_restored_from_id=draft_restored_from_id,
     )
 
@@ -438,6 +449,11 @@ async def update_fork_canvas_internal(
     plain load same as the other mutators, so it is locked for consistency even
     though it never touches draft_restored_from_id and the canvas itself stays
     last-writer-wins by design.
+
+    Runs ONLY the edge pass (``validate_canvas_edges``, R1 review fix on
+    2ade362c), never the L3 pass, for the same "the draft stores regardless"
+    reason ``restore_fork_version_internal`` documents: no inventory call, no 503,
+    on an unsaved draft.
     """
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id, for_update=True)
@@ -445,16 +461,14 @@ async def update_fork_canvas_internal(
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
     fork.canvas_data = body.canvas_data
-    # _run_topology_validation reads only .canvas_data; the fork carries it, so hand
-    # a detached probe with the new canvas rather than coupling to a Topology row.
-    validation = await _run_topology_validation(Topology(canvas_data=body.canvas_data), db)
+    edge_validation = await validate_canvas_edges(body.canvas_data, db)
     fork_id = fork.id
     await db.commit()
 
     return ForkCanvasUpdateResponse(
         id=fork_id,
-        valid=validation.valid,
-        invalid_edges=validation.invalid_edges,
+        valid=not edge_validation.invalid_edges,
+        invalid_edges=edge_validation.invalid_edges,
     )
 
 
@@ -486,8 +500,26 @@ async def save_fork_internal(
     set a fresh one, dropping the restore's marker on the floor. The lock is held
     from this load through the final commit inside commit_fork_with_new_version's
     retry loop, serializing against a concurrent restore's own locked load.
+
+    Lock ordering (R3 review fix on 2ade362c): the fork row is loaded WITHOUT
+    ``FOR UPDATE`` first, just to check ARCHIVED before doing any real work; the
+    canvas is then resolved (``resolve_canvas_wiring``) and the L3 intent gated
+    (``gate_l3_intent``), BOTH of which can make inventory HTTP calls, entirely
+    before any lock is taken. Only after those calls return does the fork get
+    re-loaded WITH ``FOR UPDATE`` (re-checking ARCHIVED, since the fork's status
+    could have changed in the gap) and handed to ``save_fork`` along with the
+    already-resolved wiring and already-gated intent, so the version-allocation
+    retry loop's reapply covers only the set arithmetic, never a second resolve,
+    gate, or inventory round trip while the row is locked.
     """
     _check_internal_token(x_internal_token)
+    fork = await _load_fork(db, reservation_id)
+    if fork.status == ForkStatus_ARCHIVED:
+        raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
+
+    wiring_resolution = await resolve_canvas_wiring(db, body.canvas_data)
+    intended_routes = await gate_l3_intent(db, body.canvas_data, wiring_resolution)
+
     fork = await _load_fork(db, reservation_id, for_update=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
@@ -497,6 +529,8 @@ async def save_fork_internal(
         fork,
         canvas_data=body.canvas_data,
         member_device_ids=set(body.member_device_ids),
+        wiring_resolution=wiring_resolution,
+        intended_routes=intended_routes,
         created_by=body.created_by or "system",
     )
 

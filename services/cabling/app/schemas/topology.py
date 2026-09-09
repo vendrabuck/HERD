@@ -90,7 +90,7 @@ class TopologyRestoreRequest(BaseModel):
 
 
 class InvalidEdge(BaseModel):
-    """One canvas edge `_run_topology_validation` could not accept, with why.
+    """One canvas edge `validate_canvas_edges` could not accept, with why.
 
     ``reason`` is a plain str (no enum), currently one of:
 
@@ -117,7 +117,7 @@ class InvalidEdge(BaseModel):
 
 
 class InvalidRoute(BaseModel):
-    """One Layer 3 routing-intent problem `_run_topology_validation` found.
+    """One Layer 3 routing-intent problem `validate_canvas_l3` found.
 
     ADR 0014 phase 1, issue #34. ``index`` is the route's position within its node's
     ``data.l3.routes`` list, or ``null`` for a switch-level refusal that stopped

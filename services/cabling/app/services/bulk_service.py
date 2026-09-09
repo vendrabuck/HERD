@@ -298,7 +298,7 @@ async def import_topologies(
 
     # Local import of the validator to avoid a circular import at module load
     # (routes/topologies imports nothing from here, but keep the dependency one-way).
-    from app.routes.topologies import _run_topology_validation
+    from app.services.topology_validation import run_full_topology_validation
 
     is_admin = actor_role in ("admin", "superadmin")
 
@@ -324,11 +324,10 @@ async def import_topologies(
                 )
                 continue
 
-            # Build a detached Topology to run the existing validator against the
-            # rewritten canvas before any write. The validator is read-only on the
-            # passed topology and reads connections from the db.
-            candidate = Topology(name=name, created_by=actor_id, canvas_data=rewritten)
-            validation = await _run_topology_validation(candidate, db)
+            # Run the existing full validator (edges + L3) against the rewritten
+            # canvas before any write; it is read-only, reading connections (and,
+            # for a canvas carrying data.l3, inventory) but never touching this row.
+            validation = await run_full_topology_validation(rewritten, db)
             if not validation.valid:
                 reasons = ", ".join(f"{e.reason}({e.edge_id})" for e in validation.invalid_edges)
                 report.rows.append(

@@ -49,11 +49,24 @@ rows and 409s correctly instead of racing past it. Both helpers are shared with
 all (ADR 0006 amendment): the same collision was reachable there with zero
 concurrency, since two reservations forking the same topology simply both
 materialize the same hops with nothing to object.
+
+ADR 0014 phase 1 (issue #34), restructured by the R1-R3 review fixes on 2ade362c:
+``node_to_device_map``, ``node_to_element_map``, and ``classify_element_edge`` now
+live in the leaf module ``canvas_nodes.py`` and are re-exported here for existing
+importers. ``gate_l3_intent`` no longer resolves wiring or parses intent itself
+(R3): the caller (``routes/forks.py``'s ``save_fork_internal``) resolves the canvas
+via ``resolve_canvas_wiring`` and calls ``gate_l3_intent`` with that resolution
+BEFORE taking the fork row's ``FOR UPDATE`` lock, so the gate's inventory HTTP
+calls never run while any lock is held; ``save_fork`` itself now takes the already
+-resolved wiring and already-parsed (and already-gated) intent as parameters,
+so the version-allocation retry loop's reapply covers only the set arithmetic,
+never a second resolve or a second gate call.
 """
 
 import logging
 import uuid
 from dataclasses import dataclass
+from typing import Callable, TypeVar
 
 from fastapi import HTTPException
 from herd_common import advisory_lock
@@ -68,6 +81,9 @@ from app.models.fork import (
     ForkVersion,
     ReservationFork,
 )
+from app.services.canvas_nodes import classify_element_edge, node_to_device_map, node_to_element_map
+from app.services.l3_intent import L3IntentMalformed, RouteSpec, parse_l3_intent
+from app.services.l3_validation import validate_canvas_l3
 from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
 from app.services.version_service import commit_fork_with_new_version
 
@@ -127,22 +143,6 @@ class ForkPruneResult:
     released: list[WireSpec]
 
 
-def node_to_device_map(canvas: dict) -> dict[str, uuid.UUID]:
-    """Map React Flow node ids to device UUIDs, mirroring _run_topology_validation."""
-    nodes = canvas.get("nodes") or []
-    mapping: dict[str, uuid.UUID] = {}
-    for node in nodes:
-        node_id = node.get("id")
-        device_id_str = ((node.get("data") or {}).get("device") or {}).get("id")
-        if not node_id or not device_id_str:
-            continue
-        try:
-            mapping[node_id] = uuid.UUID(device_id_str)
-        except (ValueError, TypeError):
-            continue
-    return mapping
-
-
 def assert_endpoints_are_members(canvas: dict | None, member_device_ids: set[uuid.UUID]) -> None:
     """Refuse a canvas whose endpoint devices fall outside the reservation (D2, the
     2026-09-04 sweep's fork endpoint-membership finding).
@@ -170,87 +170,6 @@ def assert_endpoints_are_members(canvas: dict | None, member_device_ids: set[uui
                 "device_ids": sorted(str(device_id) for device_id in offending),
             },
         )
-
-
-def node_to_element_map(canvas: dict) -> dict[str, str]:
-    """Map React Flow node ids to network element ids (ADR 0012 phase 1, issue #22).
-
-    Populated from nodes whose ``type`` is ``"networkElementNode"``, keyed by node id,
-    valued by ``data.element.id`` (the client-minted element UUID). A node of that type
-    with no ``data.element.id`` falls back to the node id itself, so a malformed element
-    node still classifies as an element rather than silently vanishing from the map.
-    Shared by ``_run_topology_validation`` and ``resolve_canvas_wiring`` so both
-    classify an element edge identically.
-    """
-    nodes = canvas.get("nodes") or []
-    mapping: dict[str, str] = {}
-    for node in nodes:
-        if node.get("type") != "networkElementNode":
-            continue
-        node_id = node.get("id")
-        if not node_id:
-            continue
-        element_id = ((node.get("data") or {}).get("element") or {}).get("id")
-        mapping[node_id] = element_id or node_id
-    return mapping
-
-
-def classify_element_edge(
-    edge: dict,
-    node_to_device: dict[str, uuid.UUID],
-    node_to_element: dict[str, str],
-) -> str | None:
-    """Classify one canvas edge against the element/device maps (ADR 0012 phase 1).
-
-    The single shared classifier behind both ``_run_topology_validation`` and
-    ``resolve_canvas_wiring``, so the validator and the fork-save resolver agree on
-    which edges are element attachments and which of those are valid. Direction is
-    accepted either way: the frontend normalizes device-as-source, but an older client
-    or a hand-edited import may hand back the element first.
-
-    Returns one of:
-
-    - ``"attachment"``: exactly one endpoint is a network element, the other is a
-      known device, and the device-side port name (``target_port_name`` when the
-      device is the target, ``source_port_name`` when the device is the source) is
-      non-empty. This is the only shape ``_run_topology_validation`` accepts and the
-      only shape ``resolve_canvas_wiring`` should count.
-    - ``"element_to_element"``: both endpoints are network elements.
-    - ``"element_edge_no_port"``: exactly one endpoint is a network element, the other
-      is a known device, but the device-side port name is missing or empty.
-    - ``None``: not an element edge (neither endpoint is in ``node_to_element``), OR
-      exactly one endpoint is an element and the other resolves to no known device
-      either. That second case is deliberately left for the caller's own
-      missing-device/unresolvable-endpoint handling, since a dangling node reference
-      is a dangling node reference regardless of what the other end is.
-    """
-    source_node = edge.get("source")
-    target_node = edge.get("target")
-    source_is_element = source_node in node_to_element
-    target_is_element = target_node in node_to_element
-
-    if not source_is_element and not target_is_element:
-        return None
-
-    if source_is_element and target_is_element:
-        return "element_to_element"
-
-    source_device = node_to_device.get(source_node) if source_node else None
-    target_device = node_to_device.get(target_node) if target_node else None
-    device_side_id = target_device if source_is_element else source_device
-    if device_side_id is None:
-        return None
-
-    edge_data = edge.get("data") or {}
-    device_side_port = (
-        edge_data.get("target_port_name")
-        if source_is_element
-        else edge_data.get("source_port_name")
-    )
-    if not device_side_port:
-        return "element_edge_no_port"
-
-    return "attachment"
 
 
 @dataclass(frozen=True)
@@ -296,7 +215,7 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> Canvas
 
     Network element edges (ADR 0012 phase 1, issue #22): every edge is classified via
     the shared ``classify_element_edge`` helper BEFORE the generic unresolvable-endpoint
-    check below, so only the edges ``_run_topology_validation`` would accept as a valid
+    check below, so only the edges ``validate_canvas_edges`` would accept as a valid
     attachment (classification ``"attachment"``) are counted in the returned
     ``element_attachments_skipped``. An element edge the validator would reject
     (``"element_to_element"`` or ``"element_edge_no_port"``) falls through to the
@@ -464,6 +383,43 @@ def _spec_identity(spec: WireSpec) -> tuple[str, str, str, str, str]:
     )
 
 
+_K = TypeVar("_K")
+_Old = TypeVar("_Old")
+_New = TypeVar("_New")
+
+
+def reconcile_by_identity(
+    old_rows: list[_Old],
+    new_items: list[_New],
+    old_key: Callable[[_Old], _K],
+    new_key: Callable[[_New], _K],
+) -> tuple[list[_Old], list[_New], int]:
+    """Generic release-before-build set arithmetic keyed by an arbitrary identity
+    (R8 review fix on 2ade362c): both ``reconcile_connection_sets`` (wiring) and
+    ``reconcile_l3_route_sets`` (routing intent) are "diff two collections by
+    identity, delete what left, insert what arrived, leave the intersection
+    untouched", so this is the one implementation both build on.
+
+    Returns ``(to_release, to_build, unchanged_count)``. ``to_release`` are the old
+    rows whose identity is absent from the new set (deleted first); ``to_build``
+    are the new items whose identity is absent from the old set (inserted second);
+    ``unchanged_count`` is the size of the intersection, left untouched. An item
+    that "moves" (its identity changes while something about it stays recognizably
+    the same to a caller) has its old identity in ``to_release`` and its new
+    identity in ``to_build``, never an in-place mutation. Both output lists are
+    sorted by the string form of their identity key, so two runs over the same
+    input produce ``to_release``/``to_build`` in the same order.
+    """
+    old_map: dict[_K, _Old] = {old_key(row): row for row in old_rows}
+    new_map: dict[_K, _New] = {new_key(item): item for item in new_items}
+    old_keys = set(old_map)
+    new_keys = set(new_map)
+    to_release = [old_map[k] for k in sorted(old_keys - new_keys, key=str)]
+    to_build = [new_map[k] for k in sorted(new_keys - old_keys, key=str)]
+    unchanged_count = len(old_keys & new_keys)
+    return to_release, to_build, unchanged_count
+
+
 def reconcile_connection_sets(
     old_rows: list[ForkConnection],
     new_specs: list[WireSpec],
@@ -478,27 +434,42 @@ def reconcile_connection_sets(
     ``to_build``, so the move is a release plus a build across the same physical port
     pair, never an in-place mutation.
     """
-    old_map: dict[tuple, ForkConnection] = {_row_identity(r): r for r in old_rows}
-    new_map: dict[tuple, WireSpec] = {_spec_identity(s): s for s in new_specs}
-    old_keys = set(old_map)
-    new_keys = set(new_map)
-    to_release = [old_map[k] for k in old_keys - new_keys]
-    to_build = [new_map[k] for k in new_keys - old_keys]
-    unchanged_count = len(old_keys & new_keys)
-    return to_release, to_build, unchanged_count
+    return reconcile_by_identity(old_rows, new_specs, _row_identity, _spec_identity)
 
 
-async def gate_l3_intent(db: AsyncSession, canvas: dict | None) -> None:
-    """Refuse an invalid L3 intent (ADR 0014 Decision 5), short-circuiting whenever
-    possible so a fork save that carries no routing intent never pays for a
-    validation pass it never needed.
+def touched_devices_from_specs(specs: list[WireSpec]) -> set[uuid.UUID]:
+    """Both endpoints of every resolved hop (R2 review fix on 2ade362c).
 
-    Both fork write paths (``save_fork``, ``fork_service.create_fork``) call this
-    ONCE, before parsing intent for the reconcile and before either takes the fork
-    row lock or a port-claim advisory lock: it makes inventory HTTP calls (a
-    device-type batch fetch plus per-switch config-version reads via
-    ``_run_topology_validation``'s L3 pass) and must never run under a lock, nor
-    repeat on a version-race retry.
+    The L3 pass's "unattached" check is defined against this set, not against the
+    edge-validation pass's own BFS: port constraints are honored (a port-
+    constrained edge whose port has no cable resolves to no hop and so touches
+    nothing) and transit devices on a multi-hop resolved path are included (they
+    are never themselves an edge endpoint, but the resolved wiring genuinely
+    reaches them).
+    """
+    touched: set[uuid.UUID] = set()
+    for spec in specs:
+        touched.add(spec.device_a_id)
+        touched.add(spec.device_b_id)
+    return touched
+
+
+async def gate_l3_intent(
+    db: AsyncSession,
+    canvas: dict | None,
+    wiring_resolution: CanvasWiringResolution,
+) -> dict[uuid.UUID, list[RouteSpec]]:
+    """Parse and refuse an invalid L3 intent (ADR 0014 Decision 5), returning the
+    parsed intent on success so the caller never parses the same canvas twice (R8
+    review fix on 2ade362c).
+
+    Callers (``routes/forks.py``'s ``save_fork_internal``) must call this BEFORE
+    taking the fork row's ``FOR UPDATE`` lock (R3): it makes inventory HTTP calls
+    (a device-type batch fetch plus per-switch config-version reads) and must
+    never run while any lock is held, nor repeat on a version-race retry.
+    ``wiring_resolution`` must be the SAME ``resolve_canvas_wiring`` result the
+    caller goes on to reconcile with (R2): this gate reuses it for the L3 pass's
+    ``touched_devices`` rather than resolving the canvas a second time.
 
     Three outcomes:
 
@@ -506,26 +477,18 @@ async def gate_l3_intent(db: AsyncSession, canvas: dict | None) -> None:
       with 422 ``{"error": "l3_intent_malformed", "node_id", "message"}``. No
       validation call, no inventory call: the shape is already known bad from the
       parse alone.
-    - The parsed intent is empty (no device node carries ``data.l3`` at all):
-      return with no validation call and no inventory call. A fork save has never
-      validated physical edge paths and must not start validating anything for a
-      canvas that expresses no L3 intent either.
-    - Otherwise, run the exact ``_run_topology_validation`` the validate routes
-      run, via a disposable ``Topology`` probe carrying only ``canvas_data`` (the
-      same technique the loose canvas PUT and restore endpoints in
-      ``routes/forks.py`` already use), and refuse with 409
-      ``{"error": "l3_intent_invalid", "invalid_routes": [...]}`` on any
-      ``invalid_routes`` entry (``invalid_edges`` is deliberately ignored: this
-      gate is L3-intent-only, not a general topology-validity gate). A malformed
-      shape can no longer appear in that list at this point, since our own parse
-      above already proved every l3-carrying node parses cleanly.
-
-    A local import avoids a module-level cycle: ``routes/topologies.py`` imports
-    ``classify_element_edge``/``node_to_element_map`` from this module at import
-    time, so this module cannot import back from it at import time too.
+    - The parsed intent is empty (no device node carries ``data.l3`` at all, or
+      every node's carries only an empty routes list, R10): return ``{}`` with no
+      validation call and no inventory call. A fork save has never validated
+      physical edge paths and must not start validating anything for a canvas
+      that expresses no L3 intent either.
+    - Otherwise, run ``validate_canvas_l3`` (the same L3 pass the validate routes
+      run) against ``touched_devices_from_specs(wiring_resolution.specs)``, and
+      refuse with 409 ``{"error": "l3_intent_invalid", "invalid_routes": [...]}``
+      on any entry. A malformed shape can no longer appear in that list at this
+      point, since our own parse above already proved every l3-carrying node
+      parses cleanly.
     """
-    from app.services.l3_intent import L3IntentMalformed, parse_l3_intent
-
     try:
         intended = parse_l3_intent(canvas)
     except L3IntentMalformed as exc:
@@ -538,19 +501,17 @@ async def gate_l3_intent(db: AsyncSession, canvas: dict | None) -> None:
             },
         ) from exc
     if not intended:
-        return
+        return {}
 
-    from app.models.topology import Topology
-    from app.routes.topologies import _run_topology_validation
-
-    validation = await _run_topology_validation(Topology(canvas_data=canvas), db)
-    if not validation.invalid_routes:
-        return
+    touched_devices = touched_devices_from_specs(wiring_resolution.specs)
+    invalid_routes = await validate_canvas_l3(canvas or {}, db, touched_devices)
+    if not invalid_routes:
+        return intended
     raise HTTPException(
         status_code=409,
         detail={
             "error": "l3_intent_invalid",
-            "invalid_routes": [route.model_dump() for route in validation.invalid_routes],
+            "invalid_routes": [route.model_dump() for route in invalid_routes],
         },
     )
 
@@ -559,28 +520,45 @@ def _l3_row_identity(row: ForkL3Route) -> tuple[uuid.UUID, str]:
     return row.device_id, row.route_key
 
 
+def _l3_item_identity(item: tuple[uuid.UUID, RouteSpec]) -> tuple[uuid.UUID, str]:
+    device_id, route = item
+    return device_id, route.route_key
+
+
+def l3_row_from_spec(
+    fork_id: uuid.UUID, device_id: uuid.UUID, route: RouteSpec, created_by: str
+) -> ForkL3Route:
+    """Build one ``ForkL3Route`` row from a parsed route (R8 review fix on
+    2ade362c): the one place both write paths (``save_fork``'s reconcile and
+    ``fork_service.create_fork``'s insert loop) construct this row, so the two
+    can never drift on which fields it carries."""
+    return ForkL3Route(
+        fork_id=fork_id,
+        device_id=device_id,
+        destination=route.destination,
+        next_hop=route.next_hop,
+        interface=route.interface,
+        virtual_router=route.virtual_router,
+        route_key=route.route_key,
+        created_by=created_by,
+    )
+
+
 def reconcile_l3_route_sets(
     old_rows: list[ForkL3Route],
-    intended: dict,
-) -> tuple[list[ForkL3Route], list[tuple[uuid.UUID, "RouteSpec"]], int]:  # noqa: F821
+    intended: dict[uuid.UUID, list[RouteSpec]],
+) -> tuple[list[ForkL3Route], list[tuple[uuid.UUID, RouteSpec]], int]:
     """Pure set arithmetic for the L3 route reconcile, keyed by (device_id, route_key).
 
-    ``intended`` is ``parse_l3_intent``'s return shape (``dict[uuid.UUID,
-    list[RouteSpec]]``). Returns ``(to_release_rows, to_build, unchanged_count)``
-    where ``to_build`` is a list of ``(device_id, RouteSpec)`` pairs, mirroring
-    ``reconcile_connection_sets``'s release-before-build shape exactly.
+    ``intended`` is ``parse_l3_intent``'s return shape. Returns ``(to_release_rows,
+    to_build, unchanged_count)`` where ``to_build`` is a list of ``(device_id,
+    RouteSpec)`` pairs, mirroring ``reconcile_connection_sets``'s release-before
+    -build shape exactly (both now built on ``reconcile_by_identity``).
     """
-    old_map: dict[tuple[uuid.UUID, str], ForkL3Route] = {_l3_row_identity(r): r for r in old_rows}
-    new_map: dict[tuple[uuid.UUID, str], tuple[uuid.UUID, object]] = {}
-    for device_id, routes in intended.items():
-        for route in routes:
-            new_map[(device_id, route.route_key)] = (device_id, route)
-    old_keys = set(old_map)
-    new_keys = set(new_map)
-    to_release = [old_map[k] for k in old_keys - new_keys]
-    to_build = [new_map[k] for k in new_keys - old_keys]
-    unchanged_count = len(old_keys & new_keys)
-    return to_release, to_build, unchanged_count
+    new_items: list[tuple[uuid.UUID, RouteSpec]] = [
+        (device_id, route) for device_id, routes in intended.items() for route in routes
+    ]
+    return reconcile_by_identity(old_rows, new_items, _l3_row_identity, _l3_item_identity)
 
 
 async def lock_port_claims(db: AsyncSession, to_build: list[WireSpec]) -> None:
@@ -684,52 +662,42 @@ async def save_fork(
     fork: ReservationFork,
     canvas_data: dict,
     member_device_ids: set[uuid.UUID],
+    wiring_resolution: CanvasWiringResolution,
+    intended_routes: dict[uuid.UUID, list[RouteSpec]],
     created_by: str = "system",
 ) -> ForkSaveResult:
     """Reconcile a fork's wiring against a submitted canvas and append a version.
 
-    Resolves the canvas once to the intended set, then reconciles and commits under
-    the version-allocation retry loop. The reconcile (endpoint-membership check,
-    fresh old-set read, port-claim lock plus check, release-before-build staging)
-    runs on the first pass here and re-runs inside ``commit_fork_with_new_version``'s
-    reapply hook on every retry, so a lost version race recomputes against committed
-    rows and a mid-reconcile failure rolls back the whole save (no half-apply, no
-    orphan version). The caller has already refused an ARCHIVED fork.
+    Reconciles and commits under the version-allocation retry loop. The reconcile
+    (endpoint-membership check, fresh old-set read, port-claim lock plus check,
+    release-before-build staging) runs on the first pass here and re-runs inside
+    ``commit_fork_with_new_version``'s reapply hook on every retry, so a lost
+    version race recomputes against committed rows and a mid-reconcile failure
+    rolls back the whole save (no half-apply, no orphan version). The caller has
+    already refused an ARCHIVED fork.
 
     ``member_device_ids`` is the reservation's device set (D2, the 2026-09-04 fork
     endpoint-membership fix): ``assert_endpoints_are_members`` runs first inside
     ``reconcile()``, before the port-claim check, so a canvas naming a foreign device
     is refused with 409 and leaves fork_connections and fork_versions untouched.
 
-    ADR 0014 phase 1 (issue #34): the L3 validation gate (``gate_l3_intent``) and
-    the canvas parse (``parse_l3_intent``) run ONCE here, outside ``reconcile()``
-    and therefore outside the version-allocation retry loop, BEFORE any lock is
-    taken. ``gate_l3_intent`` makes inventory HTTP calls (a device-type batch fetch
-    plus per-switch config-version reads); it must never run while holding the fork
-    row lock or a port-claim advisory lock, and a version-race retry must not repeat
-    those calls. ``reconcile()`` (and its retry reapply) only reads the fork's
-    current ``ForkL3Route`` rows fresh and reconciles them against the
-    ``intended_routes`` computed here once, exactly like the wiring reconcile reads
-    ``new_specs`` (computed once, above) fresh against ``ForkConnection`` on every
-    retry.
+    ADR 0014 phase 1 (issue #34), restructured by the R3 review fix on 2ade362c:
+    ``wiring_resolution`` and ``intended_routes`` are computed and gated by the
+    CALLER (``routes/forks.py``'s ``save_fork_internal``), BEFORE the fork row's
+    ``FOR UPDATE`` lock is taken, since the gate makes inventory HTTP calls that
+    must never run while any lock is held. This function receives both already
+    resolved, gated, and parsed: ``reconcile()`` (and its retry reapply) only reads
+    the fork's CURRENT ``ForkConnection``/``ForkL3Route`` rows fresh and reconciles
+    them against these fixed inputs, so a version-race retry recomputes the delta
+    against the winner's committed rows without repeating any inventory call or
+    re-resolving the canvas.
     """
     # Capture the id up front: a version-race rollback expires ``fork``, and a later
     # lazy ``fork.id`` read inside the reconcile closure would attempt synchronous IO
     # off the async loop. Setting ``fork.canvas_data`` is a plain attribute write and
     # needs no load.
     fork_id = fork.id
-    wiring_resolution = await resolve_canvas_wiring(db, canvas_data)
     new_specs = wiring_resolution.specs
-
-    # ADR 0014 phase 1 (issue #34): gate and parse once, before reconcile() is even
-    # defined, so neither runs under the fork row lock or a port-claim advisory
-    # lock, and neither re-runs on a version-race retry. A local import: l3_intent
-    # imports node_to_device_map from this module, so a module-level import here
-    # would be a genuine circular import (verified: ImportError at process start).
-    from app.services.l3_intent import parse_l3_intent
-
-    await gate_l3_intent(db, canvas_data)
-    intended_routes = parse_l3_intent(canvas_data)
 
     result: dict = {}
 
@@ -794,25 +762,14 @@ async def save_fork(
             .scalars()
             .all()
         )
-        l3_to_release, l3_to_build, l3_unchanged_count = reconcile_l3_route_sets(
+        l3_to_release, l3_to_build, _l3_unchanged_count = reconcile_l3_route_sets(
             old_l3_rows, intended_routes
         )
         for row in l3_to_release:
             await db.delete(row)
         await db.flush()
         for device_id, route in l3_to_build:
-            db.add(
-                ForkL3Route(
-                    fork_id=fork_id,
-                    device_id=device_id,
-                    destination=route.destination,
-                    next_hop=route.next_hop,
-                    interface=route.interface,
-                    virtual_router=route.virtual_router,
-                    route_key=route.route_key,
-                    created_by=created_by,
-                )
-            )
+            db.add(l3_row_from_spec(fork_id, device_id, route, created_by))
         result["l3_routes_built"] = len(l3_to_build)
         result["l3_routes_released"] = len(l3_to_release)
 
@@ -1071,6 +1028,7 @@ __all__ = [
     "WireSpec",
     "assert_endpoints_are_members",
     "assert_no_port_claims",
+    "classify_element_edge",
     "connection_identity",
     "gate_l3_intent",
     "lock_port_claims",
@@ -1078,8 +1036,10 @@ __all__ = [
     "node_to_element_map",
     "prune_canvas_for_devices",
     "prune_fork_devices",
+    "reconcile_by_identity",
     "reconcile_connection_sets",
     "reconcile_l3_route_sets",
     "resolve_canvas_wiring",
     "save_fork",
+    "touched_devices_from_specs",
 ]
