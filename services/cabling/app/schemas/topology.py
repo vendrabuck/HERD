@@ -119,21 +119,25 @@ class InvalidEdge(BaseModel):
 class InvalidRoute(BaseModel):
     """One Layer 3 routing-intent problem `validate_canvas_l3` found.
 
-    ADR 0014 phase 1, issue #34. ``index`` is the route's position within its node's
-    ``data.l3.routes`` list, or ``null`` for a switch-level refusal that stopped
-    evaluation before any per-route check ran (``l3_malformed``, ``l3_not_a_router``,
-    ``l3_switch_unconfigured``, ``l3_switch_unattached``). ``detail`` carries the
-    parser's message for ``l3_malformed`` and is null for every other reason.
+    ADR 0014 phase 1, issue #34. ``index`` is the route's ORIGINAL position within
+    its node's ``data.l3.routes`` list (S12 review fix, round 2: never shifted by
+    a duplicate collapsed earlier in the same list), or ``null`` for a switch-level
+    refusal that stopped evaluation before any per-route check ran
+    (``l3_malformed``, ``l3_not_a_router``, ``l3_switch_unconfigured``,
+    ``l3_switch_unattached``). ``detail`` carries the parser's message for
+    ``l3_malformed`` and is null for every other reason.
 
     ``reason`` is one of, in the order evaluated per switch (a switch-level reason
-    stops further evaluation for that switch; per-route reasons are all reported):
+    stops further evaluation for that switch; per-route reasons, and
+    ``l3_duplicate_route``, are all reported):
 
     - ``l3_malformed``: the node's ``data.l3`` does not match the ADR 0014 shape.
     - ``l3_not_a_router``: the device is not a ``Layer 3 Switch``.
     - ``l3_switch_unconfigured``: no latest config version, or its config lists no
       interfaces.
-    - ``l3_switch_unattached``: no valid device-to-device edge in this validation
-      touches the switch node (element attachments do not count).
+    - ``l3_switch_unattached``: the switch is not an endpoint of at least one
+      resolved hop in this canvas (transit devices on a multi-hop path count;
+      element attachments do not).
     - ``l3_bad_destination``: ``destination`` is not a parseable IP prefix.
     - ``l3_bad_next_hop``: ``next_hop`` is present and not a parseable IP address.
     - ``l3_unknown_interface``: ``interface`` is not among the config's interface
@@ -142,6 +146,11 @@ class InvalidRoute(BaseModel):
       carries no ``ip``, or an ``ip`` with no real prefix length.
     - ``l3_next_hop_outside_interface``: the interface's ``ip`` network does not
       contain ``next_hop``.
+    - ``l3_duplicate_route`` (S12 review fix, round 2): this route's identity
+      duplicates an earlier one in the same node's list and was collapsed to it.
+      INFORMATIONAL: reported so nothing vanishes silently, but never makes
+      ``valid`` false and never makes a save gate refuse (see
+      ``l3_validation.route_causes_invalid``).
     """
 
     node_id: str

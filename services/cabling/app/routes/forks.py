@@ -49,12 +49,16 @@ from app.schemas.fork import (
 )
 from app.services.fork_save_service import (
     WireSpec,
+    assert_endpoints_are_members,
     gate_l3_intent,
+    l3_intent_changed,
     prune_fork_devices,
     resolve_canvas_wiring,
     save_fork,
+    touched_devices_from_specs,
 )
 from app.services.fork_service import create_fork
+from app.services.l3_intent import merge_candidates_by_device, walk_l3_nodes
 from app.services.topology_validation import validate_canvas_edges
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
@@ -66,7 +70,11 @@ def _check_internal_token(token: str) -> None:
 
 
 async def _load_fork(
-    db: AsyncSession, reservation_id: uuid.UUID, *, for_update: bool = False
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+    refresh: bool = False,
 ) -> ReservationFork:
     """Load the fork row for a reservation, optionally under a row lock.
 
@@ -80,10 +88,27 @@ async def _load_fork(
     engine the unit suites use); every writer that passes it must hold the lock
     from this load through its own final commit or rollback, not release and
     reacquire mid-request. GET routes never pass it: they only read.
+
+    ``refresh=True`` (S1 review fix, round 2 on 2ade362c) adds
+    ``populate_existing=True`` to the SELECT's execution options. Proven live by
+    the review: a caller that already loaded this row once in the SAME session
+    (``save_fork_internal``'s unlocked pre-gate load, re-loaded ``for_update``
+    after the gate) gets back the SAME Python object from SQLAlchemy's identity
+    map by default, with whatever column values it had at the FIRST load, even
+    though the second SELECT's ``FOR UPDATE`` genuinely re-reads and locks the
+    row at the database. Without this, a concurrent archive or restore that
+    committed between the two loads is invisible to the caller despite the lock
+    having just proven the row's current committed state. Every caller that
+    re-loads a fork it already holds in this session within one request must
+    pass this; a caller's first load in a request needs it only if another
+    reference to the same row could already be memoized in that session (none
+    of the current single-load routes are).
     """
     stmt = select(ReservationFork).where(ReservationFork.reservation_id == reservation_id)
     if for_update:
         stmt = stmt.with_for_update()
+    if refresh:
+        stmt = stmt.execution_options(populate_existing=True)
     fork = (await db.execute(stmt)).scalar_one_or_none()
     if fork is None:
         raise HTTPException(status_code=404, detail="Fork not found")
@@ -503,24 +528,78 @@ async def save_fork_internal(
 
     Lock ordering (R3 review fix on 2ade362c): the fork row is loaded WITHOUT
     ``FOR UPDATE`` first, just to check ARCHIVED before doing any real work; the
-    canvas is then resolved (``resolve_canvas_wiring``) and the L3 intent gated
-    (``gate_l3_intent``), BOTH of which can make inventory HTTP calls, entirely
-    before any lock is taken. Only after those calls return does the fork get
-    re-loaded WITH ``FOR UPDATE`` (re-checking ARCHIVED, since the fork's status
-    could have changed in the gap) and handed to ``save_fork`` along with the
-    already-resolved wiring and already-gated intent, so the version-allocation
-    retry loop's reapply covers only the set arithmetic, never a second resolve,
-    gate, or inventory round trip while the row is locked.
+    canvas is then resolved (``resolve_canvas_wiring``) and, when needed (S5),
+    the L3 intent gated (``gate_l3_intent``), BOTH of which can make inventory
+    HTTP calls, entirely before any lock is taken. Only after those calls return
+    does the fork get re-loaded WITH ``FOR UPDATE`` (re-checking ARCHIVED, since
+    the fork's status could have changed in the gap) and handed to ``save_fork``
+    along with the already-resolved wiring and already-gated intent, so the
+    version-allocation retry loop's reapply covers only the set arithmetic,
+    never a second resolve, gate, or inventory round trip while the row is
+    locked. The locked re-load passes ``refresh=True`` (S1 review fix, round 2):
+    without it, SQLAlchemy's identity map hands back the FIRST load's stale
+    column values even though the ``FOR UPDATE`` genuinely re-reads and locks
+    the row, so a concurrent archive or restore committed in the gap would be
+    invisible to the ARCHIVED re-check and the restore-marker read alike.
+
+    Membership is checked BEFORE the gate (S3 review fix, round 2): a canvas
+    naming a device outside the reservation is refused with 409
+    ``fork_device_not_member`` and no inventory lookup at all, rather than
+    paying for (and potentially leaking a reason through) an L3 validation call
+    against a device this reservation has no business naming. ``save_fork``'s
+    own ``reconcile()`` still runs the same check again on every version-race
+    retry, since the retry reapplies against freshly-read state.
+
+    The canvas is parsed exactly ONCE, via ``l3_intent.walk_l3_nodes`` (S10
+    review fix, round 2): a malformed node 422s immediately (no validation call,
+    no inventory call), and the well-formed candidates feed both the merged
+    ``intended_routes`` (for the reconcile) and, when needed, ``gate_l3_intent``
+    (for validation), so the canvas's ``data.l3`` is never re-parsed.
+
+    The L3 validation pass (and its inventory calls) runs ONLY when the intent
+    actually changed (S5 review fix, round 2): ``l3_intent_changed`` compares
+    the parsed intent against the fork's EXISTING ``ForkL3Route`` rows (route-key
+    sets per device) before any lock is taken; when they match, no
+    ``resolve_canvas_wiring``-derived touched-device set is even needed for L3
+    purposes and no inventory call is made, so a wiring-only save on a fork
+    whose routes were already validated when written cannot 503. See ADR 0014's
+    phase 1 review-fixes amendment for the accepted consequence.
     """
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
-    wiring_resolution = await resolve_canvas_wiring(db, body.canvas_data)
-    intended_routes = await gate_l3_intent(db, body.canvas_data, wiring_resolution)
+    member_device_ids = set(body.member_device_ids)
+    assert_endpoints_are_members(body.canvas_data, member_device_ids)
 
-    fork = await _load_fork(db, reservation_id, for_update=True)
+    candidates, malformed = walk_l3_nodes(body.canvas_data)
+    if malformed:
+        _node_id, _device_id, exc = malformed[0]
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "l3_intent_malformed",
+                "node_id": exc.node_id,
+                "message": exc.message,
+            },
+        )
+    intended_routes = merge_candidates_by_device(candidates)
+
+    wiring_resolution = await resolve_canvas_wiring(db, body.canvas_data)
+
+    validated_config_version_ids: dict[uuid.UUID, uuid.UUID | None] = {}
+    if intended_routes:
+        existing_l3_rows = (
+            (await db.execute(select(ForkL3Route).where(ForkL3Route.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        if l3_intent_changed(existing_l3_rows, intended_routes):
+            touched_devices = touched_devices_from_specs(wiring_resolution.specs)
+            validated_config_version_ids = await gate_l3_intent(candidates, touched_devices)
+
+    fork = await _load_fork(db, reservation_id, for_update=True, refresh=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
@@ -528,9 +607,10 @@ async def save_fork_internal(
         db,
         fork,
         canvas_data=body.canvas_data,
-        member_device_ids=set(body.member_device_ids),
+        member_device_ids=member_device_ids,
         wiring_resolution=wiring_resolution,
         intended_routes=intended_routes,
+        validated_config_version_ids=validated_config_version_ids,
         created_by=body.created_by or "system",
     )
 

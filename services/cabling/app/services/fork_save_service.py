@@ -82,9 +82,13 @@ from app.models.fork import (
     ReservationFork,
 )
 from app.services.canvas_nodes import classify_element_edge, node_to_device_map, node_to_element_map
-from app.services.l3_intent import L3IntentMalformed, RouteSpec, parse_l3_intent
-from app.services.l3_validation import validate_canvas_l3
-from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_async
+from app.services.l3_intent import L3NodeCandidate, RouteSpec
+from app.services.l3_validation import route_causes_invalid, validate_canvas_l3
+from app.services.pathfind_service import (
+    build_adjacency_graph,
+    find_all_shortest_paths_async,
+    find_all_shortest_paths_batch_async,
+)
 from app.services.version_service import commit_fork_with_new_version
 
 logger = logging.getLogger(__name__)
@@ -188,8 +192,19 @@ class CanvasWiringResolution:
     element_attachments_skipped: int = 0
 
 
-async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> CanvasWiringResolution:
+async def resolve_canvas_wiring(
+    db: AsyncSession,
+    canvas: dict | None,
+    *,
+    graph: dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]] | None = None,
+) -> CanvasWiringResolution:
     """Resolve a canvas's committed edges to intended physical wiring (WireSpecs).
+
+    ``graph`` (S11 review fix, round 2) lets a caller that already built the
+    adjacency graph for this canvas (``validate_canvas_edges``, inside
+    ``run_full_topology_validation``) hand it in instead of paying for a second
+    ``build_adjacency_graph`` load; when omitted, this function builds its own,
+    unchanged from before.
 
     The shared resolver behind both fork-on-activation snapshotting and save-reconcile
     (issue #25 P3a). For each committed (non-proposal) canvas edge between two
@@ -231,7 +246,8 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> Canvas
 
     node_to_device = node_to_device_map(canvas)
     node_to_element = node_to_element_map(canvas)
-    graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
+    if graph is None:
+        graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
 
     component_devices = set(graph.keys())
     if component_devices:
@@ -262,7 +278,22 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> Canvas
     seen: set[tuple[uuid.UUID, str, uuid.UUID, str, str]] = set()
     element_attachments_skipped = 0
 
-    for edge in edges:
+    # First pass: classify every edge and resolve its endpoints/ports, WITHOUT
+    # running any BFS yet. S11 review fix, round 2: an unconstrained edge (no
+    # source_port_name/target_port_name) is deferred into `batch_pairs` for one
+    # batched BFS call via find_all_shortest_paths_batch_async; a constrained
+    # edge keeps its own per-edge find_all_shortest_paths_async call (the batch
+    # helper has no port-constraint parameter), issued in the second pass below.
+    # `edge_infos` is positional (one slot per edge in `edges`, None meaning
+    # "not resolvable, skip"), so the final hop-building pass can walk `edges`
+    # in their original order regardless of how the batch resolved its pairs.
+    edge_infos: list[tuple[uuid.UUID, uuid.UUID, str | None, str | None, str | None] | None] = [
+        None
+    ] * len(edges)
+    batch_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+    batch_edge_indices: list[int] = []
+
+    for idx, edge in enumerate(edges):
         edge_data = edge.get("data") or {}
         if edge_data.get("isProposal"):
             continue
@@ -296,13 +327,35 @@ async def resolve_canvas_wiring(db: AsyncSession, canvas: dict | None) -> Canvas
         source_port = str(raw_source_port) if raw_source_port else None
         target_port = str(raw_target_port) if raw_target_port else None
 
-        paths = await find_all_shortest_paths_async(
-            graph,
-            source_device,
-            target_device,
-            source_port=source_port,
-            target_port=target_port,
-        )
+        edge_infos[idx] = (source_device, target_device, source_port, target_port, edge_key)
+        if source_port is None and target_port is None:
+            batch_pairs.append((source_device, target_device))
+            batch_edge_indices.append(idx)
+
+    batch_results = (
+        await find_all_shortest_paths_batch_async(graph, batch_pairs) if batch_pairs else []
+    )
+    batch_paths_by_index = dict(zip(batch_edge_indices, batch_results))
+
+    # Second pass: walk edges in original order, resolving constrained edges'
+    # BFS individually and looking up the batch result for everything else, then
+    # build hops/WireSpecs exactly as before.
+    for idx, edge in enumerate(edges):
+        info = edge_infos[idx]
+        if info is None:
+            continue
+        source_device, target_device, source_port, target_port, edge_key = info
+
+        if idx in batch_paths_by_index:
+            paths = batch_paths_by_index[idx]
+        else:
+            paths = await find_all_shortest_paths_async(
+                graph,
+                source_device,
+                target_device,
+                source_port=source_port,
+                target_port=target_port,
+            )
         if not paths:
             if source_port is not None or target_port is not None:
                 logger.info(
@@ -454,64 +507,61 @@ def touched_devices_from_specs(specs: list[WireSpec]) -> set[uuid.UUID]:
     return touched
 
 
-async def gate_l3_intent(
-    db: AsyncSession,
-    canvas: dict | None,
-    wiring_resolution: CanvasWiringResolution,
-) -> dict[uuid.UUID, list[RouteSpec]]:
-    """Parse and refuse an invalid L3 intent (ADR 0014 Decision 5), returning the
-    parsed intent on success so the caller never parses the same canvas twice (R8
-    review fix on 2ade362c).
+def l3_intent_changed(
+    existing_rows: list[ForkL3Route], intended: dict[uuid.UUID, list[RouteSpec]]
+) -> bool:
+    """True iff ``intended`` differs from the existing ``ForkL3Route`` rows'
+    route-key sets per device (S5 review fix, round 2).
 
-    Callers (``routes/forks.py``'s ``save_fork_internal``) must call this BEFORE
-    taking the fork row's ``FOR UPDATE`` lock (R3): it makes inventory HTTP calls
-    (a device-type batch fetch plus per-switch config-version reads) and must
-    never run while any lock is held, nor repeat on a version-race retry.
-    ``wiring_resolution`` must be the SAME ``resolve_canvas_wiring`` result the
-    caller goes on to reconcile with (R2): this gate reuses it for the L3 pass's
-    ``touched_devices`` rather than resolving the canvas a second time.
-
-    Three outcomes:
-
-    - ``parse_l3_intent(canvas)`` raises ``L3IntentMalformed``: refuse immediately
-      with 422 ``{"error": "l3_intent_malformed", "node_id", "message"}``. No
-      validation call, no inventory call: the shape is already known bad from the
-      parse alone.
-    - The parsed intent is empty (no device node carries ``data.l3`` at all, or
-      every node's carries only an empty routes list, R10): return ``{}`` with no
-      validation call and no inventory call. A fork save has never validated
-      physical edge paths and must not start validating anything for a canvas
-      that expresses no L3 intent either.
-    - Otherwise, run ``validate_canvas_l3`` (the same L3 pass the validate routes
-      run) against ``touched_devices_from_specs(wiring_resolution.specs)``, and
-      refuse with 409 ``{"error": "l3_intent_invalid", "invalid_routes": [...]}``
-      on any entry. A malformed shape can no longer appear in that list at this
-      point, since our own parse above already proved every l3-carrying node
-      parses cleanly.
+    Used to decide whether the L3 validation pass, and the inventory calls it
+    makes, is worth running at all: a wiring-only save whose L3 intent is
+    byte-for-byte unchanged from what was already validated and persisted makes
+    no inventory call and cannot 503. The consequence (documented in ADR 0014's
+    phase 1 review-fixes amendment) is that a switch which loses attachment
+    through a wiring-only save is not caught by THIS save; it is caught by the
+    next save that actually edits L3 intent, or by execution in phase 3.
     """
-    try:
-        intended = parse_l3_intent(canvas)
-    except L3IntentMalformed as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "l3_intent_malformed",
-                "node_id": exc.node_id,
-                "message": exc.message,
-            },
-        ) from exc
-    if not intended:
-        return {}
+    existing_by_device: dict[uuid.UUID, set[str]] = {}
+    for row in existing_rows:
+        existing_by_device.setdefault(row.device_id, set()).add(row.route_key)
+    intended_by_device = {
+        device_id: {route.route_key for route in routes} for device_id, routes in intended.items()
+    }
+    return intended_by_device != existing_by_device
 
-    touched_devices = touched_devices_from_specs(wiring_resolution.specs)
-    invalid_routes = await validate_canvas_l3(canvas or {}, db, touched_devices)
-    if not invalid_routes:
-        return intended
+
+async def gate_l3_intent(
+    candidates: list[L3NodeCandidate],
+    touched_devices: set[uuid.UUID],
+) -> dict[uuid.UUID, uuid.UUID | None]:
+    """Run the L3 validation pass over already-parsed, non-malformed, non-empty
+    candidates and refuse with 409 on any real (non-``l3_duplicate_route``,
+    S12) ``invalid_routes`` entry (ADR 0014 Decision 5). Returns the per-device
+    validated-config-version-id map (S6) on success, for the caller to stamp
+    onto the ``ForkL3Route`` rows it builds.
+
+    S10 review fix, round 2: the caller (``routes/forks.py``'s
+    ``save_fork_internal``) parses the canvas ONCE via ``l3_intent.walk_l3_nodes``
+    and handles both the malformed-shape 422 and the R10 empty-intent
+    short-circuit itself, before ever calling this; by the time this runs,
+    ``candidates`` is known non-empty and free of malformed entries. S5 review
+    fix: the caller also decides (``l3_intent_changed``) whether this is worth
+    calling at all, so a wiring-only save with unchanged L3 intent never reaches
+    here and makes no inventory call.
+
+    Callers must call this BEFORE taking the fork row's ``FOR UPDATE`` lock
+    (R3): it makes inventory HTTP calls and must never run while any lock is
+    held, nor repeat on a version-race retry.
+    """
+    result = await validate_canvas_l3(candidates, [], touched_devices)
+    real_invalid = [route for route in result.invalid_routes if route_causes_invalid(route)]
+    if not real_invalid:
+        return result.validated_config_version_ids
     raise HTTPException(
         status_code=409,
         detail={
             "error": "l3_intent_invalid",
-            "invalid_routes": [route.model_dump() for route in invalid_routes],
+            "invalid_routes": [route.model_dump() for route in result.invalid_routes],
         },
     )
 
@@ -526,12 +576,20 @@ def _l3_item_identity(item: tuple[uuid.UUID, RouteSpec]) -> tuple[uuid.UUID, str
 
 
 def l3_row_from_spec(
-    fork_id: uuid.UUID, device_id: uuid.UUID, route: RouteSpec, created_by: str
+    fork_id: uuid.UUID,
+    device_id: uuid.UUID,
+    route: RouteSpec,
+    created_by: str,
+    validated_config_version_id: uuid.UUID | None = None,
 ) -> ForkL3Route:
     """Build one ``ForkL3Route`` row from a parsed route (R8 review fix on
     2ade362c): the one place both write paths (``save_fork``'s reconcile and
     ``fork_service.create_fork``'s insert loop) construct this row, so the two
-    can never drift on which fields it carries."""
+    can never drift on which fields it carries. ``validated_config_version_id``
+    (S6 review fix, round 2) is the inventory config version the save-time L3
+    validation pass actually judged this route against; left ``None`` (its
+    default) by ``fork_service.create_fork``'s tolerant path, which never
+    validates."""
     return ForkL3Route(
         fork_id=fork_id,
         device_id=device_id,
@@ -540,6 +598,7 @@ def l3_row_from_spec(
         interface=route.interface,
         virtual_router=route.virtual_router,
         route_key=route.route_key,
+        validated_config_version_id=validated_config_version_id,
         created_by=created_by,
     )
 
@@ -664,6 +723,7 @@ async def save_fork(
     member_device_ids: set[uuid.UUID],
     wiring_resolution: CanvasWiringResolution,
     intended_routes: dict[uuid.UUID, list[RouteSpec]],
+    validated_config_version_ids: dict[uuid.UUID, uuid.UUID | None] | None = None,
     created_by: str = "system",
 ) -> ForkSaveResult:
     """Reconcile a fork's wiring against a submitted canvas and append a version.
@@ -682,15 +742,19 @@ async def save_fork(
     is refused with 409 and leaves fork_connections and fork_versions untouched.
 
     ADR 0014 phase 1 (issue #34), restructured by the R3 review fix on 2ade362c:
-    ``wiring_resolution`` and ``intended_routes`` are computed and gated by the
-    CALLER (``routes/forks.py``'s ``save_fork_internal``), BEFORE the fork row's
+    ``wiring_resolution`` and ``intended_routes`` are computed and (S5 review fix,
+    round 2: ONLY when the intent actually changed) gated by the CALLER
+    (``routes/forks.py``'s ``save_fork_internal``), BEFORE the fork row's
     ``FOR UPDATE`` lock is taken, since the gate makes inventory HTTP calls that
     must never run while any lock is held. This function receives both already
     resolved, gated, and parsed: ``reconcile()`` (and its retry reapply) only reads
     the fork's CURRENT ``ForkConnection``/``ForkL3Route`` rows fresh and reconciles
     them against these fixed inputs, so a version-race retry recomputes the delta
     against the winner's committed rows without repeating any inventory call or
-    re-resolving the canvas.
+    re-resolving the canvas. ``validated_config_version_ids`` (S6 review fix,
+    round 2) is stamped onto each built ``ForkL3Route`` row via
+    ``l3_row_from_spec``; empty (every built row's column left NULL) when the
+    gate never ran, e.g. because S5 found the intent unchanged.
     """
     # Capture the id up front: a version-race rollback expires ``fork``, and a later
     # lazy ``fork.id`` read inside the reconcile closure would attempt synchronous IO
@@ -698,6 +762,7 @@ async def save_fork(
     # needs no load.
     fork_id = fork.id
     new_specs = wiring_resolution.specs
+    validated_config_version_ids = validated_config_version_ids or {}
 
     result: dict = {}
 
@@ -769,7 +834,15 @@ async def save_fork(
             await db.delete(row)
         await db.flush()
         for device_id, route in l3_to_build:
-            db.add(l3_row_from_spec(fork_id, device_id, route, created_by))
+            db.add(
+                l3_row_from_spec(
+                    fork_id,
+                    device_id,
+                    route,
+                    created_by,
+                    validated_config_version_ids.get(device_id),
+                )
+            )
         result["l3_routes_built"] = len(l3_to_build)
         result["l3_routes_released"] = len(l3_to_release)
 
@@ -1031,6 +1104,8 @@ __all__ = [
     "classify_element_edge",
     "connection_identity",
     "gate_l3_intent",
+    "l3_intent_changed",
+    "l3_row_from_spec",
     "lock_port_claims",
     "node_to_device_map",
     "node_to_element_map",

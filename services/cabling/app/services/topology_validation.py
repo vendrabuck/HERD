@@ -26,15 +26,15 @@ round trips; a topology with no ``data.l3`` anywhere pays for neither.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.topology import InvalidEdge, InvalidRoute, TopologyValidationResponse
 from app.services.canvas_nodes import classify_element_edge, node_to_device_map, node_to_element_map
 from app.services.fork_save_service import resolve_canvas_wiring, touched_devices_from_specs
-from app.services.l3_intent import canvas_has_l3
-from app.services.l3_validation import validate_canvas_l3
+from app.services.l3_intent import canvas_has_l3, walk_l3_nodes
+from app.services.l3_validation import route_causes_invalid, validate_canvas_l3
 from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_batch_async
 
 
@@ -42,10 +42,18 @@ from app.services.pathfind_service import build_adjacency_graph, find_all_shorte
 class EdgeValidation:
     """The edge pass's outcome: every canvas edge's verdict, plus the canvas's
     device node ids (issue #701 phase 2's ``device_ids``, computed alongside the
-    edge walk since both need the same ``node_to_device`` map)."""
+    edge walk since both need the same ``node_to_device`` map).
+
+    ``graph`` (S11 review fix, round 2) is the adjacency graph this pass built
+    (empty when the canvas has no edges, in which case nothing downstream ever
+    reads it), so ``run_full_topology_validation`` can hand it to
+    ``resolve_canvas_wiring`` instead of paying for a second
+    ``build_adjacency_graph`` load of the same canvas.
+    """
 
     invalid_edges: list[InvalidEdge]
     device_ids: list[uuid.UUID]
+    graph: dict[uuid.UUID, list[tuple[uuid.UUID, str, str]]] = field(default_factory=dict)
 
 
 async def validate_canvas_edges(canvas: dict | None, db: AsyncSession) -> EdgeValidation:
@@ -171,7 +179,7 @@ async def validate_canvas_edges(canvas: dict | None, db: AsyncSession) -> EdgeVa
             )
 
     invalid = [result for result in edge_results if result is not None]
-    return EdgeValidation(invalid_edges=invalid, device_ids=device_ids)
+    return EdgeValidation(invalid_edges=invalid, device_ids=device_ids, graph=graph)
 
 
 async def run_full_topology_validation(
@@ -188,18 +196,33 @@ async def run_full_topology_validation(
     connectivity for the reservation's revised membership; the topology's own
     routing intent was already judged valid at create time and is unrelated to
     which devices the booking currently includes.
+
+    S10 review fix, round 2: the canvas's L3 nodes are parsed exactly once, via
+    ``l3_intent.walk_l3_nodes``, and handed to ``validate_canvas_l3`` as already
+    -parsed candidates/malformed entries rather than a raw canvas.
+
+    S11 review fix, round 2: when the L3 pass needs ``resolve_canvas_wiring``,
+    it reuses the adjacency graph ``validate_canvas_edges`` already built for
+    this same canvas, rather than a second ``build_adjacency_graph`` load.
     """
     canvas = canvas or {}
     edge_validation = await validate_canvas_edges(canvas, db)
 
     invalid_routes: list[InvalidRoute] = []
     if check_routes and canvas_has_l3(canvas):
-        wiring_resolution = await resolve_canvas_wiring(db, canvas)
+        wiring_resolution = await resolve_canvas_wiring(db, canvas, graph=edge_validation.graph)
         touched_devices = touched_devices_from_specs(wiring_resolution.specs)
-        invalid_routes = await validate_canvas_l3(canvas, db, touched_devices)
+        candidates, malformed = walk_l3_nodes(canvas)
+        result = await validate_canvas_l3(candidates, malformed, touched_devices)
+        invalid_routes = result.invalid_routes
 
+    # S12 review fix, round 2: an informational l3_duplicate_route entry never
+    # makes the topology invalid.
+    valid = not edge_validation.invalid_edges and not any(
+        route_causes_invalid(r) for r in invalid_routes
+    )
     return TopologyValidationResponse(
-        valid=not edge_validation.invalid_edges and not invalid_routes,
+        valid=valid,
         invalid_edges=edge_validation.invalid_edges,
         device_ids=edge_validation.device_ids,
         invalid_routes=invalid_routes,

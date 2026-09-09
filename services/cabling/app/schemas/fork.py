@@ -111,6 +111,11 @@ class ForkL3RouteResponse(BaseModel):
     next_hop: str | None = None
     interface: str
     virtual_router: str | None = None
+    # The inventory config version this route's save-time L3 validation actually
+    # judged it against (S6 review fix, round 2); null for a row written by the
+    # tolerant activation path (fork_service.create_fork), which never validates.
+    # Additive; phase 3 compares this to the switch's current config version.
+    validated_config_version_id: OptionalUUIDStr = None
 
     model_config = {"from_attributes": True}
 

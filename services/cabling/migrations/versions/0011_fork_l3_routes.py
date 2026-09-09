@@ -6,6 +6,15 @@ today's L3 layer flag on a physical Connection carries no routing intent to
 carry forward). Downgrade drops the one new table. See
 docs/design/0014-first-class-layer-3-routing.md (Decision 1).
 
+This revision is still unreleased on the feat/34-l3-intent-cabling branch as of
+the round-2 adversarial review, so its two review fixes (S4, S6) are folded in
+place here rather than added as a follow-up revision: `route_key` widens from
+String(200) to String(400) (S4: the identity now JSON-packs all four fields,
+including `virtual_router`, instead of `|`-joining three), and the nullable
+`validated_config_version_id` column is added (S6: records the inventory config
+version the save-time L3 validation pass actually judged the route against, for
+phase 3 to compare against the switch's current version before driving).
+
 Revision ID: 0011
 Revises: 0010
 """
@@ -42,7 +51,8 @@ def upgrade() -> None:
         sa.Column("next_hop", sa.String(64), nullable=True),
         sa.Column("interface", sa.String(64), nullable=False),
         sa.Column("virtual_router", sa.String(64), nullable=True),
-        sa.Column("route_key", sa.String(200), nullable=False),
+        sa.Column("route_key", sa.String(400), nullable=False),
+        sa.Column("validated_config_version_id", sa.Uuid(as_uuid=True), nullable=True),
         sa.Column("created_by", sa.String(150), nullable=False),
         sa.Column(
             "created_at",

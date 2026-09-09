@@ -457,6 +457,7 @@
         "device_id": "string",
         "interface": "string",
         "next_hop": "anyOf",
+        "validated_config_version_id": "anyOf",
         "virtual_router": "anyOf"
       },
       "required": [

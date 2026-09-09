@@ -238,9 +238,22 @@ class ForkL3Route(Base):
     next_hop: Mapped[str | None] = mapped_column(String(64), nullable=True)
     interface: Mapped[str] = mapped_column(String(64), nullable=False)
     virtual_router: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # The reconcile identity (``RouteSpec.route_key``): "destination|interface|next_hop"
-    # (empty string for a null next_hop). Stored rather than recomputed so the unique
-    # constraint and the reconcile's set arithmetic both key off one column.
-    route_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    # The reconcile identity (``RouteSpec.route_key``): all four fields, JSON
+    # -packed (S4 review fix, round 2: virtual_router is part of the identity now,
+    # since two routes differing only by it must not collide; widened to
+    # String(400) to fit the packed JSON of four 64-char fields plus quoting).
+    # Stored rather than recomputed so the unique constraint and the reconcile's
+    # set arithmetic both key off one column.
+    route_key: Mapped[str] = mapped_column(String(400), nullable=False)
+    # The inventory config version the save-time L3 validation pass actually
+    # judged this route against (S6 review fix, round 2), bare UUID with no FK
+    # (inventory owns that table; this repo never uses cross-schema FKs). NULL
+    # when the row was written by the tolerant activation path
+    # (fork_service.create_fork), which never validates. Phase 3 compares this
+    # to the switch's current config version and re-runs the per-route checks
+    # before driving when they differ.
+    validated_config_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
     created_by: Mapped[str] = mapped_column(String(150), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
