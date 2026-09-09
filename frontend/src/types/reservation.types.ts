@@ -299,6 +299,14 @@ export interface ForkL3IntentMalformedDetail {
   message: string;
 }
 
+// ADR 0014 Decision 5 (issue #34): the structured 503 the L3 validation pass
+// fails closed with on an inventory outage, from either the fork save's own
+// gate or the plain-topology validate route (review fix F9 consolidates the
+// two previously-inline checks in TopologyEditorPage.tsx onto one narrower).
+export interface ForkL3ConfigUnavailableDetail {
+  error: "l3_config_unavailable";
+}
+
 // ADR 0014 phase 2 addendum (issue #34): the structured 422 a reservation
 // create returns when the fork gate refuses routing intent
 // (services/reservations/app/routers/reservations.py, `TopologyRoutingIntentInvalid`).

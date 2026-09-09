@@ -180,6 +180,12 @@ three points, each surfacing the same kind of problem list:
   has N problems" toast and the same badge/reason-line treatment, so you can fix the routes
   (or the switch's config) and try again.
 
+One reason, `l3_duplicate_route`, is informational rather than a problem: it never counts
+toward the "N problems" total, never turns a switch's badge red, and never refuses a save
+or a reservation. It renders as an amber note under the affected row instead of a red one,
+naming the row as a duplicate of another route on the same switch, harmless because a
+duplicate simply collapses in the set the switch actually applies.
+
 The reasons you may see, in plain words:
 
 | Reason | Meaning |
@@ -193,12 +199,15 @@ The reasons you may see, in plain words:
 | `l3_unknown_interface` | The interface name does not match any interface in the switch's config. |
 | `l3_next_hop_unverifiable` | The next hop is set, but the named interface has no IP address (or no prefix length) to check it against. |
 | `l3_next_hop_outside_interface` | The next hop is set, but it does not fall inside the named interface's own subnet. |
+| `l3_duplicate_route` | Informational, not a problem: another row on this switch has the same destination, next hop, interface, and virtual router. |
 
 A route's `destination` is canonicalized on the server the way a routing table normally
 is: `10.0.0.5/24` is stored as `10.0.0.0/24`, and a bare address gets an implicit host
 prefix (`/32` for IPv4, `/128` for IPv6). The Routing panel never rewrites what you typed,
-so the table can show your original text even after a save; this is cosmetic only; treat
-the two as the same route.
+so the table can show your original text even after a save; this is cosmetic for display,
+but the Compare view diffs the raw text you typed, not the canonicalized form, so two
+versions written differently for the same network (`10.0.0.5/24` in one, `10.0.0.0/24` in
+the other) show up there as a routing change even though the switch treats them alike.
 
 ## Saving
 

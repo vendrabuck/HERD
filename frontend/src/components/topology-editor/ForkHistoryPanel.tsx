@@ -2,8 +2,8 @@ import { useState } from "react";
 import toast from "react-hot-toast";
 
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { canvasNodeLabel } from "@/lib/canvasNodes";
 import type { ForkVersionSummary } from "@/types/reservation.types";
-import type { DeviceNodeData } from "@/types/topology.types";
 import type { ForkDiffCompareTarget, UseForkVersionPreviewResult } from "@/hooks/useForkVersionPreview";
 
 interface ForkHistoryPanelProps {
@@ -31,9 +31,11 @@ function formatDate(iso: string): string {
   }
 }
 
+// Review fix F11 (issue #34): shares lib/canvasNodes.ts's `canvasNodeLabel`
+// with lib/l3.ts's `routeProblemLabel` rather than each keeping its own copy
+// of the same label/device-name/id fallback chain.
 function nodeLabel(node: { id: string; data?: unknown }): string {
-  const data = node.data as DeviceNodeData | undefined;
-  return data?.label || data?.device?.name || node.id;
+  return canvasNodeLabel(node, node.id);
 }
 
 function edgeLabel(edge: { data?: unknown }): string {

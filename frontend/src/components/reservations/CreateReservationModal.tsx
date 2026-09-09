@@ -9,6 +9,7 @@ import { useTemplates } from "@/api/templates";
 import { useAIStatus } from "@/api/ai";
 import { usePurposeSuggestion } from "@/hooks/usePurposeSuggestion";
 import { Modal } from "@/components/ui/Modal";
+import { errorDetail } from "@/lib/errors";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import type { DynamicRequestSpec } from "@/types/reservation.types";
 import type { InvalidRoute } from "@/types/topology.types";
@@ -180,10 +181,12 @@ export function CreateReservationModal({
         toast.error(`Reservation refused: routing intent has ${count} problem${count === 1 ? "" : "s"}`);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to create reservation";
-      toast.error(msg);
+      // Review fix F8 (issue #34): the old hand-extraction here passed an
+      // object-shaped detail (e.g. the 422 topology_device_not_member body)
+      // straight to toast.error, which throws inside the Toaster (outside
+      // the ErrorBoundary in App.tsx, so it blanked the whole app).
+      // errorDetail is the single-sourced guard: only ever a string.
+      toast.error(errorDetail(err, "Failed to create reservation"));
     }
   };
 

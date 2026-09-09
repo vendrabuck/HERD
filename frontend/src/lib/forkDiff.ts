@@ -6,7 +6,7 @@ import type {
   L3RouteIntent,
   LayerEdgeData,
 } from "@/types/topology.types";
-import { isDeviceNode } from "@/lib/canvasNodes";
+import { isDeviceNode, l3RoutesOf } from "@/lib/canvasNodes";
 
 // Pure client-side diff between two canvas_data payloads (issue #622). Mirrors
 // the arithmetic cabling's fork save reconcile does server-side for wires: an
@@ -53,187 +53,31 @@ const EMPTY_DIFF: ForkCanvasDiff = {
   routingChangedNodes: [],
 };
 
-// --- ADR 0014 phase 2 peer-review addition (issue #34): destination
-// canonicalization, mirroring the server's exactly. -----------------------
-//
-// Cabling's l3_intent.py canonicalizes a route's `destination` at save time
-// via Python's `str(ipaddress.ip_network(value, strict=False))`: a host-form
-// CIDR like "10.0.0.1/24" is stored as "10.0.0.0/24" (host bits masked off),
-// a bare address gets an implicit host prefix ("10.0.0.1" -> "10.0.0.1/32",
-// an IPv6 address -> "/128"), and IPv6 renders lowercase in RFC 5952
-// compressed form. The CANVAS keeps whatever the user typed (the Routing
-// panel never rewrites it, ADR 0014 Decision 5's "the server is the sole
-// authority" extends to not second-guessing displayed text), so a version
-// saved before/after this canonicalization can show the "same" route as two
-// different strings. The fork diff must compare canonicalized destinations,
-// or a version-to-version diff would report a routing change nobody made.
-// An unparseable string (which the server rejects as l3_bad_destination
-// regardless) is kept verbatim, matching the server's own fallback.
-function parseIPv4Octets(value: string): number[] | null {
-  const parts = value.split(".");
-  if (parts.length !== 4) return null;
-  const octets: number[] = [];
-  for (const part of parts) {
-    if (!/^(0|[1-9]\d{0,2})$/.test(part)) return null;
-    const n = Number(part);
-    if (n > 255) return null;
-    octets.push(n);
-  }
-  return octets;
-}
-
-function canonicalizeIPv4(addressPart: string, prefixPart: string | undefined): string | null {
-  const octets = parseIPv4Octets(addressPart);
-  if (!octets) return null;
-  let prefixLen = 32;
-  if (prefixPart !== undefined) {
-    if (!/^\d{1,2}$/.test(prefixPart)) return null;
-    prefixLen = Number(prefixPart);
-    if (prefixLen > 32) return null;
-  }
-  const addrInt =
-    ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
-  const mask = prefixLen === 0 ? 0 : (0xffffffff << (32 - prefixLen)) >>> 0;
-  const network = (addrInt & mask) >>> 0;
-  const networkOctets = [
-    (network >>> 24) & 255,
-    (network >>> 16) & 255,
-    (network >>> 8) & 255,
-    network & 255,
-  ];
-  return `${networkOctets.join(".")}/${prefixLen}`;
-}
-
-// Expands "::" and validates a (possibly IPv4-mapped-tail) IPv6 address
-// string into its 8 16-bit groups.
-function parseIPv6Groups(address: string): number[] | null {
-  let addr = address;
-  if (addr.includes(".")) {
-    // An embedded IPv4 tail (e.g. "::ffff:192.0.2.1"): fold its last 32
-    // bits into two hextets before the normal colon-group parse below.
-    const lastColon = addr.lastIndexOf(":");
-    if (lastColon === -1) return null;
-    const v4 = parseIPv4Octets(addr.slice(lastColon + 1));
-    if (!v4) return null;
-    const hex1 = ((v4[0] << 8) | v4[1]).toString(16);
-    const hex2 = ((v4[2] << 8) | v4[3]).toString(16);
-    addr = `${addr.slice(0, lastColon + 1)}${hex1}:${hex2}`;
-  }
-  const doubleColonCount = (addr.match(/::/g) ?? []).length;
-  if (doubleColonCount > 1) return null;
-  let head: string[];
-  let tail: string[];
-  if (addr.includes("::")) {
-    const sides = addr.split("::");
-    if (sides.length !== 2) return null;
-    head = sides[0].length > 0 ? sides[0].split(":") : [];
-    tail = sides[1].length > 0 ? sides[1].split(":") : [];
-  } else {
-    head = addr.split(":");
-    tail = [];
-  }
-  const missing = 8 - (head.length + tail.length);
-  if (!addr.includes("::") && missing !== 0) return null;
-  if (addr.includes("::") && missing < 0) return null;
-  const zeros = addr.includes("::") ? Array<string>(missing).fill("0") : [];
-  const allParts = [...head, ...zeros, ...tail];
-  if (allParts.length !== 8) return null;
-  const groups: number[] = [];
-  for (const part of allParts) {
-    if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return null;
-    groups.push(parseInt(part, 16));
-  }
-  return groups;
-}
-
-// RFC 5952 canonical compressed lowercase form: the longest run of two-or-
-// more zero groups collapses to "::" (leftmost run wins a length tie).
-function groupsToCanonicalIPv6(groups: number[]): string {
-  let bestStart = -1;
-  let bestLen = 0;
-  let curStart = -1;
-  let curLen = 0;
-  for (let i = 0; i < groups.length; i++) {
-    if (groups[i] === 0) {
-      if (curStart === -1) curStart = i;
-      curLen++;
-      if (curLen > bestLen) {
-        bestLen = curLen;
-        bestStart = curStart;
-      }
-    } else {
-      curStart = -1;
-      curLen = 0;
-    }
-  }
-  const hexParts = groups.map((g) => g.toString(16));
-  if (bestLen >= 2) {
-    const before = hexParts.slice(0, bestStart);
-    const after = hexParts.slice(bestStart + bestLen);
-    if (before.length === 0 && after.length === 0) return "::";
-    if (before.length === 0) return `::${after.join(":")}`;
-    if (after.length === 0) return `${before.join(":")}::`;
-    return `${before.join(":")}::${after.join(":")}`;
-  }
-  return hexParts.join(":");
-}
-
-function canonicalizeIPv6(addressPart: string, prefixPart: string | undefined): string | null {
-  const groups = parseIPv6Groups(addressPart);
-  if (!groups) return null;
-  let prefixLen = 128;
-  if (prefixPart !== undefined) {
-    if (!/^\d{1,3}$/.test(prefixPart)) return null;
-    prefixLen = Number(prefixPart);
-    if (prefixLen > 128) return null;
-  }
-  const masked = groups.map((group, i) => {
-    const groupStart = i * 16;
-    const groupEnd = groupStart + 16;
-    if (groupEnd <= prefixLen) return group;
-    if (groupStart >= prefixLen) return 0;
-    const bitsToKeep = prefixLen - groupStart;
-    const mask = (0xffff << (16 - bitsToKeep)) & 0xffff;
-    return group & mask;
-  });
-  return `${groupsToCanonicalIPv6(masked)}/${prefixLen}`;
-}
-
-/**
- * Mirrors cabling's `str(ipaddress.ip_network(value, strict=False))` for the
- * common IPv4/IPv6 cases (with or without a prefix). Returns the input
- * unchanged when it does not parse as either (the server's own fallback for
- * `l3_bad_destination`, which the fork diff must not paper over as "no
- * change" either way, since two differently-malformed strings are, in fact,
- * different).
- */
-export function canonicalizeDestination(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length === 0) return value;
-  const slashIndex = trimmed.indexOf("/");
-  const addressPart = slashIndex === -1 ? trimmed : trimmed.slice(0, slashIndex);
-  const prefixPart = slashIndex === -1 ? undefined : trimmed.slice(slashIndex + 1);
-  const canonical = addressPart.includes(":")
-    ? canonicalizeIPv6(addressPart, prefixPart)
-    : canonicalizeIPv4(addressPart, prefixPart);
-  return canonical ?? value;
-}
-
 // The route-set identity key the fork diff compares on (E6): order-
-// insensitive across (canonicalized destination, interface, next_hop), plus
-// virtual_router, matching the brief's stated identity fields.
+// insensitive across (destination, interface, next_hop), plus
+// virtual_router, matching the brief's stated identity fields. Diffs the RAW
+// text the way `edgeIdentityKey` diffs raw port names (review fix F7,
+// issue #34): a client-side destination canonicalizer briefly lived here to
+// mirror cabling's `str(ipaddress.ip_network(value, strict=False))`, on the
+// premise that the server canonicalizes into `canvas_data` and two fork
+// versions could therefore hold differently-formatted "same" routes. That
+// premise was wrong: the server canonicalizes only into `fork_l3_routes`
+// (the resolved-intent table), never back into `canvas_data`, so both
+// canvases always hold the user's own raw text and there is no
+// canonicalization-only difference to hide. The mirror was also a real
+// re-implementation of `ipaddress.ip_network` that had already drifted from
+// it in named cases (a `/255.255.255.0`-style dotted-decimal mask, a
+// zero-padded prefix, an IPv6 zone id, `::` compression edge cases), each a
+// possible false diff of its own. Removed entirely rather than fixed.
 function routeSetDiffKey(route: L3RouteIntent): string {
-  return [
-    canonicalizeDestination(route.destination),
-    route.interface,
-    route.next_hop ?? "",
-    route.virtual_router ?? "",
-  ].join("|");
+  return [route.destination, route.interface, route.next_hop ?? "", route.virtual_router ?? ""].join(
+    "|",
+  );
 }
 
 function l3Routes(node: Node<CanvasNodeData> | undefined): L3RouteIntent[] {
   if (!node || !isDeviceNode(node)) return [];
-  return (node.data as DeviceNodeData).l3?.routes ?? [];
+  return l3RoutesOf(node.data as DeviceNodeData);
 }
 
 // Computes the routing-change summary for every node present in BOTH
