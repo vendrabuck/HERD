@@ -623,13 +623,34 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     Build-intent revalidation (issue #491), the _reattempt_rows analogue: before any
     BUILD-direction (provision) row is driven, cabling's CURRENT intended set is
     fetched once per reservation and the row's switch is checked against the adjacency
-    derived exactly as the reconcile derives it (_derive_l3_adjacency). A row whose
-    switch is no longer adjacent is NOT driven: it is parked FAILED intended RELEASED
-    (WIRING_STALE_BUILD_REASON, attempts reset) so the release-direction channels
-    remove the pinned set verbatim (the #20 discipline), and it reads back
+    derived exactly as the reconcile derives it (_derive_l3_adjacency, widened by ADR
+    0014 addendum X-B when the fork carries intent for a trunk-skipped switch). A row
+    whose switch is no longer adjacent is NOT driven: it is parked FAILED intended
+    RELEASED (WIRING_STALE_BUILD_REASON, attempts reset) so the release-direction
+    channels remove the pinned set verbatim (the #20 discipline), and it reads back
     "still_failed" this tick. A fetch failure drives NOTHING build-direction for that
     reservation this tick (fail-closed, issue #460); release-direction rows are
     unaffected.
+
+    ADR 0014 addendum X5 (issue #34 phase 3): when the fork carries CURRENT routing
+    intent for a still-adjacent switch, the retry drives that intent instead of the
+    row's own (possibly stale) `routes`, through the same X-A/X-F gate the reconcile
+    uses (`_gate_l3_drive_routes`); a gate failure re-records the row FAILED with the
+    gate's reason and drives nothing for it this tick. A switch whose intent is gone
+    (never had any, or it was removed) is driven with the row's own pinned `routes`
+    verbatim, unchanged from before phase 3 (addendum X4: intent disappearing is not
+    a teardown signal, so the retry keeps reattempting the applied set).
+
+    The gate call is wrapped in its OWN per-row `try/except TransientUpstreamError`
+    (review fix, issue #34 phase 3 review): `_gate_l3_drive_routes` re-validates
+    through `ctx.get_latest_config`, which raises on an inventory 5xx exactly like
+    the per-reservation fetch/derive block above, and without this isolation that
+    exception would propagate out of the whole function, silently discarding every
+    OTHER reservation's already-accumulated `by_res` entries for the tick (a
+    phase-3-introduced regression in the pre-existing "one reservation's fetch
+    failure never blocks its siblings" guarantee). A gate transport failure for one
+    row leaves that row FAILED and undriven this tick, exactly like an ordinary gate
+    refusal, but never touches any other row.
     """
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
@@ -638,7 +659,9 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
         _derive_l3_adjacency,
         _fetch_fork_intended_wires,
         _FetchContext,
+        _gate_l3_drive_routes,
     )
+    from app.services.route_service import record_route_failed
 
     if not rows:
         return []
@@ -665,8 +688,11 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
 
         for res_str, res_rows in build_rows_by_res.items():
             try:
-                wires = await _fetch_fork_intended_wires(res_str, client)
-                intended_adjacency = await _derive_l3_adjacency(wires, ctx)
+                fork_intent = await _fetch_fork_intended_wires(res_str, client)
+                l3_intent_by_switch = getattr(fork_intent, "l3_routes", {}) or {}
+                intended_adjacency = await _derive_l3_adjacency(
+                    fork_intent, ctx, l3_intent_by_switch
+                )
             except TransientUpstreamError as exc:
                 logger.warning(
                     "wiring retry: cannot verify build intent for reservation %s (%s); "
@@ -678,11 +704,39 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
                 )
                 continue
             for row in res_rows:
-                if str(row.device_id) not in intended_adjacency:
+                switch_id = str(row.device_id)
+                if switch_id not in intended_adjacency:
                     async with get_db_session() as db:
                         await park_stale_route_build(db, row.id, WIRING_STALE_BUILD_REASON)
                     continue
-                entry = {"device_id": str(row.device_id), "routes": row.routes or []}
+                intent_routes = l3_intent_by_switch.get(switch_id)
+                if intent_routes:
+                    try:
+                        clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+                    except TransientUpstreamError as exc:
+                        # Isolated to THIS row (review fix): an inventory 5xx while
+                        # re-validating one switch's intent must never propagate out
+                        # of _reattempt_l3_rows and discard every other reservation's
+                        # already-accumulated by_res entries for the tick.
+                        logger.warning(
+                            "wiring retry: cannot re-validate L3 intent for switch %s, "
+                            "reservation %s (%s); row not driven this tick "
+                            "(unverifiable intent never drives hardware, ADR 0014 "
+                            "addendum X-A)",
+                            switch_id,
+                            res_str,
+                            exc,
+                        )
+                        continue
+                    if reason is not None:
+                        async with get_db_session() as db:
+                            await record_route_failed(
+                                db, res_str, switch_id, None, 1, reason, intended="ACTIVE"
+                            )
+                        continue
+                    entry = {"device_id": switch_id, "routes": clean}
+                else:
+                    entry = {"device_id": switch_id, "routes": row.routes or []}
                 by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[
                     "provisions"
                 ].append(entry)

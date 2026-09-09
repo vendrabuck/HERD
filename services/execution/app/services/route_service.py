@@ -13,7 +13,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -74,9 +74,31 @@ async def record_route_active(
     ACTIVE row for (reservation, device) short-circuits and returns it, and a concurrent
     provision that pinned the switch first trips the active-unique index, whereupon we
     roll back and return the winner's row. A prior non-RELEASED FAILED row for this
-    reservation's switch is flipped ACTIVE in place (the pinned `routes` it already
-    carried are the immutable set; we keep them and ignore the `routes` argument on the
-    flip, so a redelivery cannot re-pin an edited config).
+    reservation's switch is flipped ACTIVE in place, and its `routes` are SET to the
+    `routes` argument (ADR 0014 phase 3, issue #34): for a config-derived switch this
+    is a no-op, since the only caller of a reattempt for one of those always re-passes
+    `get_effective_pinned_routes`' own return value (the row's existing pin, issue #20's
+    "never re-derive" invariant enforced by the CALLER, not this function); for an
+    intent-driven switch, the caller may legitimately pass the fork's CURRENT intent
+    (which can differ from what the failed attempt tried), and the pin must actually
+    advance to it on success or the retry would silently keep driving stale content
+    forever. Prior to this ADR every caller passed back exactly the row's own pin, so
+    this changed nothing for any switch until phase 3 introduced a caller that does not.
+
+    The FAILED-to-ACTIVE flip is a compare-and-swap on `status` (review fix P3, issue
+    #34 phase 3 review): a plain `SELECT` then attribute-set then `commit()` would let
+    two concurrent callers for the same (reservation, switch) -- the ordinary consumer
+    path's `add_switches` provision and the wiring-retry sweep's build-direction
+    reattempt both call this function, as independent asyncio tasks in the SAME
+    process (`WIRING_RETRY_ENABLED` defaults true) -- both read the same FAILED row and
+    both write, with whichever commits last winning regardless of which one is working
+    from the more current fork intent. The flip is instead one `UPDATE ...
+    WHERE id = :id AND status = 'FAILED'`; a `rowcount` of zero means a concurrent
+    writer already flipped (or released) this row between our SELECT and this UPDATE,
+    so we roll back, re-read, and return the WINNER's row untouched rather than
+    overwriting it. This is a real SQL-level atomic CAS (unlike the reconcile
+    functions' Python-level equality check below): `status` is a plain string column,
+    not JSON, so a `WHERE` clause on it is portable and cheap.
 
     Mirrors record_l1_connect's record-time freeze re-check (issue #461, the #412
     discipline): a provision whose reservation froze while the driver call was in
@@ -155,10 +177,36 @@ async def record_route_active(
         .first()
     )
     if reusable is not None:
-        reusable.status = "ACTIVE"
-        reusable.intended = "ACTIVE"
-        reusable.last_error = None
-        reusable.released_at = None
+        result = await db.execute(
+            update(RouteAssignment)
+            .where(
+                RouteAssignment.id == reusable.id,
+                RouteAssignment.status == "FAILED",
+            )
+            .values(
+                status="ACTIVE",
+                intended="ACTIVE",
+                routes=routes,
+                last_error=None,
+                released_at=None,
+            )
+        )
+        if result.rowcount == 0:
+            # A concurrent writer (the ordinary consumer path and the wiring-retry
+            # sweep can both reach this function for the same row) already flipped
+            # or released it between our SELECT and this UPDATE: never overwrite
+            # the winner, re-read and return its row as-is.
+            await db.rollback()
+            winner = (
+                await db.execute(select(RouteAssignment).where(RouteAssignment.id == reusable.id))
+            ).scalar_one_or_none()
+            logger.info(
+                "stale reattempt writer skipped for L3 switch %s, reservation %s: "
+                "row already flipped by a concurrent writer",
+                dev_uuid,
+                res_uuid,
+            )
+            return winner
         await db.commit()
         await db.refresh(reusable)
         logger.info(
@@ -195,6 +243,207 @@ async def record_route_active(
         len(routes),
         dev_uuid,
         res_uuid,
+    )
+    return row
+
+
+async def record_route_reconciled(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    device_id: uuid.UUID | str,
+    routes: list[dict],
+    previous_routes: list[dict],
+) -> RouteAssignment | None:
+    """Advance an already-ACTIVE L3 pin to a new route set after a clean intent
+    delta (ADR 0014 Decision 3, issue #34 phase 3).
+
+    Unlike record_route_active (whose existing-ACTIVE short-circuit exists so a
+    plain REDELIVERY of an already-applied provision never touches the pin), this
+    WRITES the new route list onto an EXISTING ACTIVE row: intent-driven switches
+    are the deliberate exception to the #20 "pinned, never re-derived" rule (ADR
+    0014 Decision 3), so a save that changes intent must actually advance what is
+    pinned, or the reconcile is theater. Only called by
+    _apply_l3_adjacency's "reconcile" item kind, after a clean drive of that
+    switch's remove/add delta; `routes` is the new FULL set to pin (not just the
+    added routes), computed by the caller from the delta actually driven (the
+    caller passes a partial set instead of the full target when the reservation
+    froze mid-reconcile and only removals ran; see ADR 0014 addendum X3).
+
+    Compare-and-swap (review fix P2, issue #34 phase 3 review; extends the #412
+    "an ACTIVE row is immutable to a stale writer" invariant to this new writer):
+    `previous_routes` is the pinned set THIS delta was actually computed against
+    (the caller reads it in the same pass that computed `remove_routes`/
+    `add_routes`). Before writing anything, this function re-checks that the
+    row's CURRENT `.routes` still equals `previous_routes`; a mismatch means a
+    FASTER concurrent writer already advanced (or failed) this row since this
+    delta was computed -- reachable only when more than one process pulls the
+    durable wiring_changed consumer (EXECUTION_POLLER_ONLY, docs/ENV_VARS.md;
+    within one replica the consumer processes one message at a time, so this
+    never fires) -- and this call is a logged, silent no-op: writing our
+    now-stale delta on top would downgrade or corrupt whatever the faster writer
+    just established. The comparison is a plain Python list/dict equality
+    within this function's own SELECT-then-write session (the same discipline
+    record_route_failed's #412 check already uses below), not a database-level
+    atomic `UPDATE ... WHERE routes = ...`: `route_assignments.routes` is a
+    plain `JSON` column (not `JSONB`) on Postgres, which has no `=` operator for
+    direct SQL comparison, and widening the column is a schema change out of
+    scope for this fix. The row is loaded `with_for_update()` (the same idiom
+    cabling's `_load_fork(..., for_update=True)` uses) and the lock is held
+    through this function's own commit, so the compare-and-swap happens under
+    the lock: a second concurrent writer's SELECT for the SAME row blocks until
+    this transaction commits or rolls back, then sees the (possibly just-moved)
+    pin and correctly no-ops instead of racing this one between an unlocked
+    compare and write.
+
+    Mirrors record_route_active's frozen re-check: a reconcile whose reservation
+    froze mid-flight (between this function being called and its own read) must
+    not silently advance the pin past what the terminal teardown already
+    snapshotted, so it is instead parked FAILED intended RELEASED
+    (FROZEN_PROVISION_PENDING_REMOVAL), exactly like record_route_active's frozen
+    branch; the release-direction retry channel then removes whatever this row's
+    `routes` were BEFORE this call (left untouched on that branch). The frozen
+    check runs AFTER the compare-and-swap: a stale writer must never touch the
+    row at all, frozen or not.
+
+    Returns None when no ACTIVE row exists for this (reservation, device) (the
+    caller guarantees one; a concurrent writer released it between the caller's
+    read and this call) or when the compare-and-swap found a stale writer.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    dev_uuid = _as_uuid(device_id)
+
+    row = (
+        (
+            await db.execute(
+                select(RouteAssignment)
+                .where(
+                    RouteAssignment.reservation_id == res_uuid,
+                    RouteAssignment.device_id == dev_uuid,
+                    RouteAssignment.status == "ACTIVE",
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        return None
+
+    if row.routes != previous_routes:
+        logger.info(
+            "stale reconcile writer skipped for L3 switch %s, reservation %s: "
+            "pinned routes moved since this delta was computed",
+            dev_uuid,
+            res_uuid,
+        )
+        return None
+
+    state = await get_wiring_state(db, res_uuid)
+    if state is not None and state.frozen:
+        row.status = "FAILED"
+        row.intended = "RELEASED"
+        row.last_error = FROZEN_PROVISION_PENDING_REMOVAL
+        await db.commit()
+        await db.refresh(row)
+        logger.warning(
+            "L3 intent-delta reconcile for frozen reservation %s landed on switch %s; "
+            "parked FAILED intended RELEASED for the release retry channel",
+            res_uuid,
+            dev_uuid,
+        )
+        return row
+
+    row.routes = routes
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "Advanced pinned route set for L3 switch %s in reservation %s (%d route(s))",
+        dev_uuid,
+        res_uuid,
+        len(routes),
+    )
+    return row
+
+
+async def record_route_reconcile_failed(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    device_id: uuid.UUID | str,
+    attempts: int,
+    last_error: str | None,
+    previous_routes: list[dict],
+) -> RouteAssignment | None:
+    """Record a failed intent-delta reconcile against an already-ACTIVE L3 pin
+    (ADR 0014 Decision 3, issue #34 phase 3).
+
+    Unlike record_route_failed's build-direction call (whose #412 stale-writer
+    guard exists for a FRESH provision race, where an existing ACTIVE row means
+    "a concurrent writer already won"), a reconcile failure targets a row that is
+    ALREADY ACTIVE for this reservation's own PRIOR pin: this writer IS the one
+    that owns that row's history for this pass IF its delta is still current, so
+    the #412 ambiguity there does not apply verbatim; it is instead covered by
+    the compare-and-swap below. `intended` stays "ACTIVE" (a build-direction
+    failure, issue #369, so the build-direction retry channel picks it up),
+    `attempts` accumulate, and `routes` is left UNTOUCHED: Decision 3 requires
+    the previous pinned set survive a failed delta verbatim, so later teardown or
+    retry still targets exactly what is actually still installed, not the new
+    intent that never fully applied.
+
+    Compare-and-swap (review fix P2, issue #34 phase 3 review): `previous_routes`
+    is the pinned set this delta was computed against; if the row's CURRENT
+    `.routes` no longer equals it, a faster concurrent writer already moved this
+    row (reachable only with more than one process pulling the durable
+    wiring_changed consumer), and this call is a logged, silent no-op rather than
+    flipping a row a faster writer already advanced to FAILED out from under it.
+    See record_route_reconciled's docstring for why this is a Python-level
+    equality check (not a SQL-level atomic UPDATE) protected by loading the row
+    `with_for_update()` and holding the lock through this function's own commit,
+    so the compare happens under the lock rather than racing an unlocked write.
+
+    Returns None when the row is no longer ACTIVE by the time this runs (a
+    concurrent writer released or already failed it first) or when the
+    compare-and-swap found a stale writer: whichever writer got there first (or
+    is still working from current data) owns the row's fate.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    dev_uuid = _as_uuid(device_id)
+    row = (
+        (
+            await db.execute(
+                select(RouteAssignment)
+                .where(
+                    RouteAssignment.reservation_id == res_uuid,
+                    RouteAssignment.device_id == dev_uuid,
+                    RouteAssignment.status == "ACTIVE",
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        return None
+    if row.routes != previous_routes:
+        logger.info(
+            "stale reconcile writer skipped for L3 switch %s, reservation %s: "
+            "pinned routes moved since this delta was computed",
+            dev_uuid,
+            res_uuid,
+        )
+        return None
+    row.status = "FAILED"
+    row.intended = "ACTIVE"
+    row.attempts = (row.attempts or 0) + attempts
+    row.last_error = last_error
+    await db.commit()
+    await db.refresh(row)
+    logger.warning(
+        "L3 intent-delta reconcile failed for switch %s, reservation %s: %s",
+        dev_uuid,
+        res_uuid,
+        last_error,
     )
     return row
 

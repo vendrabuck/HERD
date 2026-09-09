@@ -718,17 +718,41 @@ batches them: one login/logout wrapping all per-route calls for that switch.
 ### Route derivation
 
 An L3 switch participates in a reservation when a cabling connection links a reserved
-device to it, the same adjacency rule L1 and L2 use. The routes themselves do NOT come
-from the topology edge: they are the `routes` array of the switch's latest inventory
-config version (the vendor-neutral "Layer 3 Switch" schema; see the AI-config schema
-section). A switch with no config version, or whose latest config declares no routes,
-is skipped without error.
+device to it, the same adjacency rule L1 and L2 use (widened by ADR 0014 addendum X-B:
+an inter-switch trunk hop that would otherwise be "assumed provisioned, no adjacency"
+still counts when either end carries routing intent, below). Since ADR 0014 phase 3
+(issue #34), the route CONTENT itself has two sources, in precedence order:
 
-At provision time the execution service pins the exact route list in its
-`route_assignments` state, and deprovision removes exactly that pinned set. A config
-version written mid-reservation therefore never changes what gets removed: remove_route
-always receives the same values configure_route received. There is no fallback
-re-derivation; if no pinned assignment exists at deprovision time the switch is skipped
+1. **Topology routing intent**, when the reservation's fork carries Layer 3 routing
+   intent for the switch (a `data.l3.routes` entry on the switch's canvas node,
+   resolved into cabling's `fork_l3_routes` at fork save/activation; see ADR 0014 and
+   `docs/TOPOLOGY_EDITOR.md`). When present, this IS the route list driven, full stop;
+   it does not merge with or fall back to the config version below.
+2. **The switch's latest inventory config version** (the vendor-neutral "Layer 3
+   Switch" schema; see the AI-config schema section), when the switch carries no
+   routing intent. A switch with no config version, or whose latest config declares no
+   routes, is skipped without error. This is the pre-phase-3 behavior, unchanged for
+   every switch that never expresses topology intent.
+
+At provision time the execution service pins the exact route list (from whichever
+source applied) in its `route_assignments` state, and deprovision removes exactly that
+pinned set. A config version written mid-reservation therefore never changes what gets
+removed for a config-derived switch: remove_route always receives the same values
+configure_route received, and there is no fallback re-derivation for it. An
+intent-driven switch is the deliberate exception (ADR 0014 Decision 3): a fork save
+that changes the switch's routing intent drives a delta against what is currently
+pinned (`remove_route` for routes that left, `configure_route` for routes that
+arrived, both within one login/logout, removes before adds), and the pin advances to
+the new set on success; a failed delta leaves the previous pin untouched. Intent
+disappearing from a switch that stays wired does NOT tear down its routes (no
+surprise mid-reservation teardown); it keeps whatever was last successfully applied,
+recoverable only by another intent-bearing save or the reservation ending. A stale or
+missing per-route validation stamp is re-validated against the switch's CURRENT
+config before any driver call (ADR 0014 addendum X-A); a route naming a
+`virtual_router` is refused entirely until the driver contract gains VRF support
+(addendum X-F, issue #755): in both cases the WHOLE switch's drive for that pass is
+skipped and the row lands FAILED with the refusal reason, never a partial drive.
+If no pinned assignment exists at deprovision time the switch is skipped
 with a log line.
 
 A route's `next_hop` is optional in the config schema. When omitted, the driver receives

@@ -242,6 +242,39 @@ async def test_wiring_status_layered_l2_and_l3_rows(client):
 
 
 @pytest.mark.asyncio
+async def test_wiring_status_l3_route_count_reflects_applied_set_after_a_delta(client):
+    """ADR 0014 phase 3, issue #34, addendum X6: route_count already reads the
+    pinned rows (unchanged shape), but a save-driven intent DELTA (Decision 3)
+    now advances what is pinned mid-reservation; confirm the status surface
+    reflects the count AFTER such a delta, not the count at first provision."""
+    from app.services.route_service import record_route_reconciled
+
+    await _seed_l3(
+        [{"destination": "10.0.0.0/24", "next_hop": "10.0.1.1", "interface": "eth0"}],
+        status="ACTIVE",
+        intended="ACTIVE",
+    )
+
+    resp = await client.get(f"/internal/reservations/{RES_ID}/wiring-status", headers=TOKEN_HEADER)
+    assert resp.json()["connections"][0]["route_count"] == 1, "the pre-delta count"
+
+    async with TestSessionLocal() as s:
+        await record_route_reconciled(
+            s,
+            RES_ID,
+            SWITCH_ID,
+            [
+                {"destination": "10.0.0.0/24", "next_hop": "10.0.1.1", "interface": "eth0"},
+                {"destination": "10.5.0.0/24", "next_hop": None, "interface": "eth1"},
+            ],
+            [{"destination": "10.0.0.0/24", "next_hop": "10.0.1.1", "interface": "eth0"}],
+        )
+
+    resp = await client.get(f"/internal/reservations/{RES_ID}/wiring-status", headers=TOKEN_HEADER)
+    assert resp.json()["connections"][0]["route_count"] == 2, "route_count tracks the advanced pin"
+
+
+@pytest.mark.asyncio
 async def test_wiring_status_l2_unresolvable_allocation_reports_null_vlan(client):
     """A membership row parked against the nil-UUID placeholder reports vlan null.
 
