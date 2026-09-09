@@ -18,7 +18,7 @@ from app.database import Base
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.models.route_assignment import RouteAssignment
-from app.services.nats_consumer import WIRING_UNRESOLVABLE_REASON
+from app.services.nats_consumer import WIRING_UNRESOLVABLE_REASON, ForkIntent
 from app.services.wiring_retry_service import (
     WiringReservationFrozen,
     reattempt_reservation,
@@ -131,7 +131,10 @@ def _recorder(fail=None):
     return execute_fn, calls
 
 
-def _patches(execute_fn, fork_wires=None):
+CFG_VERSION_ID = "cfg-version-1"
+
+
+def _patches(execute_fn, fork_wires=None, l3_routes=None):
     async def _device(device_id, client=None):
         found = SWITCHES.get(str(device_id))
         if found is not None:
@@ -140,9 +143,17 @@ def _patches(execute_fn, fork_wires=None):
         return {"id": str(device_id), "name": "dut", "connection_type": "Server", "field_data": {}}
 
     # The switch config is EDITED out from under the pin: any retry that re-derives from
-    # config (a bug) would drive CURRENT_CONFIG, which the assertions catch.
+    # config (a bug) would drive CURRENT_CONFIG, which the assertions catch. `id` matches
+    # _intent_route's default validated_config_version_id below, so an intent-driven test
+    # that does not care about X-A re-validation content hits the gate's trusted fast path.
     async def _config(device_id, client=None):
-        return {"config": {"routes": CURRENT_CONFIG}}
+        return {"id": CFG_VERSION_ID, "config": {"routes": CURRENT_CONFIG}}
+
+    wires_return = (
+        ForkIntent(fork_wires if fork_wires is not None else DEFAULT_FORK_WIRES, l3_routes)
+        if l3_routes is not None
+        else (DEFAULT_FORK_WIRES if fork_wires is None else fork_wires)
+    )
 
     stack = ExitStack()
     for p in [
@@ -157,11 +168,29 @@ def _patches(execute_fn, fork_wires=None):
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
         patch(
             "app.services.nats_consumer._fetch_fork_intended_wires",
-            new=AsyncMock(return_value=DEFAULT_FORK_WIRES if fork_wires is None else fork_wires),
+            new=AsyncMock(return_value=wires_return),
         ),
     ]:
         stack.enter_context(p)
     return stack
+
+
+def _intent_route(
+    destination,
+    interface,
+    next_hop=None,
+    virtual_router=None,
+    validated_config_version_id=CFG_VERSION_ID,
+    device_id=SW_L3,
+):
+    return {
+        "device_id": device_id,
+        "destination": destination,
+        "interface": interface,
+        "next_hop": next_hop,
+        "virtual_router": virtual_router,
+        "validated_config_version_id": validated_config_version_id,
+    }
 
 
 async def _seed_l3_failed(
@@ -440,3 +469,70 @@ async def test_reattempt_l3_rows_skips_id_deleted_before_refresh():
 
     assert outcomes == [], "a row missing on refresh contributes no outcome, not an error"
     assert calls, "the driver call still fired"
+
+
+# --- ADR 0014 addendum X5 (issue #34 phase 3): retry-channel intent revalidation ---
+
+
+async def test_l3_build_retry_with_current_intent_drives_intent_not_stale_pin():
+    """When the fork carries CURRENT intent for a still-adjacent switch, the
+    retry drives that intent instead of the FAILED row's own (possibly stale)
+    `routes`, and the pin advances to match."""
+    rid = await _seed_l3_failed("ACTIVE", routes=PINNED)
+    new_intent = [_intent_route("10.77.0.0/24", "eth7")]
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, l3_routes={SW_L3: new_intent}):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    dests = {d for a, d in calls if a == "configure_route"}
+    assert dests == {"10.77.0.0/24"}, "the CURRENT intent drove, not the stale row.routes (PINNED)"
+    row = await _l3_row(rid)
+    assert row.status == "ACTIVE"
+    assert {r["destination"] for r in row.routes} == {"10.77.0.0/24"}, "the pin advanced to intent"
+    assert result["results"][0]["outcome"] == "reconnected"
+
+
+async def test_l3_build_retry_without_intent_drives_row_routes_verbatim():
+    """A switch with no CURRENT fork intent (never had any, or it was removed
+    since the row failed) retries with the row's own pinned `routes` verbatim,
+    unchanged from before phase 3 (addendum X4's "keep the applied set")."""
+    rid = await _seed_l3_failed("ACTIVE", routes=PINNED)
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn):
+        await reattempt_reservation(RES_ID, _db_session_factory())
+    dests = {d for a, d in calls if a == "configure_route"}
+    assert dests == {"10.0.0.0/24", "10.1.0.0/24"}
+    row = await _l3_row(rid)
+    assert row.status == "ACTIVE"
+
+
+async def test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call():
+    """A retry whose CURRENT intent fails the X-A/X-F gate (here: a VRF route,
+    X-F) drives nothing and re-records the row FAILED with the gate's reason."""
+    rid = await _seed_l3_failed("ACTIVE", routes=PINNED, attempts=1)
+    bad_intent = [_intent_route("10.80.0.0/24", "eth1", virtual_router="red")]
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, l3_routes={SW_L3: bad_intent}):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert calls == [], "no driver call once the gate refuses the intent"
+    row = await _l3_row(rid)
+    assert row.status == "FAILED"
+    assert row.intended == "ACTIVE"
+    assert row.last_error == "l3_vrf_unsupported"
+    assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present():
+    """ADR 0014 addendum X-B applies to the retry channel's adjacency check too:
+    a switch the inter-switch trunk inference would normally exclude is still
+    considered adjacent, and so IS retried, when it carries fork intent."""
+    rid = await _seed_l3_failed("ACTIVE", routes=PINNED, device_id=SW_L3)
+    trunk_wire = _fork_wire(SW_L3, "eth1", SW_L3_B, "eth1")
+    intent = [_intent_route("10.90.0.0/24", "eth1", device_id=SW_L3)]
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, fork_wires=[trunk_wire], l3_routes={SW_L3: intent}):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert {d for a, d in calls if a == "configure_route"} == {"10.90.0.0/24"}
+    row = await _l3_row(rid)
+    assert row.status == "ACTIVE"
+    assert result["results"][0]["outcome"] == "reconnected"

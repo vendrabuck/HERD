@@ -202,3 +202,92 @@ async def test_record_route_active_frozen_reuses_failed_row_keeps_pinned_routes(
     assert row.routes == ROUTES, "the flip keeps the original pinned set, never the edit"
     assert row.attempts == 2
     assert row.last_error == FROZEN_PROVISION_PENDING_REMOVAL
+
+
+# --- record_route_reconciled / record_route_reconcile_failed (ADR 0014 Decision 3,
+# --- issue #34 phase 3): the intent-delta bookkeeping for an already-ACTIVE pin ---
+
+
+async def test_record_route_reconciled_advances_the_pin_on_an_active_row(db):
+    from app.services.route_service import record_route_reconciled
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+
+    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES)
+    assert row.status == "ACTIVE"
+    assert row.routes == EDITED_ROUTES, "unlike record_route_active, this DOES advance the pin"
+
+
+async def test_record_route_reconciled_returns_none_when_no_active_row(db):
+    """The caller guarantees a reconcile item targets an already-ACTIVE switch;
+    this is a no-op safety net, not an expected path."""
+    from app.services.route_service import record_route_reconciled
+
+    row = await record_route_reconciled(db, uuid.uuid4(), uuid.uuid4(), EDITED_ROUTES)
+    assert row is None
+
+
+async def test_record_route_reconciled_frozen_parks_failed_intended_released(db):
+    """A reconcile whose reservation froze mid-flight (the record-time race, the
+    #412-style re-check) is NOT advanced to the new set: it is parked FAILED
+    intended RELEASED with the PRIOR pin left in place for the release channel."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.route_service import FROZEN_PROVISION_PENDING_REMOVAL, record_route_reconciled
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+    db.add(ReservationWiringState(reservation_id=rid, frozen=True))
+    await db.commit()
+
+    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES)
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert row.routes == ROUTES, "the PRIOR pin survives; the new set is never applied"
+    assert row.last_error == FROZEN_PROVISION_PENDING_REMOVAL
+
+
+async def test_record_route_reconcile_failed_keeps_previous_pin(db):
+    from app.services.route_service import record_route_reconcile_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+
+    row = await record_route_reconcile_failed(db, rid, sid, 2, "boom")
+    assert row.status == "FAILED"
+    assert row.intended == "ACTIVE"
+    assert row.routes == ROUTES, "Decision 3: the previous pinned set survives a failed delta"
+    assert row.attempts == 2
+    assert row.last_error == "boom"
+
+    # A row this function already flipped FAILED is no longer ACTIVE, so a second
+    # call against the same (reservation, switch) is a no-op (None): once FAILED,
+    # further reattempts go through the retry channel's own upsert
+    # (record_route_failed), not a second reconcile-delta failure.
+    row2 = await record_route_reconcile_failed(db, rid, sid, 3, "boom again")
+    assert row2 is None
+
+
+async def test_record_route_reconcile_failed_is_not_guarded_by_412_unlike_record_route_failed(db):
+    """The key behavioral difference from record_route_failed's build-direction
+    call: an ACTIVE row IS flipped FAILED here (no "a concurrent writer already
+    won" guard), since this writer IS the one that owns this pin's history for a
+    reconcile delta."""
+    from app.services.route_service import record_route_reconcile_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+
+    row = await record_route_reconcile_failed(db, rid, sid, 1, "delta boom")
+    assert row.status == "FAILED", "unlike record_route_failed, the ACTIVE row IS downgraded"
+
+
+async def test_record_route_reconcile_failed_returns_none_when_not_active(db):
+    from app.services.route_service import record_route_reconcile_failed
+
+    row = await record_route_reconcile_failed(db, uuid.uuid4(), uuid.uuid4(), 1, "boom")
+    assert row is None

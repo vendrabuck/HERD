@@ -1,4 +1,5 @@
-"""Consumer tests for the L3 layered adjacency reconcile (ADR 0009 phase 5, issue #416).
+"""Consumer tests for the L3 layered adjacency reconcile (ADR 0009 phase 5, issue #416;
+routing-intent precedence and delta added ADR 0014 phase 3, issue #34).
 
 Covers the option-C adjacency derivation (a hop terminating on a Layer 3 Switch makes the
 reservation adjacent to it; an L3-to-L3 trunk contributes nothing; a hop reaching an L3
@@ -7,7 +8,12 @@ provision-on-first-adjacency / deprovision-on-last lifecycle, the pinned-set-ver
 retry in both directions, result-gated pin writes, the #412 ACTIVE-immutable guard, and
 the Decision 4 ordering (L3 runs after L2 within one apply), all driven through
 handle_wiring_changed with an in-memory SQLite DB and a mocked sandbox, the pattern the L2
-reconcile tests use.
+reconcile tests use. The phase 3 section below adds: intent-beats-config precedence, the
+intent delta on an already-adjacent switch (add-only/remove-only/mixed/unchanged, call
+order, frozen direction scoping, partial-failure pin retention), first-adjacency-with
+-intent, intent-removed-keeps-the-applied-set, the X-A stale/missing-stamp re-validation
+gate, the X-B trunk-override (explicit intent beats the inter-switch "assumed
+provisioned" skip), and the X-F VRF-route refusal.
 """
 
 import uuid
@@ -18,6 +24,7 @@ import pytest
 from app.database import Base
 from app.models.route_assignment import RouteAssignment
 from app.services.nats_consumer import (
+    ForkIntent,
     TransientUpstreamError,
     _apply_l3_adjacency,
     _derive_l3_adjacency,
@@ -27,6 +34,7 @@ from app.services.nats_consumer import (
     handle_wiring_changed,
 )
 from app.services.route_service import record_route_active, record_route_failed
+from herd_common.l3_route_identity import route_identity_key
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -104,10 +112,38 @@ DEVICES = {
     DUT2: _dev(DUT2, "Server", "dut2"),
 }
 
+DEFAULT_CFG_VERSION_ID = "cfg-version-1"
+
 CONFIG_BY_SWITCH = {
-    SW_L3: {"config": {"routes": ROUTES}},
-    SW_L3_B: {"config": {"routes": ROUTES_B}},
+    SW_L3: {"id": DEFAULT_CFG_VERSION_ID, "config": {"routes": ROUTES}},
+    SW_L3_B: {"id": DEFAULT_CFG_VERSION_ID, "config": {"routes": ROUTES_B}},
 }
+
+
+def _intent_route(
+    destination,
+    interface,
+    next_hop=None,
+    virtual_router=None,
+    validated_config_version_id=DEFAULT_CFG_VERSION_ID,
+    device_id=None,
+):
+    """One fork `l3_routes` entry (ADR 0014 phase 3, issue #34): the shape
+    cabling's internal fork GET returns. Defaults `validated_config_version_id`
+    to the DEFAULT_CFG_VERSION_ID every test switch's config carries, so a
+    plain delta/precedence test trusts the route verbatim (the X-A re
+    -validation gate's fast path) without needing to also stand up a config
+    with `interfaces`; X-A-specific tests override this to exercise the slow
+    (re-validating) path instead.
+    """
+    return {
+        "device_id": device_id or SW_L3,
+        "destination": destination,
+        "interface": interface,
+        "next_hop": next_hop,
+        "virtual_router": virtual_router,
+        "validated_config_version_id": validated_config_version_id,
+    }
 
 
 def _wire(device_a, port_a, device_b, port_b):
@@ -150,7 +186,8 @@ def _l3_recorder(fail=None):
     return execute_fn, calls
 
 
-def _patches(execute_fn, fork_wires, config_fetch=_config_fetch):
+def _patches(execute_fn, fork_wires, config_fetch=_config_fetch, l3_routes=None):
+    wires_return = ForkIntent(fork_wires, l3_routes) if l3_routes is not None else fork_wires
     return [
         patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
         patch(
@@ -160,7 +197,7 @@ def _patches(execute_fn, fork_wires, config_fetch=_config_fetch):
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
         patch(
             "app.services.nats_consumer._fetch_fork_intended_wires",
-            new=AsyncMock(return_value=fork_wires),
+            new=AsyncMock(return_value=wires_return),
         ),
         patch(
             "app.services.nats_consumer._fetch_latest_config",
@@ -170,10 +207,16 @@ def _patches(execute_fn, fork_wires, config_fetch=_config_fetch):
     ]
 
 
-async def _reconcile(fork_wires, fork_version=1, execute_fn=None, calls=None, config_fetch=None):
+async def _reconcile(
+    fork_wires, fork_version=1, execute_fn=None, calls=None, config_fetch=None, l3_routes=None
+):
     if execute_fn is None:
         execute_fn, calls = _l3_recorder()
-    kwargs = {} if config_fetch is None else {"config_fetch": config_fetch}
+    kwargs = {}
+    if config_fetch is not None:
+        kwargs["config_fetch"] = config_fetch
+    if l3_routes is not None:
+        kwargs["l3_routes"] = l3_routes
     with ExitStack() as stack:
         for p in _patches(execute_fn, fork_wires, **kwargs):
             stack.enter_context(p)
@@ -699,3 +742,530 @@ async def test_apply_l3_adjacency_deprovision_switch_not_found_parks_failed():
     assert rows[0].intended == "RELEASED"
     assert "L3 switch" in rows[0].last_error
     assert "not found" in rows[0].last_error
+
+
+# --- ADR 0014 phase 3 (issue #34): routing-intent precedence and delta ------
+
+
+CFG_WITH_INTERFACES_ID = "cfg-version-with-interfaces"
+
+
+async def _config_with_interfaces(device_id, client=None):
+    """A config carrying `interfaces`, for the X-A re-validation tests: the
+    default `_config_fetch`/CONFIG_BY_SWITCH configs carry no `interfaces` key
+    at all (irrelevant to every pre-phase-3 test, which never re-validates)."""
+    return {
+        "id": CFG_WITH_INTERFACES_ID,
+        "config": {
+            "interfaces": [
+                {"name": "eth1", "ip": "10.20.0.1/24"},
+                {"name": "eth2", "ip": None},
+            ],
+            "routes": ROUTES,
+        },
+    }
+
+
+# --- precedence (Decision 2, addendum X2) ---
+
+
+async def test_precedence_intent_beats_config_on_first_adjacency():
+    """When the fork carries intent for a newly adjacent switch, that IS the
+    route set driven, not the switch's config version."""
+    intent = [_intent_route("10.9.0.0/24", "eth3")]
+    calls = await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], l3_routes={SW_L3: intent})
+    dests = {d for a, d in calls if a == "configure_route"}
+    assert dests == {"10.9.0.0/24"}, "the intent route drove, not the config's ROUTES"
+    rows = await _rows("ACTIVE")
+    assert len(rows) == 1
+    assert {r["destination"] for r in rows[0].routes} == {"10.9.0.0/24"}
+
+
+async def test_precedence_no_intent_still_falls_back_to_config():
+    """A switch with no fork intent at all is unaffected by phase 3: today's
+    config-version fallback rule is unchanged (l3_routes={} is the default)."""
+    calls = await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], l3_routes={})
+    dests = {d for a, d in calls if a == "configure_route"}
+    assert dests == {r["destination"] for r in ROUTES}
+
+
+async def test_precedence_decided_per_switch_in_one_reconcile():
+    """One reconcile, two switches: SW_L3 carries intent (drives it), SW_L3_B
+    carries none (falls back to its own config) -- precedence is per switch."""
+    intent = [_intent_route("10.9.0.0/24", "eth3", device_id=SW_L3)]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1"), _wire(DUT2, "eth1", SW_L3_B, "ge-0/0/2")],
+        l3_routes={SW_L3: intent},
+    )
+    configured = {d for a, d in calls if a == "configure_route"}
+    assert "10.9.0.0/24" in configured, "SW_L3 drove its intent"
+    assert {r["destination"] for r in ROUTES_B} <= configured, "SW_L3_B fell back to its config"
+    assert await _active_switches() == {SW_L3, SW_L3_B}
+
+
+# --- intent delta on an already-adjacent switch (Decision 3, addendum X3) ---
+
+
+async def test_delta_add_only_configures_only_the_new_route():
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    intent_v2 = intent_v1 + [_intent_route("10.21.0.0/24", "eth2")]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=2, l3_routes={SW_L3: intent_v2}
+    )
+
+    assert {d for a, d in calls if a == "configure_route"} == {"10.21.0.0/24"}
+    assert not any(a == "remove_route" for a, _d in calls)
+    active = await _rows("ACTIVE")
+    assert {r["destination"] for r in active[0].routes} == {"10.20.0.0/24", "10.21.0.0/24"}
+
+
+async def test_delta_remove_only_removes_only_the_dropped_route():
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1"), _intent_route("10.21.0.0/24", "eth2")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    intent_v2 = [_intent_route("10.20.0.0/24", "eth1")]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=2, l3_routes={SW_L3: intent_v2}
+    )
+
+    assert {d for a, d in calls if a == "remove_route"} == {"10.21.0.0/24"}
+    assert not any(a == "configure_route" for a, _d in calls)
+    active = await _rows("ACTIVE")
+    assert {r["destination"] for r in active[0].routes} == {"10.20.0.0/24"}
+
+
+async def test_delta_mixed_removes_and_adds_in_one_reconcile():
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    intent_v2 = [_intent_route("10.22.0.0/24", "eth3")]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=2, l3_routes={SW_L3: intent_v2}
+    )
+
+    assert {d for a, d in calls if a == "remove_route"} == {"10.20.0.0/24"}
+    assert {d for a, d in calls if a == "configure_route"} == {"10.22.0.0/24"}
+    active = await _rows("ACTIVE")
+    assert {r["destination"] for r in active[0].routes} == {"10.22.0.0/24"}
+
+
+async def test_delta_unchanged_intent_makes_no_driver_call():
+    """Also the "redelivery" shape: applying the same intent twice drives nothing
+    the second time (S5's delta-gating, mirrored at drive time)."""
+    intent = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent}
+    )
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=2, l3_routes={SW_L3: intent}
+    )
+    assert calls == [], "an unchanged intent drives nothing"
+
+
+async def test_delta_call_order_removes_before_adds_one_login_logout():
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    intent_v2 = [_intent_route("10.30.0.0/24", "eth5")]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=2, l3_routes={SW_L3: intent_v2}
+    )
+
+    actions = [a for a, _d in calls]
+    assert actions.count("login") == 1
+    assert actions.count("logout") == 1
+    assert actions.index("remove_route") < actions.index("configure_route"), (
+        "remove_route calls must run before configure_route calls within the delta"
+    )
+
+
+async def test_delta_partial_failure_keeps_previous_pin_lands_failed():
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    intent_v2 = [_intent_route("10.30.0.0/24", "eth5")]
+    execute_fn, calls = _l3_recorder(fail={"configure_route"})
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        fork_version=2,
+        l3_routes={SW_L3: intent_v2},
+        execute_fn=execute_fn,
+        calls=calls,
+    )
+
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert {r["destination"] for r in rows[0].routes} == {"10.20.0.0/24"}, (
+        "the PREVIOUS pinned set survives a failed delta verbatim (Decision 3)"
+    )
+    assert rows[0].attempts >= 1
+    assert rows[0].last_error
+
+
+# --- first adjacency with intent / intent removed (addenda X2, X4) ---
+
+
+async def test_first_adjacency_with_intent_pins_the_intent():
+    """Re-expresses test_precedence_intent_beats_config_on_first_adjacency's
+    pin-side assertion explicitly for the brief's "first adjacency with intent"
+    item."""
+    intent = [_intent_route("10.40.0.0/24", "eth7")]
+    await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], l3_routes={SW_L3: intent})
+    active = await _rows("ACTIVE")
+    assert len(active) == 1
+    assert {r["destination"] for r in active[0].routes} == {"10.40.0.0/24"}
+
+
+async def test_intent_removed_keeps_the_applied_set():
+    """ADR 0014 addendum X4: a switch whose intent disappears while it stays
+    adjacent keeps its currently-applied set; no surprise teardown mid-save."""
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    calls = await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=2, l3_routes={})
+
+    assert calls == [], "intent disappearing drives no teardown and no re-derive"
+    active = await _rows("ACTIVE")
+    assert {r["destination"] for r in active[0].routes} == {"10.20.0.0/24"}
+
+
+# --- frozen direction scoping on a reconcile item (addendum X3) -------------
+# (handle_wiring_changed's own entry guard no-ops the WHOLE event before any
+# driver call when frozen, so a frozen reconcile item is only reachable via a
+# genuine mid-flight race; these two tests drive _apply_l3_adjacency directly,
+# mirroring the "switch cannot be driven" direct-call tests below.)
+
+
+async def test_apply_l3_adjacency_frozen_reconcile_runs_removes_skips_adds():
+    async with TestSessionLocal() as s:
+        s.add(
+            RouteAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                device_id=uuid.UUID(SW_L3),
+                routes=[{"destination": "10.20.0.0/24", "interface": "eth1", "next_hop": None}],
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        from app.models.reservation_wiring_state import ReservationWiringState
+
+        s.add(ReservationWiringState(reservation_id=uuid.UUID(RES_ID), frozen=True))
+        await s.commit()
+
+    execute_fn, calls = _l3_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [],
+            ctx,
+            _db_session_factory(),
+            reconciles=[
+                {
+                    "device_id": SW_L3,
+                    "remove_routes": [
+                        {"destination": "10.20.0.0/24", "interface": "eth1", "next_hop": None}
+                    ],
+                    "add_routes": [
+                        {"destination": "10.99.0.0/24", "interface": "eth9", "next_hop": None}
+                    ],
+                    "intent": [
+                        {"destination": "10.99.0.0/24", "interface": "eth9", "next_hop": None}
+                    ],
+                }
+            ],
+        )
+
+    assert {d for a, d in calls if a == "remove_route"} == {"10.20.0.0/24"}
+    assert not any(a == "configure_route" for a, _d in calls), "adds must not drive while frozen"
+    row = (await _rows())[0]
+    assert row.status == "FAILED"
+    assert row.intended == "RELEASED"
+    assert {r["destination"] for r in row.routes} == {"10.20.0.0/24"}, "the PRIOR pin survives"
+
+
+async def test_apply_l3_adjacency_frozen_reconcile_only_adds_is_noop():
+    async with TestSessionLocal() as s:
+        s.add(
+            RouteAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                device_id=uuid.UUID(SW_L3),
+                routes=[{"destination": "10.20.0.0/24", "interface": "eth1", "next_hop": None}],
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        from app.models.reservation_wiring_state import ReservationWiringState
+
+        s.add(ReservationWiringState(reservation_id=uuid.UUID(RES_ID), frozen=True))
+        await s.commit()
+
+    execute_fn, calls = _l3_recorder()
+    ctx = _FetchContext(None)
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+    ):
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [],
+            ctx,
+            _db_session_factory(),
+            reconciles=[
+                {
+                    "device_id": SW_L3,
+                    "remove_routes": [],
+                    "add_routes": [
+                        {"destination": "10.99.0.0/24", "interface": "eth9", "next_hop": None}
+                    ],
+                    "intent": [
+                        {"destination": "10.20.0.0/24", "interface": "eth1", "next_hop": None},
+                        {"destination": "10.99.0.0/24", "interface": "eth9", "next_hop": None},
+                    ],
+                }
+            ],
+        )
+
+    assert calls == [], "a frozen reconcile with only additions drives nothing at all"
+    row = (await _rows())[0]
+    assert row.status == "ACTIVE", "the row is untouched: no bookkeeping call was even made"
+    assert {r["destination"] for r in row.routes} == {"10.20.0.0/24"}
+
+
+# --- X-A: stale or missing validated_config_version_id re-validates ---------
+
+
+async def test_gate_missing_validation_stamp_revalidates_and_drives_clean_route():
+    """A route with no validated_config_version_id (tolerant activation, or a
+    reconcile that skipped the gate) is RE-VALIDATED before any driver call; a
+    route that passes re-validation still drives normally."""
+    intent = [_intent_route("10.20.0.0/24", "eth1", validated_config_version_id=None)]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_with_interfaces,
+    )
+    assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
+    assert await _active_switches() == {SW_L3}
+
+
+async def test_gate_stale_validation_stamp_revalidates_against_current_config():
+    """A route stamped against a DIFFERENT (stale) config version id is also
+    re-validated, not merely a missing stamp."""
+    intent = [_intent_route("10.20.0.0/24", "eth1", validated_config_version_id="an-old-version")]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_with_interfaces,
+    )
+    assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
+
+
+async def test_gate_current_validation_stamp_trusts_verbatim_no_content_check():
+    """A route whose stamp matches the switch's CURRENT config version is
+    trusted verbatim: no interfaces are consulted (a config with none still
+    drives cleanly, proving no re-validation ran)."""
+
+    async def _config_no_interfaces(device_id, client=None):
+        return {"id": CFG_WITH_INTERFACES_ID, "config": {"routes": ROUTES}}
+
+    intent = [
+        _intent_route("10.20.0.0/24", "eth1", validated_config_version_id=CFG_WITH_INTERFACES_ID)
+    ]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_no_interfaces,
+    )
+    assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
+
+
+async def test_gate_missing_config_version_lands_unconfigured_failed_no_driver_call():
+    """A switch whose current config version is 404 (no config at all) lands the
+    switch FAILED with l3_switch_unconfigured and drives nothing."""
+
+    async def _no_config(device_id, client=None):
+        return None
+
+    intent = [_intent_route("10.20.0.0/24", "eth1", validated_config_version_id=None)]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], l3_routes={SW_L3: intent}, config_fetch=_no_config
+    )
+    assert calls == []
+    rows = await _rows("FAILED")
+    assert len(rows) == 1
+    assert rows[0].last_error == "l3_switch_unconfigured"
+    assert rows[0].intended == "ACTIVE"
+
+
+async def test_gate_unknown_interface_among_intent_fails_whole_switch_no_driver_call():
+    """One bad route among a switch's intent fails the WHOLE switch's drive this
+    pass (the per-switch ledger cannot record a partial pin): a clean route on
+    the SAME switch also does not drive."""
+    intent = [
+        _intent_route("10.20.0.0/24", "eth1", validated_config_version_id=None),
+        _intent_route("10.30.0.0/24", "eth-does-not-exist", validated_config_version_id=None),
+    ]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_with_interfaces,
+    )
+    assert calls == [], "no driver call for either route once one fails the gate"
+    rows = await _rows("FAILED")
+    assert len(rows) == 1
+    assert rows[0].last_error == "l3_unknown_interface"
+
+
+async def test_gate_reconcile_failure_keeps_previous_pin_via_reconcile_failed_path():
+    """The X-A gate also guards the delta path: a re-validation failure on an
+    already-adjacent switch's intent change lands FAILED via
+    record_route_reconcile_failed, keeping the prior pin untouched."""
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    intent_v2 = [
+        _intent_route("10.30.0.0/24", "eth-does-not-exist", validated_config_version_id=None)
+    ]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        fork_version=2,
+        l3_routes={SW_L3: intent_v2},
+        config_fetch=_config_with_interfaces,
+    )
+    assert calls == [], "the gate failure makes no driver call"
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert rows[0].last_error == "l3_unknown_interface"
+    assert {r["destination"] for r in rows[0].routes} == {"10.20.0.0/24"}, (
+        "the previous pin survives a gate failure on the delta path too"
+    )
+
+
+# --- X-B: explicit intent overrides the inter-switch trunk inference --------
+
+
+async def test_derive_l3_to_l3_trunk_with_intent_on_both_ends_is_adjacent():
+    """The exact scenario from the phase 3 brief's addendum X-B."""
+    ctx = _FetchContext(None)
+    intent_map = {
+        SW_L3: [_intent_route("10.2.0.0/24", "eth1", next_hop="10.0.0.2", device_id=SW_L3)],
+        SW_L3_B: [_intent_route("10.1.0.0/24", "eth1", next_hop="10.0.0.1", device_id=SW_L3_B)],
+    }
+    with patch(
+        "app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)
+    ):
+        m = await _derive_l3_adjacency([_wire(SW_L3, "eth1", SW_L3_B, "eth1")], ctx, intent_map)
+    assert m == {SW_L3, SW_L3_B}, "both trunk-skipped ends join adjacency once they carry intent"
+
+
+async def test_derive_l3_to_l3_trunk_with_intent_on_one_end_only():
+    ctx = _FetchContext(None)
+    intent_map = {SW_L3: [_intent_route("10.2.0.0/24", "eth1", device_id=SW_L3)]}
+    with patch(
+        "app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)
+    ):
+        m = await _derive_l3_adjacency([_wire(SW_L3, "eth1", SW_L3_B, "eth1")], ctx, intent_map)
+    assert m == {SW_L3}, "only the side carrying intent joins; the other stays trunk-skipped"
+
+
+async def test_trunk_override_intent_drives_both_switches_end_to_end():
+    """The full reconcile-level version of the X-B scenario: both switches'
+    intent actually drives a configure_route call, with the pin recording the
+    intent on both, no trunk skip."""
+    intent_a = [_intent_route("10.2.0.0/24", "eth1", next_hop="10.0.0.2", device_id=SW_L3)]
+    intent_b = [_intent_route("10.1.0.0/24", "eth1", next_hop="10.0.0.1", device_id=SW_L3_B)]
+    calls = await _reconcile(
+        [_wire(SW_L3, "eth1", SW_L3_B, "eth1")],
+        l3_routes={SW_L3: intent_a, SW_L3_B: intent_b},
+    )
+    configured = {d for a, d in calls if a == "configure_route"}
+    assert configured == {"10.2.0.0/24", "10.1.0.0/24"}, "both switches drove their own intent"
+    assert await _active_switches() == {SW_L3, SW_L3_B}
+
+
+# --- X-F: a VRF-bearing route fails the whole switch, no driver call --------
+
+
+async def test_vrf_route_fails_switch_with_no_driver_call():
+    intent = [
+        _intent_route("10.20.0.0/24", "eth1"),
+        _intent_route("10.30.0.0/24", "eth2", virtual_router="red"),
+    ]
+    calls = await _reconcile([_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], l3_routes={SW_L3: intent})
+    assert calls == [], "no driver call for either route once one carries a virtual_router"
+    rows = await _rows("FAILED")
+    assert len(rows) == 1
+    assert rows[0].last_error == "l3_vrf_unsupported"
+    assert rows[0].intended == "ACTIVE"
+
+
+async def test_vrf_route_on_delta_fails_via_reconcile_failed_path():
+    """Same refusal, but discovered on an intent DELTA (an already-adjacent,
+    already-pinned switch): the previous pin survives, matching the ordinary
+    gate-failure-on-delta behavior."""
+    intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
+    )
+
+    intent_v2 = [_intent_route("10.30.0.0/24", "eth2", virtual_router="red")]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=2, l3_routes={SW_L3: intent_v2}
+    )
+    assert calls == []
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].last_error == "l3_vrf_unsupported"
+    assert {r["destination"] for r in rows[0].routes} == {"10.20.0.0/24"}
+
+
+# --- X-E: the shared herd_common identity is what the delta diffs on --------
+
+
+def test_route_set_identity_uses_the_shared_herd_common_helper():
+    """_route_set_identity_keys (the delta's unchanged-check) matches
+    route_identity_key exactly, including virtual_router participating in
+    identity (S4): two routes differing only by virtual_router are distinct."""
+    from app.services.nats_consumer import _route_set_identity_keys
+
+    routes = [{"destination": "10.0.0.0/24", "interface": "eth0", "next_hop": "10.0.0.1"}]
+    assert _route_set_identity_keys(routes) == {
+        route_identity_key("10.0.0.0/24", "eth0", "10.0.0.1", None)
+    }
+    with_vrf = [dict(routes[0], virtual_router="red")]
+    assert _route_set_identity_keys(with_vrf) != _route_set_identity_keys(routes)
