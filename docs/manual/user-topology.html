@@ -358,7 +358,7 @@
       <li><b>A per-row reason.</b> After a save or a reservation attempt finds a problem, the offending row (or the panel header, for a switch-level problem such as an unconfigured or unattached switch) shows the reason in plain words, and the switch's canvas node's route-count badge turns red.</li>
     </ol>
 
-    <p>Routing intent is checked, never assumed, at three points: saving a standalone topology that carries any runs a validation pass right after the save; saving a reservation's live-edit fork gates the save itself, refusing it outright on a problem; creating a reservation from a topology with routing intent gates the booking the same way. One reason, a duplicate route on the same switch, is informational only and never blocks anything; every other reason does.</p>
+    <p>Routing intent is checked, never assumed, at three points: saving a standalone topology that carries any routing intent runs a validation pass right after the save; saving a reservation's live-edit fork gates the save itself, refusing it outright on a problem; creating a reservation from a topology with routing intent gates the booking the same way. One reason, a duplicate route on the same switch, is informational only and never blocks anything; every other reason does.</p>
 
     <h2 class="sec" id="edges">The part everyone asks about</h2>
     <p class="sectitle">Red vs green edges</p>

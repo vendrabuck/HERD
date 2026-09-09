@@ -50,7 +50,7 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Frontend: pages and components
 
-**33 page test files exist today**, covering every page under `frontend/src/pages/`
+**37 page test files exist today**, covering every page under `frontend/src/pages/`
 except `ReservationCalendarPage`. The 2026-08-30 coverage batch (PRs #650 to #660)
 added direct suites for the seven pages this register used to list as untested
 (`AddDevicePage`, `DeviceGroupsPage`, `GroupDetailPage`, `GroupsPage`, `UsersPage`,
@@ -59,13 +59,15 @@ suites (`TopologyEditorPage.HistoryAndSave`, `TopologyEditorPage.ElementAttachAn
 `TopologyEditorPage.AIProposal`) covering the base editor flows this register used
 to call out as missing: device drop, element attach, AI-proposal edge mapping,
 version-history preview/restore, save-as-template, and pathfind-status reconcile.
-`TopologyEditorPage.tsx` itself is now at 96.4% lines.
+ADR 0014 phase 2 (issue #34) added a fourth, `TopologyEditorPage.L3Routing`,
+covering the Routing panel's editor-level wiring (badge, validation toasts, the
+unsaved-routing-changes warning). `TopologyEditorPage.tsx` itself is now at 96.7% lines.
 
 - [HIGH] `frontend/src/pages/ReservationCalendarPage.tsx` (3.8% lines, no test
   file). Calendar rendering, month navigation, and reservation-click handling are
   all untested.
 
-Measured frontend coverage on main is 90.16% lines (1,297 tests, 135 test files).
+Measured frontend coverage on main is 90.44% lines (1,360 tests, 138 test files).
 The files below 85% lines, all predating v0.2.0, grouped by area with a note on
 what a test would still need to cover:
 

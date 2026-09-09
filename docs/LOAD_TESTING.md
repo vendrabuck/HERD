@@ -4,7 +4,7 @@ HERD's load tests drive the HTTP API with [Locust](https://locust.io/), a Python
 
 ## What the tests do
 
-The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and six concrete user classes:
+The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and seven concrete user classes:
 
 ### `HerdUser` (base)
 
@@ -57,6 +57,25 @@ Exercises the bulk export/import surface as an admin.
   - `export_topologies_json` (weight 2): `GET /api/cabling/topologies/export?format=json`
   - `dry_run_device_import` (weight 1): `POST /api/inventory/devices/import` with `dry_run=true`
 
+### `RoutedTopologyValidator` (weight 1)
+
+Exercises the Layer 3 routing-intent validate pass (ADR 0014, issue #34 phase 3) as
+an admin.
+
+- `on_start`: looks for an existing Layer 3 Switch device among the seeded device
+  pool; if found, creates one small persistent topology wiring a DUT to it with one
+  `data.l3` route. If no Layer 3 Switch device is seeded (a stack without
+  `SEED_FRR=1`), the class is a safe no-op: it deliberately never creates its own
+  driver, template, or device.
+- Tasks:
+  - `validate_routed_topology` (the class's only task): `POST
+    /api/cabling/topologies/{id}/validate` against the persistent topology. The
+    route need not resolve `valid: true` to be useful load; an unconfigured or
+    unattached switch still exercises the same inventory batch-fetch and per-route
+    judgement path, just landing a different `invalid_routes` reason.
+- `on_stop`: deletes the topology it created, if any.
+- Think time: 2 to 5 seconds.
+
 ### `NotificationUser` (weight 2)
 
 Simulates a user polling and tuning notifications.
@@ -82,7 +101,7 @@ Exercises `POST /connections/bulk`, the admin-only bulk cable-create path.
 
 ### Class weighting
 
-Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1; total 14), out of every 14 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 2 notification users, 2 ACL checkers, and 1 bulk-connection admin. Increase `-u` to scale all six proportionally.
+Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `RoutedTopologyValidator` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1; total 15), out of every 15 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 1 routed-topology validator, 2 notification users, 2 ACL checkers, and 1 bulk-connection admin. Increase `-u` to scale all seven proportionally.
 
 ## Prerequisites
 
