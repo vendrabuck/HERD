@@ -308,4 +308,59 @@ describe("TopologyEditorPage plain save: L3 routing intent (ADR 0014 phase 2, is
     await waitFor(() => expect(toastError).toHaveBeenCalled());
     expect(await screen.findByText("l3_unknown_interface")).toBeTruthy();
   });
+
+  // Review fix F1 (issue #34): l3_duplicate_route is informational, not a
+  // problem cabling's own save-gate refuses on; a validate result naming
+  // only that reason must not toast an error or turn the badge red.
+  it("does not toast an error or mark the badge invalid for a duplicate-only validate result", async () => {
+    server.use(
+      http.put(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
+      http.post(`/api/cabling/topologies/${TOPO_ID}/validate`, () =>
+        HttpResponse.json({
+          valid: true,
+          invalid_edges: [],
+          device_ids: [],
+          invalid_routes: [
+            { node_id: "n1", device_id: "d-1", index: 0, reason: "l3_duplicate_route", detail: null },
+          ],
+        }),
+      ),
+    );
+    await renderPageWithCanvas([l3Node("n1", "d-1", [route(), route()])]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Topology saved"));
+
+    expect(toastError).not.toHaveBeenCalled();
+    const renderedNodes = rfProps.current?.nodes as Array<{ id: string; data: DeviceNodeData }>;
+    const renderedNode = renderedNodes.find((n) => n.id === "n1");
+    expect(renderedNode?.data.l3ValidationInvalid).toBeUndefined();
+  });
+
+  // Review fix F5 (issue #34): the reservations gate validates the
+  // PERSISTED canvas, so unsaved routing edits are invisible to it; rather
+  // than block Reserve, the modal opening warns once when the canvas is
+  // dirty and carries L3 intent.
+  it("warns on opening the Reserve modal when the canvas has unsaved routing changes", async () => {
+    await renderPageWithCanvas([l3Node("n1", "d-1", [route()])]);
+
+    fireEvent.click(screen.getByRole("button", { name: /Reserve Topology/ }));
+
+    await waitFor(() =>
+      expect(toastSuccess).toHaveBeenCalledWith(
+        "Unsaved routing changes are not checked until you save",
+      ),
+    );
+  });
+
+  it("does not warn on opening the Reserve modal when the canvas has no L3 intent", async () => {
+    await renderPageWithCanvas([deviceNode("n1", "d-1")]);
+
+    fireEvent.click(screen.getByRole("button", { name: /Reserve Topology/ }));
+
+    await waitFor(() => expect(screen.getByLabelText("Purpose (optional)")).toBeTruthy());
+    expect(toastSuccess).not.toHaveBeenCalledWith(
+      "Unsaved routing changes are not checked until you save",
+    );
+  });
 });

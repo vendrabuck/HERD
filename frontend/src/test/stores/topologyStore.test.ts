@@ -442,10 +442,10 @@ describe("topologyStore", () => {
       expect((nodes.find((n) => n.id === "b")?.data as DeviceNodeData).l3).toBeUndefined();
     });
 
-    it("removes data.l3 entirely when passed null, rather than storing an empty list", () => {
+    it("removes data.l3 entirely when passed an empty list, rather than storing {routes: []} (review fix F11: the store owns this rule)", () => {
       useTopologyStore.getState().addDeviceNode(makeNode("a"));
       useTopologyStore.getState().setNodeL3Routes("a", [route()]);
-      useTopologyStore.getState().setNodeL3Routes("a", null);
+      useTopologyStore.getState().setNodeL3Routes("a", []);
       const data = useTopologyStore.getState().nodes[0].data as DeviceNodeData;
       expect(data.l3).toBeUndefined();
       expect("l3" in data).toBe(false);

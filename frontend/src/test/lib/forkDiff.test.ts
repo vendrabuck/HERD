@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  buildForkDiffOverlayCanvas,
-  canonicalizeDestination,
-  diffForkCanvases,
-  edgeIdentityKey,
-} from "@/lib/forkDiff";
+import { buildForkDiffOverlayCanvas, diffForkCanvases, edgeIdentityKey } from "@/lib/forkDiff";
 import type { CanvasData, L3RouteIntent } from "@/types/topology.types";
 
 function node(id: string, label = id): CanvasData["nodes"][number] {
@@ -197,38 +192,6 @@ describe("buildForkDiffOverlayCanvas", () => {
   });
 });
 
-// ADR 0014 phase 2 peer-review addition (issue #34): canonicalizeDestination
-// must mirror cabling's `str(ipaddress.ip_network(value, strict=False))`.
-// The first two cases reuse the exact input/output pairs pinned server-side
-// in services/cabling/tests/test_l3_intent.py
-// (test_destination_canonicalized_when_parseable,
-// test_destination_kept_verbatim_when_not_parseable).
-describe("canonicalizeDestination", () => {
-  it("masks host bits off a host-form IPv4 CIDR (server test case)", () => {
-    expect(canonicalizeDestination("10.0.0.5/24")).toBe("10.0.0.0/24");
-  });
-
-  it("keeps an unparseable string verbatim (server test case)", () => {
-    expect(canonicalizeDestination("not-an-ip")).toBe("not-an-ip");
-  });
-
-  it("gives a bare IPv4 address an implicit /32", () => {
-    expect(canonicalizeDestination("10.0.0.5")).toBe("10.0.0.5/32");
-  });
-
-  it("masks host bits off a host-form IPv6 CIDR and lowercases/compresses it", () => {
-    expect(canonicalizeDestination("2001:DB8::1/64")).toBe("2001:db8::/64");
-  });
-
-  it("gives a bare IPv6 address an implicit /128 and lowercases it", () => {
-    expect(canonicalizeDestination("2001:DB8::1")).toBe("2001:db8::1/128");
-  });
-
-  it("leaves an out-of-range prefix length unparseable, kept verbatim", () => {
-    expect(canonicalizeDestination("10.0.0.0/33")).toBe("10.0.0.0/33");
-  });
-});
-
 describe("diffForkCanvases: routingChangedNodes (E6, issue #34)", () => {
   it("reports no routing change for identical route sets in a different order", () => {
     const before = canvas(
@@ -252,10 +215,21 @@ describe("diffForkCanvases: routingChangedNodes (E6, issue #34)", () => {
     expect(diff.routingChangedNodes[0].removed).toBe(1);
   });
 
-  it("does not report a change when only the destination's canonical form differs", () => {
+  // Review fix F7: a client-side destination canonicalizer briefly lived in
+  // lib/forkDiff.ts to make THIS case report no change; it was removed
+  // because its premise was wrong (the server canonicalizes only into
+  // fork_l3_routes, never back into canvas_data, so both canvases always
+  // hold the user's own raw text and there is no canonicalization-only
+  // difference to hide). Pinning the opposite now: two differently-written
+  // but "same" destinations DO report a change, the same way edgeIdentityKey
+  // diffs raw port names.
+  it("reports a change when the destination text differs, even if it would canonicalize to the same network", () => {
     const before = canvas([l3Node("n1", [route({ destination: "10.0.0.5/24" })])], []);
     const after = canvas([l3Node("n1", [route({ destination: "10.0.0.0/24" })])], []);
-    expect(diffForkCanvases(before, after).routingChangedNodes).toEqual([]);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toHaveLength(1);
+    expect(diff.routingChangedNodes[0].added).toBe(1);
+    expect(diff.routingChangedNodes[0].removed).toBe(1);
   });
 
   it("does not report a node present on only one side (covered by added/removedNodes instead)", () => {

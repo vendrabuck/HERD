@@ -223,6 +223,50 @@ describe("ForkHistoryPanel", () => {
     expect(screen.queryByText(/Removed devices/)).not.toBeInTheDocument();
   });
 
+  // ADR 0014 phase 2 (issue #34) review fix F12: a render test for the
+  // "Routing changed on <device>: +A routes, -B routes" line, which had no
+  // direct coverage (only forkDiff.ts's own unit tests covered the numbers
+  // that feed it).
+  it("renders the routing-changed line with the device's label and the added/removed counts", () => {
+    const diffResult: ForkCanvasDiff = {
+      addedNodes: [],
+      removedNodes: [],
+      addedEdges: [],
+      removedEdges: [],
+      routingChangedNodes: [
+        {
+          node: {
+            id: "n1",
+            type: "deviceNode",
+            position: { x: 0, y: 0 },
+            data: { device: { id: "d1", name: "core-sw-1" }, label: "core-sw-1", topologyType: "PHYSICAL" },
+          },
+          added: 2,
+          removed: 1,
+        },
+      ] as unknown as ForkCanvasDiff["routingChangedNodes"],
+    };
+    const preview = makePreview({
+      mode: "diff",
+      diffBase: V1,
+      diffCompareLabel: "current draft",
+      diffResult,
+    });
+    render(
+      <ForkHistoryPanel
+        versions={[V1]}
+        isActiveReservation={false}
+        draftRestoredFromId={null}
+        preview={preview}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Routing changed (1)")).toBeInTheDocument();
+    expect(
+      screen.getByText("Routing changed on core-sw-1: +2 routes, -1 routes"),
+    ).toBeInTheDocument();
+  });
+
   it("Restore opens a confirm dialog and only calls restoreVersion after confirming", () => {
     const preview = makePreview();
     render(
