@@ -12,8 +12,10 @@ import {
 import type {
   CanvasData,
   CanvasNodeData,
+  DeviceNodeData,
   LayerEdgeData,
   EdgeLayerType,
+  L3RouteIntent,
   NetworkElementNodeData,
 } from "@/types/topology.types";
 import { genId } from "@/lib/id";
@@ -108,6 +110,17 @@ interface TopologyState {
   // from the bundle-level Delete which removes every member.
   removeEdge: (edgeId: string) => void;
   setDynamicPlaceholderCount: (nodeId: string, count: number) => void;
+  // ADR 0014 phase 2 (issue #34): writes or removes a device node's routing
+  // intent immutably, the same shape as setNetworkElementLabel /
+  // setDynamicPlaceholderCount above. `routes: null` removes `data.l3`
+  // entirely rather than storing an empty list (matches the backend's R10
+  // "empty intent is no intent" rule, so a canvas that never had any routes
+  // touched looks identical to one that had its last route removed). A node
+  // change object reference always changes on either branch, which is what
+  // useForkAutosave's canvasSignature diffs against, so this marks the
+  // canvas dirty the same way every other node/edge edit does with no
+  // separate dirty flag needed.
+  setNodeL3Routes: (nodeId: string, routes: L3RouteIntent[] | null) => void;
   setSelectedEdgeLayer: (layer: EdgeLayerType) => void;
   // One write path (issue #517 review round 3 item 12.5): the previous
   // singular updateEdgePathStatus (one store commit per changed edge) was
@@ -207,6 +220,19 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
           ? { ...n, data: { ...n.data, count } }
           : n
       ),
+    })),
+
+  setNodeL3Routes: (nodeId, routes) =>
+    set((state) => ({
+      nodes: state.nodes.map((n) => {
+        if (n.id !== nodeId || n.type !== "deviceNode") return n;
+        const data = n.data as DeviceNodeData;
+        if (routes === null) {
+          const { l3: _l3, ...rest } = data;
+          return { ...n, data: rest };
+        }
+        return { ...n, data: { ...data, l3: { routes } } };
+      }),
     })),
 
   setSelectedEdgeLayer: (layer) => set({ selectedEdgeLayer: layer }),

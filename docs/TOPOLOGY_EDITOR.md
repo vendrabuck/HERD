@@ -133,6 +133,73 @@ To express overlay links between physically isolated sites (for example, an MPLS
 
 You can also see pathfinding output per reservation on the **Routes** tab of the reservation detail modal; that tab batches pathfinding for every DUT-to-DUT pair.
 
+## Layer 3 routing intent (ADR 0014, issue #34)
+
+Selecting exactly one device node whose device is a **Layer 3 Switch** opens a **Routing**
+panel: the device name, a table of its routes (destination, next hop, interface, virtual
+router), an **Add route** button, and a per-row **Remove**. The panel does not appear for a
+proposal (ghost) node, in fork version preview or diff mode, or when more than one node is
+selected. Every edit writes to the node's `data.l3.routes` in the canvas the same way any
+other canvas edit does: it is ordinary node data, so it rides fork commit, autosave, and
+restore preview along with the rest of the node, and is saved with the topology or the fork
+draft exactly like positions and edges are. A next hop or virtual router left blank is
+stored as absent, not as an empty string; removing a switch's last route clears its routing
+intent entirely rather than leaving an empty table behind. Destination and interface are
+required to add a row (the **Add route** button stays disabled until both are filled), but
+neither field is validated as a real address in the browser: the server is the sole
+authority on whether a route is well-formed and usable (see Validation below).
+
+**Import from device config** loads the switch's newest config version and copies its
+`routes` (destination, next hop, interface) into the table, leaving `virtual_router` blank
+on every imported row, since the device config schema has no such grouping. If the table
+already has rows, importing asks for confirmation first and then replaces the table
+outright; it does not merge.
+
+A switch with at least one route shows a small route-count badge on its canvas node (for
+example "2 routes") so routing intent is visible without opening the panel. The badge turns
+red when the most recent validation found a problem on that switch.
+
+**Validation.** The editor does not validate routing intent as you type. It is checked at
+three points, each surfacing the same kind of problem list:
+
+- **Saving a standalone topology** (not a reservation's live-edit fork) that carries any
+  routing intent runs a validation pass right after the save completes. A clean result shows
+  nothing new; a problem shows a toast naming the first three problems as
+  `<device>[<index>] <reason>` (a switch-level problem shows `-` for the index), turns the
+  affected switch's badge red, and adds a reason line under the offending row in the Routing
+  panel (or at the top of the panel for a switch-level problem).
+- **Saving a reservation's live-edit fork** runs the same check as part of the save itself:
+  a routing problem refuses the save outright rather than saving broken intent, with a
+  "Routing intent refused: N problems" toast and the same badge/reason-line treatment. A
+  canvas shape the panel could not have produced (rare, and worth reporting rather than
+  hiding) toasts "Routing intent malformed: ..." instead. If the switch's config could not be
+  read at all (inventory unreachable), the toast reads "Could not verify routing intent:
+  inventory unavailable" and nothing is saved.
+- **Creating a reservation** from a topology with routing intent runs the same check as part
+  of booking; a problem refuses the reservation with a "Reservation refused: routing intent
+  has N problems" toast and the same badge/reason-line treatment, so you can fix the routes
+  (or the switch's config) and try again.
+
+The reasons you may see, in plain words:
+
+| Reason | Meaning |
+|---|---|
+| `l3_malformed` | The routing data on this node is not shaped the way the editor writes it; this should not happen through the Routing panel itself. |
+| `l3_not_a_router` | The device is not a Layer 3 Switch, so it cannot carry routes. |
+| `l3_switch_unconfigured` | The switch has no config version, or its config lists no interfaces; import a config first, or configure the switch, then add routes. |
+| `l3_switch_unattached` | Nothing on the canvas actually wires to this switch, so its routes would serve nothing. |
+| `l3_bad_destination` | The destination is not a valid IP network (e.g. not a parseable address or prefix). |
+| `l3_bad_next_hop` | The next hop is set but is not a valid IP address. |
+| `l3_unknown_interface` | The interface name does not match any interface in the switch's config. |
+| `l3_next_hop_unverifiable` | The next hop is set, but the named interface has no IP address (or no prefix length) to check it against. |
+| `l3_next_hop_outside_interface` | The next hop is set, but it does not fall inside the named interface's own subnet. |
+
+A route's `destination` is canonicalized on the server the way a routing table normally
+is: `10.0.0.5/24` is stored as `10.0.0.0/24`, and a bare address gets an implicit host
+prefix (`/32` for IPv4, `/128` for IPv6). The Routing panel never rewrites what you typed,
+so the table can show your original text even after a save; this is cosmetic only; treat
+the two as the same route.
+
 ## Saving
 
 A topology's name is set once, at creation, on the Topology list page (**New topology**);

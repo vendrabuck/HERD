@@ -5,6 +5,8 @@ import type {
   ForkCanvasDraftResult,
   ForkConflictDetail,
   ForkDeviceNotMemberDetail,
+  ForkL3IntentInvalidDetail,
+  ForkL3IntentMalformedDetail,
   ForkSaveResult,
   ForkVersionDetail,
   ForkVersionRestoreResult,
@@ -15,6 +17,7 @@ import type {
   ReservationCreate,
   ReservationFork,
   ReservationUpdate,
+  TopologyRoutingIntentInvalidDetail,
   WiringRetryResponse,
   WiringStatusResponse,
 } from "@/types/reservation.types";
@@ -535,6 +538,68 @@ export function forkDeviceNotMemberDetail(err: unknown): ForkDeviceNotMemberDeta
     Array.isArray((detail as { device_ids?: unknown }).device_ids)
   ) {
     return detail as ForkDeviceNotMemberDetail;
+  }
+  return null;
+}
+
+// Narrow an axios error's response detail to the structured fork-save L3
+// gate 409 (ADR 0014, issue #34). Returns null for any other shape, so the
+// caller can branch the routing-intent toast/panel-refresh from the plain
+// error toast.
+export function forkL3IntentInvalidDetail(err: unknown): ForkL3IntentInvalidDetail | null {
+  const response = (err as { response?: { status?: number; data?: { detail?: unknown } } })
+    ?.response;
+  if (response?.status !== 409) return null;
+  const detail = response.data?.detail;
+  if (
+    detail &&
+    typeof detail === "object" &&
+    (detail as { error?: unknown }).error === "l3_intent_invalid" &&
+    Array.isArray((detail as { invalid_routes?: unknown }).invalid_routes)
+  ) {
+    return detail as ForkL3IntentInvalidDetail;
+  }
+  return null;
+}
+
+// Narrow an axios error's response detail to the structured fork-save
+// malformed-shape 422 (ADR 0014, issue #34 addendum). This means the canvas
+// carried a `data.l3` shape the server refused outright, which the Routing
+// panel should make impossible to produce, so it is surfaced rather than
+// swallowed.
+export function forkL3IntentMalformedDetail(err: unknown): ForkL3IntentMalformedDetail | null {
+  const response = (err as { response?: { status?: number; data?: { detail?: unknown } } })
+    ?.response;
+  if (response?.status !== 422) return null;
+  const detail = response.data?.detail;
+  if (
+    detail &&
+    typeof detail === "object" &&
+    (detail as { error?: unknown }).error === "l3_intent_malformed"
+  ) {
+    return detail as ForkL3IntentMalformedDetail;
+  }
+  return null;
+}
+
+// Narrow an axios error's response detail to the structured reservation-create
+// routing-intent 422 (ADR 0014 phase 2 addendum, issue #34). Returns null for
+// any other shape, so the caller can fall back to the existing generic detail
+// toast for every other 4xx the create route can return.
+export function topologyRoutingIntentInvalidDetail(
+  err: unknown,
+): TopologyRoutingIntentInvalidDetail | null {
+  const response = (err as { response?: { status?: number; data?: { detail?: unknown } } })
+    ?.response;
+  if (response?.status !== 422) return null;
+  const detail = response.data?.detail;
+  if (
+    detail &&
+    typeof detail === "object" &&
+    (detail as { error?: unknown }).error === "topology_routing_intent_invalid" &&
+    Array.isArray((detail as { invalid_routes?: unknown }).invalid_routes)
+  ) {
+    return detail as TopologyRoutingIntentInvalidDetail;
   }
   return null;
 }

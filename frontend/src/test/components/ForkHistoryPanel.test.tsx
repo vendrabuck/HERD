@@ -199,6 +199,7 @@ describe("ForkHistoryPanel", () => {
         },
       ] as unknown as ForkCanvasDiff["addedEdges"],
       removedEdges: [],
+      routingChangedNodes: [],
     };
     const preview = makePreview({
       mode: "diff",

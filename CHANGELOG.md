@@ -14,6 +14,24 @@
   unreachable-topology error, and the fork's resolved routes ride the internal
   and user-facing fork GET. Inventory gained an internal batch device-type
   lookup (`POST /internal/devices/batch`) to serve the validation pass.
+  Editor and execution-side consumption are phases 2 and 3, not yet built.
+- Shipped phase 2 of first-class Layer 3 routing intent (ADR 0014, issue #34):
+  the topology editor's canvas contract gains `data.l3` on a device node
+  (`L3RouteIntent[]`, persisted through fork commit, autosave, and restore
+  preview like any other node data), a new Routing panel that appears when a
+  single Layer 3 Switch device node is selected (add/edit/remove routes,
+  import the switch's latest device-config routes with a confirm-to-replace
+  when rows already exist), a route-count badge on the canvas node that turns
+  red on a validation problem, and the editor's first call to
+  `POST /topologies/{id}/validate`, fired after a plain topology save when the
+  canvas carries any routing intent. Fork-save (409 `l3_intent_invalid`/422
+  `l3_intent_malformed`/503 `l3_config_unavailable`) and reservation-create
+  (422 `topology_routing_intent_invalid`) refusals render the same per-node
+  badge and per-row reasons. The fork version diff reports a route-set change
+  on an otherwise-unchanged device node ("Routing changed on <device>: +A
+  routes, -B routes"), comparing destinations in the server's canonical form
+  so a canonicalization-only difference is never reported as a change nobody
+  made. Execution-side consumption is phase 3, not yet built.
   Editor consumption (phase 2) is not yet built; execution-side consumption
   (phase 3) shipped below.
 - Shipped phase 3 of first-class Layer 3 routing intent (ADR 0014, issue #34):

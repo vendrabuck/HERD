@@ -8,8 +8,9 @@ const TOPOLOGY_COLORS: Record<string, string> = {
 };
 
 export function DeviceNode({ data, selected }: NodeProps<DeviceNodeType>) {
-  const { device, isProposal } = data;
+  const { device, isProposal, l3, l3ValidationInvalid } = data;
   const colorClass = TOPOLOGY_COLORS[device.topology_type] ?? "bg-gray-100 border-gray-400";
+  const routeCount = l3?.routes.length ?? 0;
 
   return (
     <div
@@ -23,6 +24,21 @@ export function DeviceNode({ data, selected }: NodeProps<DeviceNodeType>) {
       {isProposal && (
         <span className="absolute -top-2 -right-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-purple-600 text-white shadow">
           PROPOSED
+        </span>
+      )}
+      {routeCount > 0 && (
+        // ADR 0014 Decision 4 (issue #34): a route-count badge so routing
+        // intent is visible on the canvas without opening the Routing panel.
+        // Red variant (same semantic as every other status badge in this
+        // codebase: pale bg + saturated text for ok, saturated fill for an
+        // active problem) when the last validation run reported any
+        // invalid_routes for this node.
+        <span
+          className={`absolute -top-2 -left-2 text-[10px] font-bold px-1.5 py-0.5 rounded shadow ${
+            l3ValidationInvalid ? "bg-red-600 text-white" : "bg-slate-600 text-white"
+          }`}
+        >
+          {routeCount} route{routeCount === 1 ? "" : "s"}
         </span>
       )}
       <Handle type="source" id="top" position={Position.Top} className="!bg-gray-500" />

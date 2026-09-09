@@ -36,3 +36,17 @@ export function collectCanvasDeviceIds(nodes: Node<CanvasNodeData>[]): Set<strin
       .map((n) => (n.data as DeviceNodeData).device.id)
   );
 }
+
+// ADR 0014 phase 2 (issue #34), E5: true when any device node on the canvas
+// carries a non-empty `data.l3.routes`. Decides whether a plain topology
+// save's proactive `validateTopology` call (and the inventory round trips it
+// makes server-side) is worth running at all, mirroring cabling's own
+// `l3_intent.canvas_has_l3` gate. An empty `{routes: []}` (which the store's
+// setNodeL3Routes never actually produces, but a canvas loaded from an
+// external source in principle could) does not count, matching the
+// backend's R10 "empty intent is no intent" rule.
+export function canvasHasL3Intent(nodes: Node<CanvasNodeData>[]): boolean {
+  return nodes.some(
+    (n) => isDeviceNode(n) && ((n.data as DeviceNodeData).l3?.routes.length ?? 0) > 0,
+  );
+}

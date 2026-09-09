@@ -1,5 +1,5 @@
 import type { TopologyType } from "./device.types";
-import type { CanvasData } from "./topology.types";
+import type { CanvasData, InvalidRoute } from "./topology.types";
 
 export type ReservationStatus =
   | "PENDING"
@@ -277,6 +277,35 @@ export interface ForkConflictDetail {
 export interface ForkDeviceNotMemberDetail {
   error: "fork_device_not_member";
   device_ids: string[];
+}
+
+// ADR 0014 phase 1/2 (issue #34): the structured fork-save 409 a save's L3
+// gate refuses with (services/cabling/app/services/fork_save_service.py
+// `gate_l3_intent`), relayed verbatim through reservations.
+export interface ForkL3IntentInvalidDetail {
+  error: "l3_intent_invalid";
+  invalid_routes: InvalidRoute[];
+}
+
+// The structured fork-save 422 a malformed `data.l3` shape refuses with
+// (services/cabling/app/routes/forks.py `save_fork_internal`), relayed
+// verbatim through reservations. Distinct from ForkL3IntentInvalidDetail:
+// this means the canvas carried a shape the server refused outright (which
+// the Routing panel should make impossible to produce), not a validation
+// judgment against otherwise well-formed routes.
+export interface ForkL3IntentMalformedDetail {
+  error: "l3_intent_malformed";
+  node_id: string;
+  message: string;
+}
+
+// ADR 0014 phase 2 addendum (issue #34): the structured 422 a reservation
+// create returns when the fork gate refuses routing intent
+// (services/reservations/app/routers/reservations.py, `TopologyRoutingIntentInvalid`).
+export interface TopologyRoutingIntentInvalidDetail {
+  error: "topology_routing_intent_invalid";
+  invalid_routes: InvalidRoute[];
+  message: string;
 }
 
 // --- Layered per-connection wiring status (ADR 0007 / ADR 0009) -------------

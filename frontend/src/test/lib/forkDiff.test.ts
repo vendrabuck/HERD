@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { buildForkDiffOverlayCanvas, diffForkCanvases, edgeIdentityKey } from "@/lib/forkDiff";
-import type { CanvasData } from "@/types/topology.types";
+import {
+  buildForkDiffOverlayCanvas,
+  canonicalizeDestination,
+  diffForkCanvases,
+  edgeIdentityKey,
+} from "@/lib/forkDiff";
+import type { CanvasData, L3RouteIntent } from "@/types/topology.types";
 
 function node(id: string, label = id): CanvasData["nodes"][number] {
   return {
@@ -10,6 +15,30 @@ function node(id: string, label = id): CanvasData["nodes"][number] {
     position: { x: 0, y: 0 },
     data: { device: { id: `dev-${id}`, name: label }, label, topologyType: "PHYSICAL" },
   } as unknown as CanvasData["nodes"][number];
+}
+
+function l3Node(id: string, routes: L3RouteIntent[], label = id): CanvasData["nodes"][number] {
+  return {
+    id,
+    type: "deviceNode",
+    position: { x: 0, y: 0 },
+    data: {
+      device: { id: `dev-${id}`, name: label },
+      label,
+      topologyType: "PHYSICAL",
+      l3: { routes },
+    },
+  } as unknown as CanvasData["nodes"][number];
+}
+
+function route(overrides: Partial<L3RouteIntent> = {}): L3RouteIntent {
+  return {
+    destination: "10.0.0.0/24",
+    next_hop: null,
+    interface: "eth0",
+    virtual_router: null,
+    ...overrides,
+  };
 }
 
 function edge(
@@ -165,5 +194,84 @@ describe("buildForkDiffOverlayCanvas", () => {
     const diff = diffForkCanvases(before, compare);
     const overlay = buildForkDiffOverlayCanvas(compare, diff);
     expect(overlay.edges.find((e) => e.id === "diff-removed-e1")).toBeUndefined();
+  });
+});
+
+// ADR 0014 phase 2 peer-review addition (issue #34): canonicalizeDestination
+// must mirror cabling's `str(ipaddress.ip_network(value, strict=False))`.
+// The first two cases reuse the exact input/output pairs pinned server-side
+// in services/cabling/tests/test_l3_intent.py
+// (test_destination_canonicalized_when_parseable,
+// test_destination_kept_verbatim_when_not_parseable).
+describe("canonicalizeDestination", () => {
+  it("masks host bits off a host-form IPv4 CIDR (server test case)", () => {
+    expect(canonicalizeDestination("10.0.0.5/24")).toBe("10.0.0.0/24");
+  });
+
+  it("keeps an unparseable string verbatim (server test case)", () => {
+    expect(canonicalizeDestination("not-an-ip")).toBe("not-an-ip");
+  });
+
+  it("gives a bare IPv4 address an implicit /32", () => {
+    expect(canonicalizeDestination("10.0.0.5")).toBe("10.0.0.5/32");
+  });
+
+  it("masks host bits off a host-form IPv6 CIDR and lowercases/compresses it", () => {
+    expect(canonicalizeDestination("2001:DB8::1/64")).toBe("2001:db8::/64");
+  });
+
+  it("gives a bare IPv6 address an implicit /128 and lowercases it", () => {
+    expect(canonicalizeDestination("2001:DB8::1")).toBe("2001:db8::1/128");
+  });
+
+  it("leaves an out-of-range prefix length unparseable, kept verbatim", () => {
+    expect(canonicalizeDestination("10.0.0.0/33")).toBe("10.0.0.0/33");
+  });
+});
+
+describe("diffForkCanvases: routingChangedNodes (E6, issue #34)", () => {
+  it("reports no routing change for identical route sets in a different order", () => {
+    const before = canvas(
+      [l3Node("n1", [route({ destination: "10.0.0.0/24" }), route({ interface: "eth1" })])],
+      [],
+    );
+    const after = canvas(
+      [l3Node("n1", [route({ interface: "eth1" }), route({ destination: "10.0.0.0/24" })])],
+      [],
+    );
+    expect(diffForkCanvases(before, after).routingChangedNodes).toEqual([]);
+  });
+
+  it("reports an added and a removed route on the same node", () => {
+    const before = canvas([l3Node("n1", [route({ interface: "eth0" })])], []);
+    const after = canvas([l3Node("n1", [route({ interface: "eth1" })])], []);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toHaveLength(1);
+    expect(diff.routingChangedNodes[0].node.id).toBe("n1");
+    expect(diff.routingChangedNodes[0].added).toBe(1);
+    expect(diff.routingChangedNodes[0].removed).toBe(1);
+  });
+
+  it("does not report a change when only the destination's canonical form differs", () => {
+    const before = canvas([l3Node("n1", [route({ destination: "10.0.0.5/24" })])], []);
+    const after = canvas([l3Node("n1", [route({ destination: "10.0.0.0/24" })])], []);
+    expect(diffForkCanvases(before, after).routingChangedNodes).toEqual([]);
+  });
+
+  it("does not report a node present on only one side (covered by added/removedNodes instead)", () => {
+    const before = canvas([node("n1")], []);
+    const after = canvas([node("n1"), l3Node("n2", [route()])], []);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toEqual([]);
+    expect(diff.addedNodes.map((n) => n.id)).toEqual(["n2"]);
+  });
+
+  it("distinguishes routes that differ only by virtual_router", () => {
+    const before = canvas([l3Node("n1", [route({ virtual_router: "vr1" })])], []);
+    const after = canvas([l3Node("n1", [route({ virtual_router: "vr2" })])], []);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toHaveLength(1);
+    expect(diff.routingChangedNodes[0].added).toBe(1);
+    expect(diff.routingChangedNodes[0].removed).toBe(1);
   });
 });

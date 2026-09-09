@@ -3,11 +3,38 @@ import type { Device, TopologyType } from "./device.types";
 
 export type EdgeLayerType = "L1" | "L2" | "L3";
 
+// One routing-intent entry on a Layer 3 Switch device node (ADR 0014 Decision
+// 1, issue #34). Mirrors the cabling `RouteSpec` canvas shape exactly: no
+// extra keys, since the backend parser refuses anything outside
+// {destination, next_hop, interface, virtual_router}. A blank next hop or
+// virtual router is stored as null, never an empty string (matches the
+// server's own `_require_string` normalization).
+export interface L3RouteIntent {
+  destination: string;
+  next_hop: string | null;
+  interface: string;
+  virtual_router: string | null;
+}
+
 export interface DeviceNodeData extends Record<string, unknown> {
   device: Device;
   label: string;
   topologyType: TopologyType;
   isProposal?: boolean;
+  // Layer 3 routing intent (ADR 0014, issue #34 phase 2): present only on a
+  // node whose device is a "Layer 3 Switch" and only once at least one route
+  // has been added. Absent, not an empty `{routes: []}`, once the last route
+  // is removed (matches the backend's R10 "empty intent is no intent" rule).
+  // Persists through `persistableCanvas` untouched: it is ordinary node data,
+  // and `stripTransientEdgeFields` only ever touches edges.
+  l3?: { routes: L3RouteIntent[] };
+  // Render-only, never persisted (issue #34 E4/E5): true when the last
+  // validation run reported an `invalid_routes` entry for this node. Set by
+  // TopologyEditorPage on a derived render view of `nodes` it builds just
+  // before handing them to ReactFlow, never on the topology store's own
+  // `nodes` state, so it can never leak into `persistableCanvas` (the same
+  // transient-field precedent as LayerEdgeData's `diffStatus`).
+  l3ValidationInvalid?: boolean;
 }
 
 // A canvas-local planning artifact for a dynamic (hypervisor-backed) template:
@@ -133,4 +160,30 @@ export interface TopologyDiff {
 export interface RestoreRequest {
   description?: string;
   restore_name?: boolean;
+}
+
+// One Layer 3 routing-intent problem `POST /topologies/{id}/validate` found
+// (ADR 0014 phase 1, issue #34). Mirrors cabling's `InvalidRoute` schema
+// exactly. `index` is null for a switch-level refusal (l3_malformed,
+// l3_not_a_router, l3_switch_unconfigured, l3_switch_unattached); `detail`
+// carries the parser's message only for `l3_malformed`. The full reason
+// vocabulary is documented in docs/TOPOLOGY_EDITOR.md and
+// services/cabling/app/services/topology_validation.py.
+export interface InvalidRoute {
+  node_id: string;
+  device_id: string | null;
+  index: number | null;
+  reason: string;
+  detail: string | null;
+}
+
+// POST /topologies/{id}/validate response (additive `invalid_routes` on top
+// of the pre-existing edge validation, ADR 0014 phase 1). The editor only
+// ever reads `invalid_routes`; `invalid_edges`/`device_ids` are already
+// covered by the client-side pathfind checks this call does not replace.
+export interface TopologyValidationResponse {
+  valid: boolean;
+  invalid_edges: Array<Record<string, unknown>>;
+  device_ids: string[];
+  invalid_routes: InvalidRoute[];
 }

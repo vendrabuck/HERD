@@ -636,6 +636,95 @@ describe("TopologyEditorPage handleCommitToReservation error branches", () => {
     );
   });
 
+  // ADR 0014 phase 2 (issue #34): a fork save's L3 gate 409 renders a toast
+  // naming the problem count and feeds invalid_routes into the same page
+  // state the Routing panel's red badge and per-row reasons read (E4/E5).
+  it("an l3_intent_invalid 409 toasts the problem count", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "l3_intent_invalid",
+              invalid_routes: [
+                { node_id: "fork-node", device_id: "d-fork", index: 0, reason: "l3_bad_destination", detail: null },
+                { node_id: "fork-node", device_id: "d-fork", index: 1, reason: "l3_unknown_interface", detail: null },
+              ],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Routing intent refused: 2 problems"),
+    );
+  });
+
+  // ADR 0014 phase 2 addendum (issue #34): a malformed data.l3 shape 422s
+  // rather than being silently dropped, since the Routing panel should make
+  // this shape impossible to produce in the first place.
+  it("an l3_intent_malformed 422 toasts the parser's message", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "l3_intent_malformed",
+              node_id: "fork-node",
+              message: "'l3' must be an object with exactly one key: 'routes'",
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Routing intent malformed: 'l3' must be an object with exactly one key: 'routes'",
+      ),
+    );
+  });
+
+  // ADR 0014 Decision 5 (issue #34): the L3 pass fails closed on an
+  // inventory outage rather than passing unverified.
+  it("an l3_config_unavailable 503 toasts that inventory could not be reached", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json({ detail: { error: "l3_config_unavailable" } }, { status: 503 }),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Could not verify routing intent: inventory unavailable",
+      ),
+    );
+  });
+
   it("a transport failure with no detail falls back to the default save-failed message", async () => {
     server.use(
       ...baseHandlers(makeFork()),

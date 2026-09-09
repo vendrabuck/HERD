@@ -244,10 +244,22 @@ export function ForkHistoryPanel({
                 items={preview.diffResult.removedEdges.map(edgeLabel)}
                 color="text-red-700"
               />
+              {/* ADR 0014 phase 2 (issue #34), E6: a device node present on
+                  both sides whose L3 routing intent's route SET differs
+                  (order-insensitive) is reported here rather than as a
+                  node modification; the edge diff keys above are untouched. */}
+              <DiffList
+                title="Routing changed"
+                items={preview.diffResult.routingChangedNodes.map(
+                  (r) => `Routing changed on ${nodeLabel(r.node)}: +${r.added} routes, -${r.removed} routes`,
+                )}
+                color="text-yellow-700"
+              />
               {preview.diffResult.addedNodes.length === 0 &&
                 preview.diffResult.removedNodes.length === 0 &&
                 preview.diffResult.addedEdges.length === 0 &&
-                preview.diffResult.removedEdges.length === 0 && (
+                preview.diffResult.removedEdges.length === 0 &&
+                preview.diffResult.routingChangedNodes.length === 0 && (
                   <p className="text-gray-500">No differences.</p>
                 )}
             </div>

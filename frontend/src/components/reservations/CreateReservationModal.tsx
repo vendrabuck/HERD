@@ -1,12 +1,17 @@
 import { useEffect, useState } from "react";
 import toast from "react-hot-toast";
-import { useCreateReservation, usePurposeCategories } from "@/api/reservations";
+import {
+  useCreateReservation,
+  usePurposeCategories,
+  topologyRoutingIntentInvalidDetail,
+} from "@/api/reservations";
 import { useTemplates } from "@/api/templates";
 import { useAIStatus } from "@/api/ai";
 import { usePurposeSuggestion } from "@/hooks/usePurposeSuggestion";
 import { Modal } from "@/components/ui/Modal";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import type { DynamicRequestSpec } from "@/types/reservation.types";
+import type { InvalidRoute } from "@/types/topology.types";
 
 // Mirrors the backend cap: ReservationCreate.dynamic_requests has max_length=50.
 const MAX_DYNAMIC_REQUESTS = 50;
@@ -30,6 +35,14 @@ interface CreateReservationModalProps {
   // placeholders). Applied once at mount: callers that keep the modal mounted
   // while toggling `open` must remount it to re-prefill.
   initialDynamicEntries?: DynamicEntry[];
+  // ADR 0014 phase 2 addendum (issue #34): called when the create route
+  // refuses with the structured 422 `topology_routing_intent_invalid` body,
+  // so the caller (TopologyEditorPage) can feed the same `invalid_routes`
+  // into the page state that drives the per-node red badge (E4) and the
+  // Routing panel's per-row reasons (E5). Optional: a caller with no
+  // topology canvas in scope (e.g. a reservation created from elsewhere)
+  // simply never sees this refusal shape.
+  onRoutingIntentInvalid?: (invalidRoutes: InvalidRoute[]) => void;
   onClose: () => void;
 }
 
@@ -38,6 +51,7 @@ export function CreateReservationModal({
   deviceIds,
   topologyId,
   initialDynamicEntries,
+  onRoutingIntentInvalid,
   onClose,
 }: CreateReservationModalProps) {
   const create = useCreateReservation();
@@ -154,6 +168,18 @@ export function CreateReservationModal({
       toast.success("Reservation created");
       onClose();
     } catch (err: unknown) {
+      // ADR 0014 phase 2 addendum (issue #34): match on the structured
+      // `error` field, never the message text. A routed topology's create
+      // refusal feeds the same invalid_routes into the caller's page state
+      // (E4's red badge, E5's per-row reasons) instead of the generic detail
+      // toast every other create failure gets.
+      const routingIntentInvalid = topologyRoutingIntentInvalidDetail(err);
+      if (routingIntentInvalid) {
+        onRoutingIntentInvalid?.(routingIntentInvalid.invalid_routes);
+        const count = routingIntentInvalid.invalid_routes.length;
+        toast.error(`Reservation refused: routing intent has ${count} problem${count === 1 ? "" : "s"}`);
+        return;
+      }
       const msg =
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
         "Failed to create reservation";

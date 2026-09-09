@@ -17,7 +17,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import toast from "react-hot-toast";
 
-import { useTopology, useUpdateTopology, useRestoreVersion } from "@/api/topologies";
+import { useTopology, useUpdateTopology, useRestoreVersion, validateTopology } from "@/api/topologies";
 import {
   useReservations,
   useUpdateReservation,
@@ -25,6 +25,8 @@ import {
   useSaveReservationFork,
   forkConflictDetail,
   forkDeviceNotMemberDetail,
+  forkL3IntentInvalidDetail,
+  forkL3IntentMalformedDetail,
 } from "@/api/reservations";
 import { errorDetail } from "@/lib/errors";
 import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
@@ -36,7 +38,9 @@ import {
   isNetworkElement,
   isDeviceNode,
   collectCanvasDeviceIds,
+  canvasHasL3Intent,
 } from "@/lib/canvasNodes";
+import { routeProblemLabel, selectRoutingPanelNode } from "@/lib/l3";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
@@ -61,6 +65,7 @@ import { ForkVersionPreviewBar } from "@/components/topology-editor/ForkVersionP
 import { HistoryPanel } from "@/components/topology-editor/HistoryPanel";
 import { VersionDiffDialog } from "@/components/topology-editor/VersionDiffDialog";
 import { RestoreConfirmDialog } from "@/components/topology-editor/RestoreConfirmDialog";
+import { RoutingPanel } from "@/components/topology-editor/RoutingPanel";
 import { Modal } from "@/components/ui/Modal";
 import { useCreateTemplateFromTopology } from "@/api/topologyTemplates";
 import apiClient from "@/api/client";
@@ -81,6 +86,7 @@ import type {
   DeviceNodeData,
   DynamicPlaceholderNodeData,
   EdgeLayerType,
+  InvalidRoute,
   LayerEdgeData,
   NetworkElementNodeData,
   NetworkElementType,
@@ -174,6 +180,17 @@ function TopologyEditorInner() {
   const [isCommitting, setIsCommitting] = useState(false);
   const [forkLoaded, setForkLoaded] = useState(false);
   const [saveConflict, setSaveConflict] = useState<ForkConflictDetail | null>(null);
+
+  // ADR 0014 phase 2 (issue #34), E5: the last L3 routing-intent validation
+  // result, from whichever of three sources ran most recently: a plain
+  // topology save's proactive `validateTopology` call, a fork save's 409
+  // `l3_intent_invalid` refusal, or a reservation create's 422
+  // `topology_routing_intent_invalid` refusal. All three carry the same
+  // cabling `InvalidRoute` shape (node_id, device_id, index, reason,
+  // detail), so one flat list feeds both the per-node red badge (E4) and the
+  // Routing panel's per-row reason lines. Cleared on canvas load / commit
+  // success so a stale result never survives onto an unrelated canvas.
+  const [invalidRoutes, setInvalidRoutes] = useState<InvalidRoute[]>([]);
 
   // An ARCHIVED fork is the frozen as-built record of an ended reservation: the
   // canvas renders read-only. This is the authoritative signal (the fork is
@@ -397,6 +414,41 @@ function TopologyEditorInner() {
     [edges],
   );
   const hasInvalidEdges = invalidEdges.length > 0;
+
+  // ADR 0014 phase 2 (issue #34), E3: the Routing panel's gating rule (see
+  // selectRoutingPanelNode's own doc comment). isReadOnly already covers both
+  // an archived fork's as-built record and a fork-history preview/diff
+  // overlay (the same flag every other edit affordance gates on, e.g.
+  // nodesDraggable), so the panel disappears there for free.
+  const selectedL3Node = useMemo(
+    () => selectRoutingPanelNode(nodes, isReadOnly),
+    [nodes, isReadOnly],
+  );
+
+  // This node's slice of the last validation result (E5), by node_id (the
+  // same identity cabling's InvalidRoute rows use).
+  const invalidRoutesForSelectedNode = useMemo(
+    () => (selectedL3Node ? invalidRoutes.filter((r) => r.node_id === selectedL3Node.id) : []),
+    [invalidRoutes, selectedL3Node],
+  );
+
+  // Render-only overlay (E4): marks each device node the last validation
+  // reported an invalid_routes entry for, so DeviceNode can paint its badge
+  // red. Built the same way renderEdges is (a derived view over the store's
+  // own `nodes`, never a store mutation), so this can never leak into
+  // persistableCanvas the way a store-held field would.
+  const invalidRouteNodeIds = useMemo(
+    () => new Set(invalidRoutes.map((r) => r.node_id)),
+    [invalidRoutes],
+  );
+  const renderNodes = useMemo(() => {
+    if (invalidRouteNodeIds.size === 0) return nodes;
+    return nodes.map((n) =>
+      isDeviceNode(n) && invalidRouteNodeIds.has(n.id)
+        ? { ...n, data: { ...n.data, l3ValidationInvalid: true } }
+        : n,
+    );
+  }, [nodes, invalidRouteNodeIds]);
 
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showReserveModal, setShowReserveModal] = useState(false);
@@ -978,6 +1030,45 @@ function TopologyEditorInner() {
     } else {
       toast.success("Topology saved");
     }
+
+    // ADR 0014 phase 2 (issue #34), E5: a plain topology save never gates on
+    // routing intent (only a fork save/create does), so this is the only
+    // place a standalone topology's `data.l3` problems ever surface. Fires
+    // only when the canvas actually carries intent (canvas_has_l3 on the
+    // backend, mirrored client-side here) so a topology with none never pays
+    // for the extra request or the inventory round trips it makes server-side.
+    // Never awaited into the save's own try/catch above: a validate failure
+    // must not make the save itself look like it failed.
+    if (canvasHasL3Intent(persistableCanvas.nodes)) {
+      try {
+        const result = await validateTopology(id);
+        setInvalidRoutes(result.invalid_routes);
+        if (result.invalid_routes.length > 0) {
+          const names = result.invalid_routes.slice(0, 3).map((r) => routeProblemLabel(r, nodes));
+          toast.error(
+            `Routing intent has ${result.invalid_routes.length} problem${result.invalid_routes.length === 1 ? "" : "s"}: ${names.join(", ")}`,
+          );
+        }
+      } catch (err) {
+        // Best-effort: a failed validate call must not make a successful
+        // save look like it failed. The stale invalidRoutes (if any) is left
+        // as-is rather than cleared, since we do not know whether the
+        // problems it named still apply. The one case worth naming (ADR
+        // 0014 Decision 5): the inventory-outage 503 the L3 pass fails
+        // closed with.
+        const detail = (err as { response?: { status?: number; data?: { detail?: unknown } } })
+          ?.response;
+        const isL3Unavailable =
+          detail?.status === 503 &&
+          typeof detail.data?.detail === "object" &&
+          (detail.data?.detail as { error?: unknown })?.error === "l3_config_unavailable";
+        if (isL3Unavailable) {
+          toast.error("Could not verify routing intent: inventory unavailable");
+        }
+      }
+    } else {
+      setInvalidRoutes([]);
+    }
   };
 
   // Live-edit commit (ADR 0006 Decision 6): re-point the reservation's device
@@ -1035,16 +1126,40 @@ function TopologyEditorInner() {
         // dialog and keeps the drawing so the user can rework it. A
         // fork_device_not_member 409 (a device the PATCH above could not add,
         // or a race with a concurrent removal) names the offending devices.
+        // ADR 0014 (issue #34): an l3_intent_invalid 409 renders the same
+        // per-row reasons the Routing panel already knows how to show (E4/E5
+        // page state); an l3_intent_malformed 422 means the canvas carried a
+        // shape the server refused outright (the panel should make this
+        // impossible to produce, so it is surfaced rather than swallowed); an
+        // l3_config_unavailable 503 means the gate itself could not run.
         // Any other error (a plain 409 for a non-ACTIVE or ARCHIVED fork, a
         // transport failure) toasts generically.
         const conflict = forkConflictDetail(err);
         const notMember = forkDeviceNotMemberDetail(err);
+        const l3Invalid = forkL3IntentInvalidDetail(err);
+        const l3Malformed = forkL3IntentMalformedDetail(err);
+        const status = (err as { response?: { status?: number } })?.response?.status;
+        const l3Detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
+          ?.detail;
+        const l3Unavailable =
+          status === 503 &&
+          !!l3Detail &&
+          typeof l3Detail === "object" &&
+          (l3Detail as { error?: unknown }).error === "l3_config_unavailable";
         if (conflict) {
           setSaveConflict(conflict);
         } else if (notMember) {
           toast.error(
             `These devices are not part of the reservation: ${notMember.device_ids.join(", ")}`,
           );
+        } else if (l3Invalid) {
+          setInvalidRoutes(l3Invalid.invalid_routes);
+          const count = l3Invalid.invalid_routes.length;
+          toast.error(`Routing intent refused: ${count} problem${count === 1 ? "" : "s"}`);
+        } else if (l3Malformed) {
+          toast.error(`Routing intent malformed: ${l3Malformed.message}`);
+        } else if (l3Unavailable) {
+          toast.error("Could not verify routing intent: inventory unavailable");
         } else {
           const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
             ?.detail;
@@ -1060,6 +1175,10 @@ function TopologyEditorInner() {
 
       // The reconcile captured this canvas, so cancel any pending draft flush.
       autosave.markClean();
+      // A successful save means any prior routing-intent refusal no longer
+      // applies to what is now on the fork (issue #34): clear rather than
+      // leave a stale red badge/reason line from before this commit.
+      setInvalidRoutes([]);
       toast.custom((t) => (
         <ForkSaveResultToast result={result} onDismiss={() => toast.dismiss(t.id)} />
       ));
@@ -1345,6 +1464,12 @@ function TopologyEditorInner() {
             <EquipmentBrowser canvasDeviceIds={allDeviceIds} />
           </FloatingPanel>
 
+          {selectedL3Node && (
+            <FloatingPanel title="Routing" defaultPosition={{ x: 16, y: 320 }}>
+              <RoutingPanel node={selectedL3Node} invalidRoutes={invalidRoutesForSelectedNode} />
+            </FloatingPanel>
+          )}
+
           {pendingProposal && (
             <AIProposalBar
               purpose={pendingProposal.purpose}
@@ -1385,7 +1510,7 @@ function TopologyEditorInner() {
           <ReactFlow
             onDrop={onDrop}
             onDragOver={onDragOver}
-            nodes={nodes}
+            nodes={renderNodes}
             edges={renderEdges}
             onNodesChange={onNodesChange}
             onEdgesChange={handleEdgesChange}
@@ -1433,6 +1558,7 @@ function TopologyEditorInner() {
             deviceIds={allDeviceIds}
             topologyId={id}
             initialDynamicEntries={dynamicPrefill}
+            onRoutingIntentInvalid={setInvalidRoutes}
             onClose={() => setShowReserveModal(false)}
           />
         )}

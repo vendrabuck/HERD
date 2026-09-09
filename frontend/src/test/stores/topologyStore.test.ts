@@ -2,6 +2,7 @@ import { useTopologyStore } from "@/stores/topologyStore";
 import type { Node, Edge } from "@xyflow/react";
 import type {
   DeviceNodeData,
+  L3RouteIntent,
   LayerEdgeData,
   CanvasData,
   NetworkElementNodeData,
@@ -417,6 +418,59 @@ describe("topologyStore", () => {
       useTopologyStore.getState().setNetworkElementLabel("dev", "Should not apply");
       const after = useTopologyStore.getState().nodes;
       expect((after[0].data as DeviceNodeData).label).toBe(before[0].data.label);
+    });
+  });
+
+  // ADR 0014 phase 2 (issue #34), E2.
+  describe("setNodeL3Routes", () => {
+    const route = (overrides: Partial<L3RouteIntent> = {}): L3RouteIntent => ({
+      destination: "10.0.0.0/24",
+      next_hop: null,
+      interface: "eth0",
+      virtual_router: null,
+      ...overrides,
+    });
+
+    it("writes data.l3 on the targeted device node only", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("a"));
+      useTopologyStore.getState().addDeviceNode(makeNode("b"));
+      useTopologyStore.getState().setNodeL3Routes("a", [route()]);
+      const nodes = useTopologyStore.getState().nodes;
+      expect((nodes.find((n) => n.id === "a")?.data as DeviceNodeData).l3).toEqual({
+        routes: [route()],
+      });
+      expect((nodes.find((n) => n.id === "b")?.data as DeviceNodeData).l3).toBeUndefined();
+    });
+
+    it("removes data.l3 entirely when passed null, rather than storing an empty list", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("a"));
+      useTopologyStore.getState().setNodeL3Routes("a", [route()]);
+      useTopologyStore.getState().setNodeL3Routes("a", null);
+      const data = useTopologyStore.getState().nodes[0].data as DeviceNodeData;
+      expect(data.l3).toBeUndefined();
+      expect("l3" in data).toBe(false);
+    });
+
+    it("overwrites a previous routes array rather than merging", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("a"));
+      useTopologyStore.getState().setNodeL3Routes("a", [route({ interface: "eth0" })]);
+      useTopologyStore.getState().setNodeL3Routes("a", [route({ interface: "eth1" })]);
+      const data = useTopologyStore.getState().nodes[0].data as DeviceNodeData;
+      expect(data.l3?.routes).toEqual([route({ interface: "eth1" })]);
+    });
+
+    it("is a no-op for a non-device (network element) node id", () => {
+      useTopologyStore.getState().addDeviceNode(makeElementNode("e1"));
+      useTopologyStore.getState().setNodeL3Routes("e1", [route()]);
+      const data = useTopologyStore.getState().nodes[0].data as NetworkElementNodeData;
+      expect((data as unknown as DeviceNodeData).l3).toBeUndefined();
+    });
+
+    it("is a no-op for an id not on the canvas", () => {
+      useTopologyStore.getState().addDeviceNode(makeNode("a"));
+      const before = useTopologyStore.getState().nodes;
+      useTopologyStore.getState().setNodeL3Routes("missing", [route()]);
+      expect(useTopologyStore.getState().nodes).toEqual(before);
     });
   });
 });

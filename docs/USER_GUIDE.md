@@ -163,6 +163,7 @@ See [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md) for the full walkthrough. In short:
 - Each connection is checked against the physical cabling graph. Edges that have a real route between the two devices turn green; edges that do not (for example, devices in separate isolated labs) turn red and block reservation. The check applies regardless of layer; see [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#edge-visual-indicators) for details.
 - Save a canvas as a named topology; it can later feed into a reservation.
 - Every save is versioned. Open the **History** sidebar to preview, compare, or restore an older version; restore is blocked while a reservation still references the topology.
+- Selecting a Layer 3 Switch device opens a **Routing** panel where you can add, edit, or import routing intent (destination, next hop, interface, virtual router) for that switch; a route-count badge shows on its canvas node, turning red if a save or reservation finds a problem with it. See [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#layer-3-routing-intent-adr-0014-issue-34) for the full reason list and when it is checked.
 
 ## AI topology generation (optional feature)
 
