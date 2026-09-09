@@ -12,11 +12,14 @@ import {
 import type {
   CanvasData,
   CanvasNodeData,
+  DeviceNodeData,
   LayerEdgeData,
   EdgeLayerType,
+  L3RouteIntent,
   NetworkElementNodeData,
 } from "@/types/topology.types";
 import { genId } from "@/lib/id";
+import { isDeviceNode } from "@/lib/canvasNodes";
 
 // Shared by addEnrichedEdge and addEnrichedEdges (issue #517 review round 3
 // item 9): every enriched edge, whether created one at a time or in a batch,
@@ -108,6 +111,19 @@ interface TopologyState {
   // from the bundle-level Delete which removes every member.
   removeEdge: (edgeId: string) => void;
   setDynamicPlaceholderCount: (nodeId: string, count: number) => void;
+  // ADR 0014 phase 2 (issue #34): writes or removes a device node's routing
+  // intent immutably, the same shape as setNetworkElementLabel /
+  // setDynamicPlaceholderCount above. An empty `routes` array itself removes
+  // `data.l3` entirely rather than storing `{routes: []}` (review fix F11:
+  // the store, not its callers, owns this rule; matches the backend's R10
+  // "empty intent is no intent" rule, so a canvas that never had any routes
+  // touched looks identical to one that had its last route removed). A node
+  // change on either branch always produces a new `data` object, which is
+  // what useForkAutosave's `canvasSignature` (a JSON content signature built
+  // over each node's `data`, not a reference/identity comparison) picks up,
+  // so this marks the canvas dirty the same way every other node/edge edit
+  // does with no separate dirty flag needed.
+  setNodeL3Routes: (nodeId: string, routes: L3RouteIntent[]) => void;
   setSelectedEdgeLayer: (layer: EdgeLayerType) => void;
   // One write path (issue #517 review round 3 item 12.5): the previous
   // singular updateEdgePathStatus (one store commit per changed edge) was
@@ -207,6 +223,19 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
           ? { ...n, data: { ...n.data, count } }
           : n
       ),
+    })),
+
+  setNodeL3Routes: (nodeId, routes) =>
+    set((state) => ({
+      nodes: state.nodes.map((n) => {
+        if (n.id !== nodeId || !isDeviceNode(n)) return n;
+        const data = n.data as DeviceNodeData;
+        if (routes.length === 0) {
+          const { l3: _l3, ...rest } = data;
+          return { ...n, data: rest };
+        }
+        return { ...n, data: { ...data, l3: { routes } } };
+      }),
     })),
 
   setSelectedEdgeLayer: (layer) => set({ selectedEdgeLayer: layer }),

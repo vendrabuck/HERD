@@ -17,15 +17,23 @@ vi.mock("react-hot-toast", () => ({
   ),
 }));
 
+// Round-2 review G2 (issue #34): captures the props ReactFlow was last
+// rendered with, the same pattern TopologyEditorPage.L3Routing.test.tsx
+// uses, so a test can read `l3ValidationInvalid` off the derived `nodes`
+// prop directly without needing DeviceNode's own DOM (still mocked away
+// below, for every other test in this file).
+const rfProps = { current: null as Record<string, unknown> | null };
+
 // React Flow renders a heavy canvas that does not work in jsdom. Stub the visual
 // components but keep the provider/hooks and the store's graph helpers real.
 vi.mock("@xyflow/react", async () => {
   const actual = await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
   return {
     ...actual,
-    ReactFlow: ({ children }: { children?: React.ReactNode }) => (
-      <div data-testid="react-flow">{children}</div>
-    ),
+    ReactFlow: (props: Record<string, unknown> & { children?: React.ReactNode }) => {
+      rfProps.current = props;
+      return <div data-testid="react-flow">{props.children as React.ReactNode}</div>;
+    },
     Background: () => <div data-testid="rf-background" />,
     Controls: () => <div data-testid="rf-controls" />,
     MiniMap: () => <div data-testid="rf-minimap" />,
@@ -144,6 +152,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
+  rfProps.current = null;
   useTopologyStore.setState({ nodes: [], edges: [], selectedEdgeLayer: "L2" });
 });
 
@@ -632,6 +641,165 @@ describe("TopologyEditorPage handleCommitToReservation error branches", () => {
     await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith(
         "These devices are not part of the reservation: d-x, d-y",
+      ),
+    );
+  });
+
+  // ADR 0014 phase 2 (issue #34): a fork save's L3 gate 409 renders a toast
+  // naming the problem count and feeds invalid_routes into the same page
+  // state the Routing panel's red badge and per-row reasons read (E4/E5).
+  it("an l3_intent_invalid 409 toasts the problem count", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "l3_intent_invalid",
+              invalid_routes: [
+                { node_id: "fork-node", device_id: "d-fork", index: 0, reason: "l3_bad_destination", detail: null },
+                { node_id: "fork-node", device_id: "d-fork", index: 1, reason: "l3_unknown_interface", detail: null },
+              ],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Routing intent refused: 2 problems"),
+    );
+  });
+
+  // Round-2 review G2 (issue #34): routeProblems (and the red badge it
+  // drives) must be cleared on every wholesale canvas swap, not just the
+  // three L3 outcome branches. Reproduces the review's exact failure
+  // scenario: a fork-save 409 paints a red badge on "fork-node", then
+  // Preview loads an older version WHOSE CANVAS REUSES THE SAME NODE ID
+  // (the common case: routing edits on one node do not regenerate other
+  // nodes' ids, and often not even that node's own). Before the fix, the
+  // stale badge survived onto the read-only preview node, which was never
+  // itself validated.
+  it("a stale red badge does not survive onto a fork-history preview reusing the same node id", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "l3_intent_invalid",
+              invalid_routes: [
+                { node_id: "fork-node", device_id: "d-fork", index: 0, reason: "l3_bad_destination", detail: null },
+              ],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+      http.get(`/api/reservations/${RES_ID}/fork/versions/fv-1`, () =>
+        HttpResponse.json({
+          id: "fv-1",
+          fork_id: "fork-1",
+          version_number: 1,
+          restored_from_id: null,
+          created_at: "2026-06-01T00:00:00Z",
+          // Same node id as the live draft's "fork-node": the reuse the
+          // review's failure scenario depends on.
+          canvas_data: { nodes: [forkNode("fork-node", "d-fork")], edges: [], selectedEdgeLayer: "L2" },
+        }),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Routing intent refused: 1 problem"),
+    );
+    // Confirm the badge is genuinely red before Preview, or clearing it
+    // would prove nothing.
+    const nodesBeforePreview = rfProps.current?.nodes as Array<{ id: string; data: Record<string, unknown> }>;
+    expect(nodesBeforePreview.find((n) => n.id === "fork-node")?.data.l3ValidationInvalid).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    // "Previewing version 1" flips synchronously on click, BEFORE the
+    // version fetch and the subsequent async hydrate+loadCanvas swap the
+    // store's nodes; wait for the actual canvas swap (the ghosted preview
+    // node's isProposal flag) instead, or this assertion races the fix it
+    // means to prove.
+    await waitFor(() => {
+      const nodes = rfProps.current?.nodes as Array<{ id: string; data: Record<string, unknown> }>;
+      expect(nodes.find((n) => n.id === "fork-node")?.data.isProposal).toBe(true);
+    });
+
+    const nodesDuringPreview = rfProps.current?.nodes as Array<{ id: string; data: Record<string, unknown> }>;
+    const previewNode = nodesDuringPreview.find((n) => n.id === "fork-node");
+    expect(previewNode).toBeDefined();
+    expect(previewNode?.data.l3ValidationInvalid).not.toBe(true);
+  });
+
+  // ADR 0014 phase 2 addendum (issue #34): a malformed data.l3 shape 422s
+  // rather than being silently dropped, since the Routing panel should make
+  // this shape impossible to produce in the first place.
+  it("an l3_intent_malformed 422 toasts the parser's message", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "l3_intent_malformed",
+              node_id: "fork-node",
+              message: "'l3' must be an object with exactly one key: 'routes'",
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Routing intent malformed: 'l3' must be an object with exactly one key: 'routes'",
+      ),
+    );
+  });
+
+  // ADR 0014 Decision 5 (issue #34): the L3 pass fails closed on an
+  // inventory outage rather than passing unverified.
+  it("an l3_config_unavailable 503 toasts that inventory could not be reached", async () => {
+    server.use(
+      ...baseHandlers(makeFork()),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+        HttpResponse.json({ detail: { error: "l3_config_unavailable" } }, { status: 503 }),
+      ),
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Could not verify routing intent: inventory unavailable",
       ),
     );
   });

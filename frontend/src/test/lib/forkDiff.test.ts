@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { buildForkDiffOverlayCanvas, diffForkCanvases, edgeIdentityKey } from "@/lib/forkDiff";
-import type { CanvasData } from "@/types/topology.types";
+import type { CanvasData, L3RouteIntent } from "@/types/topology.types";
 
 function node(id: string, label = id): CanvasData["nodes"][number] {
   return {
@@ -10,6 +10,30 @@ function node(id: string, label = id): CanvasData["nodes"][number] {
     position: { x: 0, y: 0 },
     data: { device: { id: `dev-${id}`, name: label }, label, topologyType: "PHYSICAL" },
   } as unknown as CanvasData["nodes"][number];
+}
+
+function l3Node(id: string, routes: L3RouteIntent[], label = id): CanvasData["nodes"][number] {
+  return {
+    id,
+    type: "deviceNode",
+    position: { x: 0, y: 0 },
+    data: {
+      device: { id: `dev-${id}`, name: label },
+      label,
+      topologyType: "PHYSICAL",
+      l3: { routes },
+    },
+  } as unknown as CanvasData["nodes"][number];
+}
+
+function route(overrides: Partial<L3RouteIntent> = {}): L3RouteIntent {
+  return {
+    destination: "10.0.0.0/24",
+    next_hop: null,
+    interface: "eth0",
+    virtual_router: null,
+    ...overrides,
+  };
 }
 
 function edge(
@@ -165,5 +189,63 @@ describe("buildForkDiffOverlayCanvas", () => {
     const diff = diffForkCanvases(before, compare);
     const overlay = buildForkDiffOverlayCanvas(compare, diff);
     expect(overlay.edges.find((e) => e.id === "diff-removed-e1")).toBeUndefined();
+  });
+});
+
+describe("diffForkCanvases: routingChangedNodes (E6, issue #34)", () => {
+  it("reports no routing change for identical route sets in a different order", () => {
+    const before = canvas(
+      [l3Node("n1", [route({ destination: "10.0.0.0/24" }), route({ interface: "eth1" })])],
+      [],
+    );
+    const after = canvas(
+      [l3Node("n1", [route({ interface: "eth1" }), route({ destination: "10.0.0.0/24" })])],
+      [],
+    );
+    expect(diffForkCanvases(before, after).routingChangedNodes).toEqual([]);
+  });
+
+  it("reports an added and a removed route on the same node", () => {
+    const before = canvas([l3Node("n1", [route({ interface: "eth0" })])], []);
+    const after = canvas([l3Node("n1", [route({ interface: "eth1" })])], []);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toHaveLength(1);
+    expect(diff.routingChangedNodes[0].node.id).toBe("n1");
+    expect(diff.routingChangedNodes[0].added).toBe(1);
+    expect(diff.routingChangedNodes[0].removed).toBe(1);
+  });
+
+  // Review fix F7: a client-side destination canonicalizer briefly lived in
+  // lib/forkDiff.ts to make THIS case report no change; it was removed
+  // because its premise was wrong (the server canonicalizes only into
+  // fork_l3_routes, never back into canvas_data, so both canvases always
+  // hold the user's own raw text and there is no canonicalization-only
+  // difference to hide). Pinning the opposite now: two differently-written
+  // but "same" destinations DO report a change, the same way edgeIdentityKey
+  // diffs raw port names.
+  it("reports a change when the destination text differs, even if it would canonicalize to the same network", () => {
+    const before = canvas([l3Node("n1", [route({ destination: "10.0.0.5/24" })])], []);
+    const after = canvas([l3Node("n1", [route({ destination: "10.0.0.0/24" })])], []);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toHaveLength(1);
+    expect(diff.routingChangedNodes[0].added).toBe(1);
+    expect(diff.routingChangedNodes[0].removed).toBe(1);
+  });
+
+  it("does not report a node present on only one side (covered by added/removedNodes instead)", () => {
+    const before = canvas([node("n1")], []);
+    const after = canvas([node("n1"), l3Node("n2", [route()])], []);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toEqual([]);
+    expect(diff.addedNodes.map((n) => n.id)).toEqual(["n2"]);
+  });
+
+  it("distinguishes routes that differ only by virtual_router", () => {
+    const before = canvas([l3Node("n1", [route({ virtual_router: "vr1" })])], []);
+    const after = canvas([l3Node("n1", [route({ virtual_router: "vr2" })])], []);
+    const diff = diffForkCanvases(before, after);
+    expect(diff.routingChangedNodes).toHaveLength(1);
+    expect(diff.routingChangedNodes[0].added).toBe(1);
+    expect(diff.routingChangedNodes[0].removed).toBe(1);
   });
 });

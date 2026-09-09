@@ -115,11 +115,18 @@ export function useDeviceConfigVersions(
 export function useDeviceConfigVersion(
   deviceId: string | undefined,
   versionId: string | undefined,
+  // ADR 0014 phase 2 (issue #34) review fix F10: `enabled: false` lets a
+  // caller (the Routing panel's Import action) hold this query off until an
+  // explicit `refetch()`, so selecting an L3 switch never fetches the full
+  // config version body just to learn whether one exists (the cheap
+  // versions-list query already answers that). Every other caller is
+  // unaffected: omitting `options` keeps the previous always-on behavior.
+  options?: { enabled?: boolean },
 ) {
   return useQuery({
     queryKey: ["devices", deviceId, "config-versions", "detail", versionId],
     queryFn: () => fetchVersion(deviceId!, versionId!),
-    enabled: !!deviceId && !!versionId,
+    enabled: !!deviceId && !!versionId && (options?.enabled ?? true),
   });
 }
 

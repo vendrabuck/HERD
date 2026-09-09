@@ -7,6 +7,7 @@ import type {
   TopologyVersion,
   TopologyVersionDetail,
   TopologyDiff,
+  TopologyValidationResponse,
   RestoreRequest,
 } from "@/types/topology.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
@@ -46,6 +47,21 @@ async function deleteTopology(id: string): Promise<void> {
 
 async function cloneTopology({ id, name }: { id: string; name: string }): Promise<Topology> {
   const resp = await apiClient.post<Topology>(`/cabling/topologies/${id}/clone`, { name });
+  return resp.data;
+}
+
+// ADR 0014 phase 2 (issue #34): validates the PERSISTED topology's own
+// canvas_data (no request body; the backend reads `topology.canvas_data`
+// itself, same as the user-facing route it wraps). Called after a plain
+// topology save (never in live-edit/fork mode: a fork save's own 409/422
+// already carries `invalid_routes` on refusal, so there is no separate
+// proactive check to run there) so a topology with L3 intent gets its
+// routing problems surfaced even though the plain PUT save itself never
+// gates on them.
+export async function validateTopology(id: string): Promise<TopologyValidationResponse> {
+  const resp = await apiClient.post<TopologyValidationResponse>(
+    `/cabling/topologies/${id}/validate`,
+  );
   return resp.data;
 }
 

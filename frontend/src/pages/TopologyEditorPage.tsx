@@ -17,7 +17,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import toast from "react-hot-toast";
 
-import { useTopology, useUpdateTopology, useRestoreVersion } from "@/api/topologies";
+import { useTopology, useUpdateTopology, useRestoreVersion, validateTopology } from "@/api/topologies";
 import {
   useReservations,
   useUpdateReservation,
@@ -25,6 +25,9 @@ import {
   useSaveReservationFork,
   forkConflictDetail,
   forkDeviceNotMemberDetail,
+  forkL3ConfigUnavailableDetail,
+  forkL3IntentInvalidDetail,
+  forkL3IntentMalformedDetail,
 } from "@/api/reservations";
 import { errorDetail } from "@/lib/errors";
 import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
@@ -36,7 +39,16 @@ import {
   isNetworkElement,
   isDeviceNode,
   collectCanvasDeviceIds,
+  canvasHasL3Intent,
 } from "@/lib/canvasNodes";
+import {
+  isBlockingRouteProblem,
+  resolveRouteProblems,
+  routeProblemLabel,
+  selectRoutingPanelNode,
+  type ResolvedRouteProblem,
+} from "@/lib/l3";
+import { diffForkCanvases } from "@/lib/forkDiff";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
@@ -61,6 +73,7 @@ import { ForkVersionPreviewBar } from "@/components/topology-editor/ForkVersionP
 import { HistoryPanel } from "@/components/topology-editor/HistoryPanel";
 import { VersionDiffDialog } from "@/components/topology-editor/VersionDiffDialog";
 import { RestoreConfirmDialog } from "@/components/topology-editor/RestoreConfirmDialog";
+import { RoutingPanel } from "@/components/topology-editor/RoutingPanel";
 import { Modal } from "@/components/ui/Modal";
 import { useCreateTemplateFromTopology } from "@/api/topologyTemplates";
 import apiClient from "@/api/client";
@@ -175,6 +188,26 @@ function TopologyEditorInner() {
   const [forkLoaded, setForkLoaded] = useState(false);
   const [saveConflict, setSaveConflict] = useState<ForkConflictDetail | null>(null);
 
+  // ADR 0014 phase 2 (issue #34), E5: the last L3 routing-intent validation
+  // result, from whichever of three sources ran most recently: a plain
+  // topology save's proactive `validateTopology` call, a fork save's 409
+  // `l3_intent_invalid` refusal, or a reservation create's 422
+  // `topology_routing_intent_invalid` refusal. Review fix F4: each raw
+  // `InvalidRoute` is RESOLVED (route id to route VALUE) against the exact
+  // canvas that produced it at the moment it arrives, via
+  // `resolveRouteProblems`, rather than kept as a bare index that a later
+  // Remove could silently misattribute. One flat list feeds both the
+  // per-node red badge (E4, blocking entries only, review fix F1) and the
+  // Routing panel's per-row reason lines (all entries, including the
+  // informational l3_duplicate_route ones). Cleared on every wholesale
+  // canvas swap (initial load, topology/reservation id change, parent-
+  // topology preview/exit/restore, fork-history preview/diff/restore) and on
+  // commit success (round-2 review G2, issue #34: this state used to survive
+  // a canvas swap, so a stale red badge from one canvas could paint onto an
+  // unrelated one, e.g. a fork-history preview of an older version reusing
+  // the same node id), never left stale for an unrelated canvas.
+  const [routeProblems, setRouteProblems] = useState<ResolvedRouteProblem[]>([]);
+
   // An ARCHIVED fork is the frozen as-built record of an ended reservation: the
   // canvas renders read-only. This is the authoritative signal (the fork is
   // archived by the teardown paths), so mutations key off it directly. Kept
@@ -201,6 +234,27 @@ function TopologyEditorInner() {
     acceptProposalNodes,
     rejectProposalNodes,
   } = useTopologyStore();
+
+  // Round-2 review G2 (issue #34): every wholesale canvas swap that is NOT
+  // an ordinary edit must also clear the stale L3 validation result above,
+  // or a red badge/reason line from one canvas can paint onto a completely
+  // different one it was never computed against (a fork-history preview of
+  // an older version reusing the same node id is the concrete failure
+  // case). Wrapping the store's `loadCanvas` here, rather than clearing
+  // inside the store (routeProblems is page-local UI state, not canvas
+  // data) or inside useForkVersionPreview (a generic history-view hook with
+  // no reason to know about L3 validation), gives every canvas-replacing
+  // call site (the initial load effect below, parent-topology preview/exit/
+  // restore, and fork-history preview/diff/restore via the hook's own
+  // `loadCanvas` param) the clear for free just by using this instead of
+  // the raw setter.
+  const loadCanvasAndClearRouteProblems = useCallback(
+    (canvas: CanvasData) => {
+      setRouteProblems([]);
+      loadCanvas(canvas);
+    },
+    [loadCanvas],
+  );
 
   // Placeholders are excluded from every persistence path (parent topology
   // save, fork save, fork autosave): they are not devices or wiring, only a
@@ -245,7 +299,7 @@ function TopologyEditorInner() {
   const forkPreview = useForkVersionPreview({
     reservationId: isLiveEdit ? reservationId : null,
     currentCanvas: persistableCanvas,
-    loadCanvas,
+    loadCanvas: loadCanvasAndClearRouteProblems,
     flushAutosave,
   });
   const isHistoryViewActive = forkPreview.isActive;
@@ -398,6 +452,68 @@ function TopologyEditorInner() {
   );
   const hasInvalidEdges = invalidEdges.length > 0;
 
+  // ADR 0014 phase 2 (issue #34), E3: the Routing panel's gating rule (see
+  // selectRoutingPanelNode's own doc comment). isReadOnly already covers both
+  // an archived fork's as-built record and a fork-history preview/diff
+  // overlay (the same flag every other edit affordance gates on, e.g.
+  // nodesDraggable), so the panel disappears there for free.
+  const selectedL3Node = useMemo(
+    () => selectRoutingPanelNode(nodes, isReadOnly),
+    [nodes, isReadOnly],
+  );
+
+  // This node's slice of the last validation result (E5), by node_id (the
+  // same identity cabling's InvalidRoute rows use). Includes BOTH blocking
+  // and informational (l3_duplicate_route) entries; RoutingPanel renders
+  // each differently (review fix F1).
+  const routeProblemsForSelectedNode = useMemo(
+    () => (selectedL3Node ? routeProblems.filter((p) => p.node_id === selectedL3Node.id) : []),
+    [routeProblems, selectedL3Node],
+  );
+
+  // Render-only overlay (E4): marks each device node the last validation
+  // reported a BLOCKING problem for (review fix F1: a node whose only
+  // problem is an informational l3_duplicate_route never turns red), so
+  // DeviceNode can paint its badge red. Built the same way renderEdges is (a
+  // derived view over the store's own `nodes`, never a store mutation), so
+  // this can never leak into persistableCanvas the way a store-held field
+  // would.
+  const blockingRouteProblemNodeIds = useMemo(
+    () => new Set(routeProblems.filter(isBlockingRouteProblem).map((p) => p.node_id)),
+    [routeProblems],
+  );
+  const renderNodes = useMemo(() => {
+    if (blockingRouteProblemNodeIds.size === 0) return nodes;
+    return nodes.map((n) =>
+      isDeviceNode(n) && blockingRouteProblemNodeIds.has(n.id)
+        ? { ...n, data: { ...n.data, l3ValidationInvalid: true } }
+        : n,
+    );
+  }, [nodes, blockingRouteProblemNodeIds]);
+
+  // ADR 0014 phase 2 (issue #34) review fix F5: the reservations gate
+  // validates the PERSISTED topology at create time, so a routing edit made
+  // in this editor but never saved is invisible to it (and, symmetrically, a
+  // route that WAS saved and has since been removed on the canvas can still
+  // refuse a create against the stale persisted copy). Rather than block
+  // Reserve (the brief's rule: the gate is the authority, and the user may
+  // fix the device config instead), warn once, right when the modal opens.
+  // Reuses `diffForkCanvases` (the same machinery the fork-history diff
+  // panel uses) as a general "does the live canvas differ from the
+  // persisted one at all" check, ANDed with `canvasHasL3Intent` on the live
+  // canvas so an edit that never touched routing never warns.
+  const hasUnsavedRoutingChanges = useMemo(() => {
+    if (!canvasHasL3Intent(persistableCanvas.nodes)) return false;
+    const diff = diffForkCanvases(topology?.canvas_data ?? null, persistableCanvas);
+    return (
+      diff.addedNodes.length > 0 ||
+      diff.removedNodes.length > 0 ||
+      diff.addedEdges.length > 0 ||
+      diff.removedEdges.length > 0 ||
+      diff.routingChangedNodes.length > 0
+    );
+  }, [topology, persistableCanvas]);
+
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showReserveModal, setShowReserveModal] = useState(false);
   const [showAIDialog, setShowAIDialog] = useState(false);
@@ -496,6 +612,11 @@ function TopologyEditorInner() {
     if (isLiveEdit) {
       if (fork && !initializedRef.current) {
         initializedRef.current = true;
+        // Round-2 review G2 (issue #34): clear any stale L3 validation
+        // result from whatever source this component was previously
+        // rendering, BEFORE loading (or clearing to empty) the new source's
+        // canvas, on both branches below alike.
+        setRouteProblems([]);
         const persisted = fork.canvas_data;
         const applyLoad =
           persisted && persisted.nodes
@@ -509,6 +630,7 @@ function TopologyEditorInner() {
     }
     if (topology && !initializedRef.current) {
       initializedRef.current = true;
+      setRouteProblems([]);
       if (topology.canvas_data) {
         void hydrateAndLoadCanvas(topology.canvas_data, loadCanvas);
       } else {
@@ -978,6 +1100,46 @@ function TopologyEditorInner() {
     } else {
       toast.success("Topology saved");
     }
+
+    // ADR 0014 phase 2 (issue #34), E5: a plain topology save never gates on
+    // routing intent (only a fork save/create does), so this is the only
+    // place a standalone topology's `data.l3` problems ever surface. Fires
+    // only when the canvas actually carries intent (canvas_has_l3 on the
+    // backend, mirrored client-side here) so a topology with none never pays
+    // for the extra request or the inventory round trips it makes server-side.
+    // Never awaited into the save's own try/catch above: a validate failure
+    // must not make the save itself look like it failed.
+    if (canvasHasL3Intent(persistableCanvas.nodes)) {
+      try {
+        const result = await validateTopology(id);
+        // Review fix F4: resolve against persistableCanvas.nodes, the exact
+        // canvas this validate call sent, not whatever `nodes` holds by the
+        // time this promise settles.
+        setRouteProblems(resolveRouteProblems(result.invalid_routes, persistableCanvas.nodes));
+        // Review fix F1: the toast's count and named entries are BLOCKING
+        // problems only; an l3_duplicate_route-only result produces no toast
+        // (it never made `valid` false server-side either).
+        const blocking = result.invalid_routes.filter(isBlockingRouteProblem);
+        if (blocking.length > 0) {
+          const names = blocking.slice(0, 3).map((r) => routeProblemLabel(r, persistableCanvas.nodes));
+          toast.error(
+            `Routing intent has ${blocking.length} problem${blocking.length === 1 ? "" : "s"}: ${names.join(", ")}`,
+          );
+        }
+      } catch (err) {
+        // Best-effort: a failed validate call must not make a successful
+        // save look like it failed. The stale routeProblems (if any) is
+        // left as-is rather than cleared, since we do not know whether the
+        // problems it named still apply. The one case worth naming (ADR
+        // 0014 Decision 5): the inventory-outage 503 the L3 pass fails
+        // closed with.
+        if (forkL3ConfigUnavailableDetail(err)) {
+          toast.error("Could not verify routing intent: inventory unavailable");
+        }
+      }
+    } else {
+      setRouteProblems([]);
+    }
   };
 
   // Live-edit commit (ADR 0006 Decision 6): re-point the reservation's device
@@ -1035,16 +1197,36 @@ function TopologyEditorInner() {
         // dialog and keeps the drawing so the user can rework it. A
         // fork_device_not_member 409 (a device the PATCH above could not add,
         // or a race with a concurrent removal) names the offending devices.
+        // ADR 0014 (issue #34): an l3_intent_invalid 409 renders the same
+        // per-row reasons the Routing panel already knows how to show (E4/E5
+        // page state); an l3_intent_malformed 422 means the canvas carried a
+        // shape the server refused outright (the panel should make this
+        // impossible to produce, so it is surfaced rather than swallowed); an
+        // l3_config_unavailable 503 means the gate itself could not run.
         // Any other error (a plain 409 for a non-ACTIVE or ARCHIVED fork, a
         // transport failure) toasts generically.
         const conflict = forkConflictDetail(err);
         const notMember = forkDeviceNotMemberDetail(err);
+        const l3Invalid = forkL3IntentInvalidDetail(err);
+        const l3Malformed = forkL3IntentMalformedDetail(err);
+        const l3Unavailable = forkL3ConfigUnavailableDetail(err);
         if (conflict) {
           setSaveConflict(conflict);
         } else if (notMember) {
           toast.error(
             `These devices are not part of the reservation: ${notMember.device_ids.join(", ")}`,
           );
+        } else if (l3Invalid) {
+          // Review fix F4: resolve against persistableCanvas.nodes, the
+          // exact canvas that was just sent to the fork save. Review fix
+          // F1: the toast count is blocking entries only.
+          setRouteProblems(resolveRouteProblems(l3Invalid.invalid_routes, persistableCanvas.nodes));
+          const count = l3Invalid.invalid_routes.filter(isBlockingRouteProblem).length;
+          toast.error(`Routing intent refused: ${count} problem${count === 1 ? "" : "s"}`);
+        } else if (l3Malformed) {
+          toast.error(`Routing intent malformed: ${l3Malformed.message}`);
+        } else if (l3Unavailable) {
+          toast.error("Could not verify routing intent: inventory unavailable");
         } else {
           const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
             ?.detail;
@@ -1060,6 +1242,10 @@ function TopologyEditorInner() {
 
       // The reconcile captured this canvas, so cancel any pending draft flush.
       autosave.markClean();
+      // A successful save means any prior routing-intent refusal no longer
+      // applies to what is now on the fork (issue #34): clear rather than
+      // leave a stale red badge/reason line from before this commit.
+      setRouteProblems([]);
       toast.custom((t) => (
         <ForkSaveResultToast result={result} onDismiss={() => toast.dismiss(t.id)} />
       ));
@@ -1136,14 +1322,17 @@ function TopologyEditorInner() {
         // the previewVersion flip below) with the token: if this request has
         // since been superseded or exited, its result must be dropped.
         await hydrateAndLoadCanvas(ghostCanvas, (hydrated) => {
-          if (previewRequestRef.current === token) loadCanvas(hydrated);
+          // Round-2 review G2 (issue #34): a Preview swaps in a DIFFERENT
+          // canvas than whatever the last L3 validation result was computed
+          // against; that result must not survive onto this one.
+          if (previewRequestRef.current === token) loadCanvasAndClearRouteProblems(hydrated);
         });
         if (previewRequestRef.current === token) setPreviewVersion(version);
       } catch {
         toast.error("Failed to load version");
       }
     },
-    [id, nodes, edges, selectedEdgeLayer, preservedBeforePreview, loadCanvas],
+    [id, nodes, edges, selectedEdgeLayer, preservedBeforePreview, loadCanvasAndClearRouteProblems],
   );
 
   const handleExitPreview = useCallback(() => {
@@ -1151,11 +1340,14 @@ function TopologyEditorInner() {
     // preserved canvas, so a late result cannot land after exit (issue #627).
     previewRequestRef.current += 1;
     if (preservedBeforePreview) {
-      loadCanvas(preservedBeforePreview);
+      // Round-2 review G2 (issue #34): the preview's own (possibly stale,
+      // possibly never-computed) routing state must not survive back onto
+      // the restored live canvas either.
+      loadCanvasAndClearRouteProblems(preservedBeforePreview);
     }
     setPreservedBeforePreview(null);
     setPreviewVersion(null);
-  }, [preservedBeforePreview, loadCanvas]);
+  }, [preservedBeforePreview, loadCanvasAndClearRouteProblems]);
 
   const handleRestoreConfirm = useCallback(
     async ({ description: desc, restoreName }: { description: string; restoreName: boolean }) => {
@@ -1173,7 +1365,9 @@ function TopologyEditorInner() {
         // (issue #627).
         previewRequestRef.current += 1;
         if (updated.canvas_data) {
-          loadCanvas(updated.canvas_data);
+          // Round-2 review G2 (issue #34): a Restore replaces the canvas
+          // wholesale too; the same clear as Preview/Exit applies.
+          loadCanvasAndClearRouteProblems(updated.canvas_data);
         }
         setRestoreTarget(null);
         setBlockingReservations(undefined);
@@ -1193,7 +1387,7 @@ function TopologyEditorInner() {
         }
       }
     },
-    [restoreTarget, id, restoreVersion, loadCanvas],
+    [restoreTarget, id, restoreVersion, loadCanvasAndClearRouteProblems],
   );
 
   if (isLoading) {
@@ -1273,7 +1467,14 @@ function TopologyEditorInner() {
             )}
             {!isLiveEdit && (
               <button
-                onClick={() => setShowReserveModal(true)}
+                onClick={() => {
+                  // Review fix F5: a warning, never a block (the gate is the
+                  // authority; the brief's rule).
+                  if (hasUnsavedRoutingChanges) {
+                    toast("Unsaved routing changes are not checked until you save");
+                  }
+                  setShowReserveModal(true);
+                }}
                 disabled={(allDeviceIds.length === 0 && dynamicPrefill.length === 0) || hasInvalidEdges}
                 title={
                   hasInvalidEdges
@@ -1345,6 +1546,12 @@ function TopologyEditorInner() {
             <EquipmentBrowser canvasDeviceIds={allDeviceIds} />
           </FloatingPanel>
 
+          {selectedL3Node && (
+            <FloatingPanel title="Routing" defaultPosition={{ x: 16, y: 320 }}>
+              <RoutingPanel node={selectedL3Node} problems={routeProblemsForSelectedNode} />
+            </FloatingPanel>
+          )}
+
           {pendingProposal && (
             <AIProposalBar
               purpose={pendingProposal.purpose}
@@ -1385,7 +1592,7 @@ function TopologyEditorInner() {
           <ReactFlow
             onDrop={onDrop}
             onDragOver={onDragOver}
-            nodes={nodes}
+            nodes={renderNodes}
             edges={renderEdges}
             onNodesChange={onNodesChange}
             onEdgesChange={handleEdgesChange}
@@ -1433,6 +1640,13 @@ function TopologyEditorInner() {
             deviceIds={allDeviceIds}
             topologyId={id}
             initialDynamicEntries={dynamicPrefill}
+            onRoutingIntentInvalid={(invalidRoutes) =>
+              // Review fix F4: the reservations gate validates the
+              // PERSISTED topology, not whatever the store currently holds
+              // (which may carry unsaved edits, see review fix F5), so this
+              // resolves against `topology.canvas_data`, not `nodes`.
+              setRouteProblems(resolveRouteProblems(invalidRoutes, topology?.canvas_data?.nodes ?? []))
+            }
             onClose={() => setShowReserveModal(false)}
           />
         )}

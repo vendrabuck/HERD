@@ -1,6 +1,8 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { DeviceNode as DeviceNodeType } from "@/types/topology.types";
 import { TopoBadge } from "@/components/ui/TopoBadge";
+import { l3RoutesOf } from "@/lib/canvasNodes";
+import { cn } from "@/lib/cn";
 
 const TOPOLOGY_COLORS: Record<string, string> = {
   PHYSICAL: "bg-blue-100 border-blue-400 text-blue-900",
@@ -8,8 +10,13 @@ const TOPOLOGY_COLORS: Record<string, string> = {
 };
 
 export function DeviceNode({ data, selected }: NodeProps<DeviceNodeType>) {
-  const { device, isProposal } = data;
+  const { device, isProposal, l3ValidationInvalid } = data;
   const colorClass = TOPOLOGY_COLORS[device.topology_type] ?? "bg-gray-100 border-gray-400";
+  // Review fix F6 (issue #34): l3RoutesOf never throws on a malformed
+  // persisted/imported `data.l3` ({} or {routes: null}); it reads [] instead
+  // of crashing this node into the ErrorBoundary with no way back into the
+  // editor to fix it.
+  const routeCount = l3RoutesOf(data).length;
 
   return (
     <div
@@ -23,6 +30,28 @@ export function DeviceNode({ data, selected }: NodeProps<DeviceNodeType>) {
       {isProposal && (
         <span className="absolute -top-2 -right-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-purple-600 text-white shadow">
           PROPOSED
+        </span>
+      )}
+      {routeCount > 0 && (
+        // ADR 0014 Decision 4 (issue #34): a route-count badge so routing
+        // intent is visible on the canvas without opening the Routing panel.
+        // Red variant when the last validation run reported a BLOCKING
+        // problem for this node (review fix F1: an l3_duplicate_route-only
+        // result is informational and does not turn this red). Not built on
+        // components/ui/StatusBadge.tsx (review fix F11 considered it): that
+        // component is keyed by a fixed backend enum string with a pale
+        // -100/-800 tone, for an inline status pill; this is a solid overlay
+        // chip anchored to the canvas node's corner (the same treatment as
+        // the PROPOSED badge above), showing a dynamic count rather than one
+        // of a closed set of enum values, so it stays a `cn()`-composed span
+        // instead.
+        <span
+          className={cn(
+            "absolute -top-2 -left-2 text-[10px] font-bold px-1.5 py-0.5 rounded shadow",
+            l3ValidationInvalid ? "bg-red-600 text-white" : "bg-slate-600 text-white",
+          )}
+        >
+          {routeCount} route{routeCount === 1 ? "" : "s"}
         </span>
       )}
       <Handle type="source" id="top" position={Position.Top} className="!bg-gray-500" />

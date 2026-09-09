@@ -1,5 +1,12 @@
 import type { Edge, Node } from "@xyflow/react";
-import type { CanvasData, CanvasNodeData, LayerEdgeData } from "@/types/topology.types";
+import type {
+  CanvasData,
+  CanvasNodeData,
+  DeviceNodeData,
+  L3RouteIntent,
+  LayerEdgeData,
+} from "@/types/topology.types";
+import { isDeviceNode, l3RoutesOf } from "@/lib/canvasNodes";
 
 // Pure client-side diff between two canvas_data payloads (issue #622). Mirrors
 // the arithmetic cabling's fork save reconcile does server-side for wires: an
@@ -12,11 +19,23 @@ import type { CanvasData, CanvasNodeData, LayerEdgeData } from "@/types/topology
 // edges, a node's id is stable across saves for as long as the device stays on
 // the canvas (it changes only on a genuine remove-then-re-add, which IS a real
 // add/remove).
+// One device node whose L3 routing intent (issue #34, ADR 0014) changed
+// between the two canvases: present in both `before` and `after` (a node
+// that only appears on one side is already reported via addedNodes/
+// removedNodes, not here), with a different route SET (order-insensitive;
+// see routeSetDiffKey below).
+export interface RoutingChangedNode {
+  node: Node<CanvasNodeData>;
+  added: number;
+  removed: number;
+}
+
 export interface ForkCanvasDiff {
   addedNodes: Node<CanvasNodeData>[];
   removedNodes: Node<CanvasNodeData>[];
   addedEdges: Edge<LayerEdgeData>[];
   removedEdges: Edge<LayerEdgeData>[];
+  routingChangedNodes: RoutingChangedNode[];
 }
 
 export function edgeIdentityKey(edge: Edge<LayerEdgeData>): string {
@@ -31,7 +50,63 @@ const EMPTY_DIFF: ForkCanvasDiff = {
   removedNodes: [],
   addedEdges: [],
   removedEdges: [],
+  routingChangedNodes: [],
 };
+
+// The route-set identity key the fork diff compares on (E6): order-
+// insensitive across (destination, interface, next_hop), plus
+// virtual_router, matching the brief's stated identity fields. Diffs the RAW
+// text the way `edgeIdentityKey` diffs raw port names (review fix F7,
+// issue #34): a client-side destination canonicalizer briefly lived here to
+// mirror cabling's `str(ipaddress.ip_network(value, strict=False))`, on the
+// premise that the server canonicalizes into `canvas_data` and two fork
+// versions could therefore hold differently-formatted "same" routes. That
+// premise was wrong: the server canonicalizes only into `fork_l3_routes`
+// (the resolved-intent table), never back into `canvas_data`, so both
+// canvases always hold the user's own raw text and there is no
+// canonicalization-only difference to hide. The mirror was also a real
+// re-implementation of `ipaddress.ip_network` that had already drifted from
+// it in named cases (a `/255.255.255.0`-style dotted-decimal mask, a
+// zero-padded prefix, an IPv6 zone id, `::` compression edge cases), each a
+// possible false diff of its own. Removed entirely rather than fixed.
+function routeSetDiffKey(route: L3RouteIntent): string {
+  return [route.destination, route.interface, route.next_hop ?? "", route.virtual_router ?? ""].join(
+    "|",
+  );
+}
+
+function l3Routes(node: Node<CanvasNodeData> | undefined): L3RouteIntent[] {
+  if (!node || !isDeviceNode(node)) return [];
+  return l3RoutesOf(node.data as DeviceNodeData);
+}
+
+// Computes the routing-change summary for every node present in BOTH
+// canvases (a node on only one side is already fully covered by
+// addedNodes/removedNodes). Counts routes by SET membership (a route
+// appearing twice with the same identity counts once), matching how the
+// backend's own reconcile treats route identity.
+function diffRoutingChangedNodes(
+  beforeNodes: Node<CanvasNodeData>[],
+  afterNodes: Node<CanvasNodeData>[],
+): RoutingChangedNode[] {
+  const beforeById = new Map(beforeNodes.map((n) => [n.id, n]));
+  const result: RoutingChangedNode[] = [];
+  for (const afterNode of afterNodes) {
+    const beforeNode = beforeById.get(afterNode.id);
+    if (!beforeNode) continue;
+    const beforeKeys = new Set(l3Routes(beforeNode).map(routeSetDiffKey));
+    const afterKeys = new Set(l3Routes(afterNode).map(routeSetDiffKey));
+    if (beforeKeys.size === 0 && afterKeys.size === 0) continue;
+    let added = 0;
+    for (const key of afterKeys) if (!beforeKeys.has(key)) added++;
+    let removed = 0;
+    for (const key of beforeKeys) if (!afterKeys.has(key)) removed++;
+    if (added > 0 || removed > 0) {
+      result.push({ node: afterNode, added, removed });
+    }
+  }
+  return result;
+}
 
 /**
  * Diffs `before` to `after`: "added" means present in `after` but not
@@ -57,8 +132,9 @@ export function diffForkCanvases(
   const removedNodes = beforeNodes.filter((n) => !afterNodeIds.has(n.id));
 
   const { addedEdges, removedEdges } = diffEdgesByKeyCount(beforeEdges, afterEdges);
+  const routingChangedNodes = diffRoutingChangedNodes(beforeNodes, afterNodes);
 
-  return { addedNodes, removedNodes, addedEdges, removedEdges };
+  return { addedNodes, removedNodes, addedEdges, removedEdges, routingChangedNodes };
 }
 
 // Groups edges by identity key, preserving each key's edges in their

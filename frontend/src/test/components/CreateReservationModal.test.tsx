@@ -192,6 +192,122 @@ describe("CreateReservationModal", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  // ADR 0014 phase 2 addendum (issue #34): a structured 422
+  // topology_routing_intent_invalid body feeds its invalid_routes into the
+  // caller's page state instead of the generic detail toast, matched on the
+  // `error` field alone (never message text).
+  it("feeds invalid_routes to onRoutingIntentInvalid and shows the routing-refused toast for a structured 422", async () => {
+    const invalidRoutes = [
+      { node_id: "n1", device_id: "d-1", index: 0, reason: "l3_bad_destination", detail: null },
+      { node_id: "n2", device_id: "d-2", index: null, reason: "l3_switch_unattached", detail: null },
+    ];
+    server.use(
+      http.post("/api/reservations/", () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "topology_routing_intent_invalid",
+              invalid_routes: invalidRoutes,
+              message: "routing intent has 2 problems",
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+
+    const onClose = vi.fn();
+    const onRoutingIntentInvalid = vi.fn();
+    renderWithProviders(
+      <CreateReservationModal
+        open
+        deviceIds={DEVICE_IDS}
+        onClose={onClose}
+        onRoutingIntentInvalid={onRoutingIntentInvalid}
+      />,
+    );
+
+    fillTimes("2026-06-01T10:00", "2026-06-01T12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Reservation refused: routing intent has 2 problems"),
+    );
+    expect(onRoutingIntentInvalid).toHaveBeenCalledWith(invalidRoutes);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // Review fix F1/round-2 G1 (issue #34): cabling's run_full_topology_validation
+  // puts the RAW, unfiltered invalid_routes (blocking and informational
+  // l3_duplicate_route entries together) in the response body; the toast
+  // count must filter to blocking entries only, like the other two
+  // toast-count sites (TopologyEditorPage.tsx's plain-save and fork-save
+  // toasts) do.
+  it("counts only blocking entries: one blocking plus one duplicate toasts '1 problem'", async () => {
+    const invalidRoutes = [
+      { node_id: "n1", device_id: "d-1", index: 0, reason: "l3_bad_destination", detail: null },
+      { node_id: "n1", device_id: "d-1", index: 1, reason: "l3_duplicate_route", detail: null },
+    ];
+    server.use(
+      http.post("/api/reservations/", () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "topology_routing_intent_invalid",
+              invalid_routes: invalidRoutes,
+              message: "routing intent has 1 problem",
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+
+    const onClose = vi.fn();
+    renderWithProviders(
+      <CreateReservationModal open deviceIds={DEVICE_IDS} onClose={onClose} />,
+    );
+
+    fillTimes("2026-06-01T10:00", "2026-06-01T12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Reservation refused: routing intent has 1 problem"),
+    );
+  });
+
+  it("does not treat an unrelated object-shaped 422 detail as a routing-intent refusal", async () => {
+    server.use(
+      http.post("/api/reservations/", () =>
+        HttpResponse.json({ detail: { error: "topology_device_not_member", device_ids: ["d-9"] } }, { status: 422 }),
+      ),
+    );
+    const onRoutingIntentInvalid = vi.fn();
+    renderWithProviders(
+      <CreateReservationModal
+        open
+        deviceIds={DEVICE_IDS}
+        onClose={() => {}}
+        onRoutingIntentInvalid={onRoutingIntentInvalid}
+      />,
+    );
+
+    fillTimes("2026-06-01T10:00", "2026-06-01T12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    // Review fix F8/round-2 G3 (issue #34): the toast argument itself must
+    // be a STRING. The mocked toastError here is a plain vi.fn(), so it
+    // would happily accept a raw object and this test would pass unchanged
+    // even if the old hand-extracted, object-shaped `detail` were passed
+    // straight to toast.error again; only asserting the argument type
+    // catches that regression.
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(expect.any(String)));
+    // The narrowing is on `error`, never message text: a different
+    // structured `error` value must not be mistaken for the routing-intent
+    // refusal shape.
+    expect(onRoutingIntentInvalid).not.toHaveBeenCalled();
+  });
+
   it("invokes onClose when the Cancel button is clicked", () => {
     const onClose = vi.fn();
     renderWithProviders(

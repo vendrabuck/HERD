@@ -66,4 +66,50 @@ describe("DeviceNode", () => {
     expect(node.className).toContain("bg-gray-100");
     expect(screen.getByText("OFFLINE")).toBeTruthy();
   });
+
+  // ADR 0014 phase 2 (issue #34), E4.
+  it("shows no route badge when data.l3 is absent", () => {
+    renderNode({ device: device(), label: "L1-Edge-01", topologyType: "PHYSICAL" });
+    expect(screen.queryByText(/route/)).toBeNull();
+  });
+
+  it("shows a singular-count, non-red badge for one route with no validation problem", () => {
+    renderNode({
+      device: device(),
+      label: "L1-Edge-01",
+      topologyType: "PHYSICAL",
+      l3: { routes: [{ destination: "10.0.0.0/24", next_hop: null, interface: "eth0", virtual_router: null }] },
+    });
+    const badge = screen.getByText("1 route");
+    expect(badge.className).toContain("bg-slate-600");
+    expect(badge.className).not.toContain("bg-red-600");
+  });
+
+  it("shows a plural count for multiple routes", () => {
+    renderNode({
+      device: device(),
+      label: "L1-Edge-01",
+      topologyType: "PHYSICAL",
+      l3: {
+        routes: [
+          { destination: "10.0.0.0/24", next_hop: null, interface: "eth0", virtual_router: null },
+          { destination: "10.0.1.0/24", next_hop: null, interface: "eth1", virtual_router: null },
+        ],
+      },
+    });
+    expect(screen.getByText("2 routes")).toBeTruthy();
+  });
+
+  it("shows the red variant when l3ValidationInvalid is set", () => {
+    renderNode({
+      device: device(),
+      label: "L1-Edge-01",
+      topologyType: "PHYSICAL",
+      l3: { routes: [{ destination: "10.0.0.0/24", next_hop: null, interface: "eth0", virtual_router: null }] },
+      l3ValidationInvalid: true,
+    });
+    const badge = screen.getByText("1 route");
+    expect(badge.className).toContain("bg-red-600");
+    expect(badge.className).not.toContain("bg-slate-600");
+  });
 });
