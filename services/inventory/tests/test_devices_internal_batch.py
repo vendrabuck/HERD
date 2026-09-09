@@ -1,7 +1,7 @@
 """Unit tests for POST /internal/devices/batch (ADR 0014 phase 1, issue #34).
 
 Feeds cabling's L3 routing-intent validation pass. Drives the route handler
-directly against ORM-seeded rows (Device -> DeviceTemplate -> DriverPackage), the
+directly against ORM-seeded rows (Device to DeviceTemplate to DriverPackage), the
 same style test_devices_internal.py's driver-upload helper serves, but without the
 admin-API round trip since only identity/type fields matter here.
 """
@@ -162,17 +162,17 @@ async def test_batch_wrong_token_403():
 
 
 def test_batch_request_rejects_more_than_cap_ids():
-    from app.routers.devices import INTERNAL_DEVICE_BATCH_MAX_IDS, InternalDeviceBatchRequest
+    from app.routers.devices import DEVICE_BATCH_MAX_IDS, InternalDeviceBatchRequest
     from pydantic import ValidationError
 
-    too_many = [uuid.uuid4() for _ in range(INTERNAL_DEVICE_BATCH_MAX_IDS + 1)]
+    too_many = [uuid.uuid4() for _ in range(DEVICE_BATCH_MAX_IDS + 1)]
     with pytest.raises(ValidationError):
         InternalDeviceBatchRequest(device_ids=too_many)
 
 
 def test_batch_request_accepts_exactly_cap_ids():
-    from app.routers.devices import INTERNAL_DEVICE_BATCH_MAX_IDS, InternalDeviceBatchRequest
+    from app.routers.devices import DEVICE_BATCH_MAX_IDS, InternalDeviceBatchRequest
 
-    exactly_cap = [uuid.uuid4() for _ in range(INTERNAL_DEVICE_BATCH_MAX_IDS)]
+    exactly_cap = [uuid.uuid4() for _ in range(DEVICE_BATCH_MAX_IDS)]
     body = InternalDeviceBatchRequest(device_ids=exactly_cap)
-    assert len(body.device_ids) == INTERNAL_DEVICE_BATCH_MAX_IDS
+    assert len(body.device_ids) == DEVICE_BATCH_MAX_IDS

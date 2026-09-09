@@ -126,14 +126,15 @@ class DeviceBatchResponse(BaseModel):
     items: list[DeviceResponse]
 
 
-# Cap on ids per internal batch-fetch request (ADR 0014 phase 1, issue #34). Mirrors
-# DEVICE_BATCH_MAX_IDS; kept as its own constant since the two routes serve
-# different callers and the cap is not otherwise a contract coupling.
-INTERNAL_DEVICE_BATCH_MAX_IDS = 500
-
-
 class InternalDeviceBatchRequest(BaseModel):
-    device_ids: list[uuid.UUID] = Field(max_length=INTERNAL_DEVICE_BATCH_MAX_IDS)
+    """Body for POST /internal/devices/batch (ADR 0014 phase 1, issue #34).
+
+    Shares DEVICE_BATCH_MAX_IDS with the public batch route's cap rather than a
+    second constant (R6 review fix on 2ade362c): the two routes serve different
+    callers, but the cap itself is not a contract coupling worth duplicating.
+    """
+
+    device_ids: list[uuid.UUID] = Field(max_length=DEVICE_BATCH_MAX_IDS)
 
 
 class InternalDeviceBatchEntry(BaseModel):
