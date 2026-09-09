@@ -3,7 +3,14 @@
 import uuid
 
 import pytest
-from app.services.l3_intent import L3IntentMalformed, RouteSpec, parse_l3_intent, parse_node_l3
+from app.services.l3_intent import (
+    L3IntentMalformed,
+    RouteSpec,
+    canvas_has_l3,
+    parse_l3_intent,
+    parse_l3_intent_tolerant,
+    parse_node_l3,
+)
 
 DEVICE_A = uuid.uuid4()
 DEVICE_B = uuid.uuid4()
@@ -249,3 +256,201 @@ def test_parse_l3_intent_raises_on_first_malformed_node_in_canvas_order():
     with pytest.raises(L3IntentMalformed) as exc:
         parse_l3_intent(canvas)
     assert exc.value.node_id == "n2"
+
+
+# --- R10: empty routes list is no intent at all ---
+
+
+def test_parse_l3_intent_empty_routes_list_is_absent_not_empty_list():
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"routes": []})])
+    assert parse_l3_intent(canvas) == {}
+
+
+def test_parse_l3_intent_one_empty_one_nonempty_node():
+    canvas = _canvas(
+        [
+            _switch_node("n1", DEVICE_A, {"routes": []}),
+            _switch_node(
+                "n2", DEVICE_B, {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0"}]}
+            ),
+        ]
+    )
+    result = parse_l3_intent(canvas)
+    assert set(result.keys()) == {DEVICE_B}
+
+
+# --- R5(a): two nodes resolving to one device merge their routes ---
+
+
+def test_parse_l3_intent_merges_routes_across_two_nodes_same_device():
+    canvas = _canvas(
+        [
+            _switch_node(
+                "n1", DEVICE_A, {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0"}]}
+            ),
+            _switch_node(
+                "n2", DEVICE_A, {"routes": [{"destination": "10.1.0.0/24", "interface": "eth1"}]}
+            ),
+        ]
+    )
+    result = parse_l3_intent(canvas)
+    assert set(result.keys()) == {DEVICE_A}
+    assert {r.route_key for r in result[DEVICE_A]} == {
+        "10.0.0.0/24|eth0|",
+        "10.1.0.0/24|eth1|",
+    }
+
+
+def test_parse_l3_intent_merge_dedupes_on_route_key_first_wins():
+    canvas = _canvas(
+        [
+            _switch_node(
+                "n1",
+                DEVICE_A,
+                {
+                    "routes": [
+                        {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr1"}
+                    ]
+                },
+            ),
+            _switch_node(
+                "n2",
+                DEVICE_A,
+                {
+                    "routes": [
+                        {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr2"}
+                    ]
+                },
+            ),
+        ]
+    )
+    result = parse_l3_intent(canvas)
+    assert len(result[DEVICE_A]) == 1
+    assert result[DEVICE_A][0].virtual_router == "vr1"
+
+
+# --- R5(b): "" normalizes to null for optional fields ---
+
+
+def test_next_hop_empty_string_normalizes_to_null():
+    routes = parse_node_l3(
+        "n1", {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0", "next_hop": ""}]}
+    )
+    assert routes[0].next_hop is None
+
+
+def test_virtual_router_empty_string_normalizes_to_null():
+    routes = parse_node_l3(
+        "n1",
+        {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": ""}]},
+    )
+    assert routes[0].virtual_router is None
+
+
+# --- R5(c): destination canonicalization ---
+
+
+def test_destination_canonicalized_when_parseable():
+    routes = parse_node_l3("n1", {"routes": [{"destination": "10.0.0.5/24", "interface": "eth0"}]})
+    assert routes[0].destination == "10.0.0.0/24"
+
+
+def test_destination_kept_verbatim_when_not_parseable():
+    routes = parse_node_l3("n1", {"routes": [{"destination": "not-an-ip", "interface": "eth0"}]})
+    assert routes[0].destination == "not-an-ip"
+
+
+# --- R5(d): a literal '|' in any field is malformed ---
+
+
+def test_pipe_in_destination_is_malformed():
+    with pytest.raises(L3IntentMalformed):
+        parse_node_l3("n1", {"routes": [{"destination": "10.0.0.0/24|extra", "interface": "eth0"}]})
+
+
+def test_pipe_in_interface_is_malformed():
+    with pytest.raises(L3IntentMalformed):
+        parse_node_l3("n1", {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0|1"}]})
+
+
+def test_pipe_in_next_hop_is_malformed():
+    with pytest.raises(L3IntentMalformed):
+        parse_node_l3(
+            "n1",
+            {
+                "routes": [
+                    {"destination": "10.0.0.0/24", "interface": "eth0", "next_hop": "10.0.0.1|x"}
+                ]
+            },
+        )
+
+
+def test_pipe_in_virtual_router_is_malformed():
+    with pytest.raises(L3IntentMalformed):
+        parse_node_l3(
+            "n1",
+            {
+                "routes": [
+                    {
+                        "destination": "10.0.0.0/24",
+                        "interface": "eth0",
+                        "virtual_router": "vr|1",
+                    }
+                ]
+            },
+        )
+
+
+# --- canvas_has_l3 ---
+
+
+def test_canvas_has_l3_true_when_any_node_carries_l3():
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"routes": []})])
+    assert canvas_has_l3(canvas) is True
+
+
+def test_canvas_has_l3_false_when_no_node_carries_l3():
+    canvas = _canvas([_switch_node("n1", DEVICE_A)])
+    assert canvas_has_l3(canvas) is False
+
+
+# --- parse_l3_intent_tolerant (R4): drops malformed nodes, keeps well-formed ones ---
+
+
+def test_parse_l3_intent_tolerant_drops_malformed_node_keeps_others():
+    canvas = _canvas(
+        [
+            _switch_node("n1", DEVICE_A, {"bad": "shape"}),
+            _switch_node(
+                "n2", DEVICE_B, {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0"}]}
+            ),
+        ]
+    )
+    result = parse_l3_intent_tolerant(canvas)
+    assert set(result.keys()) == {DEVICE_B}
+
+
+def test_parse_l3_intent_tolerant_logs_warning_naming_the_node(caplog):
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"bad": "shape"})])
+    with caplog.at_level("WARNING", logger="app.services.l3_intent"):
+        result = parse_l3_intent_tolerant(canvas)
+    assert result == {}
+    assert any("n1" in record.getMessage() for record in caplog.records)
+
+
+def test_parse_l3_intent_tolerant_all_malformed_returns_empty():
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"bad": "shape"})])
+    assert parse_l3_intent_tolerant(canvas) == {}
+
+
+def test_parse_l3_intent_tolerant_never_raises():
+    canvas = _canvas(
+        [
+            _switch_node("n1", DEVICE_A, ["not", "a", "dict"]),
+            _switch_node("n2", DEVICE_B, {"routes": "not-a-list"}),
+        ]
+    )
+    # Must not raise, unlike parse_l3_intent on the same canvas.
+    assert parse_l3_intent_tolerant(canvas) == {}
+    with pytest.raises(L3IntentMalformed):
+        parse_l3_intent(canvas)

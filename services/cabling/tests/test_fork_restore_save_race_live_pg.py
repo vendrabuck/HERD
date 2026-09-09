@@ -41,9 +41,30 @@ import uuid
 import pytest
 from app.models.fork import ForkConnection, ForkVersion, ReservationFork
 from app.routes.forks import _load_fork
-from app.services.fork_save_service import save_fork
+from app.services.fork_save_service import resolve_canvas_wiring
+from app.services.fork_save_service import save_fork as _real_save_fork
+from app.services.l3_intent import parse_l3_intent
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+async def save_fork(db, fork, canvas_data, member_device_ids, **kwargs):
+    """Test convenience wrapper: save_fork's signature now takes an
+    already-resolved wiring and already-parsed intent (R3 review fix on
+    2ade362c moved the resolve/gate to the caller, before the FOR UPDATE load
+    this file exists to test). Neither race scenario here carries L3 intent."""
+    wiring_resolution = await resolve_canvas_wiring(db, canvas_data)
+    intended_routes = parse_l3_intent(canvas_data)
+    return await _real_save_fork(
+        db,
+        fork,
+        canvas_data=canvas_data,
+        member_device_ids=member_device_ids,
+        wiring_resolution=wiring_resolution,
+        intended_routes=intended_routes,
+        **kwargs,
+    )
+
 
 DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
 PG_DSN = os.getenv(

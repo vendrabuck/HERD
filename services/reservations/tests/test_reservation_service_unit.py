@@ -1949,6 +1949,35 @@ async def test_create_reservation_fork_raises_membership_refused_on_any_409():
 
 
 @pytest.mark.asyncio
+async def test_create_reservation_fork_raises_membership_refused_on_422():
+    """R4 review fix on 2ade362c: the 409 branch generalizes to ANY 4xx
+    (400 <= status < 500), not just 409. A 422 (a request-shape refusal
+    unrelated to L3, which ADR 0014 phase 1 removed from fork create entirely)
+    is still cabling's definitive refusal, not a transient failure, and must not
+    be retried."""
+    detail = {"error": "some_shape_refusal"}
+    mock_resp = MagicMock()
+    mock_resp.status_code = 422
+    mock_resp.json.return_value = {"detail": detail}
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("app.services.reservation_service.settings") as mock_settings,
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cabling:8000"
+        with pytest.raises(ForkMembershipRefused) as excinfo:
+            await _create_reservation_fork(uuid.uuid4(), uuid.uuid4())
+
+    assert excinfo.value.device_ids == []
+    assert excinfo.value.detail == detail
+
+
+@pytest.mark.asyncio
 async def test_fork_best_effort_swallows_exhausted_retries():
     """A fork-create that fails every retry is logged and swallowed: it must NOT
     raise out and strand the provisioned reservation."""

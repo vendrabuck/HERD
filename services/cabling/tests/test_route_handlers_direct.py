@@ -1373,7 +1373,7 @@ async def test_import_unexpected_exception_rejects_row():
             new=AsyncMock(return_value={}),
         ):
             with patch(
-                "app.routes.topologies._run_topology_validation",
+                "app.services.topology_validation.run_full_topology_validation",
                 new=AsyncMock(side_effect=RuntimeError("kaboom")),
             ):
                 # not a dry run, so the loop rolls back and records the failure.
@@ -1398,7 +1398,7 @@ async def test_import_http_exception_inside_loop_rejects_row():
             new=AsyncMock(return_value={}),
         ):
             with patch(
-                "app.routes.topologies._run_topology_validation",
+                "app.services.topology_validation.run_full_topology_validation",
                 new=AsyncMock(side_effect=HTTPException(status_code=400, detail="nope")),
             ):
                 report = await bulk_service.import_topologies(
@@ -2109,7 +2109,8 @@ async def test_list_active_forks_handler_reports_latest_version_per_fork():
     (routes/forks.py lines 143-181)."""
     from app.config import settings
     from app.routes.forks import list_active_forks_internal
-    from app.services.fork_save_service import save_fork
+    from app.services.fork_save_service import resolve_canvas_wiring, save_fork
+    from app.services.l3_intent import parse_l3_intent
 
     a, b = uuid.uuid4(), uuid.uuid4()
     saved_rid, fresh_rid = uuid.uuid4(), uuid.uuid4()
@@ -2135,8 +2136,16 @@ async def test_list_active_forks_handler_reports_latest_version_per_fork():
             ],
             "edges": [{"id": "e0", "source": "n0", "target": "n1"}],
         }
+        wiring_resolution = await resolve_canvas_wiring(db, canvas)
+        intended_routes = parse_l3_intent(canvas)
         result = await save_fork(
-            db, saved_fork, canvas_data=canvas, member_device_ids={a, b}, created_by="tester"
+            db,
+            saved_fork,
+            canvas_data=canvas,
+            member_device_ids={a, b},
+            wiring_resolution=wiring_resolution,
+            intended_routes=intended_routes,
+            created_by="tester",
         )
     assert result.version_number == 2
 

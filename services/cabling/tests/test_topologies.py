@@ -1,7 +1,7 @@
 import uuid
 from unittest.mock import patch
 
-import app.routes.topologies as topologies_module
+import app.services.topology_validation as topology_validation_module
 import pytest
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload, require_admin
@@ -1048,13 +1048,13 @@ async def test_validate_topology_element_attachment_valid_no_bfs(user_client):
     await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
 
     seen_pairs: list[list] = []
-    real = topologies_module.find_all_shortest_paths_batch_async
+    real = topology_validation_module.find_all_shortest_paths_batch_async
 
     async def _spy(graph, pairs):
         seen_pairs.append(list(pairs))
         return await real(graph, pairs)
 
-    with patch("app.routes.topologies.find_all_shortest_paths_batch_async", _spy):
+    with patch("app.services.topology_validation.find_all_shortest_paths_batch_async", _spy):
         resp = await user_client.post(f"/topologies/{topology_id}/validate")
 
     assert resp.status_code == 200

@@ -16,7 +16,10 @@ from app.models.fork import (
     ReservationFork,
 )
 from app.models.topology import Topology, TopologyVersion
+from app.services.fork_save_service import resolve_canvas_wiring
+from app.services.fork_save_service import save_fork as _real_save_fork
 from app.services.fork_service import create_fork
+from app.services.l3_intent import parse_l3_intent
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +29,25 @@ INTERNAL_TOKEN = "test-internal-token"
 
 test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
 TestSessionLocal = async_sessionmaker(test_engine, expire_on_commit=False)
+
+
+async def save_fork(db, fork, canvas_data, member_device_ids, **kwargs):
+    """Test convenience wrapper (R3 review fix on 2ade362c changed save_fork's
+    signature to take an already-resolved wiring and already-parsed intent,
+    since the real caller now resolves and gates BEFORE taking the fork row
+    lock). None of the tests in this file exercise L3 intent, so this always
+    resolves fresh and parses an always-empty intent."""
+    wiring_resolution = await resolve_canvas_wiring(db, canvas_data)
+    intended_routes = parse_l3_intent(canvas_data)
+    return await _real_save_fork(
+        db,
+        fork,
+        canvas_data=canvas_data,
+        member_device_ids=member_device_ids,
+        wiring_resolution=wiring_resolution,
+        intended_routes=intended_routes,
+        **kwargs,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1804,8 +1826,6 @@ async def test_save_fork_rolls_back_between_release_and_build():
     """
     from unittest.mock import patch
 
-    from app.services.fork_save_service import save_fork
-
     a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     await _make_physical(a, "a1", c, "c0")
@@ -2097,8 +2117,6 @@ async def test_save_fork_retries_on_version_conflict():
     """
     from unittest.mock import patch
 
-    from app.services.fork_save_service import save_fork
-
     a, b = uuid.uuid4(), uuid.uuid4()
     await _make_physical(a, "a0", b, "b0")
     rid = uuid.uuid4()
@@ -2165,7 +2183,6 @@ async def test_save_fork_port_claim_query_reruns_on_retry():
     """
     from unittest.mock import patch
 
-    from app.services.fork_save_service import save_fork
     from fastapi import HTTPException
 
     a, b, z = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()

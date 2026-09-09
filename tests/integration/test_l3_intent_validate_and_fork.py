@@ -10,19 +10,18 @@ fixtures do not cross test modules without a shared conftest plugin), each
 uploading its own uniquely-named driver so running both files together is safe.
 """
 
-import io
 import os
-import tarfile
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import httpx
 import pytest
 
-pytestmark = pytest.mark.asyncio
+from ._l3_helpers import create_connection as _create_connection
+from ._l3_helpers import create_device as _create_device
+from ._l3_helpers import create_l3_driver, create_l3_template
 
-_MOCK_L3_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l3"
+pytestmark = pytest.mark.asyncio
 
 # The Layer 3 Switch config schema (services/common/herd_common/device_config.py)
 # requires "zone" on every interfaces item (additionalProperties: False, "name"
@@ -35,31 +34,20 @@ VALID_ROUTE = {"destination": "10.20.0.0/24", "next_hop": "10.0.0.2", "interface
 BAD_DESTINATION_ROUTE = {"destination": "not-an-ip", "interface": "eth0"}
 
 
-def _mock_l3_tarball() -> bytes:
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for name in ("driver.py", "driver_metadata.json"):
-            tf.add(_MOCK_L3_DIR / name, arcname=name)
-    return buf.getvalue()
-
-
 @pytest.fixture(scope="session")
 async def l3_driver(base_url, admin_token):
+    """Re-declared locally (session-scoped fixtures do not cross test modules
+    without a shared conftest plugin), uploading its own uniquely-named driver
+    so running this file alongside test_l3_route_provisioning.py is safe. The
+    upload/teardown logic itself lives in _l3_helpers.py (R9 review fix on
+    2ade362c: moved, not copied, from test_l3_route_provisioning.py)."""
     async with httpx.AsyncClient(
         base_url=base_url,
         verify=False,
         timeout=30.0,
         headers={"Authorization": f"Bearer {admin_token}"},
     ) as client:
-        files = {"file": ("mock_l3.tar.gz", _mock_l3_tarball(), "application/gzip")}
-        data = {
-            "name": f"mock-l3-intent-{uuid.uuid4().hex[:8]}",
-            "connection_type": "Layer 3 Switch",
-            "description": "integration mock L3 switch driver (intent tests)",
-        }
-        resp = await client.post("/inventory/drivers", files=files, data=data)
-        resp.raise_for_status()
-        driver = resp.json()
+        driver = await create_l3_driver(client, f"mock-l3-intent-{uuid.uuid4().hex[:8]}")
         yield driver
         await client.delete(f"/inventory/drivers/{driver['id']}")
 
@@ -72,54 +60,11 @@ async def l3_template(base_url, admin_token, l3_driver):
         timeout=30.0,
         headers={"Authorization": f"Bearer {admin_token}"},
     ) as client:
-        payload = {
-            "name": f"mock-l3-intent-tmpl-{uuid.uuid4().hex[:8]}",
-            "template_type": "device",
-            "driver_id": l3_driver["id"],
-            "vendor": "IntegrationVendor",
-            "model": "MockL3Switch",
-            "sections": [
-                {
-                    "name": "General",
-                    "fields": [{"key": "model", "label": "Model", "type": "string"}],
-                }
-            ],
-        }
-        resp = await client.post("/inventory/templates", json=payload)
-        resp.raise_for_status()
-        template = resp.json()
+        template = await create_l3_template(
+            client, l3_driver["id"], f"mock-l3-intent-tmpl-{uuid.uuid4().hex[:8]}"
+        )
         yield template
         await client.delete(f"/inventory/templates/{template['id']}")
-
-
-async def _create_device(client, template_id: str, name: str) -> dict:
-    resp = await client.post(
-        "/inventory/devices",
-        json={
-            "name": name,
-            "template_id": template_id,
-            "topology_type": "PHYSICAL",
-            "status": "AVAILABLE",
-            "field_data": {"model": "test"},
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _create_connection(client, dut_id: str, switch_id: str, switch_port: str) -> dict:
-    resp = await client.post(
-        "/cabling/connections",
-        json={
-            "device_a_id": dut_id,
-            "port_a": "eth0",
-            "device_b_id": switch_id,
-            "port_b": switch_port,
-            "connection_type": "L1",
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
 
 
 def _canvas_with_l3(dut_id: str, switch_id: str, routes: list[dict] | None) -> dict:
@@ -185,21 +130,31 @@ async def _create_reservation(client, device_ids: list[str], topology_id: str) -
     return resp.json()
 
 
-async def test_validate_valid_l3_intent(admin_client, l3_template, fresh_device):
-    """A topology whose switch carries one valid route validates true, with an
-    empty invalid_routes list."""
+@pytest.fixture
+async def l3_switch(admin_client, l3_template):
+    """A Layer 3 Switch device with a config version publishing INTERFACES: the
+    setup every test in this file repeats (R9 review fix on 2ade362c). Deleted
+    on teardown, after the test's own finally block has released whatever it
+    cabled or topologized against this device."""
     switch = await _create_device(
         admin_client, l3_template["id"], f"mock-l3-intent-{uuid.uuid4().hex[:8]}"
     )
+    await _create_config_version(admin_client, switch["id"], INTERFACES)
+    yield switch
+    await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+async def test_validate_valid_l3_intent(admin_client, l3_switch, fresh_device):
+    """A topology whose switch carries one valid route validates true, with an
+    empty invalid_routes list."""
     connection = None
     topology_id = None
     try:
-        await _create_config_version(admin_client, switch["id"], INTERFACES)
         connection = await _create_connection(
-            admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
+            admin_client, fresh_device["id"], l3_switch["id"], "ge-0/0/1"
         )
         topology_id = await _create_topology(
-            admin_client, _canvas_with_l3(fresh_device["id"], switch["id"], [VALID_ROUTE])
+            admin_client, _canvas_with_l3(fresh_device["id"], l3_switch["id"], [VALID_ROUTE])
         )
 
         resp = await admin_client.post(f"/cabling/topologies/{topology_id}/validate")
@@ -212,24 +167,19 @@ async def test_validate_valid_l3_intent(admin_client, l3_template, fresh_device)
             await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
-async def test_validate_bad_destination_reports_reason(admin_client, l3_template, fresh_device):
+async def test_validate_bad_destination_reports_reason(admin_client, l3_switch, fresh_device):
     """A topology with a bad destination reports l3_bad_destination and is invalid."""
-    switch = await _create_device(
-        admin_client, l3_template["id"], f"mock-l3-intent-{uuid.uuid4().hex[:8]}"
-    )
     connection = None
     topology_id = None
     try:
-        await _create_config_version(admin_client, switch["id"], INTERFACES)
         connection = await _create_connection(
-            admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
+            admin_client, fresh_device["id"], l3_switch["id"], "ge-0/0/1"
         )
         topology_id = await _create_topology(
             admin_client,
-            _canvas_with_l3(fresh_device["id"], switch["id"], [BAD_DESTINATION_ROUTE]),
+            _canvas_with_l3(fresh_device["id"], l3_switch["id"], [BAD_DESTINATION_ROUTE]),
         )
 
         resp = await admin_client.post(f"/cabling/topologies/{topology_id}/validate")
@@ -238,38 +188,33 @@ async def test_validate_bad_destination_reports_reason(admin_client, l3_template
         assert body["valid"] is False
         assert len(body["invalid_routes"]) == 1
         assert body["invalid_routes"][0]["reason"] == "l3_bad_destination"
-        assert body["invalid_routes"][0]["device_id"] == switch["id"]
+        assert body["invalid_routes"][0]["device_id"] == l3_switch["id"]
     finally:
         if topology_id:
             await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
 async def test_commit_reservation_reads_l3_routes_back_and_survives_cancel_archive(
-    admin_client, base_url, l3_template, fresh_device
+    admin_client, base_url, l3_switch, fresh_device
 ):
     """Committing a reservation against a validly-routed topology resolves the
     intent into the fork; GET /reservations/{id}/fork reads it back. Cancelling
     archives the fork and the rows remain, readable via cabling's internal GET.
     """
-    switch = await _create_device(
-        admin_client, l3_template["id"], f"mock-l3-intent-{uuid.uuid4().hex[:8]}"
-    )
     connection = None
     topology_id = None
     reservation_id = None
     try:
-        await _create_config_version(admin_client, switch["id"], INTERFACES)
         connection = await _create_connection(
-            admin_client, fresh_device["id"], switch["id"], "ge-0/0/1"
+            admin_client, fresh_device["id"], l3_switch["id"], "ge-0/0/1"
         )
         topology_id = await _create_topology(
-            admin_client, _canvas_with_l3(fresh_device["id"], switch["id"], [VALID_ROUTE])
+            admin_client, _canvas_with_l3(fresh_device["id"], l3_switch["id"], [VALID_ROUTE])
         )
         reservation = await _create_reservation(
-            admin_client, [fresh_device["id"], switch["id"]], topology_id
+            admin_client, [fresh_device["id"], l3_switch["id"]], topology_id
         )
         reservation_id = reservation["id"]
 
@@ -278,7 +223,7 @@ async def test_commit_reservation_reads_l3_routes_back_and_survives_cancel_archi
         fork_body = fork_resp.json()
         assert len(fork_body["l3_routes"]) == 1
         route = fork_body["l3_routes"][0]
-        assert route["device_id"] == switch["id"]
+        assert route["device_id"] == l3_switch["id"]
         assert route["destination"] == VALID_ROUTE["destination"]
         assert route["next_hop"] == VALID_ROUTE["next_hop"]
         assert route["interface"] == VALID_ROUTE["interface"]
@@ -304,4 +249,3 @@ async def test_commit_reservation_reads_l3_routes_back_and_survives_cancel_archi
             await admin_client.delete(f"/cabling/topologies/{topology_id}")
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")

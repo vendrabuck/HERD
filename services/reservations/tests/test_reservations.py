@@ -2226,7 +2226,11 @@ async def test_update_reservation_device_change_valid_topology_succeeds(client):
         patch_resp = await client.patch(f"/{res_id}", json={"device_ids": new_ids})
     assert patch_resp.status_code == 200
     assert len(patch_resp.json()["device_ids"]) == 2
-    validate_mock.assert_awaited_once_with(uuid.UUID(topo_id), [uuid.UUID(d) for d in new_ids])
+    # check_routes=False (R11 review fix, ADR 0014 phase 1, issue #34): a
+    # device-set PATCH judges only physical connectivity, never L3 routing intent.
+    validate_mock.assert_awaited_once_with(
+        uuid.UUID(topo_id), [uuid.UUID(d) for d in new_ids], check_routes=False
+    )
 
 
 @pytest.mark.asyncio

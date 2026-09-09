@@ -1,15 +1,23 @@
 """Unit tests for the Layer 3 routing-intent resolver and write paths (ADR 0014
-phase 1, issue #34): the fork_l3_routes model, the set-arithmetic reconcile in
-fork_save_service.save_fork and fork_service.create_fork, device-removal pruning,
-the internal GET's l3_routes field, and the version-race retry reapply.
+phase 1, issue #34; R1-R4, R8, R10, R12 review fixes on 2ade362c): the
+fork_l3_routes model, the set-arithmetic reconcile in fork_save_service.save_fork
+and fork_service.create_fork, device-removal pruning, the internal GET's
+l3_routes field, and the version-race retry reapply.
 
 Mirrors test_forks.py's fixtures and helpers (its own in-memory engine, ASGI
-client, `_canvas`/`_members`/`_make_physical` idioms). `gate_l3_intent` (the L3
-validation-and-refuse gate) is patched to a no-op for tests that exercise the
-resolver's own set arithmetic, since that pass is already covered end to end by
-test_l3_validation.py; the refusal-propagation tests below patch it to raise
-instead, to prove save_fork/create_fork honor the refusal without re-testing
-validation reasons here.
+client, `_canvas`/`_members`/`_make_physical` idioms).
+
+R3 moved the L3 gate (`gate_l3_intent`) OUT of `save_fork` entirely: the route
+handler (`save_fork_internal`) now resolves the canvas and gates BEFORE taking
+the fork row lock, then calls `save_fork` with the already-resolved wiring and
+already-gated intent. So most tests here call `save_fork`/`create_fork` directly
+with a locally resolved `wiring_resolution`/`intended_routes`, exercising the
+resolver's own set arithmetic with no gate and no inventory double involved at
+all. The handful of tests that need the REAL gate to run (the ASGI-client tests
+against `/internal/forks/{id}/save`) patch `app.routes.forks.gate_l3_intent` to a
+pass-through that parses the real intent but skips the inventory-backed
+validation call, since this file's concern is the resolver and the write paths,
+not validation reasons (that is test_l3_validation.py's job).
 """
 
 import uuid
@@ -21,11 +29,15 @@ from app.database import Base, get_db
 from app.main import app
 from app.models.connection import Connection
 from app.models.fork import ForkL3Route, ForkVersion, ReservationFork
-from app.schemas.topology import TopologyValidationResponse
+from app.schemas.topology import InvalidRoute
 from app.services.fork_save_service import gate_l3_intent as _real_gate_l3_intent
-from app.services.fork_save_service import reconcile_l3_route_sets, save_fork
+from app.services.fork_save_service import (
+    reconcile_l3_route_sets,
+    resolve_canvas_wiring,
+)
+from app.services.fork_save_service import save_fork as _real_save_fork
 from app.services.fork_service import create_fork
-from app.services.l3_intent import RouteSpec
+from app.services.l3_intent import RouteSpec, parse_l3_intent
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -51,19 +63,6 @@ async def setup_db():
 def _internal_token(monkeypatch):
     monkeypatch.setattr(settings, "internal_api_token", INTERNAL_TOKEN)
     yield
-
-
-@pytest.fixture(autouse=True)
-def _no_op_l3_gate():
-    """Every test in this file exercises the resolver, not the validation gate
-    (that is test_l3_validation.py's job); default the gate to a pass-through so
-    a canvas with data.l3 does not need a real inventory double here. Individual
-    refusal tests override this with their own patch."""
-    with (
-        patch("app.services.fork_save_service.gate_l3_intent", new=AsyncMock(return_value=None)),
-        patch("app.services.fork_service.gate_l3_intent", new=AsyncMock(return_value=None)),
-    ):
-        yield
 
 
 def _hdr() -> dict:
@@ -129,6 +128,26 @@ async def _make_active_fork(reservation_id: uuid.UUID) -> uuid.UUID:
         db.add(ForkVersion(fork_id=fork.id, version_number=1))
         await db.commit()
         return fork.id
+
+
+async def save_fork(db, fork, canvas_data, member_device_ids, **kwargs):
+    """Test convenience wrapper (R3): save_fork no longer resolves the canvas or
+    gates intent itself; the caller (the route, in production; this helper, in
+    tests that do not care about gating) does both. Every test using this helper
+    exercises the resolver's own set arithmetic; the gate's own behavior is
+    covered separately (the `test_gate_l3_intent_*` section below and the
+    ASGI-client tests against the real `/save` route)."""
+    wiring_resolution = await resolve_canvas_wiring(db, canvas_data)
+    intended_routes = parse_l3_intent(canvas_data)
+    return await _real_save_fork(
+        db,
+        fork,
+        canvas_data=canvas_data,
+        member_device_ids=member_device_ids,
+        wiring_resolution=wiring_resolution,
+        intended_routes=intended_routes,
+        **kwargs,
+    )
 
 
 ROUTE_A = {"destination": "10.0.0.0/24", "interface": "eth0"}
@@ -200,7 +219,20 @@ def test_reconcile_l3_move_across_devices_is_release_plus_build():
     assert unchanged == 0
 
 
-# --- create_fork inserts rows ---
+def test_reconcile_l3_deterministic_ordering():
+    """R8: reconcile_by_identity sorts both output lists by identity key, so two
+    runs over the same (unordered) input produce the same order."""
+    d1, d2 = sorted([uuid.uuid4(), uuid.uuid4()], key=str)
+    intended = {
+        d2: [RouteSpec("10.0.0.0/24", None, "eth0", None)],
+        d1: [RouteSpec("10.0.0.0/24", None, "eth0", None)],
+    }
+    _, to_build_1, _ = reconcile_l3_route_sets([], intended)
+    _, to_build_2, _ = reconcile_l3_route_sets([], intended)
+    assert [d for d, _ in to_build_1] == [d for d, _ in to_build_2] == [d1, d2]
+
+
+# --- create_fork inserts rows (R4: tolerant parse, no gate) ---
 
 
 @pytest.mark.asyncio
@@ -240,6 +272,77 @@ async def test_create_fork_inserts_l3_routes():
     assert {r.route_key for r in rows} == {"10.0.0.0/24|eth0|", "10.1.0.0/24|eth1|10.0.0.2"}
     assert all(r.device_id == switch for r in rows)
     assert all(r.created_by == "system" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_create_fork_drops_malformed_node_with_warning_writes_other_routes(caplog):
+    """R4: create_fork never gates or refuses. A malformed node's data.l3 is
+    dropped (logged at WARNING, naming the node) and every well-formed route on
+    other nodes is still written as booked."""
+    from app.models.topology import Topology, TopologyVersion
+
+    good, bad = uuid.uuid4(), uuid.uuid4()
+    canvas = {
+        "nodes": [
+            {"id": "n0", "data": {"device": {"id": str(good)}, "l3": {"routes": [ROUTE_A]}}},
+            {"id": "n1", "data": {"device": {"id": str(bad)}, "l3": {"bad": "shape"}}},
+        ],
+        "edges": [],
+    }
+    async with TestSessionLocal() as db:
+        topo = Topology(name="parent", created_by=uuid.uuid4(), canvas_data=canvas)
+        db.add(topo)
+        await db.flush()
+        db.add(
+            TopologyVersion(
+                topology_id=topo.id,
+                version_number=1,
+                canvas_data=canvas,
+                name="parent",
+                created_by=uuid.uuid4(),
+            )
+        )
+        await db.commit()
+        topo_id = topo.id
+
+    rid = uuid.uuid4()
+    with caplog.at_level("WARNING", logger="app.services.l3_intent"):
+        async with TestSessionLocal() as db:
+            fork = await create_fork(
+                db,
+                reservation_id=rid,
+                parent_topology_id=topo_id,
+                parent_version_id=None,
+                member_device_ids={good, bad},
+            )
+            fork_id = fork.id
+
+    rows = await _l3_rows(fork_id)
+    assert {r.device_id for r in rows} == {good}
+    assert any("n1" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_create_fork_makes_no_inventory_call():
+    """R4: create_fork's tolerant parse makes no HTTP call at all (no gate, no
+    validate_canvas_l3), regardless of what data.l3 the parent canvas carries."""
+    switch = uuid.uuid4()
+    canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
+    rid = uuid.uuid4()
+    with patch(
+        "app.services.fork_service.resolve_canvas_wiring",
+        wraps=resolve_canvas_wiring,
+    ):
+        with patch("app.services.l3_validation.call_service") as call_service_mock:
+            async with TestSessionLocal() as db:
+                await create_fork(
+                    db,
+                    reservation_id=rid,
+                    parent_topology_id=None,
+                    parent_version_id=None,
+                    member_device_ids=_members(canvas),
+                )
+    call_service_mock.assert_not_called()
 
 
 # --- save_fork: build / release / unchanged, counts, DB rows ---
@@ -342,99 +445,25 @@ async def test_save_fork_move_across_devices_end_to_end():
     assert rows[0].device_id == device_b
 
 
-# --- Save refuses invalid intent: 409 shape, no version appended ---
-
-
 @pytest.mark.asyncio
-async def test_save_fork_refuses_invalid_intent_with_409_and_appends_no_version():
+async def test_save_fork_empty_routes_list_is_no_intent():
+    """R10: a node whose data.l3 is {"routes": []} builds and releases nothing."""
     switch = uuid.uuid4()
     fork_id = await _make_active_fork(uuid.uuid4())
     canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
-
-    refusal = HTTPException(
-        status_code=409,
-        detail={
-            "error": "l3_intent_invalid",
-            "invalid_routes": [
-                {
-                    "node_id": "n0",
-                    "device_id": str(switch),
-                    "index": 0,
-                    "reason": "l3_bad_destination",
-                    "detail": None,
-                }
-            ],
-        },
-    )
     async with TestSessionLocal() as db:
         fork = await db.get(ReservationFork, fork_id)
-        with patch(
-            "app.services.fork_save_service.gate_l3_intent",
-            new=AsyncMock(side_effect=refusal),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await save_fork(db, fork, canvas_data=canvas, member_device_ids=_members(canvas))
+        await save_fork(db, fork, canvas_data=canvas, member_device_ids=_members(canvas))
 
-    assert exc.value.status_code == 409
-    assert exc.value.detail["error"] == "l3_intent_invalid"
-    assert await _l3_rows(fork_id) == []
+    empty_canvas = _l3_canvas([(switch, {"routes": []})])
     async with TestSessionLocal() as db:
-        versions = (
-            (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
-            .scalars()
-            .all()
+        fork = await db.get(ReservationFork, fork_id)
+        result = await save_fork(
+            db, fork, canvas_data=empty_canvas, member_device_ids=_members(empty_canvas)
         )
-    assert [v.version_number for v in versions] == [1]  # only the seeded v1, no v2
-
-
-@pytest.mark.asyncio
-async def test_save_fork_malformed_intent_is_422():
-    switch = uuid.uuid4()
-    fork_id = await _make_active_fork(uuid.uuid4())
-    canvas = _l3_canvas([(switch, {"bad": "shape"})])
-
-    refusal = HTTPException(
-        status_code=422,
-        detail={"error": "l3_intent_malformed", "node_id": "n0", "message": "bad shape"},
-    )
-    async with TestSessionLocal() as db:
-        fork = await db.get(ReservationFork, fork_id)
-        with patch(
-            "app.services.fork_save_service.gate_l3_intent",
-            new=AsyncMock(side_effect=refusal),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await save_fork(db, fork, canvas_data=canvas, member_device_ids=_members(canvas))
-
-    assert exc.value.status_code == 422
-    assert exc.value.detail["error"] == "l3_intent_malformed"
-
-
-@pytest.mark.asyncio
-async def test_create_fork_refuses_invalid_intent_writes_no_row():
-    switch = uuid.uuid4()
-    canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
-    rid = uuid.uuid4()
-
-    refusal = HTTPException(
-        status_code=409, detail={"error": "l3_intent_invalid", "invalid_routes": []}
-    )
-    async with TestSessionLocal() as db:
-        with patch("app.services.fork_service.gate_l3_intent", new=AsyncMock(side_effect=refusal)):
-            with pytest.raises(HTTPException) as exc:
-                await create_fork(
-                    db,
-                    reservation_id=rid,
-                    parent_topology_id=None,
-                    parent_version_id=None,
-                    member_device_ids=_members(canvas),
-                )
-    assert exc.value.status_code == 409
-    async with TestSessionLocal() as db:
-        fork = (
-            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
-        ).scalar_one_or_none()
-    assert fork is None
+    assert result.l3_routes_built == 0
+    assert result.l3_routes_released == 1  # the previously-built ROUTE_A releases
+    assert await _l3_rows(fork_id) == []
 
 
 # --- Prune deletes the removed device's rows ---
@@ -537,99 +566,245 @@ async def test_save_fork_l3_reconcile_reapplies_on_version_race_retry():
     assert len(rows) == 1  # not double-inserted by the retry
 
 
-# --- gate_l3_intent placement and short-circuit (coordinator review fix on
-# 2ade362c): the gate must run OUTSIDE the fork row lock / port-claim locks and
-# must not repeat inventory calls on a version-race retry, and it must not call
-# _run_topology_validation at all when the canvas carries no L3 intent. These
-# tests use the REAL gate_l3_intent (the module fixture above no-ops it for
-# every other test in this file), restoring it for just their own scope.
+# --- gate_l3_intent: parse/short-circuit behavior (R3, R8) ---
+#
+# gate_l3_intent no longer resolves wiring itself (R3): it takes an
+# already-computed CanvasWiringResolution. These tests call it directly with a
+# freshly resolved wiring (no fork, no lock involved at all: the whole point of
+# R3 is that the gate needs neither).
 
 
 @pytest.mark.asyncio
-async def test_save_fork_no_l3_data_makes_no_validation_or_inventory_call():
-    """A canvas with no data.l3 anywhere never calls _run_topology_validation:
-    a fork save has never validated physical edge paths and must not start."""
+async def test_gate_l3_intent_no_l3_data_returns_empty_with_no_validation_call():
     switch = uuid.uuid4()
-    fork_id = await _make_active_fork(uuid.uuid4())
     canvas = _l3_canvas([(switch, None)])
-
     async with TestSessionLocal() as db:
-        fork = await db.get(ReservationFork, fork_id)
-        with (
-            patch("app.services.fork_save_service.gate_l3_intent", new=_real_gate_l3_intent),
-            patch(
-                "app.routes.topologies._run_topology_validation", new=AsyncMock()
-            ) as validate_mock,
-        ):
-            await save_fork(db, fork, canvas_data=canvas, member_device_ids=_members(canvas))
-
+        wiring_resolution = await resolve_canvas_wiring(db, canvas)
+        with patch(
+            "app.services.fork_save_service.validate_canvas_l3", new=AsyncMock()
+        ) as validate_mock:
+            result = await _real_gate_l3_intent(db, canvas, wiring_resolution)
+    assert result == {}
     validate_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_save_fork_malformed_intent_is_422_with_no_validation_call():
-    """A malformed data.l3 shape is refused from the parse alone, with no
-    _run_topology_validation call (and therefore no inventory call)."""
+async def test_gate_l3_intent_empty_routes_list_returns_empty_with_no_validation_call():
+    """R10: {"routes": []} is no intent, so the gate short-circuits exactly like
+    the "no data.l3 at all" case."""
     switch = uuid.uuid4()
-    fork_id = await _make_active_fork(uuid.uuid4())
-    canvas = _l3_canvas([(switch, {"bad": "shape"})])
-
+    canvas = _l3_canvas([(switch, {"routes": []})])
     async with TestSessionLocal() as db:
-        fork = await db.get(ReservationFork, fork_id)
-        with (
-            patch("app.services.fork_save_service.gate_l3_intent", new=_real_gate_l3_intent),
-            patch(
-                "app.routes.topologies._run_topology_validation", new=AsyncMock()
-            ) as validate_mock,
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await save_fork(db, fork, canvas_data=canvas, member_device_ids=_members(canvas))
+        wiring_resolution = await resolve_canvas_wiring(db, canvas)
+        with patch(
+            "app.services.fork_save_service.validate_canvas_l3", new=AsyncMock()
+        ) as validate_mock:
+            result = await _real_gate_l3_intent(db, canvas, wiring_resolution)
+    assert result == {}
+    validate_mock.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_gate_l3_intent_malformed_is_422_with_no_validation_call():
+    switch = uuid.uuid4()
+    canvas = _l3_canvas([(switch, {"bad": "shape"})])
+    async with TestSessionLocal() as db:
+        wiring_resolution = await resolve_canvas_wiring(db, canvas)
+        with patch(
+            "app.services.fork_save_service.validate_canvas_l3", new=AsyncMock()
+        ) as validate_mock:
+            with pytest.raises(HTTPException) as exc:
+                await _real_gate_l3_intent(db, canvas, wiring_resolution)
     assert exc.value.status_code == 422
     assert exc.value.detail["error"] == "l3_intent_malformed"
+    assert exc.value.detail["node_id"] == "n0"
     validate_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_save_fork_validation_gate_runs_exactly_once_across_version_race_retry():
-    """Valid intent runs _run_topology_validation once per save, even when the
-    version-allocation retry loop reapplies reconcile(): proves the gate sits
-    OUTSIDE reconcile() and is not repeated by the retry."""
+async def test_gate_l3_intent_valid_intent_returns_parsed_intent():
+    """R8: on success the gate returns the SAME parsed intent the caller goes on
+    to reconcile with, so a caller never parses the canvas twice."""
     switch = uuid.uuid4()
-    fork_id = await _make_active_fork(uuid.uuid4())
     canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
-
-    validate_mock = AsyncMock(
-        return_value=TopologyValidationResponse(valid=True, invalid_edges=[], invalid_routes=[])
-    )
-
     async with TestSessionLocal() as db:
-        fork = await db.get(ReservationFork, fork_id)
-        state = {"raced": False}
-        real_commit = db.commit
-
-        async def racing_commit():
-            if not state["raced"]:
-                state["raced"] = True
-                await db.rollback()
-                async with TestSessionLocal() as other:
-                    other.add(ForkVersion(fork_id=fork_id, version_number=2))
-                    await other.commit()
-                raise IntegrityError("INSERT", {}, Exception("uq_fork_versions_fork_version"))
-            return await real_commit()
-
-        with (
-            patch("app.services.fork_save_service.gate_l3_intent", new=_real_gate_l3_intent),
-            patch("app.routes.topologies._run_topology_validation", new=validate_mock),
-            patch.object(db, "commit", side_effect=racing_commit),
+        wiring_resolution = await resolve_canvas_wiring(db, canvas)
+        with patch(
+            "app.services.fork_save_service.validate_canvas_l3",
+            new=AsyncMock(return_value=[]),
         ):
-            result = await save_fork(
-                db, fork, canvas_data=canvas, member_device_ids=_members(canvas)
-            )
+            result = await _real_gate_l3_intent(db, canvas, wiring_resolution)
+    assert set(result.keys()) == {switch}
+    assert result[switch][0].route_key == "10.0.0.0/24|eth0|"
 
-    assert result.version_number == 3
-    assert result.l3_routes_built == 1
-    validate_mock.assert_awaited_once()
+
+# --- R12: the gate's 409 branch, exact shape, direct test ---
+
+
+@pytest.mark.asyncio
+async def test_gate_l3_intent_409_exact_shape_on_invalid_routes():
+    switch = uuid.uuid4()
+    canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
+    invalid = InvalidRoute(
+        node_id="n0", device_id=switch, index=0, reason="l3_bad_destination", detail=None
+    )
+    async with TestSessionLocal() as db:
+        wiring_resolution = await resolve_canvas_wiring(db, canvas)
+        with patch(
+            "app.services.fork_save_service.validate_canvas_l3",
+            new=AsyncMock(return_value=[invalid]),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await _real_gate_l3_intent(db, canvas, wiring_resolution)
+    assert exc.value.status_code == 409
+    assert exc.value.detail == {
+        "error": "l3_intent_invalid",
+        "invalid_routes": [
+            {
+                "node_id": "n0",
+                "device_id": str(switch),
+                "index": 0,
+                "reason": "l3_bad_destination",
+                "detail": None,
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_route_409_on_invalid_intent_appends_no_version(client):
+    """R12 end to end: the real /save route's gate refusal writes no
+    fork_l3_routes row and appends no fork_versions row."""
+    switch = uuid.uuid4()
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(switch)]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+
+    canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
+    invalid = InvalidRoute(
+        node_id="n0", device_id=switch, index=0, reason="l3_bad_destination", detail=None
+    )
+    with patch(
+        "app.services.fork_save_service.validate_canvas_l3",
+        new=AsyncMock(return_value=[invalid]),
+    ):
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={"canvas_data": canvas, "member_device_ids": [str(switch)]},
+            headers=_hdr(),
+        )
+    assert save_resp.status_code == 409
+    assert save_resp.json()["detail"]["error"] == "l3_intent_invalid"
+
+    get_resp = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert get_resp.json()["l3_routes"] == []
+    assert len(get_resp.json()["versions"]) == 1  # only the seeded v1
+
+
+@pytest.mark.asyncio
+async def test_save_route_422_on_malformed_intent(client):
+    switch = uuid.uuid4()
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(switch)]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+
+    canvas = _l3_canvas([(switch, {"bad": "shape"})])
+    save_resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": [str(switch)]},
+        headers=_hdr(),
+    )
+    assert save_resp.status_code == 422
+    assert save_resp.json()["detail"]["error"] == "l3_intent_malformed"
+
+
+# --- R3: lock ordering at the real /save route ---
+
+
+@pytest.mark.asyncio
+async def test_save_route_gate_runs_before_for_update_load(client):
+    """R3: the gate's inventory-backed validation call is awaited BEFORE the
+    fork row's FOR UPDATE load. Proven by patching both callables and recording
+    call order."""
+    switch = uuid.uuid4()
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(switch)]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+
+    canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
+    order: list[str] = []
+
+    async def _spy_validate(*args, **kwargs):
+        order.append("validate")
+        return []
+
+    import app.routes.forks as forks_module
+
+    real_load_fork = forks_module._load_fork
+
+    async def _spy_load_fork(db, reservation_id, *, for_update=False):
+        if for_update:
+            order.append("for_update_load")
+        return await real_load_fork(db, reservation_id, for_update=for_update)
+
+    with (
+        patch("app.services.fork_save_service.validate_canvas_l3", new=_spy_validate),
+        patch("app.routes.forks._load_fork", new=_spy_load_fork),
+    ):
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={"canvas_data": canvas, "member_device_ids": [str(switch)]},
+            headers=_hdr(),
+        )
+    assert save_resp.status_code == 200, save_resp.text
+    assert order == ["validate", "for_update_load"]
+
+
+# --- R2: the save gate reuses save_fork's own wiring_resolution (no second BFS) ---
+
+
+@pytest.mark.asyncio
+async def test_save_route_resolves_canvas_wiring_exactly_once(client):
+    switch = uuid.uuid4()
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(switch)]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+
+    canvas = _l3_canvas([(switch, {"routes": [ROUTE_A]})])
+    call_count = {"n": 0}
+    real_resolve = resolve_canvas_wiring
+
+    async def _counting_resolve(db, canvas_data):
+        call_count["n"] += 1
+        return await real_resolve(db, canvas_data)
+
+    with (
+        patch("app.routes.forks.resolve_canvas_wiring", new=_counting_resolve),
+        patch("app.services.fork_save_service.validate_canvas_l3", new=AsyncMock(return_value=[])),
+    ):
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={"canvas_data": canvas, "member_device_ids": [str(switch)]},
+            headers=_hdr(),
+        )
+    assert save_resp.status_code == 200, save_resp.text
+    assert call_count["n"] == 1
 
 
 # --- Internal GET carries l3_routes ---
@@ -647,14 +822,15 @@ async def test_internal_get_carries_l3_routes(client):
     assert resp.status_code == 201, resp.text
 
     canvas = _l3_canvas([(switch_1, {"routes": [ROUTE_B]}), (switch_2, {"routes": [ROUTE_A]})])
-    save_resp = await client.post(
-        f"/internal/forks/{rid}/save",
-        json={
-            "canvas_data": canvas,
-            "member_device_ids": [str(switch_1), str(switch_2)],
-        },
-        headers=_hdr(),
-    )
+    with patch("app.services.fork_save_service.validate_canvas_l3", new=AsyncMock(return_value=[])):
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={
+                "canvas_data": canvas,
+                "member_device_ids": [str(switch_1), str(switch_2)],
+            },
+            headers=_hdr(),
+        )
     assert save_resp.status_code == 200, save_resp.text
     assert save_resp.json()["l3_routes_built"] == 2
 

@@ -211,16 +211,19 @@ async def test_validate_topology_connectivity_invalid_edges_raises_value_error()
 
 @pytest.mark.asyncio
 async def test_validate_topology_connectivity_invalid_routes_folded_into_summary():
-    """invalid_routes entries are summarized as
-    "<device_id first 8>[<index or '-'>] (<reason>)", same message prefix as the
-    edge-only failure so existing edge-only tests keep matching."""
+    """invalid_routes entries are summarized as "<node_id>[<index or '-'>]
+    (<reason>)" in their OWN sentence (R7 review fix on 2ade362c), separate from
+    the edges-only sentence, since a routes-only failure carries no unreachable
+    edges at all."""
     device_id = str(uuid.uuid4())
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {
         "valid": False,
         "invalid_edges": [],
-        "invalid_routes": [{"device_id": device_id, "index": 0, "reason": "l3_bad_destination"}],
+        "invalid_routes": [
+            {"node_id": "n0", "device_id": device_id, "index": 0, "reason": "l3_bad_destination"}
+        ],
     }
     client = _mock_httpx_client(post_resp=resp)
     with (
@@ -229,9 +232,11 @@ async def test_validate_topology_connectivity_invalid_routes_folded_into_summary
     ):
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
-        with pytest.raises(ValueError, match="unreachable edges") as excinfo:
+        with pytest.raises(ValueError, match="invalid routing intent") as excinfo:
             await _validate_topology_connectivity(uuid.uuid4(), [])
-    assert f"{device_id[:8]}[0] (l3_bad_destination)" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "n0[0] (l3_bad_destination)" in message
+    assert "unreachable edges" not in message
 
 
 @pytest.mark.asyncio
@@ -244,7 +249,12 @@ async def test_validate_topology_connectivity_invalid_routes_switch_level_reason
         "valid": False,
         "invalid_edges": [],
         "invalid_routes": [
-            {"device_id": device_id, "index": None, "reason": "l3_switch_unattached"}
+            {
+                "node_id": "n0",
+                "device_id": device_id,
+                "index": None,
+                "reason": "l3_switch_unattached",
+            }
         ],
     }
     client = _mock_httpx_client(post_resp=resp)
@@ -256,21 +266,23 @@ async def test_validate_topology_connectivity_invalid_routes_switch_level_reason
         mock_settings.cabling_service_url = "http://cab"
         with pytest.raises(ValueError) as excinfo:
             await _validate_topology_connectivity(uuid.uuid4(), [])
-    assert f"{device_id[:8]}[-] (l3_switch_unattached)" in str(excinfo.value)
+    assert "n0[-] (l3_switch_unattached)" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
 async def test_validate_topology_connectivity_invalid_edges_and_routes_combined_first_five():
-    """Edge and route problems combine into one first-five-summaries list, edges
-    first, so an edge-only failure's message shape (and the tests pinning it) is
-    unaffected when no route problems exist."""
+    """Edge and route problems produce two joined sentences (R7 review fix on
+    2ade362c): edges keep their own first-five truncation, routes keep theirs,
+    and both sentences appear joined with "; " when both are non-empty."""
     device_id = str(uuid.uuid4())
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {
         "valid": False,
         "invalid_edges": [{"edge_id": f"e{i}", "reason": "no_path"} for i in range(4)],
-        "invalid_routes": [{"device_id": device_id, "index": 0, "reason": "l3_bad_destination"}],
+        "invalid_routes": [
+            {"node_id": "n0", "device_id": device_id, "index": 0, "reason": "l3_bad_destination"}
+        ],
     }
     client = _mock_httpx_client(post_resp=resp)
     with (
@@ -282,9 +294,10 @@ async def test_validate_topology_connectivity_invalid_edges_and_routes_combined_
         with pytest.raises(ValueError) as excinfo:
             await _validate_topology_connectivity(uuid.uuid4(), [])
     message = str(excinfo.value)
-    assert "e0 (no_path)" in message
-    assert f"{device_id[:8]}[0] (l3_bad_destination)" in message
-    assert "and" not in message  # 5 total (4 edges + 1 route): no truncation suffix
+    assert "unreachable edges in the cabling graph: e0 (no_path)" in message
+    assert "invalid routing intent: n0[0] (l3_bad_destination)" in message
+    assert "; " in message
+    assert " and " not in message  # 4 edges, 1 route: neither list truncates
 
 
 @pytest.mark.asyncio
@@ -707,7 +720,10 @@ async def test_update_reservation_remove_device_fetch_failure_assumes_exclusive(
 @pytest.mark.asyncio
 async def test_update_reservation_device_change_revalidates_topology():
     """A device-set change on a reservation that references a topology
-    re-validates connectivity before any inventory mutation."""
+    re-validates connectivity before any inventory mutation, with check_routes
+    =False (R11 review fix, ADR 0014 phase 1, issue #34): a device-set PATCH
+    judges only physical connectivity for the revised membership, never L3
+    routing intent."""
     async with TestSessionLocal() as db:
         topo = uuid.uuid4()
         res = await _insert_reservation(db, device_ids=[DEVICE_A], topology_id=topo)
@@ -730,7 +746,7 @@ async def test_update_reservation_device_change_revalidates_topology():
                 ReservationUpdate(device_ids=[DEVICE_A, DEVICE_B]),
                 token="t",
             )
-        validate_mock.assert_awaited_once_with(topo, [DEVICE_A, DEVICE_B])
+        validate_mock.assert_awaited_once_with(topo, [DEVICE_A, DEVICE_B], check_routes=False)
 
 
 # --- cancel/release exclusive-device selection via fetched dict ---
