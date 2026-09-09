@@ -3,7 +3,7 @@
 Tracking doc for test coverage not yet implemented. Shipped work lives under
 the usual service test directories; this file is the backlog.
 
-Last audit: 2026-05-04, refreshed 2026-09-01. When you close a gap, delete the
+Last audit: 2026-05-04, refreshed 2026-09-09. When you close a gap, delete the
 entry. When a new one surfaces, add it with a severity tag (CRITICAL, HIGH,
 MEDIUM, LOW) and a concrete target file path.
 
@@ -65,7 +65,7 @@ version-history preview/restore, save-as-template, and pathfind-status reconcile
   file). Calendar rendering, month navigation, and reservation-click handling are
   all untested.
 
-Measured frontend coverage on main is 89.7% lines (1,211 tests, 129 test files).
+Measured frontend coverage on main is 90.16% lines (1,297 tests, 135 test files).
 The files below 85% lines, all predating v0.2.0, grouped by area with a note on
 what a test would still need to cover:
 

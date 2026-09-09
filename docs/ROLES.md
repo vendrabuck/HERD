@@ -47,6 +47,8 @@ in their JWT access token and enforced independently by each service.
 | View device health snapshot (single device) | yes | yes | yes |
 | List device health snapshots (all devices) | | yes | yes |
 | Set `poll_interval_seconds` on a device or template | | yes | yes |
+| Set a reservation's purpose category | creator | yes | yes |
+| Review, accept, dismiss, or backfill AI purpose suggestions | | yes | yes |
 | List all user accounts | | yes | yes |
 | Promote a user to admin | | | yes |
 | Demote an admin to user | | | yes |
@@ -955,8 +957,8 @@ Authorization: Bearer <token>   # creator or admin
 
 Each reservation gets an editable fork of its parent topology on activation, so
 live edits stay off the shared master template. The reservations service exposes
-three user-facing fork endpoints (they forward to the cabling service's internal
-fork surface). All three are owner-or-admin gated: the reservation owner, an
+five user-facing fork endpoints (they forward to the cabling service's internal
+fork surface). All five are owner-or-admin gated: the reservation owner, an
 admin, or a superadmin.
 
 Read the fork (allowed for any reservation status, so the as-built record stays
@@ -994,6 +996,18 @@ Authorization: Bearer <token>
 When the reservation ends the fork is archived to an immutable as-built record:
 the read endpoint still returns it, but the two mutations are refused.
 
+Read one past fork version's full canvas payload (any reservation status, the
+same visibility rule as the fork GET), and restore the fork's draft to a past
+version (`ACTIVE`-only, `409 {"error": "reservation_not_active"}` otherwise). Restore
+touches only the draft `canvas_data`; it appends no fork version of its own and
+wires nothing until the next save (issue #622):
+
+```
+GET  /api/reservations/{reservation_id}/fork/versions/{version_id}          # owner or admin, any status
+POST /api/reservations/{reservation_id}/fork/versions/{version_id}/restore  # owner or admin, ACTIVE only
+Authorization: Bearer <token>
+```
+
 Read the reservation's per-connection wiring status, and reattempt its
 hardware-retryable FAILED rows. After a fork save reconciles the intended
 wiring, the execution service applies each row connection-by-connection and
@@ -1030,6 +1044,43 @@ Authorization: Bearer <any-authenticated-token>
 Supports query params: `range_start` (required), `range_end` (required),
 `status` (list, optional), `device_id` (optional). Non-admin users see only
 reservations for devices visible through their device group permissions.
+
+---
+
+## Lab Purpose Classification (ADR 0013, issue #646)
+
+The configured taxonomy, open to any authenticated user:
+
+```
+GET /api/reservations/purpose-categories
+Authorization: Bearer <token>
+```
+
+Set or clear a reservation's purpose category, owner-or-admin gated, allowed
+in any status including terminal ones so past reservations can be classified
+retroactively:
+
+```
+PATCH /api/reservations/{reservation_id}/purpose-category
+Authorization: Bearer <token>   # owner or admin
+```
+
+Phase 2's AI suggestions wait for an admin on the Purpose Review page
+(`/admin/purpose-review`) rather than applying automatically. All four
+endpoints below are admin-only:
+
+```
+GET  /api/reservations/admin/purpose-review                       # paginated review queue
+POST /api/reservations/admin/purpose-review/{reservation_id}/accept    # accept the suggestion or a chosen override
+POST /api/reservations/admin/purpose-review/{reservation_id}/dismiss   # decline, keeps the suggestion for metrics
+POST /api/reservations/admin/purpose/backfill                     # mark eligible reservations for the classify sweep
+Authorization: Bearer <token>   # admin or superadmin
+```
+
+See [AI_PURPOSE_CLASSIFICATION.md](AI_PURPOSE_CLASSIFICATION.md) for the
+ai-orchestrator endpoints (`POST /api/ai/classify-purpose/preview`,
+`POST /api/ai/internal/classify-purpose`) that produce the suggestions this
+page reviews.
 
 ---
 
@@ -1278,6 +1329,22 @@ reservations service returns HTTP 503 ("Could not verify device is not in use")
 rather than silently letting the delete through. There is no force flag; cancel or
 let the blocking reservation end first.
 
+### Batch device identity and type (internal, ADR 0014)
+
+```
+POST /api/inventory/internal/devices/batch
+X-Internal-Token: <internal-api-token>
+Content-Type: application/json
+
+{ "device_ids": ["uuid-1", "uuid-2"] }
+```
+
+Feeds cabling's Layer 3 routing-intent validation pass (issue #34), which needs
+each L3-carrying switch node's `connection_type` and has no acting user to
+forward. Deliberately thinner than the public `/devices/batch` above: only id,
+name, connection_type, and status, no field_data, driver, or template detail.
+Unknown ids are omitted from the response rather than erroring.
+
 ### Materialize a dynamic instance (internal, ADR 0004)
 
 ```
@@ -1452,9 +1519,17 @@ Authorization: Bearer <admin-token>
 | `/api/reservations/{id}/fork` | GET | owner only | owner or admin | owner or admin |
 | `/api/reservations/{id}/fork/canvas` | PUT | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
 | `/api/reservations/{id}/fork/save` | POST | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
+| `/api/reservations/{id}/fork/versions/{vid}` | GET | owner only, any status | owner or admin, any status | owner or admin, any status |
+| `/api/reservations/{id}/fork/versions/{vid}/restore` | POST | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
 | `/api/reservations/{id}/wiring-status` | GET | owner only, any status | owner or admin, any status | owner or admin, any status |
 | `/api/reservations/{id}/wiring/retry` | POST | owner only, not PENDING/PENDING_PROVISION | owner or admin, not PENDING/PENDING_PROVISION | owner or admin, not PENDING/PENDING_PROVISION |
 | `/api/reservations/internal/{id}/provision-result` | POST | internal | internal | internal |
+| `/api/reservations/purpose-categories` | GET | yes | yes | yes |
+| `/api/reservations/{id}/purpose-category` | PATCH | owner only, any status | owner or admin, any status | owner or admin, any status |
+| `/api/reservations/admin/purpose-review` | GET | | yes | yes |
+| `/api/reservations/admin/purpose-review/{id}/accept` | POST | | yes | yes |
+| `/api/reservations/admin/purpose-review/{id}/dismiss` | POST | | yes | yes |
+| `/api/reservations/admin/purpose/backfill` | POST | | yes | yes |
 | `/api/reservations/reports/utilization` | GET | | yes | yes |
 | `/api/reservations/reports/utilization.csv` | GET | | yes | yes |
 | `/api/cabling/connections` | GET | yes | yes | yes |
