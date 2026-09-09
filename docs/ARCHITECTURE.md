@@ -207,6 +207,26 @@ isolated fabrics (e.g., MPLS between sites), users add a virtual device and
 cable to it, which lets the same validator stay strict about physical
 reachability.
 
+Since ADR 0014 phase 1 (issue #34), both validate endpoints also run an L3
+routing-intent pass (`validate_canvas_l3`) alongside the edge pass: a Layer 3
+Switch device node may carry `data.l3.routes` in `canvas_data`, and the pass
+judges each against inventory's live device type and config content, fetched
+in batches over the internal token (`POST /internal/devices/batch`, added for
+this pass) and per-switch config-version reads bounded by a 12s overall
+deadline (4s per call). It surfaces up to ten `invalid_routes` reasons
+(malformed shape, not a router, unconfigured, unattached, a duplicate route,
+and five per-route IP/interface checks) and fails closed with a 503
+`l3_config_unavailable` on an inventory outage rather than silently passing.
+A fork save that changes the parsed L3 intent reconciles it into a new
+`fork_l3_routes` table (cabling migration 0011, the L3 analogue of
+`fork_connections`) under the same fork row lock as the wiring reconcile;
+activation writes intent tolerantly without gating. Only saves refuse (409
+`l3_intent_invalid`, 422 `l3_intent_malformed`). The per-line layer on a canvas
+edge stays a canvas annotation only (see above); L3 routing intent is a
+separate, device-scoped construct. Editor surfacing of this intent and
+execution-side consumption of it are phases 2 and 3 of ADR 0014, not yet
+built. See [docs/design/0014-first-class-layer-3-routing.md](design/0014-first-class-layer-3-routing.md).
+
 ## Device visibility
 
 - **Admins** see every device.

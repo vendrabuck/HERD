@@ -7,9 +7,9 @@
   `data.l3.routes` on Layer 3 Switch device nodes, both fork write paths (fork
   save and fork-on-activation) reconcile the resolved route set under the
   existing fork row lock, and `/topologies/{id}/validate` and `/validate/internal`
-  gain an `invalid_routes` pass with nine refusal reasons (malformed shape, not a
-  router, unconfigured, unattached, and five per-route IP/interface checks),
-  fail-closed with a 503 `l3_config_unavailable` on an inventory outage.
+  gain an `invalid_routes` pass with ten refusal reasons (malformed shape, not a
+  router, unconfigured, unattached, duplicate route, and five per-route IP/interface
+  checks), fail-closed with a 503 `l3_config_unavailable` on an inventory outage.
   Reservations' create-time gate folds route problems into its existing
   unreachable-topology error, and the fork's resolved routes ride the internal
   and user-facing fork GET. Inventory gained an internal batch device-type
