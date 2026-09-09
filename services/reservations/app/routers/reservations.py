@@ -40,6 +40,7 @@ from app.services.reporting_service import (
 )
 from app.services.reservation_service import (
     TopologyDeviceNotMember,
+    TopologyRoutingIntentInvalid,
     _cabling_fork_call,
     _execution_wiring_call,
     _lazy_create_reservation_fork,
@@ -98,6 +99,15 @@ async def create_new_reservation(
         raise HTTPException(
             status_code=422,
             detail={"error": "topology_device_not_member", "device_ids": exc.device_ids},
+        )
+    except TopologyRoutingIntentInvalid as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "topology_routing_intent_invalid",
+                "invalid_routes": exc.invalid_routes,
+                "message": str(exc),
+            },
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -718,13 +728,16 @@ def _relay_cabling_fork_response(resp: httpx.Response) -> Any:
     valid JSON at all (a raw proxy error page, an empty body).
     """
     if resp.status_code >= 500:
-        detail = _cabling_json_detail_or_none(resp)
+        detail = _cabling_detail(resp, fallback=None)
         raise HTTPException(
             status_code=503,
             detail=detail if detail is not None else "Cabling service is unavailable",
         )
     if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=_cabling_detail(resp))
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=_cabling_detail(resp, fallback=resp.text or "Cabling request failed"),
+        )
     if resp.status_code == 204 or not resp.content:
         return None
     return resp.json()
@@ -740,34 +753,30 @@ def _relay_execution_response(resp: httpx.Response) -> Any:
     if resp.status_code >= 500:
         raise HTTPException(status_code=503, detail="Execution service is unavailable")
     if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=_cabling_detail(resp))
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=_cabling_detail(resp, fallback=resp.text or "Cabling request failed"),
+        )
     if resp.status_code == 204 or not resp.content:
         return None
     return resp.json()
 
 
-def _cabling_detail(resp: httpx.Response) -> Any:
-    """Extract cabling's error detail, unwrapping the FastAPI {"detail": ...} envelope."""
-    try:
-        body = resp.json()
-    except ValueError:
-        return resp.text or "Cabling request failed"
-    if isinstance(body, dict) and "detail" in body:
-        return body["detail"]
-    return body
-
-
-def _cabling_json_detail_or_none(resp: httpx.Response) -> Any | None:
-    """Like ``_cabling_detail``, but returns ``None`` instead of falling back to
-    ``resp.text`` when the body is not valid JSON (R4 review fix on 2ade362c):
-    the 5xx relay keeps its own generic message for a genuinely non-JSON body,
-    and must not surface a raw proxy error page as if it were a structured
-    detail.
+def _cabling_detail(resp: httpx.Response, *, fallback: Any = "Cabling request failed") -> Any:
+    """Extract cabling's error detail, unwrapping the FastAPI {"detail": ...}
+    envelope. Returns ``fallback`` when the body is not valid JSON at all (S10
+    review fix, round 2: folds the former ``_cabling_json_detail_or_none`` into
+    this one function via the flag, one unwrapper instead of two nearly
+    -identical ones). The 4xx relay uses the default (or ``resp.text``) so a
+    non-JSON 4xx body still surfaces something; the 5xx relay passes
+    ``fallback=None`` so it can keep its own generic "Cabling service is
+    unavailable" message instead of surfacing a raw proxy error page as if it
+    were a structured detail.
     """
     try:
         body = resp.json()
     except ValueError:
-        return None
+        return fallback
     if isinstance(body, dict) and "detail" in body:
         return body["detail"]
     return body
