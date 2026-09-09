@@ -9,6 +9,7 @@ uses `herd_common.internal_client.call_service`, not raw `httpx.AsyncClient`).
 inventory double or event loop at all.
 """
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -346,7 +347,7 @@ async def test_port_constrained_edge_with_no_cable_leaves_switch_unattached():
     """R2: a port-constrained edge whose named port has no matching physical
     cable resolves to no hop, so the switch it names is NOT touched even though
     an (unconstrained) edge nominally connects it in the canvas."""
-    await _seed_physical_connection()  # SWITCH<->DUT wired on eth0/eth0
+    await _seed_physical_connection()  # SWITCH to DUT wired on eth0/eth0
     canvas = {
         "nodes": [
             {"id": "dut", "data": {"device": {"id": str(DUT)}}},
@@ -510,3 +511,88 @@ async def test_503_on_missing_internal_token_short_circuits_to_l3_config_unavail
         with pytest.raises(HTTPException) as exc:
             await _validate(canvas)
     assert exc.value.status_code == 503
+
+
+# --- S12: l3_duplicate_route is informational, reported with the ORIGINAL index ---
+
+
+@pytest.mark.asyncio
+async def test_duplicate_route_reported_as_informational_and_does_not_invalidate():
+    await _seed_physical_connection()
+    canvas = _canvas(
+        {
+            "routes": [
+                {"destination": "10.0.0.0/24", "interface": "eth1"},
+                {"destination": "10.0.0.0/24", "interface": "eth1"},  # duplicate, index 1
+                {"destination": "10.20.0.0/24", "interface": "eth1", "next_hop": "10.0.0.2"},
+            ]
+        }
+    )
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(),
+        config_json=_config_with_interfaces([{"name": "eth1", "ip": "10.0.0.1/24"}]),
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    assert result.valid is True  # informational only
+    reasons = {(r.index, r.reason) for r in result.invalid_routes}
+    assert reasons == {(1, "l3_duplicate_route")}
+
+
+@pytest.mark.asyncio
+async def test_original_index_survives_a_collapse_for_a_later_bad_route():
+    """S12: a bad route AFTER a collapsed duplicate reports its ORIGINAL
+    position, not its post-collapse position."""
+    await _seed_physical_connection()
+    canvas = _canvas(
+        {
+            "routes": [
+                {"destination": "10.0.0.0/24", "interface": "eth1"},  # index 0, kept
+                {"destination": "10.0.0.0/24", "interface": "eth1"},  # index 1, duplicate
+                {"destination": "not-an-ip", "interface": "eth1"},  # index 2, bad
+            ]
+        }
+    )
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(),
+        config_json=_config_with_interfaces([{"name": "eth1", "ip": "10.0.0.1/24"}]),
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    reasons = {(r.index, r.reason) for r in result.invalid_routes}
+    assert reasons == {(1, "l3_duplicate_route"), (2, "l3_bad_destination")}
+    assert result.valid is False  # l3_bad_destination is real, unlike the duplicate
+
+
+# --- S13: deadline budget ---
+
+
+@pytest.mark.asyncio
+async def test_l3_pass_deadline_trips_into_503():
+    """A validation call that never returns (a hung inventory) trips the
+    whole-pass deadline and fails closed with 503, same shape as any other
+    L3ConfigUnavailable."""
+    from fastapi import HTTPException
+
+    await _seed_physical_connection()
+    canvas = _canvas({"routes": [{"destination": "0.0.0.0/0", "interface": "eth1"}]})
+
+    async def _hang(base_url, method, path, *, json_body=None, timeout=None, auth=None):
+        await asyncio.sleep(3600)
+
+    with (
+        patch.object(l3_validation, "call_service", AsyncMock(side_effect=_hang)),
+        patch.object(l3_validation, "_L3_PASS_DEADLINE_SECONDS", 0.05),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await _validate(canvas)
+    assert exc.value.status_code == 503
+    assert exc.value.detail == {"error": "l3_config_unavailable"}
+
+
+def test_inventory_call_timeout_constant_is_pinned():
+    assert l3_validation._INVENTORY_CALL_TIMEOUT_SECONDS == 4.0
+
+
+def test_l3_pass_deadline_constant_is_pinned():
+    assert l3_validation._L3_PASS_DEADLINE_SECONDS == 12.0

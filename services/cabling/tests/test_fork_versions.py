@@ -14,6 +14,7 @@ save consumes it" invariants.
 """
 
 import uuid
+from unittest.mock import patch
 
 import pytest
 from app.config import settings
@@ -26,6 +27,7 @@ from app.models.fork import (
     ReservationFork,
 )
 from app.models.topology import Topology, TopologyVersion
+from app.services.fork_save_service import resolve_canvas_wiring
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -518,3 +520,95 @@ async def test_get_fork_detail_exposes_draft_restored_from_id(client):
 
     after_restore = await client.get(f"/internal/forks/{rid}", headers=_hdr())
     assert after_restore.json()["draft_restored_from_id"] == str(version_id)
+
+
+# --- S1 review fix (round 2 on 2ade362c): the locked re-load must refresh ------------
+#
+# save_fork_internal loads the fork once unlocked (to check ARCHIVED before any
+# inventory calls), then again FOR UPDATE afterward. Both tests below simulate a
+# concurrent write landing in that exact window by patching
+# app.routes.forks.resolve_canvas_wiring with a side effect that opens a SECOND
+# session, mutates and commits the fork row, then returns normally:
+# resolve_canvas_wiring runs unconditionally between the two loads (unlike
+# gate_l3_intent, which S5 skips entirely for a canvas with no L3 delta, as these
+# canvases have), so it is the injection point that always fires.
+
+
+@pytest.mark.asyncio
+async def test_save_archived_during_gate_window_is_refused_with_no_version(client):
+    """Proven live by the review: without `refresh=True` on the locked re-load,
+    SQLAlchemy's identity map hands back the FIRST load's stale (non-archived)
+    object even though the second SELECT's FOR UPDATE genuinely re-reads and locks
+    the row, so a concurrent archive committed in the gap would be invisible to
+    the ARCHIVED re-check and the save would land on an archived fork. Confirms
+    the fix: 409, no fork_versions row appended."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    v1_canvas = _canvas([a, b], [(0, 1)])
+    rid, fork_id = await _create_fork_from_parent(client, v1_canvas)
+
+    real_resolve = resolve_canvas_wiring
+
+    async def _archive_during_gap(db, canvas):
+        result = await real_resolve(db, canvas)
+        async with TestSessionLocal() as other:
+            fork = (
+                await other.execute(select(ReservationFork).where(ReservationFork.id == fork_id))
+            ).scalar_one()
+            fork.status = ForkStatus_ARCHIVED
+            await other.commit()
+        return result
+
+    with patch("app.routes.forks.resolve_canvas_wiring", new=_archive_during_gap):
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={"canvas_data": v1_canvas, "member_device_ids": _members(v1_canvas)},
+            headers=_hdr(),
+        )
+    assert save_resp.status_code == 409, save_resp.text
+
+    detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert detail.json()["status"] == "ARCHIVED"
+    assert len(detail.json()["versions"]) == 1  # only the seeded v1, no v2 appended
+
+
+@pytest.mark.asyncio
+async def test_save_consumes_restore_marker_committed_during_gate_window(client):
+    """A restore marker committed by a concurrent session in the gap between the
+    unlocked and locked loads is picked up by the refreshed locked re-load, so
+    the save that follows still correctly carries it onto the appended version
+    and clears it, rather than the save's stale pre-gap copy
+    (draft_restored_from_id=None) overwriting the concurrent restore's fresh
+    marker on commit."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    v1_canvas = _canvas([a, b], [(0, 1)])
+    rid, fork_id = await _create_fork_from_parent(client, v1_canvas)
+    version_id = await _get_version_id(client, rid, 1)
+
+    real_resolve = resolve_canvas_wiring
+
+    async def _restore_during_gap(db, canvas):
+        result = await real_resolve(db, canvas)
+        async with TestSessionLocal() as other:
+            fork = (
+                await other.execute(select(ReservationFork).where(ReservationFork.id == fork_id))
+            ).scalar_one()
+            fork.draft_restored_from_id = version_id
+            await other.commit()
+        return result
+
+    with patch("app.routes.forks.resolve_canvas_wiring", new=_restore_during_gap):
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={"canvas_data": v1_canvas, "member_device_ids": _members(v1_canvas)},
+            headers=_hdr(),
+        )
+    assert save_resp.status_code == 200, save_resp.text
+    assert save_resp.json()["version_number"] == 2
+
+    detail = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    body = detail.json()
+    assert body["draft_restored_from_id"] is None
+    v2 = next(v for v in body["versions"] if v["version_number"] == 2)
+    assert v2["restored_from_id"] == str(version_id)

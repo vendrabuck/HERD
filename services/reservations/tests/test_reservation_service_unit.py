@@ -1950,11 +1950,10 @@ async def test_create_reservation_fork_raises_membership_refused_on_any_409():
 
 @pytest.mark.asyncio
 async def test_create_reservation_fork_raises_membership_refused_on_422():
-    """R4 review fix on 2ade362c: the 409 branch generalizes to ANY 4xx
-    (400 <= status < 500), not just 409. A 422 (a request-shape refusal
-    unrelated to L3, which ADR 0014 phase 1 removed from fork create entirely)
-    is still cabling's definitive refusal, not a transient failure, and must not
-    be retried."""
+    """S2 review fix, round 2 on 2ade362c: the definitive-refusal set is exactly
+    {409, 422}. A 422 (a request-shape refusal unrelated to L3, which ADR 0014
+    phase 1 removed from fork create entirely) is still cabling's definitive
+    refusal, not a transient failure, and must not be retried."""
     detail = {"error": "some_shape_refusal"}
     mock_resp = MagicMock()
     mock_resp.status_code = 422
@@ -1975,6 +1974,32 @@ async def test_create_reservation_fork_raises_membership_refused_on_422():
 
     assert excinfo.value.device_ids == []
     assert excinfo.value.detail == detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404])
+async def test_create_reservation_fork_403_and_404_raise_runtime_error(status_code):
+    """S2 review fix, round 2 on 2ade362c: every 4xx OTHER than {409, 422} stays a
+    plain RuntimeError (retried, then healed by the sweep backstop), because a
+    rotated internal token (403) or a mid-deploy route gap (404) can resolve
+    itself and must not permanently disable fork creation for the process
+    lifetime the way ForkMembershipRefused would."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.text = "boom"
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("app.services.reservation_service.settings") as mock_settings,
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=mock_client),
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cabling:8000"
+        with pytest.raises(RuntimeError):
+            await _create_reservation_fork(uuid.uuid4(), uuid.uuid4())
 
 
 @pytest.mark.asyncio

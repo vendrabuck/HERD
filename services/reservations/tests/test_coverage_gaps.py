@@ -23,6 +23,7 @@ from app.models.reservation import (
 from app.schemas.reservation import ReservationUpdate, _as_utc
 from app.services.reservation_service import (
     TopologyDeviceNotMember,
+    TopologyRoutingIntentInvalid,
     _acquire_device_locks,
     _fetch_devices_best_effort,
     _release_exclusive_devices_best_effort,
@@ -134,6 +135,27 @@ async def test_validate_topology_connectivity_valid():
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
         await _validate_topology_connectivity(uuid.uuid4(), [])
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_uses_20s_timeout():
+    """S13 review fix, round 2: this call needs headroom over cabling's own
+    12s L3-pass deadline, so it uses 20s, not the usual 10s."""
+    from app.services import reservation_service
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"valid": True}
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        await _validate_topology_connectivity(uuid.uuid4(), [])
+    assert client.post.call_args.kwargs["timeout"] == 20.0
+    assert reservation_service._VALIDATE_TOPOLOGY_TIMEOUT_SECONDS == 20.0
 
 
 @pytest.mark.asyncio
@@ -316,6 +338,106 @@ async def test_validate_topology_connectivity_503_from_cabling_raises_runtime():
         mock_settings.internal_api_token = "tok"
         mock_settings.cabling_service_url = "http://cab"
         with pytest.raises(RuntimeError, match="Cabling validation returned 503"):
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+
+
+# --- S8 review fix, round 2: structured TopologyRoutingIntentInvalid ---
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_routes_only_raises_structured_type():
+    """A routes-only failure raises TopologyRoutingIntentInvalid (a ValueError
+    subclass), carrying the raw invalid_routes list."""
+    device_id = str(uuid.uuid4())
+    raw_invalid_routes = [
+        {"node_id": "n0", "device_id": device_id, "index": 0, "reason": "l3_bad_destination"}
+    ]
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": False,
+        "invalid_edges": [],
+        "invalid_routes": raw_invalid_routes,
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(TopologyRoutingIntentInvalid) as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+    assert excinfo.value.invalid_routes == raw_invalid_routes
+    assert "n0[0] (l3_bad_destination)" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_edges_only_raises_plain_value_error():
+    """An edges-only failure keeps raising a plain ValueError, NOT
+    TopologyRoutingIntentInvalid, so an edge-only failure never carries a
+    (necessarily empty) invalid_routes list through the structured type."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": False,
+        "invalid_edges": [{"edge_id": "e0", "reason": "no_path"}],
+        "invalid_routes": [],
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(ValueError) as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+    assert not isinstance(excinfo.value, TopologyRoutingIntentInvalid)
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_both_failing_raises_structured_type():
+    """Both edges and routes failing still raises TopologyRoutingIntentInvalid
+    (routes win the type), with the edge summary folded into its message."""
+    device_id = str(uuid.uuid4())
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "valid": False,
+        "invalid_edges": [{"edge_id": "e0", "reason": "no_path"}],
+        "invalid_routes": [
+            {"node_id": "n0", "device_id": device_id, "index": 0, "reason": "l3_bad_destination"}
+        ],
+    }
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(TopologyRoutingIntentInvalid) as excinfo:
+            await _validate_topology_connectivity(uuid.uuid4(), [])
+    assert "e0 (no_path)" in str(excinfo.value)
+    assert "n0[0] (l3_bad_destination)" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_validate_topology_connectivity_invalid_with_no_details_reported():
+    """valid=false with both lists empty raises a plain, informative ValueError
+    rather than an empty-message exception."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"valid": False, "invalid_edges": [], "invalid_routes": []}
+    client = _mock_httpx_client(post_resp=resp)
+    with (
+        patch("app.services.reservation_service.httpx.AsyncClient", return_value=client),
+        patch("app.services.reservation_service.settings") as mock_settings,
+    ):
+        mock_settings.internal_api_token = "tok"
+        mock_settings.cabling_service_url = "http://cab"
+        with pytest.raises(ValueError, match="no details reported"):
             await _validate_topology_connectivity(uuid.uuid4(), [])
 
 

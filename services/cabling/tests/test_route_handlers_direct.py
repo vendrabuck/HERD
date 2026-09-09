@@ -1409,6 +1409,75 @@ async def test_import_http_exception_inside_loop_rejects_row():
 
 
 @pytest.mark.asyncio
+async def test_import_l3_config_unavailable_aborts_whole_request():
+    """S9 review fix, round 2: a 503 (l3_config_unavailable) from the L3 pass
+    aborts the WHOLE import as a 503, never a per-row reject, since the row was
+    never actually judged and the rest of the batch is equally unjudged."""
+    import json
+
+    from app.services import bulk_service
+    from fastapi import HTTPException
+
+    raw = json.dumps(
+        [
+            {"name": "First", "canvas": {"nodes": [], "edges": []}},
+            {"name": "Second", "canvas": {"nodes": [], "edges": []}},
+        ]
+    ).encode()
+    async with TestSession() as db:
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={}),
+        ):
+            with patch(
+                "app.services.topology_validation.run_full_topology_validation",
+                new=AsyncMock(
+                    side_effect=HTTPException(
+                        status_code=503, detail={"error": "l3_config_unavailable"}
+                    )
+                ),
+            ):
+                with pytest.raises(HTTPException) as exc:
+                    await bulk_service.import_topologies(db, raw, "json", False, USER_ID, "viewer")
+    assert exc.value.status_code == 503
+    assert exc.value.detail == {"error": "l3_config_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_import_route_reasons_included_in_reject_message():
+    """S9: a routes-only validation failure names the route reason(s) in the
+    per-row reject message, "<node_id>[<index>] (<reason>)", the same shape
+    edges use."""
+    import json
+
+    from app.schemas.topology import InvalidRoute, TopologyValidationResponse
+    from app.services import bulk_service
+
+    raw = json.dumps([{"name": "BadRoute", "canvas": {"nodes": [], "edges": []}}]).encode()
+    bad_validation = TopologyValidationResponse(
+        valid=False,
+        invalid_edges=[],
+        invalid_routes=[
+            InvalidRoute(node_id="n0", device_id=None, index=0, reason="l3_bad_destination")
+        ],
+    )
+    async with TestSession() as db:
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={}),
+        ):
+            with patch(
+                "app.services.topology_validation.run_full_topology_validation",
+                new=AsyncMock(return_value=bad_validation),
+            ):
+                report = await bulk_service.import_topologies(
+                    db, raw, "json", False, USER_ID, "viewer"
+                )
+    assert report.rejected == 1
+    assert "n0[0] (l3_bad_destination)" in report.rows[0].reason
+
+
+@pytest.mark.asyncio
 async def test_validate_skips_malformed_device_uuid():
     """A node whose device id is not a valid UUID is skipped (treated as no device)."""
     from app.routes.topologies import validate_topology
@@ -1884,19 +1953,20 @@ async def test_fork_snapshot_skips_hop_with_null_port():
         "edges": [{"id": "e1", "source": "nA", "target": "nB"}],
     }
     # The middle hop's port_in is None, so the (first, second) pair has pb=None.
-    doctored = [
-        [
-            PathHop(device_id=dev_a, port_out="eth0"),
-            PathHop(device_id=dev_b, port_in=None, port_out=None),
-        ]
+    doctored_path = [
+        PathHop(device_id=dev_a, port_out="eth0"),
+        PathHop(device_id=dev_b, port_in=None, port_out=None),
     ]
     rid = uuid.uuid4()
     async with TestSession() as db:
         topo_id, _ = await _make_parent_topology(db, canvas)
+        # This edge carries no port constraints, so resolve_canvas_wiring (S11
+        # review fix, round 2) resolves it through the BATCHED pathfind call,
+        # not the per-edge one; patch that seam instead.
         with patch.object(
             fork_save_service,
-            "find_all_shortest_paths_async",
-            new=AsyncMock(return_value=doctored),
+            "find_all_shortest_paths_batch_async",
+            new=AsyncMock(return_value=[[doctored_path]]),
         ):
             fork = await fork_service.create_fork(
                 db,

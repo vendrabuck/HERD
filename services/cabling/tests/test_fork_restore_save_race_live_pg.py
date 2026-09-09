@@ -37,15 +37,22 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from unittest.mock import patch
 
 import pytest
-from app.models.fork import ForkConnection, ForkVersion, ReservationFork
+from app.config import settings
+from app.database import get_db
+from app.main import app
+from app.models.fork import ForkConnection, ForkStatus_ARCHIVED, ForkVersion, ReservationFork
 from app.routes.forks import _load_fork
 from app.services.fork_save_service import resolve_canvas_wiring
 from app.services.fork_save_service import save_fork as _real_save_fork
 from app.services.l3_intent import parse_l3_intent
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+_INTERNAL_TOKEN = "test-internal-token-live-pg"
 
 
 async def save_fork(db, fork, canvas_data, member_device_ids, **kwargs):
@@ -304,4 +311,129 @@ async def test_restore_holds_lock_so_a_racing_save_consumes_the_fresh_marker(ses
         # AsyncSession.close() rolls back any open transaction on its own and is
         # safe to call more than once, so no need to branch on session state here.
         await db_b.close()
+        await _delete_fork(session_factory, fork_id)
+
+
+# --- S1 review fix (round 2 on 2ade362c), coordinator addendum: drive the real
+# ROUTE (save_fork_internal), not save_fork directly, against a live Postgres. ---
+#
+# The two tests above prove _load_fork's lock genuinely blocks a second Postgres
+# session; these two prove the FULL route ordering the fix actually changed:
+# unlocked load, resolve_canvas_wiring (the gap), locked+refreshed re-load, save.
+# A concurrent write is injected via app.routes.forks.resolve_canvas_wiring
+# (SAVE_CANVAS has no device nodes, so gate_l3_intent never runs; the gap the
+# route holds open unconditionally is around resolve_canvas_wiring instead).
+
+
+@pytest.fixture(autouse=True)
+def _internal_token():
+    with patch.object(settings, "internal_api_token", _INTERNAL_TOKEN):
+        yield
+
+
+@pytest.fixture
+def pg_client(session_factory):
+    async def _override_get_db():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        yield AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def _hdr() -> dict:
+    return {"X-Internal-Token": _INTERNAL_TOKEN}
+
+
+@pytest.mark.asyncio
+async def test_save_route_consumes_restore_committed_in_the_gap_live_pg(session_factory, pg_client):
+    """The real /save route, against a live Postgres: a restore that commits
+    (via a second, independent session) in the gap between the unlocked load
+    and the locked+refreshed re-load is picked up, so the save correctly
+    carries it onto the appended version and clears the marker."""
+    reservation_id, fork_id, v1_id = await _make_fork_with_v1(session_factory)
+    real_resolve = resolve_canvas_wiring
+
+    async def _restore_during_gap(db, canvas):
+        result = await real_resolve(db, canvas)
+        async with session_factory() as other:
+            fork = (
+                await other.execute(select(ReservationFork).where(ReservationFork.id == fork_id))
+            ).scalar_one()
+            fork.draft_restored_from_id = v1_id
+            await other.commit()
+        return result
+
+    try:
+        async with pg_client as client:
+            with patch("app.routes.forks.resolve_canvas_wiring", new=_restore_during_gap):
+                resp = await client.post(
+                    f"/internal/forks/{reservation_id}/save",
+                    json={"canvas_data": SAVE_CANVAS, "member_device_ids": []},
+                    headers=_hdr(),
+                )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["version_number"] == 2
+
+        final = await _reread_fork(session_factory, fork_id)
+        assert final.draft_restored_from_id is None
+        assert final.canvas_data == SAVE_CANVAS
+
+        async with session_factory() as db:
+            versions = (
+                (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+                .scalars()
+                .all()
+            )
+        appended = next(v for v in versions if v.version_number == 2)
+        assert appended.restored_from_id == v1_id
+    finally:
+        await _delete_fork(session_factory, fork_id)
+
+
+@pytest.mark.asyncio
+async def test_save_route_refuses_archived_in_the_gap_live_pg(session_factory, pg_client):
+    """The real /save route, against a live Postgres: an archive that commits
+    (via a second, independent session) in the gap between the unlocked load
+    and the locked+refreshed re-load is picked up by the refreshed re-load, so
+    the save is refused 409 with no fork_versions row appended, proving live
+    (not just on SQLite) the review's exact "stale identity-mapped object"
+    scenario is fixed."""
+    reservation_id, fork_id, _v1_id = await _make_fork_with_v1(session_factory)
+    real_resolve = resolve_canvas_wiring
+
+    async def _archive_during_gap(db, canvas):
+        result = await real_resolve(db, canvas)
+        async with session_factory() as other:
+            fork = (
+                await other.execute(select(ReservationFork).where(ReservationFork.id == fork_id))
+            ).scalar_one()
+            fork.status = ForkStatus_ARCHIVED
+            await other.commit()
+        return result
+
+    try:
+        async with pg_client as client:
+            with patch("app.routes.forks.resolve_canvas_wiring", new=_archive_during_gap):
+                resp = await client.post(
+                    f"/internal/forks/{reservation_id}/save",
+                    json={"canvas_data": SAVE_CANVAS, "member_device_ids": []},
+                    headers=_hdr(),
+                )
+        assert resp.status_code == 409, resp.text
+
+        final = await _reread_fork(session_factory, fork_id)
+        assert final.status == ForkStatus_ARCHIVED
+
+        async with session_factory() as db:
+            versions = (
+                (await db.execute(select(ForkVersion).where(ForkVersion.fork_id == fork_id)))
+                .scalars()
+                .all()
+            )
+        assert [v.version_number for v in versions] == [1]  # only the seeded v1
+    finally:
         await _delete_fork(session_factory, fork_id)

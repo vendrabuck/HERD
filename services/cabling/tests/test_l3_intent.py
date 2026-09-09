@@ -1,15 +1,19 @@
 """Unit tests for the L3 routing-intent canvas parser (ADR 0014 phase 1, issue #34)."""
 
+import json
 import uuid
 
 import pytest
 from app.services.l3_intent import (
     L3IntentMalformed,
     RouteSpec,
+    _parse_node_l3_full,
     canvas_has_l3,
+    merge_candidates_by_device,
     parse_l3_intent,
     parse_l3_intent_tolerant,
     parse_node_l3,
+    walk_l3_nodes,
 )
 
 DEVICE_A = uuid.uuid4()
@@ -37,18 +41,21 @@ def _element_node(node_id: str, l3: dict | None = None) -> dict:
 # --- RouteSpec.route_key ---
 
 
-def test_route_key_packs_destination_interface_next_hop():
+def test_route_key_packs_all_four_fields_as_json():
+    """S4 review fix, round 2: route_key JSON-packs all four fields, including
+    virtual_router, since the driver contract carries no VRF but the identity
+    must still distinguish two routes that differ only by it."""
     spec = RouteSpec(
         destination="10.20.0.0/24", next_hop="10.0.0.2", interface="eth1", virtual_router=None
     )
-    assert spec.route_key == "10.20.0.0/24|eth1|10.0.0.2"
+    assert spec.route_key == json.dumps(["10.20.0.0/24", "eth1", "10.0.0.2", ""])
 
 
-def test_route_key_empty_string_for_null_next_hop():
+def test_route_key_empty_string_for_null_next_hop_and_virtual_router():
     spec = RouteSpec(
         destination="10.20.0.0/24", next_hop=None, interface="eth1", virtual_router=None
     )
-    assert spec.route_key == "10.20.0.0/24|eth1|"
+    assert spec.route_key == json.dumps(["10.20.0.0/24", "eth1", "", ""])
 
 
 # --- parse_node_l3 / parse_l3_intent: valid shapes ---
@@ -59,7 +66,11 @@ def test_parse_valid_single_route():
     routes = parse_node_l3("n1", l3)
     assert routes == [
         RouteSpec(
-            destination="10.20.0.0/24", next_hop="10.0.0.2", interface="eth1", virtual_router=None
+            destination="10.20.0.0/24",
+            next_hop="10.0.0.2",
+            interface="eth1",
+            virtual_router=None,
+            source_index=0,
         )
     ]
 
@@ -127,9 +138,10 @@ def test_duplicate_route_key_collapses_to_first_occurrence():
     assert len(routes) == 1
 
 
-def test_duplicate_route_key_keeps_first_when_fields_differ_only_in_dupe_key():
-    # Same route_key (destination|interface|next_hop) but let's confirm ordering:
-    # the first occurrence wins even though a later one is otherwise identical.
+def test_routes_differing_only_by_virtual_router_are_distinct_not_deduped():
+    """S4 review fix, round 2: virtual_router is part of route_key's identity
+    now, so two routes sharing destination/interface/next_hop but differing by
+    virtual_router are DISTINCT rows, not a duplicate collapse."""
     l3 = {
         "routes": [
             {"destination": "10.0.0.0/24", "interface": "eth0"},
@@ -137,8 +149,27 @@ def test_duplicate_route_key_keeps_first_when_fields_differ_only_in_dupe_key():
         ]
     }
     routes = parse_node_l3("n1", l3)
+    assert len(routes) == 2
+    assert {r.virtual_router for r in routes} == {None, "vr2"}
+
+
+def test_duplicate_route_key_keeps_first_when_all_four_fields_match():
+    # A genuine duplicate (identical on all four identity fields, virtual_router
+    # included): the first occurrence wins.
+    l3 = {
+        "routes": [
+            {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr1"},
+            {
+                "destination": "10.0.0.0/24",
+                "interface": "eth0",
+                "next_hop": None,
+                "virtual_router": "vr1",
+            },
+        ]
+    }
+    routes = parse_node_l3("n1", l3)
     assert len(routes) == 1
-    assert routes[0].virtual_router is None
+    assert routes[0].virtual_router == "vr1"
 
 
 # --- Nodes without l3 / element nodes ignored ---
@@ -296,12 +327,15 @@ def test_parse_l3_intent_merges_routes_across_two_nodes_same_device():
     result = parse_l3_intent(canvas)
     assert set(result.keys()) == {DEVICE_A}
     assert {r.route_key for r in result[DEVICE_A]} == {
-        "10.0.0.0/24|eth0|",
-        "10.1.0.0/24|eth1|",
+        json.dumps(["10.0.0.0/24", "eth0", "", ""]),
+        json.dumps(["10.1.0.0/24", "eth1", "", ""]),
     }
 
 
-def test_parse_l3_intent_merge_dedupes_on_route_key_first_wins():
+def test_parse_l3_intent_merge_keeps_both_when_virtual_router_differs():
+    """S4 review fix, round 2: virtual_router is part of the identity, so two
+    nodes' routes that differ only by virtual_router merge into TWO distinct
+    rows for the device, not a one-wins collapse."""
     canvas = _canvas(
         [
             _switch_node(
@@ -319,6 +353,36 @@ def test_parse_l3_intent_merge_dedupes_on_route_key_first_wins():
                 {
                     "routes": [
                         {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr2"}
+                    ]
+                },
+            ),
+        ]
+    )
+    result = parse_l3_intent(canvas)
+    assert len(result[DEVICE_A]) == 2
+    assert {r.virtual_router for r in result[DEVICE_A]} == {"vr1", "vr2"}
+
+
+def test_parse_l3_intent_merge_dedupes_on_full_identity_first_wins():
+    """A genuine duplicate across two nodes (identical on all four identity
+    fields) still collapses to the first occurrence."""
+    canvas = _canvas(
+        [
+            _switch_node(
+                "n1",
+                DEVICE_A,
+                {
+                    "routes": [
+                        {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr1"}
+                    ]
+                },
+            ),
+            _switch_node(
+                "n2",
+                DEVICE_A,
+                {
+                    "routes": [
+                        {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr1"}
                     ]
                 },
             ),
@@ -360,45 +424,42 @@ def test_destination_kept_verbatim_when_not_parseable():
     assert routes[0].destination == "not-an-ip"
 
 
-# --- R5(d): a literal '|' in any field is malformed ---
+# --- S4: route_key includes virtual_router (JSON-packed, no separator ban) ---
 
 
-def test_pipe_in_destination_is_malformed():
-    with pytest.raises(L3IntentMalformed):
-        parse_node_l3("n1", {"routes": [{"destination": "10.0.0.0/24|extra", "interface": "eth0"}]})
+def test_route_key_distinguishes_by_virtual_router():
+    a = RouteSpec(destination="10.0.0.0/24", next_hop=None, interface="eth0", virtual_router="vr1")
+    b = RouteSpec(destination="10.0.0.0/24", next_hop=None, interface="eth0", virtual_router="vr2")
+    assert a.route_key != b.route_key
 
 
-def test_pipe_in_interface_is_malformed():
-    with pytest.raises(L3IntentMalformed):
-        parse_node_l3("n1", {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0|1"}]})
+def test_route_key_same_when_virtual_router_matches():
+    a = RouteSpec(destination="10.0.0.0/24", next_hop=None, interface="eth0", virtual_router="vr1")
+    b = RouteSpec(destination="10.0.0.0/24", next_hop=None, interface="eth0", virtual_router="vr1")
+    assert a.route_key == b.route_key
 
 
-def test_pipe_in_next_hop_is_malformed():
-    with pytest.raises(L3IntentMalformed):
-        parse_node_l3(
-            "n1",
-            {
-                "routes": [
-                    {"destination": "10.0.0.0/24", "interface": "eth0", "next_hop": "10.0.0.1|x"}
-                ]
-            },
-        )
+def test_pipe_in_fields_no_longer_malformed():
+    """S4 review fix, round 2: route_key is JSON-packed, so a literal '|' (the
+    old separator) is an ordinary character again, not a malformed-shape trigger."""
+    routes = parse_node_l3(
+        "n1", {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0|1"}]}
+    )
+    assert routes[0].interface == "eth0|1"
 
 
-def test_pipe_in_virtual_router_is_malformed():
-    with pytest.raises(L3IntentMalformed):
-        parse_node_l3(
-            "n1",
-            {
-                "routes": [
-                    {
-                        "destination": "10.0.0.0/24",
-                        "interface": "eth0",
-                        "virtual_router": "vr|1",
-                    }
-                ]
-            },
-        )
+def test_two_routes_differing_only_by_virtual_router_both_persist_in_one_node():
+    routes = parse_node_l3(
+        "n1",
+        {
+            "routes": [
+                {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr1"},
+                {"destination": "10.0.0.0/24", "interface": "eth0", "virtual_router": "vr2"},
+            ]
+        },
+    )
+    assert len(routes) == 2
+    assert {r.virtual_router for r in routes} == {"vr1", "vr2"}
 
 
 # --- canvas_has_l3 ---
@@ -454,3 +515,103 @@ def test_parse_l3_intent_tolerant_never_raises():
     assert parse_l3_intent_tolerant(canvas) == {}
     with pytest.raises(L3IntentMalformed):
         parse_l3_intent(canvas)
+
+
+# --- S12: source_index survives a collapse; duplicate indices are reported ---
+
+
+def test_source_index_is_original_position_not_post_collapse():
+    """A route after a collapsed duplicate keeps its ORIGINAL list position,
+    not the position it ends up at after the duplicate is dropped."""
+    l3 = {
+        "routes": [
+            {"destination": "10.0.0.0/24", "interface": "eth0"},  # index 0, kept
+            {"destination": "10.0.0.0/24", "interface": "eth0"},  # index 1, duplicate, dropped
+            {"destination": "10.1.0.0/24", "interface": "eth1"},  # index 2, kept
+        ]
+    }
+    routes, duplicate_indices = _parse_node_l3_full("n1", l3)
+    assert [r.source_index for r in routes] == [0, 2]
+    assert duplicate_indices == [1]
+
+
+def test_parse_node_l3_full_no_duplicates_returns_empty_list():
+    l3 = {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0"}]}
+    routes, duplicate_indices = _parse_node_l3_full("n1", l3)
+    assert duplicate_indices == []
+    assert routes[0].source_index == 0
+
+
+def test_parse_node_l3_discards_duplicate_indices():
+    """The public parse_node_l3 still returns just the deduped routes."""
+    l3 = {
+        "routes": [
+            {"destination": "10.0.0.0/24", "interface": "eth0"},
+            {"destination": "10.0.0.0/24", "interface": "eth0"},
+        ]
+    }
+    routes = parse_node_l3("n1", l3)
+    assert len(routes) == 1
+
+
+# --- walk_l3_nodes (S10): the one shared per-node canvas walk ---
+
+
+def test_walk_l3_nodes_returns_candidates_and_malformed_separately():
+    canvas = _canvas(
+        [
+            _switch_node(
+                "n1", DEVICE_A, {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0"}]}
+            ),
+            _switch_node("n2", DEVICE_B, {"bad": "shape"}),
+        ]
+    )
+    candidates, malformed = walk_l3_nodes(canvas)
+    assert [c[0] for c in candidates] == ["n1"]
+    assert [m[0] for m in malformed] == ["n2"]
+    assert malformed[0][1] == DEVICE_B
+
+
+def test_walk_l3_nodes_empty_routes_list_absent_from_candidates():
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"routes": []})])
+    candidates, malformed = walk_l3_nodes(canvas)
+    assert candidates == []
+    assert malformed == []
+
+
+def test_walk_l3_nodes_carries_duplicate_indices_per_node():
+    canvas = _canvas(
+        [
+            _switch_node(
+                "n1",
+                DEVICE_A,
+                {
+                    "routes": [
+                        {"destination": "10.0.0.0/24", "interface": "eth0"},
+                        {"destination": "10.0.0.0/24", "interface": "eth0"},
+                    ]
+                },
+            ),
+        ]
+    )
+    candidates, _malformed = walk_l3_nodes(canvas)
+    assert len(candidates) == 1
+    _node_id, _device_id, routes, duplicate_indices = candidates[0]
+    assert len(routes) == 1
+    assert duplicate_indices == [1]
+
+
+def test_merge_candidates_by_device_matches_parse_l3_intent():
+    canvas = _canvas(
+        [
+            _switch_node(
+                "n1", DEVICE_A, {"routes": [{"destination": "10.0.0.0/24", "interface": "eth0"}]}
+            ),
+            _switch_node(
+                "n2", DEVICE_A, {"routes": [{"destination": "10.1.0.0/24", "interface": "eth1"}]}
+            ),
+        ]
+    )
+    candidates, _malformed = walk_l3_nodes(canvas)
+    merged = merge_candidates_by_device(candidates)
+    assert merged == parse_l3_intent(canvas)
