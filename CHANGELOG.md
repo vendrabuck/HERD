@@ -14,7 +14,30 @@
   unreachable-topology error, and the fork's resolved routes ride the internal
   and user-facing fork GET. Inventory gained an internal batch device-type
   lookup (`POST /internal/devices/batch`) to serve the validation pass.
-  Editor and execution-side consumption are phases 2 and 3, not yet built.
+  Editor consumption (phase 2) is not yet built; execution-side consumption
+  (phase 3) shipped below.
+- Shipped phase 3 of first-class Layer 3 routing intent (ADR 0014, issue #34):
+  execution now consumes a fork's resolved routing intent instead of always
+  reading a switch's latest config version. Precedence is per switch: intent,
+  when the fork carries it, IS the route list; otherwise the pre-phase-3
+  config-version fallback is unchanged. A switch that stays adjacent across a
+  fork save now reconciles its route-set DELTA against changed intent (removes
+  before adds, one login/logout, the pin advancing only on full success), the
+  one deliberate exception to the "pinned, never re-derived" rule; an
+  inter-switch trunk hop that the adjacency derivation would otherwise skip
+  still counts when either end carries intent. Before any intent-driven route
+  drives, it is re-validated against the switch's CURRENT config when its
+  validation stamp is missing or stale, and any route naming a `virtual_router`
+  refuses the whole switch until the driver contract gains VRF support (issue
+  #755): either way the switch lands a FAILED pin with the refusal reason and
+  no driver call, never a partial drive. The retry channel drives a
+  still-adjacent switch's CURRENT intent, not a stale FAILED row's own routes,
+  when intent is present. The four-field route identity packing moved to
+  `herd_common.l3_route_identity.route_identity_key` (issue #757, closed),
+  shared byte-identical between cabling's `fork_l3_routes.route_key` and
+  execution's fork-route-to-pin comparisons. `tests/load/locustfile.py` gained
+  a `RoutedTopologyValidator` user class exercising the L3 validate pass under
+  load. No schema change on the execution side.
 - Fixed issue #758: `fork_l3_routes.route_key` was `String(400)`, which legal
   routing intent could overflow (a 64-character non-ASCII `virtual_router` and
   the default `json.dumps` escaping inflated past 400 characters), 500ing a

@@ -629,3 +629,110 @@ the switch is an endpoint of at least one resolved hop in the canvas (transit
 devices on a multi-hop path count; element attachments do not); it does NOT
 assert that the specific interface a route names is the one actually wired,
 which is a named follow-up (filed as an issue, not phase 1 scope).
+
+## Amendment: phase 3 delivery (2026-09-09)
+
+Phase 3 (execution consumes fork routing intent) shipped as decided by the phase 3
+brief and its two addenda, with implementation notes worth recording against the
+Decision 6 and Contract summary sections above.
+
+**Precedence and delta (Decisions 2 and 3).** `_reconcile_l3_adjacency`
+(`services/execution/app/services/nats_consumer.py`) now takes the fork's `l3_routes`
+(grouped by switch device id) alongside its intended wires, both fetched in the SAME
+`_fetch_fork_intended_wires` call: the fetch's return value widened from a plain
+`list[dict]` to `ForkIntent`, a `list` SUBCLASS carrying `.l3_routes` as an added
+attribute, so every pre-phase-3 caller and test double that only ever treated the
+return value as the wires list (`fork_intent == []`, iteration, indexing) keeps
+working unchanged; new code reads `getattr(fork_intent, "l3_routes", {})` so an old
+test double that still returns a bare list degrades to "no intent" instead of
+raising. For a switch newly gaining adjacency, intent (when present) IS the route
+list, full stop, ahead of the existing effective-pinned/config-version fallback. For
+a switch that STAYS adjacent across an apply, intent-carrying switches now diff their
+pinned set against the fresh intent by identity (`removes = pinned - intent`,
+`adds = intent - pinned`) and drive only the delta, one login/logout, removes before
+adds; a config-derived switch is untouched, exactly as before phase 3. The delta's
+bookkeeping needed two new `route_service.py` functions rather than reusing
+`record_route_active`/`record_route_failed`: `record_route_reconciled` (advances an
+ALREADY-ACTIVE row's pinned set on a clean delta, which `record_route_active` never
+does by design) and `record_route_reconcile_failed` (flips an ACTIVE row FAILED on a
+delta failure without the #412 stale-writer guard, since a reconcile's writer IS the
+row's own prior history, not a competing fresh-provision race).
+
+**X-B (explicit intent overrides the trunk skip).** `_derive_l3_adjacency` gained an
+optional `l3_intent` parameter: for an inter-switch trunk hop (both ends Layer 3
+Switches, normally "assumed provisioned, contributes no adjacency"), a side named in
+`l3_intent` still joins the adjacency set. Both the reconcile and the retry channel's
+build-intent revalidation pass this parameter now.
+
+**X-A and X-F (the drive-time gate).** A new `_gate_l3_drive_routes` function runs
+immediately before any switch's intent-driven routes are added to a provision or
+reconcile item (both the first-adjacency and delta paths, and the retry channel's own
+revalidation). It checks `virtual_router` first and unconditionally (X-F): any route
+naming one fails the WHOLE switch with `l3_vrf_unsupported` and no driver call, since
+`route_assignments` pins one list per switch and there is no way to drive "everything
+except the VRF routes" while recording an honest pin. It then re-validates (X-A) only
+when a route's `validated_config_version_id` is missing or does not match the
+switch's CURRENT latest config version (fetched at most once per switch per event,
+memoized on `_FetchContext`): re-validation re-runs cabling's exact per-route reason
+vocabulary (`l3_switch_unconfigured`, `l3_bad_destination`, `l3_bad_next_hop`,
+`l3_unknown_interface`, `l3_next_hop_unverifiable`, `l3_next_hop_outside_interface`)
+against a small execution-local copy of the interface-membership check (services
+never import each other's code across the boundary); any failing route fails the
+WHOLE switch with that reason and no driver call, matching X-F's atomicity. The
+attachment check (`l3_switch_unattached`) needs no re-verification here: every caller
+of the gate already established the switch is an endpoint of a recorded hop (via the
+ordinary derivation or the X-B override) before calling it. This closes the gap S5
+left open in the phase 1 amendment: a config or wiring change invisible to cabling
+between L3-touching saves is now caught by execution before it ever reaches the
+driver.
+
+**X-E (shared route identity, issue #757).** The four-field route identity packing
+(`json.dumps([destination, interface, next_hop or "", virtual_router or ""],
+ensure_ascii=False)`, with destination canonicalization) moved out of cabling's
+`RouteSpec.route_key` into `herd_common.l3_route_identity.route_identity_key`, pinned
+byte-identical to the prior inline expression by a dedicated unit test. Execution
+uses the same helper wherever a fork route is compared to a pinned route (the
+delta's set arithmetic); the three-field identity `_route_run_identity` already used
+for the ExecutionRun dedupe/idempotency columns is a SEPARATE, unchanged concept
+(driver-call redelivery identity, not fork-versus-pin comparison) and was not touched.
+
+**Frozen direction scoping (X3), the record-time simplification.** `_apply_l3_adjacency`
+gained a third work kind, `"reconcile"`, carrying `remove_routes`/`add_routes`/`intent`.
+A frozen reservation's reconcile item still drives `remove_routes` and skips
+`add_routes` (a frozen item with no removes is a pure no-op, one INFO log, no driver
+call at all). Since HERD's freeze flag is monotonic (never reverts), a reconcile that
+observed frozen at the top of its own processing is still frozen by the time its
+result is recorded, so `_apply_l3_adjacency` always passes the FULL target intent to
+`record_route_reconciled` and lets THAT function's own frozen re-check (mirroring
+`record_route_active`'s existing record-time race guard) decide the outcome: frozen
+parks the row FAILED intended RELEASED with its PRIOR pin intact (a safe superset of
+what a frozen partial drive actually removed, since removing an already-removed
+route is idempotent), never frozen advances the pin normally. An earlier draft tried
+to compute a partial pin inside `_apply_l3_adjacency` itself for the frozen case; it
+was dead code (the record-time check always wins once frozen persists) and was
+removed in favor of this simpler, single-authority design.
+
+**Retry channel (X5).** `_reattempt_l3_rows` now derives adjacency with the X-B-aware
+`_derive_l3_adjacency` (passing the fork's current `l3_routes`), and for a
+still-adjacent switch that carries CURRENT intent, drives that intent (through the
+same `_gate_l3_drive_routes` gate) instead of the FAILED row's own possibly-stale
+`routes`; `record_route_active`'s reusable-FAILED-row flip was changed to actually SET
+`.routes` to the caller's argument (previously it silently kept the row's existing
+value, correct for the config-derived "never re-derive" case but wrong once a caller
+legitimately wants to advance the pin to fresh intent) since every pre-phase-3 caller
+already passed back the row's own existing value anyway, so the change is a no-op for
+every switch that predates this phase. A switch with no current intent (never had
+any, or it was removed) retries with the row's own pinned set verbatim, unchanged
+from before (addendum X4).
+
+**Docs, load, and CI shape.** `docs/DRIVERS.md`'s route-derivation section and
+`docs/ARCHITECTURE.md`'s L3 sentence were amended to describe the precedence and
+delta; no route or schema changed, so no contract snapshot moved. `tests/load/locustfile.py`
+gained `RoutedTopologyValidator` (ADR 0014's Testing section promise, X-C): it
+re-validates one small persistent topology carrying `data.l3` intent on every task
+tick when the seeded device pool has a Layer 3 Switch, and is a safe no-op otherwise
+(it never creates its own driver/template/device, to avoid polluting the stack the
+way `BulkExporter`'s own docstring warns a real import would). No Alembic revision
+was needed: `route_assignments` carries no new column, since the pin CONTENT is
+still a plain JSON list and the delta's identity is computed at read time, never
+stored.
