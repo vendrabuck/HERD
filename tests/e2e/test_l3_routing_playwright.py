@@ -24,6 +24,7 @@ import io
 import tarfile
 import uuid
 from pathlib import Path
+from typing import Callable
 
 import pytest
 from playwright.sync_api import expect
@@ -67,6 +68,22 @@ def l3_switch_setup(pw_page):
     Switch device with a config version (one interface, a prefixed IP), finds
     a seeded DUT, and cables the two together. Yields the assembled dict;
     tears every created entity back down afterward regardless of outcome.
+
+    Review fix F13 (issue #34): each successful POST appends its own teardown
+    call to `cleanup`, in creation order, instead of the four skip branches
+    each hand-listing a different prefix of the same DELETE calls (a trap for
+    drift: the connection-failure branch above once cleaned up device,
+    template, and driver but not, say, a group-membership join). `_run_cleanup`
+    replays that one list in REVERSE (last created, first deleted) on every
+    skip path and on the normal post-yield teardown, so both run the exact
+    same code. No entry is appended for the config version or the group-
+    membership join: both are owned by the device row (device_group_devices
+    declares `device_id` with `ondelete="CASCADE"` in both the model,
+    services/inventory/app/models/device_group.py, and the migration that
+    created it, services/inventory/migrations/versions/0009_device_groups.py;
+    inventory_service.delete_device issues a real ORM `db.delete(device)` +
+    commit, a genuine SQL DELETE the database's own FK cascade applies to),
+    so deleting the switch device below already removes both.
     """
     page = pw_page
     pw_login(page)
@@ -77,6 +94,12 @@ def l3_switch_setup(pw_page):
     dut, dut_port = dut_found
 
     suffix = uuid.uuid4().hex[:8]
+    cleanup: list[Callable[[], None]] = []
+
+    def run_cleanup() -> None:
+        for teardown in reversed(cleanup):
+            teardown()
+
     driver_resp = pw_api(
         page,
         "POST",
@@ -90,11 +113,15 @@ def l3_switch_setup(pw_page):
         allow_errors=True,
     )
     if driver_resp.status_code not in (200, 201):
+        run_cleanup()
         pytest.skip(
             f"could not upload the mock L3 driver: "
             f"{driver_resp.status_code} {driver_resp.text}"
         )
     driver = driver_resp.json()
+    cleanup.append(
+        lambda: pw_api(page, "DELETE", f"/inventory/drivers/{driver['id']}", allow_errors=True)
+    )
 
     template_resp = pw_api(
         page,
@@ -116,12 +143,15 @@ def l3_switch_setup(pw_page):
         allow_errors=True,
     )
     if template_resp.status_code not in (200, 201):
-        pw_api(page, "DELETE", f"/inventory/drivers/{driver['id']}", allow_errors=True)
+        run_cleanup()
         pytest.skip(
             f"could not create the L3 template: "
             f"{template_resp.status_code} {template_resp.text}"
         )
     template = template_resp.json()
+    cleanup.append(
+        lambda: pw_api(page, "DELETE", f"/inventory/templates/{template['id']}", allow_errors=True)
+    )
 
     device_resp = pw_api(
         page,
@@ -137,13 +167,15 @@ def l3_switch_setup(pw_page):
         allow_errors=True,
     )
     if device_resp.status_code not in (200, 201):
-        pw_api(page, "DELETE", f"/inventory/templates/{template['id']}", allow_errors=True)
-        pw_api(page, "DELETE", f"/inventory/drivers/{driver['id']}", allow_errors=True)
+        run_cleanup()
         pytest.skip(
             f"could not create the L3 switch device: "
             f"{device_resp.status_code} {device_resp.text}"
         )
     switch = device_resp.json()
+    cleanup.append(
+        lambda: pw_api(page, "DELETE", f"/inventory/devices/{switch['id']}", allow_errors=True)
+    )
 
     config_resp = pw_api(
         page,
@@ -158,9 +190,7 @@ def l3_switch_setup(pw_page):
         allow_errors=True,
     )
     if config_resp.status_code not in (200, 201):
-        pw_api(page, "DELETE", f"/inventory/devices/{switch['id']}", allow_errors=True)
-        pw_api(page, "DELETE", f"/inventory/templates/{template['id']}", allow_errors=True)
-        pw_api(page, "DELETE", f"/inventory/drivers/{driver['id']}", allow_errors=True)
+        run_cleanup()
         pytest.skip(
             f"could not create the switch config version: "
             f"{config_resp.status_code} {config_resp.text}"
@@ -172,7 +202,9 @@ def l3_switch_setup(pw_page):
     # (still in "No Pool" only) and a seeded DUT (in some other, disjoint
     # group) therefore share no group, and cabling enforces device-group
     # boundaries (issue #392): join the switch into the DUT's first group so
-    # the connection below is not refused as cross-group.
+    # the connection below is not refused as cross-group. No cleanup entry:
+    # the membership row is removed automatically when the switch device is
+    # deleted (see the fixture docstring).
     dut_groups_resp = pw_api(page, "GET", f"/inventory/device-groups/device/{dut['id']}")
     dut_groups = dut_groups_resp.json()
     if dut_groups:
@@ -198,14 +230,17 @@ def l3_switch_setup(pw_page):
         allow_errors=True,
     )
     if connection_resp.status_code not in (200, 201):
-        pw_api(page, "DELETE", f"/inventory/devices/{switch['id']}", allow_errors=True)
-        pw_api(page, "DELETE", f"/inventory/templates/{template['id']}", allow_errors=True)
-        pw_api(page, "DELETE", f"/inventory/drivers/{driver['id']}", allow_errors=True)
+        run_cleanup()
         pytest.skip(
             f"could not cable the switch to the DUT: "
             f"{connection_resp.status_code} {connection_resp.text}"
         )
     connection = connection_resp.json()
+    cleanup.append(
+        lambda: pw_api(
+            page, "DELETE", f"/cabling/connections/{connection['id']}", allow_errors=True
+        )
+    )
 
     yield {
         "dut": dut,
@@ -215,10 +250,7 @@ def l3_switch_setup(pw_page):
         "connection": connection,
     }
 
-    pw_api(page, "DELETE", f"/cabling/connections/{connection['id']}", allow_errors=True)
-    pw_api(page, "DELETE", f"/inventory/devices/{switch['id']}", allow_errors=True)
-    pw_api(page, "DELETE", f"/inventory/templates/{template['id']}", allow_errors=True)
-    pw_api(page, "DELETE", f"/inventory/drivers/{driver['id']}", allow_errors=True)
+    run_cleanup()
 
 
 def _canvas_with_switch_and_dut(dut_id: str, switch_id: str) -> dict:
@@ -264,62 +296,71 @@ def test_add_route_saves_then_edit_to_bad_destination_shows_red_badge_and_toast(
         json={"name": f"e2e-l3-routing-{uuid.uuid4().hex[:8]}"},
     )
     topology = topo_resp.json()
-    put_resp = pw_api(
-        page,
-        "PUT",
-        f"/cabling/topologies/{topology['id']}",
-        json={"canvas_data": _canvas_with_switch_and_dut(setup["dut"]["id"], switch_id)},
-    )
-    assert put_resp.status_code == 200, put_resp.text
+    # Review fix F13 (issue #34): the topology is deleted in `finally` rather
+    # than only as the test's last statement, so a failed assertion anywhere
+    # below still tears it down. Without this, a failure left the topology
+    # referencing the switch device, and the fixture's own teardown (which
+    # always runs, since it is a fixture) then deleted that device out from
+    # under the leaked topology's canvas_data.
+    try:
+        put_resp = pw_api(
+            page,
+            "PUT",
+            f"/cabling/topologies/{topology['id']}",
+            json={"canvas_data": _canvas_with_switch_and_dut(setup["dut"]["id"], switch_id)},
+        )
+        assert put_resp.status_code == 200, put_resp.text
 
-    page.goto(f"{HOST_BASE_URL}/topology/{topology['id']}")
-    expect(page.locator(".react-flow")).to_be_visible(timeout=15_000)
+        page.goto(f"{HOST_BASE_URL}/topology/{topology['id']}")
+        expect(page.locator(".react-flow")).to_be_visible(timeout=15_000)
 
-    switch_node = page.locator(".react-flow__node").filter(has_text=switch_name)
-    expect(switch_node).to_be_visible(timeout=15_000)
-    switch_node.click()
+        switch_node = page.locator(".react-flow__node").filter(has_text=switch_name)
+        expect(switch_node).to_be_visible(timeout=15_000)
+        switch_node.click()
 
-    expect(page.get_by_text("Routing", exact=True)).to_be_visible(timeout=10_000)
+        expect(page.get_by_text("Routing", exact=True)).to_be_visible(timeout=10_000)
 
-    page.get_by_label("New destination").fill("10.20.1.0/24")
-    page.get_by_label("New interface").fill("eth0")
-    add_button = page.get_by_role("button", name="Add route")
-    expect(add_button).to_be_enabled()
-    add_button.click()
+        page.get_by_label("New destination").fill("10.20.1.0/24")
+        page.get_by_label("New interface").fill("eth0")
+        add_button = page.get_by_role("button", name="Add route")
+        expect(add_button).to_be_enabled()
+        add_button.click()
 
-    page.get_by_role("button", name="Save", exact=True).click()
-    expect(page.get_by_text("Topology saved")).to_be_visible(timeout=15_000)
+        page.get_by_role("button", name="Save", exact=True).click()
+        expect(page.get_by_text("Topology saved")).to_be_visible(timeout=15_000)
 
-    # Backend effect via API read-back (the standing e2e rule): the saved
-    # canvas_data carries data.l3 on the switch node.
-    saved = pw_api(page, "GET", f"/cabling/topologies/{topology['id']}").json()
-    switch_node_data = next(
-        n["data"] for n in saved["canvas_data"]["nodes"] if n["id"] == "n-switch"
-    )
-    expected_route = {
-        "destination": "10.20.1.0/24",
-        "next_hop": None,
-        "interface": "eth0",
-        "virtual_router": None,
-    }
-    assert switch_node_data.get("l3") == {"routes": [expected_route]}, switch_node_data
+        # Backend effect via API read-back (the standing e2e rule): the saved
+        # canvas_data carries data.l3 on the switch node.
+        saved = pw_api(page, "GET", f"/cabling/topologies/{topology['id']}").json()
+        switch_node_data = next(
+            n["data"] for n in saved["canvas_data"]["nodes"] if n["id"] == "n-switch"
+        )
+        expected_route = {
+            "destination": "10.20.1.0/24",
+            "next_hop": None,
+            "interface": "eth0",
+            "virtual_router": None,
+        }
+        assert switch_node_data.get("l3") == {"routes": [expected_route]}, switch_node_data
 
-    # Edit the route to a bad destination and save again.
-    # exact=True: "Destination" (the existing row) is otherwise a substring
-    # match against "New destination" (the Add-route staging form) too.
-    page.get_by_label("Destination", exact=True).fill("not-an-ip")
-    page.get_by_role("button", name="Save", exact=True).click()
+        # Edit the route to a bad destination and save again.
+        # exact=True: "Destination" (the existing row) is otherwise a
+        # substring match against "New destination" (the Add-route staging
+        # form) too.
+        page.get_by_label("Destination", exact=True).fill("not-an-ip")
+        page.get_by_role("button", name="Save", exact=True).click()
 
-    expect(
-        page.get_by_text("Routing intent has 1 problem", exact=False)
-    ).to_be_visible(timeout=15_000)
-    # exact=True: the toast text above also contains "l3_bad_destination" as a
-    # substring, so this disambiguates to the Routing panel's own reason line.
-    expect(page.get_by_text("l3_bad_destination", exact=True)).to_be_visible(timeout=10_000)
+        expect(
+            page.get_by_text("Routing intent has 1 problem", exact=False)
+        ).to_be_visible(timeout=15_000)
+        # exact=True: the toast text above also contains "l3_bad_destination"
+        # as a substring, so this disambiguates to the Routing panel's own
+        # reason line.
+        expect(page.get_by_text("l3_bad_destination", exact=True)).to_be_visible(timeout=10_000)
 
-    badge = page.get_by_text("1 route", exact=True)
-    expect(badge).to_be_visible()
-    badge_class = badge.get_attribute("class") or ""
-    assert "bg-red-600" in badge_class, badge_class
-
-    pw_api(page, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)
+        badge = page.get_by_text("1 route", exact=True)
+        expect(badge).to_be_visible()
+        badge_class = badge.get_attribute("class") or ""
+        assert "bg-red-600" in badge_class, badge_class
+    finally:
+        pw_api(page, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)
