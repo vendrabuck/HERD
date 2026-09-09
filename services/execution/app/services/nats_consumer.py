@@ -1,6 +1,7 @@
 """NATS consumer: subscribe to reservation lifecycle events and trigger driver execution."""
 
 import asyncio
+import ipaddress
 import json
 import logging
 import uuid
@@ -8,6 +9,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 from herd_common.jetstream import ensure_stream_exists
+from herd_common.l3_route_identity import route_identity_key
 from herd_common.outbox import event_dedupe_key
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import select
@@ -331,23 +333,53 @@ async def _fetch_secret_value(secret_id: str, client=None) -> dict | None:
         return data.get("data", {}) if isinstance(data, dict) else {}
 
 
-async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> list[dict]:
-    """Fetch a reservation fork's full intended L1 wiring from cabling (ADR 0007).
+class ForkIntent(list):
+    """A fork's intended L1 wiring, exactly as before (ADR 0014 phase 3, issue #34,
+    addendum X1: "a small frozen dataclass ForkIntent(wires, l3_routes) or a
+    second return value; keep every existing caller's behavior").
+
+    Subclasses ``list`` rather than adding a wrapper type, so this instance IS the
+    L1 wires list every caller before phase 3 already expected:
+    ``fork_intent == []``, ``for wire in fork_intent``, ``[w["x"] for w in
+    fork_intent]``, and every existing test double
+    (``AsyncMock(return_value=<plain list>)``, or a bare ``[]`` literal) keep
+    working unchanged. The fork's resolved L3 routing intent
+    (ADR 0014 phase 1's additive ``l3_routes`` on the internal fork GET) rides
+    along as the ``.l3_routes`` attribute, grouped by switch device id (a string,
+    matching every other device-id key this module already uses); a switch with
+    no intent is simply absent from the map. New L3 code reads
+    ``getattr(fork_intent, "l3_routes", {})`` rather than ``.l3_routes`` directly,
+    so a caller that still passes a bare list through (an old test double)
+    degrades to "no intent" instead of raising AttributeError.
+    """
+
+    def __init__(self, wires, l3_routes=None):
+        super().__init__(wires)
+        self.l3_routes: dict[str, list[dict]] = l3_routes or {}
+
+
+async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> ForkIntent:
+    """Fetch a reservation fork's full intended L1 wiring, plus its resolved L3
+    routing intent, from cabling (ADR 0007; L3 intent added ADR 0014 phase 3,
+    issue #34).
 
     The desired set for the gap/heal full-reconcile path (Decision 4): cabling's
     internal fork GET returns every fork_connections row, the intended wiring as the
     human reviewed and saved it. Raises TransientUpstreamError on a 5xx or transport
     error so the message NAKs (an UPSTREAM failure, Decision 7); a 404 (no fork yet)
-    returns [] so the reconcile converges the applied set to empty. Any OTHER non-200
-    (a 403 during an INTERNAL_API_TOKEN rotation is the realistic case) also raises
-    TransientUpstreamError (issue #460): this list is the DESIRED set the L1/L2/L3
-    full reconciles converge live wiring toward, so misreading an auth or shape error
-    as "empty" would tear down a live reservation's entire wiring and then stamp the
-    version so nothing re-applies it. Unreadable intent must defer convergence (ADR
-    0007), never destroy state. This deliberately diverges from the sibling _fetch_*
-    helpers above, whose non-200-means-absent reading only degrades one connection;
-    do not "symmetrize" this branch with theirs. Only L1 rows are returned; phase 1
-    wiring is L1 by construction, and a stray non-L1 row is ignored.
+    returns an empty ForkIntent so the reconcile converges the applied set to empty.
+    Any OTHER non-200 (a 403 during an INTERNAL_API_TOKEN rotation is the realistic
+    case) also raises TransientUpstreamError (issue #460): this is the DESIRED set
+    the L1/L2/L3 full reconciles converge live wiring toward, so misreading an auth
+    or shape error as "empty" would tear down a live reservation's entire wiring and
+    then stamp the version so nothing re-applies it. Unreadable intent must defer
+    convergence (ADR 0007), never destroy state. This deliberately diverges from the
+    sibling _fetch_* helpers above, whose non-200-means-absent reading only degrades
+    one connection; do not "symmetrize" this branch with theirs. Only L1 rows are
+    returned in the wires list; phase 1 wiring is L1 by construction, and a stray
+    non-L1 row is ignored. The ``l3_routes`` field is additive on cabling's payload
+    (ADR 0014 phase 1): a cabling image that predates it, or a response with no such
+    key, means no intent for every switch, not an error.
     """
     url = f"{settings.cabling_service_url}/internal/forks/{reservation_id}"
     async with _client_ctx(client) as c:
@@ -359,7 +391,7 @@ async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> list[d
             timeout=10.0,
         )
         if resp.status_code == 404:
-            return []
+            return ForkIntent([])
         if resp.status_code != 200:
             raise TransientUpstreamError(
                 f"fetch fork wiring for reservation {reservation_id}: "
@@ -367,7 +399,13 @@ async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> list[d
             )
         data = resp.json()
         connections = data.get("connections", []) if isinstance(data, dict) else []
-        return [c for c in connections if (c.get("layer") or "L1") == "L1"]
+        wires = [c for c in connections if (c.get("layer") or "L1") == "L1"]
+        l3_routes: dict[str, list[dict]] = {}
+        raw_routes = data.get("l3_routes") or [] if isinstance(data, dict) else []
+        for route in raw_routes:
+            device_id = str(route.get("device_id"))
+            l3_routes.setdefault(device_id, []).append(route)
+        return ForkIntent(wires, l3_routes)
 
 
 class _FetchContext:
@@ -2798,6 +2836,7 @@ async def _reconcile_l2_memberships(
 async def _derive_l3_adjacency(
     wires: list[dict],
     ctx: "_FetchContext",
+    l3_intent: dict[str, list[dict]] | None = None,
 ) -> set[str]:
     """Derive the intended L3-adjacent switch set from a set of recorded hops (option C).
 
@@ -2807,7 +2846,18 @@ async def _derive_l3_adjacency(
     TransientUpstreamError and NAKs the whole message (Decision 7): an upstream outage must
     never be mistaken for "this switch is no longer adjacent". The L2 derivation's exact
     shape, keyed on the switch device id (an L3 pin is per switch, not per port).
+
+    ADR 0014 addendum X-B (issue #34 phase 3): when `l3_intent` (the fork's routing
+    intent, grouped by switch device id) names a switch, that switch is ALSO
+    adjacent whenever it is an endpoint of any wire here, even an inter-switch
+    trunk hop whose both ends are Layer 3 Switches (normally "assumed provisioned,
+    contributes no adjacency" below). Explicit routing intent overrides the trunk
+    inference: the intent is the user's direct instruction to route on that
+    switch, regardless of what HERD infers about the hop it happens to ride.
+    `l3_intent` defaults to no override, so every pre-phase-3 caller (and every
+    existing test that calls this with two positional args) is unaffected.
     """
+    l3_intent = l3_intent or {}
     switches: set[str] = set()
     for wire in wires:
         da = str(wire.get("device_a_id"))
@@ -2821,7 +2871,13 @@ async def _derive_l3_adjacency(
         a_is_l3 = dev_a.get("connection_type") == "Layer 3 Switch"
         b_is_l3 = dev_b.get("connection_type") == "Layer 3 Switch"
         if a_is_l3 and b_is_l3:
-            # Inter-switch trunk: assumed provisioned, contributes no adjacency.
+            # Inter-switch trunk: assumed provisioned, contributes no adjacency,
+            # UNLESS one or both ends carry explicit routing intent (X-B), in
+            # which case that side still joins the adjacency set.
+            if da in l3_intent:
+                switches.add(da)
+            if db_dev in l3_intent:
+                switches.add(db_dev)
             continue
         if a_is_l3:
             switches.add(da)
@@ -2830,26 +2886,256 @@ async def _derive_l3_adjacency(
     return switches
 
 
+def _usable_interfaces_for_drive(raw_interfaces: object) -> dict[str, str | None]:
+    """Extract a name-to-ip map from a config's ``interfaces`` list.
+
+    Execution's own copy of cabling's ``l3_validation._usable_interfaces``
+    (ADR 0014 addendum X-A, issue #34 phase 3): services never import each
+    other's code across the service boundary, and this one small check has
+    exactly one call site each, so it is duplicated rather than promoted to
+    herd_common. Tolerates a driver-published schema that stores any shape in
+    ``interfaces`` (a non-list, or a non-dict/no-name entry, is skipped rather
+    than raising), so a garbled config reports ``l3_switch_unconfigured``
+    (no usable interface names) instead of raising mid-reconcile.
+    """
+    if not isinstance(raw_interfaces, list):
+        return {}
+    result: dict[str, str | None] = {}
+    for entry in raw_interfaces:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if name:
+            result[name] = entry.get("ip")
+    return result
+
+
+def _validate_route_at_drive_time(route: dict, interfaces: dict[str, str | None]) -> str | None:
+    """Re-run cabling's per-route L3 validation reasons against one route dict.
+
+    ADR 0014 addendum X-A (issue #34 phase 3): mirrors
+    ``services/cabling/app/services/l3_validation.py``'s ``_validate_one_route``
+    exactly (same reason vocabulary and evaluation order), operating on a plain
+    route dict (``destination``/``next_hop``/``interface``, as carried on the
+    fork's ``l3_routes`` payload) instead of cabling's ``RouteSpec``, since
+    execution never imports cabling code across the service boundary. Returns
+    the first applicable reason, or None when the route is clean. Interface
+    routes (no ``next_hop``) skip every next-hop check, same as cabling's pass.
+    """
+    destination = route.get("destination")
+    try:
+        ipaddress.ip_network(destination, strict=False)
+    except (ValueError, TypeError):
+        return "l3_bad_destination"
+
+    next_hop = route.get("next_hop")
+    next_hop_addr: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+    if next_hop is not None:
+        try:
+            next_hop_addr = ipaddress.ip_address(next_hop)
+        except ValueError:
+            return "l3_bad_next_hop"
+
+    interface = route.get("interface")
+    if interface not in interfaces:
+        return "l3_unknown_interface"
+
+    if next_hop_addr is None:
+        return None
+
+    ip_value = interfaces.get(interface)
+    iface = None
+    if ip_value:
+        try:
+            iface = ipaddress.ip_interface(ip_value)
+        except ValueError:
+            iface = None
+    if iface is None or iface.network.prefixlen == iface.network.max_prefixlen:
+        return "l3_next_hop_unverifiable"
+    if next_hop_addr not in iface.network:
+        return "l3_next_hop_outside_interface"
+    return None
+
+
+async def _gate_l3_drive_routes(
+    switch_id: str,
+    routes: list[dict],
+    ctx: "_FetchContext",
+) -> tuple[list[dict], str | None]:
+    """Pre-flight gate for one switch's intent-driven route set, before any
+    driver call (ADR 0014 addenda X-A and X-F, issue #34 phase 3).
+
+    Returns ``(routes, None)`` when every route is drivable (the input `routes`
+    returned unchanged, never a subset: a per-switch `route_assignments` row
+    cannot record a partial pin, so one bad route fails the WHOLE switch's drive
+    this pass, matching X-A's "any failing route lands a FAILED assignment row
+    ... no driver call"). Returns ``([], reason)`` when the switch must land
+    FAILED with that reason and drive nothing.
+
+    X-F runs first and unconditionally (no inventory call needed): a route
+    naming a ``virtual_router`` can never be driven, since the driver contract
+    has no VRF concept (issue #755, tracked follow-up). Its presence fails the
+    WHOLE switch with ``l3_vrf_unsupported`` regardless of validation
+    staleness, since the ledger pins one route list per switch and there is no
+    way to drive "everything except the VRF routes" while still recording an
+    honest pin.
+
+    X-A then re-validates only when warranted: a route's own
+    ``validated_config_version_id`` is missing, or does not match the switch's
+    CURRENT latest inventory config version (fetched at most once per switch
+    per event via ``ctx.get_latest_config``, memoized). When every route's
+    stamp is current, the routes are trusted verbatim and no inventory-content
+    validation runs (the S6 amendment's deliberate gap: cabling's last
+    L3-touching save already judged them). Re-validation reuses cabling's exact
+    per-route reason vocabulary (``l3_switch_unconfigured`` when the switch has
+    no config version or no usable interfaces, then per route:
+    ``l3_bad_destination``, ``l3_bad_next_hop``, ``l3_unknown_interface``,
+    ``l3_next_hop_unverifiable``, ``l3_next_hop_outside_interface``). The
+    attachment check (``l3_switch_unattached``) needs no re-check here: every
+    caller of this function already established the switch is adjacent (an
+    endpoint of a recorded hop) before calling it, whether through the ordinary
+    derivation or the X-B intent override, so attachment is an invariant of
+    being called at all, not something this gate re-verifies.
+    """
+    for route in routes:
+        if route.get("virtual_router"):
+            return [], "l3_vrf_unsupported"
+
+    stale = any(route.get("validated_config_version_id") is None for route in routes)
+    detail = None
+    if not stale:
+        detail = await ctx.get_latest_config(switch_id)
+        current_version_id = str(detail["id"]) if detail and detail.get("id") else None
+        stale = any(
+            str(route.get("validated_config_version_id")) != current_version_id for route in routes
+        )
+    if not stale:
+        return routes, None
+
+    if detail is None:
+        detail = await ctx.get_latest_config(switch_id)
+    if detail is None:
+        return [], "l3_switch_unconfigured"
+
+    interfaces = _usable_interfaces_for_drive((detail.get("config") or {}).get("interfaces"))
+    if not interfaces:
+        return [], "l3_switch_unconfigured"
+
+    for route in routes:
+        reason = _validate_route_at_drive_time(route, interfaces)
+        if reason is not None:
+            return [], reason
+    return routes, None
+
+
+async def _drive_l3_route(
+    db,
+    switch_uuid: uuid.UUID,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    driver_path: str,
+    method: str,
+    context: dict,
+    password_keys: set,
+    redacted: dict,
+    res_uuid: uuid.UUID,
+    route: dict,
+) -> tuple[bool, int, str | None]:
+    """Drive one configure_route/remove_route call: create the execution_run row,
+    run the sandbox call with result gating, and record the outcome.
+
+    Shared by _apply_l3_adjacency's uniform provision/deprovision loop (one method
+    for every route on the switch) and its mixed-method reconcile loop (ADR 0014
+    Decision 3, issue #34 phase 3: remove_route for the departing routes,
+    configure_route for the arriving ones, within the SAME login/logout), so the
+    run bookkeeping and result gating are identical regardless of which drove it.
+    """
+    from datetime import datetime, timezone
+
+    from app.services.execution_service import create_execution_run, update_execution_run
+
+    destination = route.get("destination")
+    next_hop = route.get("next_hop")
+    interface = route.get("interface")
+    ident_a, ident_b = _route_run_identity(destination, next_hop, interface)
+    route_kwargs = {"destination": destination, "next_hop": next_hop, "interface": interface}
+    run = await create_execution_run(
+        db,
+        switch_uuid,
+        driver_id,
+        driver_sha256,
+        method,
+        WIRING_SYSTEM_USER,
+        redacted,
+        res_uuid,
+        ident_a,
+        ident_b,
+        method_kwargs=route_kwargs,
+    )
+    op_started = datetime.now(timezone.utc)
+    ok, attempts, err, result = await _run_driver_with_retry(
+        driver_path, method, context, password_keys, method_kwargs=route_kwargs
+    )
+    await update_execution_run(
+        db,
+        run,
+        "SUCCESS" if ok else "FAILED",
+        output=json.dumps(result["output"], default=str)
+        if ok and result and result.get("output")
+        else None,
+        error=None if ok else err,
+        started_at=op_started,
+        completed_at=datetime.now(timezone.utc),
+    )
+    return ok, attempts, err
+
+
 async def _apply_l3_adjacency(
     reservation_id: str,
     deprovisions: list[dict],
     provisions: list[dict],
     ctx: "_FetchContext",
     get_db_session,
+    reconciles: list[dict] | None = None,
 ) -> None:
-    """Apply an L3 adjacency reconcile: deprovision departed switches, then provision new.
+    """Apply an L3 adjacency reconcile: deprovision departed switches, provision new
+    ones, and reconcile the route-set delta on switches that stayed adjacent but
+    whose fork intent changed (ADR 0014 Decision 3, issue #34 phase 3).
 
     `deprovisions`/`provisions` are dicts with device_id and routes (the pinned set).
-    Switch sets are disjoint (adjacency is per-switch binary: a switch cannot both gain and
-    lose adjacency in one reconcile), and deprovisions run first (ADR 0009 Decision 4
-    ordering: L3 deprovision before L3 provision). Per switch: login once, drive
-    remove_route (deprovision) or configure_route (provision) for each pinned route, then
-    logout. Every driver call is result-gated through _run_driver_with_retry (Decision 3).
-    A clean provision records the switch ACTIVE (record_route_active); a clean removal
-    releases the pin (release_route_membership). A per-switch failure (any route failed, a
-    login failure, or an undrivable switch) lands a FAILED row tagged with its direction
-    (issue #369) and the pass continues (Decision 6, never NAKs). This one apply is shared
-    by the reconcile and both retry channels, the _apply_l2_memberships analogue.
+    `reconciles` (added phase 3) are dicts with device_id, remove_routes, add_routes,
+    and intent (the full new set to pin on success). The three switch sets are
+    disjoint (adjacency is per-switch binary, and a reconcile item is only built for
+    a switch that stayed adjacent both before and after), and deprovisions run before
+    provisions (ADR 0009 Decision 4 ordering: L3 deprovision before L3 provision);
+    reconciles run last since they never interact with the other two sets. Per
+    switch: login once, drive its route calls, then logout. For a plain provision or
+    deprovision every route uses the SAME method (configure_route or remove_route
+    respectively); for a reconcile item, remove_route calls run for `remove_routes`
+    BEFORE configure_route calls for `add_routes`, both within the one login/logout
+    (ADR 0014 Decision 3). Every driver call is result-gated through
+    _run_driver_with_retry (Decision 3 of ADR 0009).
+
+    A clean provision records the switch ACTIVE (record_route_active); a clean
+    removal releases the pin (release_route_membership); a clean reconcile advances
+    the pin to the new set (record_route_reconciled). A per-switch failure (any
+    route failed, a login failure, or an undrivable switch) lands a FAILED row
+    tagged with its direction (issue #369; a reconcile failure keeps the PREVIOUS
+    pinned set untouched via record_route_reconcile_failed) and the pass continues
+    (Decision 6, never NAKs). This one apply is shared by the reconcile and both
+    retry channels, the _apply_l2_memberships analogue.
+
+    Direction scoping for a reconcile item (ADR 0014 addendum X3, ADR 0009 Decision
+    5): when the reservation's wiring is frozen at the START of processing this
+    switch, `remove_routes` still drives (a release is always permitted) and
+    `add_routes` does not; a frozen reconcile whose `remove_routes` is empty (only
+    additions) is skipped entirely with one INFO log, no driver call. Since freeze
+    is monotonic (never reverts), a reconcile that saw frozen at the start of this
+    switch's processing still sees it frozen at record time, so
+    record_route_reconciled's OWN frozen re-check parks the row FAILED intended
+    RELEASED with its PRIOR pin intact (a superset of what a frozen partial drive
+    actually removed, which is safe: removing an already-removed route is
+    idempotent) rather than this function trying to compute a partial pin itself.
     """
     from datetime import datetime, timezone
 
@@ -2861,29 +3147,64 @@ async def _apply_l3_adjacency(
         redact_context_for_logging,
         update_execution_run,
     )
+    from app.services.l1_assignment_service import get_wiring_state
     from app.services.route_service import (
         record_route_active,
         record_route_failed,
+        record_route_reconcile_failed,
+        record_route_reconciled,
         release_route_membership,
         route_needs_remove,
     )
 
     res_uuid = uuid.UUID(reservation_id)
-    work = [("deprovision", d) for d in deprovisions] + [("provision", p) for p in provisions]
+    work = (
+        [("deprovision", d) for d in deprovisions]
+        + [("provision", p) for p in provisions]
+        + [("reconcile", r) for r in (reconciles or [])]
+    )
 
     for direction, item in work:
         switch_id = str(item["device_id"])
-        routes = item["routes"] or []
         switch_uuid = uuid.UUID(switch_id)
-        method = "remove_route" if direction == "deprovision" else "configure_route"
-        intended = "RELEASED" if direction == "deprovision" else "ACTIVE"
 
-        # A deprovision whose pin is no longer believed installed (already released, or a
-        # FAILED-intended-ACTIVE row that never applied) is an idempotent no-op.
-        if direction == "deprovision":
+        routes: list[dict] = []
+        remove_routes: list[dict] = []
+        add_routes: list[dict] = []
+        method = ""
+        intended = "ACTIVE"
+        frozen_now = False
+
+        if direction == "reconcile":
+            remove_routes = item.get("remove_routes") or []
+            add_routes = item.get("add_routes") or []
             async with get_db_session() as db:
-                if not await route_needs_remove(db, res_uuid, switch_id):
+                state = await get_wiring_state(db, res_uuid)
+            frozen_now = state is not None and state.frozen
+            if frozen_now:
+                if not remove_routes:
+                    logger.info(
+                        "L3 reconcile for frozen reservation %s switch %s has only "
+                        "additions; skipped (ADR 0009 decision 5 direction scoping)",
+                        reservation_id,
+                        switch_id,
+                    )
                     continue
+                add_routes = []
+            if not remove_routes and not add_routes:
+                continue
+        else:
+            routes = item["routes"] or []
+            method = "remove_route" if direction == "deprovision" else "configure_route"
+            intended = "RELEASED" if direction == "deprovision" else "ACTIVE"
+
+            # A deprovision whose pin is no longer believed installed (already
+            # released, or a FAILED-intended-ACTIVE row that never applied) is an
+            # idempotent no-op.
+            if direction == "deprovision":
+                async with get_db_session() as db:
+                    if not await route_needs_remove(db, res_uuid, switch_id):
+                        continue
 
         switch_data = await ctx.get_device(switch_id)
         template_data = (
@@ -2921,9 +3242,12 @@ async def _apply_l3_adjacency(
 
         if load_error is not None or driver_path is None:
             async with get_db_session() as db:
-                await record_route_failed(
-                    db, res_uuid, switch_id, routes, 0, load_error, intended=intended
-                )
+                if direction == "reconcile":
+                    await record_route_reconcile_failed(db, res_uuid, switch_id, 0, load_error)
+                else:
+                    await record_route_failed(
+                        db, res_uuid, switch_id, routes, 0, load_error, intended=intended
+                    )
             continue
 
         redacted = redact_context_for_logging(context, password_keys)
@@ -2956,62 +3280,51 @@ async def _apply_l3_adjacency(
                 completed_at=datetime.now(timezone.utc),
             )
             if not login_ok:
-                await record_route_failed(
-                    db,
-                    res_uuid,
-                    switch_id,
-                    routes,
-                    login_attempts,
-                    f"driver login failed: {login_err}",
-                    intended=intended,
-                )
+                if direction == "reconcile":
+                    await record_route_reconcile_failed(
+                        db, res_uuid, switch_id, login_attempts, f"driver login failed: {login_err}"
+                    )
+                else:
+                    await record_route_failed(
+                        db,
+                        res_uuid,
+                        switch_id,
+                        routes,
+                        login_attempts,
+                        f"driver login failed: {login_err}",
+                        intended=intended,
+                    )
                 continue
 
             switch_ok = True
             switch_attempts = 0
             switch_last_error: str | None = None
-            for route in routes:
-                destination = route.get("destination")
-                next_hop = route.get("next_hop")
-                interface = route.get("interface")
-                ident_a, ident_b = _route_run_identity(destination, next_hop, interface)
-                route_kwargs = {
-                    "destination": destination,
-                    "next_hop": next_hop,
-                    "interface": interface,
-                }
-                run = await create_execution_run(
+
+            if direction == "reconcile":
+                drive_sequence = [("remove_route", r) for r in remove_routes] + [
+                    ("configure_route", r) for r in add_routes
+                ]
+            else:
+                drive_sequence = [(method, r) for r in routes]
+
+            for op_method, route in drive_sequence:
+                ok, attempts, err = await _drive_l3_route(
                     db,
                     switch_uuid,
                     driver_id,
                     driver_sha256,
-                    method,
-                    WIRING_SYSTEM_USER,
+                    driver_path,
+                    op_method,
+                    context,
+                    password_keys,
                     redacted,
                     res_uuid,
-                    ident_a,
-                    ident_b,
-                    method_kwargs=route_kwargs,
-                )
-                op_started = datetime.now(timezone.utc)
-                ok, attempts, err, result = await _run_driver_with_retry(
-                    driver_path, method, context, password_keys, method_kwargs=route_kwargs
+                    route,
                 )
                 if not ok:
                     switch_ok = False
                     switch_attempts += attempts
                     switch_last_error = err
-                await update_execution_run(
-                    db,
-                    run,
-                    "SUCCESS" if ok else "FAILED",
-                    output=json.dumps(result["output"], default=str)
-                    if ok and result and result.get("output")
-                    else None,
-                    error=None if ok else err,
-                    started_at=op_started,
-                    completed_at=datetime.now(timezone.utc),
-                )
 
             logout_run = await create_execution_run(
                 db,
@@ -3041,7 +3354,24 @@ async def _apply_l3_adjacency(
                 completed_at=datetime.now(timezone.utc),
             )
 
-            if switch_ok:
+            if direction == "reconcile":
+                if switch_ok:
+                    # Always pass the full target intent: freeze is monotonic (never
+                    # reverts), so if `frozen_now` caught the freeze at the top of this
+                    # switch's processing (skipping `add_routes`), record_route_reconciled's
+                    # OWN frozen re-check below will still see frozen and park FAILED
+                    # intended RELEASED regardless of what is passed here, ignoring this
+                    # value entirely and leaving the row's PRIOR pin in place for the
+                    # release channel to remove (a superset of what was actually driven,
+                    # which is safe: removing an already-removed route is idempotent). This
+                    # value is only actually used on the ordinary, unfrozen success path.
+                    new_pin = item.get("intent") or []
+                    await record_route_reconciled(db, res_uuid, switch_id, new_pin)
+                else:
+                    await record_route_reconcile_failed(
+                        db, res_uuid, switch_id, switch_attempts or 1, switch_last_error
+                    )
+            elif switch_ok:
                 if direction == "provision":
                     await record_route_active(db, res_uuid, switch_id, routes)
                 else:
@@ -3058,32 +3388,66 @@ async def _apply_l3_adjacency(
                 )
 
 
+def _route_set_identity_keys(routes: list[dict]) -> set[str]:
+    """The shared herd_common route identity, applied to a plain route-dict list
+    (ADR 0014 addendum X-E, issue #757): used to diff a pinned set against fork
+    intent by identity, never by raw dict equality (key order, an absent vs. null
+    `virtual_router`, etc. must not read as a difference)."""
+    return {
+        route_identity_key(
+            r.get("destination"), r.get("interface"), r.get("next_hop"), r.get("virtual_router")
+        )
+        for r in routes
+    }
+
+
 async def _reconcile_l3_adjacency(
     reservation_id: str,
     intended_wires: list[dict],
+    l3_intent: dict[str, list[dict]],
     ctx: "_FetchContext",
     get_db_session,
 ) -> None:
-    """Full L3 adjacency reconcile against cabling's intended wires (ADR 0009 phase 5).
+    """Full L3 adjacency reconcile against cabling's intended wires and routing
+    intent (ADR 0009 phase 5; intent precedence and delta added ADR 0014 phase 3,
+    issue #34).
 
     L3 adjacency is ALWAYS a full reconcile (not a per-hop delta), on every apply (delta,
     heal, or gap): many hops can imply the same switch's adjacency, so a released hop alone
     cannot prove adjacency ended; only the intended set can. Derives the intended adjacency
-    (option C), diffs against this reservation's ACTIVE route pins, and drives
-    deprovisions-then-provisions through the shared _apply_l3_adjacency. Runs AFTER the L2
-    pass (Decision 4 ordering). The pinned routes for a provision come from an existing
-    non-RELEASED pin if one survives (reused verbatim, issue #20) or the switch's latest
-    config version on a genuinely fresh provision; a switch whose config declares no routes
-    is skipped and nothing is pinned.
+    (option C, widened by ADR 0014 addendum X-B when `l3_intent` names a trunk-skipped
+    switch), diffs against this reservation's ACTIVE route pins, and drives
+    deprovisions-then-provisions-then-reconciles through the shared _apply_l3_adjacency.
+    Runs AFTER the L2 pass (Decision 4 ordering).
+
+    Route content precedence (ADR 0014 Decision 2, addendum X2), per switch: when the
+    fork carries `l3_intent` for it, that IS the route set, full stop; otherwise today's
+    rule is unchanged (an existing non-RELEASED pin reused verbatim, issue #20, or the
+    switch's latest config version on a genuinely fresh provision). A switch newly
+    joining adjacency with intent goes through the ordinary provision path (Decision 4)
+    with the route list being the intent. A switch that STAYS adjacent across this apply
+    (already has an ACTIVE pin, still intended) is normally left untouched (the #20
+    "pinned, never re-derived" rule) UNLESS it carries intent, in which case Decision 3's
+    delta reconcile applies: `removes = pinned - intent`, `adds = intent - pinned` by
+    identity, no-op when both are empty (S5's identical shape: only an actual delta pays
+    for a drive). A switch whose intent was REMOVED while it stays adjacent keeps its
+    currently-applied set (addendum X4): intent disappearing is not a teardown signal.
+
+    Before any intent-driven switch is added to `provisions` or a reconcile item, its
+    routes pass `_gate_l3_drive_routes` (ADR 0014 addenda X-A, X-F): a gate failure lands
+    the switch FAILED with the gate's reason and drives nothing for it this pass, exactly
+    like an unresolvable switch or driver load failure.
     """
     from app.services.route_service import (
         failed_route_assignments_for_reservation,
         get_effective_pinned_routes,
         get_route_assignments,
         park_stale_route_build,
+        record_route_failed,
+        record_route_reconcile_failed,
     )
 
-    intended = await _derive_l3_adjacency(intended_wires, ctx)
+    intended = await _derive_l3_adjacency(intended_wires, ctx, l3_intent)
 
     async with get_db_session() as db:
         active_rows = await get_route_assignments(db, reservation_id)
@@ -3109,12 +3473,21 @@ async def _reconcile_l3_adjacency(
 
     add_switches = intended - set(current.keys())
     remove_switches = set(current.keys()) - intended
-
-    if not add_switches and not remove_switches and not stale_rows:
-        return
+    stay_switches = set(current.keys()) & intended
 
     provisions: list[dict] = []
     for switch_id in add_switches:
+        intent_routes = l3_intent.get(switch_id)
+        if intent_routes:
+            clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+            if reason is not None:
+                async with get_db_session() as db:
+                    await record_route_failed(
+                        db, reservation_id, switch_id, None, 0, reason, intended="ACTIVE"
+                    )
+                continue
+            provisions.append({"device_id": switch_id, "routes": clean})
+            continue
         async with get_db_session() as db:
             pinned = await get_effective_pinned_routes(db, reservation_id, switch_id)
         if pinned is None:
@@ -3143,10 +3516,55 @@ async def _reconcile_l3_adjacency(
             await park_stale_route_build(db, row.id, WIRING_STALE_BUILD_REASON)
         deprovisions.append({"device_id": str(row.device_id), "routes": row.routes or []})
 
-    if not provisions and not deprovisions:
+    reconciles: list[dict] = []
+    for switch_id in stay_switches:
+        intent_routes = l3_intent.get(switch_id)
+        if not intent_routes:
+            continue  # today's rule: a config-derived switch never re-derives on a save
+        row = current[switch_id]
+        pinned_routes = row.routes or []
+        pinned_keys = _route_set_identity_keys(pinned_routes)
+        intent_keys = _route_set_identity_keys(intent_routes)
+        if pinned_keys == intent_keys:
+            continue  # unchanged: no drive, no bookkeeping (S5's delta-gating shape)
+        clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+        if reason is not None:
+            async with get_db_session() as db:
+                await record_route_reconcile_failed(db, reservation_id, switch_id, 0, reason)
+            continue
+        clean_keys = {
+            route_identity_key(
+                r.get("destination"), r.get("interface"), r.get("next_hop"), r.get("virtual_router")
+            ): r
+            for r in clean
+        }
+        remove_routes = [
+            r
+            for r in pinned_routes
+            if route_identity_key(
+                r.get("destination"), r.get("interface"), r.get("next_hop"), r.get("virtual_router")
+            )
+            not in clean_keys
+        ]
+        add_routes = [r for key, r in clean_keys.items() if key not in pinned_keys]
+        if not remove_routes and not add_routes:
+            continue
+        reconciles.append(
+            {
+                "device_id": switch_id,
+                "remove_routes": remove_routes,
+                "add_routes": add_routes,
+                "intent": clean,
+                "previous_routes": pinned_routes,
+            }
+        )
+
+    if not provisions and not deprovisions and not reconciles:
         return
 
-    await _apply_l3_adjacency(reservation_id, deprovisions, provisions, ctx, get_db_session)
+    await _apply_l3_adjacency(
+        reservation_id, deprovisions, provisions, ctx, get_db_session, reconciles=reconciles
+    )
 
 
 async def handle_wiring_changed(
@@ -3219,10 +3637,15 @@ async def handle_wiring_changed(
         # them once here for the L2 pass. The fork stores L1-hop-only rows, so this is the
         # complete recorded-hop set L2 membership is derived from (option C).
         l2_intended_wires: list[dict]
+        # The fork's resolved L3 routing intent, grouped by switch device id (ADR
+        # 0014 phase 3, issue #34): rides along on the SAME fetch as the wires
+        # (ForkIntent.l3_routes), never a second HTTP call.
+        l3_intent_by_switch: dict[str, list[dict]] = {}
 
         if full_reconcile:
             desired_wires = await _fetch_fork_intended_wires(str(reservation_id), client)
             l2_intended_wires = desired_wires
+            l3_intent_by_switch = getattr(desired_wires, "l3_routes", {}) or {}
             desired_by_switch, unresolvable = await _wires_to_switch_pairs(desired_wires, ctx)
 
             # Convergent reconcile against the current ACTIVE rows: release ACTIVE pairs
@@ -3303,6 +3726,7 @@ async def handle_wiring_changed(
             )
         else:
             l2_intended_wires = await _fetch_fork_intended_wires(str(reservation_id), client)
+            l3_intent_by_switch = getattr(l2_intended_wires, "l3_routes", {}) or {}
             release_by_switch, unresolvable_r = await _wires_to_switch_pairs(released, ctx)
             build_by_switch, unresolvable_b = await _wires_to_switch_pairs(built, ctx)
             # Tag each side with its direction (issue #369) before merging: a hop
@@ -3327,7 +3751,10 @@ async def handle_wiring_changed(
         # L3 adjacency reconcile runs AFTER the L2 pass (Decision 4 ordering: L3 deprovision
         # then provision, all after L2), always a full reconcile against the SAME intended
         # wires fetched once above (derive both layers from one fetch, never fetch twice).
-        await _reconcile_l3_adjacency(str(reservation_id), l2_intended_wires, ctx, get_db_session)
+        # The fork's L3 routing intent (ADR 0014 phase 3) rode along on that same fetch.
+        await _reconcile_l3_adjacency(
+            str(reservation_id), l2_intended_wires, l3_intent_by_switch, ctx, get_db_session
+        )
 
     # Advance the monotonic marker: the version was processed (Decision 4/6), even if
     # the pass left FAILED rows for the Decision 6 retry channel.

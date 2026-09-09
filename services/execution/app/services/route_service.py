@@ -74,9 +74,16 @@ async def record_route_active(
     ACTIVE row for (reservation, device) short-circuits and returns it, and a concurrent
     provision that pinned the switch first trips the active-unique index, whereupon we
     roll back and return the winner's row. A prior non-RELEASED FAILED row for this
-    reservation's switch is flipped ACTIVE in place (the pinned `routes` it already
-    carried are the immutable set; we keep them and ignore the `routes` argument on the
-    flip, so a redelivery cannot re-pin an edited config).
+    reservation's switch is flipped ACTIVE in place, and its `routes` are SET to the
+    `routes` argument (ADR 0014 phase 3, issue #34): for a config-derived switch this
+    is a no-op, since the only caller of a reattempt for one of those always re-passes
+    `get_effective_pinned_routes`' own return value (the row's existing pin, issue #20's
+    "never re-derive" invariant enforced by the CALLER, not this function); for an
+    intent-driven switch, the caller may legitimately pass the fork's CURRENT intent
+    (which can differ from what the failed attempt tried), and the pin must actually
+    advance to it on success or the retry would silently keep driving stale content
+    forever. Prior to this ADR every caller passed back exactly the row's own pin, so
+    this changed nothing for any switch until phase 3 introduced a caller that does not.
 
     Mirrors record_l1_connect's record-time freeze re-check (issue #461, the #412
     discipline): a provision whose reservation froze while the driver call was in
@@ -157,6 +164,7 @@ async def record_route_active(
     if reusable is not None:
         reusable.status = "ACTIVE"
         reusable.intended = "ACTIVE"
+        reusable.routes = routes
         reusable.last_error = None
         reusable.released_at = None
         await db.commit()
@@ -195,6 +203,145 @@ async def record_route_active(
         len(routes),
         dev_uuid,
         res_uuid,
+    )
+    return row
+
+
+async def record_route_reconciled(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    device_id: uuid.UUID | str,
+    routes: list[dict],
+) -> RouteAssignment | None:
+    """Advance an already-ACTIVE L3 pin to a new route set after a clean intent
+    delta (ADR 0014 Decision 3, issue #34 phase 3).
+
+    Unlike record_route_active (whose existing-ACTIVE short-circuit exists so a
+    plain REDELIVERY of an already-applied provision never touches the pin), this
+    WRITES the new route list onto an EXISTING ACTIVE row: intent-driven switches
+    are the deliberate exception to the #20 "pinned, never re-derived" rule (ADR
+    0014 Decision 3), so a save that changes intent must actually advance what is
+    pinned, or the reconcile is theater. Only called by
+    _apply_l3_adjacency's "reconcile" item kind, after a clean drive of that
+    switch's remove/add delta; `routes` is the new FULL set to pin (not just the
+    added routes), computed by the caller from the delta actually driven (the
+    caller passes a partial set instead of the full target when the reservation
+    froze mid-reconcile and only removals ran; see ADR 0014 addendum X3).
+
+    Mirrors record_route_active's frozen re-check: a reconcile whose reservation
+    froze mid-flight (between this function being called and its own read) must
+    not silently advance the pin past what the terminal teardown already
+    snapshotted, so it is instead parked FAILED intended RELEASED
+    (FROZEN_PROVISION_PENDING_REMOVAL), exactly like record_route_active's frozen
+    branch; the release-direction retry channel then removes whatever this row's
+    `routes` were BEFORE this call (left untouched on that branch).
+
+    Returns None when no ACTIVE row exists for this (reservation, device): the
+    caller guarantees one (a reconcile item is only built for a switch already in
+    the ACTIVE `current` set), so this is a no-op safety net, not an expected
+    path, e.g. a concurrent writer released the row between the caller's read and
+    this call.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    dev_uuid = _as_uuid(device_id)
+
+    row = (
+        (
+            await db.execute(
+                select(RouteAssignment).where(
+                    RouteAssignment.reservation_id == res_uuid,
+                    RouteAssignment.device_id == dev_uuid,
+                    RouteAssignment.status == "ACTIVE",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        return None
+
+    state = await get_wiring_state(db, res_uuid)
+    if state is not None and state.frozen:
+        row.status = "FAILED"
+        row.intended = "RELEASED"
+        row.last_error = FROZEN_PROVISION_PENDING_REMOVAL
+        await db.commit()
+        await db.refresh(row)
+        logger.warning(
+            "L3 intent-delta reconcile for frozen reservation %s landed on switch %s; "
+            "parked FAILED intended RELEASED for the release retry channel",
+            res_uuid,
+            dev_uuid,
+        )
+        return row
+
+    row.routes = routes
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "Advanced pinned route set for L3 switch %s in reservation %s (%d route(s))",
+        dev_uuid,
+        res_uuid,
+        len(routes),
+    )
+    return row
+
+
+async def record_route_reconcile_failed(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    device_id: uuid.UUID | str,
+    attempts: int,
+    last_error: str | None,
+) -> RouteAssignment | None:
+    """Record a failed intent-delta reconcile against an already-ACTIVE L3 pin
+    (ADR 0014 Decision 3, issue #34 phase 3).
+
+    Unlike record_route_failed's build-direction call (whose #412 stale-writer
+    guard exists for a FRESH provision race, where an existing ACTIVE row means
+    "a concurrent writer already won"), a reconcile failure targets a row that is
+    ALREADY ACTIVE for this reservation's own PRIOR pin: this writer IS the one
+    that owns that row's history for this pass, so the #412 ambiguity does not
+    apply and the row is unconditionally flipped FAILED. `intended` stays "ACTIVE"
+    (a build-direction failure, issue #369, so the build-direction retry channel
+    picks it up), `attempts` accumulate, and `routes` is left UNTOUCHED: Decision 3
+    requires the previous pinned set survive a failed delta verbatim, so later
+    teardown or retry still targets exactly what is actually still installed, not
+    the new intent that never fully applied.
+
+    Returns None when the row is no longer ACTIVE by the time this runs (a
+    concurrent writer released or already failed it first): whichever writer got
+    there first owns the row's fate, matching the #412 posture applied in reverse.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    dev_uuid = _as_uuid(device_id)
+    row = (
+        (
+            await db.execute(
+                select(RouteAssignment).where(
+                    RouteAssignment.reservation_id == res_uuid,
+                    RouteAssignment.device_id == dev_uuid,
+                    RouteAssignment.status == "ACTIVE",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        return None
+    row.status = "FAILED"
+    row.intended = "ACTIVE"
+    row.attempts = (row.attempts or 0) + attempts
+    row.last_error = last_error
+    await db.commit()
+    await db.refresh(row)
+    logger.warning(
+        "L3 intent-delta reconcile failed for switch %s, reservation %s: %s",
+        dev_uuid,
+        res_uuid,
+        last_error,
     )
     return row
 
