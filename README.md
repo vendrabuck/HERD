@@ -49,7 +49,8 @@ The images below are design-system mockups rendered from the HERD UI kit, not ca
 - Build network topologies via drag-and-drop, connecting devices at Layer 1/2/3
 - Enforce physical/cloud topology separation; physical and cloud devices cannot be mixed in a single topology
 - Upload driver packages with connection types (Management, Layer 1/2/3 Switch) to classify devices as DUT or infrastructure
-- Automatic L1 switch port connections and L2 VLAN provisioning when reservations are created, with automatic teardown on cancellation or completion
+- Automatic L1 switch port connections, L2 VLAN provisioning, and L3 static route provisioning when reservations are created, with automatic teardown on cancellation or completion
+- Layer 3 routing intent (ADR 0014): a Layer 3 Switch device node can carry a per-switch route table (destination, next hop, interface, virtual router), edited in the topology editor's Routing panel, validated before a topology save, a reservation fork save, or a reservation is created, and driven by the execution service ahead of the switch's stored config version when present
 - Shortest-path cable routing through L1 switch infrastructure with visual feedback on the topology canvas
 - Reservation detail view with device inventory, hop-by-hop route visualization, schedule editing, and live device list modification
 - Automatic reservation expiration: pending reservations activate, active reservations complete on schedule

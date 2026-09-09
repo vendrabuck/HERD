@@ -147,13 +147,18 @@ stored as absent, not as an empty string; removing a switch's last route clears 
 intent entirely rather than leaving an empty table behind. Destination and interface are
 required to add a row (the **Add route** button stays disabled until both are filled), but
 neither field is validated as a real address in the browser: the server is the sole
-authority on whether a route is well-formed and usable (see Validation below).
+authority on whether a route is well-formed and usable (see Validation below). Editing an
+existing row commits on blur or Enter rather than on every keystroke, and every field
+(destination, next hop, interface, virtual router, on both existing rows and the add-row
+draft) is capped at 64 characters, matching the server's own field-length limit.
 
 **Import from device config** loads the switch's newest config version and copies its
 `routes` (destination, next hop, interface) into the table, leaving `virtual_router` blank
 on every imported row, since the device config schema has no such grouping. If the table
 already has rows, importing asks for confirmation first and then replaces the table
-outright; it does not merge.
+outright; it does not merge. The **Import from device config** button is disabled (labeled
+"Importing..." while a fetch is in flight) until the switch's config version has loaded, and
+stays disabled with no config version to import from.
 
 A switch with at least one route shows a small route-count badge on its canvas node (for
 example "2 routes") so routing intent is visible without opening the panel. The badge turns
@@ -178,7 +183,13 @@ three points, each surfacing the same kind of problem list:
 - **Creating a reservation** from a topology with routing intent runs the same check as part
   of booking; a problem refuses the reservation with a "Reservation refused: routing intent
   has N problems" toast and the same badge/reason-line treatment, so you can fix the routes
-  (or the switch's config) and try again.
+  (or the switch's config) and try again. This gate validates the topology's PERSISTED
+  canvas, not the editor's live draft: a routing edit made but never saved is invisible to
+  it. Opening the Reserve dialog (the "Reserve from this topology" flow, not a reservation's
+  live-edit fork) with unsaved edits that touched routing intent shows a one-time
+  "Unsaved routing changes are not checked until you save" toast rather than blocking Reserve
+  outright, since the gate itself is the real authority and you may prefer to fix the switch's
+  config instead of saving first.
 
 One reason, `l3_duplicate_route`, is informational rather than a problem: it never counts
 toward the "N problems" total, never turns a switch's badge red, and never refuses a save

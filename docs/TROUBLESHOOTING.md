@@ -128,7 +128,7 @@ One or both chosen ports have no recorded physical cabling. Pick a different por
 The L3 validation pass (ADR 0014) fetches each L3-carrying switch's latest
 inventory config version, up to 8 concurrently, and must finish the whole pass
 within a 12 second deadline. At a typical 4 second inventory response time,
-that budget covers roughly two concurrent rounds, about 24 L3 switches, before
+that budget covers roughly three concurrent rounds, about 24 L3 switches, before
 the deadline trips and the pass fails closed with `l3_config_unavailable`. A
 topology with more L3 switches than that, or against a slower inventory,
 refuses validation and save on this timeout rather than validating a partial
