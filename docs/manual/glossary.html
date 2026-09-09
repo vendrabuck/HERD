@@ -64,6 +64,8 @@
 
       <div><dt>L1 / L2 / L3</dt><dd>The network layer of a connection. <b>L1</b> = physical cabling (gray, dashed). <b>L2</b> = Ethernet / VLAN (blue, solid). <b>L3</b> = IP / routing (green, dashed). L2 and L3 are logical overlays that still need a real L1 path underneath.</dd></div>
 
+      <div><dt>Routing intent</dt><dd>A Layer 3 Switch's per-switch route table (destination, next hop, interface, virtual router), edited in the topology editor's Routing panel and carried on the switch's canvas node. Checked when you save a topology, save a reservation's fork, or create a reservation; when present, the execution service applies it in precedence over the switch's stored config version. <a href="user-topology.html#connect">Routing intent &rarr;</a></dd></div>
+
       <div><dt>Pathfinding &amp; hops</dt><dd>HERD checks whether two devices can actually reach each other through the recorded cabling. A valid link shows <span class="badge available">"N hops"</span> (the number of switches in between); an impossible one shows <span class="badge failed">"no path"</span>.</dd></div>
 
       <div><dt>Fabric</dt><dd>A connected cluster of L2 switches and the ports linking them. Used to keep VLAN ids unique <em>within</em> a fabric while letting isolated fabrics reuse the same ids.</dd></div>

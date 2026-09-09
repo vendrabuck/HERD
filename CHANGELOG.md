@@ -14,7 +14,7 @@
   unreachable-topology error, and the fork's resolved routes ride the internal
   and user-facing fork GET. Inventory gained an internal batch device-type
   lookup (`POST /internal/devices/batch`) to serve the validation pass.
-  Editor and execution-side consumption are phases 2 and 3, not yet built.
+  Editor and execution-side consumption are phases 2 and 3, shipped below.
 - Shipped phase 2 of first-class Layer 3 routing intent (ADR 0014, issue #34):
   the topology editor's canvas contract gains `data.l3` on a device node
   (`L3RouteIntent[]`, persisted through fork commit, autosave, and restore
@@ -31,9 +31,7 @@
   on an otherwise-unchanged device node ("Routing changed on <device>: +A
   routes, -B routes"), comparing destinations in the server's canonical form
   so a canonicalization-only difference is never reported as a change nobody
-  made. Execution-side consumption is phase 3, not yet built.
-  Editor consumption (phase 2) is not yet built; execution-side consumption
-  (phase 3) shipped below.
+  made. Execution-side consumption (phase 3) shipped below.
 - Shipped phase 3 of first-class Layer 3 routing intent (ADR 0014, issue #34):
   execution now consumes a fork's resolved routing intent instead of always
   reading a switch's latest config version. Precedence is per switch: intent,
@@ -67,6 +65,19 @@
   deadline, so a save could time out on the reservations side and 503 the user
   while cabling went on to commit it. The save forward now uses a 20s budget,
   matching the headroom already given to the validate forward.
+- Docs and manual for phase 4 of first-class Layer 3 routing (ADR 0014, issue
+  #34): with all three delivery phases merged, `PLANNED_FEATURES.md`'s entry
+  flips from `Partial` to `Shipped` with a phase-by-phase summary and PR
+  numbers, and `FEATURES.md` gains a Topology-section bullet describing the
+  Routing panel (route table, Import from device config, the route-count
+  badge) plus a corrected one-sentence precedence statement (fork routing
+  intent, else the switch's latest config version) on the existing Layer 3
+  provisioning bullet. `docs/ARCHITECTURE.md` had one stale "not yet built"
+  sentence left over from when phases 2 and 3 were still in flight, corrected
+  to say both shipped. The published manual's `user-topology.html` gains a
+  Routing panel mockup in the wiring section, `user-live-editing.html#fork`
+  gains one sentence on the fork-diff "Routing changed" line, and
+  `glossary.html` gains a Routing intent term.
 
 ## [0.4.0] - 2026-09-05
 
