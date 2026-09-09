@@ -287,7 +287,13 @@ async def record_route_reconciled(
     atomic `UPDATE ... WHERE routes = ...`: `route_assignments.routes` is a
     plain `JSON` column (not `JSONB`) on Postgres, which has no `=` operator for
     direct SQL comparison, and widening the column is a schema change out of
-    scope for this fix.
+    scope for this fix. The row is loaded `with_for_update()` (the same idiom
+    cabling's `_load_fork(..., for_update=True)` uses) and the lock is held
+    through this function's own commit, so the compare-and-swap happens under
+    the lock: a second concurrent writer's SELECT for the SAME row blocks until
+    this transaction commits or rolls back, then sees the (possibly just-moved)
+    pin and correctly no-ops instead of racing this one between an unlocked
+    compare and write.
 
     Mirrors record_route_active's frozen re-check: a reconcile whose reservation
     froze mid-flight (between this function being called and its own read) must
@@ -309,11 +315,13 @@ async def record_route_reconciled(
     row = (
         (
             await db.execute(
-                select(RouteAssignment).where(
+                select(RouteAssignment)
+                .where(
                     RouteAssignment.reservation_id == res_uuid,
                     RouteAssignment.device_id == dev_uuid,
                     RouteAssignment.status == "ACTIVE",
                 )
+                .with_for_update()
             )
         )
         .scalars()
@@ -389,7 +397,9 @@ async def record_route_reconcile_failed(
     wiring_changed consumer), and this call is a logged, silent no-op rather than
     flipping a row a faster writer already advanced to FAILED out from under it.
     See record_route_reconciled's docstring for why this is a Python-level
-    equality check, not a SQL-level atomic UPDATE.
+    equality check (not a SQL-level atomic UPDATE) protected by loading the row
+    `with_for_update()` and holding the lock through this function's own commit,
+    so the compare happens under the lock rather than racing an unlocked write.
 
     Returns None when the row is no longer ACTIVE by the time this runs (a
     concurrent writer released or already failed it first) or when the
@@ -401,11 +411,13 @@ async def record_route_reconcile_failed(
     row = (
         (
             await db.execute(
-                select(RouteAssignment).where(
+                select(RouteAssignment)
+                .where(
                     RouteAssignment.reservation_id == res_uuid,
                     RouteAssignment.device_id == dev_uuid,
                     RouteAssignment.status == "ACTIVE",
                 )
+                .with_for_update()
             )
         )
         .scalars()
