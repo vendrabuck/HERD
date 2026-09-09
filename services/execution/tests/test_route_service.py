@@ -21,8 +21,19 @@ from app.services.route_service import record_route_active
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
-test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+# StaticPool + check_same_thread=False (matching test_wiring_retry_l3.py and
+# test_nats_consumer_l3_reconcile.py): the P3 review-fix CAS test below opens
+# TWO independent sessions concurrently, which need to share the SAME
+# in-memory SQLite database; the default pool gives each checked-out
+# connection its own separate `:memory:` database.
+test_engine = create_async_engine(
+    "sqlite+aiosqlite:///:memory:",
+    echo=False,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
 TestSessionLocal = async_sessionmaker(test_engine, expire_on_commit=False)
 
 
@@ -215,7 +226,7 @@ async def test_record_route_reconciled_advances_the_pin_on_an_active_row(db):
     sid = uuid.uuid4()
     await record_route_active(db, rid, sid, ROUTES)
 
-    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES)
+    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES, ROUTES)
     assert row.status == "ACTIVE"
     assert row.routes == EDITED_ROUTES, "unlike record_route_active, this DOES advance the pin"
 
@@ -225,7 +236,7 @@ async def test_record_route_reconciled_returns_none_when_no_active_row(db):
     this is a no-op safety net, not an expected path."""
     from app.services.route_service import record_route_reconciled
 
-    row = await record_route_reconciled(db, uuid.uuid4(), uuid.uuid4(), EDITED_ROUTES)
+    row = await record_route_reconciled(db, uuid.uuid4(), uuid.uuid4(), EDITED_ROUTES, ROUTES)
     assert row is None
 
 
@@ -242,11 +253,56 @@ async def test_record_route_reconciled_frozen_parks_failed_intended_released(db)
     db.add(ReservationWiringState(reservation_id=rid, frozen=True))
     await db.commit()
 
-    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES)
+    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES, ROUTES)
     assert row.status == "FAILED"
     assert row.intended == "RELEASED"
     assert row.routes == ROUTES, "the PRIOR pin survives; the new set is never applied"
     assert row.last_error == FROZEN_PROVISION_PENDING_REMOVAL
+
+
+async def test_record_route_reconciled_stale_previous_routes_is_a_noop(db):
+    """Review fix P2 (issue #34 phase 3 review): when the row's CURRENT routes no
+    longer equal `previous_routes` (a faster concurrent writer already moved it),
+    this call is a no-op that returns None and never overwrites the row, even
+    though an ACTIVE row exists."""
+    from app.services.route_service import record_route_reconciled
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+
+    # previous_routes does not match the row's actual current routes (ROUTES).
+    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES, EDITED_ROUTES)
+    assert row is None
+
+    survivor = (
+        (
+            await db.execute(
+                select(RouteAssignment).where(
+                    RouteAssignment.reservation_id == rid,
+                    RouteAssignment.device_id == sid,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert survivor.status == "ACTIVE"
+    assert survivor.routes == ROUTES, "the stale writer's call never touched the row"
+
+
+async def test_record_route_reconciled_matching_previous_routes_succeeds(db):
+    """The CAS's positive case: when `previous_routes` matches exactly what is
+    currently pinned, the write proceeds normally."""
+    from app.services.route_service import record_route_reconciled
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+
+    row = await record_route_reconciled(db, rid, sid, EDITED_ROUTES, ROUTES)
+    assert row is not None
+    assert row.routes == EDITED_ROUTES
 
 
 async def test_record_route_reconcile_failed_keeps_previous_pin(db):
@@ -256,7 +312,7 @@ async def test_record_route_reconcile_failed_keeps_previous_pin(db):
     sid = uuid.uuid4()
     await record_route_active(db, rid, sid, ROUTES)
 
-    row = await record_route_reconcile_failed(db, rid, sid, 2, "boom")
+    row = await record_route_reconcile_failed(db, rid, sid, 2, "boom", ROUTES)
     assert row.status == "FAILED"
     assert row.intended == "ACTIVE"
     assert row.routes == ROUTES, "Decision 3: the previous pinned set survives a failed delta"
@@ -267,7 +323,7 @@ async def test_record_route_reconcile_failed_keeps_previous_pin(db):
     # call against the same (reservation, switch) is a no-op (None): once FAILED,
     # further reattempts go through the retry channel's own upsert
     # (record_route_failed), not a second reconcile-delta failure.
-    row2 = await record_route_reconcile_failed(db, rid, sid, 3, "boom again")
+    row2 = await record_route_reconcile_failed(db, rid, sid, 3, "boom again", ROUTES)
     assert row2 is None
 
 
@@ -275,19 +331,129 @@ async def test_record_route_reconcile_failed_is_not_guarded_by_412_unlike_record
     """The key behavioral difference from record_route_failed's build-direction
     call: an ACTIVE row IS flipped FAILED here (no "a concurrent writer already
     won" guard), since this writer IS the one that owns this pin's history for a
-    reconcile delta."""
+    reconcile delta whose previous_routes still matches."""
     from app.services.route_service import record_route_reconcile_failed
 
     rid = uuid.uuid4()
     sid = uuid.uuid4()
     await record_route_active(db, rid, sid, ROUTES)
 
-    row = await record_route_reconcile_failed(db, rid, sid, 1, "delta boom")
+    row = await record_route_reconcile_failed(db, rid, sid, 1, "delta boom", ROUTES)
     assert row.status == "FAILED", "unlike record_route_failed, the ACTIVE row IS downgraded"
 
 
 async def test_record_route_reconcile_failed_returns_none_when_not_active(db):
     from app.services.route_service import record_route_reconcile_failed
 
-    row = await record_route_reconcile_failed(db, uuid.uuid4(), uuid.uuid4(), 1, "boom")
+    row = await record_route_reconcile_failed(db, uuid.uuid4(), uuid.uuid4(), 1, "boom", ROUTES)
     assert row is None
+
+
+async def test_record_route_reconcile_failed_stale_previous_routes_is_a_noop(db):
+    """Review fix P2: a mismatched `previous_routes` (a faster concurrent writer
+    already moved the row) is a no-op that never flips the row FAILED, even
+    though it is still ACTIVE."""
+    from app.services.route_service import record_route_reconcile_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+
+    row = await record_route_reconcile_failed(db, rid, sid, 1, "delta boom", EDITED_ROUTES)
+    assert row is None
+
+    survivor = (
+        (
+            await db.execute(
+                select(RouteAssignment).where(
+                    RouteAssignment.reservation_id == rid,
+                    RouteAssignment.device_id == sid,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert survivor.status == "ACTIVE", "the stale writer's call never flipped the row"
+    assert survivor.routes == ROUTES
+
+
+# --- record_route_active's FAILED-to-ACTIVE flip is a CAS on status (review
+# --- fix P3, issue #34 phase 3 review) ---
+
+
+async def test_record_route_active_reusable_flip_succeeds_when_cas_matches(db):
+    """The CAS's positive path: a plain (non-racing) reattempt still flips
+    FAILED to ACTIVE with the new routes, since the row's status is still
+    FAILED when the UPDATE runs."""
+    from app.services.route_service import record_route_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_failed(db, rid, sid, ROUTES, 2, "boom", intended="ACTIVE")
+
+    row = await record_route_active(db, rid, sid, EDITED_ROUTES)
+    assert row.status == "ACTIVE"
+    assert row.routes == EDITED_ROUTES
+
+
+async def test_record_route_active_reusable_cas_loser_never_overwrites(db):
+    """P3 review fix: the FAILED-to-ACTIVE flip's CAS
+    (`UPDATE ... WHERE status = 'FAILED'`) must reject a writer whose UPDATE
+    runs after another writer's commit already flipped the row, even though
+    BOTH writers' SELECTs saw the row as FAILED (the genuine TOCTOU window this
+    fix closes: the ordinary consumer path and the wiring-retry sweep can both
+    reach record_route_active for the same row as independent asyncio tasks).
+
+    A live two-session interleaving that forces both writers past their SELECT
+    before either commits cannot be driven by two SEQUENTIAL calls to
+    record_route_active itself: the second caller's own `existing == ACTIVE`
+    check would already short-circuit once the first has committed (a
+    different, pre-existing safety net that predates phase 3). So this test
+    drives the exact CAS UPDATE statement record_route_active issues directly,
+    with the interleaving forced explicitly, to prove the CAS clause itself
+    (not the unrelated `existing` short-circuit) is what rejects the loser.
+    """
+    from app.services.route_service import record_route_failed
+    from sqlalchemy import update
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    failed = await record_route_failed(db, rid, sid, ROUTES, 2, "boom", intended="ACTIVE")
+
+    async with TestSessionLocal() as db_a, TestSessionLocal() as db_b:
+        # Both writers' SELECTs land before either writer's UPDATE (the race).
+        row_a = (
+            await db_a.execute(select(RouteAssignment).where(RouteAssignment.id == failed.id))
+        ).scalar_one()
+        row_b = (
+            await db_b.execute(select(RouteAssignment).where(RouteAssignment.id == failed.id))
+        ).scalar_one()
+        assert row_a.status == "FAILED"
+        assert row_b.status == "FAILED"
+
+        # Writer A wins: its CAS UPDATE matches (status is still FAILED) and commits.
+        result_a = await db_a.execute(
+            update(RouteAssignment)
+            .where(RouteAssignment.id == failed.id, RouteAssignment.status == "FAILED")
+            .values(status="ACTIVE", intended="ACTIVE", routes=ROUTES, last_error=None)
+        )
+        assert result_a.rowcount == 1
+        await db_a.commit()
+
+        # Writer B (the loser) issues the SAME CAS UPDATE against the row it read
+        # BEFORE A's commit; its WHERE clause no longer matches (status is now
+        # ACTIVE), so it must affect zero rows and must NEVER overwrite A's
+        # content.
+        result_b = await db_b.execute(
+            update(RouteAssignment)
+            .where(RouteAssignment.id == failed.id, RouteAssignment.status == "FAILED")
+            .values(status="ACTIVE", intended="ACTIVE", routes=EDITED_ROUTES, last_error=None)
+        )
+        assert result_b.rowcount == 0, "the loser's CAS must match zero rows"
+        await db_b.rollback()
+
+    final = (
+        await db.execute(select(RouteAssignment).where(RouteAssignment.id == failed.id))
+    ).scalar_one()
+    assert final.routes == ROUTES, "the winner's content survives; the loser never overwrote it"

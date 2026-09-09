@@ -267,6 +267,7 @@ async def test_wiring_status_l3_route_count_reflects_applied_set_after_a_delta(c
                 {"destination": "10.0.0.0/24", "next_hop": "10.0.1.1", "interface": "eth0"},
                 {"destination": "10.5.0.0/24", "next_hop": None, "interface": "eth1"},
             ],
+            [{"destination": "10.0.0.0/24", "next_hop": "10.0.1.1", "interface": "eth0"}],
         )
 
     resp = await client.get(f"/internal/reservations/{RES_ID}/wiring-status", headers=TOKEN_HEADER)

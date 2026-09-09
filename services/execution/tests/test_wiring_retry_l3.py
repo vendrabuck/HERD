@@ -536,3 +536,77 @@ async def test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_pre
     row = await _l3_row(rid)
     assert row.status == "ACTIVE"
     assert result["results"][0]["outcome"] == "reconnected"
+
+
+# --- ADR 0014 phase 3 review fix P1: gate TransientUpstreamError isolation ---
+
+
+async def test_l3_build_retry_gate_transient_failure_isolated_per_row(monkeypatch):
+    """Review fix P1 (issue #34 phase 3 review): a TransientUpstreamError from
+    the X-A gate's config re-validation for ONE row, in ONE reservation, must
+    not drop every OTHER reservation's already-accumulated retry entries for
+    the tick. Before the fix, an unwrapped `_gate_l3_drive_routes` call let this
+    exception escape `_reattempt_l3_rows` entirely, discarding every other
+    reservation's `by_res` entries too, not just the raising row's."""
+    monkeypatch.setattr("app.config.settings.wiring_retry_batch_size", 10)
+    monkeypatch.setattr("app.config.settings.wiring_retry_max_attempts", 100)
+
+    res_a = str(uuid.uuid4())
+    res_b = str(uuid.uuid4())
+    rid_a = await _seed_l3_failed("ACTIVE", routes=PINNED, device_id=SW_L3, reservation_id=res_a)
+    rid_b = await _seed_l3_failed("ACTIVE", routes=PINNED, device_id=SW_L3_B, reservation_id=res_b)
+
+    intent_a = [
+        _intent_route("10.95.0.0/24", "eth1", validated_config_version_id=None, device_id=SW_L3)
+    ]
+    intent_b = [_intent_route("10.96.0.0/24", "eth1", device_id=SW_L3_B)]
+
+    fork_wires = [
+        _fork_wire(DUT, "eth0", SW_L3, "ge-0/0/1"),
+        _fork_wire(str(uuid.uuid4()), "eth0", SW_L3_B, "ge-0/0/2"),
+    ]
+
+    async def _config_raising_for_sw_l3(device_id, client=None):
+        from app.services.nats_consumer import TransientUpstreamError
+
+        if str(device_id) == SW_L3:
+            raise TransientUpstreamError("inventory hiccup")
+        return {"id": CFG_VERSION_ID, "config": {"routes": CURRENT_CONFIG}}
+
+    async def _device(device_id, client=None):
+        found = SWITCHES.get(str(device_id))
+        if found is not None:
+            return found
+        return {"id": str(device_id), "name": "dut", "connection_type": "Server", "field_data": {}}
+
+    execute_fn, calls = _recorder()
+    with (
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device)),
+        patch(
+            "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
+        ),
+        patch(
+            "app.services.nats_consumer._fetch_latest_config",
+            new=AsyncMock(side_effect=_config_raising_for_sw_l3),
+        ),
+        patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(
+                return_value=ForkIntent(fork_wires, {SW_L3: intent_a, SW_L3_B: intent_b})
+            ),
+        ),
+    ):
+        await run_wiring_retry_tick(_db_session_factory())
+
+    # RES_B's row was still driven despite RES_A's gate failure.
+    assert {d for a, d in calls if a == "configure_route"} == {"10.96.0.0/24"}
+    row_b = await _l3_row(rid_b)
+    assert row_b.status == "ACTIVE"
+
+    # RES_A's row is untouched: stays FAILED, not driven, not corrupted, not
+    # dropped from the tick's bookkeeping entirely.
+    row_a = await _l3_row(rid_a)
+    assert row_a.status == "FAILED"
+    assert row_a.routes == PINNED

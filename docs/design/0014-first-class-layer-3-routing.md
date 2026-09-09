@@ -725,6 +725,21 @@ every switch that predates this phase. A switch with no current intent (never ha
 any, or it was removed) retries with the row's own pinned set verbatim, unchanged
 from before (addendum X4).
 
+**X4 is a distinct concept from the pre-existing wiring-adjacency "intent gone"
+rule (review fix P4).** Both retry channels already revalidate a BUILD-direction
+row against cabling's CURRENT intended WIRING set before driving it, and park a
+row whose switch left that set (release-direction, `park_stale_route_build`,
+`WIRING_STALE_BUILD_REASON`): that is coarse, "is this switch even wired into the
+reservation at all" adjacency intent, unchanged by this phase. X4 is a second,
+finer-grained concept phase 3 introduces on top of it: "for a switch that IS
+still wired, does the fork still carry ROUTE-CONTENT intent for it", and it
+deliberately gets the OPPOSITE answer when that intent disappears, keep the
+applied set, not park it. The two never conflict in practice, since they gate on
+different questions (wiring adjacency versus route content) and the wiring
+-adjacency check runs first: a switch that loses ADJACENCY is parked regardless
+of route-content intent; a switch that keeps adjacency but loses route-content
+intent is never even evaluated by the adjacency-intent rule.
+
 **Docs, load, and CI shape.** `docs/DRIVERS.md`'s route-derivation section and
 `docs/ARCHITECTURE.md`'s L3 sentence were amended to describe the precedence and
 delta; no route or schema changed, so no contract snapshot moved. `tests/load/locustfile.py`

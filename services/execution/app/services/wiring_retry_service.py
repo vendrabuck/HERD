@@ -640,6 +640,17 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     (never had any, or it was removed) is driven with the row's own pinned `routes`
     verbatim, unchanged from before phase 3 (addendum X4: intent disappearing is not
     a teardown signal, so the retry keeps reattempting the applied set).
+
+    The gate call is wrapped in its OWN per-row `try/except TransientUpstreamError`
+    (review fix, issue #34 phase 3 review): `_gate_l3_drive_routes` re-validates
+    through `ctx.get_latest_config`, which raises on an inventory 5xx exactly like
+    the per-reservation fetch/derive block above, and without this isolation that
+    exception would propagate out of the whole function, silently discarding every
+    OTHER reservation's already-accumulated `by_res` entries for the tick (a
+    phase-3-introduced regression in the pre-existing "one reservation's fetch
+    failure never blocks its siblings" guarantee). A gate transport failure for one
+    row leaves that row FAILED and undriven this tick, exactly like an ordinary gate
+    refusal, but never touches any other row.
     """
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
@@ -700,7 +711,23 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
                     continue
                 intent_routes = l3_intent_by_switch.get(switch_id)
                 if intent_routes:
-                    clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+                    try:
+                        clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+                    except TransientUpstreamError as exc:
+                        # Isolated to THIS row (review fix): an inventory 5xx while
+                        # re-validating one switch's intent must never propagate out
+                        # of _reattempt_l3_rows and discard every other reservation's
+                        # already-accumulated by_res entries for the tick.
+                        logger.warning(
+                            "wiring retry: cannot re-validate L3 intent for switch %s, "
+                            "reservation %s (%s); row not driven this tick "
+                            "(unverifiable intent never drives hardware, ADR 0014 "
+                            "addendum X-A)",
+                            switch_id,
+                            res_str,
+                            exc,
+                        )
+                        continue
                     if reason is not None:
                         async with get_db_session() as db:
                             await record_route_failed(

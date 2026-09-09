@@ -996,6 +996,9 @@ async def test_apply_l3_adjacency_frozen_reconcile_runs_removes_skips_adds():
                     "intent": [
                         {"destination": "10.99.0.0/24", "interface": "eth9", "next_hop": None}
                     ],
+                    "previous_routes": [
+                        {"destination": "10.20.0.0/24", "interface": "eth1", "next_hop": None}
+                    ],
                 }
             ],
         )

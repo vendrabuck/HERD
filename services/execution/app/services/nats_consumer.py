@@ -3104,17 +3104,20 @@ async def _apply_l3_adjacency(
 
     `deprovisions`/`provisions` are dicts with device_id and routes (the pinned set).
     `reconciles` (added phase 3) are dicts with device_id, remove_routes, add_routes,
-    and intent (the full new set to pin on success). The three switch sets are
-    disjoint (adjacency is per-switch binary, and a reconcile item is only built for
-    a switch that stayed adjacent both before and after), and deprovisions run before
-    provisions (ADR 0009 Decision 4 ordering: L3 deprovision before L3 provision);
-    reconciles run last since they never interact with the other two sets. Per
-    switch: login once, drive its route calls, then logout. For a plain provision or
-    deprovision every route uses the SAME method (configure_route or remove_route
-    respectively); for a reconcile item, remove_route calls run for `remove_routes`
-    BEFORE configure_route calls for `add_routes`, both within the one login/logout
-    (ADR 0014 Decision 3). Every driver call is result-gated through
-    _run_driver_with_retry (Decision 3 of ADR 0009).
+    intent (the full new set to pin on success), and previous_routes (the pinned set
+    this delta was computed against, review fix P2: threaded through to both
+    bookkeeping calls as the compare-and-swap baseline, below). The three switch
+    sets are disjoint (adjacency is per-switch binary, and a reconcile item is only
+    built for a switch that stayed adjacent both before and after), and
+    deprovisions run before provisions (ADR 0009 Decision 4 ordering: L3
+    deprovision before L3 provision); reconciles run last since they never interact
+    with the other two sets. Per switch: login once, drive its route calls, then
+    logout. For a plain provision or deprovision every route uses the SAME method
+    (configure_route or remove_route respectively); for a reconcile item,
+    remove_route calls run for `remove_routes` BEFORE configure_route calls for
+    `add_routes`, both within the one login/logout (ADR 0014 Decision 3). Every
+    driver call is result-gated through _run_driver_with_retry (Decision 3 of ADR
+    0009).
 
     A clean provision records the switch ACTIVE (record_route_active); a clean
     removal releases the pin (release_route_membership); a clean reconcile advances
@@ -3124,6 +3127,15 @@ async def _apply_l3_adjacency(
     pinned set untouched via record_route_reconcile_failed) and the pass continues
     (Decision 6, never NAKs). This one apply is shared by the reconcile and both
     retry channels, the _apply_l2_memberships analogue.
+
+    Review fix P2 (issue #34 phase 3 review, the #412 extension): both
+    record_route_reconciled and record_route_reconcile_failed are called with
+    `previous_routes` and compare it against the row's CURRENT `.routes` before
+    writing anything; a mismatch means a faster concurrent writer already moved
+    this row (reachable only with more than one process pulling the durable
+    wiring_changed consumer, EXECUTION_POLLER_ONLY), and the call is a logged,
+    silent no-op rather than downgrading or corrupting what the faster writer
+    established. See both functions' docstrings in route_service.py.
 
     Direction scoping for a reconcile item (ADR 0014 addendum X3, ADR 0009 Decision
     5): when the reservation's wiring is frozen at the START of processing this
@@ -3171,6 +3183,7 @@ async def _apply_l3_adjacency(
         routes: list[dict] = []
         remove_routes: list[dict] = []
         add_routes: list[dict] = []
+        previous_routes: list[dict] = []
         method = ""
         intended = "ACTIVE"
         frozen_now = False
@@ -3178,6 +3191,7 @@ async def _apply_l3_adjacency(
         if direction == "reconcile":
             remove_routes = item.get("remove_routes") or []
             add_routes = item.get("add_routes") or []
+            previous_routes = item.get("previous_routes") or []
             async with get_db_session() as db:
                 state = await get_wiring_state(db, res_uuid)
             frozen_now = state is not None and state.frozen
@@ -3243,7 +3257,9 @@ async def _apply_l3_adjacency(
         if load_error is not None or driver_path is None:
             async with get_db_session() as db:
                 if direction == "reconcile":
-                    await record_route_reconcile_failed(db, res_uuid, switch_id, 0, load_error)
+                    await record_route_reconcile_failed(
+                        db, res_uuid, switch_id, 0, load_error, previous_routes
+                    )
                 else:
                     await record_route_failed(
                         db, res_uuid, switch_id, routes, 0, load_error, intended=intended
@@ -3282,7 +3298,12 @@ async def _apply_l3_adjacency(
             if not login_ok:
                 if direction == "reconcile":
                     await record_route_reconcile_failed(
-                        db, res_uuid, switch_id, login_attempts, f"driver login failed: {login_err}"
+                        db,
+                        res_uuid,
+                        switch_id,
+                        login_attempts,
+                        f"driver login failed: {login_err}",
+                        previous_routes,
                     )
                 else:
                     await record_route_failed(
@@ -3366,10 +3387,15 @@ async def _apply_l3_adjacency(
                     # which is safe: removing an already-removed route is idempotent). This
                     # value is only actually used on the ordinary, unfrozen success path.
                     new_pin = item.get("intent") or []
-                    await record_route_reconciled(db, res_uuid, switch_id, new_pin)
+                    await record_route_reconciled(db, res_uuid, switch_id, new_pin, previous_routes)
                 else:
                     await record_route_reconcile_failed(
-                        db, res_uuid, switch_id, switch_attempts or 1, switch_last_error
+                        db,
+                        res_uuid,
+                        switch_id,
+                        switch_attempts or 1,
+                        switch_last_error,
+                        previous_routes,
                     )
             elif switch_ok:
                 if direction == "provision":
@@ -3530,7 +3556,9 @@ async def _reconcile_l3_adjacency(
         clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
         if reason is not None:
             async with get_db_session() as db:
-                await record_route_reconcile_failed(db, reservation_id, switch_id, 0, reason)
+                await record_route_reconcile_failed(
+                    db, reservation_id, switch_id, 0, reason, pinned_routes
+                )
             continue
         clean_keys = {
             route_identity_key(
