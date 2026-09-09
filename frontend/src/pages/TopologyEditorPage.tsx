@@ -199,8 +199,13 @@ function TopologyEditorInner() {
   // Remove could silently misattribute. One flat list feeds both the
   // per-node red badge (E4, blocking entries only, review fix F1) and the
   // Routing panel's per-row reason lines (all entries, including the
-  // informational l3_duplicate_route ones). Cleared on canvas load / commit
-  // success so a stale result never survives onto an unrelated canvas.
+  // informational l3_duplicate_route ones). Cleared on every wholesale
+  // canvas swap (initial load, topology/reservation id change, parent-
+  // topology preview/exit/restore, fork-history preview/diff/restore) and on
+  // commit success (round-2 review G2, issue #34: this state used to survive
+  // a canvas swap, so a stale red badge from one canvas could paint onto an
+  // unrelated one, e.g. a fork-history preview of an older version reusing
+  // the same node id), never left stale for an unrelated canvas.
   const [routeProblems, setRouteProblems] = useState<ResolvedRouteProblem[]>([]);
 
   // An ARCHIVED fork is the frozen as-built record of an ended reservation: the
@@ -229,6 +234,27 @@ function TopologyEditorInner() {
     acceptProposalNodes,
     rejectProposalNodes,
   } = useTopologyStore();
+
+  // Round-2 review G2 (issue #34): every wholesale canvas swap that is NOT
+  // an ordinary edit must also clear the stale L3 validation result above,
+  // or a red badge/reason line from one canvas can paint onto a completely
+  // different one it was never computed against (a fork-history preview of
+  // an older version reusing the same node id is the concrete failure
+  // case). Wrapping the store's `loadCanvas` here, rather than clearing
+  // inside the store (routeProblems is page-local UI state, not canvas
+  // data) or inside useForkVersionPreview (a generic history-view hook with
+  // no reason to know about L3 validation), gives every canvas-replacing
+  // call site (the initial load effect below, parent-topology preview/exit/
+  // restore, and fork-history preview/diff/restore via the hook's own
+  // `loadCanvas` param) the clear for free just by using this instead of
+  // the raw setter.
+  const loadCanvasAndClearRouteProblems = useCallback(
+    (canvas: CanvasData) => {
+      setRouteProblems([]);
+      loadCanvas(canvas);
+    },
+    [loadCanvas],
+  );
 
   // Placeholders are excluded from every persistence path (parent topology
   // save, fork save, fork autosave): they are not devices or wiring, only a
@@ -273,7 +299,7 @@ function TopologyEditorInner() {
   const forkPreview = useForkVersionPreview({
     reservationId: isLiveEdit ? reservationId : null,
     currentCanvas: persistableCanvas,
-    loadCanvas,
+    loadCanvas: loadCanvasAndClearRouteProblems,
     flushAutosave,
   });
   const isHistoryViewActive = forkPreview.isActive;
@@ -586,6 +612,11 @@ function TopologyEditorInner() {
     if (isLiveEdit) {
       if (fork && !initializedRef.current) {
         initializedRef.current = true;
+        // Round-2 review G2 (issue #34): clear any stale L3 validation
+        // result from whatever source this component was previously
+        // rendering, BEFORE loading (or clearing to empty) the new source's
+        // canvas, on both branches below alike.
+        setRouteProblems([]);
         const persisted = fork.canvas_data;
         const applyLoad =
           persisted && persisted.nodes
@@ -599,6 +630,7 @@ function TopologyEditorInner() {
     }
     if (topology && !initializedRef.current) {
       initializedRef.current = true;
+      setRouteProblems([]);
       if (topology.canvas_data) {
         void hydrateAndLoadCanvas(topology.canvas_data, loadCanvas);
       } else {
@@ -1290,14 +1322,17 @@ function TopologyEditorInner() {
         // the previewVersion flip below) with the token: if this request has
         // since been superseded or exited, its result must be dropped.
         await hydrateAndLoadCanvas(ghostCanvas, (hydrated) => {
-          if (previewRequestRef.current === token) loadCanvas(hydrated);
+          // Round-2 review G2 (issue #34): a Preview swaps in a DIFFERENT
+          // canvas than whatever the last L3 validation result was computed
+          // against; that result must not survive onto this one.
+          if (previewRequestRef.current === token) loadCanvasAndClearRouteProblems(hydrated);
         });
         if (previewRequestRef.current === token) setPreviewVersion(version);
       } catch {
         toast.error("Failed to load version");
       }
     },
-    [id, nodes, edges, selectedEdgeLayer, preservedBeforePreview, loadCanvas],
+    [id, nodes, edges, selectedEdgeLayer, preservedBeforePreview, loadCanvasAndClearRouteProblems],
   );
 
   const handleExitPreview = useCallback(() => {
@@ -1305,11 +1340,14 @@ function TopologyEditorInner() {
     // preserved canvas, so a late result cannot land after exit (issue #627).
     previewRequestRef.current += 1;
     if (preservedBeforePreview) {
-      loadCanvas(preservedBeforePreview);
+      // Round-2 review G2 (issue #34): the preview's own (possibly stale,
+      // possibly never-computed) routing state must not survive back onto
+      // the restored live canvas either.
+      loadCanvasAndClearRouteProblems(preservedBeforePreview);
     }
     setPreservedBeforePreview(null);
     setPreviewVersion(null);
-  }, [preservedBeforePreview, loadCanvas]);
+  }, [preservedBeforePreview, loadCanvasAndClearRouteProblems]);
 
   const handleRestoreConfirm = useCallback(
     async ({ description: desc, restoreName }: { description: string; restoreName: boolean }) => {
@@ -1327,7 +1365,9 @@ function TopologyEditorInner() {
         // (issue #627).
         previewRequestRef.current += 1;
         if (updated.canvas_data) {
-          loadCanvas(updated.canvas_data);
+          // Round-2 review G2 (issue #34): a Restore replaces the canvas
+          // wholesale too; the same clear as Preview/Exit applies.
+          loadCanvasAndClearRouteProblems(updated.canvas_data);
         }
         setRestoreTarget(null);
         setBlockingReservations(undefined);
@@ -1347,7 +1387,7 @@ function TopologyEditorInner() {
         }
       }
     },
-    [restoreTarget, id, restoreVersion, loadCanvas],
+    [restoreTarget, id, restoreVersion, loadCanvasAndClearRouteProblems],
   );
 
   if (isLoading) {

@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { MemoryRouter, Routes, Route, useNavigate } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Node } from "@xyflow/react";
 
@@ -113,6 +113,20 @@ const PARENT_TOPOLOGY = {
   canvas_data: null,
 };
 
+// Round-2 review G2 (issue #34): a second topology, distinct id, to prove
+// routeProblems does not survive an in-place id navigation (this page does
+// NOT remount on a param-only route change).
+const OTHER_TOPO_ID = "topo-l3-2";
+const OTHER_TOPOLOGY = {
+  id: OTHER_TOPO_ID,
+  name: "Other topology",
+  created_by: "u",
+  owner_name: "u",
+  created_at: "2026-05-01T00:00:00Z",
+  updated_at: "2026-05-01T00:00:00Z",
+  canvas_data: { nodes: [deviceNode("other-node", "d-other")], edges: [], selectedEdgeLayer: "L2" },
+};
+
 function baseHandlers() {
   return [
     http.get(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
@@ -142,6 +156,38 @@ function renderPage() {
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[`/topology/${TOPO_ID}`]}>
+        <Routes>
+          <Route path="/topology/:id" element={<TopologyEditorPage />} />
+          <Route path="/topology" element={<div>topology list page</div>} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+// Round-2 review G2 (issue #34): a plain `<Link>`/history.push would still
+// let React Router REMOUNT the page if the route pattern changed, which
+// would not exercise the leak (TopologyEditorPage does NOT remount on a
+// param-only change, per the review). A real useNavigate call to a sibling
+// path matching the SAME "/topology/:id" route pattern is what genuinely
+// reproduces an in-place id swap.
+function NavButton({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(to)}>
+      go to other topology
+    </button>
+  );
+}
+
+function renderPageWithNav() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[`/topology/${TOPO_ID}`]}>
+        <NavButton to={`/topology/${OTHER_TOPO_ID}`} />
         <Routes>
           <Route path="/topology/:id" element={<TopologyEditorPage />} />
           <Route path="/topology" element={<div>topology list page</div>} />
@@ -361,6 +407,56 @@ describe("TopologyEditorPage plain save: L3 routing intent (ADR 0014 phase 2, is
     await waitFor(() => expect(screen.getByLabelText("Purpose (optional)")).toBeTruthy());
     expect(toastSuccess).not.toHaveBeenCalledWith(
       "Unsaved routing changes are not checked until you save",
+    );
+  });
+
+  // Round-2 review G2 (issue #34): routeProblems (and the red badge it
+  // drives) must not survive a topology id navigation. This page does NOT
+  // remount on a param-only route change (both routes match the same
+  // "/topology/:id" pattern), so a stale useState value genuinely persists
+  // unless the id-change path clears it.
+  it("clears a stale routing problem set when the topology id changes", async () => {
+    server.use(
+      http.get(`/api/cabling/topologies/${OTHER_TOPO_ID}`, () => HttpResponse.json(OTHER_TOPOLOGY)),
+      http.get(`/api/cabling/topologies/${OTHER_TOPO_ID}/versions`, () =>
+        HttpResponse.json({ items: [], total: 0, skip: 0, limit: 200 }),
+      ),
+      http.put(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
+      http.post(`/api/cabling/topologies/${TOPO_ID}/validate`, () =>
+        HttpResponse.json({
+          valid: false,
+          invalid_edges: [],
+          device_ids: [],
+          invalid_routes: [
+            { node_id: "n1", device_id: "d-1", index: 0, reason: "l3_bad_destination", detail: null },
+          ],
+        }),
+      ),
+    );
+    renderPageWithNav();
+    await screen.findByText("Parent topology");
+    act(() => {
+      useTopologyStore.setState({
+        nodes: [l3Node("n1", "d-1", [route()])],
+        edges: [],
+        selectedEdgeLayer: "L2",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    const nodesBeforeNav = rfProps.current?.nodes as Array<{ id: string; data: DeviceNodeData }>;
+    expect(nodesBeforeNav.find((n) => n.id === "n1")?.data.l3ValidationInvalid).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "go to other topology" }));
+    await screen.findByText("Other topology");
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("other-node"),
+    );
+
+    const nodesAfterNav = rfProps.current?.nodes as Array<{ id: string; data: DeviceNodeData }>;
+    expect(nodesAfterNav.find((n) => n.id === "other-node")?.data.l3ValidationInvalid).not.toBe(
+      true,
     );
   });
 });

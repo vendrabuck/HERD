@@ -10,6 +10,7 @@ import { useAIStatus } from "@/api/ai";
 import { usePurposeSuggestion } from "@/hooks/usePurposeSuggestion";
 import { Modal } from "@/components/ui/Modal";
 import { errorDetail } from "@/lib/errors";
+import { isBlockingRouteProblem } from "@/lib/l3";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import type { DynamicRequestSpec } from "@/types/reservation.types";
 import type { InvalidRoute } from "@/types/topology.types";
@@ -177,7 +178,14 @@ export function CreateReservationModal({
       const routingIntentInvalid = topologyRoutingIntentInvalidDetail(err);
       if (routingIntentInvalid) {
         onRoutingIntentInvalid?.(routingIntentInvalid.invalid_routes);
-        const count = routingIntentInvalid.invalid_routes.length;
+        // Review fix F1/round-2 G1 (issue #34): invalid_routes carries both
+        // blocking and informational (l3_duplicate_route) entries (cabling's
+        // run_full_topology_validation puts the raw, unfiltered list in the
+        // response body); the count must match the other two toast-count
+        // sites (TopologyEditorPage.tsx's plain-save and fork-save toasts)
+        // and use only blocking entries, or a refusal caused by one real
+        // problem plus one duplicate note overstates the count.
+        const count = routingIntentInvalid.invalid_routes.filter(isBlockingRouteProblem).length;
         toast.error(`Reservation refused: routing intent has ${count} problem${count === 1 ? "" : "s"}`);
         return;
       }
