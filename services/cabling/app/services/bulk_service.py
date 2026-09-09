@@ -458,11 +458,17 @@ async def import_topologies(
                 await db.rollback()
             # S9 review fix, round 2: a 503 (l3_config_unavailable: inventory
             # could not be asked to judge this row's routing intent at all)
-            # aborts the WHOLE import request, the same way the upfront
-            # resolve_device_names failure does, rather than being swallowed as
-            # a per-row reject: unlike a genuine validation failure, this row
-            # was never actually judged, so "reject this one row" would be
-            # misleading and the rest of the batch is equally unjudged.
+            # STOPS the import request from processing any further row, the
+            # same way the upfront resolve_device_names failure does, rather
+            # than being swallowed as a per-row reject: unlike a genuine
+            # validation failure, this row was never actually judged, so
+            # "reject this one row" would be misleading and the rest of the
+            # batch is equally unjudged. This does NOT roll back rows already
+            # processed: each prior row committed its own write individually
+            # (see the per-row `await db.commit()` above), so any row before
+            # this one that created or updated a topology keeps that write;
+            # only this row's own uncommitted change is rolled back and no
+            # further row is attempted.
             if exc.status_code == 503:
                 raise
             report.rows.append(

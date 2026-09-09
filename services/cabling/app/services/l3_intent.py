@@ -115,9 +115,14 @@ class RouteSpec:
     def route_key(self) -> str:
         """The reconcile/uniqueness identity: all four fields, JSON-packed (S4
         review fix, round 2): two routes differing only by ``virtual_router`` are
-        distinct identities."""
+        distinct identities. ``ensure_ascii=False`` (#758 fix): the default
+        ``ensure_ascii=True`` would \\uXXXX-escape every non-ASCII character to six
+        bytes each, inflating a 64-character non-ASCII field far past what a fixed
+        column width can hold; UTF-8 output keeps the worst case bounded (see the
+        ``fork_l3_routes.route_key`` column, now ``Text``)."""
         return json.dumps(
-            [self.destination, self.interface, self.next_hop or "", self.virtual_router or ""]
+            [self.destination, self.interface, self.next_hop or "", self.virtual_router or ""],
+            ensure_ascii=False,
         )
 
 

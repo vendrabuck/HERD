@@ -59,9 +59,12 @@ def test_chain_is_linear_and_walks_to_base():
     )
 
 
-def test_head_is_0011_fork_l3_routes():
-    """The current head is 0011 (ADR 0014 phase 1's fork_l3_routes table)."""
+def test_head_is_0012_fork_l3_routes_key_text():
+    """The current head is 0012 (issue #758's route_key String(400) to Text widen),
+    which follows 0011 (ADR 0014 phase 1's fork_l3_routes table)."""
     script = _script_directory()
-    assert script.get_heads() == ["0011"]
-    head = script.get_revision("0011")
-    assert head.down_revision == "0010"
+    assert script.get_heads() == ["0012"]
+    head = script.get_revision("0012")
+    assert head.down_revision == "0011"
+    prior = script.get_revision("0011")
+    assert prior.down_revision == "0010"

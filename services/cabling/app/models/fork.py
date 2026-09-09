@@ -25,6 +25,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     Uuid,
     func,
@@ -240,11 +241,15 @@ class ForkL3Route(Base):
     virtual_router: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # The reconcile identity (``RouteSpec.route_key``): all four fields, JSON
     # -packed (S4 review fix, round 2: virtual_router is part of the identity now,
-    # since two routes differing only by it must not collide; widened to
-    # String(400) to fit the packed JSON of four 64-char fields plus quoting).
-    # Stored rather than recomputed so the unique constraint and the reconcile's
-    # set arithmetic both key off one column.
-    route_key: Mapped[str] = mapped_column(String(400), nullable=False)
+    # since two routes differing only by it must not collide). ``Text`` (#758 fix):
+    # a fixed-width column overflowed for legal input (non-ASCII/quote/backslash
+    # fields up to the 64-char per-field cap); Postgres btree caps an index key
+    # near 2700 bytes, and the worst case here, four 64-char fields JSON-packed
+    # with ``ensure_ascii=False``, stays well under that, so the unique
+    # constraint on this column is still safe. Stored rather than recomputed so
+    # the unique constraint and the reconcile's set arithmetic both key off one
+    # column.
+    route_key: Mapped[str] = mapped_column(Text, nullable=False)
     # The inventory config version the save-time L3 validation pass actually
     # judged this route against (S6 review fix, round 2), bare UUID with no FK
     # (inventory owns that table; this repo never uses cross-schema FKs). NULL

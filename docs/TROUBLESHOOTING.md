@@ -123,6 +123,19 @@ No physical cabling path between the two DUTs through known L1 switches. Either:
 
 One or both chosen ports have no recorded physical cabling. Pick a different port or ask an admin to record the cable.
 
+### L3 validation or fork save fails with `503 l3_config_unavailable`
+
+The L3 validation pass (ADR 0014) fetches each L3-carrying switch's latest
+inventory config version, up to 8 concurrently, and must finish the whole pass
+within a 12 second deadline. At a typical 4 second inventory response time,
+that budget covers roughly two concurrent rounds, about 24 L3 switches, before
+the deadline trips and the pass fails closed with `l3_config_unavailable`. A
+topology with more L3 switches than that, or against a slower inventory,
+refuses validation and save on this timeout rather than validating a partial
+result. Retry once inventory latency recovers; there is no per-request
+workaround, since the deadline exists so a slow inventory never lets an
+unverified route land.
+
 ## AI topology generation
 
 ### `409 Inventory shifted during generation`

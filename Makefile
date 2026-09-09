@@ -615,7 +615,9 @@ _gate-pg-live-tests:
 	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_fork_restore_save_race_live_pg.py -v) && \
 	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
-		uv run pytest tests/test_fork_port_claim_race_live_pg.py -v)
+		uv run pytest tests/test_fork_port_claim_race_live_pg.py -v) && \
+	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_l3_route_key_width_live_pg.py -v)
 
 # Gate phase used by master and everything, run after test-e2e (issue #572):
 # proves the STACK, not just the directory, can authenticate against LDAP.
