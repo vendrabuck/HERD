@@ -709,9 +709,20 @@ def _relay_cabling_fork_response(resp: httpx.Response) -> Any:
     is raised as RuntimeError upstream and mapped to 503 by the same rule). A 4xx is
     relayed verbatim, so cabling's structured 409 detail (port conflicts, ARCHIVED
     refusal) reaches the user unchanged.
+
+    R4 review fix on 2ade362c: a 5xx body that IS structured JSON (e.g. cabling's
+    L3 gate 503 ``{"error": "l3_config_unavailable"}``) relays that structured
+    detail instead of the generic message, so the client can distinguish "cabling
+    is down" from "cabling is up but can't verify routing intent right now"; the
+    generic "Cabling service is unavailable" is kept ONLY when the 5xx body is not
+    valid JSON at all (a raw proxy error page, an empty body).
     """
     if resp.status_code >= 500:
-        raise HTTPException(status_code=503, detail="Cabling service is unavailable")
+        detail = _cabling_json_detail_or_none(resp)
+        raise HTTPException(
+            status_code=503,
+            detail=detail if detail is not None else "Cabling service is unavailable",
+        )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=_cabling_detail(resp))
     if resp.status_code == 204 or not resp.content:
@@ -741,6 +752,22 @@ def _cabling_detail(resp: httpx.Response) -> Any:
         body = resp.json()
     except ValueError:
         return resp.text or "Cabling request failed"
+    if isinstance(body, dict) and "detail" in body:
+        return body["detail"]
+    return body
+
+
+def _cabling_json_detail_or_none(resp: httpx.Response) -> Any | None:
+    """Like ``_cabling_detail``, but returns ``None`` instead of falling back to
+    ``resp.text`` when the body is not valid JSON (R4 review fix on 2ade362c):
+    the 5xx relay keeps its own generic message for a genuinely non-JSON body,
+    and must not surface a raw proxy error page as if it were a structured
+    detail.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
     if isinstance(body, dict) and "detail" in body:
         return body["detail"]
     return body

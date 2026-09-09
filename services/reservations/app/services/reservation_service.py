@@ -211,7 +211,7 @@ class TopologyDeviceNotMember(ValueError):
 
 
 async def _validate_topology_connectivity(
-    topology_id: uuid.UUID, device_ids: list[uuid.UUID]
+    topology_id: uuid.UUID, device_ids: list[uuid.UUID], *, check_routes: bool = True
 ) -> None:
     """Reject the reservation when the referenced topology has unreachable edges,
     or when its canvas names a device outside ``device_ids``.
@@ -228,6 +228,14 @@ async def _validate_topology_connectivity(
     drive provisioning against a device it never booked. Riding the existing
     validate/internal response keeps this one cabling round trip rather than two.
 
+    ``check_routes=False`` (R11 review fix, ADR 0014 phase 1, issue #34) passes
+    ``l3=0`` to cabling's validate/internal, skipping its L3 routing-intent pass
+    entirely: the ACTIVE device-set PATCH path (the #701 membership check in
+    ``update_reservation``) uses this, since a device-set edit judges only
+    physical connectivity for the revised membership, and the topology's routing
+    intent was already judged valid at create time. The create path leaves this
+    True.
+
     Authenticated as a service-to-service call via X-Internal-Token rather than
     forwarding the booking user's JWT: the booking user does not necessarily
     own the topology they're reserving, so JWT-forward would 403 against the
@@ -238,6 +246,7 @@ async def _validate_topology_connectivity(
             resp = await client.post(
                 f"{settings.cabling_service_url}/topologies/{topology_id}/validate/internal",
                 headers={"X-Internal-Token": settings.internal_api_token},
+                params=None if check_routes else {"l3": "0"},
                 timeout=10.0,
             )
         except httpx.HTTPError as exc:
@@ -268,48 +277,57 @@ async def _validate_topology_connectivity(
         reason = entry.get("reason") or "invalid"
         edge_summaries.append(f"{edge_id} ({reason})")
 
-    # ADR 0014 phase 1 (issue #34): fold invalid_routes into the same summary,
-    # additively, so an edge-only failure's message (and the tests pinning it) is
-    # byte-for-byte unchanged. Format matches the ADR's contract summary:
-    # "<device_id first 8>[<index or '-'>] (<reason>)".
+    # ADR 0014 phase 1 (issue #34), R7 review fix on 2ade362c: fold invalid_routes
+    # into a SEPARATE sentence rather than the edges-only prefix, so an edge-only
+    # failure's message (and the tests pinning it) is byte-for-byte unchanged, a
+    # routes-only failure reads as its own claim, and a combined failure joins
+    # both sentences. Carries the node_id (not a truncated device id), matching
+    # what the editor's canvas actually shows the user.
     invalid_routes = body.get("invalid_routes") or []
     route_summaries = []
     for entry in invalid_routes:
-        device_id = entry.get("device_id")
-        short_id = str(device_id)[:8] if device_id else "?"
+        node_id = entry.get("node_id") or "?"
         index = entry.get("index")
         index_str = str(index) if index is not None else "-"
         reason = entry.get("reason") or "invalid"
-        route_summaries.append(f"{short_id}[{index_str}] ({reason})")
+        route_summaries.append(f"{node_id}[{index_str}] ({reason})")
 
-    all_summaries = edge_summaries + route_summaries
-    summaries = all_summaries[:5]
-    extra = "" if len(all_summaries) <= 5 else f" and {len(all_summaries) - 5} more"
-    raise ValueError(
-        "Topology has unreachable edges in the cabling graph: " + ", ".join(summaries) + extra
-    )
+    sentences: list[str] = []
+    if edge_summaries:
+        shown = edge_summaries[:5]
+        extra = "" if len(edge_summaries) <= 5 else f" and {len(edge_summaries) - 5} more"
+        sentences.append(
+            "Topology has unreachable edges in the cabling graph: " + ", ".join(shown) + extra
+        )
+    if route_summaries:
+        shown = route_summaries[:5]
+        extra = "" if len(route_summaries) <= 5 else f" and {len(route_summaries) - 5} more"
+        sentences.append("Topology has invalid routing intent: " + ", ".join(shown) + extra)
+    raise ValueError("; ".join(sentences))
 
 
 class ForkMembershipRefused(Exception):
-    """Cabling refused a fork create with a definitive 409 (D2/D3 of the 2026-09-04
-    fork endpoint-membership fix, generalized to any 409 by issue #721).
+    """Cabling refused a fork create with a definitive 4xx (D2/D3 of the
+    2026-09-04 fork endpoint-membership fix, generalized to any 409 by issue
+    #721, then to any 4xx by the R4 review fix on 2ade362c).
 
     Originally raised only for the endpoint-membership shape
     (``fork_device_not_member``); issue #721 (ADR 0006 Decision 4's activation-path
     port-claim check) generalized this to ANY 409 cabling's fork-create route
-    returns, membership or a cross-reservation port claim alike: both are cabling's
+    returns, membership or a cross-reservation port claim alike. ADR 0014 phase 1
+    removed cabling's L3 gate from fork create entirely, so the only 4xxes left
+    are those two 409s and a request-shape 422; all three are cabling's
     definitive answer that this canvas cannot be forked as submitted, not a
-    transient failure, so neither must ever be retried the way a transport error or
-    a 5xx is. ``device_ids`` is populated only for the membership shape (empty for
-    a port-claim conflict, which names ports and reservations instead); ``detail``
-    carries whatever structured detail body cabling actually returned, for a
-    caller that wants the full shape regardless of which 409 it was.
+    transient failure, so none of them must ever be retried the way a transport
+    error or a 5xx is. ``device_ids`` is populated only for the membership shape
+    (empty for a port-claim conflict or a 422, which carry their own detail
+    shapes instead); ``detail`` carries whatever structured detail body cabling
+    actually returned, for a caller that wants the full shape regardless of
+    which 4xx it was.
     """
 
     def __init__(self, device_ids: list[str], detail: dict | str | None = None):
-        super().__init__(
-            f"fork create refused (409): {detail if detail is not None else device_ids}"
-        )
+        super().__init__(f"fork create refused: {detail if detail is not None else device_ids}")
         self.device_ids = device_ids
         self.detail = detail
 
@@ -404,12 +422,17 @@ async def _create_reservation_fork(
             },
             timeout=10.0,
         )
-    if resp.status_code == 409:
-        # Generalized by issue #721: ANY 409 from fork-create is cabling's
-        # definitive refusal, not just the endpoint-membership shape. device_ids
-        # is populated only when the detail is actually that shape; a port-claim
-        # conflict (or anything else) still raises, just with an empty list, and
-        # the raw detail is carried alongside for a caller that wants it.
+    if 400 <= resp.status_code < 500:
+        # Generalized by issue #721 to any 409, then to ANY 4xx by the R4 review
+        # fix on 2ade362c: cabling's fork-create route is now a pure snapshot
+        # (ADR 0014 phase 1 removed its L3 gate entirely), so the only 4xxes it
+        # can still raise are the endpoint-membership 409, the port-claim 409, or
+        # a request-shape 422; all three are cabling's definitive refusal, not a
+        # transient failure, and none of them resolve themselves on a retry.
+        # device_ids is populated only when the detail is actually the
+        # fork_device_not_member shape; anything else still raises, just with an
+        # empty list, and the raw detail is carried alongside for a caller that
+        # wants it.
         try:
             detail = resp.json().get("detail") or {}
         except ValueError:
@@ -2003,8 +2026,15 @@ async def update_reservation(
             # remaining way to leave a foreign device wired. Runs before any
             # inventory status mutation below, so a failure aborts with no side
             # effects to unwind. Reservations without a topology are unaffected.
+            # check_routes=False (R11 review fix, ADR 0014 phase 1, issue #34):
+            # a device-set edit judges only physical connectivity for the revised
+            # membership; the topology's L3 routing intent was already judged at
+            # create time and is unrelated to which devices this booking now
+            # includes, so this must never refuse (or 503) on it.
             if reservation.topology_id is not None:
-                await _validate_topology_connectivity(reservation.topology_id, data.device_ids)
+                await _validate_topology_connectivity(
+                    reservation.topology_id, data.device_ids, check_routes=False
+                )
 
             # Check added exclusive devices are available and have no conflicts
             if added_ids:
