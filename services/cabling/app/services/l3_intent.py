@@ -9,16 +9,16 @@ review fix on 2ade362c): there is no cycle to work around here.
 ``route_key`` is the route identity used both by the fork-save set reconcile
 (``fork_save_service.save_fork``, ``fork_service.create_fork``) and by the
 ``fork_l3_routes`` unique constraint. S4 review fix (round 2 on 2ade362c): it now
-packs all FOUR fields, including ``virtual_router``, via
-``json.dumps([destination, interface, next_hop or "", virtual_router or ""])``, so
-two routes differing only by ``virtual_router`` are distinct rows rather than
-colliding. The driver contract carries no VRF concept, so execution's
-``_route_run_identity`` (``services/execution/app/services/nats_consumer.py:413-424``)
-still keys on the three fields it drives on; phase 3 collapses ``route_key``'s
-four-field identity down to that three-field one when actually calling the driver
-(see ADR 0014's phase 1 review-fixes amendment). JSON's own escaping makes any
-field value safe to pack, so R5(d)'s ``|``-rejection rule is gone: it existed only
-because the old packing used ``|`` as an unescaped separator.
+packs all FOUR fields, including ``virtual_router``. The packing itself moved to
+``herd_common.l3_route_identity.route_identity_key`` (issue #757, ADR 0014
+addendum X-E): ``route_key`` just calls it, so the identity formula lives in
+exactly one place shared with execution, which uses the same helper wherever a
+fork route is compared to a pinned route or a ledger row (ADR 0014 phase 3). The
+driver contract carries no VRF concept, so the actual driver call arguments stay
+three fields (destination, next_hop, interface); only the IDENTITY used for
+comparison and storage is four fields. JSON's own escaping makes any field value
+safe to pack, so R5(d)'s ``|``-rejection rule is gone: it existed only because
+the old packing used ``|`` as an unescaped separator.
 
 Element and dynamic-placeholder nodes never carry ``l3``: this module only ever
 looks at ``data.l3`` on nodes that ``node_to_device_map`` resolves to a real device,
@@ -53,11 +53,12 @@ overwriting the first):
 from __future__ import annotations
 
 import ipaddress
-import json
 import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
+
+from herd_common.l3_route_identity import route_identity_key
 
 from app.services.canvas_nodes import node_to_device_map
 
@@ -115,14 +116,16 @@ class RouteSpec:
     def route_key(self) -> str:
         """The reconcile/uniqueness identity: all four fields, JSON-packed (S4
         review fix, round 2): two routes differing only by ``virtual_router`` are
-        distinct identities. ``ensure_ascii=False`` (#758 fix): the default
-        ``ensure_ascii=True`` would \\uXXXX-escape every non-ASCII character to six
-        bytes each, inflating a 64-character non-ASCII field far past what a fixed
-        column width can hold; UTF-8 output keeps the worst case bounded (see the
-        ``fork_l3_routes.route_key`` column, now ``Text``)."""
-        return json.dumps(
-            [self.destination, self.interface, self.next_hop or "", self.virtual_router or ""],
-            ensure_ascii=False,
+        distinct identities. Delegates to
+        ``herd_common.l3_route_identity.route_identity_key`` (issue #757, ADR 0014
+        addendum X-E) so the packing formula lives in one place shared with
+        execution. ``ensure_ascii=False`` (#758 fix, carried by the shared helper):
+        the default ``ensure_ascii=True`` would \\uXXXX-escape every non-ASCII
+        character to six bytes each, inflating a 64-character non-ASCII field far
+        past what a fixed column width can hold; UTF-8 output keeps the worst case
+        bounded (see the ``fork_l3_routes.route_key`` column, now ``Text``)."""
+        return route_identity_key(
+            self.destination, self.interface, self.next_hop, self.virtual_router
         )
 
 
