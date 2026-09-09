@@ -1,10 +1,13 @@
 """Locust load test definitions for HERD.
 
-Six user classes simulating different usage patterns:
+Seven user classes simulating different usage patterns:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices and templates
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
 - ACLChecker: batch checks permissions
+- RoutedTopologyValidator: repeatedly validates one topology carrying Layer 3
+  routing intent (ADR 0014, issue #34 phase 3), a safe no-op when the seeded
+  pool has no Layer 3 Switch device
 - NotificationUser: polls notifications and updates channel/event preferences
 - BulkConnectionAdmin: posts small POST /connections/bulk batches, then deletes
   what it created
@@ -247,6 +250,90 @@ class BulkExporter(HerdUser):
             params={"format": "json", "dry_run": "true"},
             files={"file": ("d.json", body, "application/json")},
         )
+
+
+class RoutedTopologyValidator(HerdUser):
+    """Exercises the L3 routing-intent validate pass under load (ADR 0014's
+    Testing section promise; issue #34 phase 3 is when a slow validate first has
+    a driven consequence, since execution now actually applies what validate
+    approved).
+
+    on_start looks for an existing Layer 3 Switch device among the seeded device
+    pool and, if found, creates ONE small persistent topology wiring a DUT to it
+    with one `data.l3` route (the shape validate parses, batch-fetches inventory
+    for, and judges on every call), then every task iteration re-validates that
+    same topology. If no Layer 3 Switch device is present (a stack seeded without
+    `SEED_FRR=1`), the task is a safe no-op: this class deliberately never
+    creates its own driver/template/device, since doing that per simulated user
+    would pollute the stack the way BulkExporter's docstring warns import would.
+    The route need not resolve `valid: true` to be useful load: an unconfigured
+    or unattached switch still exercises the same inventory batch-fetch and
+    per-route judgement path, just landing a different `invalid_routes` reason.
+    """
+
+    weight = 1
+    wait_time = between(2, 5)
+
+    def on_start(self):
+        self._login(ADMIN_EMAIL, ADMIN_PASSWORD)
+        self._topology_id = None
+
+        resp = self._auth_get("/api/inventory/devices", params={"limit": 200})
+        if resp.status_code != 200:
+            return
+        items = resp.json().get("items", [])
+        switch = next((d for d in items if d.get("connection_type") == "Layer 3 Switch"), None)
+        if switch is None:
+            return
+        dut = next((d for d in items if d["id"] != switch["id"]), None)
+        if dut is None:
+            return
+
+        canvas = {
+            "nodes": [
+                {"id": "nDut", "data": {"device": {"id": dut["id"]}}},
+                {
+                    "id": "nSwitch",
+                    "data": {
+                        "device": {"id": switch["id"]},
+                        "l3": {
+                            "routes": [
+                                {
+                                    "destination": "10.250.0.0/24",
+                                    "next_hop": "10.250.0.1",
+                                    "interface": "eth0",
+                                }
+                            ]
+                        },
+                    },
+                },
+            ],
+            "edges": [
+                {
+                    "id": "e1",
+                    "source": "nDut",
+                    "target": "nSwitch",
+                    "data": {"layer": "L1", "isProposal": False},
+                }
+            ],
+        }
+        create = self._auth_post(
+            "/api/cabling/topologies", json={"name": f"load-l3-validate-{uuid.uuid4().hex[:8]}"}
+        )
+        if create.status_code != 201:
+            return
+        self._topology_id = create.json()["id"]
+        self._auth_put(f"/api/cabling/topologies/{self._topology_id}", json={"canvas_data": canvas})
+
+    def on_stop(self):
+        if self._topology_id:
+            self._auth_delete(f"/api/cabling/topologies/{self._topology_id}")
+
+    @task
+    def validate_routed_topology(self):
+        if not self._topology_id:
+            return
+        self._auth_post(f"/api/cabling/topologies/{self._topology_id}/validate")
 
 
 class NotificationUser(HerdUser):
