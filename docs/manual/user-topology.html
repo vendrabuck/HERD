@@ -317,6 +317,49 @@
     <p class="sectitle">Quick connect</p>
     <p>For a single connection, toggle <b>Quick connect</b> in the toolbar before drawing a line. It opens a compact popover instead: pick one port on each side and a layer, then <b>Connect</b>. Its <b>Open wiring dialog</b> link escalates to the full dialog for the same device pair without losing your place.</p>
 
+    <p class="sectitle">Routing intent</p>
+    <p>Selecting a single device node whose device is a <b>Layer 3 Switch</b> opens a floating <b>Routing</b> panel: a table of the switch's routes (destination, next hop, interface, virtual router), an <b>Add route</b> control, and a per-row <b>Remove</b>. An <b>Import from device config</b> action copies the switch's latest config-version routes into the table; if the table already has rows, it asks to confirm before it replaces them outright. Every edit writes to the node's data the same way a position or a label does, so it rides fork commit, autosave, and restore preview with the rest of the canvas. A switch with at least one route also shows a small route-count badge on its canvas node.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-canvas" style="height:300px;">
+              <div class="hd-node sel" id="rn1" style="left:30px;top:120px;">
+                <span class="handle r"></span><div class="gl"></div><div class="nm">leaf-sw-09</div><div class="tb"><span class="hd-badge physical">PHYSICAL</span></div><div class="sub">Arista 7050X</div>
+              </div>
+              <div class="hd-palette" style="left:200px;top:12px;width:540px;" data-anno="1" data-anno-pin="l" data-anno-arrow>
+                <div class="ph">Routing <span style="font-weight:400;color:var(--gray-500);">&mdash; leaf-sw-09</span></div>
+                <div class="pbody" style="max-height:none;">
+                  <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+                    <span class="hd-btn secondary sm" data-anno="2" data-anno-pin="l" data-anno-arrow>Import from device config</span>
+                  </div>
+                  <table class="hd-table" style="font-size:12px;">
+                    <thead><tr><th style="padding:8px 10px;">Destination</th><th style="padding:8px 10px;">Next hop</th><th style="padding:8px 10px;">Interface</th><th style="padding:8px 10px;">Virtual router</th><th style="padding:8px 10px;"></th></tr></thead>
+                    <tbody>
+                      <tr><td style="padding:8px 10px;">10.20.0.0/24</td><td style="padding:8px 10px;">10.0.0.2</td><td style="padding:8px 10px;">eth1</td><td style="padding:8px 10px;">&ndash;</td><td style="padding:8px 10px;color:var(--res-cancelled-fg);font-size:12px;">Remove</td></tr>
+                      <tr><td style="padding:8px 10px;">10.30.0.0/24</td><td style="padding:8px 10px;">10.0.0.99</td><td style="padding:8px 10px;">eth1</td><td style="padding:8px 10px;">&ndash;</td><td style="padding:8px 10px;color:var(--res-cancelled-fg);font-size:12px;">Remove</td></tr>
+                    </tbody>
+                  </table>
+                  <div data-anno="3" data-anno-pin="r" data-anno-arrow style="background:var(--error-bg);border:1px solid var(--error-border);color:var(--error-fg);font-size:11px;padding:5px 8px;border-radius:6px;margin:4px 0 10px;">l3_next_hop_outside_interface: 10.0.0.99 is not inside eth1's subnet</div>
+                  <span class="hd-btn secondary sm" style="opacity:.6;">Add route</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The Routing panel.</b> Opens for one selected Layer 3 Switch node; a red reason line marks the row a save or reservation refused.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Panel header.</b> Names the selected switch. The panel opens only while exactly one Layer 3 Switch device node is selected.</li>
+      <li><b>Import from device config.</b> Copies the switch's newest config version's routes into the table, leaving virtual router blank on every imported row (the device config schema has no such grouping); asks to confirm first if the table already has rows, since it replaces them outright rather than merging.</li>
+      <li><b>A per-row reason.</b> After a save or a reservation attempt finds a problem, the offending row (or the panel header, for a switch-level problem such as an unconfigured or unattached switch) shows the reason in plain words, and the switch's canvas node's route-count badge turns red.</li>
+    </ol>
+
+    <p>Routing intent is checked, never assumed, at three points: saving a standalone topology that carries any runs a validation pass right after the save; saving a reservation's live-edit fork gates the save itself, refusing it outright on a problem; creating a reservation from a topology with routing intent gates the booking the same way. One reason, a duplicate route on the same switch, is informational only and never blocks anything; every other reason does.</p>
+
     <h2 class="sec" id="edges">The part everyone asks about</h2>
     <p class="sectitle">Red vs green edges</p>
     <p>Every edge gets checked against the real physical cabling. The badge on the edge tells you the verdict. Here's the full vocabulary:</p>

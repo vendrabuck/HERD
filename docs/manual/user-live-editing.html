@@ -109,7 +109,7 @@
 
     <ol class="legend">
       <li><b>Preview.</b> A read-only, ghosted render of that snapshot on the canvas, with a "Previewing version N" banner and an Exit control. Editing, the wiring dialog, and Commit all lock while it is up.</li>
-      <li><b>Diff.</b> Compare against another version or your current draft: added and removed devices and wires list in the panel, and the affected edges highlight on the canvas.</li>
+      <li><b>Diff.</b> Compare against another version or your current draft: added and removed devices and wires list in the panel, and the affected edges highlight on the canvas. A Layer 3 Switch node whose routing intent changed, with its wires otherwise unchanged, lists separately as &ldquo;Routing changed on &lt;device&gt;: +A routes, -B routes&rdquo;.</li>
       <li><b>Restore.</b> Copies that version's canvas onto your draft. Restore stages the draft; the next <b>Commit to reservation</b> is what applies it. Restore never reconciles by itself.</li>
       <li><b>The amber chip.</b> A pending, unsaved restore. Commit to keep it, or keep editing on top of it.</li>
     </ol>

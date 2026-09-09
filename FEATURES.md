@@ -143,6 +143,20 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   and hop-count badge when a path exists, red stroke when not).
 - **Port cable validation** (Shipped): the editor warns about uncabled ports before
   connections are created.
+- **Layer 3 routing intent** (Shipped, ADR 0014, issue #34): a Layer 3 Switch device
+  node's canvas data may carry `data.l3.routes` (destination, optional next hop,
+  interface, optional virtual router). Selecting a single such node opens a Routing
+  panel: a route table, an Add route control, a per-row Remove, and an Import from
+  device config action that copies the switch's latest config-version routes
+  (replacing the table after a confirm dialog if it already has rows). A route-count
+  badge on the canvas node ("2 routes") shows intent without opening the panel,
+  turning red when the most recent validation found a problem. Both fork write paths
+  (save and activation) resolve intent into a `fork_l3_routes` table;
+  `/topologies/{id}/validate` and `/validate/internal` run a routing-intent pass with
+  ten refusal reasons, fail-closed on an inventory outage; execution drives the
+  intent-derived route set in precedence over the config-version fallback (see the
+  Reservations section below). See
+  [docs/TOPOLOGY_EDITOR.md](docs/TOPOLOGY_EDITOR.md#layer-3-routing-intent-adr-0014-issue-34).
 
 ## Reservations
 
@@ -155,9 +169,11 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   reconcile that later commits use): Layer 1 port cross-connects, Layer 2 VLAN
   definition and membership (fabric-aware, conflict-free VLAN ids, defined on
   the switches on first use and deleted when the last membership releases), and Layer 3
-  static routes taken from the switch's latest config version, pinned at provision
-  time so teardown removes exactly what was applied. Deprovisioning on cancel or
-  completion releases from the per-layer wiring ledgers (ADR 0009).
+  static routes, pinned at provision time so teardown removes exactly what was
+  applied: the reservation's fork routing intent when the topology expresses it
+  (ADR 0014, issue #34) takes precedence, falling back to the switch's latest config
+  version only when it does not. Deprovisioning on cancel or completion releases from
+  the per-layer wiring ledgers (ADR 0009).
 - **Live editing** (Shipped): modify device lists, extend end times, and update
   purpose on an active reservation. A device added to the device list wires
   nothing by itself: its connections are built when a topology commit draws them

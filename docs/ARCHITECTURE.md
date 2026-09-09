@@ -223,9 +223,10 @@ A fork save that changes the parsed L3 intent reconciles it into a new
 activation writes intent tolerantly without gating. Only saves refuse (409
 `l3_intent_invalid`, 422 `l3_intent_malformed`). The per-line layer on a canvas
 edge stays a canvas annotation only (see above); L3 routing intent is a
-separate, device-scoped construct. Editor surfacing of this intent and
-execution-side consumption of it are phases 2 and 3 of ADR 0014, not yet
-built. See [docs/design/0014-first-class-layer-3-routing.md](design/0014-first-class-layer-3-routing.md).
+separate, device-scoped construct. Editor surfacing of this intent (the
+topology editor's Routing panel) and execution-side consumption of it (this
+file's `reservation.wiring_changed` paragraph above) are phases 2 and 3 of
+ADR 0014, both shipped. See [docs/design/0014-first-class-layer-3-routing.md](design/0014-first-class-layer-3-routing.md).
 
 ## Device visibility
 
