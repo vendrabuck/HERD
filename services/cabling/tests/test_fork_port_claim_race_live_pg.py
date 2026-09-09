@@ -59,10 +59,30 @@ import pytest
 from app.models.connection import Connection
 from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
 from app.services import fork_save_service
-from app.services.fork_save_service import save_fork
+from app.services.fork_save_service import resolve_canvas_wiring
+from app.services.fork_save_service import save_fork as _real_save_fork
+from app.services.l3_intent import parse_l3_intent
 from fastapi import HTTPException
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+async def save_fork(db, fork, canvas_data, member_device_ids, **kwargs):
+    """Test convenience wrapper: save_fork's signature now takes an
+    already-resolved wiring and already-parsed intent (R3 review fix on
+    2ade362c). This file's races carry no L3 intent."""
+    wiring_resolution = await resolve_canvas_wiring(db, canvas_data)
+    intended_routes = parse_l3_intent(canvas_data)
+    return await _real_save_fork(
+        db,
+        fork,
+        canvas_data=canvas_data,
+        member_device_ids=member_device_ids,
+        wiring_resolution=wiring_resolution,
+        intended_routes=intended_routes,
+        **kwargs,
+    )
+
 
 DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
 PG_DSN = os.getenv(

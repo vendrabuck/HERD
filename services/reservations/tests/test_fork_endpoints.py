@@ -91,6 +91,37 @@ async def test_get_fork_owner_forwards_200():
 
 
 @pytest.mark.asyncio
+async def test_get_fork_forwards_l3_routes():
+    """ADR 0014 phase 1 (issue #34): cabling's additive l3_routes field on the
+    fork detail body passes through untouched, the same generic JSON relay
+    test_get_fork_owner_forwards_200 already proves for the whole body."""
+    rid = await _insert_reservation()
+    device_id = str(uuid.uuid4())
+    fork_body = {
+        "id": str(uuid.uuid4()),
+        "reservation_id": str(rid),
+        "status": "ACTIVE",
+        "l3_routes": [
+            {
+                "device_id": device_id,
+                "destination": "10.0.0.0/24",
+                "next_hop": None,
+                "interface": "eth0",
+                "virtual_router": None,
+            }
+        ],
+    }
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(return_value=_resp(200, fork_body)),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 200
+    assert resp.json()["l3_routes"] == fork_body["l3_routes"]
+
+
+@pytest.mark.asyncio
 async def test_get_fork_other_user_404_and_no_cabling_call():
     rid = await _insert_reservation()
     with patch("app.routers.reservations._cabling_fork_call", new=AsyncMock()) as call:
@@ -206,6 +237,37 @@ async def test_get_fork_cabling_unreachable_maps_to_503():
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_get_fork_cabling_5xx_with_structured_json_relays_detail():
+    """R4 review fix on 2ade362c: a 5xx body that IS structured JSON (e.g.
+    cabling's L3 gate 503 {"error": "l3_config_unavailable"}) relays that detail
+    instead of the generic "Cabling service is unavailable" message."""
+    rid = await _insert_reservation()
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(return_value=_resp(503, {"detail": {"error": "l3_config_unavailable"}})),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == {"error": "l3_config_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message():
+    """The generic "Cabling service is unavailable" message is kept ONLY when
+    the 5xx body is not valid JSON at all (R4 review fix on 2ade362c)."""
+    rid = await _insert_reservation()
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(return_value=httpx.Response(502, content=b"<html>bad gateway</html>")),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "Cabling service is unavailable"
 
 
 # --- PUT /{id}/fork/canvas -----------------------------------------------------------

@@ -19,13 +19,12 @@ from app.config import settings
 from app.database import get_db
 from app.models.fork import (
     ForkConnection,
+    ForkL3Route,
     ForkStatus_ACTIVE,
     ForkStatus_ARCHIVED,
     ForkVersion,
     ReservationFork,
 )
-from app.models.topology import Topology
-from app.routes.topologies import _run_topology_validation
 from app.schemas.fork import (
     ActiveForkEntry,
     ActiveForkListResponse,
@@ -39,6 +38,7 @@ from app.schemas.fork import (
     ForkDetailResponse,
     ForkDevicesBatchRequest,
     ForkDevicesBatchResponse,
+    ForkL3RouteResponse,
     ForkPruneRequest,
     ForkPruneResponse,
     ForkRestoreResponse,
@@ -47,8 +47,19 @@ from app.schemas.fork import (
     ForkVersionDetailResponse,
     ForkVersionSummary,
 )
-from app.services.fork_save_service import WireSpec, prune_fork_devices, save_fork
+from app.services.fork_save_service import (
+    WireSpec,
+    assert_endpoints_are_members,
+    gate_l3_intent,
+    l3_intent_changed,
+    prune_fork_devices,
+    resolve_canvas_wiring,
+    save_fork,
+    touched_devices_from_specs,
+)
 from app.services.fork_service import create_fork
+from app.services.l3_intent import merge_candidates_by_device, walk_l3_nodes
+from app.services.topology_validation import validate_canvas_edges
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
 
@@ -59,7 +70,11 @@ def _check_internal_token(token: str) -> None:
 
 
 async def _load_fork(
-    db: AsyncSession, reservation_id: uuid.UUID, *, for_update: bool = False
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+    refresh: bool = False,
 ) -> ReservationFork:
     """Load the fork row for a reservation, optionally under a row lock.
 
@@ -73,10 +88,27 @@ async def _load_fork(
     engine the unit suites use); every writer that passes it must hold the lock
     from this load through its own final commit or rollback, not release and
     reacquire mid-request. GET routes never pass it: they only read.
+
+    ``refresh=True`` (S1 review fix, round 2 on 2ade362c) adds
+    ``populate_existing=True`` to the SELECT's execution options. Proven live by
+    the review: a caller that already loaded this row once in the SAME session
+    (``save_fork_internal``'s unlocked pre-gate load, re-loaded ``for_update``
+    after the gate) gets back the SAME Python object from SQLAlchemy's identity
+    map by default, with whatever column values it had at the FIRST load, even
+    though the second SELECT's ``FOR UPDATE`` genuinely re-reads and locks the
+    row at the database. Without this, a concurrent archive or restore that
+    committed between the two loads is invisible to the caller despite the lock
+    having just proven the row's current committed state. Every caller that
+    re-loads a fork it already holds in this session within one request must
+    pass this; a caller's first load in a request needs it only if another
+    reference to the same row could already be memoized in that session (none
+    of the current single-load routes are).
     """
     stmt = select(ReservationFork).where(ReservationFork.reservation_id == reservation_id)
     if for_update:
         stmt = stmt.with_for_update()
+    if refresh:
+        stmt = stmt.execution_options(populate_existing=True)
     fork = (await db.execute(stmt)).scalar_one_or_none()
     if fork is None:
         raise HTTPException(status_code=404, detail="Fork not found")
@@ -290,6 +322,20 @@ async def get_fork_internal(
         .scalars()
         .all()
     )
+    # ADR 0014 phase 1 (issue #34): the fork's resolved L3 routing intent, sorted
+    # by (device_id, route_key) so the response is deterministic regardless of
+    # insertion order.
+    l3_routes = (
+        (
+            await db.execute(
+                select(ForkL3Route)
+                .where(ForkL3Route.fork_id == fork.id)
+                .order_by(ForkL3Route.device_id, ForkL3Route.route_key)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     return ForkDetailResponse(
         id=fork.id,
@@ -303,6 +349,7 @@ async def get_fork_internal(
         updated_at=fork.updated_at,
         connections=[ForkConnectionResponse.model_validate(c) for c in connections],
         versions=[ForkVersionSummary.model_validate(v) for v in versions],
+        l3_routes=[ForkL3RouteResponse.model_validate(r) for r in l3_routes],
     )
 
 
@@ -372,6 +419,12 @@ async def restore_fork_version_internal(
     fresh marker with the save's stale, already-cleared copy, silently losing it.
     Holding the row lock from this load through commit serializes against a
     concurrent save's own locked load.
+
+    Runs ONLY the edge pass (``validate_canvas_edges``, R1 review fix on
+    2ade362c), never the L3 pass: this endpoint's contract is "the draft stores
+    regardless", so it must never make an inventory call or 503 on an unsaved
+    draft. ``valid``/``invalid_edges`` are therefore edge-only, unchanged in
+    shape and behavior from before ADR 0014.
     """
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id, for_update=True)
@@ -385,15 +438,15 @@ async def restore_fork_version_internal(
     # Same validation the loose canvas PUT runs, on the same terms: reported, not
     # gated on. This also mirrors that endpoint in appending no version and not
     # touching fork_connections.
-    validation = await _run_topology_validation(Topology(canvas_data=restored_canvas), db)
+    edge_validation = await validate_canvas_edges(restored_canvas, db)
     fork_id = fork.id
     draft_restored_from_id = fork.draft_restored_from_id
     await db.commit()
 
     return ForkRestoreResponse(
         id=fork_id,
-        valid=validation.valid,
-        invalid_edges=validation.invalid_edges,
+        valid=not edge_validation.invalid_edges,
+        invalid_edges=edge_validation.invalid_edges,
         draft_restored_from_id=draft_restored_from_id,
     )
 
@@ -421,6 +474,11 @@ async def update_fork_canvas_internal(
     plain load same as the other mutators, so it is locked for consistency even
     though it never touches draft_restored_from_id and the canvas itself stays
     last-writer-wins by design.
+
+    Runs ONLY the edge pass (``validate_canvas_edges``, R1 review fix on
+    2ade362c), never the L3 pass, for the same "the draft stores regardless"
+    reason ``restore_fork_version_internal`` documents: no inventory call, no 503,
+    on an unsaved draft.
     """
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id, for_update=True)
@@ -428,16 +486,14 @@ async def update_fork_canvas_internal(
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
     fork.canvas_data = body.canvas_data
-    # _run_topology_validation reads only .canvas_data; the fork carries it, so hand
-    # a detached probe with the new canvas rather than coupling to a Topology row.
-    validation = await _run_topology_validation(Topology(canvas_data=body.canvas_data), db)
+    edge_validation = await validate_canvas_edges(body.canvas_data, db)
     fork_id = fork.id
     await db.commit()
 
     return ForkCanvasUpdateResponse(
         id=fork_id,
-        valid=validation.valid,
-        invalid_edges=validation.invalid_edges,
+        valid=not edge_validation.invalid_edges,
+        invalid_edges=edge_validation.invalid_edges,
     )
 
 
@@ -469,9 +525,81 @@ async def save_fork_internal(
     set a fresh one, dropping the restore's marker on the floor. The lock is held
     from this load through the final commit inside commit_fork_with_new_version's
     retry loop, serializing against a concurrent restore's own locked load.
+
+    Lock ordering (R3 review fix on 2ade362c): the fork row is loaded WITHOUT
+    ``FOR UPDATE`` first, just to check ARCHIVED before doing any real work; the
+    canvas is then resolved (``resolve_canvas_wiring``) and, when needed (S5),
+    the L3 intent gated (``gate_l3_intent``), BOTH of which can make inventory
+    HTTP calls, entirely before any lock is taken. Only after those calls return
+    does the fork get re-loaded WITH ``FOR UPDATE`` (re-checking ARCHIVED, since
+    the fork's status could have changed in the gap) and handed to ``save_fork``
+    along with the already-resolved wiring and already-gated intent, so the
+    version-allocation retry loop's reapply covers only the set arithmetic,
+    never a second resolve, gate, or inventory round trip while the row is
+    locked. The locked re-load passes ``refresh=True`` (S1 review fix, round 2):
+    without it, SQLAlchemy's identity map hands back the FIRST load's stale
+    column values even though the ``FOR UPDATE`` genuinely re-reads and locks
+    the row, so a concurrent archive or restore committed in the gap would be
+    invisible to the ARCHIVED re-check and the restore-marker read alike.
+
+    Membership is checked BEFORE the gate (S3 review fix, round 2): a canvas
+    naming a device outside the reservation is refused with 409
+    ``fork_device_not_member`` and no inventory lookup at all, rather than
+    paying for (and potentially leaking a reason through) an L3 validation call
+    against a device this reservation has no business naming. ``save_fork``'s
+    own ``reconcile()`` still runs the same check again on every version-race
+    retry, since the retry reapplies against freshly-read state.
+
+    The canvas is parsed exactly ONCE, via ``l3_intent.walk_l3_nodes`` (S10
+    review fix, round 2): a malformed node 422s immediately (no validation call,
+    no inventory call), and the well-formed candidates feed both the merged
+    ``intended_routes`` (for the reconcile) and, when needed, ``gate_l3_intent``
+    (for validation), so the canvas's ``data.l3`` is never re-parsed.
+
+    The L3 validation pass (and its inventory calls) runs ONLY when the intent
+    actually changed (S5 review fix, round 2): ``l3_intent_changed`` compares
+    the parsed intent against the fork's EXISTING ``ForkL3Route`` rows (route-key
+    sets per device) before any lock is taken; when they match, no
+    ``resolve_canvas_wiring``-derived touched-device set is even needed for L3
+    purposes and no inventory call is made, so a wiring-only save on a fork
+    whose routes were already validated when written cannot 503. See ADR 0014's
+    phase 1 review-fixes amendment for the accepted consequence.
     """
     _check_internal_token(x_internal_token)
-    fork = await _load_fork(db, reservation_id, for_update=True)
+    fork = await _load_fork(db, reservation_id)
+    if fork.status == ForkStatus_ARCHIVED:
+        raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
+
+    member_device_ids = set(body.member_device_ids)
+    assert_endpoints_are_members(body.canvas_data, member_device_ids)
+
+    candidates, malformed = walk_l3_nodes(body.canvas_data)
+    if malformed:
+        _node_id, _device_id, exc = malformed[0]
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "l3_intent_malformed",
+                "node_id": exc.node_id,
+                "message": exc.message,
+            },
+        )
+    intended_routes = merge_candidates_by_device(candidates)
+
+    wiring_resolution = await resolve_canvas_wiring(db, body.canvas_data)
+
+    validated_config_version_ids: dict[uuid.UUID, uuid.UUID | None] = {}
+    if intended_routes:
+        existing_l3_rows = (
+            (await db.execute(select(ForkL3Route).where(ForkL3Route.fork_id == fork.id)))
+            .scalars()
+            .all()
+        )
+        if l3_intent_changed(existing_l3_rows, intended_routes):
+            touched_devices = touched_devices_from_specs(wiring_resolution.specs)
+            validated_config_version_ids = await gate_l3_intent(candidates, touched_devices)
+
+    fork = await _load_fork(db, reservation_id, for_update=True, refresh=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
@@ -479,7 +607,10 @@ async def save_fork_internal(
         db,
         fork,
         canvas_data=body.canvas_data,
-        member_device_ids=set(body.member_device_ids),
+        member_device_ids=member_device_ids,
+        wiring_resolution=wiring_resolution,
+        intended_routes=intended_routes,
+        validated_config_version_ids=validated_config_version_ids,
         created_by=body.created_by or "system",
     )
 
@@ -490,6 +621,8 @@ async def save_fork_internal(
         built=[_to_delta(spec) for spec in result.built],
         unchanged_count=result.unchanged_count,
         element_attachments_skipped=result.element_attachments_skipped,
+        l3_routes_built=result.l3_routes_built,
+        l3_routes_released=result.l3_routes_released,
     )
 
 

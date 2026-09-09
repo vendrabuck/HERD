@@ -15,7 +15,7 @@ from app.main import app
 from app.models.reservation import Reservation, ReservationStatus
 from app.routers.reservations import bearer_scheme
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
-from app.services.reservation_service import TopologyDeviceNotMember
+from app.services.reservation_service import TopologyDeviceNotMember, TopologyRoutingIntentInvalid
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
 
@@ -1409,6 +1409,55 @@ async def test_create_reservation_blocked_by_invalid_topology(client):
 
 
 @pytest.mark.asyncio
+async def test_create_reservation_blocked_by_invalid_routing_intent(client):
+    """S8 review fix, round 2: a routes-only (or combined) failure is answered
+    with the structured 422 topology_routing_intent_invalid detail shape,
+    carrying the raw invalid_routes list."""
+    topo_id = str(uuid.uuid4())
+    devices = [make_device_response(DEVICE_A, "PHYSICAL")]
+    body = {
+        "device_ids": [DEVICE_A],
+        "topology_id": topo_id,
+        "purpose": "Bad routing intent",
+        "start_time": START,
+        "end_time": END,
+    }
+    raw_invalid_routes = [
+        {
+            "node_id": "n0",
+            "device_id": str(uuid.uuid4()),
+            "index": 0,
+            "reason": "l3_bad_destination",
+        }
+    ]
+    with (
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=devices),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=AsyncMock(
+                side_effect=TopologyRoutingIntentInvalid(
+                    raw_invalid_routes,
+                    "Topology has invalid routing intent: n0[0] (l3_bad_destination)",
+                )
+            ),
+        ),
+        patch(
+            "app.services.reservation_service._update_device_statuses",
+            new=AsyncMock(),
+        ),
+    ):
+        resp = await client.post("/", json=body)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "topology_routing_intent_invalid"
+    assert detail["invalid_routes"] == raw_invalid_routes
+    assert "l3_bad_destination" in detail["message"]
+
+
+@pytest.mark.asyncio
 async def test_create_reservation_blocked_by_topology_device_not_member(client):
     """A topology naming a device outside device_ids is rejected at 422 with the
     pinned topology_device_not_member detail shape (issue #701 phase 2)."""
@@ -2226,7 +2275,11 @@ async def test_update_reservation_device_change_valid_topology_succeeds(client):
         patch_resp = await client.patch(f"/{res_id}", json={"device_ids": new_ids})
     assert patch_resp.status_code == 200
     assert len(patch_resp.json()["device_ids"]) == 2
-    validate_mock.assert_awaited_once_with(uuid.UUID(topo_id), [uuid.UUID(d) for d in new_ids])
+    # check_routes=False (R11 review fix, ADR 0014 phase 1, issue #34): a
+    # device-set PATCH judges only physical connectivity, never L3 routing intent.
+    validate_mock.assert_awaited_once_with(
+        uuid.UUID(topo_id), [uuid.UUID(d) for d in new_ids], check_routes=False
+    )
 
 
 @pytest.mark.asyncio

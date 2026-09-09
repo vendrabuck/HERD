@@ -20,6 +20,19 @@ materialize the same physical hops with nothing to object, an invariant violatio
 reachable with zero concurrency. ``create_fork`` now runs the same
 ``lock_port_claims``/``assert_no_port_claims`` pair ``save_fork`` runs, before any
 fork_connections row is written, sharing both helpers with ``fork_save_service``.
+
+ADR 0014 phase 1 (issue #34), R4 review fix on 2ade362c: activation does NOT gate on
+L3 routing intent. ``create_fork`` used to run ``gate_l3_intent`` (422 on a malformed
+shape, 409 on a failed validation pass) exactly like ``save_fork``; that made a
+reservation's create-time topology judgment revocable by drift between create and
+activation (a topology edit, or the config-version fetch answering differently), which
+could strand an otherwise-provisioned reservation with no fork and no wiring at any
+layer. The reservation create path already judges the topology (D5 wiring); activation
+now parses L3 intent TOLERANTLY instead (``parse_l3_intent_tolerant``): a malformed
+node's ``data.l3`` is dropped with one WARNING naming the node, and every well-formed
+route is still written as booked. Phase 3 surfaces any resulting per-route provisioning
+failure as a FAILED assignment row the user can retry, the same posture as a pulled
+cable; it is not this module's concern.
 """
 
 import copy
@@ -30,15 +43,22 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkVersion, ReservationFork
+from app.models.fork import (
+    ForkConnection,
+    ForkStatus_ACTIVE,
+    ForkVersion,
+    ReservationFork,
+)
 from app.models.topology import Topology, TopologyVersion
 from app.services.fork_save_service import (
     WireSpec,
     assert_endpoints_are_members,
     assert_no_port_claims,
+    l3_row_from_spec,
     lock_port_claims,
     resolve_canvas_wiring,
 )
+from app.services.l3_intent import parse_l3_intent_tolerant
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +161,15 @@ async def create_fork(
     the check entirely: an existing fork was already validated (or predates this
     check) and is not re-validated on a retried create.
 
+    ADR 0014 phase 1 (issue #34), R4 review fix on 2ade362c: activation does NOT
+    gate on L3 routing intent. ``parse_l3_intent_tolerant`` parses the forked
+    canvas right after the membership check, dropping any malformed node's
+    ``data.l3`` with a WARNING rather than refusing the create: the reservation
+    was already judged bookable at create time, and drift since then (a topology
+    edit, or an unreachable/changed device config) must not strand an
+    otherwise-provisioned reservation with no fork and no wiring at any layer.
+    Every well-formed route is still written as booked.
+
     Issue #721 (ADR 0006 amendment): ``lock_port_claims`` then ``assert_no_port_claims``
     run right after, against the SAME resolved specs ``_snapshot_connections`` goes on
     to write, also before the fork row is added: a parent canvas whose resolved wiring
@@ -164,6 +193,10 @@ async def create_fork(
     )
     forked_canvas = None if parent_canvas is None else copy.deepcopy(parent_canvas)
     assert_endpoints_are_members(forked_canvas, member_device_ids)
+
+    # ADR 0014 phase 1 (issue #34), R4: tolerant parse, no gate, no inventory call.
+    intended_routes = parse_l3_intent_tolerant(forked_canvas)
+
     specs = (await resolve_canvas_wiring(db, forked_canvas)).specs
     fork_id = uuid.uuid4()
     await lock_port_claims(db, specs)
@@ -190,6 +223,13 @@ async def create_fork(
     # inside the guard too.
     try:
         await db.flush()
+        # ADR 0014 phase 1 (issue #34): insert the tolerantly-parsed L3 routing
+        # intent before _snapshot_connections, sharing this try block so an
+        # activation race's IntegrityError rolls both back together with the
+        # wiring snapshot.
+        for device_id, routes in intended_routes.items():
+            for route in routes:
+                db.add(l3_row_from_spec(fork.id, device_id, route, created_by))
         await _snapshot_connections(db, fork.id, specs, created_by)
         db.add(
             ForkVersion(

@@ -11,7 +11,6 @@ from app.database import get_db
 from app.dependencies import get_current_user_payload
 from app.models.topology import Topology, TopologyVersion
 from app.schemas.topology import (
-    InvalidEdge,
     PaginatedTopologyResponse,
     TopologyClone,
     TopologyCreate,
@@ -19,12 +18,8 @@ from app.schemas.topology import (
     TopologyUpdate,
     TopologyValidationResponse,
 )
-from app.services.fork_save_service import classify_element_edge, node_to_element_map
-from app.services.pathfind_service import (
-    build_adjacency_graph,
-    find_all_shortest_paths_batch_async,
-)
 from app.services.reservation_guard import find_blocking_reservations
+from app.services.topology_validation import run_full_topology_validation
 from app.services.version_service import commit_with_new_version
 
 router = APIRouter(prefix="/topologies", tags=["topologies"])
@@ -202,147 +197,10 @@ async def clone_topology(
     return clone
 
 
-async def _run_topology_validation(
-    topology: Topology, db: AsyncSession
-) -> TopologyValidationResponse:
-    """Walk the topology canvas and check each edge against the cabling graph.
-
-    Shared by the public /validate (user-facing) and /validate/internal (service)
-    endpoints; the only thing that differs between the two is the auth path.
-    """
-    canvas = topology.canvas_data or {}
-    nodes = canvas.get("nodes") or []
-    edges = canvas.get("edges") or []
-
-    # node_id (React Flow id) to device_id map. Edges reference React Flow node ids,
-    # not device ids; we resolve devices through this map.
-    node_to_device: dict[str, uuid.UUID] = {}
-    for node in nodes:
-        node_id = node.get("id")
-        device_id_str = ((node.get("data") or {}).get("device") or {}).get("id")
-        if not node_id or not device_id_str:
-            continue
-        try:
-            node_to_device[node_id] = uuid.UUID(device_id_str)
-        except (ValueError, TypeError):
-            continue
-
-    # node_id to network element id (ADR 0012 phase 1, issue #22). Shared with
-    # resolve_canvas_wiring's classification via node_to_element_map so the validator
-    # and the fork-save resolver agree on which edges are element attachments.
-    node_to_element = node_to_element_map(canvas)
-
-    # Issue #701: the canvas's device node ids, deduplicated and sorted, for
-    # reservations' create-time membership check. Computed from node_to_device so a
-    # dynamic placeholder or network element node (neither carries data.device.id)
-    # never appears here regardless of edge presence.
-    device_ids = sorted(set(node_to_device.values()))
-
-    if not edges:
-        return TopologyValidationResponse(valid=True, invalid_edges=[], device_ids=device_ids)
-
-    # Scope the graph to the connected component(s) of the topology's devices.
-    # Expansion still loads off-canvas intermediates (a patch panel that
-    # physically realizes an edge), so no reachable path is dropped; it only
-    # skips fabrics unrelated to this topology. Built once and reused across all
-    # edges, as before.
-    graph = await build_adjacency_graph(db, device_ids=set(node_to_device.values()))
-
-    # First pass: skip proposal edges, classify missing-device edges immediately
-    # (same reason and fields as before), and defer the rest for pathfinding.
-    # `edge_results` is positional (one slot per edge in `edges`, None meaning
-    # "not invalid" or "proposal, skipped"), so the final invalid list can be
-    # reassembled in the exact original per-edge order regardless of how the
-    # batched pathfind call below resolves its pairs. `pending` carries the
-    # (edges-index, edge_id, layer, source_device, target_device) tuples for
-    # every edge that needs a path lookup, in edge order.
-    edge_results: list[InvalidEdge | None] = [None] * len(edges)
-    pending: list[tuple[int, str, str | None, uuid.UUID, uuid.UUID]] = []
-
-    for idx, edge in enumerate(edges):
-        edge_id = str(edge.get("id") or "")
-        edge_data = edge.get("data") or {}
-        layer = edge_data.get("layer")
-        # Skip proposal edges (not yet committed by the user).
-        if edge_data.get("isProposal"):
-            continue
-
-        source_node = edge.get("source")
-        target_node = edge.get("target")
-        source_device = node_to_device.get(source_node) if source_node else None
-        target_device = node_to_device.get(target_node) if target_node else None
-
-        # Network element classification (ADR 0012 phase 1, issue #22), via the
-        # classifier shared with resolve_canvas_wiring. Checked before the
-        # missing_device fallback so an element edge is classified on its own terms
-        # rather than as a dangling device reference.
-        classification = classify_element_edge(edge, node_to_device, node_to_element)
-
-        if classification == "element_to_element":
-            edge_results[idx] = InvalidEdge(
-                edge_id=edge_id,
-                source_device_id=None,
-                target_device_id=None,
-                layer=layer,
-                reason="element_to_element",
-            )
-            continue
-
-        if classification == "element_edge_no_port":
-            edge_results[idx] = InvalidEdge(
-                edge_id=edge_id,
-                source_device_id=source_device,
-                target_device_id=target_device,
-                layer=layer,
-                reason="element_edge_no_port",
-            )
-            continue
-
-        if classification == "attachment":
-            # VALID declarative attachment: no BFS, not added to `pending`. An
-            # element is not a physical thing the cabling graph could contain a
-            # path to.
-            continue
-
-        if source_device is None or target_device is None:
-            edge_results[idx] = InvalidEdge(
-                edge_id=edge_id,
-                source_device_id=source_device,
-                target_device_id=target_device,
-                layer=layer,
-                reason="missing_device",
-            )
-            continue
-
-        pending.append((idx, edge_id, layer, source_device, target_device))
-
-    # Second pass: one batched BFS call over every resolvable pair instead of
-    # one asyncio.to_thread hop per edge (issue #313, same fix class as
-    # #249/#250). Results are returned in request order, matching `pending`
-    # positionally, and an empty path-list means the same "no_path" outcome
-    # find_all_shortest_paths_async would have produced for that pair.
-    pairs = [(source_device, target_device) for _, _, _, source_device, target_device in pending]
-    all_paths = await find_all_shortest_paths_batch_async(graph, pairs)
-
-    for (idx, edge_id, layer, source_device, target_device), paths in zip(pending, all_paths):
-        if not paths:
-            edge_results[idx] = InvalidEdge(
-                edge_id=edge_id,
-                source_device_id=source_device,
-                target_device_id=target_device,
-                layer=layer,
-                reason="no_path",
-            )
-
-    invalid = [result for result in edge_results if result is not None]
-    return TopologyValidationResponse(
-        valid=not invalid, invalid_edges=invalid, device_ids=device_ids
-    )
-
-
 @router.post("/{topology_id}/validate/internal", response_model=TopologyValidationResponse)
 async def validate_topology_internal(
     topology_id: uuid.UUID,
+    l3: bool = Query(True),
     x_internal_token: str = Header(..., alias="X-Internal-Token"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -352,13 +210,20 @@ async def validate_topology_internal(
     with unreachable edges. The booking user does not necessarily own the
     topology being reserved, so JWT-forward against the public /validate
     endpoint would 403 on the creator-or-admin check.
+
+    ``l3=0`` (R11 review fix, ADR 0014 phase 1, issue #34) skips the L3 routing
+    -intent pass entirely: no ``resolve_canvas_wiring`` call, no inventory call,
+    ``invalid_routes`` empty. Reservations' ACTIVE device-set PATCH path (the
+    issue #701 membership check) passes this, since a device-set edit judges only
+    physical connectivity for the revised membership; the topology's routing
+    intent was already judged at create time.
     """
     if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
     topology = await db.get(Topology, topology_id)
     if not topology:
         raise HTTPException(status_code=404, detail="Topology not found")
-    return await _run_topology_validation(topology, db)
+    return await run_full_topology_validation(topology.canvas_data, db, check_routes=l3)
 
 
 @router.post("/{topology_id}/validate", response_model=TopologyValidationResponse)
@@ -381,7 +246,7 @@ async def validate_topology(
     if str(topology.created_by) != payload["sub"] and user_role not in ("admin", "superadmin"):
         raise HTTPException(status_code=403, detail="Not authorized to validate this topology")
 
-    return await _run_topology_validation(topology, db)
+    return await run_full_topology_validation(topology.canvas_data, db)
 
 
 @router.delete("/{topology_id}", status_code=status.HTTP_204_NO_CONTENT)

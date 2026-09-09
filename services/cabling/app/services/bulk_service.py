@@ -298,7 +298,7 @@ async def import_topologies(
 
     # Local import of the validator to avoid a circular import at module load
     # (routes/topologies imports nothing from here, but keep the dependency one-way).
-    from app.routes.topologies import _run_topology_validation
+    from app.services.topology_validation import run_full_topology_validation
 
     is_admin = actor_role in ("admin", "superadmin")
 
@@ -324,19 +324,26 @@ async def import_topologies(
                 )
                 continue
 
-            # Build a detached Topology to run the existing validator against the
-            # rewritten canvas before any write. The validator is read-only on the
-            # passed topology and reads connections from the db.
-            candidate = Topology(name=name, created_by=actor_id, canvas_data=rewritten)
-            validation = await _run_topology_validation(candidate, db)
+            # Run the existing full validator (edges + L3) against the rewritten
+            # canvas before any write; it is read-only, reading connections (and,
+            # for a canvas carrying data.l3, inventory) but never touching this row.
+            validation = await run_full_topology_validation(rewritten, db)
             if not validation.valid:
-                reasons = ", ".join(f"{e.reason}({e.edge_id})" for e in validation.invalid_edges)
+                reasons = [f"{e.reason}({e.edge_id})" for e in validation.invalid_edges]
+                # S9 review fix, round 2: route reasons ride the same per-row
+                # reject message as edge reasons, "<node_id>[<index>] (<reason>)",
+                # so a routes-only (or combined) failure names what's actually
+                # wrong instead of an empty edges-only reason string.
+                reasons += [
+                    f"{r.node_id}[{r.index if r.index is not None else '-'}] ({r.reason})"
+                    for r in validation.invalid_routes
+                ]
                 report.rows.append(
                     RowResult(
                         row=index,
                         action="reject",
                         identity=name,
-                        reason=f"topology validation failed: {reasons}",
+                        reason=f"topology validation failed: {', '.join(reasons)}",
                     )
                 )
                 continue
@@ -449,6 +456,15 @@ async def import_topologies(
         except HTTPException as exc:
             if not dry_run:
                 await db.rollback()
+            # S9 review fix, round 2: a 503 (l3_config_unavailable: inventory
+            # could not be asked to judge this row's routing intent at all)
+            # aborts the WHOLE import request, the same way the upfront
+            # resolve_device_names failure does, rather than being swallowed as
+            # a per-row reject: unlike a genuine validation failure, this row
+            # was never actually judged, so "reject this one row" would be
+            # misleading and the rest of the batch is equally unjudged.
+            if exc.status_code == 503:
+                raise
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
             )

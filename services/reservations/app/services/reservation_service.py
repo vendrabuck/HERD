@@ -42,6 +42,12 @@ from app.services.purpose_service import (
 
 logger = logging.getLogger(__name__)
 
+# S13 review fix, round 2: `_validate_topology_connectivity`'s call to cabling's
+# validate/internal needs headroom over cabling's own L3 pass budget
+# (`l3_validation._L3_PASS_DEADLINE_SECONDS`, 12s), or this timeout could fire
+# first and misreport a slow-but-answering cabling as a transport failure.
+_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS = 20.0
+
 # Test-only fault-injection seam (issue #573), mirroring inventory's
 # HERD_FAULT_INJECTION convention (services/inventory/app/routers/devices.py).
 # Double-gated: active only when HERD_FAULT_INJECTION is set (dev/test compose
@@ -211,7 +217,7 @@ class TopologyDeviceNotMember(ValueError):
 
 
 async def _validate_topology_connectivity(
-    topology_id: uuid.UUID, device_ids: list[uuid.UUID]
+    topology_id: uuid.UUID, device_ids: list[uuid.UUID], *, check_routes: bool = True
 ) -> None:
     """Reject the reservation when the referenced topology has unreachable edges,
     or when its canvas names a device outside ``device_ids``.
@@ -228,17 +234,33 @@ async def _validate_topology_connectivity(
     drive provisioning against a device it never booked. Riding the existing
     validate/internal response keeps this one cabling round trip rather than two.
 
+    ``check_routes=False`` (R11 review fix, ADR 0014 phase 1, issue #34) passes
+    ``l3=0`` to cabling's validate/internal, skipping its L3 routing-intent pass
+    entirely: the ACTIVE device-set PATCH path (the #701 membership check in
+    ``update_reservation``) uses this, since a device-set edit judges only
+    physical connectivity for the revised membership, and the topology's routing
+    intent was already judged valid at create time. The create path leaves this
+    True.
+
     Authenticated as a service-to-service call via X-Internal-Token rather than
     forwarding the booking user's JWT: the booking user does not necessarily
     own the topology they're reserving, so JWT-forward would 403 against the
     cabling RBAC check.
+
+    Timeout is 20s, not the usual 10s (S13 review fix, round 2): when
+    ``check_routes`` is True, cabling's own L3 pass can itself run for up to its
+    12s ``_L3_PASS_DEADLINE_SECONDS`` budget before it fails closed with a 503,
+    so this call's timeout must comfortably exceed that or a slow-but-answering
+    cabling would be cut off here first, misreporting a transport failure
+    (RuntimeError) instead of relaying cabling's own 503.
     """
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
                 f"{settings.cabling_service_url}/topologies/{topology_id}/validate/internal",
                 headers={"X-Internal-Token": settings.internal_api_token},
-                timeout=10.0,
+                params=None if check_routes else {"l3": "0"},
+                timeout=_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
@@ -262,37 +284,106 @@ async def _validate_topology_connectivity(
         return
 
     invalid = body.get("invalid_edges") or []
-    summaries = []
-    for entry in invalid[:5]:
+    edge_summaries = []
+    for entry in invalid:
         edge_id = entry.get("edge_id") or "?"
         reason = entry.get("reason") or "invalid"
-        summaries.append(f"{edge_id} ({reason})")
-    extra = "" if len(invalid) <= 5 else f" and {len(invalid) - 5} more"
-    raise ValueError(
-        "Topology has unreachable edges in the cabling graph: " + ", ".join(summaries) + extra
-    )
+        edge_summaries.append(f"{edge_id} ({reason})")
+
+    # ADR 0014 phase 1 (issue #34), R7 review fix on 2ade362c: fold invalid_routes
+    # into a SEPARATE sentence rather than the edges-only prefix, so an edge-only
+    # failure's message (and the tests pinning it) is byte-for-byte unchanged, a
+    # routes-only failure reads as its own claim, and a combined failure joins
+    # both sentences. Carries the node_id (not a truncated device id), matching
+    # what the editor's canvas actually shows the user.
+    invalid_routes = body.get("invalid_routes") or []
+    route_summaries = []
+    for entry in invalid_routes:
+        node_id = entry.get("node_id") or "?"
+        index = entry.get("index")
+        index_str = str(index) if index is not None else "-"
+        reason = entry.get("reason") or "invalid"
+        route_summaries.append(f"{node_id}[{index_str}] ({reason})")
+
+    if not edge_summaries and not route_summaries:
+        # valid=False with both lists empty: cabling answered but named nothing
+        # specific (should not happen in practice, but must not raise an
+        # uninformative empty message, S8 review fix, round 2).
+        raise ValueError("Topology failed validation (no details reported)")
+
+    sentences: list[str] = []
+    if edge_summaries:
+        sentences.append(
+            "Topology has unreachable edges in the cabling graph: " + _summarize(edge_summaries)
+        )
+    if route_summaries:
+        sentences.append("Topology has invalid routing intent: " + _summarize(route_summaries))
+    message = "; ".join(sentences)
+
+    # S8 review fix, round 2: a routes failure (alone, or combined with edges)
+    # raises the structured TopologyRoutingIntentInvalid, carrying the RAW
+    # invalid_routes list so the router can answer a 422 with machine-readable
+    # detail instead of only a message string; an edges-only failure keeps the
+    # plain ValueError (unchanged, so existing edge-only callers/tests still
+    # just get a message).
+    if route_summaries:
+        raise TopologyRoutingIntentInvalid(invalid_routes, message)
+    raise ValueError(message)
+
+
+def _summarize(entries: list[str], *, limit: int = 5) -> str:
+    """Join up to `limit` summary strings with a "and N more" suffix (S10 review
+    fix, round 2): the one helper both the edge and route summary sections use."""
+    shown = entries[:limit]
+    extra = "" if len(entries) <= limit else f" and {len(entries) - limit} more"
+    return ", ".join(shown) + extra
+
+
+class TopologyRoutingIntentInvalid(ValueError):
+    """Raised by `_validate_topology_connectivity` when cabling's validate/internal
+    response reports one or more `invalid_routes` (S8 review fix, round 2, ADR
+    0014 phase 1, issue #34). A `ValueError` subclass so any caller that only
+    catches `ValueError` (existing behavior) still catches this; carries the RAW
+    `invalid_routes` list additionally, so the router can answer a structured 422
+    (`{"error": "topology_routing_intent_invalid", "invalid_routes": [...],
+    "message": ...}`) instead of only a message string.
+    """
+
+    def __init__(self, invalid_routes: list[dict], message: str):
+        super().__init__(message)
+        self.invalid_routes = invalid_routes
 
 
 class ForkMembershipRefused(Exception):
-    """Cabling refused a fork create with a definitive 409 (D2/D3 of the 2026-09-04
-    fork endpoint-membership fix, generalized to any 409 by issue #721).
+    """Cabling refused a fork create with a definitive 409 or 422 (D2/D3 of the
+    2026-09-04 fork endpoint-membership fix, generalized to any 409 by issue
+    #721; scoped to exactly {409, 422} by the S2 review fix, round 2 on
+    2ade362c, after the R4 review fix briefly over-widened it to any 4xx).
 
     Originally raised only for the endpoint-membership shape
     (``fork_device_not_member``); issue #721 (ADR 0006 Decision 4's activation-path
     port-claim check) generalized this to ANY 409 cabling's fork-create route
-    returns, membership or a cross-reservation port claim alike: both are cabling's
-    definitive answer that this canvas cannot be forked as submitted, not a
-    transient failure, so neither must ever be retried the way a transport error or
-    a 5xx is. ``device_ids`` is populated only for the membership shape (empty for
-    a port-claim conflict, which names ports and reservations instead); ``detail``
-    carries whatever structured detail body cabling actually returned, for a
-    caller that wants the full shape regardless of which 409 it was.
+    returns, membership or a cross-reservation port claim alike. ADR 0014 phase 1
+    removed cabling's L3 gate from fork create entirely, so the only refusals
+    cabling's fork-create route can still raise for a genuinely bad canvas are
+    those two 409s and a request-shape 422; all three are cabling's definitive
+    answer that THIS canvas cannot be forked as submitted, not a transient
+    failure, so none of them must ever be retried the way a transport error or
+    a 5xx is. Every OTHER 4xx (403 from a rotated or misconfigured internal
+    token, 404 from a mid-deploy route gap) is a caller/environment problem
+    that can resolve itself, so it stays a plain RuntimeError: retried by
+    ``retry_with_backoff``, then healed by the expiration sweep's backstop on
+    exhaustion, never permanently disabling fork creation for the rest of the
+    process's lifetime the way treating it as definitive would.
+    ``device_ids`` is populated only for the membership shape (empty for a
+    port-claim conflict or a 422, which carry their own detail shapes instead);
+    ``detail`` carries whatever structured detail body cabling actually
+    returned, for a caller that wants the full shape regardless of which of the
+    two it was.
     """
 
     def __init__(self, device_ids: list[str], detail: dict | str | None = None):
-        super().__init__(
-            f"fork create refused (409): {detail if detail is not None else device_ids}"
-        )
+        super().__init__(f"fork create refused: {detail if detail is not None else device_ids}")
         self.device_ids = device_ids
         self.detail = detail
 
@@ -356,12 +447,15 @@ async def _create_reservation_fork(
     Fail-open for transient failures: a transport error or a 5xx must NOT strand a
     successfully-provisioned reservation. The caller wraps this in retry_with_backoff
     (retryable only on RuntimeError/httpx.HTTPError) and, on exhaustion, logs and
-    continues, leaving fork_id null. ANY 409 (ForkMembershipRefused, generalized by
-    issue #721) is different: it is cabling's definitive refusal, whether the
-    canvas names a foreign device or claims a port another ACTIVE fork already
-    holds, not a transient failure, so it is raised as a type retry_with_backoff's
-    retryable tuple deliberately excludes, and propagates on the first attempt with
-    no retry.
+    continues, leaving fork_id null. A 409 or 422 (ForkMembershipRefused; S2 review
+    fix, round 2, scoped this to exactly those two statuses) is different: it is
+    cabling's definitive refusal, whether the canvas names a foreign device, claims
+    a port another ACTIVE fork already holds, or is shaped wrong, not a transient
+    failure, so it is raised as a type retry_with_backoff's retryable tuple
+    deliberately excludes, and propagates on the first attempt with no retry. Every
+    OTHER 4xx (403, 404) stays a plain RuntimeError instead, since a rotated token
+    or a mid-deploy route gap can resolve itself and must not permanently disable
+    fork creation for the process lifetime.
     """
     if topology_id is None:
         # Decision 3 Case A: no parent topology, create the fork lazily on first
@@ -387,12 +481,22 @@ async def _create_reservation_fork(
             },
             timeout=10.0,
         )
-    if resp.status_code == 409:
-        # Generalized by issue #721: ANY 409 from fork-create is cabling's
-        # definitive refusal, not just the endpoint-membership shape. device_ids
-        # is populated only when the detail is actually that shape; a port-claim
-        # conflict (or anything else) still raises, just with an empty list, and
-        # the raw detail is carried alongside for a caller that wants it.
+    if resp.status_code in (409, 422):
+        # Generalized by issue #721 to any 409; scoped to exactly {409, 422} by
+        # the S2 review fix (round 2 on 2ade362c): cabling's fork-create route
+        # is now a pure snapshot (ADR 0014 phase 1 removed its L3 gate
+        # entirely), so the only refusals it can still raise for a genuinely
+        # bad canvas are the endpoint-membership 409, the port-claim 409, or a
+        # request-shape 422; all three are cabling's definitive refusal, not a
+        # transient failure, and none of them resolve themselves on a retry. A
+        # 403 (rotated/misconfigured internal token) or 404 (mid-deploy route
+        # gap) is a caller/environment problem that CAN resolve itself, so it
+        # falls through to the plain RuntimeError branch below instead: retried,
+        # then healed by the sweep backstop, never permanently disabling fork
+        # creation for the process lifetime. device_ids is populated only when
+        # the detail is actually the fork_device_not_member shape; anything
+        # else still raises, just with an empty list, and the raw detail is
+        # carried alongside for a caller that wants it.
         try:
             detail = resp.json().get("detail") or {}
         except ValueError:
@@ -1986,8 +2090,15 @@ async def update_reservation(
             # remaining way to leave a foreign device wired. Runs before any
             # inventory status mutation below, so a failure aborts with no side
             # effects to unwind. Reservations without a topology are unaffected.
+            # check_routes=False (R11 review fix, ADR 0014 phase 1, issue #34):
+            # a device-set edit judges only physical connectivity for the revised
+            # membership; the topology's L3 routing intent was already judged at
+            # create time and is unrelated to which devices this booking now
+            # includes, so this must never refuse (or 503) on it.
             if reservation.topology_id is not None:
-                await _validate_topology_connectivity(reservation.topology_id, data.device_ids)
+                await _validate_topology_connectivity(
+                    reservation.topology_id, data.device_ids, check_routes=False
+                )
 
             # Check added exclusive devices are available and have no conflicts
             if added_ids:

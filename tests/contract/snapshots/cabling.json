@@ -416,6 +416,7 @@
         "created_at": "string",
         "draft_restored_from_id": "anyOf",
         "id": "string",
+        "l3_routes": "array",
         "parent_topology_id": "anyOf",
         "parent_version_id": "anyOf",
         "reservation_id": "string",
@@ -448,6 +449,22 @@
         "devices": "object"
       },
       "required": [],
+      "type": "object"
+    },
+    "ForkL3RouteResponse": {
+      "properties": {
+        "destination": "string",
+        "device_id": "string",
+        "interface": "string",
+        "next_hop": "anyOf",
+        "validated_config_version_id": "anyOf",
+        "virtual_router": "anyOf"
+      },
+      "required": [
+        "destination",
+        "device_id",
+        "interface"
+      ],
       "type": "object"
     },
     "ForkPruneRequest": {
@@ -505,6 +522,8 @@
         "built": "array",
         "element_attachments_skipped": "integer",
         "fork_id": "string",
+        "l3_routes_built": "integer",
+        "l3_routes_released": "integer",
         "released": "array",
         "unchanged_count": "integer",
         "version_number": "integer"
@@ -572,6 +591,20 @@
       },
       "required": [
         "edge_id",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "InvalidRoute": {
+      "properties": {
+        "detail": "anyOf",
+        "device_id": "anyOf",
+        "index": "anyOf",
+        "node_id": "string",
+        "reason": "string"
+      },
+      "required": [
+        "node_id",
         "reason"
       ],
       "type": "object"
@@ -881,6 +914,7 @@
       "properties": {
         "device_ids": "array",
         "invalid_edges": "array",
+        "invalid_routes": "array",
         "valid": "boolean"
       },
       "required": [

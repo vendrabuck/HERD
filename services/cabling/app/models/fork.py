@@ -194,3 +194,66 @@ class ForkVersion(Base):
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ForkL3Route(Base):
+    """Resolved Layer 3 routing intent for one fork (ADR 0014 phase 1, issue #34).
+
+    The L3 analogue of ``fork_connections``: ``data.l3`` on a device node in the
+    fork's canvas (see ``app/services/l3_intent.py``) is the user-editable intent,
+    this table is what execution reads (a later phase), and both the save-reconcile
+    (``fork_save_service.save_fork``) and fork-on-activation
+    (``fork_service.create_fork``) write it under the same fork row lock that
+    guards ``fork_connections``. A save is a set reconcile keyed on
+    ``(device_id, route_key)``, exactly like the connection identity reconcile:
+    released rows are deleted, built rows inserted, unchanged rows untouched.
+
+    Archive leaves rows in place (the as-built record, like ``fork_connections``);
+    device-removal pruning (``prune_canvas_for_devices``) deletes a removed
+    device's rows in the same transaction as its ``fork_connections`` release;
+    fork restore is canvas-only and never touches this table (the next save
+    reconciles it, same as wiring).
+    """
+
+    __tablename__ = "fork_l3_routes"
+    __table_args__ = (
+        UniqueConstraint(
+            "fork_id",
+            "device_id",
+            "route_key",
+            name="uq_fork_l3_routes_device_route",
+        ),
+        *(({"schema": _schema},) if _schema else ()),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    fork_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(_fork_fk, ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    device_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    destination: Mapped[str] = mapped_column(String(64), nullable=False)
+    next_hop: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    interface: Mapped[str] = mapped_column(String(64), nullable=False)
+    virtual_router: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The reconcile identity (``RouteSpec.route_key``): all four fields, JSON
+    # -packed (S4 review fix, round 2: virtual_router is part of the identity now,
+    # since two routes differing only by it must not collide; widened to
+    # String(400) to fit the packed JSON of four 64-char fields plus quoting).
+    # Stored rather than recomputed so the unique constraint and the reconcile's
+    # set arithmetic both key off one column.
+    route_key: Mapped[str] = mapped_column(String(400), nullable=False)
+    # The inventory config version the save-time L3 validation pass actually
+    # judged this route against (S6 review fix, round 2), bare UUID with no FK
+    # (inventory owns that table; this repo never uses cross-schema FKs). NULL
+    # when the row was written by the tolerant activation path
+    # (fork_service.create_fork), which never validates. Phase 3 compares this
+    # to the switch's current config version and re-runs the per-route checks
+    # before driving when they differ.
+    validated_config_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    created_by: Mapped[str] = mapped_column(String(150), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

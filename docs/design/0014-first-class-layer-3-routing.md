@@ -341,3 +341,281 @@ batching rule `docs/DRIVERS.md` already documents.
 - Bulk import and export of routing intent: the topology importer and
   exporter carry `canvas_data` whole, so intent rides along; a CSV column
   is not added.
+
+## Amendment: phase 1 delivery (2026-09-08)
+
+Phase 1 (cabling model and validate) shipped as designed, with three points
+worth recording against the Decision and Contract summary sections above,
+none of which change the shape decided there.
+
+**A ninth validation reason, `l3_malformed`.** Decision 5 lists eight reasons
+and calls the canvas shape itself out of scope for enumeration ("`data.l3`
+must be an object whose only key is `routes`..." lives in the canvas parser,
+not the validation reason list). Implementation surfaced that a malformed
+`data.l3` shape needs its own reason so it can be reported alongside every
+other switch, rather than raised as an exception that would abort validating
+the rest of the topology: `l3_malformed` (index null, `detail` carrying the
+parser's message) is evaluated first, before `l3_not_a_router`, and stops
+further evaluation for that switch, exactly like the other switch-level
+reasons. It is also the 422 the two fork write paths (save, create_fork) map
+a malformed shape to, distinct from the 409 every other `invalid_routes`
+entry produces (see the write-path refusal shape below).
+
+**The route identity is a stored column, `route_key`.** The Contract summary
+names the `fork_l3_routes` unique constraint as
+`(fork_id, device_id, destination, interface, next_hop)`. The shipped schema
+instead stores the packed identity `f"{destination}|{interface}|{next_hop or
+''}"` as its own `route_key` column (`String(200)`) and uniques on
+`(fork_id, device_id, route_key)`. This is the same three-field identity
+Decision 3 already points at (`_route_run_identity`'s
+`(destination, interface, next_hop)`), packed into one string instead of
+three columns so the set-reconcile's identity tuple and the database
+constraint are the same value, never three columns that could drift out of
+sync with the reconcile's own notion of identity. `RouteSpec.route_key` (the
+canvas parser's dataclass) and the stored column are the same string by
+construction.
+
+**The inventory internal batch route was added.** Decision 5 says device type
+comes from inventory "batched per validation call"; inventory had a
+single-device internal read (`GET /devices/{id}/internal`) but no batch form,
+so `POST /internal/devices/batch` was added (`X-Internal-Token`, body
+`{"device_ids": [...]}` capped at 500, returning
+`[{id, name, connection_type, status}]`), with its own unit tests and an
+additive inventory contract snapshot entry. The L3 validation pass batches
+every L3-carrying switch's device-type lookup into one call per validation
+request and memoizes both device type and each switch's latest config version
+per device id for the rest of that call.
+
+Two more implementation notes, neither a deviation: the fork write paths'
+refusal shape (as shipped in the initial phase 1 delivery: save and create_fork
+both ran the validation pass first and refused before writing any
+`fork_l3_routes` row, 422 `{"error": "l3_intent_malformed", "node_id",
+"message"}` for a malformed switch, otherwise 409
+`{"error": "l3_intent_invalid", "invalid_routes": [...]}` for any other
+refusal) was implementable directly from Decision 5's reason vocabulary plus
+the Contract summary's write-path sketch, so it needed no separate decision.
+**This shape changed for `create_fork` under the round-2 review fixes (S4);
+see the later amendment for the current, authoritative behavior: only `save`
+still gates this way, while `create_fork` parses tolerantly and never
+refuses.** And device-removal pruning (`prune_fork_devices`) releases
+a removed device's `fork_l3_routes` rows outright rather than reasoning about
+edge incidence the way wiring hops do: a route belongs to the switch itself,
+not to any particular canvas edge, so there is no "through-hop" case to
+preserve.
+
+## Amendment: phase 1 review fixes (2026-09-09)
+
+Adversarial review of the phase 1 delivery (PR #754) found five points worth
+recording against the Decision, Contract summary, and prior amendment
+sections above; none change the shape those sections already committed to.
+
+**Module layout untangled the real cycle (R1).** The phase 1 amendment above
+already named the shipped module split; the review found that the actual
+implementation still leaned on function-local imports and one `noqa: F821` to
+paper over a real circular import between `routes/topologies.py` (which
+needed `classify_element_edge`/`node_to_element_map` from
+`fork_save_service.py`) and `fork_save_service.py` (whose `gate_l3_intent`
+needed the topology validator back). The fix is a leaf module,
+`services/cabling/app/services/canvas_nodes.py`, holding
+`node_to_device_map`, `node_to_element_map`, and `classify_element_edge` with
+no dependency on anything else in `app.services` or `app.routes`;
+`fork_save_service.py` re-exports all three for existing importers.
+`routes/topologies.py`'s `_run_topology_validation` moved out entirely, split
+into `services/topology_validation.py`'s `validate_canvas_edges` (the edge
+pass, returning an `EdgeValidation` of `invalid_edges` and `device_ids`) and
+`services/l3_validation.py`'s `validate_canvas_l3` (the L3 pass), composed by
+`topology_validation.py`'s `run_full_topology_validation` for the two
+`/validate` routes. `l3_intent.py` imports from `canvas_nodes.py` only. The
+loose canvas PUT and fork-version restore endpoints (`routes/forks.py`) now
+call `validate_canvas_edges` alone: their contract is "the draft stores
+regardless," so they must never make an inventory call or 503 on an unsaved
+draft, which running the full pass (as shipped) would have risked the moment
+a draft carried `data.l3`. No function-local imports or `noqa: F821` remain
+anywhere this PR touched.
+
+**Attachment (`l3_switch_unattached`) is defined against resolved wiring, not
+the edge-validation BFS (R2).** Decision 5's `l3_switch_unattached` says "no
+valid device-to-device edge in this validation touches the switch node," which
+the shipped code read as the edge pass's own BFS touching the switch as an
+edge *endpoint*. That undercounts a transit device: a switch that sits
+mid-path on someone else's multi-hop resolved wire is never itself an edge
+endpoint, yet the wiring genuinely reaches it. It also overcounts a
+port-constrained edge whose named port has no physical cable: the edge
+existed in the canvas and would have contributed to the old BFS-touch
+notion built from device-pair reachability, even though
+`resolve_canvas_wiring`'s own port-constrained search (issue #531) resolves
+to no hop at all for it. The fix: `touched_devices` for the L3 pass is now
+the set of both endpoints of every `WireSpec` in
+`resolve_canvas_wiring(canvas).specs` (`fork_save_service.touched_devices_from_specs`),
+in both the validate routes and the save gate. The save gate reuses the exact
+`CanvasWiringResolution` `save_fork`'s caller already computed rather than
+resolving the canvas a second time; the validate routes call
+`resolve_canvas_wiring` once, and only when `l3_intent.canvas_has_l3` says the
+canvas carries any `data.l3` at all, so a topology with none still makes
+neither a second graph build nor an inventory call.
+
+To be precise about what `l3_switch_unattached` asserts (S7 review fix, round
+2): the switch is an endpoint of at least one resolved hop (a `WireSpec`) in
+this canvas, transit devices on a multi-hop path included. It does NOT assert
+that the specific `interface` a route names is the one actually wired; a
+switch with two interfaces, one wired and one not, is "attached" for every
+route regardless of which interface a route claims. Interface-to-port matching
+is a named follow-up (recorded as a filed issue), not phase 1 scope.
+
+**Lock ordering: the gate now runs before ANY lock, not just before the ones
+`gate_l3_intent` takes itself (R3).** The phase 1 amendment's second commit
+moved the gate's own inventory calls outside `save_fork`'s reconcile closure,
+but the SAVE ROUTE (`routes/forks.py`'s `save_fork_internal`) still loaded the
+fork row `FOR UPDATE` before calling `save_fork` at all, so the gate's
+inventory HTTP calls ran while that row lock was already held the entire
+time, exactly the hazard Decision 5 and the fork-lock discipline (issue #626)
+both exist to avoid. The route now: loads the fork WITHOUT `FOR UPDATE` to
+check ARCHIVED; resolves the canvas (`resolve_canvas_wiring`) and gates intent
+(`gate_l3_intent`), neither of which touches the fork row; re-loads the fork
+WITH `FOR UPDATE` (re-checking ARCHIVED, since status could have changed in
+the gap); and only then calls `save_fork`, which now takes the already
+-resolved `CanvasWiringResolution` and already-parsed, already-gated intent as
+parameters instead of computing either itself. The version-allocation retry
+loop's reapply still covers only the set arithmetic, unchanged.
+
+**Activation does not gate on L3 intent (R4).** Decision 6's "the driver
+contract is untouched" did not settle whether *activation itself* should be
+revocable by an L3 refusal the way a save is; phase 1 shipped `create_fork`
+running the identical `gate_l3_intent` a save runs, so a topology edit or an
+inventory answer that changed between reservation-create and activation could
+422 or 409 the activation, stranding the reservation with no fork and no
+wiring at any layer, physical or routed alike. This amendment decides
+activation must not gate, matching physical wiring's own posture (a booking
+already judged connectable at create time is never re-refused at activation
+for a physical-path reason either). `create_fork` now calls
+`l3_intent.parse_l3_intent_tolerant`: a malformed node's `data.l3` is dropped
+with one WARNING naming the node, and every well-formed route on every other
+node is still written as booked. `fork_service.py` no longer imports or calls
+`gate_l3_intent` at all. Reservations' `_create_reservation_fork` widens its
+409-is-definitive branch to any `4xx` (cabling's fork-create route can now
+only still refuse with the endpoint-membership 409, the cross-reservation
+port-claim 409, or a request-shape 422, none of which resolve on a retry), and
+`_relay_cabling_fork_response` relays a structured JSON `5xx` body (e.g.
+cabling's L3-gate 503 `{"error": "l3_config_unavailable"}` from the SAVE path,
+which still gates) instead of the generic "Cabling service is unavailable"
+message, keeping the generic message only when the body is not valid JSON at
+all.
+
+**Empty intent is no intent (R10).** A device node whose `data.l3` is exactly
+`{"routes": []}` carries the key but expresses nothing: it now produces no
+entry from the parser (absent from `parse_l3_intent`'s map, not present with
+an empty list) and triggers no switch-level check and no inventory call,
+identically to a node that never carried `data.l3` at all, on both the
+validate routes and the save gate. `l3_validation.py`'s node walk
+(`_split_l3_nodes`) applies the same rule directly, so a switch whose only
+contribution is an empty routes list is treated as carrying no intent rather
+than being reported `l3_switch_unconfigured` or evaluated for attachment.
+
+**The device-set PATCH path never judges routing (R11).**
+`POST /topologies/{id}/validate/internal` gained a query parameter `l3`
+(default true); `l3=0` skips the L3 pass entirely (no `resolve_canvas_wiring`
+call, no inventory call, `invalid_routes` always empty).
+`_validate_topology_connectivity` gained `check_routes: bool = True`;
+reservations' ACTIVE device-set PATCH path (`update_reservation`, the issue
+#701 membership check) passes `False`, while the create path leaves the
+default. Rationale: a device-set edit judges only physical connectivity for
+the revised membership, and the topology's L3 routing intent was already
+judged at create time and is unrelated to which devices the booking currently
+includes; without this, editing a reservation's device set could refuse (or
+503) on routing intent nobody asked it to re-check.
+
+Two smaller fixes rode along with the above, neither its own decision:
+`l3_intent.py`'s parser now merges two nodes that resolve to the same device
+(deduplicating on `route_key`, first occurrence wins) rather than the second
+node's routes silently overwriting the first's; `next_hop` and
+`virtual_router` submitted as `""` normalize to null; `destination` is
+canonicalized via `ipaddress.ip_network(value, strict=False)` when parseable
+and kept verbatim otherwise (so `l3_bad_destination` still fires for a
+genuinely bad string); and a literal `|` in any field is refused as malformed,
+since `route_key` packs its three fields with `|` as the separator.
+Reservations' error text (`_validate_topology_connectivity`) now builds its
+`ValueError` from whichever of the two non-empty sections apply, joined with
+`"; "` when both are present, and names the offending canvas node id rather
+than a truncated device id, so a routes-only failure no longer reads as if it
+were an edge failure.
+
+## Amendment: phase 1 round-2 review fixes (2026-09-09)
+
+A second adversarial review of PR #754 (head aad7fedc, the round-1 fixes above)
+found four more points worth recording against the Decision and Contract summary
+sections; three (S4, S5, S6) change the shipped shape, and the fourth (S7) is the
+contradiction fix folded into the section above.
+
+**S4: route identity includes the virtual router.** Decision 1's `RouteSpec`
+shape and the phase 1 amendment's `route_key` both described the identity as
+three fields, `(destination, interface, next_hop)`, packed with `|` as a
+separator. That was wrong on its own terms: two routes differing only by
+`virtual_router` (e.g. the same destination and interface routed via two
+different VRFs) collided on `route_key` and could never coexist as distinct
+`fork_l3_routes` rows, even though ADR 0014 Decision 1 lists `virtual_router` as
+part of a route's identity-bearing shape. `route_key` now JSON-packs all FOUR
+fields (`json.dumps([destination, interface, next_hop or "", virtual_router or
+""])`); the `|`-separator and its associated "no field may contain `|`"
+malformed rule are gone, since JSON's own escaping makes every field safe to
+pack regardless of content. `fork_l3_routes.route_key` widens from
+`String(200)` to `String(400)` to fit the packed JSON of four 64-character
+fields plus quoting; migration 0011 was still unreleased on this branch, so the
+column width and the `validated_config_version_id` addition from S6 (below) are
+folded into that same migration rather than added as a follow-up revision. The
+driver contract carries no VRF concept (see the "Out of scope" section and the
+filed follow-up issue on this), so phase 3 collapses `route_key`'s four-field
+identity down to the three-field one execution's `_route_run_identity`
+already uses when it actually calls the driver; a VRF-aware driver contract is
+a separate, explicitly out-of-scope follow-up.
+
+**S5: a fork save gates the L3 validation pass on an actual intent delta, not
+on "any L3 intent present."** Decision 3 already established that a save
+reconciles the route set only on switches with intent; this amendment adds the
+missing precondition on the validation pass itself: `save_fork_internal`
+computes the parsed intent and reads the fork's EXISTING `fork_l3_routes` rows
+before deciding whether to call the L3 pass at all
+(`fork_save_service.l3_intent_changed`, comparing route-key sets per device).
+When they match exactly, the pass (and its inventory calls) never runs. This
+matters because a save can be triggered by a purely physical wiring edit on a
+canvas that also happens to carry `data.l3` nobody touched; without this check,
+every such save would re-validate routes that were already judged valid when
+last written, paying for inventory round trips (and risking a spurious 503) for
+no reason. Consequence, stated explicitly: a switch that loses its wiring
+attachment through a wiring-only save (no L3 edit) is NOT caught by that save;
+it is caught by the next save that actually edits L3 intent on that switch, or
+by execution's own re-validation in phase 3. This is a deliberate trade
+-off, the same shape as ADR 0009's "pinned, never re-derived" rule for
+config-version routes: intent-driven switches only re-derive when the fork
+save reconciles their intent, not on every save that happens to touch the
+fork.
+
+**S6: the save path records which inventory config version it validated
+against.** `fork_l3_routes` gains a nullable `validated_config_version_id`
+(bare UUID, no FK, matching this repo's no-cross-schema-FK convention),
+written by `L3InventoryContext`'s config fetch (`L3InventoryContext.config_version_id`,
+sourced from the `id` field on inventory's `GET
+/devices/{id}/config-versions/latest/internal` response) and threaded through
+`validate_canvas_l3`'s result, `fork_save_service.gate_l3_intent`, and
+`save_fork`'s `l3_row_from_spec` calls onto every BUILT row from a save that
+actually ran the gate (S5's delta check). Left `NULL` by
+`fork_service.create_fork`'s tolerant activation path, which never validates,
+and by any save whose L3 intent was unchanged (S5) and so never re-ran the
+gate; those rows simply keep whatever value (possibly still `NULL`) a prior
+save recorded, since they are UNCHANGED rows in the reconcile and are never
+rewritten. Additive on the internal fork GET payload as
+`validated_config_version_id`. Phase 3 will compare this to the switch's
+CURRENT config version at drive time and re-run the per-route checks when they
+differ, closing the gap S5 deliberately leaves open (a config or wiring change
+after the last L3-touching save is invisible to cabling until the next L3 edit,
+but execution can still catch it before actually driving a stale route).
+
+**S7: the phase 1 delivery section's write-path description was stale.** The
+original phase 1 amendment (above) said "save and create_fork both run the
+validation pass first and refuse before writing any row"; that stopped being
+true the moment R4 (round 1) made `create_fork` tolerant. The sentence there
+now points forward to this section rather than asserting the old, now-false
+behavior. Also recorded here for clarity: `l3_switch_unattached` asserts that
+the switch is an endpoint of at least one resolved hop in the canvas (transit
+devices on a multi-hop path count; element attachments do not); it does NOT
+assert that the specific interface a route names is the one actually wired,
+which is a named follow-up (filed as an issue, not phase 1 scope).

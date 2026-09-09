@@ -23,18 +23,17 @@ The suite self-seeds the mock L3 driver via a session fixture.
 """
 
 import asyncio
-import io
-import tarfile
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import httpx
 import pytest
 
-pytestmark = pytest.mark.asyncio
+from ._l3_helpers import create_connection as _create_connection
+from ._l3_helpers import create_device as _create_device
+from ._l3_helpers import create_l3_driver, create_l3_template
 
-_MOCK_L3_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l3"
+pytestmark = pytest.mark.asyncio
 
 ROUTES = [
     {"destination": "10.20.0.0/24", "next_hop": "192.168.50.1", "interface": "eth0"},
@@ -46,34 +45,18 @@ EDITED_ROUTES = [
 ]
 
 
-def _mock_l3_tarball() -> bytes:
-    """Package the checked-in drivers/mock_l3 package into a .tar.gz for upload."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for name in ("driver.py", "driver_metadata.json"):
-            tf.add(_MOCK_L3_DIR / name, arcname=name)
-    return buf.getvalue()
-
-
 @pytest.fixture(scope="session")
 async def l3_driver(base_url, admin_token):
-    """Upload the mock Layer 3 Switch driver once per session."""
+    """Upload the mock Layer 3 Switch driver once per session (R9 review fix on
+    2ade362c: the upload/teardown logic itself lives in _l3_helpers.py, shared
+    with test_l3_intent_validate_and_fork.py)."""
     async with httpx.AsyncClient(
         base_url=base_url,
         verify=False,
         timeout=30.0,
         headers={"Authorization": f"Bearer {admin_token}"},
     ) as client:
-        files = {"file": ("mock_l3.tar.gz", _mock_l3_tarball(), "application/gzip")}
-        data = {
-            "name": f"mock-l3-{uuid.uuid4().hex[:8]}",
-            "connection_type": "Layer 3 Switch",
-            "description": "integration mock L3 switch driver",
-        }
-        resp = await client.post("/inventory/drivers", files=files, data=data)
-        resp.raise_for_status()
-        driver = resp.json()
-        assert driver["connection_type"] == "Layer 3 Switch"
+        driver = await create_l3_driver(client, f"mock-l3-{uuid.uuid4().hex[:8]}")
         yield driver
         await client.delete(f"/inventory/drivers/{driver['id']}")
 
@@ -87,57 +70,11 @@ async def l3_template(base_url, admin_token, l3_driver):
         timeout=30.0,
         headers={"Authorization": f"Bearer {admin_token}"},
     ) as client:
-        payload = {
-            "name": f"mock-l3-tmpl-{uuid.uuid4().hex[:8]}",
-            "template_type": "device",
-            "driver_id": l3_driver["id"],
-            "vendor": "IntegrationVendor",
-            "model": "MockL3Switch",
-            "sections": [
-                {
-                    "name": "General",
-                    "fields": [{"key": "model", "label": "Model", "type": "string"}],
-                }
-            ],
-        }
-        resp = await client.post("/inventory/templates", json=payload)
-        resp.raise_for_status()
-        template = resp.json()
+        template = await create_l3_template(
+            client, l3_driver["id"], f"mock-l3-tmpl-{uuid.uuid4().hex[:8]}"
+        )
         yield template
         await client.delete(f"/inventory/templates/{template['id']}")
-
-
-async def _create_device(client, template_id: str, name: str) -> dict:
-    resp = await client.post(
-        "/inventory/devices",
-        json={
-            "name": name,
-            "template_id": template_id,
-            "topology_type": "PHYSICAL",
-            "status": "AVAILABLE",
-            "field_data": {"model": "test"},
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _create_connection(client, dut_id: str, switch_id: str, switch_port: str) -> dict:
-    # The cabling connection_type field is irrelevant to L3 adjacency: the L3 reconcile
-    # derives adjacency from the fork's recorded hops, keying on the far-end device's
-    # driver connection_type ("Layer 3 Switch"), not on this field.
-    resp = await client.post(
-        "/cabling/connections",
-        json={
-            "device_a_id": dut_id,
-            "port_a": "eth0",
-            "device_b_id": switch_id,
-            "port_b": switch_port,
-            "connection_type": "L1",
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
 
 
 def _canvas_edge(a_id: str, b_id: str) -> dict:

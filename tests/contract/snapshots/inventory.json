@@ -233,6 +233,10 @@
       "/hypervisors/{hypervisor_id}/internal"
     ],
     [
+      "POST",
+      "/internal/devices/batch"
+    ],
+    [
       "DELETE",
       "/ports/{port_id}"
     ],
@@ -881,6 +885,29 @@
         "secret_id": "anyOf"
       },
       "required": [],
+      "type": "object"
+    },
+    "InternalDeviceBatchEntry": {
+      "properties": {
+        "connection_type": "anyOf",
+        "id": "string",
+        "name": "string",
+        "status": "#/components/schemas/DeviceStatus"
+      },
+      "required": [
+        "id",
+        "name",
+        "status"
+      ],
+      "type": "object"
+    },
+    "InternalDeviceBatchRequest": {
+      "properties": {
+        "device_ids": "array"
+      },
+      "required": [
+        "device_ids"
+      ],
       "type": "object"
     },
     "InternalDeviceCreate": {

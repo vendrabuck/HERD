@@ -98,6 +98,28 @@ class ForkRestoreResponse(BaseModel):
     draft_restored_from_id: OptionalUUIDStr = None
 
 
+class ForkL3RouteResponse(BaseModel):
+    """One resolved Layer 3 route (ADR 0014 phase 1, issue #34, GET /internal/forks).
+
+    Deliberately thinner than the row: no id, fork_id, created_by, or created_at,
+    matching what execution's future consumer and the reservations forward need
+    (device_id plus the route's own fields).
+    """
+
+    device_id: UUIDStr
+    destination: str
+    next_hop: str | None = None
+    interface: str
+    virtual_router: str | None = None
+    # The inventory config version this route's save-time L3 validation actually
+    # judged it against (S6 review fix, round 2); null for a row written by the
+    # tolerant activation path (fork_service.create_fork), which never validates.
+    # Additive; phase 3 compares this to the switch's current config version.
+    validated_config_version_id: OptionalUUIDStr = None
+
+    model_config = {"from_attributes": True}
+
+
 class ForkDetailResponse(BaseModel):
     """GET /internal/forks/{reservation_id}: fork metadata, canvas, wiring, versions."""
 
@@ -115,6 +137,10 @@ class ForkDetailResponse(BaseModel):
     updated_at: datetime
     connections: list[ForkConnectionResponse]
     versions: list[ForkVersionSummary]
+    # ADR 0014 phase 1 (issue #34): the fork's resolved Layer 3 routing intent,
+    # sorted by (device_id, route_key). Additive; reservations' user-facing
+    # GET /{id}/fork forwards this JSON body verbatim.
+    l3_routes: list[ForkL3RouteResponse] = Field(default_factory=list)
 
 
 class ForkCanvasUpdate(BaseModel):
@@ -186,6 +212,10 @@ class ForkSaveResponse(BaseModel):
     # resolver skipped explicitly (never a hop, so never in released/built). Additive
     # field, defaulted to 0 so existing clients are unaffected.
     element_attachments_skipped: int = 0
+    # ADR 0014 phase 1 (issue #34): counts from the same save's Layer 3
+    # routing-intent set reconcile (fork_l3_routes), additive and defaulted to 0.
+    l3_routes_built: int = 0
+    l3_routes_released: int = 0
 
 
 class ForkPruneRequest(BaseModel):
