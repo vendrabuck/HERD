@@ -70,9 +70,62 @@ def test_reporting_rollup_table_cards(admin_browser, base_url):
         assert title in body, f"rollup section missing: {title}"
 
 
+# Exportable cards, keyed by the h3 title each CardHeader renders. The purpose
+# cards (issue #646, PR #696) mount only after the report query resolves, so a
+# count taken right after the heading appears races the data load: it sees the
+# four always-rendered card buttons on a slow stack (nightly CI) and all seven
+# on a fast one (the local make-everything gate). The test therefore waits for
+# a data-only element before counting, and scopes each count to its card so a
+# new exportable card changes this list on purpose instead of drifting a total.
+EXPORTABLE_CARD_TITLES = (
+    "By User",
+    "By Device",
+    "By Template",
+    "Fleet Utilization",
+    "Device-hours by purpose",
+    "Purpose Mix - By User",
+    "Purpose Mix - By Device",
+)
+NON_EXPORTABLE_CARD_TITLES = ("By Group (cost center)", "By Topology Type")
+CSV_BUTTON = "button[normalize-space()='Download CSV']"
+
+
+def _card_buttons(driver, title, button_xpath=CSV_BUTTON):
+    """Buttons inside the header div whose h3 reads exactly `title`."""
+    return driver.find_elements(
+        By.XPATH, f"//h3[normalize-space()='{title}']/parent::div//{button_xpath}"
+    )
+
+
 def test_reporting_csv_buttons_render(admin_browser, base_url):
-    """The Download CSV actions render on the exportable cards."""
+    """Each exportable card carries exactly one Download CSV action once the
+    report has loaded; the non-exportable rollups carry none."""
     _open_reporting(admin_browser, base_url)
-    buttons = admin_browser.find_elements(By.XPATH, "//button[normalize-space()='Download CSV']")
-    # By User, By Device, By Template, and Fleet Utilization each carry one.
-    assert len(buttons) == 4
+    # The purpose section exists only after the report query resolves, so its
+    # heading is the load signal; the heading alone is not.
+    WebDriverWait(admin_browser, WAIT).until(
+        EC.presence_of_element_located(
+            (By.XPATH, "//h3[normalize-space()='Device-hours by purpose']")
+        )
+    )
+
+    for title in EXPORTABLE_CARD_TITLES:
+        buttons = _card_buttons(admin_browser, title)
+        assert len(buttons) == 1, f"{title}: expected 1 Download CSV button, found {len(buttons)}"
+        assert buttons[0].is_displayed(), f"{title}: Download CSV button not displayed"
+
+    for title in NON_EXPORTABLE_CARD_TITLES:
+        assert not _card_buttons(admin_browser, title), f"{title}: unexpected Download CSV button"
+
+    # The suggested-bucket export sits beside the chart's main export under a
+    # distinct label, so the exact-match count above does not include it.
+    suggested = _card_buttons(
+        admin_browser,
+        "Device-hours by purpose",
+        "button[normalize-space()='Download CSV (suggested)']",
+    )
+    assert len(suggested) == 1
+
+    # Page-wide total pins the exportable set: nothing outside the named cards.
+    all_buttons = admin_browser.find_elements(By.XPATH, f"//{CSV_BUTTON}")
+    assert len(all_buttons) == len(EXPORTABLE_CARD_TITLES)
