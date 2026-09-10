@@ -1,0 +1,7 @@
+enter candidate
+set / interface ethernet-1/1 admin-state enable
+set / interface ethernet-1/1 vlan-tagging true
+set / interface ethernet-1/2 admin-state enable
+set / interface ethernet-1/2 vlan-tagging true
+commit stay
+save startup

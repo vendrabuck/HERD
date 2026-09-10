@@ -1,0 +1,99 @@
+# Checked-in emulated-gear test lab (phase 0 of the emulated-gear test tier,
+# ADR 0010, issue #undecided): a license-free, no-external-host network-OS
+# lab that proves driver dialects against real network operating systems
+# rather than the deterministic mock drivers. See docs/NOS_LAB.md.
+#
+# Two nodes:
+#   srl  - Nokia SR Linux, the Layer 2 target (netmiko device_type nokia_srl)
+#   frr  - FRRouting with SSH-to-vtysh, the Layer 3 / Cisco-dialect target
+#          (netmiko device_type cisco_ios)
+#
+# Deliberately stateless, like infra/ldap-test/: no named volumes, so
+# `docker compose down` discards all node state and the next `up` reboots
+# both nodes from a clean image and reapplies the checked-in baseline. This
+# is the whole point of the lab: a developer (or CI, once wired in) always
+# gets the same starting state, and a broken run is fixed by `make nos-reset`
+# rather than by hand-repairing a stateful container.
+#
+# Both services need `privileged: true`: SR Linux manages its own network
+# namespaces and interfaces at boot, and FRR's zebra/staticd daemons program
+# the kernel routing table and need raw-socket access neither works under an
+# unprivileged container on this host.
+
+name: herd-nos-test
+
+networks:
+  nos-test:
+    name: herd-nos-test-net
+
+services:
+  srl:
+    image: ghcr.io/nokia/srlinux:latest
+    container_name: nos-test-srl
+    hostname: srl
+    privileged: true
+    user: "0"
+    networks:
+      - nos-test
+    # The stock entrypoint boots sr_linux directly; it never applies our
+    # baseline. Replace it with our own start.sh (mounted below), which
+    # starts sr_linux the same way, waits for sr_cli to answer, then pipes
+    # the baseline into sr_cli on stdin. `sudo bash -c "..."` is the base
+    # command verified to work against this image; do not replace it with a
+    # plain `bash -c` or the daemon fails to acquire the privileges it needs.
+    command: ["sudo", "bash", "-c", "/etc/opt/srlinux/start.sh"]
+    volumes:
+      - ./srl/start.sh:/etc/opt/srlinux/start.sh:ro
+      - ./srl/baseline.cli:/etc/opt/srlinux/baseline.cli:ro
+    ports:
+      - "${HERD_TEST_SRL_PORT:-2223}:22"
+    healthcheck:
+      # Proves the BASELINE LANDED, not merely that sr_cli answers: the
+      # saved startup config must exist (the `save startup` step that clears
+      # the [FACTORY] prompt tag, see start.sh) and the LAST setting the
+      # baseline applies, ethernet-1/2 vlan-tagging, must read back true.
+      # Checking the last-applied setting (not the first) means a healthy
+      # result implies the whole baseline ran to completion, the same
+      # reasoning infra/ldap-test/docker-compose.yml uses for its own
+      # last-fixture healthcheck probe.
+      #
+      # NOTE: no "-c" flag on sr_cli here. "-c" means "--commit-at-end", not
+      # "run this command"; passing the info command as a bare positional
+      # argument is the correct non-interactive, single-shot form. "-c"
+      # made this exit 1 on a "Parsing error: Unknown token 'commit'" even
+      # when the info output itself was correct (verified live).
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /etc/opt/srlinux/config.json && sr_cli 'info /interface ethernet-1/2 vlan-tagging' | grep -q true",
+        ]
+      # SR Linux's own boot (loading its ~30 internal manager processes
+      # before sr_cli answers at all) took close to 4 minutes measured live
+      # on this host, well before start.sh even begins applying the
+      # baseline, so the retries budget below is sized for that plus margin,
+      # not for a quick CLI-only check.
+      interval: 5s
+      timeout: 10s
+      retries: 100
+      start_period: 30s
+
+  frr:
+    build:
+      context: ./frr
+    container_name: nos-test-frr
+    hostname: frr
+    privileged: true
+    networks:
+      - nos-test
+    ports:
+      - "${HERD_TEST_FRR_PORT:-2224}:22"
+    healthcheck:
+      # Proves vtysh is actually usable over the daemons FRR just started,
+      # not just that sshd is listening: a container whose zebra/staticd
+      # sockets are not up yet lets you SSH in but then fails vtysh with
+      # "failed to connect to any daemons".
+      test: ["CMD-SHELL", "vtysh -c 'show version' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s

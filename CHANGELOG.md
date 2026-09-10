@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- Added phase 0 of the emulated-gear test tier (ADR 0010): a checked-in,
+  license-free network-OS lab (`infra/nos-test/`) with two nodes, Nokia SR
+  Linux (Layer 2, netmiko `nokia_srl`) and FRRouting over SSH-to-vtysh
+  (Layer 3 / Cisco dialect, netmiko `cisco_ios`), modeled on
+  `infra/ldap-test/`'s stateless, seed-on-boot shape. SR Linux needs a small
+  checked-in CLI baseline (`infra/nos-test/srl/baseline.cli`) applied and
+  saved on every boot to clear a factory-fresh device's `[FACTORY]`
+  config-prompt tag, which otherwise breaks netmiko 4.7.0's
+  `nokia_srl.check_config_mode` regex. New Makefile targets `nos-up`,
+  `nos-down`, `nos-status`, `nos-logs`, `nos-reset` (opt-in only, not part of
+  `make test`, `make master`, or `make everything`); `tests/unit/test_nos_lab_compose.py`
+  pins the compose file's stateless shape and port non-collision with the
+  dev/gate stacks; `tests/nos_lab/test_nos_lab_live.py` is an opt-in live
+  suite (`HERD_TEST_NOS_REQUIRED=1`, mirroring the LDAP live-suite
+  convention) that creates and independently verifies a VLAN on SR Linux
+  and a static route on FRR. See `docs/NOS_LAB.md`.
+
 - Fixed the stack-lifecycle Makefile targets so a `make everything` gate cannot be
   blocked by a leftover e2e Selenium container: every compose `down` (`down`, `clean`,
   `clean-data`, `gate-clean`, `_clean-images`, `_master-stack-down`) now enables the
