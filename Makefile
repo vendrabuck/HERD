@@ -181,8 +181,8 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + epheme
 _clean-images:
 	@echo ""
 	@echo "=== Removing HERD compose images ==="
-	-docker compose down --remove-orphans
-	-$(GATE_COMPOSE) down -v --remove-orphans
+	-docker compose --profile e2e down --remove-orphans
+	-$(GATE_COMPOSE) --profile e2e down -v --remove-orphans
 	@ids=$$(docker images --filter "reference=herd-*" --filter "reference=$(GATE_PROJECT)-*" -q | sort -u); \
 		if [ -n "$$ids" ]; then \
 			echo "$$ids" | xargs -r docker rmi -f; \
@@ -320,7 +320,7 @@ _master-stack-up:
 
 _master-wait-healthy:
 	@echo "Waiting for stack to report healthy..."
-	@TIMEOUT=180; START=$$(date +%s); \
+	@TIMEOUT=180; START=$$(date +%s); ELAPSED=0; \
 		until curl -skf https://localhost/api/auth/health > /dev/null 2>&1; do \
 			NOW=$$(date +%s); ELAPSED=$$((NOW - START)); \
 			if [ $$ELAPSED -gt $$TIMEOUT ]; then \
@@ -334,7 +334,7 @@ _master-stack-down:
 	@echo ""
 	@echo "=== Tearing down ephemeral gate stack ==="
 	-$(MAKE) test-e2e-stop COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
-	-$(GATE_COMPOSE) down -v --remove-orphans
+	-$(GATE_COMPOSE) --profile e2e down -v --remove-orphans
 
 # Public name for stopping a gate stack that a successful `make everything`
 # left running (master always tears its stack down itself). After gate-down,
@@ -353,8 +353,13 @@ dev:  ## Start the full stack in dev mode (build + detached)
 prod:  ## Start the stack without dev overrides (no reload)
 	docker compose -f docker-compose.yml up --build -d
 
-down:  ## Stop the stack
-	docker compose down
+# Every compose `down` below carries --profile e2e: a profile-gated service that is
+# not enabled is neither an active service nor an orphan, so a plain `down` (even
+# with --remove-orphans) leaves the e2e Selenium container running. Left behind
+# by the dev project it holds host port 4444 and the gate's e2e phase then fails
+# at Selenium recreate ("Bind for 0.0.0.0:4444 failed") before any test runs.
+down:  ## Stop the stack (including the e2e Selenium container if it is up)
+	docker compose --profile e2e down
 
 build:  ## Build all service images
 	docker compose build
@@ -436,9 +441,14 @@ test-load-ui:  ## Run locust with its web UI (needs a running stack)
 # cannot drift apart. HERD_E2E_REQUIRE_NO_SKIP is whatever the caller's
 # environment/command line already has: test-e2e leaves it unset, test-e2e-seeded
 # sets it to 1 before invoking this via a recursive $(MAKE).
+# The Selenium recreate uses --wait, which blocks until the healthcheck in
+# docker-compose.override.yml passes. Without it pytest starts within seconds of
+# the container start, and the host-side Chromium can observe the new veth's
+# address churn mid-load: net::ERR_NETWORK_CHANGED on the app bundle, an empty
+# root element, and a 30s login timeout on the first Playwright test.
 _test-e2e-run:
 	-docker compose --profile e2e rm -fsv selenium
-	docker compose --profile e2e up -d --force-recreate selenium
+	docker compose --profile e2e up -d --force-recreate --wait selenium
 	uv run playwright install chromium  # no-op once cached; on a fresh host, missing OS libs need: uv run playwright install --with-deps chromium (sudo)
 	@uv run python -c "import os, tempfile; print('e2e failure artifacts (if any) go to: ' + (os.environ.get('HERD_E2E_ARTIFACT_DIR') or os.path.join(tempfile.gettempdir(), 'herd-e2e-artifacts')))"
 	uv run pytest tests/e2e/ -v --tb=short
@@ -809,7 +819,7 @@ format:  ## Format and autofix backend Python (services/ + root scripts)
 # -- Cleanup ------------------------------------------------------------------
 
 clean:  ## Stop the stack (KEEPING volumes/data) and remove caches/coverage artifacts
-	docker compose down --remove-orphans
+	docker compose --profile e2e down --remove-orphans
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
@@ -823,7 +833,7 @@ clean:  ## Stop the stack (KEEPING volumes/data) and remove caches/coverage arti
 # gate run. The gate project itself is purged WITH volumes so every gate is born
 # on a fresh database.
 gate-clean: clean  ## Stop the dev stack (data kept), purge any stale gate-project stack
-	$(GATE_COMPOSE) down -v --remove-orphans
+	$(GATE_COMPOSE) --profile e2e down -v --remove-orphans
 
 clean-data:  ## DESTRUCTIVE: tear down the dev stack INCLUDING volumes (the pre-gate-isolation `make clean`)
-	docker compose down -v --remove-orphans
+	docker compose --profile e2e down -v --remove-orphans

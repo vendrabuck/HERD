@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- Fixed the stack-lifecycle Makefile targets so a `make everything` gate cannot be
+  blocked by a leftover e2e Selenium container: every compose `down` (`down`, `clean`,
+  `clean-data`, `gate-clean`, `_clean-images`, `_master-stack-down`) now enables the
+  `e2e` profile, since a profile-gated service that is not enabled is neither active
+  nor an orphan and survived a plain `down` holding host port 4444. The e2e recreate
+  now uses `--wait` against a new Grid healthcheck on the Selenium service, so the
+  first Playwright page load no longer races the new container's network setup
+  (`net::ERR_NETWORK_CHANGED`, the recurring first-test login timeout). Pinned by
+  `tests/unit/test_makefile_stack_lifecycle.py`.
 - Shipped phase 1 of first-class Layer 3 routing intent (ADR 0014, issue #34):
   cabling migration 0011 adds `fork_l3_routes`, a canvas parser reads
   `data.l3.routes` on Layer 3 Switch device nodes, both fork write paths (fork

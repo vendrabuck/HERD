@@ -120,6 +120,14 @@ services:
       - "4444:4444"
       - "7900:7900"
     shm_size: 2g
+    # The image's own Grid readiness probe; `make test-e2e` recreates this
+    # service with --wait so pytest starts only once the Grid answers.
+    healthcheck:
+      test: ["CMD", "/opt/bin/check-grid.sh", "--host", "0.0.0.0", "--port", "4444"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
     networks:
       - herd-net
     profiles:
