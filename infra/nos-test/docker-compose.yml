@@ -1,5 +1,5 @@
 # Checked-in emulated-gear test lab (phase 0 of the emulated-gear test tier,
-# ADR 0010, issue #undecided): a license-free, no-external-host network-OS
+# ADR 0010): a license-free, no-external-host network-OS
 # lab that proves driver dialects against real network operating systems
 # rather than the deterministic mock drivers. See docs/NOS_LAB.md.
 #
@@ -67,11 +67,15 @@ services:
           "CMD-SHELL",
           "test -f /etc/opt/srlinux/config.json && sr_cli 'info /interface ethernet-1/2 vlan-tagging' | grep -q true",
         ]
-      # SR Linux's own boot (loading its ~30 internal manager processes
-      # before sr_cli answers at all) took close to 4 minutes measured live
-      # on this host, well before start.sh even begins applying the
-      # baseline, so the retries budget below is sized for that plus margin,
-      # not for a quick CLI-only check.
+      # The budget below is deliberately generous because SR Linux's own boot
+      # time (loading its many internal manager processes before sr_cli
+      # answers at all, well before start.sh applies the baseline) VARIES
+      # WIDELY on the same host: a cold `make nos-reset` was measured at 22s,
+      # while an earlier run on a busier host measured minutes. Since that
+      # spread is not understood, the retries are sized for the slow case, so
+      # a slow boot waits rather than failing the lab spuriously. The cost is
+      # that a genuinely broken node takes several minutes to report failure;
+      # if that becomes annoying, lower `retries`, do not lower `interval`.
       interval: 5s
       timeout: 10s
       retries: 100
