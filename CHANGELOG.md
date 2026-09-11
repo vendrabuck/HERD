@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+- Shipped phase 3a of the emulated-gear test tier (ADR 0010): the checked-in
+  NOS test lab can now be wired into a running HERD stack so HERD drives the
+  real devices through its OWN execution service and driver sandbox, not by
+  calling a driver directly. New Makefile targets `nos-attach`/`nos-detach`
+  connect/disconnect the lab containers (`nos-test-srl`, `nos-test-frr`) to
+  the dev stack's Docker network, so the execution service reaches them by
+  CONTAINER NAME over Docker DNS (container IPs are not stable across a
+  recreate; container names are). `seed_devices_public.py` gained
+  `seed_nos_lab` (gated by `SEED_NOS=1`, mirroring `seed_frr_demo`'s
+  `SEED_FRR=1` shape): it registers the real `drivers/srl_l2` and
+  `drivers/frr_l3` packages, one device template each, the two lab devices
+  with `field_data.ip` set to the container name, two placeholder DUT
+  devices, and cabling to the SR Linux node's `ethernet-1/1`/`ethernet-1/2`
+  ports, laying the groundwork for a later phase to derive an L2 VLAN
+  membership from recorded L1 hops (ADR 0009); a new `--nos-only` seed-script
+  mode and `scripts/seed_nos_lab.sh` wrapper mirror the existing `--acl-only`/
+  `seed_frr_demo.sh` pattern. `tests/nos_lab/test_frr_l3_via_stack_live.py`
+  is the end-to-end proof: it drives a real static route onto the real FRR
+  node entirely through HERD's API (a reservation whose fork carries L3
+  routing intent, ADR 0009/0014), independently verifies the change via
+  `docker exec ... vtysh`, removes it via reservation cancellation, and
+  proves a device-rejected route lands as a FAILED execution run with the
+  device's own error text, not a false success. `tests/unit/test_seed_nos_lab_driver.py`
+  pins the new driver-zip-from-disk helper. Opt-in, needs both the lab
+  (`make nos-up`) and a stack with the lab attached (`make up`,
+  `make nos-attach`); not part of `make test`, `make master`, or
+  `make everything`. See `docs/NOS_LAB.md`.
+
 - Added `drivers/frr_l3/`, the first real Layer 3 Switch driver package: SSH-to-vtysh over the same FRRouting node and netmiko `cisco_ios` transport as `drivers/frr_mgmt`, implementing `login`/`logout`/`configure_route`/`remove_route`/`status` per the Layer 3 Switch contract (docs/DRIVERS.md). `configure_route` sends `ip route <destination> <next_hop>`, or `ip route <destination> <interface>` when `next_hop` is `None` (an interface route); `remove_route` sends the same line prefixed with `no `. `supports_dry_run: true` is honored on every mutating method (no session opened, transcript still recorded). Verified live against the checked-in NOS test lab's FRR node (docs/NOS_LAB.md) that both `configure_route` and `remove_route` are idempotent under redelivery: FRR silently no-ops a duplicate route install, and a duplicate removal answers a benign CLI warning rather than an error, so this driver treats both as success, matching the redelivery guarantee the Layer 2 contract states explicitly for `create_vlan`. `tests/unit/test_frr_l3_driver.py` (stack-free, netmiko mocked) and `tests/nos_lab/test_frr_l3_driver_live.py` (opt-in, `HERD_TEST_NOS_REQUIRED=1`) cover it; see docs/DRIVERS.md's new "FRR reference driver" section and docs/NOS_LAB.md.
 
 - Added phase 0 of the emulated-gear test tier (ADR 0010): a checked-in,

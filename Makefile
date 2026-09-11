@@ -34,6 +34,14 @@ ROOT_PY := seed_devices_public.py scripts/check_image_matches_lock.py
 GATE_PROJECT := $(shell printf '%s' '$(notdir $(CURDIR))' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-' | sed 's/^[^a-z0-9]*//')-gate
 GATE_COMPOSE := docker compose -p $(GATE_PROJECT)
 
+# The dev stack's own compose project name, same derivation as GATE_PROJECT
+# minus the "-gate" suffix (docker compose's own default when no `name:` /
+# `-p` is given). Used by nos-attach/nos-detach below to find the dev stack's
+# network from a worktree whose CURDIR-derived name would otherwise be wrong;
+# an explicit COMPOSE_PROJECT_NAME always wins, the same override
+# _gate-ldap-stack-tests supports.
+DEV_PROJECT := $(shell printf '%s' '$(notdir $(CURDIR))' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-' | sed 's/^[^a-z0-9]*//')
+
 # Coverage package name per service. Most are app/; common ships herd_common/.
 cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 
@@ -51,7 +59,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
-	nos-up nos-down nos-status nos-logs nos-reset \
+	nos-up nos-down nos-status nos-logs nos-reset nos-attach nos-detach \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run \
 	_collect-stack-diagnostics
@@ -621,6 +629,54 @@ nos-logs:  ## Tail the NOS test lab's logs
 nos-reset:  ## Recreate the NOS test lab from scratch (discards all node state)
 	$(NOS_COMPOSE) down -v
 	$(MAKE) nos-up
+
+# Attach/detach the NOS test lab containers to the DEV stack's Docker network,
+# so HERD's own execution service can reach them by CONTAINER NAME over
+# Docker DNS (proven live 2026-09-11: netmiko from inside the execution
+# container reached both nos-test-srl and nos-test-frr by name once
+# attached). Container IPs are not stable across a recreate; container names
+# are, which is why devices are seeded with field_data.ip set to the
+# container name (see seed_nos_lab in seed_devices_public.py), not an IP.
+#
+# Mirrors _gate-ldap-stack-tests' connect/disconnect trap: `docker compose
+# down` on a network that still holds an attached container prints "Resource
+# is still in use" but still exits 0 (verified live), so leaving a lab
+# container attached never breaks `make clean`/`make down`. It DOES leave the
+# network behind, so nos-detach must always be run to undo nos-attach.
+#
+# Scoped to the DEV stack only (never the gate stack): an explicit
+# COMPOSE_PROJECT_NAME always wins, else DEV_PROJECT (CURDIR-derived) is
+# used, the same override _gate-ldap-stack-tests supports, needed because a
+# worktree's own CURDIR-derived name does not match the dev stack's project
+# when the dev stack was booted from a different checkout directory.
+NOS_LAB_CONTAINERS := nos-test-srl nos-test-frr
+
+nos-attach:  ## Attach the NOS test lab containers to the dev stack's network (make up first)
+	@net=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}_herd-net; \
+	if ! docker network inspect "$$net" >/dev/null 2>&1; then \
+		echo "Dev stack network $$net not found; run 'make up' first (or set COMPOSE_PROJECT_NAME)."; \
+		exit 1; \
+	fi; \
+	for c in $(NOS_LAB_CONTAINERS); do \
+		if ! docker ps --format '{{.Names}}' | grep -qx "$$c"; then \
+			echo "$$c is not running; run 'make nos-up' first."; \
+			exit 1; \
+		fi; \
+		out=$$(docker network connect "$$net" "$$c" 2>&1); rc=$$?; \
+		if [ $$rc -ne 0 ] && ! echo "$$out" | grep -qi already; then \
+			echo "$$out"; \
+			echo "Failed to attach $$c to $$net"; \
+			exit 1; \
+		fi; \
+		echo "Attached $$c to $$net"; \
+	done
+
+nos-detach:  ## Detach the NOS test lab containers from the dev stack's network
+	@net=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}_herd-net; \
+	for c in $(NOS_LAB_CONTAINERS); do \
+		docker network disconnect "$$net" "$$c" 2>/dev/null || true; \
+	done; \
+	echo "Detached NOS lab containers from $$net (a no-op for any that were not attached)"
 
 # Postgres-live coverage for the ADR 0011 sync surface (issue #572): the
 # advisory-lock SQL and _SyncSlot's cross-replica branch never run on the
