@@ -1223,6 +1223,7 @@ def get_or_create_device(
     poll_interval_seconds: int | None = None,
 ) -> str:
     field_data = {"ip": ip, "login": "admin", "password": "admin123"}
+    assert set(field_data) == set(SEED_DEVICE_FIELD_KEYS)  # keep the two in step
     body: dict = {
         "name": name,
         "template_id": template_id,
@@ -2105,13 +2106,41 @@ def register_acl_user(client: httpx.Client, spec: dict) -> str | None:
     return uid
 
 
+# The field keys get_or_create_device always sends in field_data. A template that does
+# not declare all of them rejects the create with "Unknown fields: ...", so any helper
+# that CHOOSES a template for those devices has to filter on this set.
+SEED_DEVICE_FIELD_KEYS = ("ip", "login", "password")
+
+
+def template_field_keys(template: dict) -> set[str]:
+    """The field keys a device template declares, flattened across its sections."""
+    return {
+        field.get("key")
+        for section in (template.get("sections") or [])
+        for field in (section.get("fields") or [])
+    }
+
+
+def template_declares_seed_fields(template: dict) -> bool:
+    """Whether `template` accepts every field key get_or_create_device sends."""
+    return set(SEED_DEVICE_FIELD_KEYS).issubset(template_field_keys(template))
+
+
 def pick_dut_template(client: httpx.Client) -> str | None:
     """Pick a device template backed by a Management-connection driver (a DUT).
 
     The non-admin device list is dut_only: it shows only devices whose driver
     connection_type is Management. A switch-backed template would be filtered out
-    of a scoped user's view, so the Santa Clara demo devices must be DUTs. Falls
-    back to the first device template if no Management driver is found.
+    of a scoped user's view, so the Santa Clara demo devices must be DUTs.
+
+    Only templates that declare every key in SEED_DEVICE_FIELD_KEYS are eligible,
+    because get_or_create_device always sends those and inventory rejects a create
+    carrying fields the template does not declare ("Unknown fields: ip, login,
+    password"). Without that filter the pick is order-dependent and a
+    Management-backed template that declares something else entirely (the
+    integration suite seeds `int-seed-template-*` rows whose only field is `model`)
+    can win and break seeding on any database those tests have touched. Falls back
+    to the first usable template, then to the first template of any kind.
     """
     drivers = client.get(f"{BASE}/inventory/drivers", params={"limit": 500}).json().get("items", [])
     mgmt_driver_ids = {d["id"] for d in drivers if d.get("connection_type") == "Management"}
@@ -2120,9 +2149,12 @@ def pick_dut_template(client: httpx.Client) -> str | None:
         params={"template_type": "device", "limit": 500},
     )
     items = listing.json().get("items", [])
-    for t in items:
+    usable = [t for t in items if template_declares_seed_fields(t)]
+    for t in usable:
         if t.get("driver_id") in mgmt_driver_ids:
             return t["id"]
+    if usable:
+        return usable[0]["id"]
     return items[0]["id"] if items else None
 
 
