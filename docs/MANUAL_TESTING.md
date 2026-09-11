@@ -36,6 +36,20 @@ mid-run exhaustion within a single long invocation.
 - Expected: execution run recorded SUCCESS with a per-command transcript;
   `vtysh -c "show ip route"` on the router shows the route; removing the
   route via a second apply removes it live.
+- UPDATE (ADR 0010 phase 3a): this case's own Management-driver, generic
+  config-apply flow against the EXTERNAL network-simulator lab is still
+  manual only, since that lab is not checked in. But the EQUIVALENT live
+  proof for the narrower Layer 3 Switch driver contract (`drivers/frr_l3`,
+  ADR 0009/0014's reservation routing-intent path rather than a generic
+  config-apply job) is now automated end to end against the checked-in NOS
+  test lab (`infra/nos-test`, docs/NOS_LAB.md):
+  `tests/nos_lab/test_frr_l3_via_stack_live.py`. It drives a real static
+  route onto the real FRR node through HERD's own API (reservation, fork,
+  execution service, driver sandbox), verifies the execution run and the
+  device independently, removes the route via cancellation, and also
+  proves a device-rejected route lands as a FAILED execution run. Opt-in;
+  needs both `make nos-up` and a dev stack with `make nos-attach` run
+  (see docs/NOS_LAB.md).
 
 ## M2. AI topology generate with a real model
 

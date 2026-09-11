@@ -53,9 +53,107 @@ hand-repairing a stateful container.
 - `make nos-status` , show container status
 - `make nos-logs` , tail both nodes' logs
 - `make nos-reset` , tear down and rebuild from scratch
+- `make nos-attach` , attach both lab containers to the DEV stack's Docker
+  network, so HERD's own execution service can reach them by CONTAINER NAME
+  (`nos-test-srl`, `nos-test-frr`) over Docker DNS (phase 3a, ADR 0010)
+- `make nos-detach` , detach both lab containers from the dev stack's network
 
 None of these run as part of `make test`, `make master`, or `make everything`;
 this phase is opt-in only, so a host that never runs it pays nothing for it.
+
+## Phase 3a: wiring the lab into a running HERD stack
+
+Phases 0 to 2 (above) drive the lab nodes directly, over the host-published
+SSH ports, bypassing HERD's own execution service entirely. Phase 3a wires
+the lab INTO a running dev stack so HERD drives the real devices through its
+own API, execution service, and driver sandbox, the same way it drives any
+other device.
+
+The mechanism is `docker network connect`: once a lab container is
+attached to the dev stack's Docker network (`herd-public_herd-net` by
+default; a differently-named checkout gets a differently-named network, see
+`make nos-attach`'s own project-name resolution), the execution service's
+container reaches it by CONTAINER NAME over Docker DNS, not by the host-
+published port. Container IPs are not stable across a `docker compose`
+recreate; container names are, which is why devices registered this way
+carry the container name in `field_data.ip`, not an IP address.
+
+Workflow:
+
+```bash
+make up                    # dev stack up
+make nos-up                # NOS test lab up (if not already)
+make nos-attach             # wire the lab into the dev stack's network
+scripts/seed_nos_lab.sh     # register the real drivers, the two lab nodes,
+                             # and DUT/port/cabling groundwork (SEED_NOS=1)
+```
+
+`scripts/seed_nos_lab.sh` defaults to `--nos-only` (just the NOS lab pieces,
+skipping the ~20 min default seed population; pass `--full` to run the
+whole seed with `SEED_NOS=1` layered on, mirroring `scripts/seed_frr_demo.sh`
+for `SEED_FRR=1`). It is get-or-create throughout: registers the real
+`drivers/srl_l2` (Layer 2 Switch) and `drivers/frr_l3` (Layer 3 Switch)
+driver packages, a `NOS Lab SR Linux L2 Switch` and `NOS Lab FRR L3 Switch`
+device template each, the two lab devices (`nos-lab-srl`, container
+`nos-test-srl`; `nos-lab-frr`, container `nos-test-frr`; with the credentials from the table
+above), two placeholder DUT devices, and cables both DUTs to the SR Linux
+node's `ethernet-1/1` and `ethernet-1/2` ports, the two interfaces the
+checked-in baseline already enables and VLAN-tags. This is inventory-side
+groundwork only (devices, ports, cabling); it deliberately creates no
+topology or reservation, since ADR 0009's L2 membership and ADR 0014's L3
+routing intent are both driven through a reservation fork, not a bare
+device registration. See `seed_devices_public.py`'s `seed_nos_lab` for the
+exact shape.
+
+`make nos-detach` reverses `make nos-attach`. A `docker compose down` (or
+`make down`) while a lab container is still attached prints "Resource is
+still in use" for the stack's network but still exits 0 (verified live), so
+a forgotten detach never breaks `make down`/`make clean`; it DOES leave the
+stack's network behind after the stack itself is gone, so always pair
+`make nos-attach` with an eventual `make nos-detach`.
+
+## Phase 3a proof: driving a real device through HERD's own API
+
+`tests/nos_lab/test_frr_l3_via_stack_live.py` is the end-to-end proof that
+phase 3a is real: it drives the checked-in FRR node through HERD's normal
+Layer 3 Switch path (a reservation whose topology fork carries
+`data.l3.routes` routing intent, ADR 0009/0014), not by calling the driver
+directly. It creates its own throwaway driver/template/device/topology/
+reservation (independent of `seed_nos_lab`, so it needs no prior seed run),
+then:
+
+- applies a real static route through the reservation's fork-save/activate
+  path and verifies BOTH the execution run's own SUCCESS status and,
+  independently, `docker exec nos-test-frr vtysh -c "show ip route static"`;
+- removes the route by cancelling the reservation (ADR 0014's deprovision
+  reconcile) and independently verifies it is gone;
+- proves the flip side of the contract: a route the real device REJECTS
+  (an interface name with an embedded second token vtysh cannot parse,
+  verified live to reproduce a genuine `% Unknown command` rejection)
+  records a FAILED execution run with the device's own error text, and
+  independently verifies nothing was installed. A syntactically malformed
+  destination or next-hop (bad octets, the classic example) cannot reach
+  the device this way: cabling's own save-time L3 intent gate validates
+  every route with `ipaddress.ip_network()`/`ip_address()` before accepting
+  the fork save, so that case is refused upstream (422
+  `l3_intent_malformed`) and never reaches execution or the driver.
+
+Needs BOTH the lab (`make nos-up`) and a running dev stack with the lab
+attached (`make up`, `make nos-attach`); it lives under `tests/nos_lab/`
+(never invoked by `make test`, `make master`, or `make everything`) rather
+than `tests/integration/` (which IS invoked by those, against an ephemeral
+gate stack the lab is never attached to). Same gating convention as the
+other lab-live tests: skips automatically when either precondition is
+missing, and `HERD_TEST_NOS_REQUIRED=1` turns a missing precondition into a
+hard failure. Run it with:
+
+```bash
+make up
+make nos-up
+make nos-attach
+HERD_TEST_NOS_REQUIRED=1 uv run pytest tests/nos_lab/test_frr_l3_via_stack_live.py -v
+make nos-detach
+```
 
 ## Tests
 
@@ -64,6 +162,11 @@ this phase is opt-in only, so a host that never runs it pays nothing for it.
   both services declare a healthcheck, that the published ports do not
   collide with the dev or gate compose files' ports, and the shape of the
   checked-in SR Linux baseline file.
+- `tests/unit/test_seed_nos_lab_driver.py` , static, runs in CI with no lab
+  or stack: pins that `seed_devices_public.py`'s `seed_nos_lab` zips the
+  real `drivers/srl_l2` and `drivers/frr_l3` packages from disk (never
+  drifting from the source of truth) and degrades gracefully when either
+  package is missing, mirroring `tests/unit/test_seed_frr_driver.py`.
 - `tests/nos_lab/test_nos_lab_live.py` , opt-in, needs the lab running.
   Skips automatically when the lab is not reachable. Set
   `HERD_TEST_NOS_REQUIRED=1` to turn an unreachable lab into a hard failure
