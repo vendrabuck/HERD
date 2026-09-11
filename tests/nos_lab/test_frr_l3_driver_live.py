@@ -295,6 +295,44 @@ def test_remove_route_is_idempotent_when_route_already_gone():
 
 
 # ---------------------------------------------------------------------------
+# Rejected routes must report failure, not success (regression test for the
+# blocking bug: the driver initially reported {"success": True} for a route
+# vtysh answered "% Unknown command" for, while `show ip route static`
+# independently proved nothing was installed). This asserts BOTH halves: the
+# driver's own return value, and an independent verification that the device
+# never accepted the route.
+# ---------------------------------------------------------------------------
+
+
+def test_configure_route_rejected_by_device_reports_failure_and_installs_nothing():
+    # A malformed destination the device rejects outright ("% Unknown command").
+    malformed_destination = "999.999.999.0/24"
+    next_hop = _frr_connected_nexthop()
+
+    d = Driver(_context())
+    try:
+        d.login()
+        result = d.configure_route(
+            destination=malformed_destination, next_hop=next_hop, interface=FRR_INTERFACE
+        )
+        # Half 1: the driver's own return value must say failure.
+        assert result["success"] is False, (
+            f"driver reported success for a route the device rejected: {result!r}"
+        )
+        assert "error" in result
+
+        # Half 2: independent verification, never through the driver's own
+        # read path, that nothing was actually installed.
+        routes = _show_ip_route_static()
+        assert malformed_destination not in routes, routes
+    finally:
+        d.logout()
+        # Nothing should have been installed, but clean up defensively in case
+        # a future regression reintroduces the bug this test guards against.
+        _cleanup_route(malformed_destination, next_hop, FRR_INTERFACE)
+
+
+# ---------------------------------------------------------------------------
 # status()
 # ---------------------------------------------------------------------------
 

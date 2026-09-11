@@ -805,20 +805,43 @@ instead of raw config lines. It maps the contract onto vtysh as:
 - `status()` opens a session and checks the `show version` banner, returning
   `{"reachable": bool}`, matching the table above (not `{"success": ...}`).
 
+Error detection: unlike `drivers/frr_mgmt` (whose `configure()` never
+inspects command output), this driver scans `send_config_set`'s output for a
+vtysh line starting with `%` and treats it as a genuine rejection,
+`{"success": False, "error": <the line>}`, rather than trusting the absence
+of a raised exception (netmiko does not raise for a rejected vtysh command,
+so a driver that only checks for exceptions can report `{"success": True}`
+for a route the device never installed; this was a real bug caught by the
+live NOS-lab suite before this driver shipped). The one exception is
+`remove_route`'s benign `% Refusing to remove a non-existent route` line
+(see Idempotency below), which is deliberately still success.
+
+LIMITATION: `%`-detection is best-effort, not proof. Verified live: a
+syntactically invalid next-hop address (`ip route 203.0.113.8/30 999.1.1.1`)
+is silently rejected with NO output at all, so it produces no `%` line to
+detect. A `{"success": True}` return from this driver means "the device did
+not report a failure", not "the route is confirmed in the RIB"; only an
+independent read (e.g. `show ip route static`, as the live tests do) proves
+the latter. The driver deliberately does not parse `show ip route` itself to
+close this gap, since a driver verifying its own work through its own read
+path defeats the purpose of independent verification.
+
 Idempotency (verified live against the checked-in NOS test lab's FRR node,
 `docs/NOS_LAB.md`, and not currently stated as a rule for L3 anywhere else in
 this document): re-sending an already-configured route is a silent no-op on
-real FRR (no error, identical output to the first apply), so
+real FRR (no `%` line, identical output to the first apply), so
 `configure_route` needs no special handling to be idempotent. Removing an
-already-removed route gets a benign CLI warning,
-`% Refusing to remove a non-existent route`, but netmiko does not raise for
-it; this driver does not parse command output for embedded CLI errors
-(matching `drivers/frr_mgmt`), so that case still reports `{"success": True}`,
-since the desired end state (the route is gone) already holds. Both methods
-are therefore idempotent under redelivery, the same guarantee the Layer 2
-contract states explicitly for `create_vlan`. `tests/nos_lab/test_frr_l3_driver_live.py`
-is the live evidence for this decision; `tests/unit/test_frr_l3_driver.py`
-pins it in the stack-free suite.
+already-removed route gets the one benign `%` line,
+`% Refusing to remove a non-existent route`; this specific line is treated
+as success (`{"success": True, "already_absent": True}`) since the desired
+end state (the route is gone) already holds, while every OTHER `%` line from
+`remove_route` is a genuine failure. Both methods are therefore idempotent
+under redelivery, the same guarantee the Layer 2 contract states explicitly
+for `create_vlan`, without ever reporting success for a route the device
+actually rejected. `tests/nos_lab/test_frr_l3_driver_live.py` is the live
+evidence for this decision (including a regression test that a rejected
+route reports failure AND is independently confirmed absent);
+`tests/unit/test_frr_l3_driver.py` pins it in the stack-free suite.
 
 ## Management driver contract
 

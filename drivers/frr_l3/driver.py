@@ -27,25 +27,49 @@ docs/NOS_LAB.md, 127.0.0.1:2224):
                    "ip route <destination> <interface>"          (next_hop is None)
   remove_route     the same line prefixed with "no "
 
+Error detection (load-bearing; see docs/DRIVERS.md's "FRR reference driver" note):
+vtysh reports a rejected command as an output line starting with "%", e.g.
+"% Unknown command: ip route 999.999.999.0/24 172.17.0.1" for a malformed
+destination. netmiko does NOT raise for this: send_config_set returns normally
+with the error text embedded in the output. Unlike drivers/frr_mgmt (whose
+configure() never inspects output and always reports success), this driver DOES
+scan for a "%" line, because a false {"success": True} here is a silent
+provisioning failure: the execution service keys ledger state on the driver's
+returned payload, not on transport health (docs/DRIVERS.md, "Driver-call success
+is keyed on the DRIVER RESULT payload"). A "%" line (other than the one benign
+case below) means {"success": False, "error": <the offending line>}.
+
+IMPORTANT LIMITATION, stated plainly rather than papered over: this is
+best-effort. Not every rejected command prints a "%" line. Verified live: `ip
+route 203.0.113.8/30 999.1.1.1` (a syntactically invalid next hop) produces NO
+output at all and installs nothing, yet there is no error text to detect. So
+{"success": True} means "the device did not report a failure", not "the route
+is proven to be in the RIB". Nothing in this driver parses `show ip route` to
+close that gap, and nothing should: verifying a driver's own work through the
+driver's own read path is the exact anti-pattern the live NOS-lab tests exist to
+avoid (tests/nos_lab/test_frr_l3_driver_live.py verifies independently via a
+separate `docker exec ... vtysh` call instead).
+
 Idempotency decision (evidence, not assumption; see the report for the human-facing
 summary):
   - configure_route re-sending an already-configured route is a silent no-op on the
-    real device: FRR accepts a duplicate `ip route` line with no error and the
-    output is identical to the first apply. No special handling is needed in this
-    driver for the "install" direction; FRR itself is already idempotent there.
-  - remove_route on an already-removed route prints a benign CLI warning on the
-    real device, "% Refusing to remove a non-existent route", but netmiko does not
-    raise for it and the session/config mode stay healthy. This driver, like
-    drivers/frr_mgmt, does not parse command output for embedded CLI errors, so
-    that warning surfaces only in the recorded transcript and the call still
-    reports {"success": True}: removing an already-absent route converges to the
-    same desired state (the route is gone), which is exactly what HERD's
-    execution service needs when a wiring-changed/deprovision event is
-    redelivered or a retry channel re-drives a row.
+    real device: FRR accepts a duplicate `ip route` line with no error (no "%"
+    line) and the output is identical to the first apply. No special handling is
+    needed in this driver for the "install" direction; FRR itself is already
+    idempotent there.
+  - remove_route on an already-removed route DOES print a "%" line on the real
+    device, "% Refusing to remove a non-existent route", but this one case is
+    deliberately treated as success rather than failure: removing an
+    already-absent route converges to the same desired state (the route is
+    gone), which is exactly what HERD's execution service needs when a
+    wiring-changed/deprovision event is redelivered or a retry channel
+    re-drives a row. Every OTHER "%" line from remove_route is a genuine
+    failure and is reported as {"success": False}, same as configure_route.
   Net effect: both configure_route and remove_route are idempotent under
   redelivery, mirroring the Layer 2 contract's explicit idempotent create_vlan
   requirement, even though docs/DRIVERS.md does not currently state this rule for
-  L3 (see docs/DRIVERS.md's new "FRR reference driver" note).
+  L3, while a genuine rejection (any other "%" line) is never reported as
+  success.
 """
 
 try:
@@ -71,6 +95,27 @@ def _route_command(verb, destination, next_hop, interface):
     if next_hop is None:
         return f"{verb} {destination} {interface}"
     return f"{verb} {destination} {next_hop}"
+
+
+# The one "%" line that means "already in the desired state", not "rejected".
+# Only meaningful for remove_route; configure_route treats every "%" line as a
+# genuine failure (see the module docstring's "Error detection" section).
+_ALREADY_ABSENT_MARKER = "Refusing to remove a non-existent route"
+
+
+def _find_error_line(output):
+    """Return the first vtysh "%"-prefixed error line in `output`, or None.
+
+    Best-effort, not proof of success: see the module docstring's IMPORTANT
+    LIMITATION note. A rejected command that prints no "%" line (verified live
+    for a malformed next-hop address) returns None here even though nothing was
+    installed.
+    """
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("%"):
+            return stripped
+    return None
 
 
 class Driver:
@@ -143,24 +188,48 @@ class Driver:
         return {"success": True}
 
     def configure_route(self, destination, next_hop, interface, **_):
-        """Install one static route. See the module docstring for idempotency."""
+        """Install one static route.
+
+        See the module docstring's "Error detection" and "Idempotency decision"
+        sections: a "%" line in the output is a genuine rejection and reports
+        {"success": False}; anything else (including a silent no-op re-apply of
+        an already-configured route) reports {"success": True}.
+        """
         command = _route_command("ip route", destination, next_hop, interface)
         if self.dry_run:
             record_command(command, response="(simulated)", exit_status="simulated")
             return {"success": True, "simulated": True}
         conn = self._connect()
         output = conn.send_config_set([command])
+        error_line = _find_error_line(output)
+        if error_line is not None:
+            record_command(command, response=output, exit_status="error")
+            return {"success": False, "error": error_line, "output": output}
         record_command(command, response=output)
         return {"success": True, "output": output}
 
     def remove_route(self, destination, next_hop, interface, **_):
-        """Remove one static route. See the module docstring for idempotency."""
+        """Remove one static route.
+
+        See the module docstring's "Error detection" and "Idempotency decision"
+        sections: the device's "already absent" warning is the one "%" line
+        deliberately treated as success (the desired end state already holds);
+        every other "%" line is a genuine rejection and reports
+        {"success": False}.
+        """
         command = _route_command("no ip route", destination, next_hop, interface)
         if self.dry_run:
             record_command(command, response="(simulated)", exit_status="simulated")
             return {"success": True, "simulated": True}
         conn = self._connect()
         output = conn.send_config_set([command])
+        error_line = _find_error_line(output)
+        if error_line is not None:
+            if _ALREADY_ABSENT_MARKER in error_line:
+                record_command(command, response=output)
+                return {"success": True, "output": output, "already_absent": True}
+            record_command(command, response=output, exit_status="error")
+            return {"success": False, "error": error_line, "output": output}
         record_command(command, response=output)
         return {"success": True, "output": output}
 

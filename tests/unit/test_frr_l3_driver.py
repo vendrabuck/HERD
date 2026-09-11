@@ -111,12 +111,11 @@ def test_remove_route_interface_route_omits_next_hop():
 
 def test_remove_route_of_an_already_removed_route_still_reports_success():
     # Verified live: FRR answers "% Refusing to remove a non-existent route" for
-    # this case but netmiko does not raise. The driver does not parse command
-    # output for embedded CLI errors (matching drivers/frr_mgmt), so this
-    # degenerate remove still reports success: the desired end state (the route
-    # is gone) already holds. This is the idempotency decision from the module
-    # docstring / PR report, pinned here so a future change cannot regress it
-    # silently.
+    # this case but netmiko does not raise. This is the ONE "%" line the driver
+    # deliberately treats as success rather than failure: the desired end state
+    # (the route is gone) already holds. This is the idempotency decision from
+    # the module docstring / PR report, pinned here so a future change cannot
+    # regress it silently.
     conn = MagicMock()
     conn.send_config_set.return_value = (
         "frr(config)# no ip route 192.0.2.0/30 172.20.255.254\n"
@@ -127,6 +126,60 @@ def test_remove_route_of_an_already_removed_route_still_reports_success():
             destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0"
         )
     assert result["success"] is True
+    assert result["already_absent"] is True
+
+
+# --- a "%" line is a genuine rejection, not a success (the blocking bug fix) -
+
+
+def test_configure_route_rejected_by_device_reports_failure():
+    # Regression test: a route the device REJECTS (a malformed destination)
+    # must not be reported as success. Verified live: vtysh answers
+    # "% Unknown command: ..." and netmiko does not raise, so the driver must
+    # scan the output itself rather than trust the absence of an exception.
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)#  ip route 999.999.999.0/24 172.17.0.1\n"
+        "% Unknown command: ip route 999.999.999.0/24 172.17.0.1\n"
+        "frr(config)#  end"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="999.999.999.0/24", next_hop="172.17.0.1", interface="eth0"
+        )
+    assert result["success"] is False
+    assert "Unknown command" in result["error"]
+
+
+def test_remove_route_rejected_by_device_reports_failure():
+    # A genuine rejection on remove_route (not the benign "already absent"
+    # case) must also report failure, not success.
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)#  no ip route not-a-prefix 172.17.0.1\n"
+        "% Unknown command: no ip route not-a-prefix 172.17.0.1\n"
+        "frr(config)#  end"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_route(
+            destination="not-a-prefix", next_hop="172.17.0.1", interface="eth0"
+        )
+    assert result["success"] is False
+    assert "Unknown command" in result["error"]
+    assert "already_absent" not in result
+
+
+def test_configure_route_clean_apply_still_reports_success():
+    # A clean apply (no "%" line anywhere in the output) is unaffected by the
+    # error-detection change.
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)#  ip route 192.0.2.0/30 172.20.255.254"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0"
+        )
+    assert result["success"] is True
+    assert "error" not in result
 
 
 def test_configure_route_of_an_already_configured_route_is_a_silent_no_op():
