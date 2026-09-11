@@ -162,14 +162,18 @@ def _rejection_error(output):
     commit time, surfacing as a line starting with "Error:" (e.g. "Error:
     Commit failed"). All three were reproduced live against this exact
     node before being pinned here.
+
+    Returns the offending LINE, not the whole transcript: this value is what
+    HERD stores in a wiring assignment's last_error column, so it has to stay
+    readable there. The full device output rides alongside it under "output".
+    This matches drivers/frr_l3, whose "error" is likewise a single line.
     """
     if not output:
         return None
-    if any(marker in output for marker in _ERROR_SUBSTRINGS):
-        return output.strip()
     for line in output.splitlines():
-        if line.strip().startswith("Error:"):
-            return output.strip()
+        stripped = line.strip()
+        if stripped.startswith("Error:") or any(m in stripped for m in _ERROR_SUBSTRINGS):
+            return stripped
     return None
 
 
@@ -243,7 +247,11 @@ class Driver:
                 conn._discard()
             except Exception:  # noqa: BLE001 - best-effort cleanup; the failure below still stands
                 pass
-            return {"success": False, "error": error}
+            return {
+                "success": False,
+                "error": error,
+                "output": output if set_error else commit_output,
+            }
         return {"success": True}
 
     def _record_simulated(self, commands):
