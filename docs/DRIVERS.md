@@ -103,6 +103,118 @@ apply may follow against unverified intent.
 
 ---
 
+## A driver must report a device rejection as a failure
+
+Every driver method that mutates the device (`configure`, `configure_route`,
+`remove_route`, `create_vlan`, `add_to_vlan`, `remove_from_vlan`, `delete_vlan`,
+`backup`, and any connection-type-specific equivalent) MUST return
+`{"success": False}` when the device rejected the operation. This is binding,
+not a style preference: the execution service keys driver-call success on the
+returned PAYLOAD, never on transport health, via the `driver_result_failed`
+helper in `services/execution/app/services/execution_service.py` (a present
+`success` key that is falsy means failure; an absent key stays success, see
+the "Return values" section for each connection type). A driver that returns
+`{"success": True}` after the device rejected the command makes HERD record
+the operation as applied, in its wiring ledger or whatever state the call was
+provisioning, even though nothing actually changed on the device. The ledger
+then silently diverges from reality with nothing downstream told to
+reconcile it: a silent provisioning failure, the exact failure mode issue
+#771 is named for.
+
+**Do not raise for an ordinary device rejection.** A rejection is not an
+exceptional condition from the driver's point of view, it is exactly the
+outcome `{"success": False}` exists to report, and it is what the execution
+service's failure handling reads. Reserve raising (`DriverError`, or letting
+a transport exception propagate) for things a caller cannot recover from by
+retrying the same call against the same device state, such as missing
+connection parameters (`HERD_ip`/`HERD_login` absent) or a broken transport.
+
+**Surface the offending device text, and surface the right slice of it.** The
+value you put in `error` is what HERD stores in a wiring assignment's
+`last_error` column and shows an operator, so it should be the offending LINE
+the device printed (e.g. `% Unknown command: ip route 999.999.999.0/24
+172.17.0.1`), not the whole session transcript. If you also have the fuller
+output, include it alongside under a separate key such as `output`, not in
+place of the single-line `error`. Both reference drivers below do exactly
+this.
+
+**Error detection is best-effort; say so, do not paper over it.** A device
+can reject an operation silently, with no error text to detect at all.
+Verified live against the checked-in NOS test lab (`docs/NOS_LAB.md`): a
+syntactically invalid next hop (`ip route 203.0.113.8/30 999.1.1.1` against
+the FRR node) produces NO output at all and installs nothing, yet there is no
+line to scan for. So a driver's `{"success": True}` means "the device did not
+report a failure", never "the configuration is confirmed present". Document
+this limitation in your own driver's docstring rather than implying a
+stronger guarantee than you can deliver.
+
+**Do not self-verify.** A driver must NOT try to close the gap above by
+reading the device back through its own connection and reporting on that: a
+driver verifying its own work through its own read path only proves internal
+consistency, that the session agrees with itself, not that the device is
+actually in the state the caller wanted. Independent verification is what the
+live suites under `tests/nos_lab/` exist to do: a separate `docker exec` or a
+fresh connection outside the driver, never the driver's own session.
+
+**Judge success by desired end state, not by whether the device complained.**
+Re-applying an already-configured route, re-creating an already-defined VLAN,
+or removing something already absent should all report `{"success": True}`
+when the operation's goal already holds, even if the device's own response to
+that one command reads like a rejection. HERD relies on this: NATS event
+redelivery and the retry channels re-drive calls whose effect may already be
+in place, and a driver that reported failure for such a no-op would make
+those channels retry forever against a route or VLAN that already matches
+intent.
+
+**Which complaints are benign is vendor-specific: work it out, do not
+inherit it.** Whether a device complains about a no-op at all differs by
+vendor: some stay silent, some emit a warning, and the exact wording is never
+the same across devices or even across commands on the same device. This
+means classifying a device's complaints into benign and genuine is a
+per-driver, per-device responsibility that cannot be copied from another
+driver's benign list or guessed at, only verified against the device you are
+actually writing for. See the worked example below for what that looks like
+for one concrete device and command; it is an example of the rule, not a
+reusable rule of its own.
+
+**Classify ALL of a device's complaints before deciding, never stop at the
+first.** A method whose single call can emit multiple lines of device
+output, whether because it batches several commands per call or because one
+command's own response spans several lines, must scan every line and
+partition all of them into benign and genuine, then report failure if ANY
+genuine complaint is present (surfacing the first genuine one, not the first
+complaint of any kind, as `error`). Stopping at the first line is a real bug,
+not an acceptable simplification: a benign warning that happens to come
+first would otherwise hide a genuine failure that arrives after it in the
+same response.
+
+**None of this proves the configuration is present.** A `{"success": True}`
+reached this way still only means "the device reported nothing genuinely
+wrong", the same best-effort limitation stated above; only an independent
+read confirms the end state actually holds.
+
+FRR's response to removing an already-absent route, `% Refusing to remove a
+non-existent route`, is the worked EXAMPLE of this rule, not the rule itself:
+`drivers/frr_l3/driver.py`'s single-line `remove_route` and
+`drivers/frr_mgmt/driver.py`'s multi-command `configure` both treat this
+exact line as benign, for the same reason (the route is already gone, which
+is the desired end state), each verified independently against the live NOS
+test lab. `frr_mgmt` additionally has to scan and classify every line in its
+batch rather than just the first, since a "first match" check there would be
+exactly the masking bug this section warns about; `frr_l3`'s `remove_route`
+does not need to, because it is a narrower, single-line contract.
+
+Two reference implementations exist and should be read before writing a new
+driver against real gear: `drivers/frr_l3/driver.py` (`_find_error_line`,
+used by `configure_route`/`remove_route`) and `drivers/srl_l2/driver.py`
+(`_rejection_error`, used by `_apply`); `drivers/frr_mgmt/driver.py`
+(`_find_error_lines`/`_classify_error_lines`, used by `configure`/`backup`)
+is a third, and the one issue #771 fixed: it originally shipped without any
+output inspection at all and always reported success regardless of what the
+device did.
+
+---
+
 ## Golden-transcript regression tests
 
 A small mock-Cisco-IOS fixture driver lives at
@@ -374,6 +486,9 @@ preserved as the run output), exactly as if it had raised. A returned dict with 
 `success` key is treated as bare diagnostic data and does not fail the run, so
 methods like `status` that report reachability rather than success are unaffected.
 
+A device that rejects `connect_ports`/`disconnect_ports` is a failure, not a
+success: see "A driver must report a device rejection as a failure" above.
+
 Minimum required keys per method:
 
 | Method | Required keys |
@@ -632,6 +747,9 @@ to the driver.
 | delete_vlan | `{"success": bool}` |
 | status | `{"reachable": bool}` |
 
+A device that rejects any of the mutating calls above is a failure, not a
+success: see "A driver must report a device rejection as a failure" above.
+
 ---
 
 ## Reference implementation: Nokia SR Linux (drivers/srl_l2)
@@ -851,6 +969,10 @@ also accept full config pushes through those paths must implement it; the checke
 | remove_route | `{"success": bool}` |
 | status | `{"reachable": bool}` |
 
+A device that rejects `configure_route`/`remove_route` is a failure, not a
+success: see "A driver must report a device rejection as a failure" above,
+and the FRR reference driver note just below for the worked example.
+
 ### FRR reference driver
 
 `drivers/frr_l3/driver.py` is the reference real implementation of the Layer 3
@@ -920,6 +1042,10 @@ class Driver:
     def backup(self) -> dict: ...
     def status(self) -> dict: ...
 ```
+
+A device that rejects `configure` (or a `backup` read) is a failure, not a
+success: see "A driver must report a device rejection as a failure" above.
+`drivers/frr_mgmt/driver.py` is the worked example (issue #771).
 
 ### AI-generated configs are allowlisted (B8)
 

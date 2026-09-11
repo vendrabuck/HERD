@@ -102,6 +102,172 @@ def test_configure_without_commands_raises():
             d.configure()
 
 
+# --- device rejection must be reported as failure, not success (issue #771) --
+
+
+def test_configure_rejected_by_device_reports_failure_with_offending_line():
+    """A vtysh '%' line in the output is a genuine rejection: configure()
+    must return success: False with the offending line surfaced, and must
+    NOT save the (unapplied) config. Before issue #771 this driver never
+    inspected output and always reported success here."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  ip route 999.999.999.0/24 172.17.0.1\n"
+        "% Unknown command: ip route 999.999.999.0/24 172.17.0.1\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.configure(commands=["ip route 999.999.999.0/24 172.17.0.1"])
+    assert result["success"] is False
+    assert result["error"] == "% Unknown command: ip route 999.999.999.0/24 172.17.0.1"
+    assert "output" in result
+    conn.save_config.assert_not_called()
+
+
+def test_configure_clean_apply_still_succeeds():
+    """A clean apply (no '%' line) must still report success and persist,
+    unchanged by the new error-detection path."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  ip route 192.0.2.0/24 blackhole\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    conn.save_config.return_value = "ok"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.configure(commands=["ip route 192.0.2.0/24 blackhole"])
+    assert result["success"] is True
+    assert "error" not in result
+    conn.save_config.assert_called_once()
+
+
+def test_configure_carves_out_the_benign_remove_route_line_as_success():
+    """Lane's ruling (reversing the earlier no-carve-out decision): FRR's
+    "already absent" response to removing a route means the desired end
+    state (the route is gone) already holds, so configure() must report
+    success here, the same as drivers/frr_l3's remove_route does for the
+    identical device text. The benign line is still surfaced, under
+    "benign_warnings" rather than "error", so an operator can see it."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  no ip route 203.0.113.0/30 172.17.0.1\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    conn.save_config.return_value = "ok"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.configure(commands=["no ip route 203.0.113.0/30 172.17.0.1"])
+    assert result["success"] is True
+    assert "error" not in result
+    assert result["benign_warnings"] == ["% Refusing to remove a non-existent route"]
+    conn.save_config.assert_called_once()
+
+
+def test_configure_reports_genuine_failure_even_after_a_benign_line():
+    """The masking bug this whole ruling is about: if configure() only
+    inspected the FIRST '%' line, a benign line arriving before a genuine
+    one would hide the genuine failure entirely. This batch's first error is
+    the benign 'already absent' marker; its second is a real rejection, and
+    the result must be failure, reporting the FIRST GENUINE line, not the
+    benign one that came first in the output."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  no ip route 203.0.113.0/30 172.17.0.1\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  ip route 999.999.999.0/24 172.17.0.1\n"
+        "% Unknown command: ip route 999.999.999.0/24 172.17.0.1\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.configure(
+            commands=[
+                "no ip route 203.0.113.0/30 172.17.0.1",
+                "ip route 999.999.999.0/24 172.17.0.1",
+            ]
+        )
+    assert result["success"] is False
+    assert result["error"] == "% Unknown command: ip route 999.999.999.0/24 172.17.0.1"
+    conn.save_config.assert_not_called()
+
+
+def test_configure_reports_genuine_failure_when_it_comes_first():
+    """The symmetric ordering, for completeness: a genuine failure followed
+    by a benign line must still report the genuine one."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  ip route 999.999.999.0/24 172.17.0.1\n"
+        "% Unknown command: ip route 999.999.999.0/24 172.17.0.1\n"
+        "frr(config)#  no ip route 203.0.113.0/30 172.17.0.1\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.configure(
+            commands=[
+                "ip route 999.999.999.0/24 172.17.0.1",
+                "no ip route 203.0.113.0/30 172.17.0.1",
+            ]
+        )
+    assert result["success"] is False
+    assert result["error"] == "% Unknown command: ip route 999.999.999.0/24 172.17.0.1"
+    conn.save_config.assert_not_called()
+
+
+def test_dry_run_configure_rejected_command_is_not_evaluated():
+    """A dry-run never opens a connection, so error detection never runs;
+    the recorded transcript is what a user reviews, not a driver verdict."""
+    with patch("netmiko.ConnectHandler") as ch:
+        d = Driver(_DRY_CTX)
+        result = d.configure(commands=["ip route 999.999.999.0/24 172.17.0.1"])
+    ch.assert_not_called()
+    assert result["success"] is True
+    assert result["simulated"] is True
+
+
+def test_backup_rejected_by_device_reports_failure():
+    conn = MagicMock()
+    conn.send_command.return_value = "% Unknown command: show running-config"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.backup()
+    assert result["success"] is False
+    assert result["error"] == "% Unknown command: show running-config"
+
+
+def test_backup_clean_read_still_succeeds():
+    conn = MagicMock()
+    conn.send_command.return_value = "Building configuration...\n!\nhostname r1\n!\nend"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.backup()
+    assert result["success"] is True
+    assert result["config"] == conn.send_command.return_value
+
+
+def test_dry_run_backup_does_not_evaluate_output():
+    with patch("netmiko.ConnectHandler") as ch:
+        d = Driver(_DRY_CTX)
+        result = d.backup()
+    ch.assert_not_called()
+    assert result["success"] is True
+    assert result["simulated"] is True
+    assert result["config"] is None
+
+
 # --- status degrades gracefully, login validates params ---------------------
 
 

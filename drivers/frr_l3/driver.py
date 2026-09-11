@@ -31,9 +31,9 @@ Error detection (load-bearing; see docs/DRIVERS.md's "FRR reference driver" note
 vtysh reports a rejected command as an output line starting with "%", e.g.
 "% Unknown command: ip route 999.999.999.0/24 172.17.0.1" for a malformed
 destination. netmiko does NOT raise for this: send_config_set returns normally
-with the error text embedded in the output. Unlike drivers/frr_mgmt (whose
-configure() never inspects output and always reports success), this driver DOES
-scan for a "%" line, because a false {"success": True} here is a silent
+with the error text embedded in the output. This driver scans for a "%" line
+(as does drivers/frr_mgmt/driver.py's configure()/backup(), fixed alongside it
+for issue #771), because a false {"success": True} here is a silent
 provisioning failure: the execution service keys ledger state on the driver's
 returned payload, not on transport health (docs/DRIVERS.md, "Driver-call success
 is keyed on the DRIVER RESULT payload"). A "%" line (other than the one benign
