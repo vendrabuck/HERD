@@ -156,28 +156,62 @@ actually in the state the caller wanted. Independent verification is what the
 live suites under `tests/nos_lab/` exist to do: a separate `docker exec` or a
 fresh connection outside the driver, never the driver's own session.
 
-**Idempotent no-ops are successes, not failures.** Re-applying an
-already-configured route, re-creating an already-defined VLAN, or removing
-something already absent all converge to the desired end state and should
-report `{"success": True}`, even when the device's own response to that one
-command reads like a rejection (FRR's `% Refusing to remove a non-existent
-route` is the worked example below). HERD relies on this: NATS event
+**Judge success by desired end state, not by whether the device complained.**
+Re-applying an already-configured route, re-creating an already-defined VLAN,
+or removing something already absent should all report `{"success": True}`
+when the operation's goal already holds, even if the device's own response to
+that one command reads like a rejection. HERD relies on this: NATS event
 redelivery and the retry channels re-drive calls whose effect may already be
 in place, and a driver that reported failure for such a no-op would make
 those channels retry forever against a route or VLAN that already matches
 intent.
 
+**Which complaints are benign is vendor-specific: work it out, do not
+inherit it.** Whether a device complains about a no-op at all differs by
+vendor: some stay silent, some emit a warning, and the exact wording is never
+the same across devices or even across commands on the same device. This
+means classifying a device's complaints into benign and genuine is a
+per-driver, per-device responsibility that cannot be copied from another
+driver's benign list or guessed at, only verified against the device you are
+actually writing for. See the worked example below for what that looks like
+for one concrete device and command; it is an example of the rule, not a
+reusable rule of its own.
+
+**Classify ALL of a device's complaints before deciding, never stop at the
+first.** A method whose single call can emit multiple lines of device
+output, whether because it batches several commands per call or because one
+command's own response spans several lines, must scan every line and
+partition all of them into benign and genuine, then report failure if ANY
+genuine complaint is present (surfacing the first genuine one, not the first
+complaint of any kind, as `error`). Stopping at the first line is a real bug,
+not an acceptable simplification: a benign warning that happens to come
+first would otherwise hide a genuine failure that arrives after it in the
+same response.
+
+**None of this proves the configuration is present.** A `{"success": True}`
+reached this way still only means "the device reported nothing genuinely
+wrong", the same best-effort limitation stated above; only an independent
+read confirms the end state actually holds.
+
+FRR's response to removing an already-absent route, `% Refusing to remove a
+non-existent route`, is the worked EXAMPLE of this rule, not the rule itself:
+`drivers/frr_l3/driver.py`'s single-line `remove_route` and
+`drivers/frr_mgmt/driver.py`'s multi-command `configure` both treat this
+exact line as benign, for the same reason (the route is already gone, which
+is the desired end state), each verified independently against the live NOS
+test lab. `frr_mgmt` additionally has to scan and classify every line in its
+batch rather than just the first, since a "first match" check there would be
+exactly the masking bug this section warns about; `frr_l3`'s `remove_route`
+does not need to, because it is a narrower, single-line contract.
+
 Two reference implementations exist and should be read before writing a new
 driver against real gear: `drivers/frr_l3/driver.py` (`_find_error_line`,
 used by `configure_route`/`remove_route`) and `drivers/srl_l2/driver.py`
-(`_rejection_error`, used by `_apply`). Both scan device output for a
-rejection marker and return the offending line, and both carve out exactly
-one benign response as a success rather than a failure (documented in each
-driver's module docstring). `drivers/frr_mgmt/driver.py`, the pre-existing
-Management driver, originally shipped without any such check and always
-reported success regardless of device output; it was fixed to match (issue
-#771), and its module docstring documents its own scan and the one benign
-case it deliberately does NOT carve out.
+(`_rejection_error`, used by `_apply`); `drivers/frr_mgmt/driver.py`
+(`_find_error_lines`/`_classify_error_lines`, used by `configure`/`backup`)
+is a third, and the one issue #771 fixed: it originally shipped without any
+output inspection at all and always reported success regardless of what the
+device did.
 
 ---
 

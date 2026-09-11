@@ -146,13 +146,13 @@ def test_configure_clean_apply_still_succeeds():
     conn.save_config.assert_called_once()
 
 
-def test_configure_does_not_carve_out_the_benign_remove_route_line():
-    """Unlike drivers/frr_l3's remove_route, this driver's configure() treats
-    EVERY '%' line as a failure, including the exact text FRR uses for
-    removing an already-absent route. See the module docstring: configure()
-    accepts an arbitrary multi-line batch, so special-casing one benign line
-    found first in the output could mask a genuine failure on a later line
-    in the same batch."""
+def test_configure_carves_out_the_benign_remove_route_line_as_success():
+    """Lane's ruling (reversing the earlier no-carve-out decision): FRR's
+    "already absent" response to removing a route means the desired end
+    state (the route is gone) already holds, so configure() must report
+    success here, the same as drivers/frr_l3's remove_route does for the
+    identical device text. The benign line is still surfaced, under
+    "benign_warnings" rather than "error", so an operator can see it."""
     conn = MagicMock()
     conn.send_config_set.return_value = (
         " configure terminal\n"
@@ -161,11 +161,69 @@ def test_configure_does_not_carve_out_the_benign_remove_route_line():
         "frr(config)#  end\n"
         "frr# "
     )
+    conn.save_config.return_value = "ok"
     with patch("netmiko.ConnectHandler", return_value=conn):
         d = Driver(_REAL_CTX)
         result = d.configure(commands=["no ip route 203.0.113.0/30 172.17.0.1"])
+    assert result["success"] is True
+    assert "error" not in result
+    assert result["benign_warnings"] == ["% Refusing to remove a non-existent route"]
+    conn.save_config.assert_called_once()
+
+
+def test_configure_reports_genuine_failure_even_after_a_benign_line():
+    """The masking bug this whole ruling is about: if configure() only
+    inspected the FIRST '%' line, a benign line arriving before a genuine
+    one would hide the genuine failure entirely. This batch's first error is
+    the benign 'already absent' marker; its second is a real rejection, and
+    the result must be failure, reporting the FIRST GENUINE line, not the
+    benign one that came first in the output."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  no ip route 203.0.113.0/30 172.17.0.1\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  ip route 999.999.999.0/24 172.17.0.1\n"
+        "% Unknown command: ip route 999.999.999.0/24 172.17.0.1\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.configure(
+            commands=[
+                "no ip route 203.0.113.0/30 172.17.0.1",
+                "ip route 999.999.999.0/24 172.17.0.1",
+            ]
+        )
     assert result["success"] is False
-    assert result["error"] == "% Refusing to remove a non-existent route"
+    assert result["error"] == "% Unknown command: ip route 999.999.999.0/24 172.17.0.1"
+    conn.save_config.assert_not_called()
+
+
+def test_configure_reports_genuine_failure_when_it_comes_first():
+    """The symmetric ordering, for completeness: a genuine failure followed
+    by a benign line must still report the genuine one."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  ip route 999.999.999.0/24 172.17.0.1\n"
+        "% Unknown command: ip route 999.999.999.0/24 172.17.0.1\n"
+        "frr(config)#  no ip route 203.0.113.0/30 172.17.0.1\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        result = d.configure(
+            commands=[
+                "ip route 999.999.999.0/24 172.17.0.1",
+                "no ip route 203.0.113.0/30 172.17.0.1",
+            ]
+        )
+    assert result["success"] is False
+    assert result["error"] == "% Unknown command: ip route 999.999.999.0/24 172.17.0.1"
     conn.save_config.assert_not_called()
 
 

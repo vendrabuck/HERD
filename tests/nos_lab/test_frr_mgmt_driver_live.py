@@ -246,15 +246,15 @@ def test_configure_rejected_by_device_reports_failure_and_installs_nothing():
 
 
 # ---------------------------------------------------------------------------
-# The Management driver's benign-carve-out decision: unlike drivers/frr_l3's
-# remove_route, configure() must NOT special-case the "already absent" line;
-# it is a genuine failure return here (see the driver's module docstring for
-# why: configure() batches arbitrary lines, so carving out one benign
-# response found first in a batch could mask a real failure later in it).
+# The Management driver's benign classification (Lane's ruling): removing an
+# already-absent route is judged by desired end state (the route is gone,
+# which is what the caller wanted), not by whether the device complained, so
+# it must report success, the same as drivers/frr_l3's remove_route does for
+# the identical device text.
 # ---------------------------------------------------------------------------
 
 
-def test_configure_removing_already_absent_route_reports_failure_not_success():
+def test_configure_removing_already_absent_route_reports_success():
     destination = _unique_test_prefix()
     next_hop = _frr_connected_nexthop()
 
@@ -264,14 +264,60 @@ def test_configure_removing_already_absent_route_reports_failure_not_success():
         # Confirm the route is not present, then try to remove it anyway.
         assert destination not in _show_ip_route_static()
         result = d.configure(commands=[f"no ip route {destination} {next_hop}"])
-        assert result["success"] is False, (
-            "drivers/frr_mgmt must not carve out the 'already absent' line as "
-            f"benign the way drivers/frr_l3's remove_route does: {result!r}"
+        assert result["success"] is True, (
+            "removing an already-absent route should converge to the desired "
+            f"end state (the route is gone) and report success: {result!r}"
         )
-        assert "Refusing to remove a non-existent route" in result["error"]
+        assert "error" not in result
+        assert result["benign_warnings"] == ["% Refusing to remove a non-existent route"]
+
+        # The end state itself: still gone, nothing was disturbed.
+        assert destination not in _show_ip_route_static()
     finally:
         d.logout()
         _cleanup_route(destination, next_hop)
+
+
+# ---------------------------------------------------------------------------
+# The masking bug this ruling closes: a benign line arriving BEFORE a genuine
+# rejection in the same multi-command batch must not hide the genuine one.
+# Driven live in one configure() call: the first line is a no-op removal of
+# an already-absent route (benign), the second is a malformed destination
+# the device rejects outright (genuine). The overall result must be failure,
+# reporting the genuine line, and nothing from the batch may be installed.
+# ---------------------------------------------------------------------------
+
+
+def test_configure_genuine_failure_after_a_benign_line_is_not_masked():
+    absent_destination = _unique_test_prefix()
+    malformed_destination = "999.999.999.0/24"
+    next_hop = _frr_connected_nexthop()
+
+    d = Driver(_context())
+    try:
+        d.login()
+        assert absent_destination not in _show_ip_route_static()
+
+        result = d.configure(
+            commands=[
+                f"no ip route {absent_destination} {next_hop}",  # benign, comes first
+                f"ip route {malformed_destination} {next_hop}",  # genuine, comes second
+            ]
+        )
+        assert result["success"] is False, (
+            f"a benign line before a genuine rejection must not mask it: {result!r}"
+        )
+        assert malformed_destination in result["error"]
+        assert "Refusing to remove a non-existent route" not in result["error"]
+
+        # Independent verification: the rejected line installed nothing.
+        routes = _show_ip_route_static()
+        assert malformed_destination not in routes, routes
+        running = _show_running_config()
+        assert malformed_destination not in running, running
+    finally:
+        d.logout()
+        _cleanup_route(malformed_destination, next_hop)
 
 
 # ---------------------------------------------------------------------------
