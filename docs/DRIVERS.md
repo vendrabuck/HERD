@@ -136,6 +136,12 @@ prove driver CLI output is stable, not that it works against a real device.
 A driver that ships with green goldens AND green real-hardware acceptance
 testing (done separately, outside this suite) is fully covered.
 
+Between golden fixtures and real hardware sits `docs/NOS_LAB.md`: a
+checked-in, license-free lab of two real network operating systems (Nokia
+SR Linux, FRRouting) that a driver can be run against over real SSH, with
+no mock in the loop and no external lab host. It is opt-in (`make nos-up`)
+and not part of any default test run.
+
 ---
 
 ## Layer 1 Switch driver contract

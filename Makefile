@@ -51,6 +51,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
+	nos-up nos-down nos-status nos-logs nos-reset \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run \
 	_collect-stack-diagnostics
@@ -588,6 +589,38 @@ _gate-ldap-tests:
 	fi; \
 	trap 'if [ "$$started" = 1 ]; then $(MAKE) ldap-down; fi' EXIT INT TERM; \
 	$(MAKE) test-auth-ldap
+
+# Checked-in emulated-gear test lab (infra/nos-test, docs/NOS_LAB.md): phase 0
+# of the emulated-gear test tier (ADR 0010). License-free, needs no external
+# Proxmox host, unlike network-simulator. Deliberately opt-in: NOT wired into
+# `make test`, `make master`, or `make everything`, so it costs nothing on a
+# host that never runs it. Pinned with -p (own compose project
+# herd-nos-test, own network herd-nos-test-net) for the same reason
+# LDAP_COMPOSE is pinned: an exported COMPOSE_PROJECT_NAME must never be able
+# to redirect a `down` on this file onto another project's containers.
+NOS_COMPOSE := docker compose -p herd-nos-test -f infra/nos-test/docker-compose.yml
+HERD_TEST_SRL_HOST ?= 127.0.0.1
+HERD_TEST_FRR_HOST ?= 127.0.0.1
+HERD_TEST_SRL_PORT ?= 2223
+HERD_TEST_FRR_PORT ?= 2224
+
+nos-up:  ## Start the checked-in NOS test lab (infra/nos-test), wait until healthy
+	HERD_TEST_SRL_PORT=$(HERD_TEST_SRL_PORT) HERD_TEST_FRR_PORT=$(HERD_TEST_FRR_PORT) \
+		$(NOS_COMPOSE) up -d --build --wait
+	@echo "NOS test lab up: SR Linux ssh://$(HERD_TEST_SRL_HOST):$(HERD_TEST_SRL_PORT), FRR ssh://$(HERD_TEST_FRR_HOST):$(HERD_TEST_FRR_PORT)"
+
+nos-down:  ## Stop and remove the NOS test lab
+	$(NOS_COMPOSE) down -v
+
+nos-status:  ## Show the NOS test lab's container status
+	$(NOS_COMPOSE) ps
+
+nos-logs:  ## Tail the NOS test lab's logs
+	$(NOS_COMPOSE) logs -f
+
+nos-reset:  ## Recreate the NOS test lab from scratch (discards all node state)
+	$(NOS_COMPOSE) down -v
+	$(MAKE) nos-up
 
 # Postgres-live coverage for the ADR 0011 sync surface (issue #572): the
 # advisory-lock SQL and _SyncSlot's cross-replica branch never run on the
