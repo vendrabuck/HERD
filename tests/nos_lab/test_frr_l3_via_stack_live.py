@@ -128,6 +128,29 @@ _PRECONDITIONS_MET = _FRR_REACHABLE and _LAB_ATTACHED and _STACK_REACHABLE
 _NOS_REQUIRED = os.getenv("HERD_TEST_NOS_REQUIRED", "") not in ("", "0")
 
 
+def _credentials_accepted() -> bool:
+    """Whether SEED_EMAIL/SUPERADMIN_EMAIL actually authenticate against the stack.
+
+    Resolved from the ENVIRONMENT, not from .env: this mirrors tests/e2e/conftest.py,
+    but the failure mode there is a bare 401 deep inside a test. The stack seeds its
+    superadmin from .env, so a shell that has not exported those values falls back to
+    the generic default and gets 401. Probing here turns that into a precondition
+    message naming the fix instead.
+    """
+    try:
+        with httpx.Client(verify=False, timeout=10) as client:
+            resp = client.post(
+                f"{BASE_URL}/auth/login",
+                json={"email": SEED_EMAIL, "password": SEED_PASSWORD},
+            )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+_CREDENTIALS_OK = _credentials_accepted() if _STACK_REACHABLE else False
+
+
 def _missing_precondition_reason() -> str:
     if not _FRR_REACHABLE:
         return (
@@ -141,18 +164,26 @@ def _missing_precondition_reason() -> str:
         )
     if not _STACK_REACHABLE:
         return f"HERD stack not reachable at {BASE_URL}; run `make up`."
+    if not _CREDENTIALS_OK:
+        return (
+            f"the stack rejected the seed credentials for {SEED_EMAIL!r}. These are read "
+            "from the ENVIRONMENT, while the stack seeds its superadmin from .env, so "
+            "export them first, for example: "
+            "export SUPERADMIN_EMAIL=$(grep -E '^SUPERADMIN_EMAIL=' .env | cut -d= -f2-) "
+            "and the same for SUPERADMIN_PASSWORD; or set SEED_EMAIL/SEED_PASSWORD."
+        )
     return ""
 
 
 pytestmark = pytest.mark.skipif(
-    not _NOS_REQUIRED and not _PRECONDITIONS_MET,
+    not _NOS_REQUIRED and not (_PRECONDITIONS_MET and _CREDENTIALS_OK),
     reason=_missing_precondition_reason() or "NOS lab + stack preconditions not met",
 )
 
 
 @pytest.fixture(autouse=True)
 def _fail_when_required_but_unavailable():
-    if _NOS_REQUIRED and not _PRECONDITIONS_MET:
+    if _NOS_REQUIRED and not (_PRECONDITIONS_MET and _CREDENTIALS_OK):
         pytest.fail(_missing_precondition_reason())
 
 

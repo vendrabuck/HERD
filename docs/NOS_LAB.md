@@ -151,6 +151,15 @@ hard failure. Run it with:
 make up
 make nos-up
 make nos-attach
+bash scripts/seed_nos_lab.sh
+
+# The test authenticates as the stack's superadmin and reads those credentials
+# from the ENVIRONMENT, while the stack seeds them from .env, so export them
+# first. Skipping this step is the one easy way to get a bare 401; the suite
+# probes for it up front and says so rather than failing inside a test.
+export SUPERADMIN_EMAIL=$(grep -E '^SUPERADMIN_EMAIL=' .env | head -1 | cut -d= -f2-)
+export SUPERADMIN_PASSWORD=$(grep -E '^SUPERADMIN_PASSWORD=' .env | head -1 | cut -d= -f2-)
+
 HERD_TEST_NOS_REQUIRED=1 uv run pytest tests/nos_lab/test_frr_l3_via_stack_live.py -v
 make nos-detach
 ```
