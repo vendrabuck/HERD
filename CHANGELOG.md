@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- Shipped phase 3b of the emulated-gear test tier (ADR 0010), the Layer 2
+  counterpart of phase 3a's Layer 3 proof: `tests/nos_lab/test_srl_l2_via_stack_live.py`
+  proves HERD derives a Layer 2 VLAN membership from a reservation's wiring and
+  configures it on the REAL Nokia SR Linux node entirely through HERD's own API,
+  execution service, and driver sandbox (drivers/srl_l2), not by calling the driver
+  directly. It reuses the seeded `nos-lab-dut-1`/`nos-lab-dut-2`/`nos-lab-srl`
+  devices and cabling (`scripts/seed_nos_lab.sh`), wires the two DUTs together on a
+  topology canvas with no switch node (cabling's pathfinder resolves it through the
+  real switch's `ethernet-1/1`/`ethernet-1/2` ports), activates a reservation over
+  it, and saves the fork to drive the connection-driven L2 reconcile (ADR 0009).
+  It reads the VLAN id HERD allocated from the reservation's own
+  `GET /reservations/{id}/wiring-status` surface instead of assuming a number,
+  independently verifies on the real device (a separate `docker exec nos-test-srl
+  sr_cli` session, never the driver's own session) that the `mac-vrf`
+  network-instance exists AND both subinterfaces are bound into it, cancels the
+  reservation, and independently verifies both the port bindings and the VLAN
+  definition are gone, cross-checking HERD's own ledger (RELEASED) against the
+  device at each step. `delete_vlan` runs in its own driver session shortly after
+  the membership ledger flips RELEASED, so the teardown-side device check polls
+  rather than asserting once. Same gating and cleanup discipline as
+  `test_frr_l3_via_stack_live.py`; see docs/NOS_LAB.md.
+
 - Shipped phase 3a of the emulated-gear test tier (ADR 0010): the checked-in
   NOS test lab can now be wired into a running HERD stack so HERD drives the
   real devices through its OWN execution service and driver sandbox, not by
