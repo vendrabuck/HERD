@@ -47,6 +47,30 @@ commit() ("commit stay") after every mutating batch. A candidate change
 that is never committed is silently never applied, so every create_vlan,
 add_to_vlan, remove_from_vlan, and delete_vlan call ends in a commit.
 
+A rejected command is NOT an exception, it is a returned {"success": False}:
+HERD keys provisioning success on the driver's returned payload
+(execution_service.py's driver_result_failed helper), so a false "success"
+here would make HERD record an ACTIVE VLAN membership the switch never
+actually accepted. Every mutating method therefore scans both the `set`
+and the `commit` output for a genuine device rejection ("Parsing error:",
+"Invalid value", or a line starting with "Error:", all verified live
+against this exact node) before reporting success. This also disambiguates
+create_vlan/delete_vlan idempotency from a false success: SR Linux's
+"Nothing to commit." is what BOTH a legitimately idempotent no-op AND a
+`set` that was rejected outright (and so never staged) produce, since a
+rejected command never enters the candidate for commit to act on; the
+error-marker scan is what tells them apart, not the "Nothing to commit."
+text itself. A detected rejection also discards the candidate
+(conn._discard(), netmiko's private-candidate-clear command for this
+platform) before returning failure: a partially-staged batch (some lines
+valid, one rejected) can leave the candidate dirty even though nothing
+committed, and since mutating calls share one login/logout session, that
+leftover diff would otherwise silently ride along into the NEXT call's
+commit on this session (verified live: a batch with one out-of-range field
+staged its three sibling lines into the candidate, then failed at commit
+with a semantic "inconsistent" error, leaving the candidate dirty until
+discarded).
+
 Connection params come from the device field_data as HERD_-prefixed context
 keys (mirrors drivers/frr_mgmt/driver.py):
   HERD_ip       host/IP the execution service can reach (e.g. 127.0.0.1)
@@ -120,6 +144,35 @@ def _remove_from_vlan_commands(port, vlan_id):
     ]
 
 
+_ERROR_SUBSTRINGS = ("Parsing error:", "Invalid value")
+
+
+def _rejection_error(output):
+    """Return the offending text if `output` carries a genuine device
+    rejection, else None.
+
+    SR Linux's own commit response is ambiguous by itself: "Nothing to
+    commit." is what BOTH a legitimately idempotent no-op call AND a `set`
+    that was rejected outright produce, since a rejected command never
+    enters the candidate for commit to act on. The disambiguator is
+    whether the SET or the COMMIT output itself carried an error marker.
+    A syntax-level rejection surfaces as "Parsing error:" or "Invalid
+    value" somewhere in the `send_config_set` output; a config that
+    parses but is refused for semantic reasons can instead fail only at
+    commit time, surfacing as a line starting with "Error:" (e.g. "Error:
+    Commit failed"). All three were reproduced live against this exact
+    node before being pinned here.
+    """
+    if not output:
+        return None
+    if any(marker in output for marker in _ERROR_SUBSTRINGS):
+        return output.strip()
+    for line in output.splitlines():
+        if line.strip().startswith("Error:"):
+            return output.strip()
+    return None
+
+
 class Driver:
     """Nokia SR Linux Layer 2 switch driver, SSH via netmiko's nokia_srl platform."""
 
@@ -162,13 +215,36 @@ class Driver:
         Real path only (never called in dry-run). commit() is mandatory,
         never optional: a candidate change that is not committed is
         silently not applied.
+
+        Returns {"success": True} on a clean apply (including a
+        legitimate idempotent no-op), or {"success": False, "error": ...}
+        if the SET or the COMMIT output carried a genuine device
+        rejection (see _rejection_error). A detected rejection also
+        discards the candidate so a partially-staged, uncommitted batch
+        never rides along into a later call's commit on this shared
+        session.
         """
         conn = self._connect()
         output = conn.send_config_set(commands)
-        record_command("\n".join(commands), response=output)
+        set_error = _rejection_error(output)
+        record_command(
+            "\n".join(commands), response=output, exit_status="error" if set_error else "ok"
+        )
+
         commit_output = conn.commit()
-        record_command("commit stay", response=commit_output)
-        return output, commit_output
+        commit_error = _rejection_error(commit_output)
+        record_command(
+            "commit stay", response=commit_output, exit_status="error" if commit_error else "ok"
+        )
+
+        error = set_error or commit_error
+        if error:
+            try:
+                conn._discard()
+            except Exception:  # noqa: BLE001 - best-effort cleanup; the failure below still stands
+                pass
+            return {"success": False, "error": error}
+        return {"success": True}
 
     def _record_simulated(self, commands):
         for line in commands:
@@ -211,24 +287,21 @@ class Driver:
         if self.dry_run:
             self._record_simulated(commands)
             return {"success": True, "simulated": True}
-        self._apply(commands)
-        return {"success": True}
+        return self._apply(commands)
 
     def add_to_vlan(self, port, vlan_id, tag="tagged"):
         commands = _add_to_vlan_commands(port, vlan_id, tag)
         if self.dry_run:
             self._record_simulated(commands)
             return {"success": True, "simulated": True}
-        self._apply(commands)
-        return {"success": True}
+        return self._apply(commands)
 
     def remove_from_vlan(self, port, vlan_id):
         commands = _remove_from_vlan_commands(port, vlan_id)
         if self.dry_run:
             self._record_simulated(commands)
             return {"success": True, "simulated": True}
-        self._apply(commands)
-        return {"success": True}
+        return self._apply(commands)
 
     def delete_vlan(self, vlan_id):
         """Delete vlan_id's network-instance.
@@ -241,8 +314,7 @@ class Driver:
         if self.dry_run:
             self._record_simulated(commands)
             return {"success": True, "simulated": True}
-        self._apply(commands)
-        return {"success": True}
+        return self._apply(commands)
 
     def status(self):
         """Reachability check: open a session and read the version banner."""

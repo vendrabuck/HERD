@@ -17,6 +17,14 @@ picks a random, per-run-unique VLAN id so concurrent or repeated runs
 picks from random.randint(100, 4000) for its own throwaway SR Linux VLAN)
 do not collide, and cleans up everything it creates, including on
 assertion failure, so the lab stays re-runnable without a reset.
+
+One test drives a genuine device rejection (an out-of-range vlan id) and
+proves BOTH halves of the contract: the driver reports success: False
+rather than a false success or a raised exception, AND the independent
+docker exec read confirms nothing was actually created on the device. HERD
+keys provisioning success on the driver's returned payload, so the first
+half without the second would not catch a driver that returns the right
+shape while still leaving stray state behind.
 """
 
 from __future__ import annotations
@@ -224,6 +232,44 @@ def test_delete_vlan_on_missing_vlan_is_idempotent():
         driver.logout()
 
     # Still absent; the call was a genuine no-op, not a partial create.
+    assert _info(net_path).strip() == "", _info(net_path)
+
+
+# ---------------------------------------------------------------------------
+# A device rejection must surface as success: False, not a false success and
+# not a raised exception, and must leave nothing on the device. HERD keys
+# provisioning success on this returned payload, so a false success here
+# would make HERD record an ACTIVE VLAN membership the switch never actually
+# accepted (execution_service.py's driver_result_failed helper).
+# ---------------------------------------------------------------------------
+
+
+def test_add_to_vlan_with_out_of_range_vlan_id_fails_and_creates_nothing():
+    # A vlan_id in this range is a VALID subinterface index (0..9999) but
+    # always exceeds the encap vlan-id's valid range (1..4094), so it
+    # reliably reproduces the same rejection every run while still picking a
+    # fresh id per run.
+    vlan_id = _random_vlan_id(4095, 9999)
+    net_instance = f"vlan{vlan_id}"
+    port = "ethernet-1/1"
+    subif_path = f"/interface {port} subinterface {vlan_id}"
+    net_path = f"/network-instance {net_instance}"
+
+    driver = Driver(_context())
+    assert driver.login()["success"] is True
+    try:
+        result = driver.add_to_vlan(port=port, vlan_id=vlan_id, tag="tagged")
+        assert result["success"] is False
+        assert result.get("error"), result
+    finally:
+        driver.logout()
+
+    # Independent verification: a fresh docker exec, never the driver's own
+    # session. A rejected batch must leave the running config untouched, even
+    # though some sibling lines in the same batch (vlan-tagging true, the
+    # bridged subinterface itself) parse fine on their own and would
+    # otherwise have staged into the candidate.
+    assert _info(subif_path).strip() == "", _info(subif_path)
     assert _info(net_path).strip() == "", _info(net_path)
 
 

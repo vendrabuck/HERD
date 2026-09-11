@@ -155,6 +155,88 @@ def test_delete_vlan_sends_exact_command_and_commits():
     assert result == {"success": True}
 
 
+# --- device rejection surfaces as success: False, never an exception -----------
+#
+# HERD keys provisioning success on the driver's returned payload (execution's
+# driver_result_failed helper), so a false "success" for a command the switch
+# actually rejected would make HERD record an ACTIVE VLAN membership that was
+# never really applied. SR Linux's "Nothing to commit." is ambiguous on its
+# own: a rejected `set` never stages, so commit says the same thing a genuine
+# idempotent no-op says. These tests pin the error-marker scan that tells the
+# two apart, on both the set output and the commit output, plus the
+# discard-on-rejection cleanup that protects the next call in the same
+# shared session.
+
+
+def test_create_vlan_returns_failure_when_set_output_has_parsing_error():
+    conn = MagicMock()
+    conn.send_config_set.return_value = "Parsing error: Unknown token 'network-instance'."
+    conn.commit.return_value = "commit stay\nNothing to commit. Starting new transaction."
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).create_vlan(100)
+    assert result["success"] is False
+    assert "Parsing error:" in result["error"]
+    conn._discard.assert_called_once()
+
+
+def test_add_to_vlan_returns_failure_when_commit_output_has_invalid_value():
+    conn = MagicMock()
+    conn.send_config_set.return_value = "(ok, no error in the set output)"
+    conn.commit.return_value = (
+        'Invalid value "9999": Does not match any of the union types:\n'
+        "    Must be an integer in range 1..4094"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).add_to_vlan(port="ethernet-1/1", vlan_id=9999, tag="tagged")
+    assert result["success"] is False
+    assert "Invalid value" in result["error"]
+    conn._discard.assert_called_once()
+
+
+def test_remove_from_vlan_returns_failure_on_error_prefixed_commit_line():
+    """A config that parses cleanly can still be refused only at commit
+    time, e.g. a semantic inconsistency between two otherwise-valid lines
+    in the same batch (reproduced live: "vlan tagging true inconsistent
+    with subinterface 9999"). That surfaces as a line starting with
+    "Error:" rather than "Parsing error:" or "Invalid value"."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = "(ok, no error in the set output)"
+    conn.commit.return_value = (
+        "commit stay\n"
+        "Error in /interface[name=ethernet-1/1]/vlan-tagging:\n"
+        "    vlan tagging true inconsistent with subinterface 9999\n"
+        "Error: Commit failed"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_from_vlan(port="ethernet-1/1", vlan_id=9999)
+    assert result["success"] is False
+    assert "Commit failed" in result["error"]
+    conn._discard.assert_called_once()
+
+
+def test_clean_apply_still_returns_success_and_never_discards():
+    conn = MagicMock()
+    conn.send_config_set.return_value = "set / network-instance vlan100 type mac-vrf"
+    conn.commit.return_value = "commit stay\nAll changes have been committed."
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).create_vlan(100)
+    assert result == {"success": True}
+    conn._discard.assert_not_called()
+
+
+def test_nothing_to_commit_with_no_error_marker_is_still_success():
+    """The idempotent-no-op case, pinned distinctly from the failure case
+    above: both produce "Nothing to commit.", but only the failure case
+    carries an error marker anywhere in the set or commit output."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = "set / network-instance vlan100 type mac-vrf"
+    conn.commit.return_value = "commit stay\nNothing to commit. Starting new transaction."
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).create_vlan(100)
+    assert result == {"success": True}
+    conn._discard.assert_not_called()
+
+
 # --- commit is issued for every mutating operation, one session is reused ------
 
 

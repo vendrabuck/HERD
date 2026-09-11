@@ -674,6 +674,22 @@ anyone writing the next real L2 driver against different gear:
 - Config is transactional: netmiko's `nokia_srl` platform enters candidate mode
   automatically, and this driver calls `commit()` (`commit stay`) after every mutating
   batch. A candidate change that is never committed is silently never applied.
+- A device rejection is reported as `{"success": False, "error": ...}`, never a raised
+  exception and never a false `{"success": True}`: HERD keys provisioning success on the
+  driver's returned payload (`driver_result_failed` in
+  `services/execution/app/services/execution_service.py`), so a false success would make
+  HERD record an ACTIVE VLAN membership the switch never actually accepted. Every
+  mutating method scans both the `set` and the `commit` output for a genuine rejection
+  marker (`Parsing error:`, `Invalid value`, or a line starting with `Error:`, all
+  reproduced live against this exact node). This is also what disambiguates
+  `create_vlan`/`delete_vlan` idempotency from a false success: SR Linux's own
+  `"Nothing to commit."` is what BOTH a legitimately idempotent no-op AND a rejected
+  `set` that never staged produce, and the error-marker scan, not that text, is what
+  tells them apart. A detected rejection also discards the candidate
+  (`conn._discard()`), because a partially-staged batch (some lines valid, one rejected)
+  can leave the candidate dirty even though nothing committed; since mutating calls to
+  one switch share a login/logout session, an undiscarded dirty candidate would
+  otherwise silently ride along into the next call's commit.
 
 See `docs/NOS_LAB.md` for the live lab this driver is verified against, including the
 `[FACTORY]` config-mode trap a factory-fresh node hits before its baseline is applied.
