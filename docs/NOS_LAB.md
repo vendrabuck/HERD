@@ -82,6 +82,12 @@ this phase is opt-in only, so a host that never runs it pays nothing for it.
   netmiko session that made it (a separate `docker exec` into the
   container, never the driver's own status method), and cleans up
   afterward so the lab stays re-runnable without a reset.
+- `tests/nos_lab/test_frr_l3_driver_live.py` , opt-in, same gating as above,
+  drives the checked-in `drivers/frr_l3` Layer 3 Switch reference driver
+  (not raw netmiko) against the FRR node, verifying every route change
+  independently via `docker exec ... vtysh` and covering both route forms
+  plus the driver's idempotency behavior; see docs/DRIVERS.md's "FRR
+  reference driver" section.
 
 ## The `[FACTORY]` trap and why the baseline exists
 

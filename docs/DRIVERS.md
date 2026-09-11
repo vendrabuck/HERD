@@ -789,6 +789,37 @@ also accept full config pushes through those paths must implement it; the checke
 | remove_route | `{"success": bool}` |
 | status | `{"reachable": bool}` |
 
+### FRR reference driver
+
+`drivers/frr_l3/driver.py` is the reference real implementation of the Layer 3
+Switch contract: SSH to an FRR router's vtysh shell (netmiko, `cisco_ios`
+platform), the same device and transport as `drivers/frr_mgmt` (see the
+Management driver contract below), driving `configure_route`/`remove_route`
+instead of raw config lines. It maps the contract onto vtysh as:
+
+- `configure_route(destination, next_hop, interface)` sends
+  `ip route <destination> <next_hop>` when `next_hop` is given, or
+  `ip route <destination> <interface>` when `next_hop` is `None` (an interface
+  route).
+- `remove_route` sends the same line prefixed with `no `.
+- `status()` opens a session and checks the `show version` banner, returning
+  `{"reachable": bool}`, matching the table above (not `{"success": ...}`).
+
+Idempotency (verified live against the checked-in NOS test lab's FRR node,
+`docs/NOS_LAB.md`, and not currently stated as a rule for L3 anywhere else in
+this document): re-sending an already-configured route is a silent no-op on
+real FRR (no error, identical output to the first apply), so
+`configure_route` needs no special handling to be idempotent. Removing an
+already-removed route gets a benign CLI warning,
+`% Refusing to remove a non-existent route`, but netmiko does not raise for
+it; this driver does not parse command output for embedded CLI errors
+(matching `drivers/frr_mgmt`), so that case still reports `{"success": True}`,
+since the desired end state (the route is gone) already holds. Both methods
+are therefore idempotent under redelivery, the same guarantee the Layer 2
+contract states explicitly for `create_vlan`. `tests/nos_lab/test_frr_l3_driver_live.py`
+is the live evidence for this decision; `tests/unit/test_frr_l3_driver.py`
+pins it in the stack-free suite.
+
 ## Management driver contract
 
 The Management connection type is implemented (it is the worked example in the
