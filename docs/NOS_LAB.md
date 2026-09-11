@@ -88,6 +88,14 @@ this phase is opt-in only, so a host that never runs it pays nothing for it.
   independently via `docker exec ... vtysh` and covering both route forms
   plus the driver's idempotency behavior; see docs/DRIVERS.md's "FRR
   reference driver" section.
+- `tests/nos_lab/test_srl_l2_driver_live.py` , the same opt-in gating,
+  scoped to the SR Linux node only. Exercises the real
+  `drivers/srl_l2/driver.py` (Nokia SR Linux Layer 2 Switch driver, see
+  `docs/DRIVERS.md`) end to end: create a VLAN, add a port to it tagged and
+  untagged, verify the mac-vrf and the port binding independently via
+  `sr_cli` (never through the driver's own session), prove `create_vlan`
+  idempotency and `delete_vlan`-on-a-missing-VLAN, then remove and delete
+  and verify both are gone.
 
 ## The `[FACTORY]` trap and why the baseline exists
 

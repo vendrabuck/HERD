@@ -1,0 +1,7 @@
+{
+  "name": "Nokia SR Linux Layer 2 Switch Driver",
+  "version": "0.1.0",
+  "connection_type": "Layer 2 Switch",
+  "supports_dry_run": true,
+  "notes": "Manages VLANs as mac-vrf network-instances over SSH (netmiko, nokia_srl platform). All mutating methods honor context['dry_run']. Connection params: HERD_ip, HERD_login, HERD_password, optional HERD_port."
+}

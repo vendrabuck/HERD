@@ -106,6 +106,24 @@
   Routing panel mockup in the wiring section, `user-live-editing.html#fork`
   gains one sentence on the fork-diff "Routing changed" line, and
   `glossary.html` gains a Routing intent term.
+- Added `drivers/srl_l2/`, HERD's first real (non-mock) Layer 2 Switch
+  driver: Nokia SR Linux over SSH via netmiko's `nokia_srl` platform,
+  modeled structurally on `drivers/frr_mgmt/` (HERD_-prefixed connection
+  params, dry-run gating, `record_command`, `DriverError` on missing
+  connection params) but mapping VLANs onto SR Linux's mac-vrf
+  network-instance model instead of Cisco's flat `vlan <id>` object: a
+  VLAN is a `network-instance vlan<id> type mac-vrf`, and a port joins it
+  through a tagged-or-untagged bridged subinterface plus a binding. Every
+  mutating command is issued as an absolute `set /` or `delete /` path, a
+  load-bearing detail: SR Linux's candidate-mode CLI otherwise carries a
+  "current context" across commands in the same session that an
+  unqualified command can silently inherit. `create_vlan` and
+  `delete_vlan` are idempotent by construction (SR Linux treats a
+  redefinition or a delete-of-missing as a no-op commit), proven live, not
+  merely asserted, in the new `tests/nos_lab/test_srl_l2_driver_live.py`.
+  `tests/unit/test_srl_l2_driver.py` pins the exact command text for the
+  tagged and untagged forms and the commit-per-mutating-op invariant with
+  netmiko mocked. See `docs/DRIVERS.md` and `docs/NOS_LAB.md`.
 
 ## [0.4.0] - 2026-09-05
 

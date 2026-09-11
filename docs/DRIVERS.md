@@ -634,6 +634,52 @@ to the driver.
 
 ---
 
+## Reference implementation: Nokia SR Linux (drivers/srl_l2)
+
+`drivers/srl_l2/` is the first real (non-mock) Layer 2 Switch driver, driving Nokia SR
+Linux over SSH via netmiko's `nokia_srl` platform. Its structural shape mirrors
+`drivers/frr_mgmt/` (HERD_-prefixed connection params, dry-run gating via
+`context["dry_run"]`, `record_command`, `DriverError` on missing connection params), but
+SR Linux's Layer 2 model is NOT Cisco-shaped, and the mapping is worth spelling out for
+anyone writing the next real L2 driver against different gear:
+
+- There is no bare "VLAN" object a port references directly. A VLAN is a
+  `network-instance <name> type mac-vrf`; this driver derives the name deterministically
+  from the vlan id as `vlan<id>` (`create_vlan` / `delete_vlan`).
+- Adding a port to a VLAN is two steps on the interface plus one binding: enable
+  `vlan-tagging` on the port, define a bridged `subinterface <vlan_id>` on it (the
+  subinterface index is the vlan id itself), give that subinterface a `vlan encap
+  single-tagged vlan-id <vlan_id>` (or, for `tag="untagged"`, a bare `vlan encap
+  untagged`), then bind `<port>.<vlan_id>` into the network-instance (`add_to_vlan`).
+  `remove_from_vlan` deletes the subinterface and the binding, but deliberately leaves
+  `vlan-tagging` set on the port: that flag is not tied to any one vlan_id, and the port
+  may still carry other VLANs on other subinterfaces.
+- Every mutating command is issued as an ABSOLUTE path, `set /...` or `delete /...`,
+  never a bare relative one. This is load-bearing: SR Linux's candidate-mode CLI keeps a
+  "current context" that a prior command in the same session can silently change. A
+  command with no trailing scalar value, such as `network-instance vlan100 interface
+  ethernet-1/1.100`, is treated as "enter that list entry", and the CLI navigates the
+  session into it; since HERD shares one login/logout session across several mutating
+  calls to the same switch, the NEXT command is then parsed relative to that stale
+  context instead of the root, and an otherwise-correct command fails with a "Parsing
+  error: Unknown token" it would never hit issued alone. A leading `/` roots every
+  command and leaves the session at the top-level context afterward regardless of what
+  the command itself did. This was found empirically against the checked-in lab
+  (`docs/NOS_LAB.md`), not inferred from vendor docs.
+- `create_vlan` and `delete_vlan` are idempotent by construction, not by any
+  special-casing in the driver: SR Linux's own candidate/commit model treats redefining
+  an already-identical network-instance, or deleting a path that does not exist, as a
+  no-op commit ("Nothing to commit."). Both are proven live in
+  `tests/nos_lab/test_srl_l2_driver_live.py`, not merely asserted.
+- Config is transactional: netmiko's `nokia_srl` platform enters candidate mode
+  automatically, and this driver calls `commit()` (`commit stay`) after every mutating
+  batch. A candidate change that is never committed is silently never applied.
+
+See `docs/NOS_LAB.md` for the live lab this driver is verified against, including the
+`[FACTORY]` config-mode trap a factory-fresh node hits before its baseline is applied.
+
+---
+
 ## Layer 3 Switch driver contract
 
 Layer 3 switches provide routed forwarding between reserved segments. The execution
