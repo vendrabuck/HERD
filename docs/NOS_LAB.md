@@ -164,6 +164,45 @@ HERD_TEST_NOS_REQUIRED=1 uv run pytest tests/nos_lab/test_frr_l3_via_stack_live.
 make nos-detach
 ```
 
+## Phase 3b proof: a real Layer 2 VLAN membership through HERD's own API
+
+`tests/nos_lab/test_srl_l2_via_stack_live.py` is the Layer 2 counterpart of the
+phase 3a proof above: it proves HERD derives a Layer 2 VLAN membership from a
+reservation's wiring (ADR 0009: membership is derived from RECORDED HOPS, not
+per-hop deltas, and always full-reconciles on a `reservation.wiring_changed`
+event) and configures it on the real SR Linux node through HERD's execution
+service and driver sandbox, not by calling `drivers/srl_l2` directly.
+
+Unlike the phase 3a test, it reuses the SEEDED `nos-lab-dut-1`,
+`nos-lab-dut-2`, and `nos-lab-srl` devices and their cabling (run
+`scripts/seed_nos_lab.sh` first) rather than creating throwaway devices:
+membership derivation depends on cabling's pathfinder walking a real physical
+connections graph, which only exists between the seeded lab devices. It wires
+the two DUTs together on a topology canvas with no switch node (the pathfinder
+resolves it through the real switch's `ethernet-1/1`/`ethernet-1/2` ports),
+activates a reservation over it, and saves the fork to drive the
+connection-driven L2 reconcile. It reads the VLAN id HERD allocated from
+`GET /reservations/{id}/wiring-status` instead of assuming a number,
+independently verifies on the real device that the `mac-vrf` network-instance
+exists AND both subinterfaces are bound into it, cancels the reservation, and
+independently verifies both the bindings and the VLAN definition are gone,
+cross-checking HERD's own ledger (RELEASED) against the device at each step.
+
+Same gating, credential-export, and cleanup discipline as the phase 3a test.
+Run it with:
+
+```bash
+make up
+make nos-up
+make nos-attach
+bash scripts/seed_nos_lab.sh
+export SUPERADMIN_EMAIL=$(grep -E '^SUPERADMIN_EMAIL=' .env | head -1 | cut -d= -f2-)
+export SUPERADMIN_PASSWORD=$(grep -E '^SUPERADMIN_PASSWORD=' .env | head -1 | cut -d= -f2-)
+
+HERD_TEST_NOS_REQUIRED=1 uv run pytest tests/nos_lab/test_srl_l2_via_stack_live.py -v
+make nos-detach
+```
+
 ## Tests
 
 - `tests/unit/test_nos_lab_compose.py` , static, runs in CI with no lab: pins
