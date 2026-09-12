@@ -38,5 +38,5 @@ dev = [
     "selenium>=4.48.0",
     "playwright>=1.62.0",
     "pytest-timeout>=2.4.0",
-    "locust>=2.46.4",
+    "locust>=2.46.5",
 ]
