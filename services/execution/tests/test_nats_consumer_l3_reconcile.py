@@ -186,14 +186,31 @@ def _l3_recorder(fail=None):
     return execute_fn, calls
 
 
-def _patches(execute_fn, fork_wires, config_fetch=_config_fetch, l3_routes=None):
+def _patches(
+    execute_fn, fork_wires, config_fetch=_config_fetch, l3_routes=None, driver_metadata=None
+):
     wires_return = ForkIntent(fork_wires, l3_routes) if l3_routes is not None else fork_wires
+    # ADR 0014 addendum X-G (issue #755): the capability claim execution reads
+    # from the driver's cached metadata. Defaults to the real function, which
+    # finds no DriverCache row in these in-memory tests and so answers
+    # DEFAULT_DRIVER_METADATA (supports_vrf False), the closed-by-default case.
+    metadata_patches = (
+        [
+            patch(
+                "app.services.driver_loader.get_driver_metadata",
+                new=AsyncMock(return_value=driver_metadata),
+            )
+        ]
+        if driver_metadata is not None
+        else []
+    )
     return [
         patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device_fetch)),
         patch(
             "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
+        *metadata_patches,
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
         patch(
             "app.services.nats_consumer._fetch_fork_intended_wires",
@@ -208,7 +225,13 @@ def _patches(execute_fn, fork_wires, config_fetch=_config_fetch, l3_routes=None)
 
 
 async def _reconcile(
-    fork_wires, fork_version=1, execute_fn=None, calls=None, config_fetch=None, l3_routes=None
+    fork_wires,
+    fork_version=1,
+    execute_fn=None,
+    calls=None,
+    config_fetch=None,
+    l3_routes=None,
+    driver_metadata=None,
 ):
     if execute_fn is None:
         execute_fn, calls = _l3_recorder()
@@ -217,6 +240,8 @@ async def _reconcile(
         kwargs["config_fetch"] = config_fetch
     if l3_routes is not None:
         kwargs["l3_routes"] = l3_routes
+    if driver_metadata is not None:
+        kwargs["driver_metadata"] = driver_metadata
     with ExitStack() as stack:
         for p in _patches(execute_fn, fork_wires, **kwargs):
             stack.enter_context(p)
@@ -525,16 +550,30 @@ async def test_provision_wraps_routes_in_one_login_logout():
 # --- executor tests in test_nats_consumer_l3.py were deleted for ADR 0009 phase 7) ---
 
 
-def test_route_run_identity_packs_three_fields():
+def test_route_run_identity_packs_four_fields():
     """A route's idempotency identity puts destination in port_a and packs
-    interface plus next_hop into port_b as "interface|next_hop"; a None next_hop
-    renders as an empty string."""
+    interface, next_hop, and virtual_router into port_b as
+    "interface|next_hop|virtual_router"; an absent next_hop or virtual_router
+    renders as an empty string (ADR 0014 addendum X-G, issue #755, widened the
+    packing from three fields to four)."""
     assert _route_run_identity("10.0.0.0/24", "192.168.1.1", "eth0") == (
         "10.0.0.0/24",
-        "eth0|192.168.1.1",
+        "eth0|192.168.1.1|",
     )
-    # None next_hop (an interface route) renders empty after the pipe.
-    assert _route_run_identity("10.1.0.0/24", None, "eth1") == ("10.1.0.0/24", "eth1|")
+    # None next_hop (an interface route) renders empty between the pipes.
+    assert _route_run_identity("10.1.0.0/24", None, "eth1") == ("10.1.0.0/24", "eth1||")
+
+
+def test_route_run_identity_distinguishes_routes_that_differ_only_by_vrf():
+    """Two routes identical but for their VRF land in different kernel routing
+    tables on the device, so they must NOT collapse into one guarded action
+    (the same non-collapse property ECMP siblings have)."""
+    default_table = _route_run_identity("10.0.0.0/24", "192.168.1.1", "eth0", None)
+    in_blue = _route_run_identity("10.0.0.0/24", "192.168.1.1", "eth0", "blue")
+    in_green = _route_run_identity("10.0.0.0/24", "192.168.1.1", "eth0", "green")
+    assert default_table != in_blue
+    assert in_blue != in_green
+    assert in_blue == ("10.0.0.0/24", "eth0|192.168.1.1|blue")
 
 
 async def test_config_fetch_5xx_raises_transient_for_nak():
@@ -1255,6 +1294,93 @@ async def test_vrf_route_on_delta_fails_via_reconcile_failed_path():
     assert rows[0].status == "FAILED"
     assert rows[0].last_error == "l3_vrf_unsupported"
     assert {r["destination"] for r in rows[0].routes} == {"10.20.0.0/24"}
+
+
+# --- X-G: the VRF refusal is capability-conditional, and the keyword only
+# --- reaches a driver that declared support (issue #755) --------------------
+
+
+def _kwargs_recorder():
+    """(execute_fn, calls): records (action, method_kwargs) for every sandbox op,
+    so a test can assert on the EXACT keyword set a driver would receive."""
+    calls = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        calls.append((action, dict(kwargs.get("method_kwargs") or {})))
+        return SUCCESS_RESULT
+
+    return execute_fn, calls
+
+
+async def test_vrf_route_drives_when_the_driver_declares_supports_vrf():
+    """The mirror of test_vrf_route_fails_switch_with_no_driver_call: the SAME
+    intent, against a driver whose cached metadata declares supports_vrf, passes
+    the gate and is driven with the virtual_router keyword."""
+    execute_fn, calls = _kwargs_recorder()
+    intent = [_intent_route("10.30.0.0/24", "eth2", virtual_router="blue")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        execute_fn=execute_fn,
+        l3_routes={SW_L3: intent},
+        driver_metadata={"supports_dry_run": False, "supports_vrf": True},
+    )
+    configure = [kw for action, kw in calls if action == "configure_route"]
+    assert len(configure) == 1, f"expected exactly one configure_route, got {calls!r}"
+    assert configure[0]["virtual_router"] == "blue"
+    assert configure[0]["destination"] == "10.30.0.0/24"
+    rows = await _rows("ACTIVE")
+    assert len(rows) == 1 and rows[0].last_error is None
+
+
+async def test_declaring_driver_receives_virtual_router_null_for_a_default_table_route():
+    """X-G: a declaring driver receives the keyword on EVERY route call, null
+    included, so it never has to guess whether the absence means "default table"
+    or "an older HERD"."""
+    execute_fn, calls = _kwargs_recorder()
+    intent = [_intent_route("10.30.0.0/24", "eth2")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        execute_fn=execute_fn,
+        l3_routes={SW_L3: intent},
+        driver_metadata={"supports_dry_run": False, "supports_vrf": True},
+    )
+    configure = [kw for action, kw in calls if action == "configure_route"]
+    assert len(configure) == 1
+    assert "virtual_router" in configure[0]
+    assert configure[0]["virtual_router"] is None
+
+
+async def test_non_declaring_driver_is_never_handed_the_virtual_router_keyword():
+    """The trap X-G exists to close: every shipped L3 signature ends in **_, so a
+    non-declaring driver handed the keyword would swallow it in silence. It must
+    not appear in method_kwargs AT ALL, not even as None."""
+    execute_fn, calls = _kwargs_recorder()
+    intent = [_intent_route("10.30.0.0/24", "eth2")]
+    await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        execute_fn=execute_fn,
+        l3_routes={SW_L3: intent},
+        driver_metadata={"supports_dry_run": True},
+    )
+    configure = [kw for action, kw in calls if action == "configure_route"]
+    assert len(configure) == 1
+    assert "virtual_router" not in configure[0], (
+        f"a driver that never declared supports_vrf received the keyword: {configure[0]!r}"
+    )
+
+
+async def test_vrf_route_still_fails_when_the_driver_declares_only_dry_run():
+    """A driver with metadata but no supports_vrf key is a non-declaring driver:
+    the flag is opt-in, so an unrelated declaration never grants VRF support."""
+    intent = [_intent_route("10.30.0.0/24", "eth2", virtual_router="red")]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        driver_metadata={"supports_dry_run": True},
+    )
+    assert calls == []
+    rows = await _rows("FAILED")
+    assert len(rows) == 1 and rows[0].last_error == "l3_vrf_unsupported"
 
 
 # --- X-E: the shared herd_common identity is what the delta diffs on --------

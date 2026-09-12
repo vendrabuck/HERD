@@ -452,18 +452,32 @@ class _FetchContext:
         return self._config_cache[device_id]
 
 
-def _route_run_identity(destination, next_hop, interface) -> tuple[str, str]:
+def _route_run_identity(destination, next_hop, interface, virtual_router=None) -> tuple[str, str]:
     """Identity of one route within a switch+action, for the idempotency guard.
 
     ExecutionRun exposes two free-form columns (port_a/port_b), but a route is
-    uniquely identified by three fields: (destination, next_hop, interface). Two
-    routes to the same prefix out the same interface via different next hops are
-    distinct ECMP paths and must NOT collapse into one guarded action. So
-    destination goes in port_a, and next_hop plus interface are packed into
-    port_b, letting all three fields participate in action_already_succeeded.
-    next_hop may be None (an interface route); it renders as empty.
+    uniquely identified by FOUR fields: (destination, next_hop, interface,
+    virtual_router). Two routes to the same prefix out the same interface via
+    different next hops are distinct ECMP paths and must NOT collapse into one
+    guarded action; since ADR 0014 addendum X-G (issue #755) the same is true of
+    two routes differing only by VRF, which are distinct rows in cabling's
+    fork_l3_routes (the four-field `route_identity_key`, X-E) and land in
+    different kernel routing tables on the device. So destination goes in port_a,
+    and interface, next hop, and virtual router are packed into port_b, letting
+    all four fields participate in action_already_succeeded.
+
+    next_hop may be None (an interface route) and virtual_router may be None (a
+    default-table route); both render as empty. Widening port_b DOES change the
+    string an existing default-table pin produced before X-G ("eth0|10.0.0.2"
+    becomes "eth0|10.0.0.2|"), so a run recorded by an older build no longer
+    satisfies ``action_already_succeeded`` and a redelivery re-drives it once.
+    That is accepted rather than worked around with a compatibility read: both
+    L3 driver methods are idempotent under redelivery by contract
+    (docs/DRIVERS.md), so the cost is one extra call per pre-upgrade route on
+    the first redelivery after the upgrade, and a dual-key lookup would have to
+    be carried forever to save it.
     """
-    return destination, f"{interface}|{next_hop or ''}"
+    return destination, f"{interface}|{next_hop or ''}|{virtual_router or ''}"
 
 
 # --- Dynamic resources (ADR 0004, issue #32) --------------------------------
@@ -2917,10 +2931,73 @@ def _validate_route_at_drive_time(
     )
 
 
+async def _l3_driver_supports_vrf(switch_id: str, ctx: "_FetchContext", get_db_session) -> bool:
+    """Whether this switch's driver declares ``supports_vrf`` (ADR 0014 addendum
+    X-G, issue #755).
+
+    Reads the cached driver metadata, but calls ``load_driver`` first, which is
+    a cache hit and a no-op once the package is known: the gate runs BEFORE
+    ``_apply_l3_adjacency``'s own load, so on a cold cache (the first drive
+    after an execution restart, or a driver this service has never loaded)
+    ``get_driver_metadata`` would answer with DEFAULT_DRIVER_METADATA and park a
+    perfectly drivable VRF route as ``l3_vrf_unsupported``. Loading first is
+    also what ``get_driver_metadata``'s own contract asks of a caller that needs
+    the freshest metadata, since it keys on driver_id alone while
+    ``load_driver`` re-extracts on a SHA256 change.
+
+    Fail-closed on anything it cannot resolve (the switch is gone from
+    inventory, it carries no driver, or the package will not load): a route is
+    refused rather than driven through a driver whose VRF support is unproven,
+    because every shipped L3 signature ends in ``**_`` and would swallow the
+    keyword in silence. A transport failure reaching inventory propagates as
+    ``TransientUpstreamError`` instead, exactly like the config re-validation
+    below, so an outage defers the drive rather than recording a wrong reason.
+
+    Called only when a route set actually names a VRF, so the ordinary
+    default-table drive pays nothing for it.
+    """
+    from app.services.driver_loader import get_driver_metadata, load_driver
+
+    switch_data = await ctx.get_device(switch_id)
+    if not switch_data or not switch_data.get("driver_id"):
+        logger.warning(
+            "L3 VRF capability check: switch %s has no resolvable driver; "
+            "refusing its VRF routes (ADR 0014 addendum X-G)",
+            switch_id,
+        )
+        return False
+    driver_id = uuid.UUID(switch_data["driver_id"])
+    async with get_db_session() as db:
+        try:
+            await load_driver(
+                db,
+                driver_id,
+                switch_data.get("driver_sha256", "unknown"),
+                switch_data.get("driver_filename", "driver.zip"),
+                switch_data.get("connection_type", "Layer 3 Switch"),
+            )
+        except RuntimeError as exc:
+            # Download failure: inventory is unreachable, which is transient.
+            raise TransientUpstreamError(
+                f"cannot read driver metadata for L3 switch {switch_id}: {exc}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - a broken package proves no capability
+            logger.warning(
+                "L3 VRF capability check: driver for switch %s will not load (%s); "
+                "refusing its VRF routes (ADR 0014 addendum X-G)",
+                switch_id,
+                exc,
+            )
+            return False
+        metadata = await get_driver_metadata(db, driver_id)
+    return bool(metadata.get("supports_vrf", False))
+
+
 async def _gate_l3_drive_routes(
     switch_id: str,
     routes: list[dict],
     ctx: "_FetchContext",
+    get_db_session,
 ) -> tuple[list[dict], str | None]:
     """Pre-flight gate for one switch's intent-driven route set, before any
     driver call (ADR 0014 addenda X-A and X-F, issue #34 phase 3).
@@ -2932,13 +3009,16 @@ async def _gate_l3_drive_routes(
     ... no driver call"). Returns ``([], reason)`` when the switch must land
     FAILED with that reason and drive nothing.
 
-    X-F runs first and unconditionally (no inventory call needed): a route
-    naming a ``virtual_router`` can never be driven, since the driver contract
-    has no VRF concept (issue #755, tracked follow-up). Its presence fails the
-    WHOLE switch with ``l3_vrf_unsupported`` regardless of validation
+    X-F runs first: a route naming a ``virtual_router`` fails the WHOLE switch
+    with ``l3_vrf_unsupported`` and drives nothing, regardless of validation
     staleness, since the ledger pins one route list per switch and there is no
     way to drive "everything except the VRF routes" while still recording an
-    honest pin.
+    honest pin. Since ADR 0014 addendum X-G (issue #755) that refusal is
+    CAPABILITY-CONDITIONAL rather than unconditional: the driver contract now
+    carries ``virtual_router``, so a switch whose driver declares
+    ``supports_vrf`` passes this check and is driven with the keyword, while a
+    switch whose driver does not is still refused here. The check costs nothing
+    for a route set that names no VRF: it is only reached when one does.
 
     X-A then re-validates only when warranted: a route's own
     ``validated_config_version_id`` is missing, or does not match the switch's
@@ -2957,8 +3037,8 @@ async def _gate_l3_drive_routes(
     derivation or the X-B intent override, so attachment is an invariant of
     being called at all, not something this gate re-verifies.
     """
-    for route in routes:
-        if route.get("virtual_router"):
+    if any(route.get("virtual_router") for route in routes):
+        if not await _l3_driver_supports_vrf(switch_id, ctx, get_db_session):
             return [], "l3_vrf_unsupported"
 
     stale = any(route.get("validated_config_version_id") is None for route in routes)
@@ -3002,6 +3082,7 @@ async def _drive_l3_route(
     redacted: dict,
     res_uuid: uuid.UUID,
     route: dict,
+    supports_vrf: bool = False,
 ) -> tuple[bool, int, str | None]:
     """Drive one configure_route/remove_route call: create the execution_run row,
     run the sandbox call with result gating, and record the outcome.
@@ -3011,6 +3092,18 @@ async def _drive_l3_route(
     Decision 3, issue #34 phase 3: remove_route for the departing routes,
     configure_route for the arriving ones, within the SAME login/logout), so the
     run bookkeeping and result gating are identical regardless of which drove it.
+
+    ``supports_vrf`` is the driver package's own declaration (ADR 0014 addendum
+    X-G, issue #755), read from its cached metadata after the package loaded.
+    It gates the ``virtual_router`` keyword and NOTHING else: a declaring driver
+    receives it on EVERY route call (null for a default-table route), and a
+    non-declaring driver never receives it at all, not even as null. That
+    asymmetry is the whole point: every shipped L3 signature ends in ``**_``, so
+    a non-declaring driver handed the keyword would swallow it in silence,
+    install the route in the default table, and report success. The run identity
+    packs the VRF either way, since it records what was INTENDED, and a switch
+    whose driver does not declare support never reaches here at all (the X-F
+    gate refuses it with ``l3_vrf_unsupported``).
     """
     from datetime import datetime, timezone
 
@@ -3019,8 +3112,11 @@ async def _drive_l3_route(
     destination = route.get("destination")
     next_hop = route.get("next_hop")
     interface = route.get("interface")
-    ident_a, ident_b = _route_run_identity(destination, next_hop, interface)
+    virtual_router = route.get("virtual_router")
+    ident_a, ident_b = _route_run_identity(destination, next_hop, interface, virtual_router)
     route_kwargs = {"destination": destination, "next_hop": next_hop, "interface": interface}
+    if supports_vrf:
+        route_kwargs["virtual_router"] = virtual_router
     run = await create_execution_run(
         db,
         switch_uuid,
@@ -3113,7 +3209,7 @@ async def _apply_l3_adjacency(
     """
     from datetime import datetime, timezone
 
-    from app.services.driver_loader import load_driver
+    from app.services.driver_loader import get_driver_metadata, load_driver
     from app.services.execution_service import (
         build_context,
         create_execution_run,
@@ -3201,6 +3297,7 @@ async def _apply_l3_adjacency(
         driver_id = None
         driver_sha256 = "unknown"
         driver_path = None
+        supports_vrf = False
         if load_error is None:
             driver_id = uuid.UUID(switch_data["driver_id"])
             driver_sha256 = switch_data.get("driver_sha256", "unknown")
@@ -3215,6 +3312,16 @@ async def _apply_l3_adjacency(
                     )
                 except Exception as exc:  # noqa: BLE001 - a load failure strands the switch
                     load_error = f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: {exc}"
+                else:
+                    # ADR 0014 addendum X-G (issue #755): read the capability
+                    # claim from the metadata the load just cached, so the
+                    # `virtual_router` keyword reaches only a driver that
+                    # declared it. Read AFTER load_driver, never before: the
+                    # cache row is what load_driver writes, and it is keyed on
+                    # driver_id alone, so a pre-load read can answer from a
+                    # stale SHA256's metadata.
+                    metadata = await get_driver_metadata(db, driver_id)
+                    supports_vrf = bool(metadata.get("supports_vrf", False))
 
         if load_error is not None or driver_path is None:
             async with get_db_session() as db:
@@ -3303,6 +3410,7 @@ async def _apply_l3_adjacency(
                     redacted,
                     res_uuid,
                     route,
+                    supports_vrf,
                 )
                 if not ok:
                     switch_ok = False
@@ -3467,7 +3575,9 @@ async def _reconcile_l3_adjacency(
     for switch_id in add_switches:
         intent_routes = l3_intent.get(switch_id)
         if intent_routes:
-            clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+            clean, reason = await _gate_l3_drive_routes(
+                switch_id, intent_routes, ctx, get_db_session
+            )
             if reason is not None:
                 async with get_db_session() as db:
                     await record_route_failed(
@@ -3515,7 +3625,7 @@ async def _reconcile_l3_adjacency(
         intent_keys = _route_set_identity_keys(intent_routes)
         if pinned_keys == intent_keys:
             continue  # unchanged: no drive, no bookkeeping (S5's delta-gating shape)
-        clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+        clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx, get_db_session)
         if reason is not None:
             async with get_db_session() as db:
                 await record_route_reconcile_failed(

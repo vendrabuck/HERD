@@ -712,7 +712,9 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
                 intent_routes = l3_intent_by_switch.get(switch_id)
                 if intent_routes:
                     try:
-                        clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx)
+                        clean, reason = await _gate_l3_drive_routes(
+                            switch_id, intent_routes, ctx, get_db_session
+                        )
                     except TransientUpstreamError as exc:
                         # Isolated to THIS row (review fix): an inventory 5xx while
                         # re-validating one switch's intent must never propagate out
