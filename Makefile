@@ -455,9 +455,12 @@ test-load-ui:  ## Run locust with its web UI (needs a running stack)
 # the container start, and the host-side Chromium can observe the new veth's
 # address churn mid-load: net::ERR_NETWORK_CHANGED on the app bundle, an empty
 # root element, and a 30s login timeout on the first Playwright test.
+# --wait-timeout bounds that wait (issue #783): without it a wedged Grid
+# healthcheck blocks here indefinitely with no diagnostic; compose fails
+# with a clear "container ... did not become healthy" message instead.
 _test-e2e-run:
 	-docker compose --profile e2e rm -fsv selenium
-	docker compose --profile e2e up -d --force-recreate --wait selenium
+	docker compose --profile e2e up -d --force-recreate --wait --wait-timeout 120 selenium
 	uv run playwright install chromium  # no-op once cached; on a fresh host, missing OS libs need: uv run playwright install --with-deps chromium (sudo)
 	@uv run python -c "import os, tempfile; print('e2e failure artifacts (if any) go to: ' + (os.environ.get('HERD_E2E_ARTIFACT_DIR') or os.path.join(tempfile.gettempdir(), 'herd-e2e-artifacts')))"
 	uv run pytest tests/e2e/ -v --tb=short
@@ -673,10 +676,32 @@ nos-attach:  ## Attach the NOS test lab containers to the dev stack's network (m
 
 nos-detach:  ## Detach the NOS test lab containers from the dev stack's network
 	@net=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}_herd-net; \
+	echo "Target network: $$net"; \
+	fail=0; \
 	for c in $(NOS_LAB_CONTAINERS); do \
-		docker network disconnect "$$net" "$$c" 2>/dev/null || true; \
+		if ! docker inspect "$$c" >/dev/null 2>&1; then \
+			echo "$$c: container not found, nothing to detach"; \
+			continue; \
+		fi; \
+		netjson=$$(docker inspect "$$c" --format '{{json .NetworkSettings.Networks}}' 2>/dev/null); \
+		case "$$netjson" in \
+			*"\"$$net\":"*) attached=yes ;; \
+			*) attached=no ;; \
+		esac; \
+		if [ "$$attached" = no ]; then \
+			echo "$$c: not attached to $$net"; \
+			continue; \
+		fi; \
+		out=$$(docker network disconnect "$$net" "$$c" 2>&1); rc=$$?; \
+		if [ $$rc -ne 0 ]; then \
+			echo "$$out"; \
+			echo "$$c: failed to detach from $$net"; \
+			fail=1; \
+		else \
+			echo "$$c: detached from $$net"; \
+		fi; \
 	done; \
-	echo "Detached NOS lab containers from $$net (a no-op for any that were not attached)"
+	exit $$fail
 
 # Postgres-live coverage for the ADR 0011 sync surface (issue #572): the
 # advisory-lock SQL and _SyncSlot's cross-replica branch never run on the

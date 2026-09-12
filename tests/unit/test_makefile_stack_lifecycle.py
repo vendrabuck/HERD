@@ -18,8 +18,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MAKEFILE = REPO_ROOT / "Makefile"
 DEV_OVERRIDE = REPO_ROOT / "docker-compose.override.yml"
 
-# A recipe line invoking `docker compose [flags] down` or `$(GATE_COMPOSE) [flags] down`.
-DOWN_LINE = re.compile(r"^\t-?\s*(?:docker compose|\$\(GATE_COMPOSE\))(?P<flags>[^\n]*?)\bdown\b")
+# A recipe line invoking `docker compose [flags] down` or `$(GATE_COMPOSE) [flags] down`,
+# anywhere in the line (issue #783): a leading `@`/`-`, a `VAR=value` prefix, or the
+# whole call sitting inside an `if ...; then ... ; fi` all escaped the earlier anchored
+# form. `flags` captures whatever sits between the compose invocation and `down`.
+DOWN_LINE = re.compile(r"^\t.*?(?:docker compose|\$\(GATE_COMPOSE\))(?P<flags>.*?)\bdown\b")
 
 
 def _recipe_lines() -> list[str]:
@@ -37,6 +40,25 @@ def test_ldap_compose_down_is_not_in_scope():
     # LDAP_COMPOSE targets its own single-service file with no profiles; the pin
     # above must not silently start matching it if that variable is ever renamed.
     assert not any("$(LDAP_COMPOSE)" in line and DOWN_LINE.match(line) for line in _recipe_lines())
+
+
+def test_nos_compose_down_is_not_in_scope():
+    # NOS_COMPOSE targets its own single-service-project lab file with no
+    # profiles either; same reasoning and same pin as LDAP_COMPOSE above.
+    assert not any("$(NOS_COMPOSE)" in line and DOWN_LINE.match(line) for line in _recipe_lines())
+
+
+def test_down_line_matches_previously_escaping_spellings():
+    # Probed against the pre-#783 regex (`^\t-?\s*(?:docker compose|...)`), these
+    # three all escaped it: a leading `@`, a `VAR=value` prefix before the compose
+    # invocation, and the invocation sitting inside an `if ...; then ...; fi` guard.
+    escaping_spellings = [
+        "\t@docker compose down -v",
+        "\tCOMPOSE_PROJECT_NAME=x docker compose down",
+        '\t@if [ -n "$$x" ]; then docker compose down; fi',
+    ]
+    for line in escaping_spellings:
+        assert DOWN_LINE.match(line), f"tightened DOWN_LINE should match: {line!r}"
 
 
 def test_e2e_selenium_recreate_waits_for_health():

@@ -28,7 +28,18 @@ networks:
 
 services:
   srl:
-    image: ghcr.io/nokia/srlinux:latest
+    # Pinned 2026-09-12 (issue #783): this is the exact build that booted
+    # nos-test-srl (org.opencontainers.image.version label 26.7.2-519,
+    # confirmed against ghcr.io). The drivers' rejection classification keys
+    # on exact SR Linux wording ("% Refusing to remove a non-existent
+    # route", "Parsing error:"), and docs/NOS_LAB.md promises "the same
+    # starting state" on every `make nos-reset`; an unpinned `latest` could
+    # silently change either. To bump: pull the new `latest`,
+    # `docker image inspect ghcr.io/nokia/srlinux:latest --format
+    # '{{index .RepoDigests 0}} {{.Config.Labels}}'` for the digest and
+    # version label, re-verify the baseline and driver wording still match
+    # live, then update both the tag and the digest here.
+    image: ghcr.io/nokia/srlinux:26.7.2-519@sha256:0096fe3ebcafabb7253492e2060425fe027a168e0e066766d1e85efbb0b48be8
     container_name: nos-test-srl
     hostname: srl
     privileged: true
@@ -95,8 +106,12 @@ services:
       # Proves vtysh is actually usable over the daemons FRR just started,
       # not just that sshd is listening: a container whose zebra/staticd
       # sockets are not up yet lets you SSH in but then fails vtysh with
-      # "failed to connect to any daemons".
-      test: ["CMD-SHELL", "vtysh -c 'show version' >/dev/null 2>&1"]
+      # "failed to connect to any daemons". The `nc -z` probe (issue #783)
+      # closes the other gap: start.sh's own `set -e` plus sshd check
+      # already stops the container on a dead sshd at boot, but this
+      # healthcheck also catches sshd dying LATER, after boot succeeded,
+      # when vtysh alone would still report healthy.
+      test: ["CMD-SHELL", "vtysh -c 'show version' >/dev/null 2>&1 && nc -z localhost 22"]
       interval: 3s
       timeout: 5s
       retries: 30
