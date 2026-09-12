@@ -14,6 +14,7 @@ class DriverPackageInfo(BaseModel):
     sha256: str
     uploaded_by: str
     supports_dry_run: bool = False
+    supports_vrf: bool = False
     created_at: datetime
     updated_at: datetime
     modified_by: uuid.UUID | None = None

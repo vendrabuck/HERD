@@ -20,14 +20,13 @@ logger = logging.getLogger(__name__)
 ALLOWED_EXTENSIONS = {".zip", ".tar.gz"}
 
 
-def _parse_supports_dry_run(filename: str, file_data: bytes) -> bool:
-    """Peek inside a driver package for `driver_metadata.json` and return its
-    `supports_dry_run` claim.
+def _parse_driver_metadata(filename: str, file_data: bytes) -> dict:
+    """Peek inside a driver package for `driver_metadata.json` and return it.
 
-    Returns False on any failure: unrecognized archive, malformed JSON,
-    missing field, missing metadata file, or anything else surprising. The
-    flag is opt-in and closed-by-default; only drivers that explicitly
-    declare `supports_dry_run: true` are eligible for dry-run scheduling.
+    Returns an empty dict on any failure: unrecognized archive, malformed JSON,
+    missing metadata file, a top-level value that is not an object, or anything
+    else surprising. Every capability flag read from the result is therefore
+    opt-in and closed by default.
     """
     lower = filename.lower()
     try:
@@ -36,26 +35,47 @@ def _parse_supports_dry_run(filename: str, file_data: bytes) -> bool:
                 try:
                     raw = zf.read("driver_metadata.json")
                 except KeyError:
-                    return False
+                    return {}
         elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
             with tarfile.open(fileobj=io.BytesIO(file_data), mode="r:gz") as tf:
                 try:
                     member = tf.getmember("driver_metadata.json")
                 except KeyError:
-                    return False
+                    return {}
                 extracted = tf.extractfile(member)
                 if extracted is None:
-                    return False
+                    return {}
                 raw = extracted.read()
         else:
-            return False
+            return {}
         meta = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         logger.info("driver upload: could not parse driver_metadata.json (%s)", exc)
-        return False
+        return {}
     if not isinstance(meta, dict):
-        return False
-    return bool(meta.get("supports_dry_run", False))
+        return {}
+    return meta
+
+
+def _parse_supports_dry_run(filename: str, file_data: bytes) -> bool:
+    """The package's `supports_dry_run` claim, False unless explicitly declared.
+
+    Only drivers that declare `supports_dry_run: true` are eligible for dry-run
+    scheduling.
+    """
+    return bool(_parse_driver_metadata(filename, file_data).get("supports_dry_run", False))
+
+
+def _parse_supports_vrf(filename: str, file_data: bytes) -> bool:
+    """The package's `supports_vrf` claim, False unless explicitly declared.
+
+    ADR 0014 addendum X-G (issue #755): a Layer 3 driver that declares this
+    accepts the `virtual_router` keyword on configure_route/remove_route.
+    Execution passes the keyword ONLY to a declaring driver: every shipped L3
+    signature ends in `**_`, so a non-declaring driver would swallow it in
+    silence, install the route in the default table, and report success.
+    """
+    return bool(_parse_driver_metadata(filename, file_data).get("supports_vrf", False))
 
 
 def _validate_filename(filename: str) -> None:
@@ -126,7 +146,7 @@ async def create_driver(
     sha256 = hashlib.sha256(file_data).hexdigest()
     driver_id = uuid.uuid4()
     storage_key = f"{driver_id}/{filename}"
-    supports_dry_run = _parse_supports_dry_run(filename, file_data)
+    metadata = _parse_driver_metadata(filename, file_data)
 
     upload_object(storage_key, file_data)
 
@@ -140,7 +160,8 @@ async def create_driver(
         size_bytes=len(file_data),
         sha256=sha256,
         uploaded_by=username,
-        supports_dry_run=supports_dry_run,
+        supports_dry_run=bool(metadata.get("supports_dry_run", False)),
+        supports_vrf=bool(metadata.get("supports_vrf", False)),
     )
     db.add(package)
     try:
@@ -225,7 +246,9 @@ async def replace_driver_file(
     package.size_bytes = len(file_data)
     package.sha256 = sha256
     package.uploaded_by = username
-    package.supports_dry_run = _parse_supports_dry_run(filename, file_data)
+    replacement_metadata = _parse_driver_metadata(filename, file_data)
+    package.supports_dry_run = bool(replacement_metadata.get("supports_dry_run", False))
+    package.supports_vrf = bool(replacement_metadata.get("supports_vrf", False))
     await db.commit()
     await db.refresh(package)
     return package

@@ -36,6 +36,13 @@ class DriverPackage(Base):
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     uploaded_by: Mapped[str] = mapped_column(String(255), nullable=False)
     supports_dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # ADR 0014 addendum X-G (issue #755): the driver declares it understands the
+    # `virtual_router` keyword on configure_route/remove_route. Opt-in and
+    # closed by default, exactly like supports_dry_run above: execution never
+    # passes the keyword to a driver that has not declared it, because every
+    # shipped L3 signature ends in **_ and would swallow it silently, installing
+    # a VRF route into the default table and reporting success.
+    supports_vrf: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
