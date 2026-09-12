@@ -252,6 +252,17 @@ jobs:
       # the lab up for the diagnostics step below; the always-step at the end
       # of the job is what stops it. The runner allows the privileged
       # containers SR Linux needs.
+      # The FRR node's VRF fixture (ADR 0014 addendum X-G, issue #755) needs
+      # the host kernel's vrf and dummy modules: a container cannot load them
+      # for itself, and the runner image does not carry them loaded, so
+      # infra/nos-test/frr/start.sh would otherwise report "Unknown device
+      # type" and the VRF tests would skip. Not `set -e`-fatal on purpose: if a
+      # future runner image drops the modules entirely, this job should still
+      # run the other three dialect suites rather than go red over a host
+      # capability they do not need.
+      - name: Load the VRF kernel modules the lab fixture needs
+        run: sudo modprobe vrf dummy || echo "vrf/dummy modules unavailable; VRF tests will skip"
+
       - name: Start NOS test lab
         run: make nos-up
 

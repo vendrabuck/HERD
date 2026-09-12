@@ -893,6 +893,38 @@ async def test_rejected_route_records_a_failed_execution_run_via_stack_api():
 # ---------------------------------------------------------------------------
 
 
+def _vrf_fixture_reason() -> str:
+    """Empty when the lab node carries the VRF fixture; otherwise the reason.
+
+    Same host-capability gate as the dialect suite's
+    (tests/nos_lab/test_frr_l3_driver_live.py): the fixture needs the DOCKER
+    HOST's vrf and dummy kernel modules, which a container cannot load for
+    itself, so a host without them gets a visible SKIP naming the remedy rather
+    than a red test that says nothing about the cause.
+    """
+    try:
+        links = subprocess.run(
+            ["docker", "exec", FRR_CONTAINER, "ip", "-br", "link"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not probe the FRR node for the VRF fixture: {exc}"
+    if links.returncode != 0 or VRF_NAME not in links.stdout:
+        return (
+            f"the lab's FRR node carries no `{VRF_NAME}` VRF fixture (the Docker host "
+            "is probably missing the vrf/dummy kernel modules): run "
+            "`sudo modprobe vrf dummy` on the host, then `make nos-reset`. "
+            "See docs/NOS_LAB.md."
+        )
+    return ""
+
+
+_VRF_FIXTURE_REASON = _vrf_fixture_reason()
+
+
+@pytest.mark.skipif(bool(_VRF_FIXTURE_REASON), reason=_VRF_FIXTURE_REASON)
 async def test_vrf_routing_intent_installs_in_the_real_vrf_via_stack_api():
     suffix = uuid.uuid4().hex[:8]
     token = await _login()

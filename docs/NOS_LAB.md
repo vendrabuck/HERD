@@ -397,6 +397,23 @@ refuses `no vrf <name>` with `% Only inactive VRFs can be deleted` while the
 Linux device exists. Tests treat the fixture as permanent and clean up only
 their own routes.
 
+**The fixture needs the DOCKER HOST's `vrf` and `dummy` kernel modules.** A
+container cannot load a kernel module for itself, so on a host without them
+`ip link add blue type vrf` answers `Error: Unknown device type.` and the
+fixture cannot be built. This is the one part of the lab that is host-dependent,
+so it is deliberately BEST-EFFORT: start.sh prints a warning and boots the node
+anyway, rather than taking every non-VRF dialect test down with it over a
+capability none of them need. The VRF tests then skip, each naming the remedy:
+
+```
+sudo modprobe vrf dummy
+make nos-reset
+```
+
+A GitHub Actions runner is the known case; both `ci.yml`'s `nos-dialect` job and
+`nightly.yml`'s feature-tier step run that `modprobe` before booting the lab, and
+neither treats its failure as fatal.
+
 Verifying a VRF route independently, the way the live tests do (never through
 the driver's own session):
 

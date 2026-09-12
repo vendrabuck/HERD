@@ -24,17 +24,34 @@ set -e
 # restart re-enters this cleanly. Never deleted: FRR refuses `no vrf <name>`
 # with "% Only inactive VRFs can be deleted" while the Linux device exists, so
 # tests treat the fixture as permanent and clean up only their own routes.
-if ! ip link show blue >/dev/null 2>&1; then
-    ip link add blue type vrf table 10
-fi
-ip link set blue up
-if ! ip link show dummy0 >/dev/null 2>&1; then
-    ip link add dummy0 type dummy
-fi
-ip link set dummy0 master blue
-ip link set dummy0 up
-if ! ip -4 -o addr show dev dummy0 | grep -q "192.0.2.254/30"; then
-    ip addr add 192.0.2.254/30 dev dummy0
+#
+# BEST-EFFORT, deliberately, unlike the sshd check below: `ip link add ... type
+# vrf` needs the HOST kernel's `vrf` module (and `dummy` for the member), which
+# a container cannot load for itself. A host without them answers "Error:
+# Unknown device type." and this whole block fails; a GitHub Actions runner is
+# the known case. Killing the node there would take every NON-VRF dialect test
+# down with it over a host capability none of them need, so the failure is
+# reported loudly and the node boots anyway. The VRF tests detect the missing
+# fixture and skip with this same remedy
+# (tests/nos_lab/test_frr_l3_driver_live.py); see docs/NOS_LAB.md.
+setup_vrf_fixture() {
+    ip link show blue >/dev/null 2>&1 || ip link add blue type vrf table 10 || return 1
+    ip link set blue up || return 1
+    ip link show dummy0 >/dev/null 2>&1 || ip link add dummy0 type dummy || return 1
+    ip link set dummy0 master blue || return 1
+    ip link set dummy0 up || return 1
+    ip -4 -o addr show dev dummy0 | grep -q "192.0.2.254/30" \
+        || ip addr add 192.0.2.254/30 dev dummy0 || return 1
+    return 0
+}
+
+if setup_vrf_fixture; then
+    echo "start.sh: VRF fixture ready (blue, table 10, member dummy0 192.0.2.254/30)"
+else
+    echo "start.sh: WARNING: could not create the VRF fixture; the host kernel is" >&2
+    echo "start.sh: probably missing the vrf/dummy modules (run 'sudo modprobe vrf" >&2
+    echo "start.sh: dummy' on the Docker host, then 'make nos-reset'). The node is" >&2
+    echo "start.sh: booting anyway; the VRF tests will skip. See docs/NOS_LAB.md." >&2
 fi
 
 /usr/sbin/sshd

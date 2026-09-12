@@ -80,6 +80,49 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _vrf_fixture_reason() -> str:
+    """Empty when the lab node carries the VRF fixture; otherwise the reason,
+    naming the remedy.
+
+    The fixture depends on the DOCKER HOST's kernel: `ip link add ... type vrf`
+    needs the host's `vrf` module (and `dummy` for the member interface), which a
+    container cannot load for itself, so `infra/nos-test/frr/start.sh` creates it
+    best-effort and boots the node either way (a GitHub Actions runner without
+    the modules is the known case). Probing here, rather than asserting inside
+    each test, keeps a host-capability gap a visible SKIP with a fix attached
+    instead of a red test that says nothing about the cause.
+    """
+    if not _FRR_REACHABLE:
+        return ""  # the lab-reachability gate above already covers this
+    try:
+        links = subprocess.run(
+            ["docker", "exec", FRR_CONTAINER, "ip", "-br", "link"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not probe the FRR node for the VRF fixture: {exc}"
+    if links.returncode != 0:
+        return f"could not probe the FRR node for the VRF fixture: {links.stderr.strip()}"
+    if VRF_NAME not in links.stdout or VRF_INTERFACE not in links.stdout:
+        return (
+            f"the lab's FRR node carries no `{VRF_NAME}` VRF fixture (the Docker host "
+            "is probably missing the vrf/dummy kernel modules): run "
+            "`sudo modprobe vrf dummy` on the host, then `make nos-reset`. "
+            "See docs/NOS_LAB.md."
+        )
+    return ""
+
+
+_VRF_FIXTURE_REASON = _vrf_fixture_reason()
+
+# Applied to every test that needs the VRF fixture. Note this is a SKIP even
+# under HERD_TEST_NOS_REQUIRED=1, which is about the lab being REACHABLE, not
+# about the host kernel's feature set.
+needs_vrf_fixture = pytest.mark.skipif(bool(_VRF_FIXTURE_REASON), reason=_VRF_FIXTURE_REASON)
+
+
 @pytest.fixture(autouse=True)
 def _fail_when_required_but_unreachable():
     if _NOS_REQUIRED and not _FRR_REACHABLE:
@@ -377,21 +420,20 @@ def _cleanup_vrf_route(destination: str, next_hop: str | None) -> None:
     )
 
 
+@needs_vrf_fixture
 def test_the_lab_node_carries_the_vrf_fixture():
     """The precondition the two tests below rest on: start.sh created VRF `blue`
     (table 10) with `dummy0` as a member. A lab built from an older image would
     otherwise make the VRF tests fail for a reason that has nothing to do with
     the driver; `make nos-reset` is the remedy."""
     links = _docker_exec(FRR_CONTAINER, "ip", "-br", "link")
-    assert VRF_NAME in links, (
-        f"the lab's FRR node has no `{VRF_NAME}` VRF device; rebuild it with "
-        f"`make nos-reset` (see docs/NOS_LAB.md):\n{links}"
-    )
-    assert VRF_INTERFACE in links, f"no `{VRF_INTERFACE}` VRF member interface:\n{links}"
+    assert VRF_NAME in links, links
+    assert VRF_INTERFACE in links, links
     addrs = _docker_exec(FRR_CONTAINER, "ip", "-4", "-o", "addr", "show", VRF_INTERFACE)
     assert "192.0.2.254/30" in addrs, addrs
 
 
+@needs_vrf_fixture
 def test_configure_and_remove_a_vrf_route_is_independently_verifiable():
     destination = _unique_test_prefix()
 
@@ -432,6 +474,7 @@ def test_configure_and_remove_a_vrf_route_is_independently_verifiable():
         _cleanup_vrf_route(destination, VRF_NEXT_HOP)
 
 
+@needs_vrf_fixture
 def test_a_route_naming_an_unknown_vrf_reports_failure():
     """ADR 0014 addendum X-H: FRR ACCEPTS the route into its configuration (no
     "%" line at all) but never installs it, answering "Static Route to <prefix>
