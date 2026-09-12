@@ -10,6 +10,12 @@
 # `make test-e2e-seeded`, re-runs the same suite against the now-seeded stack
 # and fails if anything still skips (issue #629).
 #
+# Runs the NOS lab feature tier too (issue #785): after the seeded e2e pass,
+# the checked-in emulated-gear lab (infra/nos-test) is attached to this stack
+# and the two via-stack suites drive a real SR Linux and a real FRR node
+# through HERD's own reservation path. The cheaper dialect suites, which need
+# no stack, run on every PR in ci.yml's nos-dialect job instead.
+#
 # Also runs the LDAP-mode stack coverage the master/everything gates run
 # (issue #572): infra/ldap-test boots alongside the stack, and after e2e the
 # stack's auth service is switched to LDAP mode, tests/integration/
@@ -113,6 +119,35 @@ jobs:
       - name: E2E tests (seeded, no skips allowed)
         run: make test-e2e-seeded
 
+      # NOS lab feature tier (issue #785): the two via-stack suites drive a
+      # REAL SR Linux and a REAL FRR node through HERD's own API (reserve,
+      # fork save, execution reconcile), which is why they live here and not
+      # in PR CI: they need a booted, seeded stack with the lab attached to
+      # its network. `make nos-test-feature` attaches the lab, runs
+      # `make seed-nos`, runs the suites hard-required, and always detaches.
+      # COMPOSE_PROJECT_NAME=herd for the same reason the LDAP-mode step
+      # passes it: this job's stack is the default-named `herd` project, not
+      # a CURDIR-derived one (see the header comment).
+      #
+      # Placement is deliberate, on both sides. AFTER the seeded e2e pass:
+      # the L2 suite reuses the `nos-lab-*` devices `make seed-nos` creates
+      # and needs the stack already seeded. BEFORE the load test: locust
+      # hammers reservations across the whole seeded inventory, and these
+      # suites hold real reservations over real devices, so running them
+      # alongside it would race for the same ports.
+      #
+      # The suites authenticate as the stack's superadmin and read the
+      # credentials from the ENVIRONMENT, while the "Create CI .env" step
+      # above writes them to .env for the stack itself; the env block below
+      # is what bridges the two.
+      - name: NOS lab feature tests (reservation-driven, real SR Linux and FRR)
+        env:
+          SUPERADMIN_EMAIL: admin@example.com
+          SUPERADMIN_PASSWORD: admin123!
+        run: |
+          make nos-up
+          make nos-test-feature COMPOSE_PROJECT_NAME=herd
+
       - name: Load test (locust, headless)
         run: HERD_BASE_URL=https://localhost make test-load
 
@@ -132,7 +167,10 @@ jobs:
       # stack-diagnostics), so the two jobs cannot drift apart.
       - name: Collect stack diagnostics
         if: failure()
-        run: make _collect-stack-diagnostics
+        run: |
+          make _collect-stack-diagnostics
+          docker compose -p herd-nos-test -f infra/nos-test/docker-compose.yml \
+            logs --tail 400 > nos-lab-logs.txt 2>&1 || true
 
       - name: Upload failure artifacts
         if: failure()
@@ -144,8 +182,13 @@ jobs:
             docker-ps-a.txt
             compose-logs.txt
             logs-*.txt
+            nos-lab-logs.txt
           retention-days: 7
 
       - name: Stop LDAP test server
         if: always()
         run: make ldap-down
+
+      - name: Stop NOS test lab
+        if: always()
+        run: make nos-down

@@ -209,3 +209,72 @@ jobs:
             compose-logs.txt
             logs-*.txt
           retention-days: 7
+
+  # Driver-dialect gate against the checked-in emulated-gear lab
+  # (infra/nos-test, docs/NOS_LAB.md): a real Nokia SR Linux node and a real
+  # FRRouting node in privileged containers, driven over SSH by the
+  # checked-in srl_l2 / frr_l3 / frr_mgmt driver packages. What it proves is
+  # exactly what the mock drivers cannot: that a driver speaks its vendor's
+  # dialect, walks its prompt state machine, and classifies that vendor's own
+  # error wording correctly. No HERD stack is involved, which is why this can
+  # run on every PR at all; the two via-stack suites that DO need a booted,
+  # seeded stack run in nightly.yml instead (issue #785).
+  #
+  # Its own job, with no `needs:`, so it runs in parallel with backend,
+  # frontend and integration rather than adding its runtime to any of them.
+  # Advisory: the branch-protection ruleset requires only `backend` and
+  # `frontend`, so a red run here reports but does not block; promoting it to
+  # a required check is a ruleset toggle, no workflow change.
+  nos-dialect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache uv
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: ${{ runner.os }}-uv-
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      # The lab is booted as its own step, not left to nos-test-dialect's
+      # boot-if-not-up branch, for one reason: that branch also tears down
+      # what it started, and `docker compose down -v` removes the containers,
+      # so a failing run would have no logs left to collect. Booting here
+      # sends nos-test-dialect down its already-running branch, which leaves
+      # the lab up for the diagnostics step below; the always-step at the end
+      # of the job is what stops it. The runner allows the privileged
+      # containers SR Linux needs.
+      - name: Start NOS test lab
+        run: make nos-up
+
+      # Runs the four dialect suites hard-required: HERD_TEST_NOS_REQUIRED=1
+      # turns an unreachable lab into a failure instead of the suites' normal
+      # skip, so this job can never silently no-op.
+      - name: NOS lab dialect tests
+        run: make nos-test-dialect
+
+      - name: Collect NOS lab logs
+        if: failure()
+        run: |
+          docker compose -p herd-nos-test -f infra/nos-test/docker-compose.yml \
+            logs --tail 400 > nos-lab-logs.txt 2>&1 || true
+
+      - name: Upload NOS lab logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nos-dialect-logs
+          path: nos-lab-logs.txt
+          retention-days: 7
+
+      - name: Stop NOS test lab
+        if: always()
+        run: make nos-down
