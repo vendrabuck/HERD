@@ -7,7 +7,7 @@ Why this is NOT the M1 config-apply flow verbatim: frr_l3 implements the
 narrower Layer 3 Switch contract (login, logout, configure_route,
 remove_route, status), not the Management contract's generic configure()
 job M1 was originally written against (see docs/DRIVERS.md and
-seed_devices_public.py's seed_nos_lab docstring). HERD only ever drives a
+seedtools.nos_lab's seed_nos_lab docstring). HERD only ever drives a
 Layer 3 Switch through a reservation fork's routing intent (ADR 0009/0014),
 so "through HERD's normal path" here means: create a device, a config
 version, a topology whose switch node carries data.l3.routes, and a
@@ -58,14 +58,12 @@ test_frr_l3_driver_live.py.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import ipaddress
 import os
 import random
 import re
 import socket
 import subprocess
-import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -73,17 +71,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# Reuse seedtools' driver-zip-from-disk helper and constants instead of a
+# third copy of "zip a real driver package from disk" logic.
+from seedtools.catalog import SECTIONS
+from seedtools.drivers import _make_driver_zip_from_dir, _make_dummy_zip
+from seedtools.nos_lab import FRR_L3_DRIVER_DIR
 
-# Reuse seed_devices_public.py's driver-zip-from-disk helper and constants
-# instead of a third copy of "zip a real driver package from disk" logic.
-_seed_spec = importlib.util.spec_from_file_location(
-    "seed_devices_public_for_nos_stack_test", _REPO_ROOT / "seed_devices_public.py"
-)
-assert _seed_spec is not None and _seed_spec.loader is not None
-_seed = importlib.util.module_from_spec(_seed_spec)
-sys.modules[_seed_spec.name] = _seed
-_seed_spec.loader.exec_module(_seed)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 FRR_HOST = os.getenv("HERD_TEST_FRR_HOST", "127.0.0.1")
 FRR_PORT = int(os.getenv("HERD_TEST_FRR_PORT", "2224"))
@@ -356,7 +350,7 @@ async def _create_template(client, driver_id: str, name: str) -> dict:
             "driver_id": driver_id,
             "vendor": "IntegrationVendor",
             "model": "nos_lab stack e2e",
-            "sections": _seed.SECTIONS,
+            "sections": SECTIONS,
         },
     )
     resp.raise_for_status()
@@ -539,7 +533,7 @@ async def test_reservation_applies_changes_and_removes_real_static_routes_via_st
             client,
             f"nos-stack-frr-l3-{suffix}",
             "Layer 3 Switch",
-            _seed._make_driver_zip_from_dir(_seed.FRR_L3_DRIVER_DIR),
+            _make_driver_zip_from_dir(FRR_L3_DRIVER_DIR),
         )
         switch_template = await _create_template(
             client, driver["id"], f"nos-stack-frr-l3-tmpl-{suffix}"
@@ -548,7 +542,7 @@ async def test_reservation_applies_changes_and_removes_real_static_routes_via_st
             client,
             f"nos-stack-dut-driver-{suffix}",
             "Management",
-            _seed._make_dummy_zip("nos-stack-dut"),
+            _make_dummy_zip("nos-stack-dut"),
         )
         dut_template = await _create_template(
             client, dut_driver["id"], f"nos-stack-dut-tmpl-{suffix}"
@@ -735,7 +729,7 @@ async def test_rejected_route_records_a_failed_execution_run_via_stack_api():
             client,
             f"nos-stack-frr-l3-rej-{suffix}",
             "Layer 3 Switch",
-            _seed._make_driver_zip_from_dir(_seed.FRR_L3_DRIVER_DIR),
+            _make_driver_zip_from_dir(FRR_L3_DRIVER_DIR),
         )
         switch_template = await _create_template(
             client, driver["id"], f"nos-stack-frr-l3-rej-tmpl-{suffix}"
@@ -744,7 +738,7 @@ async def test_rejected_route_records_a_failed_execution_run_via_stack_api():
             client,
             f"nos-stack-dut-driver-rej-{suffix}",
             "Management",
-            _seed._make_dummy_zip("nos-stack-dut-rej"),
+            _make_dummy_zip("nos-stack-dut-rej"),
         )
         dut_template = await _create_template(
             client, dut_driver["id"], f"nos-stack-dut-rej-tmpl-{suffix}"

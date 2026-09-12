@@ -10,11 +10,11 @@ Why this test reuses the SEEDED lab devices rather than creating its own
 device): L2 membership is derived from RECORDED HOPS (ADR 0009), which in turn
 come from cabling's pathfinder walking the PHYSICAL connections graph. That
 graph only exists between `nos-lab-dut-1`, `nos-lab-dut-2`, and `nos-lab-srl`
-because `scripts/seed_nos_lab.sh` cabled them: `nos-lab-dut-1:eth1` to
+because `make seed-nos` cabled them: `nos-lab-dut-1:eth1` to
 `nos-lab-srl:ethernet-1/1`, `nos-lab-dut-2:eth1` to `nos-lab-srl:ethernet-1/2`.
 A throwaway device would have no physical path to the real switch to resolve
 through. So this test looks the three devices up by name (seeded ahead of
-time; `scripts/seed_nos_lab.sh` is idempotent) and creates only the topology
+time; `make seed-nos` is idempotent) and creates only the topology
 and reservation on top of them.
 
 The load-bearing rule under test (docs/design/0009-l2-l3-connection-driven-
@@ -370,9 +370,7 @@ async def _device_id_by_name(client, name: str) -> str:
     for item in resp.json().get("items", []):
         if item["name"] == name:
             return item["id"]
-    raise AssertionError(
-        f"seeded NOS lab device {name!r} not found; run `bash scripts/seed_nos_lab.sh` first"
-    )
+    raise AssertionError(f"seeded NOS lab device {name!r} not found; run `make seed-nos` first")
 
 
 def _canvas_edge(dut_a_id: str, dut_b_id: str) -> dict:

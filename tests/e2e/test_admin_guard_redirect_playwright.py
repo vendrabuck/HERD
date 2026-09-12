@@ -17,7 +17,7 @@ useEffect fires on mount before the page component does anything with the
 param), so the redirect fires before an invalid id could matter.
 
 Self-provisions its non-admin account via POST /api/auth/register rather
-than using a seed_devices_public.py account: in the make everything gate the
+than using a `make seed` account: in the make everything gate the
 stack is seeded only AFTER the test phases (the seed exists to leave a demo
 behind), so during e2e no seeded users exist and tests must create what they
 need (the standing self-seed convention; this file learned that the hard way

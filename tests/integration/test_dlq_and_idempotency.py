@@ -188,7 +188,7 @@ async def slow_l2_template(base_url, admin_token, slow_l2_driver):
     device can carry a per-action driver sleep in its field_data.
 
     non-exclusive, mirroring the real seeded L2 switch templates (shared
-    infrastructure, seed_devices_public.py): the redelivery test's canvas names
+    infrastructure, the seedtools package): the redelivery test's canvas names
     the switch as a real endpoint device, so every reservation booking it must
     include it (issue #701 phase 2's membership check), and it books the SAME
     switch into two overlapping reservations, which a still-exclusive switch

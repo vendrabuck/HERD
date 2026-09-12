@@ -1,8 +1,7 @@
 """Unit tests for scripts/check_image_matches_lock.py (issue #593).
 
-The script lives at the repo root, not inside a package, so it is loaded by
-path the same way tests/unit/test_seed_build_canvas.py loads
-seed_devices_public.py. No image build or stack is needed: `load_pins` reads
+The script lives under scripts/, not inside a package, so it is loaded by
+path rather than imported. No image build or stack is needed: `load_pins` reads
 plain requirements-style text files that the tests write to `tmp_path`, and
 `main` is driven end to end through `sys.argv` with those files plus captured
 stdout, pinning the exact drift messages an image-vs-lock mismatch prints.

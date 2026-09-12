@@ -8,7 +8,7 @@ pip install locust
 uv pip install locust
 ```
 
-Requires a running HERD stack with seed data (`uv run python seed_devices_public.py`).
+Requires a running HERD stack with seed data (`make seed`, or `uv run python -m seedtools full`).
 
 ## Running
 

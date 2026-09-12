@@ -6,12 +6,12 @@
 SERVICES := common auth inventory reservations cabling acl execution config ai-orchestrator user-profile notifications integration secrets
 DB_SERVICES := auth inventory reservations cabling acl execution user-profile notifications ai-orchestrator integration secrets
 
-# Root-level Python helper scripts. These live outside services/ so they are not
-# covered by the workspace ruff config's default discovery, so lint/format target
-# them explicitly. Add new repo-root scripts here so they are linted and
-# format-checked locally and in CI. Today this is the seed script and the
-# CI image-vs-lock guard script (issue #593).
-ROOT_PY := seed_devices_public.py scripts/check_image_matches_lock.py
+# Repo-root Python that lives outside services/, so it is not covered by the
+# workspace ruff config's default discovery and lint/format must target it
+# explicitly. Add new repo-root packages or scripts here so they are linted and
+# format-checked locally and in CI. Today this is the seedtools seeding package
+# (issue #791) and the CI image-vs-lock guard script (issue #593).
+ROOT_PY := seedtools/ scripts/check_image_matches_lock.py
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh
@@ -57,7 +57,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix shell-,$(DB_SERVICES)) \
 	test-frontend test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap \
 	test-root coverage-parallel coverage-frontend \
-	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed \
+	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
 	nos-up nos-down nos-status nos-logs nos-reset nos-attach nos-detach \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
@@ -291,38 +291,41 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 everything-noload:  ## everything minus the load-test tail (stack still seeded and left up)
 	$(MAKE) everything EVERYTHING_LOAD=0
 
-# Seeds the running stack via seed_devices_public.py: users, drivers, templates,
-# devices, ports, L1/L2 switches, cabling, device/user groups, 6 isolated demo
-# devices, and 60 demo lab topologies (50 valid + 10 deliberately invalid). The
-# script is re-runnable and skips resources that already exist.
+# Seeds the running stack via the seedtools package (issue #791): users, drivers,
+# templates, devices, ports, L1/L2 switches, cabling, device/user groups, 6
+# isolated demo devices, and 60 demo lab topologies (50 valid + 10 deliberately
+# invalid). Every subcommand is re-runnable and skips resources that already
+# exist.
 #
-# Credential resolution (highest priority first):
-#   1. SEED_EMAIL / SEED_PASSWORD already in the shell env.
-#   2. SUPERADMIN_EMAIL / SUPERADMIN_PASSWORD read from .env via grep (not
-#      `source`, so unquoted placeholder values elsewhere in .env cannot crash
-#      the recipe). Values are taken verbatim after the first `=`, so an embedded
-#      `=` survives; surrounding quotes in .env are not stripped, so keep .env
-#      values unquoted.
-#   3. The seed script's own fallback (admin@example.com) if both are empty.
-# If .env is missing we say so and fall through to the script's defaults rather
-# than failing: a stack bootstrapped with default creds still seeds.
+# Credential resolution lives in seedtools/client.py, in one place for every
+# subcommand (highest priority first): SEED_EMAIL / SEED_PASSWORD, then
+# SUPERADMIN_EMAIL / SUPERADMIN_PASSWORD from the environment, then the same
+# SUPERADMIN_* keys read from .env (parsed line by line, not sourced, so an
+# unquoted placeholder value elsewhere in .env cannot break the run), then a
+# generic admin@example.com placeholder. A missing .env is not an error: a stack
+# bootstrapped with default creds still seeds.
+#
+# SEED_FRR=1 and SEED_NOS=1 keep their meaning here and layer the FRR
+# live-config demo and the NOS test lab onto the full population; `make seed-frr`
+# and `make seed-nos` stage just those pieces.
 _everything-seed:
 	@if [ ! -f .env ]; then \
-		echo "No .env found; relying on shell SEED_*/SUPERADMIN_* or the seed script defaults."; \
+		echo "No .env found; relying on shell SEED_*/SUPERADMIN_* or the seedtools defaults."; \
 	fi
-	@email=$$(grep -E '^SUPERADMIN_EMAIL=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
-	 pw=$$(grep -E '^SUPERADMIN_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
-	 export SEED_EMAIL="$${SEED_EMAIL:-$$email}"; \
-	 export SEED_PASSWORD="$${SEED_PASSWORD:-$$pw}"; \
-	 export SEED_BASE_URL="$${SEED_BASE_URL:-$${HERD_BASE_URL:-https://localhost/api}}"; \
-	 if [ -z "$$SEED_EMAIL" ]; then \
-		echo "No SEED_EMAIL/SUPERADMIN_EMAIL resolved; seed script will fall back to its admin@example.com default."; \
-	 fi; \
-	 echo "Seeding $$SEED_BASE_URL (users, devices, switches, cabling, groups, isolated demo devices, demo topologies) as $${SEED_EMAIL:-<script default>}"; \
-	 uv run python seed_devices_public.py
+	uv run python -m seedtools full
 
 # Public alias so `make seed` works against an already-running stack.
 seed: _everything-seed  ## Seed a running stack with demo users, devices, cabling, and topologies
+
+# The two lab demos on their own, against an already-seeded stack: what the
+# retired scripts/seed_frr_demo.sh and scripts/seed_nos_lab.sh wrapped. Both are
+# idempotent; `python -m seedtools frr --full` / `nos --full` layer the demo onto
+# a full population instead.
+seed-frr:  ## Seed a running stack with the FRR live-config demo (the two slice1 lab routers)
+	uv run python -m seedtools frr
+
+seed-nos:  ## Seed a running stack with the NOS test lab (real SR Linux + FRR lab nodes)
+	uv run python -m seedtools nos
 
 _master-stack-up:
 	$(GATE_COMPOSE) up -d --build
@@ -403,8 +406,8 @@ $(addprefix migrate-,$(DB_SERVICES)):
 #
 # Per-service `test-<svc>` and the aggregator `test` are generated from SERVICES.
 
-# Repo-root unit tests (tests/unit/) cover root scripts like
-# seed_devices_public.py. They need no stack and are not under services/, so
+# Repo-root unit tests (tests/unit/) cover repo-root code like the seedtools
+# package. They need no stack and are not under services/, so
 # the per-service loops never reach them; both `test` and `coverage` depend on
 # this target so they cannot be silently skipped locally or in CI.
 test-root:  ## Run the repo-root unit tests (tests/unit, no stack needed)
@@ -639,7 +642,7 @@ nos-reset:  ## Recreate the NOS test lab from scratch (discards all node state)
 # container reached both nos-test-srl and nos-test-frr by name once
 # attached). Container IPs are not stable across a recreate; container names
 # are, which is why devices are seeded with field_data.ip set to the
-# container name (see seed_nos_lab in seed_devices_public.py), not an IP.
+# container name (see seed_nos_lab in seedtools/nos_lab.py), not an IP.
 #
 # Mirrors _gate-ldap-stack-tests' connect/disconnect trap: `docker compose
 # down` on a network that still holds an attached container prints "Resource

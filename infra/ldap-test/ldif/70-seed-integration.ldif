@@ -2,7 +2,7 @@
 # (tests/integration/test_ldap_auth.py, test_ldap_sync_admin.py), added
 # 2026-08-26 (issue #572 follow-up).
 #
-# A gate stack seeded via seed_devices_public.py (`make seed`) already holds
+# A gate stack seeded via the seedtools package (`make seed`) already holds
 # LOCAL users user1..user1000 and admin1..admin50 in the same users table
 # (auth_source="local"). JIT-provisioning an LDAP login for uid=user10 or
 # similar collides on username (auth_service.py's username_collision path),

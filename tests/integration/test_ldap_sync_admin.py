@@ -9,7 +9,7 @@ surface (mapping create, sync-now, run polling, group-membership reconcile)
 works too, coverage no gate exercised before _gate-ldap-stack-tests existed.
 
 Dedicated ldapit-* identities, not the userN/herd-eng fixtures: a gate stack
-seeded via `make seed` (seed_devices_public.py) already holds LOCAL users
+seeded via `make seed` (the seedtools package) already holds LOCAL users
 user1..user1000 and admin1..admin50 in the same users table (auth_source=
 "local"). JIT-provisioning an LDAP login for one of those usernames collides
 (auth_service.py's username_collision path refuses it), and separately,
