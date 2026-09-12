@@ -28,8 +28,8 @@ mid-run exhaustion within a single long invocation.
 - Why manual: needs the external network-simulator lab; netmiko over real
   SSH; CI has no hardware. The dry-run half IS automated.
 - Cadence: on change to drivers/frr_mgmt/ or the execution configure path.
-- Preconditions: lab reachable; `scripts/seed_frr_demo.sh` run with
-  SEED_FRR=1; the two lab routers up.
+- Preconditions: lab reachable; `make seed-frr` run (or `make seed` with
+  SEED_FRR=1 in the environment); the two lab routers up.
 - Steps: from DevicesPage, open the FRR router; apply a config version
   adding a static route (live, not dry-run); open the device again and
   fetch status.

@@ -255,6 +255,13 @@ idempotent and get-or-create, so it layers onto an already-seeded stack the way
 `seed_frr_demo.sh` does. A new repo-root seed script must be added to the Makefile
 `ROOT_PY` lint list and the CI lint lines, per the repo convention.
 
+Naming note (issue #791, after this ADR was written): the seed family is now the
+`seedtools` package. `scripts/seed_frr_demo.sh` is `python -m seedtools frr`
+(`make seed-frr`) and `scripts/seed_nos_lab.sh` is `python -m seedtools nos`
+(`make seed-nos`), so the companion seed path proposed above is a new subcommand
+in `seedtools/cli.py` rather than a new repo-root script; `ROOT_PY` already
+covers the whole package. The recommendation itself is unchanged.
+
 ## Phased delivery
 
 Smallest-first, each phase independently valuable and independently mergeable, matching

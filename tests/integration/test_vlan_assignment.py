@@ -82,7 +82,7 @@ async def l2_template(base_url, admin_token, l2_driver):
     """A device template wired to the mock L2 driver.
 
     non-exclusive, mirroring the real seeded L2 switch templates (shared
-    infrastructure, seed_devices_public.py): the canvas now names the switch as
+    infrastructure, the seedtools package): the canvas now names the switch as
     a real endpoint device so every reservation booking it must include it
     (issue #701 phase 2's membership check), and
     test_vlan_ids_are_unique_within_same_fabric below books the SAME switch

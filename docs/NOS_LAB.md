@@ -84,14 +84,15 @@ Workflow:
 make up                    # dev stack up
 make nos-up                # NOS test lab up (if not already)
 make nos-attach             # wire the lab into the dev stack's network
-scripts/seed_nos_lab.sh     # register the real drivers, the two lab nodes,
-                             # and DUT/port/cabling groundwork (SEED_NOS=1)
+make seed-nos              # register the real drivers, the two lab nodes,
+                          # and DUT/port/cabling groundwork
 ```
 
-`scripts/seed_nos_lab.sh` defaults to `--nos-only` (just the NOS lab pieces,
-skipping the ~20 min default seed population; pass `--full` to run the
-whole seed with `SEED_NOS=1` layered on, mirroring `scripts/seed_frr_demo.sh`
-for `SEED_FRR=1`). It is get-or-create throughout: registers the real
+`make seed-nos` runs `python -m seedtools nos`, which stages just the NOS lab
+pieces and skips the ~20 min default seed population; `python -m seedtools nos
+--full` runs the whole seed with the NOS lab layered on, mirroring
+`python -m seedtools frr --full` for the FRR demo (`make seed` with `SEED_NOS=1`
+in the environment does the same thing). It is get-or-create throughout: registers the real
 `drivers/srl_l2` (Layer 2 Switch) and `drivers/frr_l3` (Layer 3 Switch)
 driver packages, a `NOS Lab SR Linux L2 Switch` and `NOS Lab FRR L3 Switch`
 device template each, the two lab devices (`nos-lab-srl`, container
@@ -102,7 +103,7 @@ checked-in baseline already enables and VLAN-tags. This is inventory-side
 groundwork only (devices, ports, cabling); it deliberately creates no
 topology or reservation, since ADR 0009's L2 membership and ADR 0014's L3
 routing intent are both driven through a reservation fork, not a bare
-device registration. See `seed_devices_public.py`'s `seed_nos_lab` for the
+device registration. See `seedtools/nos_lab.py`'s `seed_nos_lab` for the
 exact shape.
 
 `make nos-detach` reverses `make nos-attach`. A `docker compose down` (or
@@ -165,7 +166,7 @@ hard failure. Run it with:
 make up
 make nos-up
 make nos-attach
-bash scripts/seed_nos_lab.sh
+make seed-nos
 
 # The test authenticates as the stack's superadmin and reads those credentials
 # from the ENVIRONMENT, while the stack seeds them from .env, so export them
@@ -189,7 +190,7 @@ service and driver sandbox, not by calling `drivers/srl_l2` directly.
 
 Unlike the phase 3a test, it reuses the SEEDED `nos-lab-dut-1`,
 `nos-lab-dut-2`, and `nos-lab-srl` devices and their cabling (run
-`scripts/seed_nos_lab.sh` first) rather than creating throwaway devices:
+`make seed-nos` first) rather than creating throwaway devices:
 membership derivation depends on cabling's pathfinder walking a real physical
 connections graph, which only exists between the seeded lab devices. It activates the
 reservation over an EDGELESS canvas and only then saves a fork that ADDS the
@@ -225,7 +226,7 @@ logs in nowhere. Run it with:
 make up
 make nos-up
 make nos-attach
-bash scripts/seed_nos_lab.sh
+make seed-nos
 export SUPERADMIN_EMAIL=$(grep -E '^SUPERADMIN_EMAIL=' .env | head -1 | cut -d= -f2-)
 export SUPERADMIN_PASSWORD=$(grep -E '^SUPERADMIN_PASSWORD=' .env | head -1 | cut -d= -f2-)
 
@@ -241,7 +242,7 @@ make nos-detach
   collide with the dev or gate compose files' ports, and the shape of the
   checked-in SR Linux baseline file.
 - `tests/unit/test_seed_nos_lab_driver.py`, static, runs in CI with no lab
-  or stack: pins that `seed_devices_public.py`'s `seed_nos_lab` zips the
+  or stack: pins that `seedtools.nos_lab`'s `seed_nos_lab` zips the
   real `drivers/srl_l2` and `drivers/frr_l3` packages from disk (never
   drifting from the source of truth) and degrades gracefully when either
   package is missing, mirroring `tests/unit/test_seed_frr_driver.py`.
@@ -267,7 +268,7 @@ make nos-detach
   The other two files in this directory, `test_frr_l3_via_stack_live.py` and
   `test_srl_l2_via_stack_live.py`, additionally need a running dev stack with
   the lab attached and seeded (`make up`, `make nos-attach`,
-  `scripts/seed_nos_lab.sh`); see the phase 3a and phase 3b sections above,
+  `make seed-nos`); see the phase 3a and phase 3b sections above,
   which already document them.
 - `tests/nos_lab/test_frr_l3_driver_live.py`, opt-in, same gating as above,
   drives the checked-in `drivers/frr_l3` Layer 3 Switch reference driver

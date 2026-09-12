@@ -18,7 +18,7 @@ Expected directory layout (see services/auth/tests/test_ldap_service_live.py):
 
 Default login identity is ldapit-eng1 (infra/ldap-test/ldif/70-seed-integration.ldif),
 not one of the userN fixtures: a gate stack seeded via `make seed`
-(seed_devices_public.py) already holds LOCAL users user1..user1000 in the same
+(the seedtools package) already holds LOCAL users user1..user1000 in the same
 users table (auth_source="local"), so JIT-provisioning uid=userN over LDAP
 would collide on username (auth_service.py's username_collision path) on any
 seeded stack. The ldapit-* uids can never match the seed script's

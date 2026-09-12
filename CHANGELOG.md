@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- Moved seeding into a `seedtools/` package with a subcommand CLI and retired
+  the root module and both shell wrappers (issue #791). `seed_devices_public.py`
+  (2,637 lines), `scripts/seed_frr_demo.sh`, and `scripts/seed_nos_lab.sh` are
+  gone; `python -m seedtools full | acl | frr | nos` replaces them, with
+  `--full` on `frr` and `nos` layering a demo onto the whole population the way
+  the wrappers did, and `make seed`, `make seed-frr`, and `make seed-nos` as
+  the front doors. Credential resolution lives once in `seedtools/client.py`
+  (SEED_*, then SUPERADMIN_* from the environment, then SUPERADMIN_* read from
+  `.env`, then a generic placeholder), so the Makefile recipe and the two
+  wrappers no longer each re-implement it, and the personal default address the
+  root module carried is gone. Behavior is otherwise unchanged: the same
+  section headers print, every subcommand is still re-runnable, and SEED_FRR=1
+  / SEED_NOS=1 still layer the demos onto `full`. The four seed unit tests now
+  import the package instead of loading a file by path.
+
 - Tightened the two `tests/nos_lab/` via-stack feature tests so they prove what
   they claim (issue #782). The FRR Layer 3 test now runs a fork SAVE with a
   CHANGED route set, which is the only path that exercises `gate_l3_intent`,

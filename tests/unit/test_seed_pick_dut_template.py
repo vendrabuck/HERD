@@ -1,4 +1,4 @@
-"""Pins for seed_devices_public.pick_dut_template (issue #775, #781).
+"""Pins for seedtools.inventory.pick_dut_template (issue #775, #781).
 
 `get_or_create_device` always sends ip, login and password in field_data, and
 inventory rejects a create carrying fields the template does not declare
@@ -15,24 +15,15 @@ same validation the filter exists to satisfy. The picker now returns None in
 that case, and the caller (seed_acl_test_fixtures) already skips on None.
 """
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_SEED_PATH = _REPO_ROOT / "seed_devices_public.py"
-
-
-@pytest.fixture(scope="module")
-def seed():
-    spec = importlib.util.spec_from_file_location("seed_devices_public", _SEED_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["seed_devices_public"] = module
-    spec.loader.exec_module(module)
-    return module
+from seedtools.inventory import (
+    SEED_DEVICE_FIELD_KEYS,
+    get_or_create_device,
+    pick_dut_template,
+    template_declares_seed_fields,
+    template_field_keys,
+)
 
 
 def _template(name, driver_id, field_keys):
@@ -67,11 +58,11 @@ def mgmt():
 
 
 @pytest.fixture
-def seed_keys(seed):
-    return list(seed.SEED_DEVICE_FIELD_KEYS)
+def seed_keys():
+    return list(SEED_DEVICE_FIELD_KEYS)
 
 
-def test_skips_a_management_template_that_lacks_the_seeded_fields(seed, mgmt, seed_keys):
+def test_skips_a_management_template_that_lacks_the_seeded_fields(mgmt, seed_keys):
     """The exact issue #775 ordering: a fieldless Management template sorts first."""
     client = _FakeClient(
         mgmt,
@@ -80,10 +71,10 @@ def test_skips_a_management_template_that_lacks_the_seeded_fields(seed, mgmt, se
             _template("Ubuntu Client", "drv-mgmt", seed_keys),
         ],
     )
-    assert seed.pick_dut_template(client) == "tpl-Ubuntu Client"
+    assert pick_dut_template(client) == "tpl-Ubuntu Client"
 
 
-def test_prefers_a_management_backed_template_among_usable_ones(seed, mgmt, seed_keys):
+def test_prefers_a_management_backed_template_among_usable_ones(mgmt, seed_keys):
     client = _FakeClient(
         mgmt,
         [
@@ -91,10 +82,10 @@ def test_prefers_a_management_backed_template_among_usable_ones(seed, mgmt, seed
             _template("Ubuntu Client", "drv-mgmt", seed_keys),
         ],
     )
-    assert seed.pick_dut_template(client) == "tpl-Ubuntu Client"
+    assert pick_dut_template(client) == "tpl-Ubuntu Client"
 
 
-def test_falls_back_to_a_usable_non_management_template(seed, mgmt, seed_keys):
+def test_falls_back_to_a_usable_non_management_template(mgmt, seed_keys):
     client = _FakeClient(
         mgmt,
         [
@@ -102,39 +93,39 @@ def test_falls_back_to_a_usable_non_management_template(seed, mgmt, seed_keys):
             _template("L2-Switch-48", "drv-switch", seed_keys),
         ],
     )
-    assert seed.pick_dut_template(client) == "tpl-L2-Switch-48"
+    assert pick_dut_template(client) == "tpl-L2-Switch-48"
 
 
-def test_returns_none_when_no_template_declares_the_seeded_fields(seed, mgmt):
+def test_returns_none_when_no_template_declares_the_seeded_fields(mgmt):
     """Issue #781: previously fell back to items[0], a template guaranteed to
     fail get_or_create_device's create (it does not declare ip/login/password).
     The caller, seed_acl_test_fixtures, treats None as "skip", so returning the
     unusable template instead of None is the bug this pins against."""
     client = _FakeClient(mgmt, [_template("odd-one", "drv-mgmt", ["model"])])
-    assert seed.pick_dut_template(client) is None
+    assert pick_dut_template(client) is None
 
 
-def test_returns_none_with_no_templates(seed, mgmt):
-    assert seed.pick_dut_template(_FakeClient(mgmt, [])) is None
+def test_returns_none_with_no_templates(mgmt):
+    assert pick_dut_template(_FakeClient(mgmt, [])) is None
 
 
-def test_template_field_keys_flattens_every_section(seed):
+def test_template_field_keys_flattens_every_section():
     tpl = {
         "sections": [
             {"name": "Network", "fields": [{"key": "ip"}]},
             {"name": "Auth", "fields": [{"key": "login"}, {"key": "password"}]},
         ]
     }
-    assert seed.template_field_keys(tpl) == {"ip", "login", "password"}
-    assert seed.template_declares_seed_fields(tpl)
+    assert template_field_keys(tpl) == {"ip", "login", "password"}
+    assert template_declares_seed_fields(tpl)
 
 
-def test_template_with_no_sections_declares_nothing(seed):
-    assert seed.template_field_keys({"sections": None}) == set()
-    assert not seed.template_declares_seed_fields({})
+def test_template_with_no_sections_declares_nothing():
+    assert template_field_keys({"sections": None}) == set()
+    assert not template_declares_seed_fields({})
 
 
-def test_template_field_keys_skips_a_fieldless_entry(seed):
+def test_template_field_keys_skips_a_fieldless_entry():
     """A field dict without a `key` must not surface as a member (it would
     otherwise poison the set with None and break set[str]'s real return type)."""
     tpl = {
@@ -142,7 +133,7 @@ def test_template_field_keys_skips_a_fieldless_entry(seed):
             {"name": "Network", "fields": [{"key": "ip"}, {"label": "no key here"}]},
         ]
     }
-    assert seed.template_field_keys(tpl) == {"ip"}
+    assert template_field_keys(tpl) == {"ip"}
 
 
 class _FakeDeviceClient:
@@ -156,11 +147,11 @@ class _FakeDeviceClient:
         return _FakeResponse({"id": "dev-1"}, status_code=201)
 
 
-def test_get_or_create_device_field_data_matches_seed_device_field_keys(seed):
+def test_get_or_create_device_field_data_matches_seed_device_field_keys():
     """Pins the request body's field_data key set against SEED_DEVICE_FIELD_KEYS
     without a live stack, so drift between the two (the #781 assert's subject)
     fails here in CI rather than only during a real seed run."""
     client = _FakeDeviceClient()
-    seed.get_or_create_device(client, "dev-1", "tpl-1", ip="10.0.0.1")
+    get_or_create_device(client, "dev-1", "tpl-1", ip="10.0.0.1")
     assert client.posted_json is not None
-    assert set(client.posted_json["field_data"]) == set(seed.SEED_DEVICE_FIELD_KEYS)
+    assert set(client.posted_json["field_data"]) == set(SEED_DEVICE_FIELD_KEYS)
