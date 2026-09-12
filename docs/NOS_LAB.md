@@ -31,8 +31,8 @@ reseed themselves on every `up`.
 
 | Node | Image | Role | netmiko `device_type` | Port | Credentials |
 |---|---|---|---|---|---|
-| `srl` | `ghcr.io/nokia/srlinux:latest` | Layer 2 target (mac-vrf / bridged subinterfaces) | `nokia_srl` | `${HERD_TEST_SRL_PORT:-2223}` (SSH) | `admin` / `NokiaSrl1!` |
-| `frr` | built from `infra/nos-test/frr/Dockerfile` (`frrouting/frr:latest` base) | Layer 3 / Cisco-dialect target (vtysh, IOS-style syntax) | `cisco_ios` | `${HERD_TEST_FRR_PORT:-2224}` (SSH) | `netadmin` / `netadmin` |
+| `srl` | `ghcr.io/nokia/srlinux:26.7.2-519` (pinned by digest; see the compose file's comment) | Layer 2 target (mac-vrf / bridged subinterfaces) | `nokia_srl` | `${HERD_TEST_SRL_PORT:-2223}` (SSH) | `admin` / `NokiaSrl1!` |
+| `frr` | built from `infra/nos-test/frr/Dockerfile` (`frrouting/frr` base, pinned by digest with no matching version tag; see the Dockerfile's comment) | Layer 3 / Cisco-dialect target (vtysh, IOS-style syntax) | `cisco_ios` | `${HERD_TEST_FRR_PORT:-2224}` (SSH) | `netadmin` / `netadmin` |
 
 Both nodes run `privileged: true`: SR Linux manages its own network
 namespaces and interfaces at boot, and FRR's zebra/staticd daemons program

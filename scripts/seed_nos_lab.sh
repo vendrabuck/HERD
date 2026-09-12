@@ -34,9 +34,13 @@ pw=$(grep -E '^SUPERADMIN_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2- |
 export SEED_EMAIL="${SEED_EMAIL:-$email}"
 export SEED_PASSWORD="${SEED_PASSWORD:-$pw}"
 export SEED_BASE_URL="${SEED_BASE_URL:-${HERD_BASE_URL:-https://localhost/api}}"
+# SEED_NOS=1 is read by seed_devices_public.py's main(), which only the
+# --full path below calls; the default --nos-only path calls seed_nos_lab()
+# directly and never reads this var. It is exported unconditionally anyway
+# so --full (if passed) picks it up too, but the message below must not
+# claim it drives the default path (issue #783).
 export SEED_NOS=1
 
-echo "Seeding ${SEED_BASE_URL} with the NOS test lab (SEED_NOS=1) as ${SEED_EMAIL:-<script default>}"
 echo "Lab nodes: nos-lab-srl (container nos-test-srl), nos-lab-frr (container nos-test-frr)"
 
 # `--nos-only` (mirrors the seed script's own `--acl-only`) stages just the
@@ -45,7 +49,9 @@ echo "Lab nodes: nos-lab-srl (container nos-test-srl), nos-lab-frr (container no
 # (users, DUTs, cabling, topologies, ...) with SEED_NOS=1 layered on top, the
 # same way seed_frr_demo.sh always does for SEED_FRR.
 if [ "${1:-}" = "--full" ]; then
+  echo "Seeding ${SEED_BASE_URL} with the full demo population plus the NOS test lab (SEED_NOS=1) as ${SEED_EMAIL:-<script default>}"
   uv run python seed_devices_public.py
 else
+  echo "Seeding ${SEED_BASE_URL} with the NOS test lab (--nos-only) as ${SEED_EMAIL:-<script default>}"
   uv run python seed_devices_public.py --nos-only
 fi

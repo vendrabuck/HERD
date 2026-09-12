@@ -25,9 +25,11 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NOS_COMPOSE_PATH = REPO_ROOT / "infra" / "nos-test" / "docker-compose.yml"
 BASELINE_PATH = REPO_ROOT / "infra" / "nos-test" / "srl" / "baseline.cli"
+FRR_DOCKERFILE_PATH = REPO_ROOT / "infra" / "nos-test" / "frr" / "Dockerfile"
+DEV_OVERRIDE_PATH = REPO_ROOT / "docker-compose.override.yml"
 DEV_COMPOSE_PATHS = [
     REPO_ROOT / "docker-compose.yml",
-    REPO_ROOT / "docker-compose.override.yml",
+    DEV_OVERRIDE_PATH,
 ]
 
 EXPECTED_SRL_PORT = "2223"
@@ -142,3 +144,40 @@ def test_srl_baseline_configures_both_vlan_tagging_interfaces():
     lines = BASELINE_PATH.read_text().splitlines()
     assert "set / interface ethernet-1/1 vlan-tagging true" in lines
     assert "set / interface ethernet-1/2 vlan-tagging true" in lines
+
+
+def _assert_pinned(ref: str, where: str) -> None:
+    """An image reference must carry a `@sha256:` digest, which pins it exactly
+    regardless of the tag (or lack of one) alongside it; a digest-only reference
+    (no tag at all, e.g. `repo@sha256:...`) is fine. Without a digest, a bare
+    `:latest` tag or no tag at all (implicit latest) is not; see issue #783."""
+    has_digest = "@sha256:" in ref
+    assert has_digest, f"{where}: {ref!r} has no digest pin"
+    # Strip the digest before inspecting the tag, so a tag@digest reference like
+    # "repo:26.7.2-519@sha256:..." is judged on its tag, not the digest suffix.
+    name = ref.split("@sha256:", 1)[0]
+    assert not name.endswith(":latest"), f"{where}: {ref!r} pins a floating :latest tag"
+
+
+def test_no_image_under_nos_lab_or_dev_override_selenium_floats_latest_or_untagged():
+    # infra/nos-test/docker-compose.yml: the srl service's `image:` key (frr
+    # builds from a Dockerfile, checked separately below).
+    data = _load_nos_compose()
+    _assert_pinned(data["services"]["srl"]["image"], "infra/nos-test/docker-compose.yml srl")
+
+    # infra/nos-test/frr/Dockerfile: the FROM line.
+    from_lines = [
+        line
+        for line in FRR_DOCKERFILE_PATH.read_text().splitlines()
+        if line.strip().upper().startswith("FROM ")
+    ]
+    assert len(from_lines) == 1, from_lines
+    from_ref = from_lines[0].split(None, 1)[1].strip()
+    _assert_pinned(from_ref, "infra/nos-test/frr/Dockerfile FROM")
+
+    # docker-compose.override.yml: the selenium service's `image:` key.
+    override_data = yaml.safe_load(DEV_OVERRIDE_PATH.read_text())
+    _assert_pinned(
+        override_data["services"]["selenium"]["image"],
+        "docker-compose.override.yml selenium",
+    )

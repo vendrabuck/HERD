@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- Pinned the NOS lab and Selenium images by digest (issue #783): SR Linux
+  (`26.7.2-519`), the FRR base image (no matching version tag; digest only),
+  and `selenium/standalone-chrome` (`4.43.0-20260404`), plus the FRR
+  Dockerfile's `apk add openssh` version; added `--wait-timeout 120` to the
+  Selenium `up --wait` recreate; tightened the Makefile `down`-line test
+  regex to catch `@`/`-`/`VAR=value`-prefixed and conditional spellings;
+  made `nos-detach` report per-container attachment and exit non-zero on a
+  real disconnect error; fixed `scripts/seed_nos_lab.sh`'s misleading
+  `SEED_NOS=1` message on its default `--nos-only` path; hardened
+  `infra/nos-test/frr/start.sh` (`set -e`, an sshd-up check) and extended the
+  FRR healthcheck to also probe port 22.
+
 - Fixed `pick_dut_template`'s last fallback tier in `seed_devices_public.py`
   (issue #781, follow-up to #775): it returned `items[0]` even when no
   template declared the seed fields, guaranteeing a create that fails

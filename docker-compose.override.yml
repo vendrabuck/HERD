@@ -112,7 +112,18 @@ services:
     # pins that this file adds no second 8080 binding.
 
   selenium:
-    image: selenium/standalone-chrome:latest
+    # Pinned 2026-09-12 (issue #783): this was the digest `latest` resolved
+    # to at pin time (Selenium release 4.43.0-20260404, confirmed against
+    # registry-1.docker.io). PR #768's healthcheck below calls
+    # /opt/bin/check-grid.sh, which this image ships but does not itself
+    # declare as a HEALTHCHECK; an unpinned bump could silently move or
+    # remove that script. To bump: pull the new `latest`, `docker image
+    # inspect selenium/standalone-chrome:latest --format
+    # '{{index .RepoDigests 0}} {{.Config.Labels}}'` for the digest and
+    # version label, verify check-grid.sh still exists
+    # (`docker run --rm --entrypoint ls <image> /opt/bin/check-grid.sh`),
+    # then update both the tag and the digest here.
+    image: selenium/standalone-chrome:4.43.0-20260404@sha256:b36b0749f77dce2cbf9a5bc7ac02b0364c91c3a149c5c36cd46dfb04ca2b39a4
     environment:
       - SE_NODE_MAX_SESSIONS=3
       - SE_SESSION_REQUEST_TIMEOUT=300
