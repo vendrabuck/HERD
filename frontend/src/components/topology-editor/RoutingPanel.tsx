@@ -8,7 +8,12 @@ import { useTopologyStore } from "@/stores/topologyStore";
 import { useDeviceConfigVersions, useDeviceConfigVersion } from "@/api/deviceConfig";
 import { errorDetail } from "@/lib/errors";
 import { l3IsMalformed, l3RoutesOf } from "@/lib/canvasNodes";
-import { matchRouteProblems, type ResolvedRouteProblem } from "@/lib/l3";
+import {
+  matchRouteProblems,
+  routeProblemFields,
+  type ResolvedRouteProblem,
+  type RouteProblemField,
+} from "@/lib/l3";
 import type { DeviceNodeData, L3RouteIntent } from "@/types/topology.types";
 
 export interface RoutingPanelProps {
@@ -88,6 +93,18 @@ function normalizeConfigRoutes(config: Record<string, unknown> | undefined): L3R
 
 const INPUT_CLASS =
   "w-full text-xs border border-gray-300 rounded px-1.5 py-1 focus:outline-none focus:border-blue-500";
+
+// The same box, outlined red because a blocking reason on this row is ABOUT this
+// field (ADR 0014 addendum X-I, issue #755). The reason line below the row still
+// names the reason; this only says WHICH box it is talking about, which matters
+// most for the VRF reasons, where "unknown virtual router" and "interface bound
+// to a virtual router" point at different columns.
+const INPUT_CLASS_INVALID =
+  "w-full text-xs border border-red-400 bg-red-50 rounded px-1.5 py-1 focus:outline-none focus:border-red-500";
+
+function inputClass(fields: Set<RouteProblemField>, field: RouteProblemField): string {
+  return fields.has(field) ? INPUT_CLASS_INVALID : INPUT_CLASS;
+}
 
 function ReasonLine({ problem }: { problem: ResolvedRouteProblem }) {
   // Review fix F1: l3_duplicate_route is informational (cabling's
@@ -304,6 +321,7 @@ export function RoutingPanel({ node, problems }: RoutingPanelProps) {
             {routes.map((_route, index) => {
               const rowDraft = rowDrafts[index] ?? EMPTY_DRAFT;
               const rowReasons = perRow.get(index) ?? [];
+              const invalidFields = routeProblemFields(rowReasons);
               const rowError = rowErrors[index];
               return (
                 <Fragment key={`route-${index}`}>
@@ -311,7 +329,7 @@ export function RoutingPanel({ node, problems }: RoutingPanelProps) {
                     <td className="pr-1 pb-1">
                       <input
                         aria-label="Destination"
-                        className={INPUT_CLASS}
+                        className={inputClass(invalidFields, "destination")}
                         maxLength={MAX_FIELD_LENGTH}
                         value={rowDraft.destination}
                         onChange={(e) => updateRowField(index, "destination", e.target.value)}
@@ -322,7 +340,7 @@ export function RoutingPanel({ node, problems }: RoutingPanelProps) {
                     <td className="pr-1 pb-1">
                       <input
                         aria-label="Next hop"
-                        className={INPUT_CLASS}
+                        className={inputClass(invalidFields, "next_hop")}
                         maxLength={MAX_FIELD_LENGTH}
                         value={rowDraft.next_hop}
                         onChange={(e) => updateRowField(index, "next_hop", e.target.value)}
@@ -333,7 +351,7 @@ export function RoutingPanel({ node, problems }: RoutingPanelProps) {
                     <td className="pr-1 pb-1">
                       <input
                         aria-label="Interface"
-                        className={INPUT_CLASS}
+                        className={inputClass(invalidFields, "interface")}
                         maxLength={MAX_FIELD_LENGTH}
                         value={rowDraft.interface}
                         onChange={(e) => updateRowField(index, "interface", e.target.value)}
@@ -344,7 +362,7 @@ export function RoutingPanel({ node, problems }: RoutingPanelProps) {
                     <td className="pr-1 pb-1">
                       <input
                         aria-label="Virtual router"
-                        className={INPUT_CLASS}
+                        className={inputClass(invalidFields, "virtual_router")}
                         maxLength={MAX_FIELD_LENGTH}
                         value={rowDraft.virtual_router}
                         onChange={(e) => updateRowField(index, "virtual_router", e.target.value)}

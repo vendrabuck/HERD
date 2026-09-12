@@ -71,6 +71,18 @@ Drivers without this file (or with `supports_dry_run: false`) cannot be schedule
 in dry-run mode: the inventory schedule endpoint rejects the request with HTTP 422,
 and the execution sandbox refuses to spawn the subprocess as a second-line defense.
 
+The file carries every capability declaration a driver makes. All of them are
+opt-in and closed by default: a missing file, unreadable JSON, or a silent field
+means the driver declares nothing.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `supports_dry_run` | bool | false | Every mutating method honors `context["dry_run"]` and records its commands without touching the wire. |
+| `supports_vrf` | bool | false | Layer 3 only (ADR 0014 addendum X-G, issue #755): `configure_route` and `remove_route` accept a `virtual_router` keyword. Execution passes that keyword ONLY to a declaring driver, because every Layer 3 signature in this repo ends in `**_` and a non-declaring driver would swallow it in silence, install the route in the default table, and report success. A switch whose driver does not declare it has its VRF-naming routes refused with `l3_vrf_unsupported` and no driver call at all. |
+
+Inventory parses both on upload and stores them on the driver package, so neither
+is re-read from the archive at drive time.
+
 In your `Driver` class, read the flag from the context dict and gate every mutating
 method on it (`context.get("dry_run", False)`):
 
@@ -885,7 +897,13 @@ class Driver:
         """
         ...
 
-    def configure_route(self, destination: str, next_hop: str | None, interface: str) -> dict:
+    def configure_route(
+        self,
+        destination: str,
+        next_hop: str | None,
+        interface: str,
+        virtual_router: str | None = None,
+    ) -> dict:
         """Install one static route.
 
         Called once per route during provisioning.
@@ -894,13 +912,23 @@ class Driver:
             destination: destination prefix (e.g. "10.0.0.0/24")
             next_hop: next-hop address, or None for an interface route
             interface: the switch's own egress interface name
+            virtual_router: the VRF to install into, or None for the default
+                routing table. Passed ONLY to a driver whose
+                driver_metadata.json declares supports_vrf, and then on EVERY
+                route call, null included.
 
         Returns:
             dict with at minimum {"success": bool}.
         """
         ...
 
-    def remove_route(self, destination: str, next_hop: str | None, interface: str) -> dict:
+    def remove_route(
+        self,
+        destination: str,
+        next_hop: str | None,
+        interface: str,
+        virtual_router: str | None = None,
+    ) -> dict:
         """Remove one static route.
 
         Called once per route during deprovisioning, with exactly the values
@@ -910,6 +938,8 @@ class Driver:
             destination: destination prefix
             next_hop: next-hop address, or None for an interface route
             interface: the switch's own egress interface name
+            virtual_router: the same VRF the matching configure_route received,
+                or None; the removal has to name the table the route landed in
 
         Returns:
             dict with at minimum {"success": bool}.
@@ -929,8 +959,8 @@ class Driver:
 
 | Event | Sequence |
 |---|---|
-| Reservation created (DUTs connected through L3 switch) | login(), configure_route(destination, next_hop, interface) for each route, logout() |
-| Reservation cancelled or completed | login(), remove_route(destination, next_hop, interface) for each route, logout() |
+| Reservation created (DUTs connected through L3 switch) | login(), configure_route(destination, next_hop, interface[, virtual_router]) for each route, logout() |
+| Reservation cancelled or completed | login(), remove_route(destination, next_hop, interface[, virtual_router]) for each route, logout() |
 | Reservation failed | same as cancelled: remove_route for each pinned route; a switch with no pinned assignment is skipped |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
@@ -971,9 +1001,11 @@ surprise mid-reservation teardown); it keeps whatever was last successfully appl
 recoverable only by another intent-bearing save or the reservation ending. A stale or
 missing per-route validation stamp is re-validated against the switch's CURRENT
 config before any driver call (ADR 0014 addendum X-A); a route naming a
-`virtual_router` is refused entirely until the driver contract gains VRF support
-(addendum X-F, issue #755): in both cases the WHOLE switch's drive for that pass is
-skipped and the row lands FAILED with the refusal reason, never a partial drive.
+`virtual_router` is refused for drivers that do not declare `supports_vrf`
+(addenda X-F and X-G, issue #755): in both cases the WHOLE switch's drive for that
+pass is skipped and the row lands FAILED with the refusal reason, never a partial
+drive. A switch whose driver DOES declare `supports_vrf` is driven normally, with
+the VRF passed on every route call.
 If no pinned assignment exists at deprovision time the switch is skipped
 with a log line.
 
@@ -1017,10 +1049,15 @@ platform), the same device and transport as `drivers/frr_mgmt` (see the
 Management driver contract below), driving `configure_route`/`remove_route`
 instead of raw config lines. It maps the contract onto vtysh as:
 
-- `configure_route(destination, next_hop, interface)` sends
+- `configure_route(destination, next_hop, interface, virtual_router)` sends
   `ip route <destination> <next_hop>` when `next_hop` is given, or
   `ip route <destination> <interface>` when `next_hop` is `None` (an interface
   route).
+- A non-empty `virtual_router` appends ` vrf <name>` to either form, the
+  one-line equivalent of FRR's `vrf <name>` configuration block (both land in
+  the same place in the running config, verified live). This driver declares
+  `supports_vrf: true`; a null or empty `virtual_router` renders the
+  default-table line unchanged.
 - `remove_route` sends the same line prefixed with `no `.
 - `status()` opens a session and checks the `show version` banner, returning
   `{"reachable": bool}`, matching the table above (not `{"success": ...}`).
@@ -1047,6 +1084,22 @@ would outlive the reservation that justified them and resurrect stale routes
 on the next daemon restart. The running config is the intended lifetime, and
 recovering after a restart is the execution service's full reconcile against
 cabling's intended set, not a startup-config side effect.
+
+Accepted but not installed is a failure (ADR 0014 addendum X-H, issue #755):
+FRR answers a route it took into its configuration but could not program into
+the kernel with `Static Route to <prefix> not installed currently because
+dependent config not fully available`. That line carries NO `%` marker, so the
+scan above cannot see it, and it is checked separately (after the `%` scan,
+which wins when both appear). Under the rejection contract's judge-by-the-
+desired-end-state rule an uninstalled route is not provisioned, so
+`configure_route` reports `{"success": False}` with that line as `error`. The
+rule applies to every route, VRF or not; verified live as the exact answer for
+a route naming a VRF with no Linux VRF device behind it, where
+`show ip route vrf <name>` then answers `% VRF <name> not active`. The check is
+deliberately not applied to `remove_route`, where the line has no meaning.
+`infra/nos-test/frr/start.sh` gives the lab node a real VRF (`blue`, table 10,
+member `dummy0`) so the live suite can prove the success case too; see
+`docs/NOS_LAB.md`.
 
 LIMITATION: `%`-detection is best-effort, not proof. Verified live: a
 syntactically invalid next-hop address (`ip route 203.0.113.8/30 999.1.1.1`)

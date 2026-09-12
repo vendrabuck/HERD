@@ -154,7 +154,9 @@ draft) is capped at 64 characters, matching the server's own field-length limit.
 
 **Import from device config** loads the switch's newest config version and copies its
 `routes` (destination, next hop, interface) into the table, leaving `virtual_router` blank
-on every imported row, since the device config schema has no such grouping. If the table
+on every imported row, since the config schema's `routes` entries carry no virtual router
+of their own (the schema's separate `virtual_routers` list is what a typed virtual router
+name is checked against). If the table
 already has rows, importing asks for confirmation first and then replaces the table
 outright; it does not merge. The **Import from device config** button is disabled (labeled
 "Importing..." while a fetch is in flight) until the switch's config version has loaded, and
@@ -210,7 +212,15 @@ The reasons you may see, in plain words:
 | `l3_unknown_interface` | The interface name does not match any interface in the switch's config. |
 | `l3_next_hop_unverifiable` | The next hop is set, but the named interface has no IP address (or no prefix length) to check it against. |
 | `l3_next_hop_outside_interface` | The next hop is set, but it does not fall inside the named interface's own subnet. |
+| `l3_unknown_virtual_router` | The virtual router name does not match any virtual router in the switch's config. A switch whose config declares no virtual routers at all refuses every route that names one. |
+| `l3_interface_outside_virtual_router` | The virtual router exists, but the named interface is not one of its member interfaces, so a route through it would not belong to that virtual router. |
+| `l3_interface_bound_to_virtual_router` | The route names no virtual router, but its interface belongs to one. An interface inside a virtual router is not in the default routing table, so a default-table route through it could never be installed. |
 | `l3_duplicate_route` | Informational, not a problem: another row on this switch has the same destination, next hop, interface, and virtual router. |
+
+The Routing panel outlines the box a reason is about, so a virtual router problem
+points at the **Virtual router** field and
+`l3_interface_bound_to_virtual_router` (which fires on a route with no virtual
+router at all) points at **Interface**.
 
 A route's `destination` is canonicalized on the server the way a routing table normally
 is: `10.0.0.5/24` is stored as `10.0.0.0/24`, and a bare address gets an implicit host

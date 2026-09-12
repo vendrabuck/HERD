@@ -124,6 +124,50 @@ export interface MatchedRouteProblems {
 // canvas was judged) is silently dropped: the panel has nothing correct left
 // to attach it to, and the node's badge staying red until the next result is
 // the intended signal that something here may still be wrong.
+// The route field each validation reason is ABOUT (ADR 0014 addendum X-I,
+// issue #755). The Routing panel uses this to outline the offending input, so a
+// reason like `l3_unknown_virtual_router` points at the Virtual router box
+// rather than leaving the user to map a raw reason string onto a column
+// themselves. A reason that is not about one field (every switch-level reason,
+// and the informational `l3_duplicate_route`) returns null and highlights
+// nothing.
+//
+// The three VRF reasons are the ones X-I added, and their mapping is the part
+// worth stating twice: `l3_unknown_virtual_router` and
+// `l3_interface_outside_virtual_router` are both about the VRF the route names,
+// so they point at Virtual router; `l3_interface_bound_to_virtual_router` fires
+// on a route that names NO VRF, so its problem is the interface (it is enslaved
+// to a VRF), and it points at Interface.
+export type RouteProblemField = "destination" | "next_hop" | "interface" | "virtual_router";
+
+const ROUTE_PROBLEM_FIELDS: Record<string, RouteProblemField> = {
+  l3_bad_destination: "destination",
+  l3_bad_next_hop: "next_hop",
+  l3_next_hop_unverifiable: "next_hop",
+  l3_next_hop_outside_interface: "next_hop",
+  l3_unknown_interface: "interface",
+  l3_interface_bound_to_virtual_router: "interface",
+  l3_unknown_virtual_router: "virtual_router",
+  l3_interface_outside_virtual_router: "virtual_router",
+};
+
+export function routeProblemField(reason: string): RouteProblemField | null {
+  return ROUTE_PROBLEM_FIELDS[reason] ?? null;
+}
+
+// The set of fields to outline for one row, given every problem attached to it.
+// Only blocking problems contribute: an informational duplicate must not paint
+// a field red.
+export function routeProblemFields(problems: { reason: string }[]): Set<RouteProblemField> {
+  const fields = new Set<RouteProblemField>();
+  for (const problem of problems) {
+    if (!isBlockingRouteProblem(problem)) continue;
+    const field = routeProblemField(problem.reason);
+    if (field) fields.add(field);
+  }
+  return fields;
+}
+
 export function matchRouteProblems(
   routes: L3RouteIntent[],
   problems: ResolvedRouteProblem[],
