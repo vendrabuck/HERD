@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- Fixed `pick_dut_template`'s last fallback tier in `seed_devices_public.py`
+  (issue #781, follow-up to #775): it returned `items[0]` even when no
+  template declared the seed fields, guaranteeing a create that fails
+  inventory validation. It now returns `None` in that case, which the caller
+  already handled by skipping ACL fixture seeding. Also hardened
+  `template_field_keys` to skip fieldless entries and gave the
+  `get_or_create_device` field-key assert a message.
+
 - Shipped phase 3b of the emulated-gear test tier (ADR 0010), the Layer 2
   counterpart of phase 3a's Layer 3 proof: `tests/nos_lab/test_srl_l2_via_stack_live.py`
   proves HERD derives a Layer 2 VLAN membership from a reservation's wiring and

@@ -1223,7 +1223,10 @@ def get_or_create_device(
     poll_interval_seconds: int | None = None,
 ) -> str:
     field_data = {"ip": ip, "login": "admin", "password": "admin123"}
-    assert set(field_data) == set(SEED_DEVICE_FIELD_KEYS)  # keep the two in step
+    assert set(field_data) == set(SEED_DEVICE_FIELD_KEYS), (
+        f"field_data keys {sorted(field_data)} != SEED_DEVICE_FIELD_KEYS "
+        f"{sorted(SEED_DEVICE_FIELD_KEYS)}; keep the two in step"
+    )
     body: dict = {
         "name": name,
         "template_id": template_id,
@@ -2115,9 +2118,10 @@ SEED_DEVICE_FIELD_KEYS = ("ip", "login", "password")
 def template_field_keys(template: dict) -> set[str]:
     """The field keys a device template declares, flattened across its sections."""
     return {
-        field.get("key")
+        field["key"]
         for section in (template.get("sections") or [])
         for field in (section.get("fields") or [])
+        if field.get("key") is not None
     }
 
 
@@ -2140,7 +2144,9 @@ def pick_dut_template(client: httpx.Client) -> str | None:
     Management-backed template that declares something else entirely (the
     integration suite seeds `int-seed-template-*` rows whose only field is `model`)
     can win and break seeding on any database those tests have touched. Falls back
-    to the first usable template, then to the first template of any kind.
+    to the first usable template; returns None when no template is usable (issue
+    #781, the worked example is #775), never a template guaranteed to fail
+    validation. The caller, seed_acl_test_fixtures, handles None by skipping.
     """
     drivers = client.get(f"{BASE}/inventory/drivers", params={"limit": 500}).json().get("items", [])
     mgmt_driver_ids = {d["id"] for d in drivers if d.get("connection_type") == "Management"}
@@ -2153,9 +2159,7 @@ def pick_dut_template(client: httpx.Client) -> str | None:
     for t in usable:
         if t.get("driver_id") in mgmt_driver_ids:
             return t["id"]
-    if usable:
-        return usable[0]["id"]
-    return items[0]["id"] if items else None
+    return usable[0]["id"] if usable else None
 
 
 def seed_acl_test_fixtures(client: httpx.Client) -> None:
