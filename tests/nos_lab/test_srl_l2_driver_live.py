@@ -282,3 +282,233 @@ def test_status_reports_reachable_against_the_real_node():
     driver = Driver(_context())
     result = driver.status()
     assert result["reachable"] is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #778: candidate discipline.
+#
+# SR Linux stages every set/delete in a per-user PRIVATE CANDIDATE that only
+# `commit stay` applies, and that candidate outlives the SSH session it was
+# staged in. netmiko also keeps sending after a rejected line. Together those
+# two facts produced the bug: a commit issued before the set output was judged
+# applied the valid PREFIX of a batch the driver then reported as failed, and
+# a candidate left dirty by a call that died rode into the next call's commit
+# through the DEVICE (the sandbox runs one process per action, so there is no
+# shared session to blame).
+#
+# These tests run on ethernet-1/3, which the lab baseline deliberately does
+# NOT touch (ethernet-1/1 and ethernet-1/2 already carry `vlan-tagging true`,
+# which would mask exactly the partial apply under test). Independent
+# verification is a separate `docker exec nos-test-srl sr_cli` read, never the
+# driver's own session.
+# ---------------------------------------------------------------------------
+
+_UNTOUCHED_PORT = "ethernet-1/3"
+_UNTOUCHED_PORT_PATH = f"/interface {_UNTOUCHED_PORT}"
+
+
+def _restore_untouched_port():
+    """Return ethernet-1/3 to its baseline (absent from the running config).
+
+    Runs through a separate sr_cli session rather than the driver, so a driver
+    bug cannot quietly skip its own cleanup. `delete` on an absent path is a
+    clean no-op on SR Linux (verified live), so this is safe to call
+    unconditionally.
+    """
+    _docker_exec(
+        "bash",
+        "-c",
+        "sr_cli <<'EOS'\n"
+        "enter candidate private\n"
+        f"delete {_UNTOUCHED_PORT_PATH}\n"
+        "commit stay\n"
+        "quit\n"
+        "EOS\n",
+    )
+
+
+def _stage_stale_candidate(line):
+    """Stage `line` in the admin user's private candidate and walk away.
+
+    Deliberately a second netmiko SSH session as the SAME user, not a
+    `docker exec sr_cli` session: verified live, the container-side sr_cli
+    runs as a different user and gets a DIFFERENT private candidate, which
+    the driver's admin session cannot see. Only a same-user session
+    reproduces the leak this test is about.
+
+    Disconnects without committing and without discarding, which is what a
+    driver process killed by the sandbox rlimit leaves behind.
+    """
+    from netmiko import ConnectHandler
+
+    conn = ConnectHandler(
+        device_type="nokia_srl",
+        host=SRL_HOST,
+        username=SRL_USERNAME,
+        password=SRL_PASSWORD,
+        port=SRL_PORT,
+        fast_cli=False,
+    )
+    try:
+        conn.config_mode()
+        conn.send_config_set([line])
+        diff = conn.send_command("diff")
+        assert diff.strip(), "precondition failed: nothing staged in the private candidate"
+    finally:
+        conn.disconnect()
+
+
+def _clear_admin_candidate():
+    """Discard whatever is left in the admin user's private candidate."""
+    from netmiko import ConnectHandler
+
+    conn = ConnectHandler(
+        device_type="nokia_srl",
+        host=SRL_HOST,
+        username=SRL_USERNAME,
+        password=SRL_PASSWORD,
+        port=SRL_PORT,
+        fast_cli=False,
+    )
+    try:
+        conn.config_mode()
+        conn._discard()
+    finally:
+        conn.disconnect()
+
+
+def test_rejected_batch_commits_nothing_of_its_valid_prefix():
+    """The literal replay of issue #778's first transcript.
+
+    Two lines, the first valid and the second a parsing error. netmiko sends
+    both; before the fix the unconditional commit() answered "All changes have
+    been committed." and `admin-state enable` landed on a port HERD believed
+    untouched, while the caller was told success: False.
+
+    This drives _apply directly rather than a contract method because no
+    contract method can BUILD a syntactically invalid line: the partial-apply
+    window is a property of the batch, and this is the batch that opens it.
+    """
+    driver = Driver(_context())
+    assert driver.login()["success"] is True
+    try:
+        result = driver._apply(
+            [
+                f"set / interface {_UNTOUCHED_PORT} admin-state enable",
+                f"set / interface {_UNTOUCHED_PORT} vlan-taggingX true",
+            ]
+        )
+        assert result["success"] is False, result
+        assert "Parsing error:" in result["error"], result
+        # Read the device BEFORE cleanup. Asserting after the finally block
+        # would assert on the cleanup's work, not the driver's: the first cut
+        # of this test did exactly that and passed against the unfixed driver.
+        observed = _info(_UNTOUCHED_PORT_PATH)
+    finally:
+        driver.logout()
+        _restore_untouched_port()
+
+    # The whole point: the valid first line must NOT be in the running config.
+    assert observed.strip() == "", observed
+
+
+def test_add_to_vlan_rejection_leaves_an_untouched_port_untouched():
+    """The same rule through the public contract method, on a port whose
+    baseline carries nothing.
+
+    add_to_vlan's first line is `vlan-tagging true`, which parses fine on its
+    own; an out-of-range vlan id only rejects further down the batch. The
+    sibling out-of-range test above runs on ethernet-1/1, whose baseline
+    already sets vlan-tagging, so it cannot see a leaked flag. This one can.
+
+    Honest scope note: this test does NOT fail against the unfixed driver, and
+    is not the regression detector for #778
+    (test_rejected_batch_commits_nothing_of_its_valid_prefix is). Measured
+    live: this batch's valid prefix is semantically inconsistent on its own
+    (vlan-tagging plus an out-of-range encap), so SR Linux refuses the whole
+    commit and the partial apply never opens. It is kept as the public-contract
+    guard on a port with no baseline config, where a future regression that
+    DOES leak through add_to_vlan would show up.
+    """
+    vlan_id = _random_vlan_id(4095, 9999)
+    net_path = f"/network-instance vlan{vlan_id}"
+
+    assert _info(_UNTOUCHED_PORT_PATH).strip() == "", "precondition: port must start clean"
+
+    driver = Driver(_context())
+    assert driver.login()["success"] is True
+    try:
+        result = driver.add_to_vlan(port=_UNTOUCHED_PORT, vlan_id=vlan_id, tag="tagged")
+        assert result["success"] is False, result
+        assert result.get("error"), result
+        observed_port = _info(_UNTOUCHED_PORT_PATH)  # before cleanup; see the test above
+        observed_net = _info(net_path)
+    finally:
+        driver.logout()
+        _restore_untouched_port()
+
+    assert observed_port.strip() == "", observed_port
+    assert observed_net.strip() == "", observed_net
+
+
+def test_a_stale_candidate_from_an_earlier_call_is_never_committed():
+    """The cross-session half of issue #778.
+
+    A previous action that died after staging leaves lines in the admin
+    user's private candidate ON THE DEVICE. A fresh sandbox process is no
+    protection: its `enter candidate private` lands in that same candidate,
+    and its commit would apply the orphaned lines alongside its own. The entry
+    discard in _apply is what stops that.
+    """
+    vlan_id = _random_vlan_id(2000, 2999)
+    net_path = f"/network-instance vlan{vlan_id}"
+    stale = f"set / interface {_UNTOUCHED_PORT} description HERD-778-STALE"
+
+    assert _info(_UNTOUCHED_PORT_PATH).strip() == "", "precondition: port must start clean"
+    _stage_stale_candidate(stale)
+
+    driver = Driver(_context())
+    assert driver.login()["success"] is True
+    try:
+        # An ordinary, entirely valid call. It must commit its OWN work only.
+        assert driver.create_vlan(vlan_id)["success"] is True
+        # Before cleanup; see test_rejected_batch_commits_nothing_of_its_valid_prefix.
+        port_info = _info(_UNTOUCHED_PORT_PATH)
+        # The call's own work DID land, so a driver that simply does nothing
+        # cannot pass this test by accident.
+        assert "type mac-vrf" in _info(net_path), _info(net_path)
+    finally:
+        driver.delete_vlan(vlan_id)
+        driver.logout()
+        _clear_admin_candidate()
+        _restore_untouched_port()
+
+    assert "HERD-778-STALE" not in port_info, port_info
+    assert port_info.strip() == "", port_info
+    assert _info(net_path).strip() == "", _info(net_path)
+
+
+def test_remove_from_vlan_on_an_absent_membership_is_idempotent():
+    """`delete` on an absent path is a clean no-op on SR Linux, so a redelivered
+    or retried release converges instead of failing. Verified live rather than
+    assumed, the same way create_vlan/delete_vlan idempotency is."""
+    vlan_id = _random_vlan_id(2000, 2999)
+    port = "ethernet-1/1"
+    subif_path = f"/interface {port} subinterface {vlan_id}"
+    net_path = f"/network-instance vlan{vlan_id}"
+
+    # Confirm there is genuinely nothing to remove before calling remove.
+    assert _info(subif_path).strip() == "", _info(subif_path)
+    assert _info(net_path).strip() == "", _info(net_path)
+
+    driver = Driver(_context())
+    assert driver.login()["success"] is True
+    try:
+        result = driver.remove_from_vlan(port=port, vlan_id=vlan_id)
+        assert result["success"] is True, result
+    finally:
+        driver.logout()
+
+    # Still absent, and the call created nothing on its way through.
+    assert _info(subif_path).strip() == "", _info(subif_path)
+    assert _info(net_path).strip() == "", _info(net_path)
