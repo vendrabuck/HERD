@@ -57,9 +57,15 @@ hand-repairing a stateful container.
   network, so HERD's own execution service can reach them by CONTAINER NAME
   (`nos-test-srl`, `nos-test-frr`) over Docker DNS (phase 3a, ADR 0010)
 - `make nos-detach`, detach both lab containers from the dev stack's network
+- `make nos-test-dialect`, run the four dialect suites, booting the lab first
+  if it is not already up (see "Where these run" below)
+- `make nos-test-feature`, run the two via-stack suites against a running
+  stack: attach, seed, run, always detach
 
 None of these run as part of `make test`, `make master`, or `make everything`;
-this phase is opt-in only, so a host that never runs it pays nothing for it.
+locally this phase is opt-in only, so a host that never runs it pays nothing
+for it. The two test targets DO run in GitHub Actions, on different
+schedules; see "Where these run" below.
 
 ## Phase 3a: wiring the lab into a running HERD stack
 
@@ -292,6 +298,43 @@ make nos-detach
   `sr_cli` (never through the driver's own session), prove `create_vlan`
   idempotency and `delete_vlan`-on-a-missing-VLAN, then remove and delete
   and verify both are gone.
+
+## Where these run
+
+The suites are split into two tiers (issue #785, decided 2026-09-12), one
+Makefile variable each, so a workflow and a local run share one recipe and
+cannot drift:
+
+- Dialect tier, `make nos-test-dialect` (`NOS_DIALECT_TESTS`): the four
+  suites that drive one driver against one lab node over SSH, with no HERD
+  stack involved. Runs on every pull request from the `nos-dialect` job in
+  `.github/workflows/ci.yml`, which boots the lab, runs the suites
+  hard-required (`HERD_TEST_NOS_REQUIRED=1`), uploads the lab logs as the
+  `nos-dialect-logs` artifact if anything fails, and stops the lab again.
+  The job is advisory: the branch-protection ruleset requires only `backend`
+  and `frontend`, so a red run reports without blocking a merge. Run locally
+  with `make nos-test-dialect`, which boots the lab if it is not already up
+  and tears down only what it started.
+- Feature tier, `make nos-test-feature` (`NOS_FEATURE_TESTS`): the two
+  via-stack suites that drive a real device through HERD's own API. Runs in
+  `.github/workflows/nightly.yml`, step "NOS lab feature tests
+  (reservation-driven, real SR Linux and FRR)", placed after the seeded e2e
+  pass (the L2 suite reuses the `nos-lab-*` devices `make seed-nos` creates)
+  and before the locust load test (both hold reservations over the same
+  devices, so running them together would race for ports). Locally it needs
+  a running stack and a running lab: `make up`, `make nos-up`, then
+  `make nos-test-feature`. It attaches the lab, runs `make seed-nos`, runs
+  the suites, and always detaches. Export `SUPERADMIN_EMAIL` and
+  `SUPERADMIN_PASSWORD` (or `SEED_EMAIL` / `SEED_PASSWORD`) first; the
+  suites read them from the environment, not from `.env`.
+
+`make master` and `make everything` run neither target. The lab stays opt-in
+there, so a host that never uses it still pays nothing; wiring it into the
+local gates is a separate decision.
+
+`tests/unit/test_nos_lab_ci_wiring.py` pins all of this statically, including
+that every file under `tests/nos_lab/` appears in exactly one of the two
+lists, so a new suite cannot be merged with nothing running it.
 
 ## The `[FACTORY]` trap and why the baseline exists
 

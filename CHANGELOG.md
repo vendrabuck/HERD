@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- Split the NOS lab suites into two CI tiers (issue #785). The four dialect
+  suites, which drive one driver against one lab node with no HERD stack, run
+  on every pull request from ci.yml's new advisory `nos-dialect` job; the two
+  via-stack feature suites, which drive a real SR Linux and a real FRR node
+  through HERD's own reservation path, run in nightly after the seed step and
+  before the load test. Both go through new Makefile targets,
+  `make nos-test-dialect` (boots the lab if it is not already up, tears down
+  only what it started) and `make nos-test-feature` (attaches the lab, seeds
+  it, always detaches), so a workflow and a local run share one recipe.
+  `tests/unit/test_nos_lab_ci_wiring.py` fails if a new file under
+  `tests/nos_lab/` belongs to neither tier. Neither target is wired into
+  `make master` or `make everything`.
+
 - Moved seeding into a `seedtools/` package with a subcommand CLI and retired
   the root module and both shell wrappers (issue #791). `seed_devices_public.py`
   (2,637 lines), `scripts/seed_frr_demo.sh`, and `scripts/seed_nos_lab.sh` are

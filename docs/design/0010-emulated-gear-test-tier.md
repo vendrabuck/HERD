@@ -8,6 +8,24 @@ driver-testing tier between the deterministic mocks and real hardware, built on 
 external `network-simulator` project. Context verified against the live HERD-public
 tree and the `network-simulator` working tree on 2026-07-28.
 
+## Status amendment, 2026-09-12
+
+The body below is kept as written. What was actually built diverged from it,
+and the CI placement it left open is now settled.
+
+- The tier was built IN-REPO as `infra/nos-test/` (a real Nokia SR Linux node
+  and a real FRRouting node in containers, PRs #769 to #776, drivers
+  `drivers/srl_l2` and `drivers/frr_l3`, plus tests that drive real devices
+  through HERD's own reservation path), not on the external
+  `network-simulator` emulator. See `docs/NOS_LAB.md`.
+- L1 emulation is still blocked on `network-simulator` having no socket
+  transport, so no HERD driver can reach it. That open question is unchanged.
+- The "self-hosted nightly runner" assumption was wrong: every HERD workflow
+  runs on `ubuntu-latest`, which runs the lab's privileged containers fine.
+- CI placement was decided 2026-09-12 per issue #785: dialect suites on every
+  pull request, via-stack feature suites in nightly after the seed step.
+  `docs/NOS_LAB.md` section "Where these run" is the reference.
+
 ## Context
 
 HERD drives physical and virtual lab gear through admin-uploaded driver packages
