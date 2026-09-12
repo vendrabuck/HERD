@@ -60,6 +60,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
 	nos-up nos-down nos-status nos-logs nos-reset nos-attach nos-detach \
+	nos-test-dialect nos-test-feature \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run \
 	_collect-stack-diagnostics
@@ -705,6 +706,91 @@ nos-detach:  ## Detach the NOS test lab containers from the dev stack's network
 		fi; \
 	done; \
 	exit $$fail
+
+# NOS lab test tiers (issue #785, decided 2026-09-12). Every file under
+# tests/nos_lab/ belongs to exactly one of the two lists below, and
+# tests/unit/test_nos_lab_ci_wiring.py fails if a new file belongs to
+# neither, so a new suite cannot quietly go unrun.
+#
+# - DIALECT suites drive ONE driver against ONE lab node over SSH. No HERD
+#   stack is involved, so they are cheap enough to run on every PR
+#   (.github/workflows/ci.yml, job nos-dialect).
+# - FEATURE suites drive a real device through HERD's own API (reservation,
+#   fork save, execution service), so they need a booted and seeded stack
+#   with the lab attached to its network. Those run in nightly.yml, after
+#   the seed step.
+#
+# Both workflows call these targets rather than spelling out a pytest
+# invocation, so a workflow and a local run cannot drift apart. Neither
+# target is wired into `make master` or `make everything`: keeping the lab
+# opt-in there is a separate decision (docs/NOS_LAB.md).
+NOS_DIALECT_TESTS := \
+	tests/nos_lab/test_nos_lab_live.py \
+	tests/nos_lab/test_frr_l3_driver_live.py \
+	tests/nos_lab/test_frr_mgmt_driver_live.py \
+	tests/nos_lab/test_srl_l2_driver_live.py
+
+NOS_FEATURE_TESTS := \
+	tests/nos_lab/test_frr_l3_via_stack_live.py \
+	tests/nos_lab/test_srl_l2_via_stack_live.py
+
+# Recursion alias. GNU make executes a recipe line that literally contains
+# `$(MAKE)` even under `-n`, which for the two targets below would mean a
+# `make -n` boots containers and runs a multi-minute live suite for real
+# (that is why `make -n _gate-ldap-tests` is not a dry run today). Going
+# through an alias hides the literal from that check, so `make -n` prints
+# and stops, while a real run recurses exactly as before. The one thing the
+# alias gives up is jobserver propagation under `-j`; neither target is ever
+# run in parallel.
+SUBMAKE := $(MAKE)
+
+# Boot the lab if (and only if) it is not already up, run the dialect
+# suites hard-required (HERD_TEST_NOS_REQUIRED=1 turns "lab unreachable"
+# into a failure instead of the suites' normal skip, so a CI job asking for
+# them can never silently no-op), then tear down only what this run started.
+# The trap covers the failure path, so a red run cannot strand a
+# target-started lab. Same shape as _gate-ldap-tests above.
+nos-test-dialect:  ## Run the NOS lab dialect suites (boots the lab if it is not already up)
+	@started=0; running=1; \
+	for c in $(NOS_LAB_CONTAINERS); do \
+		docker ps --format '{{.Names}}' | grep -qx "$$c" || running=0; \
+	done; \
+	if [ "$$running" = 1 ]; then \
+		echo "NOS test lab already running; leaving it up afterward."; \
+	else \
+		$(SUBMAKE) nos-up; started=1; \
+	fi; \
+	trap 'if [ "$$started" = 1 ]; then $(SUBMAKE) nos-down; fi' EXIT INT TERM; \
+	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_DIALECT_TESTS) -v
+
+# The via-stack half. Unlike nos-test-dialect this one does NOT boot
+# anything by itself beyond the attachment: it needs a running HERD stack
+# (`make up`, or nightly's `docker compose up -d`) and a running lab
+# (`make nos-up`), and fails fast with nos-attach's own wording when the
+# stack network is missing, rather than seeding into nothing. The detach
+# trap is armed BEFORE the attach so a failure anywhere, including inside
+# nos-attach's own loop, still leaves the lab off the stack's network.
+# COMPOSE_PROJECT_NAME selects which stack: it flows through to
+# nos-attach/nos-detach, which is why nightly calls this target with
+# COMPOSE_PROJECT_NAME=herd (its stack is the default-named project, not a
+# CURDIR-derived one).
+#
+# Credentials: the two suites authenticate against the stack as its
+# superadmin and read SEED_EMAIL/SEED_PASSWORD, else
+# SUPERADMIN_EMAIL/SUPERADMIN_PASSWORD, from the ENVIRONMENT (not from
+# .env, which only the stack itself reads), so export them before calling
+# this target. Both suites probe the credentials up front and say so
+# instead of failing inside a test.
+nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running stack and lab)
+	@net=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}_herd-net; \
+	if ! docker network inspect "$$net" >/dev/null 2>&1; then \
+		echo "Dev stack network $$net not found; run 'make up' first (or set COMPOSE_PROJECT_NAME)."; \
+		exit 1; \
+	fi; \
+	trap '$(SUBMAKE) nos-detach' EXIT INT TERM; \
+	$(SUBMAKE) nos-attach && \
+	$(SUBMAKE) seed-nos && \
+	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
 # Postgres-live coverage for the ADR 0011 sync surface (issue #572): the
 # advisory-lock SQL and _SyncSlot's cross-replica branch never run on the
