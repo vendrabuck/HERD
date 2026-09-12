@@ -113,7 +113,13 @@ not a style preference: the execution service keys driver-call success on the
 returned PAYLOAD, never on transport health, via the `driver_result_failed`
 helper in `services/execution/app/services/execution_service.py` (a present
 `success` key that is falsy means failure; an absent key stays success, see
-the "Return values" section for each connection type). A driver that returns
+the "Return values" section for each connection type). The one deliberate
+exception is the Hypervisor recipe pair `create_instance`/`destroy_instance`,
+judged by `_recipe_reported_success` in
+`services/execution/app/services/nats_consumer.py`: those require a POSITIVE
+`{"success": True}`, so a missing key is a failure there, because a dynamic
+instance that cannot be proven created must not be recorded in the ledger as
+if it were. A driver that returns
 `{"success": True}` after the device rejected the command makes HERD record
 the operation as applied, in its wiring ledger or whatever state the call was
 provisioning, even though nothing actually changed on the device. The ledger
@@ -199,19 +205,38 @@ non-existent route`, is the worked EXAMPLE of this rule, not the rule itself:
 `drivers/frr_mgmt/driver.py`'s multi-command `configure` both treat this
 exact line as benign, for the same reason (the route is already gone, which
 is the desired end state), each verified independently against the live NOS
-test lab. `frr_mgmt` additionally has to scan and classify every line in its
-batch rather than just the first, since a "first match" check there would be
-exactly the masking bug this section warns about; `frr_l3`'s `remove_route`
-does not need to, because it is a narrower, single-line contract.
+test lab. Both drivers scan and classify EVERY line of the response rather
+than stopping at the first, `frr_mgmt` because it batches many commands per
+call and `frr_l3` because even a single command's response can span several
+lines (issue #779); neither one gets to assume its response is one line long.
+
+Anchor a benign marker at the START of the rendered line, never as a
+substring of it. FRR quotes the offending command back inside its own
+rejection, so the config line `ip route Refusing to remove a non-existent
+route` comes back as `% Unknown command: ip route Refusing to remove a
+non-existent route` (verified live 2026-09-12). An unanchored `marker in
+line` test called that genuine rejection benign and reported success, with
+nothing upstream filtering the phrase out, which is issue #779's first item.
 
 Two reference implementations exist and should be read before writing a new
-driver against real gear: `drivers/frr_l3/driver.py` (`_find_error_line`,
-used by `configure_route`/`remove_route`) and `drivers/srl_l2/driver.py`
+driver against real gear: `drivers/frr_l3/driver.py`
+(`_find_error_lines`/`_classify_error_lines`, used by
+`configure_route`/`remove_route`) and `drivers/srl_l2/driver.py`
 (`_rejection_error`, used by `_apply`); `drivers/frr_mgmt/driver.py`
-(`_find_error_lines`/`_classify_error_lines`, used by `configure`/`backup`)
-is a third, and the one issue #771 fixed: it originally shipped without any
-output inspection at all and always reported success regardless of what the
-device did.
+(the same two helper names plus `_save_failure_line`, used by
+`configure`/`backup`) is a third, and the one issue #771 fixed: it originally
+shipped without any output inspection at all and always reported success
+regardless of what the device did.
+
+**A write that has to be persisted is not done until the persist step is
+classified too.** `frr_mgmt`'s `configure()` ends with a `write memory`, and
+vtysh reports a FAILED save with no `%` line at all and exit status 0
+(verified live: `Building Configuration...` followed by `Can't open
+configuration file /etc/frr/zebra.conf.XXXXXX.` per daemon), so the rejection
+scan above cannot see it. It therefore requires POSITIVE evidence of a save,
+a `configuration saved to ...` line, and reports `{"success": False}` with
+the offending save line otherwise. If your device has a save step, classify
+its output the same way rather than assuming silence means success.
 
 ---
 
@@ -1000,16 +1025,28 @@ instead of raw config lines. It maps the contract onto vtysh as:
 - `status()` opens a session and checks the `show version` banner, returning
   `{"reachable": bool}`, matching the table above (not `{"success": ...}`).
 
-Error detection: unlike `drivers/frr_mgmt` (whose `configure()` never
-inspects command output), this driver scans `send_config_set`'s output for a
-vtysh line starting with `%` and treats it as a genuine rejection,
-`{"success": False, "error": <the line>}`, rather than trusting the absence
-of a raised exception (netmiko does not raise for a rejected vtysh command,
-so a driver that only checks for exceptions can report `{"success": True}`
-for a route the device never installed; this was a real bug caught by the
-live NOS-lab suite before this driver shipped). The one exception is
-`remove_route`'s benign `% Refusing to remove a non-existent route` line
-(see Idempotency below), which is deliberately still success.
+Error detection: this driver scans `send_config_set`'s output for vtysh
+lines starting with `%` and treats them as genuine rejections,
+`{"success": False, "error": <the first genuine line>}`, rather than trusting
+the absence of a raised exception (netmiko does not raise for a rejected
+vtysh command, so a driver that only checks for exceptions can report
+`{"success": True}` for a route the device never installed; this was a real
+bug caught by the live NOS-lab suite before this driver shipped).
+`drivers/frr_mgmt`'s `configure()`/`backup()` do the same, since issue #771
+fixed the same defect there. The one exception is `remove_route`'s benign
+`% Refusing to remove a non-existent route` line (see Idempotency below),
+which is deliberately still success; it is matched anchored at the start of
+the line and only when EVERY `%` line in the response is that marker (issue
+#779).
+
+Persistence, deliberately absent: this driver never calls `write memory`,
+unlike `drivers/frr_mgmt`'s `configure()`. The routes it installs are
+reservation-scoped, installed when a reservation's wiring says so and removed
+again on teardown or a fork re-save, so writing them to the startup config
+would outlive the reservation that justified them and resurrect stale routes
+on the next daemon restart. The running config is the intended lifetime, and
+recovering after a restart is the execution service's full reconcile against
+cabling's intended set, not a startup-config side effect.
 
 LIMITATION: `%`-detection is best-effort, not proof. Verified live: a
 syntactically invalid next-hop address (`ip route 203.0.113.8/30 999.1.1.1`)

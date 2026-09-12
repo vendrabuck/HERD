@@ -200,6 +200,186 @@ def test_configure_route_of_an_already_configured_route_is_a_silent_no_op():
     assert second["success"] is True
 
 
+# --- the benign carve-out is anchored, and every line is classified ---------
+# (issue #779: the same two defects drivers/frr_mgmt carried.)
+
+
+def test_remove_route_echoed_benign_marker_is_a_genuine_failure():
+    """vtysh echoes the offending command back inside its own rejection, so a
+    command whose text CONTAINS the benign phrase yields a genuine
+    "% Unknown command" line that also contains it. Verified live 2026-09-12
+    against the NOS test lab FRR node:
+
+        $ docker exec nos-test-frr vtysh -c "configure terminal" \
+              -c "ip route Refusing to remove a non-existent route"
+        % Unknown command: ip route Refusing to remove a non-existent route
+
+    Cabling validates this driver's destination/next-hop as IP objects, so
+    HERD's own call path cannot reach this today; the anchored test is what
+    keeps that a defense in depth rather than a dependency on a caller three
+    services away."""
+    destination = "Refusing to remove a non-existent route"
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        f"frr(config)#  no ip route {destination} 172.17.0.1\n"
+        f"% Unknown command: no ip route {destination} 172.17.0.1\n"
+        "frr(config)#  end"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_route(
+            destination=destination, next_hop="172.17.0.1", interface="eth0"
+        )
+    assert result["success"] is False, (
+        f"an echoed benign phrase inside a genuine rejection must not be carved out: {result!r}"
+    )
+    assert "Unknown command" in result["error"]
+    assert "already_absent" not in result
+
+
+def test_remove_route_genuine_line_after_a_benign_one_is_not_masked():
+    """A first-match scanner would stop at the benign "already absent" line
+    and report success, hiding the genuine rejection printed after it
+    (docs/DRIVERS.md, "Classify ALL of a device's complaints before
+    deciding")."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)#  no ip route 192.0.2.0/30 172.20.255.254\n"
+        "% Refusing to remove a non-existent route\n"
+        "% Unknown command: no ip route 192.0.2.0/30 172.20.255.254\n"
+        "frr(config)#  end"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_route(
+            destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0"
+        )
+    assert result["success"] is False
+    assert "Unknown command" in result["error"]
+    assert "already_absent" not in result
+
+
+def test_remove_route_genuine_line_before_a_benign_one_is_reported():
+    """The symmetric ordering: the FIRST GENUINE line is the error, not the
+    first line of any kind."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)#  no ip route 192.0.2.0/30 172.20.255.254\n"
+        "% Unknown command: no ip route 192.0.2.0/30 172.20.255.254\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  end"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_route(
+            destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0"
+        )
+    assert result["success"] is False
+    assert result["error"] == "% Unknown command: no ip route 192.0.2.0/30 172.20.255.254"
+
+
+def test_remove_route_all_benign_lines_still_report_already_absent():
+    """The carve-out itself is unchanged when every line found is benign,
+    including a response that repeats the marker."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)#  no ip route 192.0.2.0/30 172.20.255.254\n"
+        "% Refusing to remove a non-existent route\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  end"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_route(
+            destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0"
+        )
+    assert result["success"] is True
+    assert result["already_absent"] is True
+
+
+def test_configure_route_does_not_carve_out_the_removal_marker():
+    """The benign line belongs to remove_route alone: an install that somehow
+    drew it is a rejection, not an idempotent no-op."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)#  ip route 192.0.2.0/30 172.20.255.254\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr(config)#  end"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0"
+        )
+    assert result["success"] is False
+
+
+def test_driver_never_calls_save_config():
+    """Deliberate asymmetry with drivers/frr_mgmt (module docstring and
+    docs/DRIVERS.md): these routes are reservation-scoped, so they live in the
+    running config and are never written to the startup config."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)# ip route 192.0.2.0/30 172.20.255.254"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        d = Driver(_REAL_CTX)
+        d.configure_route(destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0")
+        d.remove_route(destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0")
+    conn.save_config.assert_not_called()
+
+
+# --- HERD_port parsing (issue #780) -----------------------------------------
+
+
+def test_blank_port_defaults_to_22_instead_of_raising():
+    """A present-but-blank optional `port` device field reaches the driver as
+    "", and int("") used to raise inside __init__, before any method could
+    run (issue #780)."""
+    conn = MagicMock()
+    conn.send_command.return_value = "FRRouting 8.4_git (r1) on Linux"
+    with patch("netmiko.ConnectHandler", return_value=conn) as ch:
+        result = Driver({**_REAL_CTX, "HERD_port": ""}).status()
+    assert result["reachable"] is True
+    _, kwargs = ch.call_args
+    assert kwargs["port"] == 22
+
+
+def test_missing_port_defaults_to_22():
+    ctx = {k: v for k, v in _REAL_CTX.items() if k != "HERD_port"}
+    conn = MagicMock()
+    conn.send_command.return_value = "FRRouting 8.4_git (r1) on Linux"
+    with patch("netmiko.ConnectHandler", return_value=conn) as ch:
+        Driver(ctx).status()
+    _, kwargs = ch.call_args
+    assert kwargs["port"] == 22
+
+
+def test_numeric_string_port_is_honored():
+    conn = MagicMock()
+    conn.send_command.return_value = "FRRouting 8.4_git (r1) on Linux"
+    with patch("netmiko.ConnectHandler", return_value=conn) as ch:
+        Driver({**_REAL_CTX, "HERD_port": "2224"}).status()
+    _, kwargs = ch.call_args
+    assert kwargs["port"] == 2224
+
+
+def test_non_integer_port_does_not_raise_from_the_constructor():
+    with patch("netmiko.ConnectHandler"):
+        Driver({**_REAL_CTX, "HERD_port": "abc"})  # must not raise
+
+
+def test_non_integer_port_raises_driver_error_from_the_mutating_path():
+    with patch("netmiko.ConnectHandler") as ch:
+        d = Driver({**_REAL_CTX, "HERD_port": "abc"})
+        with pytest.raises(DriverError, match="HERD_port must be an integer"):
+            d.configure_route(
+                destination="192.0.2.0/30", next_hop="172.20.255.254", interface="eth0"
+            )
+    ch.assert_not_called()
+
+
+def test_non_integer_port_degrades_status_to_unreachable():
+    """status() must never raise, whatever the field_data says."""
+    with patch("netmiko.ConnectHandler"):
+        result = Driver({**_REAL_CTX, "HERD_port": "abc"}).status()
+    assert result["reachable"] is False
+    assert "HERD_port must be an integer" in result["error"]
+
+
 # --- dry-run must never touch the wire --------------------------------------
 
 

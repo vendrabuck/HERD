@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- Closed four rejection-classification gaps in the FRR drivers (issue #779)
+  and the shared `HERD_port` parsing defect (issue #780). `drivers/frr_mgmt`
+  and `drivers/frr_l3` now anchor the benign "already absent" carve-out at the
+  START of the device's line instead of testing for it anywhere in the line:
+  FRR quotes the offending command back inside `% Unknown command: ...`, so a
+  config line containing that phrase had its genuine rejection reported as
+  success (verified live on the NOS test lab node). `frr_mgmt.configure()` now
+  classifies its `write memory` output instead of assuming it worked, since a
+  failed save prints no `%` line and exits 0; it requires a
+  `configuration saved to ...` line and reports `{"success": False}` with the
+  offending save line otherwise, and its failure payload calls the commands
+  `attempted` rather than `applied`. `frr_l3` got `frr_mgmt`'s
+  collect-and-partition scanner, so `remove_route` reports the first GENUINE
+  line and treats a response as `already_absent` only when every `%` line in
+  it is benign. Both drivers now parse `HERD_port` in `_connect()` rather than
+  the constructor, treating blank or missing as 22 and raising
+  `DriverError("HERD_port must be an integer")` otherwise, so a device with a
+  present-but-empty `port` field degrades to `{"reachable": False}` instead of
+  failing the sandbox before any method runs. `docs/DRIVERS.md` gained the
+  anchoring and persist-classification rules, the Hypervisor
+  `create_instance`/`destroy_instance` exception to "an absent key stays
+  success", and a note that `frr_l3` deliberately does not persist its
+  reservation-scoped routes.
+
 - Fixed `drivers/srl_l2` applying part of a batch it reported as failed, and
   committing configuration staged by an earlier call that died (issue #778). SR Linux
   stages every `set`/`delete` in a per-user private candidate that only `commit stay`
@@ -33,7 +57,6 @@
   `SEED_NOS=1` message on its default `--nos-only` path; hardened
   `infra/nos-test/frr/start.sh` (`set -e`, an sshd-up check) and extended the
   FRR healthcheck to also probe port 22.
-
 
 - Fixed `pick_dut_template`'s last fallback tier in `seed_devices_public.py`
   (issue #781, follow-up to #775): it returned `items[0]` even when no
