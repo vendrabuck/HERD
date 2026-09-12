@@ -3,5 +3,6 @@
   "version": "0.1.0",
   "connection_type": "Layer 3 Switch",
   "supports_dry_run": true,
-  "notes": "Hardware-free L3 switch driver for integration tests. Acknowledges route operations (configure_route, remove_route, including interface routes with next_hop None) deterministically and supports failure injection via HERD_mock_fail_actions / HERD_mock_raise_actions / HERD_mock_sleep_ms field_data. Not for production use."
+  "supports_vrf": true,
+  "notes": "Hardware-free L3 switch driver for integration tests. Acknowledges route operations (configure_route, remove_route, including interface routes with next_hop None) deterministically and supports failure injection via HERD_mock_fail_actions / HERD_mock_raise_actions / HERD_mock_sleep_ms field_data. Not for production use. Declares supports_vrf (ADR 0014 addendum X-G, issue #755): configure_route and remove_route accept a virtual_router keyword and record it in the transcript so integration tests can assert it reached the driver."
 }

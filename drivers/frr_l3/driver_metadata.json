@@ -3,5 +3,6 @@
   "version": "0.1.0",
   "connection_type": "Layer 3 Switch",
   "supports_dry_run": true,
-  "notes": "Installs and removes static routes on an FRR router over SSH via vtysh (netmiko, cisco_ios platform). All mutating methods honor context['dry_run']. Connection params: HERD_ip, HERD_login, HERD_password, optional HERD_port. Reference driver for the Layer 3 Switch contract; see docs/DRIVERS.md."
+  "supports_vrf": true,
+  "notes": "Installs and removes static routes on an FRR router over SSH via vtysh (netmiko, cisco_ios platform). All mutating methods honor context['dry_run']. Connection params: HERD_ip, HERD_login, HERD_password, optional HERD_port. Reference driver for the Layer 3 Switch contract; see docs/DRIVERS.md. Declares supports_vrf (ADR 0014 addendum X-G, issue #755): configure_route and remove_route accept a virtual_router keyword and render it as a trailing `vrf <name>`."
 }

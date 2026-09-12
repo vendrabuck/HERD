@@ -360,6 +360,8 @@
 
     <p>Routing intent is checked, never assumed, at three points: saving a standalone topology that carries any routing intent runs a validation pass right after the save; saving a reservation's live-edit fork gates the save itself, refusing it outright on a problem; creating a reservation from a topology with routing intent gates the booking the same way. One reason, a duplicate route on the same switch, is informational only and never blocks anything; every other reason does.</p>
 
+    <p>A route's <b>virtual router</b> is checked against the switch's own config, which lists the virtual routers it has and the interfaces each one owns. A name the config does not list is refused, as is a route whose interface does not belong to the virtual router it names; so is a route that names no virtual router while its interface belongs to one, since an interface inside a virtual router is not in the default routing table. The panel outlines the box each of those is about. Applying a virtual router route also needs a driver that supports virtual routers: a switch whose driver does not declare that support has its virtual router routes refused at provisioning time, with nothing sent to the device.</p>
+
     <h2 class="sec" id="edges">The part everyone asks about</h2>
     <p class="sectitle">Red vs green edges</p>
     <p>Every edge gets checked against the real physical cabling. The badge on the edge tells you the verdict. Here's the full vocabulary:</p>

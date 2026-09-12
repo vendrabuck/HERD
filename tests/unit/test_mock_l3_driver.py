@@ -51,6 +51,14 @@ def test_metadata_declares_l3_and_dry_run():
     assert meta["supports_dry_run"] is True
 
 
+def test_metadata_declares_vrf_support():
+    """ADR 0014 addendum X-G (issue #755). Without this declaration the execution
+    service never passes `virtual_router`, and the integration tests that assert
+    a VRF reached the driver could never see one."""
+    meta = json.loads((_DRIVER_DIR / "driver_metadata.json").read_text())
+    assert meta["supports_vrf"] is True
+
+
 def test_route_ops_return_success_and_echo_kwargs(driver_cls):
     d = driver_cls({})
     assert d.login() == {"success": True, "output": {}}
@@ -58,11 +66,21 @@ def test_route_ops_return_success_and_echo_kwargs(driver_cls):
         destination="10.0.0.0/24", next_hop="192.168.1.1", interface="eth0"
     ) == {
         "success": True,
-        "output": {"destination": "10.0.0.0/24", "next_hop": "192.168.1.1", "interface": "eth0"},
+        "output": {
+            "destination": "10.0.0.0/24",
+            "next_hop": "192.168.1.1",
+            "interface": "eth0",
+            "virtual_router": None,
+        },
     }
     assert d.remove_route(destination="10.0.0.0/24", next_hop="192.168.1.1", interface="eth0") == {
         "success": True,
-        "output": {"destination": "10.0.0.0/24", "next_hop": "192.168.1.1", "interface": "eth0"},
+        "output": {
+            "destination": "10.0.0.0/24",
+            "next_hop": "192.168.1.1",
+            "interface": "eth0",
+            "virtual_router": None,
+        },
     }
     assert d.logout() == {"success": True, "output": {}}
 
@@ -71,7 +89,12 @@ def test_configure_route_accepts_interface_route(driver_cls):
     # next_hop None is an interface route; it still succeeds and echoes the None.
     res = driver_cls({}).configure_route(destination="10.0.0.0/24", next_hop=None, interface="eth0")
     assert res["success"] is True
-    assert res["output"] == {"destination": "10.0.0.0/24", "next_hop": None, "interface": "eth0"}
+    assert res["output"] == {
+        "destination": "10.0.0.0/24",
+        "next_hop": None,
+        "interface": "eth0",
+        "virtual_router": None,
+    }
 
 
 def test_configure_acknowledges_config(driver_cls):
@@ -92,7 +115,24 @@ def test_dry_run_flags_simulated(driver_cls):
         "destination": "10.0.0.0/24",
         "next_hop": "192.168.1.1",
         "interface": "eth0",
+        "virtual_router": None,
     }
+
+
+def test_route_ops_record_the_virtual_router(driver_cls):
+    """ADR 0014 addendum X-G (issue #755): the VRF must be observable in the
+    result, so an integration test can prove it reached the driver rather than
+    being swallowed by the `**_` catch-all every L3 signature ends in."""
+    d = driver_cls({})
+    configured = d.configure_route(
+        destination="10.0.0.0/24", next_hop="192.168.1.1", interface="eth0", virtual_router="blue"
+    )
+    assert configured["success"] is True
+    assert configured["output"]["virtual_router"] == "blue"
+    removed = d.remove_route(
+        destination="10.0.0.0/24", next_hop="192.168.1.1", interface="eth0", virtual_router="blue"
+    )
+    assert removed["output"]["virtual_router"] == "blue"
 
 
 def test_status_reports_reachable_and_never_raises(driver_cls):

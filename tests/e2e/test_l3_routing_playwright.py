@@ -362,5 +362,26 @@ def test_add_route_saves_then_edit_to_bad_destination_shows_red_badge_and_toast(
         expect(badge).to_be_visible()
         badge_class = badge.get_attribute("class") or ""
         assert "bg-red-600" in badge_class, badge_class
+
+        # ADR 0014 addendum X-I (issue #755): a virtual router the switch's
+        # config does not declare is refused, and the panel outlines the
+        # Virtual router box rather than leaving the reason string to be
+        # mapped onto a column by eye. Repaired destination first, so the only
+        # remaining problem is the VRF one.
+        page.get_by_label("Destination", exact=True).fill("10.20.1.0/24")
+        page.get_by_label("Virtual router", exact=True).fill("no-such-vrf")
+        page.get_by_role("button", name="Save", exact=True).click()
+
+        expect(
+            page.get_by_text("Routing intent has 1 problem", exact=False)
+        ).to_be_visible(timeout=15_000)
+        expect(
+            page.get_by_text("l3_unknown_virtual_router", exact=True)
+        ).to_be_visible(timeout=10_000)
+        vrf_input = page.get_by_label("Virtual router", exact=True)
+        vrf_class = vrf_input.get_attribute("class") or ""
+        assert "border-red-400" in vrf_class, vrf_class
+        iface_class = page.get_by_label("Interface", exact=True).get_attribute("class") or ""
+        assert "border-red-400" not in iface_class, iface_class
     finally:
         pw_api(page, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)

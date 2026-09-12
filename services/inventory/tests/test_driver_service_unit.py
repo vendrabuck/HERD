@@ -12,6 +12,7 @@ from app.database import Base
 from app.models.template import DeviceTemplate
 from app.services.driver_service import (
     _parse_supports_dry_run,
+    _parse_supports_vrf,
     _validate_connection_type,
     _validate_filename,
     create_driver,
@@ -162,6 +163,44 @@ def test_parse_supports_dry_run_corrupt_zip_returns_false():
     assert _parse_supports_dry_run("d.zip", b"not a zip at all") is False
 
 
+# --- _parse_supports_vrf (ADR 0014 addendum X-G, issue #755) ---
+
+
+def test_parse_supports_vrf_zip_true():
+    assert _parse_supports_vrf("d.zip", _zip_with_metadata({"supports_vrf": True})) is True
+
+
+def test_parse_supports_vrf_targz_true():
+    assert _parse_supports_vrf("d.tar.gz", _targz_with_metadata({"supports_vrf": True})) is True
+
+
+def test_parse_supports_vrf_default_false_when_field_absent():
+    # The load-bearing default: a package that never declared VRF support must
+    # never be handed a `virtual_router` keyword, since every shipped L3
+    # signature ends in **_ and would swallow it in silence.
+    assert _parse_supports_vrf("d.zip", _zip_with_metadata({"supports_dry_run": True})) is False
+
+
+def test_parse_supports_vrf_missing_metadata_returns_false():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("readme.txt", "hi")
+    assert _parse_supports_vrf("d.zip", buf.getvalue()) is False
+
+
+def test_parse_supports_vrf_corrupt_zip_returns_false():
+    assert _parse_supports_vrf("d.zip", b"not a zip at all") is False
+
+
+def test_the_two_capability_flags_are_read_independently():
+    dry_run_only = _zip_with_metadata({"supports_dry_run": True, "supports_vrf": False})
+    vrf_only = _zip_with_metadata({"supports_dry_run": False, "supports_vrf": True})
+    assert _parse_supports_dry_run("d.zip", dry_run_only) is True
+    assert _parse_supports_vrf("d.zip", dry_run_only) is False
+    assert _parse_supports_dry_run("d.zip", vrf_only) is False
+    assert _parse_supports_vrf("d.zip", vrf_only) is True
+
+
 # --- create_driver ---
 
 
@@ -181,6 +220,29 @@ async def test_create_driver_success():
             )
             assert driver.name == "Test"
             assert driver.connection_type == "Management"
+            # A package with no parseable metadata declares no capability.
+            assert driver.supports_dry_run is False
+            assert driver.supports_vrf is False
+
+
+@pytest.mark.asyncio
+async def test_create_driver_persists_the_declared_capability_flags():
+    """ADR 0014 addendum X-G (issue #755): supports_vrf rides the same upload
+    parse as supports_dry_run, so execution can read it without re-extracting."""
+    async with TestSessionLocal() as db:
+        with patch("app.services.driver_service.upload_object"):
+            driver = await create_driver(
+                db,
+                "VrfCapable",
+                "desc",
+                "Layer 3 Switch",
+                "vrf.zip",
+                _zip_with_metadata({"supports_dry_run": True, "supports_vrf": True}),
+                "admin",
+                10_000_000,
+            )
+            assert driver.supports_dry_run is True
+            assert driver.supports_vrf is True
 
 
 @pytest.mark.asyncio

@@ -231,6 +231,51 @@ def _show_ip_route_static() -> str:
     return _docker_exec(FRR_CONTAINER, "vtysh", "-c", "show ip route static")
 
 
+# The VRF fixture infra/nos-test/frr/start.sh creates at boot (ADR 0014 addendum
+# X-G, issue #755; docs/NOS_LAB.md): `blue` maps to routing table 10 and owns
+# `dummy0` at 192.0.2.254/30. Permanent by design, so this file cleans up only
+# its own routes.
+VRF_NAME = "blue"
+VRF_TABLE = "10"
+VRF_INTERFACE = "dummy0"
+VRF_INTERFACE_CIDR = "192.0.2.254/30"
+VRF_MEMBER_SUBNET = "192.0.2.252/30"
+VRF_NEXT_HOP = "192.0.2.253"
+UNKNOWN_VRF_NAME = "no-such-vrf"
+
+
+def _vrf_kernel_routes() -> str:
+    """The kernel routing table the VRF maps to, read WITHOUT going through FRR
+    at all: the most independent verification channel available here."""
+    return _docker_exec(FRR_CONTAINER, "ip", "route", "show", "table", VRF_TABLE)
+
+
+def _vrf_frr_routes() -> str:
+    return _docker_exec(FRR_CONTAINER, "vtysh", "-c", f"show ip route vrf {VRF_NAME} static")
+
+
+def _remove_vrf_route_on_device(destination: str, next_hop: str | None) -> None:
+    """The VRF counterpart of _remove_route_on_device; same best-effort role."""
+    target = next_hop if next_hop else VRF_INTERFACE
+    subprocess.run(
+        [
+            "docker",
+            "exec",
+            FRR_CONTAINER,
+            "vtysh",
+            "-c",
+            "configure terminal",
+            "-c",
+            f"no ip route {destination} {target} vrf {VRF_NAME}",
+            "-c",
+            "end",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
 def _frr_eth0_cidr() -> str:
     addr_output = _docker_exec(FRR_CONTAINER, "ip", "-4", "-o", "addr", "show", "eth0")
     match = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", addr_output)
@@ -252,9 +297,14 @@ def _connected_nexthop(cidr: str) -> str:
 def _unique_test_prefix(*, exclude: tuple[str, ...] = ()) -> str:
     """A random, per-run-unique /30 destination inside RFC5737 TEST-NET-1,
     never one of `exclude` (the route-set delta phase needs two distinct
-    prefixes, and a 64-subnet pool collides often enough to matter)."""
+    prefixes, and a 64-subnet pool collides often enough to matter), and never
+    the subnet the lab's VRF member interface occupies."""
     network = ipaddress.ip_network("192.0.2.0/24")
-    subnets = [str(s) for s in network.subnets(new_prefix=30) if str(s) not in exclude]
+    subnets = [
+        str(s)
+        for s in network.subnets(new_prefix=30)
+        if str(s) not in exclude and str(s) != VRF_MEMBER_SUBNET
+    ]
     return random.choice(subnets)
 
 
@@ -371,10 +421,18 @@ async def _create_device(client, template_id: str, name: str, field_data: dict) 
     return resp.json()
 
 
-async def _set_config(client, device_id: str, interfaces: list[dict]) -> dict:
+async def _set_config(
+    client, device_id: str, interfaces: list[dict], virtual_routers: list[dict] | None = None
+) -> dict:
+    config: dict = {"interfaces": interfaces}
+    if virtual_routers is not None:
+        # ADR 0014 addendum X-I (issue #755): the declared virtual routers a
+        # route's `virtual_router` is validated against, at the save gate and at
+        # drive-time re-validation alike.
+        config["virtual_routers"] = virtual_routers
     resp = await client.post(
         f"/inventory/devices/{device_id}/config-versions",
-        json={"config": {"interfaces": interfaces}, "description": "nos_lab stack e2e"},
+        json={"config": config, "description": "nos_lab stack e2e"},
     )
     assert resp.status_code == 201, f"config-version create failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -808,6 +866,184 @@ async def test_rejected_route_records_a_failed_execution_run_via_stack_api():
             await _cleanup(
                 client,
                 reservation_id=reservation_id,
+                topology_id=topology_id,
+                connection_id=connection["id"] if connection else None,
+                device_ids=(switch["id"], dut["id"]),
+                template_ids=(switch_template["id"], dut_template["id"]),
+                driver_ids=(driver["id"], dut_driver["id"]),
+            )
+
+
+# ---------------------------------------------------------------------------
+# (c) VRF, end to end through HERD's own API (ADR 0014 addenda X-G and X-I,
+# issue #755), in two phases against the one real router:
+#   1. A reservation whose switch config DECLARES virtual router `blue` and
+#      whose canvas carries a route into it installs that route in the real
+#      VRF, proven through the kernel's own table 10 and through FRR's per-VRF
+#      view, and proven ABSENT from the default table (a VRF route that leaked
+#      into the default table is the exact silent failure X-G exists to
+#      prevent).
+#   2. A fork save naming a virtual router the config does NOT declare is
+#      refused by the save gate with l3_unknown_virtual_router, and the router
+#      is untouched.
+# The driver half (rendering, the not-installed classification) is proven in
+# tests/nos_lab/test_frr_l3_driver_live.py; this file proves the PATH: the
+# capability claim reached execution, the keyword reached the driver, and the
+# config-declared virtual routers gated the save.
+# ---------------------------------------------------------------------------
+
+
+def _vrf_fixture_reason() -> str:
+    """Empty when the lab node carries the VRF fixture; otherwise the reason.
+
+    Same host-capability gate as the dialect suite's
+    (tests/nos_lab/test_frr_l3_driver_live.py): the fixture needs the DOCKER
+    HOST's vrf and dummy kernel modules, which a container cannot load for
+    itself, so a host without them gets a visible SKIP naming the remedy rather
+    than a red test that says nothing about the cause.
+    """
+    try:
+        links = subprocess.run(
+            ["docker", "exec", FRR_CONTAINER, "ip", "-br", "link"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not probe the FRR node for the VRF fixture: {exc}"
+    if links.returncode != 0 or VRF_NAME not in links.stdout:
+        return (
+            f"the lab's FRR node carries no `{VRF_NAME}` VRF fixture (the Docker host "
+            "is probably missing the vrf/dummy kernel modules): run "
+            "`sudo modprobe vrf dummy` on the host, then `make nos-reset`. "
+            "See docs/NOS_LAB.md."
+        )
+    return ""
+
+
+_VRF_FIXTURE_REASON = _vrf_fixture_reason()
+
+
+@pytest.mark.skipif(bool(_VRF_FIXTURE_REASON), reason=_VRF_FIXTURE_REASON)
+async def test_vrf_routing_intent_installs_in_the_real_vrf_via_stack_api():
+    suffix = uuid.uuid4().hex[:8]
+    token = await _login()
+    async with _client(token) as client:
+        driver = await _upload_driver(
+            client,
+            f"nos-stack-frr-l3-vrf-{suffix}",
+            "Layer 3 Switch",
+            _make_driver_zip_from_dir(FRR_L3_DRIVER_DIR),
+        )
+        # The capability claim is what makes execution pass `virtual_router` at
+        # all; asserting it here turns a silently-non-declaring upload into a
+        # clear failure rather than an unexplained l3_vrf_unsupported below.
+        assert driver["supports_vrf"] is True, driver
+
+        switch_template = await _create_template(
+            client, driver["id"], f"nos-stack-frr-l3-vrf-tmpl-{suffix}"
+        )
+        dut_driver = await _upload_driver(
+            client,
+            f"nos-stack-dut-driver-vrf-{suffix}",
+            "Management",
+            _make_dummy_zip("nos-stack-dut-vrf"),
+        )
+        dut_template = await _create_template(
+            client, dut_driver["id"], f"nos-stack-dut-vrf-tmpl-{suffix}"
+        )
+
+        switch = await _create_device(
+            client,
+            switch_template["id"],
+            f"nos-stack-frr-vrf-{suffix}",
+            {"ip": FRR_CONTAINER, "login": FRR_LOGIN, "password": FRR_PASSWORD},
+        )
+        dut = await _create_device(
+            client,
+            dut_template["id"],
+            f"nos-stack-dut-vrf-{suffix}",
+            {"ip": "192.0.2.242", "login": "x", "password": "x"},
+        )
+
+        eth0_cidr = _frr_eth0_cidr()
+        await _set_config(
+            client,
+            switch["id"],
+            [
+                {"name": "eth0", "ip": eth0_cidr, "zone": "trust"},
+                {"name": VRF_INTERFACE, "ip": VRF_INTERFACE_CIDR, "zone": "trust"},
+            ],
+            virtual_routers=[{"name": VRF_NAME, "interfaces": [VRF_INTERFACE]}],
+        )
+
+        destination = _unique_test_prefix()
+        vrf_route = {
+            "destination": destination,
+            "next_hop": VRF_NEXT_HOP,
+            "interface": VRF_INTERFACE,
+            "virtual_router": VRF_NAME,
+        }
+
+        connection = None
+        topology_id = None
+        reservation_id = None
+        reservation_cancelled = False
+        try:
+            connection = await _create_connection(client, dut["id"], switch["id"], "ge-0/0/1")
+            topology_id = await _create_topology(
+                client, _canvas_with_l3(dut["id"], switch["id"], [vrf_route])
+            )
+            reservation = await _reserve(client, [dut["id"], switch["id"]], topology_id)
+            reservation_id = reservation["id"]
+            assert await _poll_active(client, reservation_id), "reservation never activated"
+
+            run = await _poll_route_run(client, reservation_id, "configure_route", destination)
+            assert run is not None, (
+                "the VRF intent route was never configured (no SUCCESS configure_route "
+                "run); an l3_vrf_unsupported park means the capability claim did not "
+                "reach execution"
+            )
+            # The run identity packs the VRF, so two routes differing only by
+            # virtual router stay distinct guarded actions.
+            assert run["port_b"].endswith(f"|{VRF_NAME}"), run["port_b"]
+
+            # Independent verification, two channels, neither the driver's own
+            # session: the kernel table the VRF maps to, and FRR's per-VRF view.
+            assert destination in _vrf_kernel_routes(), _vrf_kernel_routes()
+            assert destination in _vrf_frr_routes(), _vrf_frr_routes()
+            # And NOT in the default table.
+            _assert_route_absent(_show_ip_route_static(), destination)
+
+            # Phase 2: a save naming an undeclared virtual router is refused by
+            # the gate; nothing reaches the device.
+            bad_route = dict(vrf_route, virtual_router=UNKNOWN_VRF_NAME)
+            refused = await _save_fork(
+                client, reservation_id, _canvas_with_l3(dut["id"], switch["id"], [bad_route])
+            )
+            assert refused.status_code == 409, refused.text
+            body = refused.json()
+            reasons = {
+                entry["reason"] for entry in (body.get("detail") or {}).get("invalid_routes", [])
+            }
+            assert "l3_unknown_virtual_router" in reasons, body
+            # The applied route is untouched: a refused save drives nothing.
+            assert destination in _vrf_kernel_routes()
+
+            # Cancelling deprovisions exactly the applied set, out of the VRF.
+            cancel_resp = await client.delete(f"/reservations/{reservation_id}")
+            assert cancel_resp.status_code == 204, cancel_resp.text
+            reservation_cancelled = True
+            remove_run = await _poll_route_run(client, reservation_id, "remove_route", destination)
+            assert remove_run is not None, (
+                f"the VRF route was never removed (no SUCCESS remove_route run for {destination})"
+            )
+            assert destination not in _vrf_kernel_routes(), _vrf_kernel_routes()
+        finally:
+            _remove_vrf_route_on_device(destination, VRF_NEXT_HOP)
+            await _cleanup(
+                client,
+                reservation_id=None if reservation_cancelled else reservation_id,
                 topology_id=topology_id,
                 connection_id=connection["id"] if connection else None,
                 device_ids=(switch["id"], dut["id"]),

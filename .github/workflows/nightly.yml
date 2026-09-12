@@ -145,6 +145,12 @@ jobs:
           SUPERADMIN_EMAIL: admin@example.com
           SUPERADMIN_PASSWORD: admin123!
         run: |
+          # The FRR node's VRF fixture (ADR 0014 addendum X-G, issue #755) needs
+          # the host kernel's vrf and dummy modules; a container cannot load
+          # them for itself. Not fatal: without them start.sh boots the node
+          # anyway and the VRF feature test skips, rather than taking the other
+          # via-stack tests down with it. See docs/NOS_LAB.md.
+          sudo modprobe vrf dummy || echo "vrf/dummy modules unavailable; VRF tests will skip"
           make nos-up
           make nos-test-feature COMPOSE_PROJECT_NAME=herd
 

@@ -34,13 +34,13 @@ raise ``L3ConfigUnavailable``, which the caller maps to a 503
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import uuid
 from dataclasses import dataclass, field
 
 import httpx
 from fastapi import HTTPException
 from herd_common.internal_client import InternalTokenAuth, call_service
+from herd_common.l3_validation import usable_interfaces, usable_virtual_routers, validate_one_route
 
 from app.config import settings
 from app.schemas.topology import InvalidRoute
@@ -192,61 +192,30 @@ class L3InventoryContext:
         return self._config_version_ids.get(device_id)
 
 
-def _usable_interfaces(raw_interfaces: object) -> dict[str, str | None]:
-    """Extract a name-to-ip map from a config's ``interfaces`` list, tolerating a
-    driver-published schema that stores any shape there (R6): a non-list, or a
-    non-dict/no-name entry, is skipped rather than raising, so a garbled config
-    reports ``l3_switch_unconfigured`` (no usable interface names) instead of a
-    500.
+def _validate_one_route(
+    route: RouteSpec,
+    interfaces: dict[str, str | None],
+    virtual_routers: dict[str, set[str]] | None = None,
+) -> str | None:
+    """Unpack one ``RouteSpec`` into the shared per-route pass.
+
+    ADR 0014 addendum X-I (issue #755): the evaluation order and reason
+    vocabulary now live once, in ``herd_common.l3_validation.validate_one_route``,
+    which execution's drive-time re-validation (X-A) imports too. This wrapper
+    exists only because cabling holds routes as ``RouteSpec`` objects while
+    execution holds them as plain dicts; nothing is judged here.
+
+    ``virtual_routers`` defaults to "the switch declares none", which is what a
+    config written before X-I means and what the pure-function tests pass.
     """
-    if not isinstance(raw_interfaces, list):
-        return {}
-    result: dict[str, str | None] = {}
-    for entry in raw_interfaces:
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name")
-        if name:
-            result[name] = entry.get("ip")
-    return result
-
-
-def _validate_one_route(route: RouteSpec, interfaces: dict[str, str | None]) -> str | None:
-    """Evaluate one route's per-route reasons in order; return the first that
-    applies, or None when the route is clean. Interface routes (no next_hop) skip
-    every next-hop check. S10: ``next_hop`` is parsed to an ``ip_address`` once
-    and reused for both the shape check and the interface-membership check.
-    """
-    try:
-        ipaddress.ip_network(route.destination, strict=False)
-    except ValueError:
-        return "l3_bad_destination"
-
-    next_hop_addr: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
-    if route.next_hop is not None:
-        try:
-            next_hop_addr = ipaddress.ip_address(route.next_hop)
-        except ValueError:
-            return "l3_bad_next_hop"
-
-    if route.interface not in interfaces:
-        return "l3_unknown_interface"
-
-    if next_hop_addr is None:
-        return None
-
-    ip_value = interfaces.get(route.interface)
-    iface = None
-    if ip_value:
-        try:
-            iface = ipaddress.ip_interface(ip_value)
-        except ValueError:
-            iface = None
-    if iface is None or iface.network.prefixlen == iface.network.max_prefixlen:
-        return "l3_next_hop_unverifiable"
-    if next_hop_addr not in iface.network:
-        return "l3_next_hop_outside_interface"
-    return None
+    return validate_one_route(
+        route.destination,
+        route.next_hop,
+        route.interface,
+        route.virtual_router,
+        interfaces=interfaces,
+        virtual_routers=virtual_routers,
+    )
 
 
 async def validate_switch_l3(
@@ -279,7 +248,8 @@ async def validate_switch_l3(
         )
 
     config = ctx.config(device_id)
-    interfaces = _usable_interfaces((config or {}).get("interfaces"))
+    interfaces = usable_interfaces((config or {}).get("interfaces"))
+    virtual_routers = usable_virtual_routers((config or {}).get("virtual_routers"))
     if config is None or not interfaces:
         return (
             [
@@ -305,7 +275,7 @@ async def validate_switch_l3(
 
     results: list[InvalidRoute] = []
     for route in routes:
-        reason = _validate_one_route(route, interfaces)
+        reason = _validate_one_route(route, interfaces, virtual_routers)
         if reason is not None:
             results.append(
                 InvalidRoute(

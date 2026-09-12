@@ -370,6 +370,62 @@ startup config) exists and that the LAST setting the baseline applies
 (`ethernet-1/2 vlan-tagging`) reads back `true`. A healthy container
 therefore implies the whole baseline ran to completion.
 
+## The FRR node's VRF fixture
+
+`infra/nos-test/frr/start.sh` creates a Linux VRF at boot, before sshd, so the
+FRR node carries a deterministic virtual router the way the SR Linux node
+carries its baseline (ADR 0014 addendum X-G, issue #755):
+
+| Object | Value |
+|---|---|
+| VRF device | `blue`, routing table `10` |
+| Member interface | `dummy0` (a dummy device enslaved to `blue`) |
+| Member address | `192.0.2.254/30` (RFC5737 TEST-NET-1) |
+
+Why it has to exist at boot: FRR accepts `ip route <prefix> <next_hop> vrf
+<name>` into its configuration whether or not a Linux VRF device with that name
+exists, but with no device it never installs the route. vtysh answers
+`Static Route to <prefix> not installed currently because dependent config not
+fully available` (a line with no `%` marker, which is why `drivers/frr_l3`
+classifies it separately; see docs/DRIVERS.md), and `show ip route vrf <name>`
+answers `% VRF <name> not active`. Without the fixture the lab could only ever
+prove the failure case.
+
+Creation is idempotent (each step is skipped when the object already exists) so
+a container restart re-enters it cleanly, and nothing ever deletes it: FRR
+refuses `no vrf <name>` with `% Only inactive VRFs can be deleted` while the
+Linux device exists. Tests treat the fixture as permanent and clean up only
+their own routes.
+
+**The fixture needs the DOCKER HOST's `vrf` and `dummy` kernel modules.** A
+container cannot load a kernel module for itself, so on a host without them
+`ip link add blue type vrf` answers `Error: Unknown device type.` and the
+fixture cannot be built. This is the one part of the lab that is host-dependent,
+so it is deliberately BEST-EFFORT: start.sh prints a warning and boots the node
+anyway, rather than taking every non-VRF dialect test down with it over a
+capability none of them need. The VRF tests then skip, each naming the remedy:
+
+```
+sudo modprobe vrf dummy
+make nos-reset
+```
+
+A GitHub Actions runner is the known case; both `ci.yml`'s `nos-dialect` job and
+`nightly.yml`'s feature-tier step run that `modprobe` before booting the lab, and
+neither treats its failure as fatal.
+
+Verifying a VRF route independently, the way the live tests do (never through
+the driver's own session):
+
+```
+docker exec nos-test-frr ip route show table 10
+docker exec nos-test-frr vtysh -c "show ip route vrf blue static"
+```
+
+`tests/unit/test_nos_lab_compose.py` carries a static pin that start.sh still
+mentions `type vrf` and `dummy0`, so a lab-less CI run catches an edit that
+drops the fixture.
+
 ## SR Linux versus Cisco Layer 2
 
 SR Linux's Layer 2 model is not Cisco-shaped, and a driver written against

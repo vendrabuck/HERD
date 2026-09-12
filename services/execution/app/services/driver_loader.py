@@ -16,7 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.driver_cache import DriverCache
 
-DEFAULT_DRIVER_METADATA: dict = {"supports_dry_run": False}
+# Capability declarations are opt-in and closed by default: a package whose
+# driver_metadata.json is missing, unreadable, or silent on a flag declares
+# nothing. `supports_vrf` (ADR 0014 addendum X-G, issue #755) is load-bearing
+# here, because every shipped Layer 3 signature ends in `**_`: a driver that
+# has not declared VRF support would silently swallow a `virtual_router`
+# keyword, install the route in the default table, and report success.
+DEFAULT_DRIVER_METADATA: dict = {"supports_dry_run": False, "supports_vrf": False}
 
 logger = logging.getLogger(__name__)
 

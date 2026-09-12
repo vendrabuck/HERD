@@ -134,7 +134,7 @@ def _recorder(fail=None):
 CFG_VERSION_ID = "cfg-version-1"
 
 
-def _patches(execute_fn, fork_wires=None, l3_routes=None):
+def _patches(execute_fn, fork_wires=None, l3_routes=None, driver_metadata=None):
     async def _device(device_id, client=None):
         found = SWITCHES.get(str(device_id))
         if found is not None:
@@ -169,6 +169,19 @@ def _patches(execute_fn, fork_wires=None, l3_routes=None):
         patch(
             "app.services.nats_consumer._fetch_fork_intended_wires",
             new=AsyncMock(return_value=wires_return),
+        ),
+        # ADR 0014 addendum X-G (issue #755): the driver's cached capability
+        # claim. Left unpatched, the real function finds no DriverCache row here
+        # and answers DEFAULT_DRIVER_METADATA (supports_vrf False).
+        *(
+            [
+                patch(
+                    "app.services.driver_loader.get_driver_metadata",
+                    new=AsyncMock(return_value=driver_metadata),
+                )
+            ]
+            if driver_metadata is not None
+            else []
         ),
     ]:
         stack.enter_context(p)
@@ -520,6 +533,33 @@ async def test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call():
     assert row.intended == "ACTIVE"
     assert row.last_error == "l3_vrf_unsupported"
     assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_l3_build_retry_with_vrf_intent_drives_when_the_driver_declares_support():
+    """The X-G mirror of the test above: the same VRF intent, against a driver
+    whose cached metadata declares supports_vrf, passes the gate and is driven
+    with the keyword through the retry channel too."""
+    rid = await _seed_l3_failed("ACTIVE", routes=PINNED, attempts=1)
+    vrf_intent = [_intent_route("10.80.0.0/24", "eth1", virtual_router="red")]
+    seen = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        seen.append((action, dict(kwargs.get("method_kwargs") or {})))
+        return {"success": True, "output": {}, "error": None, "duration_ms": 1}
+
+    with _patches(
+        execute_fn,
+        l3_routes={SW_L3: vrf_intent},
+        driver_metadata={"supports_vrf": True},
+    ):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    configure = [kw for action, kw in seen if action == "configure_route"]
+    assert len(configure) == 1, f"expected one configure_route, got {seen!r}"
+    assert configure[0]["virtual_router"] == "red"
+    row = await _l3_row(rid)
+    assert row.status == "ACTIVE"
+    assert result["results"][0]["outcome"] == "reconnected"
 
 
 async def test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present():

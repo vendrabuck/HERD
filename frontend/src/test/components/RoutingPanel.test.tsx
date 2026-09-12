@@ -384,6 +384,58 @@ describe("RoutingPanel", () => {
     });
   });
 
+  // ADR 0014 addendum X-I (issue #755): a reason points at the box it is about.
+  describe("per-field highlighting (addendum X-I)", () => {
+    const invalid = (label: string) =>
+      (screen.getByLabelText(label) as HTMLInputElement).className.includes("red");
+
+    it("outlines the Virtual router box for l3_unknown_virtual_router", () => {
+      const r = route({ virtual_router: "green" });
+      seedStoreAndRender([r], [problem({ route: r, reason: "l3_unknown_virtual_router" })]);
+      expect(invalid("Virtual router")).toBe(true);
+      expect(invalid("Interface")).toBe(false);
+      expect(invalid("Destination")).toBe(false);
+    });
+
+    it("outlines the Virtual router box for l3_interface_outside_virtual_router", () => {
+      const r = route({ virtual_router: "blue", interface: "eth1" });
+      seedStoreAndRender(
+        [r],
+        [problem({ route: r, reason: "l3_interface_outside_virtual_router" })],
+      );
+      expect(invalid("Virtual router")).toBe(true);
+      expect(invalid("Interface")).toBe(false);
+    });
+
+    it("outlines the Interface box for l3_interface_bound_to_virtual_router", () => {
+      // This reason fires on a route that names NO VRF: the problem is that its
+      // interface is enslaved to one, so it points at Interface, not at the
+      // (empty) Virtual router box.
+      const r = route({ interface: "dummy0" });
+      seedStoreAndRender(
+        [r],
+        [problem({ route: r, reason: "l3_interface_bound_to_virtual_router" })],
+      );
+      expect(invalid("Interface")).toBe(true);
+      expect(invalid("Virtual router")).toBe(false);
+    });
+
+    it("outlines nothing for an informational duplicate", () => {
+      const r = route();
+      seedStoreAndRender([r], [problem({ route: r, reason: "l3_duplicate_route" })]);
+      expect(invalid("Destination")).toBe(false);
+      expect(invalid("Next hop")).toBe(false);
+      expect(invalid("Interface")).toBe(false);
+      expect(invalid("Virtual router")).toBe(false);
+    });
+
+    it("outlines nothing for a switch-level reason", () => {
+      seedStoreAndRender([route()], [problem({ reason: "l3_switch_unattached" })]);
+      expect(invalid("Destination")).toBe(false);
+      expect(invalid("Virtual router")).toBe(false);
+    });
+  });
+
   describe("malformed data.l3 (review fix F6)", () => {
     it("shows a repair line and Remove all for {} rather than throwing", () => {
       const node = makeMalformedNode({});

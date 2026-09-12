@@ -142,6 +142,16 @@ class InvalidRoute(BaseModel):
     - ``l3_bad_next_hop``: ``next_hop`` is present and not a parseable IP address.
     - ``l3_unknown_interface``: ``interface`` is not among the config's interface
       names.
+    - ``l3_unknown_virtual_router`` (ADR 0014 addendum X-I, issue #755): the route
+      names a ``virtual_router`` the config's ``virtual_routers`` does not declare.
+      A config with no ``virtual_routers`` key declares none, so every VRF-naming
+      route refuses here.
+    - ``l3_interface_outside_virtual_router`` (X-I): the route names a declared
+      VRF, but ``interface`` is not one of that VRF's ``interfaces``.
+    - ``l3_interface_bound_to_virtual_router`` (X-I): the route names no VRF, but
+      ``interface`` is listed under one. An interface enslaved to a VRF is not in
+      the default routing table, so a default-table route through it can never
+      install.
     - ``l3_next_hop_unverifiable``: ``next_hop`` is present and the named interface
       carries no ``ip``, or an ``ip`` with no real prefix length.
     - ``l3_next_hop_outside_interface``: the interface's ``ip`` network does not

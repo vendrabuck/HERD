@@ -751,6 +751,7 @@
         "sha256": "string",
         "size_bytes": "integer",
         "supports_dry_run": "boolean",
+        "supports_vrf": "boolean",
         "updated_at": "string",
         "uploaded_by": "string"
       },
