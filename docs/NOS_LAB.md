@@ -122,16 +122,30 @@ directly. It creates its own throwaway driver/template/device/topology/
 reservation (independent of `seed_nos_lab`, so it needs no prior seed run),
 then:
 
-- applies a real static route through the reservation's fork-save/activate
-  path and verifies BOTH the execution run's own SUCCESS status and,
-  independently, `docker exec nos-test-frr vtysh -c "show ip route static"`;
+- applies a real static route at ACTIVATION (create_fork writes the canvas
+  intent tolerantly and by design does not gate) and verifies BOTH the
+  execution run's own SUCCESS status and, independently,
+  `docker exec nos-test-frr vtysh -c "show ip route static"`;
+- then runs a fork SAVE carrying a CHANGED route set, which is the only path
+  that exercises the gated save (`gate_l3_intent`), the staged
+  `reservation.wiring_changed`, and execution's stay-adjacent route-set
+  reconcile (`removes = pinned - intent`, `adds = intent - pinned`, removes
+  driven before adds inside one login/logout, ADR 0014 Decision 3). Both
+  halves are verified on the router itself: the old prefix is gone and the
+  new one is installed;
 - removes the route by cancelling the reservation (ADR 0014's deprovision
   reconcile) and independently verifies it is gone;
 - proves the flip side of the contract: a route the real device REJECTS
   (an interface name with an embedded second token vtysh cannot parse,
   verified live to reproduce a genuine `% Unknown command` rejection)
-  records a FAILED execution run with the device's own error text, and
-  independently verifies nothing was installed. A syntactically malformed
+  records a FAILED execution run carrying the device's own wording (the
+  assertion pins the `% Unknown command:` prefix plus the destination and
+  the offending interface, not merely a non-empty string), and
+  independently verifies nothing was installed.
+
+Every destination assertion matches the FULL prefix FRR prints
+(`192.0.2.4/30`), never the bare network address, which would also match a
+leaked neighbouring prefix such as `192.0.2.40/30`. A syntactically malformed
   destination or next-hop (bad octets, the classic example) cannot reach
   the device this way: cabling's own save-time L3 intent gate validates
   every route with `ipaddress.ip_network()`/`ip_address()` before accepting
@@ -177,19 +191,35 @@ Unlike the phase 3a test, it reuses the SEEDED `nos-lab-dut-1`,
 `nos-lab-dut-2`, and `nos-lab-srl` devices and their cabling (run
 `scripts/seed_nos_lab.sh` first) rather than creating throwaway devices:
 membership derivation depends on cabling's pathfinder walking a real physical
-connections graph, which only exists between the seeded lab devices. It wires
-the two DUTs together on a topology canvas with no switch node (the pathfinder
-resolves it through the real switch's `ethernet-1/1`/`ethernet-1/2` ports),
-activates a reservation over it, and saves the fork to drive the
-connection-driven L2 reconcile. It reads the VLAN id HERD allocated from
-`GET /reservations/{id}/wiring-status` instead of assuming a number,
+connections graph, which only exists between the seeded lab devices. It activates the
+reservation over an EDGELESS canvas and only then saves a fork that ADDS the
+DUT-to-DUT edge (no switch node; the pathfinder resolves it through the real
+switch's `ethernet-1/1`/`ethernet-1/2` ports). That ordering is what makes the
+save's effect observable: with nothing wired at activation, and the applied
+fork version polled to prove activation's own reconcile ran and derived
+nothing, every subinterface binding that appears afterwards is attributable to
+the save's connection-driven reconcile. It reads the VLAN id HERD allocated
+from `GET /reservations/{id}/wiring-status` instead of assuming a number,
 independently verifies on the real device that the `mac-vrf` network-instance
 exists AND both subinterfaces are bound into it, cancels the reservation, and
 independently verifies both the bindings and the VLAN definition are gone,
 cross-checking HERD's own ledger (RELEASED) against the device at each step.
 
+The device baseline is snapshotted BEFORE the reservation exists, so nothing
+HERD does can race it, and it is scoped to what this test actually uses: the
+two ports carry no subinterface, and the VLAN HERD later allocated was absent
+from the pre-reservation `show network-instance summary`. An unrelated
+`mac-vrf` left on the switch by another lane therefore no longer fails this
+test with a misleading message. The teardown that removes any leftover
+membership from the device checks its own exit status and fails with the
+`sr_cli` stderr, so a silently failed cleanup cannot resurface as the next
+run's baseline failure.
+
 Same gating, credential-export, and cleanup discipline as the phase 3a test.
-Run it with:
+In both files the preconditions are probed from a session-scoped fixture
+rather than at import, so plain collection (the repo-root `testpaths` means a
+bare `uv run pytest` collects them) opens no socket, runs no `docker`, and
+logs in nowhere. Run it with:
 
 ```bash
 make up

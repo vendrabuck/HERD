@@ -17,6 +17,26 @@ tests/integration/test_l3_intent_execution.py already proves against the
 mock_l3 driver; this file is that same shape against the REAL frr_l3 driver
 and a REAL device, plus independent on-device verification.
 
+Exactly what the two tests here prove, in order:
+
+  (a) ACTIVATION applies the fork's routing intent: the route the canvas
+      carried at reserve time is installed on the real router (create_fork
+      writes intent tolerantly and does not gate, ADR 0014).
+  (b) A fork SAVE that CHANGES the route set runs the gated save path
+      (gate_l3_intent) and drives the resulting route-set delta: the save
+      stages reservation.wiring_changed, execution's stay-adjacent reconcile
+      computes removes = pinned - intent and adds = intent - pinned, and
+      drives removes BEFORE adds inside one login/logout (ADR 0014
+      Decision 3). Both halves are verified on the real router: the old
+      prefix is gone and the new one is installed.
+  (c) CANCELLING the reservation deprovisions exactly the applied set.
+  (d) A route the real device REJECTS records a FAILED execution run
+      carrying the device's own vtysh wording, and installs nothing.
+
+Every destination assertion matches the FULL prefix FRR prints (192.0.2.4/30),
+never the bare network address: the bare form would also match a leaked
+neighbouring prefix such as 192.0.2.40/30.
+
 Placement and gating: this is the one test in the repo that needs BOTH the
 NOS test lab (make nos-up) AND a running dev stack (make up) with the lab
 attached to the stack's Docker network (make nos-attach), so the execution
@@ -121,10 +141,6 @@ def _stack_reachable() -> bool:
         return False
 
 
-_FRR_REACHABLE = _reachable(FRR_HOST, FRR_PORT)
-_LAB_ATTACHED = _FRR_REACHABLE and _lab_attached_to_stack()
-_STACK_REACHABLE = _stack_reachable()
-_PRECONDITIONS_MET = _FRR_REACHABLE and _LAB_ATTACHED and _STACK_REACHABLE
 _NOS_REQUIRED = os.getenv("HERD_TEST_NOS_REQUIRED", "") not in ("", "0")
 
 
@@ -148,23 +164,30 @@ def _credentials_accepted() -> bool:
         return False
 
 
-_CREDENTIALS_OK = _credentials_accepted() if _STACK_REACHABLE else False
-
-
 def _missing_precondition_reason() -> str:
-    if not _FRR_REACHABLE:
+    """Probe every precondition in dependency order and return the first
+    unmet one's message, or "" when all hold.
+
+    Called from a session-scoped fixture, NEVER at import: the repo-root
+    pytest config sets testpaths = ["tests"], so a bare `uv run pytest` from
+    the repo root collects this file, and an import-time probe would make
+    plain collection open a socket, shell out to docker, and log in over
+    HTTPS. The dependency order (and each message) is unchanged; it is only
+    the timing that moved.
+    """
+    if not _reachable(FRR_HOST, FRR_PORT):
         return (
             f"NOS test lab FRR node not reachable ({FRR_HOST}:{FRR_PORT}); "
             "start it with `make nos-up`."
         )
-    if not _LAB_ATTACHED:
+    if not _lab_attached_to_stack():
         return (
             "NOS test lab is not attached to the dev stack's Docker network; "
             "run `make nos-attach` (dev stack must be up: `make up`)."
         )
-    if not _STACK_REACHABLE:
+    if not _stack_reachable():
         return f"HERD stack not reachable at {BASE_URL}; run `make up`."
-    if not _CREDENTIALS_OK:
+    if not _credentials_accepted():
         return (
             f"the stack rejected the seed credentials for {SEED_EMAIL!r}. These are read "
             "from the ENVIRONMENT, while the stack seeds its superadmin from .env, so "
@@ -175,16 +198,23 @@ def _missing_precondition_reason() -> str:
     return ""
 
 
-pytestmark = pytest.mark.skipif(
-    not _NOS_REQUIRED and not (_PRECONDITIONS_MET and _CREDENTIALS_OK),
-    reason=_missing_precondition_reason() or "NOS lab + stack preconditions not met",
-)
+@pytest.fixture(scope="session")
+def _nos_precondition_reason() -> str:
+    """The one probe pass for the whole session (each probe is a socket, a
+    docker exec, and two HTTPS logins; running them per test would triple
+    that for no added signal)."""
+    return _missing_precondition_reason()
 
 
 @pytest.fixture(autouse=True)
-def _fail_when_required_but_unavailable():
-    if _NOS_REQUIRED and not (_PRECONDITIONS_MET and _CREDENTIALS_OK):
-        pytest.fail(_missing_precondition_reason())
+def _require_nos_lab_and_stack(_nos_precondition_reason: str) -> None:
+    """Unchanged gating semantics: skip by default, hard-fail (with the same
+    message) under HERD_TEST_NOS_REQUIRED=1."""
+    if not _nos_precondition_reason:
+        return
+    if _NOS_REQUIRED:
+        pytest.fail(_nos_precondition_reason)
+    pytest.skip(_nos_precondition_reason)
 
 
 # ---------------------------------------------------------------------------
@@ -225,11 +255,62 @@ def _connected_nexthop(cidr: str) -> str:
     return str(candidate)
 
 
-def _unique_test_prefix() -> str:
-    """A random, per-run-unique /30 destination inside RFC5737 TEST-NET-1."""
+def _unique_test_prefix(*, exclude: tuple[str, ...] = ()) -> str:
+    """A random, per-run-unique /30 destination inside RFC5737 TEST-NET-1,
+    never one of `exclude` (the route-set delta phase needs two distinct
+    prefixes, and a 64-subnet pool collides often enough to matter)."""
     network = ipaddress.ip_network("192.0.2.0/24")
-    subnets = list(network.subnets(new_prefix=30))
-    return str(random.choice(subnets))
+    subnets = [str(s) for s in network.subnets(new_prefix=30) if str(s) not in exclude]
+    return random.choice(subnets)
+
+
+def _assert_route_installed(routes_output: str, destination: str) -> None:
+    """`show ip route static` lists the FULL prefix, so assert the full prefix.
+
+    Matching only the network address (destination.split("/")[0]) would pass
+    against a leaked NEIGHBOUR prefix: "192.0.2.4" is a substring of
+    "192.0.2.40/30". tests/nos_lab/test_nos_lab_live.py asserts the full
+    prefix for exactly this reason; this is the same rule applied to the
+    via-stack path.
+    """
+    assert destination in routes_output, (
+        f"expected the full prefix {destination} in `show ip route static`:\n{routes_output}"
+    )
+
+
+def _assert_route_absent(routes_output: str, destination: str) -> None:
+    """The mirror of _assert_route_installed: the FULL prefix is gone."""
+    assert destination not in routes_output, (
+        f"expected the full prefix {destination} to be absent from "
+        f"`show ip route static`:\n{routes_output}"
+    )
+
+
+def _remove_route_on_device(destination: str, next_hop: str | None) -> None:
+    """Defence in depth: drop `destination` straight off the router if the API
+    path left it behind (an assertion failed before the teardown step ran).
+    Best-effort by design; the test's own assertions are what prove the
+    product path works."""
+    command = f"no ip route {destination}"
+    if next_hop:
+        command = f"{command} {next_hop}"
+    subprocess.run(
+        [
+            "docker",
+            "exec",
+            FRR_CONTAINER,
+            "vtysh",
+            "-c",
+            "configure terminal",
+            "-c",
+            command,
+            "-c",
+            "end",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +468,9 @@ async def _runs(client, reservation_id: str, action: str, status: str = "SUCCESS
     resp = await client.get(
         "/execution/runs", params={"reservation_id": reservation_id, "status": status, "limit": 300}
     )
-    if resp.status_code != 200:
-        return []
+    # Never swallow a non-200 into an empty list: that turns an API error into
+    # the far more misleading "the route was never configured".
+    assert resp.status_code == 200, f"GET /execution/runs failed: {resp.status_code} {resp.text}"
     return [r for r in resp.json().get("items", []) if r["action"] == action]
 
 
@@ -438,12 +520,18 @@ async def _cleanup(
 
 
 # ---------------------------------------------------------------------------
-# (a) The headline proof: HERD's API drives a real static route onto the
-# real FRR router, and removes it again, both independently verified.
+# (a) The headline proof, in three phases against the one real router:
+#   1. ACTIVATION applies the fork's routing intent (route A installed).
+#   2. A fork SAVE carrying a CHANGED route set (route B instead of route A)
+#      runs the gated save path and drives the route-set delta: removes
+#      before adds, inside one login/logout (ADR 0014 Decision 3). A is gone
+#      from the router, B is installed.
+#   3. CANCELLING deprovisions the applied set (route B removed).
+# Every device read is an independent `docker exec ... vtysh` call.
 # ---------------------------------------------------------------------------
 
 
-async def test_reservation_applies_and_removes_a_real_static_route_via_stack_api():
+async def test_reservation_applies_changes_and_removes_real_static_routes_via_stack_api():
     suffix = uuid.uuid4().hex[:8]
     token = await _login()
     async with _client(token) as client:
@@ -484,9 +572,18 @@ async def test_reservation_applies_and_removes_a_real_static_route_via_stack_api
             client, switch["id"], [{"name": "eth0", "ip": eth0_cidr, "zone": "trust"}]
         )
 
-        destination = _unique_test_prefix()
         next_hop = _connected_nexthop(eth0_cidr)
+        # Two distinct destinations: the first lands at activation, the second
+        # replaces it through a fork save so the save's route-set delta has
+        # both a remove and an add to drive.
+        destination = _unique_test_prefix()
+        destination_after_save = _unique_test_prefix(exclude=(destination,))
         route = {"destination": destination, "next_hop": next_hop, "interface": "eth0"}
+        route_after_save = {
+            "destination": destination_after_save,
+            "next_hop": next_hop,
+            "interface": "eth0",
+        }
 
         connection = None
         topology_id = None
@@ -501,60 +598,95 @@ async def test_reservation_applies_and_removes_a_real_static_route_via_stack_api
             reservation_id = reservation["id"]
             assert await _poll_active(client, reservation_id), "reservation never activated"
 
+            # Phase 1: activation applied the canvas intent. _poll_route_run
+            # already filters on status=SUCCESS, so finding the run IS the
+            # status assertion; re-asserting it would be a tautology.
             run = await _poll_route_run(client, reservation_id, "configure_route", destination)
             assert run is not None, (
                 "the intent route was never configured (no SUCCESS configure_route run)"
             )
-            assert run["status"] == "SUCCESS"
 
             # Independent verification: a fresh vtysh call, never the driver's
             # own session or the execution run's own success flag.
-            routes_after_apply = _show_ip_route_static()
-            assert destination.split("/")[0] in routes_after_apply, routes_after_apply
+            _assert_route_installed(_show_ip_route_static(), destination)
 
             fork = (await client.get(f"/reservations/{reservation_id}/fork")).json()
             assert len(fork["l3_routes"]) == 1
             assert fork["l3_routes"][0]["destination"] == destination
 
-            # Remove the route: cancelling the reservation deprovisions exactly
+            # Phase 2: a fork SAVE with a CHANGED route set. Activation
+            # (create_fork) writes intent tolerantly and deliberately does not
+            # gate, so phase 1 alone never exercises the save path. This save
+            # does: gate_l3_intent runs, the version advances, reservations
+            # stages reservation.wiring_changed, and execution's stay-adjacent
+            # reconcile computes removes = pinned - intent and adds = intent -
+            # pinned by route identity, driving removes BEFORE adds within one
+            # login/logout (ADR 0014 Decision 3). Both halves are then checked
+            # on the router itself, which is the only place a "removes before
+            # adds, in one session" claim can actually be falsified.
+            saved = await _save_fork(
+                client,
+                reservation_id,
+                _canvas_with_l3(dut["id"], switch["id"], [route_after_save]),
+            )
+            assert saved.status_code == 200, saved.text
+
+            delta_add = await _poll_route_run(
+                client, reservation_id, "configure_route", destination_after_save
+            )
+            assert delta_add is not None, (
+                "the fork save's added route was never configured (no SUCCESS "
+                f"configure_route run for {destination_after_save})"
+            )
+            delta_remove = await _poll_route_run(
+                client, reservation_id, "remove_route", destination
+            )
+            assert delta_remove is not None, (
+                "the fork save's departed route was never removed (no SUCCESS "
+                f"remove_route run for {destination})"
+            )
+
+            # The router itself reflects the delta: the old prefix is gone and
+            # the new one is installed. Read once, after both runs landed: on
+            # the BUILD direction the device leads the ledger, so a single read
+            # after the run appears is correctly ordered.
+            routes_after_save = _show_ip_route_static()
+            _assert_route_absent(routes_after_save, destination)
+            _assert_route_installed(routes_after_save, destination_after_save)
+
+            # HERD's own fork surface agrees: the saved intent IS the new set.
+            fork_after_save = (await client.get(f"/reservations/{reservation_id}/fork")).json()
+            assert [r["destination"] for r in fork_after_save["l3_routes"]] == [
+                destination_after_save
+            ], fork_after_save["l3_routes"]
+
+            # Phase 3: remove the route. Cancelling the reservation deprovisions exactly
             # the applied (intent-derived) set (ADR 0014; matches
             # test_l3_intent_execution.py's mock-driver equivalent). A fork
-            # save that merely clears intent while the switch stays wired
+            # save that merely CLEARS intent while the switch stays wired
             # deliberately does NOT do this (addendum X4, "no surprise
-            # teardown": proven live while building this test), so cancel is
-            # the correct "remove it" path here, not an empty-routes save.
+            # teardown": proven live while building this test), which is why
+            # phase 2 above CHANGED the route set rather than emptying it; so
+            # cancel is the correct "remove it" path here, not an empty save.
             cancel_resp = await client.delete(f"/reservations/{reservation_id}")
             assert cancel_resp.status_code == 204, cancel_resp.text
             reservation_cancelled = True
 
-            remove_run = await _poll_route_run(client, reservation_id, "remove_route", destination)
+            remove_run = await _poll_route_run(
+                client, reservation_id, "remove_route", destination_after_save
+            )
             assert remove_run is not None, (
-                "the route was never removed (no SUCCESS remove_route run)"
+                "the route was never removed (no SUCCESS remove_route run for "
+                f"{destination_after_save})"
             )
-            assert remove_run["status"] == "SUCCESS"
 
-            routes_after_remove = _show_ip_route_static()
-            assert destination.split("/")[0] not in routes_after_remove, routes_after_remove
+            _assert_route_absent(_show_ip_route_static(), destination_after_save)
         finally:
-            # Defense in depth: remove the route directly if the API path left
-            # it behind (e.g. an earlier assertion failed before cleanup ran).
-            subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    FRR_CONTAINER,
-                    "vtysh",
-                    "-c",
-                    "configure terminal",
-                    "-c",
-                    f"no ip route {destination} {next_hop}",
-                    "-c",
-                    "end",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
+            # Defense in depth: remove BOTH prefixes directly if the API path
+            # left either behind (e.g. an earlier assertion failed before the
+            # cancel ran).
+            _remove_route_on_device(destination, next_hop)
+            _remove_route_on_device(destination_after_save, next_hop)
             await _cleanup(
                 client,
                 reservation_id=None if reservation_cancelled else reservation_id,
@@ -659,7 +791,17 @@ async def test_rejected_route_records_a_failed_execution_run_via_stack_api():
                 "device rejects; HERD's ledger must not record success for a "
                 "config the router refused"
             )
-            assert failed_run["error"], "a FAILED run must carry the device's own rejection text"
+            # The device's OWN wording, not merely "some non-empty string":
+            # vtysh answers a command it cannot parse with a "%"-prefixed line
+            # that echoes the offending command back, and drivers/frr_l3
+            # reports that line verbatim as the run's error (issue #779). The
+            # full destination and the bogus interface must both appear, so a
+            # driver that invented a generic message, or reported the wrong
+            # route's rejection, fails here.
+            error_text = failed_run["error"] or ""
+            assert error_text.startswith("% Unknown command:"), error_text
+            assert destination in error_text, error_text
+            assert bogus_interface in error_text, error_text
 
             # No SUCCESS run for this destination: the driver must never have
             # reported success for a command the device rejected.
@@ -667,8 +809,7 @@ async def test_rejected_route_records_a_failed_execution_run_via_stack_api():
             assert destination not in {r.get("port_a") for r in success_runs}
 
             # Independent verification: the real device never installed it.
-            routes_after = _show_ip_route_static()
-            assert destination.split("/")[0] not in routes_after, routes_after
+            _assert_route_absent(_show_ip_route_static(), destination)
         finally:
             await _cleanup(
                 client,
