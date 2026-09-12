@@ -7,9 +7,15 @@ route-assignment flow), not here; this driver just acknowledges each operation,
 so it stays stateless.
 
 Connection type: Layer 3 Switch
-  login, logout, configure_route(destination, next_hop, interface),
-  remove_route(destination, next_hop, interface), status.
+  login, logout, configure_route(destination, next_hop, interface, virtual_router),
+  remove_route(destination, next_hop, interface, virtual_router), status.
 next_hop may be None (an interface route); the recorded command then omits it.
+virtual_router may be None (a default-table route); the recorded command then
+omits the trailing "vrf <name>". driver_metadata.json declares
+`supports_vrf: true` (ADR 0014 addendum X-G, issue #755), which is what makes the
+execution service pass the keyword at all, and both the transcript line and the
+result `output` carry it, so an integration test can prove the VRF reached the
+driver rather than being swallowed by the `**_` catch-all.
 An optional configure(**config) is included so inventory config-apply jobs stay
 demonstrable against this driver.
 
@@ -42,11 +48,20 @@ def _csv_set(value):
     return {item.strip() for item in str(value).split(",") if item.strip()}
 
 
-def _route_command(verb, destination, next_hop, interface):
-    """Render a route transcript line; interface routes (next_hop None) omit the hop."""
+def _route_command(verb, destination, next_hop, interface, virtual_router=None):
+    """Render a route transcript line; interface routes (next_hop None) omit the hop.
+
+    A non-empty virtual_router appends " vrf <name>", mirroring drivers/frr_l3's
+    rendering, so the transcript a test reads names the table the route was meant
+    for.
+    """
     if next_hop is None:
-        return f"{verb} {destination} {interface}"
-    return f"{verb} {destination} {next_hop} {interface}"
+        base = f"{verb} {destination} {interface}"
+    else:
+        base = f"{verb} {destination} {next_hop} {interface}"
+    if virtual_router:
+        return f"{base} vrf {virtual_router}"
+    return base
 
 
 class Driver:
@@ -96,22 +111,24 @@ class Driver:
     def logout(self):
         return self._maybe_inject("logout") or self._ok("logout")
 
-    def configure_route(self, destination, next_hop, interface, **_):
+    def configure_route(self, destination, next_hop, interface, virtual_router=None, **_):
         return self._maybe_inject("configure_route") or self._ok(
             "configure_route",
-            command=_route_command("ip route", destination, next_hop, interface),
+            command=_route_command("ip route", destination, next_hop, interface, virtual_router),
             destination=destination,
             next_hop=next_hop,
             interface=interface,
+            virtual_router=virtual_router,
         )
 
-    def remove_route(self, destination, next_hop, interface, **_):
+    def remove_route(self, destination, next_hop, interface, virtual_router=None, **_):
         return self._maybe_inject("remove_route") or self._ok(
             "remove_route",
-            command=_route_command("no ip route", destination, next_hop, interface),
+            command=_route_command("no ip route", destination, next_hop, interface, virtual_router),
             destination=destination,
             next_hop=next_hop,
             interface=interface,
+            virtual_router=virtual_router,
         )
 
     def configure(self, **config):

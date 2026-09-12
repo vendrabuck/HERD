@@ -370,6 +370,45 @@ startup config) exists and that the LAST setting the baseline applies
 (`ethernet-1/2 vlan-tagging`) reads back `true`. A healthy container
 therefore implies the whole baseline ran to completion.
 
+## The FRR node's VRF fixture
+
+`infra/nos-test/frr/start.sh` creates a Linux VRF at boot, before sshd, so the
+FRR node carries a deterministic virtual router the way the SR Linux node
+carries its baseline (ADR 0014 addendum X-G, issue #755):
+
+| Object | Value |
+|---|---|
+| VRF device | `blue`, routing table `10` |
+| Member interface | `dummy0` (a dummy device enslaved to `blue`) |
+| Member address | `192.0.2.254/30` (RFC5737 TEST-NET-1) |
+
+Why it has to exist at boot: FRR accepts `ip route <prefix> <next_hop> vrf
+<name>` into its configuration whether or not a Linux VRF device with that name
+exists, but with no device it never installs the route. vtysh answers
+`Static Route to <prefix> not installed currently because dependent config not
+fully available` (a line with no `%` marker, which is why `drivers/frr_l3`
+classifies it separately; see docs/DRIVERS.md), and `show ip route vrf <name>`
+answers `% VRF <name> not active`. Without the fixture the lab could only ever
+prove the failure case.
+
+Creation is idempotent (each step is skipped when the object already exists) so
+a container restart re-enters it cleanly, and nothing ever deletes it: FRR
+refuses `no vrf <name>` with `% Only inactive VRFs can be deleted` while the
+Linux device exists. Tests treat the fixture as permanent and clean up only
+their own routes.
+
+Verifying a VRF route independently, the way the live tests do (never through
+the driver's own session):
+
+```
+docker exec nos-test-frr ip route show table 10
+docker exec nos-test-frr vtysh -c "show ip route vrf blue static"
+```
+
+`tests/unit/test_nos_lab_compose.py` carries a static pin that start.sh still
+mentions `type vrf` and `dummy0`, so a lab-less CI run catches an edit that
+drops the fixture.
+
 ## SR Linux versus Cisco Layer 2
 
 SR Linux's Layer 2 model is not Cisco-shaped, and a driver written against

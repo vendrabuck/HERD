@@ -25,7 +25,18 @@ Dialect mapping (verified live against the checked-in NOS test lab's frr node,
 docs/NOS_LAB.md, 127.0.0.1:2224):
   configure_route  "ip route <destination> <next_hop>"          (next_hop given)
                    "ip route <destination> <interface>"          (next_hop is None)
+                   "... vrf <virtual_router>"                    (virtual_router given)
   remove_route     the same line prefixed with "no "
+
+VRF support (ADR 0014 addendum X-G, issue #755): configure_route and remove_route
+take an optional `virtual_router` keyword, and driver_metadata.json declares
+`supports_vrf: true`. That declaration is what makes the execution service pass
+the keyword at all: every Layer 3 signature in this repo ends in `**_`, so a
+driver that has NOT declared support would swallow a VRF route's `virtual_router`
+in silence, install the route in the default table, and report success. FRR
+accepts the VRF form either inside a `vrf <name>` block or, as rendered here, as
+a trailing `vrf <name>` on the one-line form; both land in the `vrf` block of the
+running config (verified live).
 
 Persistence, deliberately absent: this driver never calls `write memory`
 (netmiko's save_config), unlike drivers/frr_mgmt's configure(). The routes it
@@ -50,6 +61,18 @@ provisioning failure: the execution service keys ledger state on the driver's
 returned payload, not on transport health (docs/DRIVERS.md, "Driver-call success
 is keyed on the DRIVER RESULT payload"). A "%" line (other than the one benign
 case below) means {"success": False, "error": <the offending line>}.
+
+Accepted-but-not-installed is a FAILURE (ADR 0014 addendum X-H, issue #755).
+FRR answers a route it took into its configuration but could not program into
+the kernel with "Static Route to <prefix> not installed currently because
+dependent config not fully available", a line with NO "%" marker, so the scan
+above cannot see it. Verified live: that is exactly what a route naming a VRF
+with no Linux VRF device behind it produces, and `show ip route vrf <name>` then
+answers "% VRF <name> not active". Under docs/DRIVERS.md's rejection contract
+("judge by the desired end state") a route that is not installed is not
+provisioned, so configure_route classifies this line as a genuine failure and
+returns {"success": False} with it as `error`. The rule is not VRF-specific: any
+route the device accepts but does not install reports failure.
 
 IMPORTANT LIMITATION, stated plainly rather than papered over: this is
 best-effort. Not every rejected command prints a "%" line. Verified live: `ip
@@ -143,17 +166,28 @@ def _parse_port(raw):
         raise DriverError("HERD_port must be an integer") from None
 
 
-def _route_command(verb, destination, next_hop, interface):
+def _route_command(verb, destination, next_hop, interface, virtual_router=None):
     """Render the vtysh route command line for `verb` ("ip route" / "no ip route").
 
     An explicit next_hop is a next-hop route: "<verb> <destination> <next_hop>",
     FRR resolves the egress interface itself. next_hop=None is an interface route:
     "<verb> <destination> <interface>". Verified live: FRR neither wants nor
     accepts both a next-hop and an interface on the same line for this usage.
+
+    A non-empty `virtual_router` appends " vrf <name>" (ADR 0014 addendum X-G,
+    issue #755), the one-line form of FRR's `vrf <name>` configuration block;
+    both land in the same place in the running config. None or an empty string
+    renders the default-table line unchanged, so a declaring driver handed
+    `virtual_router=None` behaves exactly as it did before X-G.
     """
-    if next_hop is None:
-        return f"{verb} {destination} {interface}"
-    return f"{verb} {destination} {next_hop}"
+    base = (
+        f"{verb} {destination} {interface}"
+        if next_hop is None
+        else f"{verb} {destination} {next_hop}"
+    )
+    if virtual_router:
+        return f"{base} vrf {virtual_router}"
+    return base
 
 
 # The one "%" line that means "already in the desired state", not "rejected".
@@ -168,6 +202,29 @@ def _route_command(verb, destination, next_hop, interface):
 # anchor is what makes that a defense in depth rather than a dependency on a
 # caller three services away. Keep in sync with drivers/frr_mgmt/driver.py.
 _ALREADY_ABSENT_MARKER = "% Refusing to remove a non-existent route"
+
+
+# The line FRR prints for a route it ACCEPTED into configuration but could not
+# install, e.g. a VRF route whose Linux VRF device does not exist. It carries no
+# "%" marker, so _find_error_lines cannot see it, and under docs/DRIVERS.md's
+# "judge by the desired end state" rule a route that is not installed is a
+# failure (ADR 0014 addendum X-H, issue #755). Matched as a SUBSTRING on purpose,
+# unlike the anchored benign marker below: FRR prefixes it with the offending
+# prefix ("Static Route to 192.0.2.8/30 not installed currently because ..."), so
+# there is no fixed line start to anchor on, and no benign line contains it.
+_NOT_INSTALLED_MARKER = "not installed currently because dependent config not fully available"
+
+
+def _find_not_installed_lines(output):
+    """Return every "accepted but not installed" line in `output`, in order.
+
+    Separate from _find_error_lines because this complaint carries no "%" marker;
+    every "%"-line rule (the benign remove_route carve-out, the all-or-nothing
+    classification) is deliberately unaffected by it.
+    """
+    return [
+        line.strip() for line in output.splitlines() if _NOT_INSTALLED_MARKER in line
+    ]
 
 
 def _find_error_lines(output):
@@ -283,8 +340,8 @@ class Driver:
         record_command("exit", response="(disconnected)")
         return {"success": True}
 
-    def configure_route(self, destination, next_hop, interface, **_):
-        """Install one static route.
+    def configure_route(self, destination, next_hop, interface, virtual_router=None, **_):
+        """Install one static route, optionally inside a VRF.
 
         See the module docstring's "Error detection" and "Idempotency decision"
         sections: ANY "%" line in the output is a genuine rejection and reports
@@ -293,8 +350,18 @@ class Driver:
         reports {"success": True}. The benign "already absent" carve-out is
         remove_route's alone: this direction has no no-op the device
         complains about.
+
+        The accepted-but-not-installed line (ADR 0014 addendum X-H) is the
+        second failure channel, checked after the "%" scan because a "%"
+        rejection is the more specific complaint when both appear. It applies to
+        every route, VRF or not: a route the device took into its configuration
+        but did not install is not provisioned.
+
+        `virtual_router` (ADR 0014 addendum X-G) names the VRF to install into;
+        None means the default table. This driver declares `supports_vrf: true`,
+        so the execution service passes the keyword on every call.
         """
-        command = _route_command("ip route", destination, next_hop, interface)
+        command = _route_command("ip route", destination, next_hop, interface, virtual_router)
         if self.dry_run:
             record_command(command, response="(simulated)", exit_status="simulated")
             return {"success": True, "simulated": True}
@@ -304,11 +371,15 @@ class Driver:
         if error_lines:
             record_command(command, response=output, exit_status="error")
             return {"success": False, "error": error_lines[0], "output": output}
+        not_installed = _find_not_installed_lines(output)
+        if not_installed:
+            record_command(command, response=output, exit_status="error")
+            return {"success": False, "error": not_installed[0], "output": output}
         record_command(command, response=output)
         return {"success": True, "output": output}
 
-    def remove_route(self, destination, next_hop, interface, **_):
-        """Remove one static route.
+    def remove_route(self, destination, next_hop, interface, virtual_router=None, **_):
+        """Remove one static route, from a VRF when `virtual_router` names one.
 
         See the module docstring's "Error detection" and "Idempotency decision"
         sections: the device's anchored "already absent" warning is the one
@@ -322,8 +393,15 @@ class Driver:
         line anywhere in the response reports {"success": False} with the
         FIRST GENUINE line as `error`, whether it arrived before or after a
         benign one.
+
+        `virtual_router` (ADR 0014 addendum X-G) must be the same value the
+        matching configure_route received, which is what the execution service
+        passes: the removal has to name the table the route actually landed in.
+        The accepted-but-not-installed check is deliberately NOT applied here,
+        since that line is a complaint about installing a route, not removing
+        one.
         """
-        command = _route_command("no ip route", destination, next_hop, interface)
+        command = _route_command("no ip route", destination, next_hop, interface, virtual_router)
         if self.dry_run:
             record_command(command, response="(simulated)", exit_status="simulated")
             return {"success": True, "simulated": True}

@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 NOS_COMPOSE_PATH = REPO_ROOT / "infra" / "nos-test" / "docker-compose.yml"
 BASELINE_PATH = REPO_ROOT / "infra" / "nos-test" / "srl" / "baseline.cli"
 FRR_DOCKERFILE_PATH = REPO_ROOT / "infra" / "nos-test" / "frr" / "Dockerfile"
+FRR_START_PATH = REPO_ROOT / "infra" / "nos-test" / "frr" / "start.sh"
 DEV_OVERRIDE_PATH = REPO_ROOT / "docker-compose.override.yml"
 DEV_COMPOSE_PATHS = [
     REPO_ROOT / "docker-compose.yml",
@@ -144,6 +145,25 @@ def test_srl_baseline_configures_both_vlan_tagging_interfaces():
     lines = BASELINE_PATH.read_text().splitlines()
     assert "set / interface ethernet-1/1 vlan-tagging true" in lines
     assert "set / interface ethernet-1/2 vlan-tagging true" in lines
+
+
+def test_frr_start_script_creates_the_vrf_fixture():
+    """ADR 0014 addendum X-G (issue #755): the FRR node must boot carrying a
+    Linux VRF, or the Layer 3 VRF tests can only ever prove the failure case
+    (FRR accepts a VRF route into its config but never installs it when no VRF
+    device exists). This is a STATIC pin, in the same spirit as the SR Linux
+    baseline pins above: it runs in CI with no lab and no Docker, and catches a
+    start.sh edit that drops the fixture while the live suite is not running.
+    """
+    text = FRR_START_PATH.read_text()
+    assert "type vrf" in text, (
+        "infra/nos-test/frr/start.sh no longer creates a Linux VRF device; "
+        "tests/nos_lab/test_frr_l3_driver_live.py's VRF cases depend on it"
+    )
+    assert "dummy0" in text, (
+        "infra/nos-test/frr/start.sh no longer creates the dummy0 VRF member "
+        "interface; a VRF with no member interface cannot carry a route"
+    )
 
 
 def _assert_pinned(ref: str, where: str) -> None:

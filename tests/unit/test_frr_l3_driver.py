@@ -61,6 +61,170 @@ def test_metadata_declares_l3_and_dry_run():
     assert meta["supports_dry_run"] is True
 
 
+def test_metadata_declares_vrf_support():
+    """ADR 0014 addendum X-G (issue #755): this is what makes the execution
+    service pass `virtual_router` at all. Without the declaration the keyword is
+    never sent, and the VRF rendering below is unreachable in production."""
+    meta = json.loads((_DRIVER_DIR / "driver_metadata.json").read_text())
+    assert meta["supports_vrf"] is True
+
+
+# --- VRF rendering (ADR 0014 addendum X-G, issue #755) -----------------------
+
+
+def test_configure_route_with_a_virtual_router_appends_the_vrf_clause():
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)# ip route 192.0.2.0/30 192.0.2.253 vrf blue"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30",
+            next_hop="192.0.2.253",
+            interface="dummy0",
+            virtual_router="blue",
+        )
+    conn.send_config_set.assert_called_once_with(["ip route 192.0.2.0/30 192.0.2.253 vrf blue"])
+    assert result["success"] is True
+
+
+def test_configure_route_interface_form_with_a_virtual_router():
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)# ip route 192.0.2.4/30 dummy0 vrf blue"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.4/30", next_hop=None, interface="dummy0", virtual_router="blue"
+        )
+    conn.send_config_set.assert_called_once_with(["ip route 192.0.2.4/30 dummy0 vrf blue"])
+    assert result["success"] is True
+
+
+def test_remove_route_with_a_virtual_router_appends_the_vrf_clause():
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)# no ip route 192.0.2.0/30 192.0.2.253 vrf blue"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_route(
+            destination="192.0.2.0/30",
+            next_hop="192.0.2.253",
+            interface="dummy0",
+            virtual_router="blue",
+        )
+    conn.send_config_set.assert_called_once_with(["no ip route 192.0.2.0/30 192.0.2.253 vrf blue"])
+    assert result["success"] is True
+
+
+def test_a_null_virtual_router_renders_the_default_table_line_unchanged():
+    """A declaring driver receives the keyword on every call, null included, so
+    the default-table rendering must be byte-identical to the pre-X-G one."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)# ip route 192.0.2.0/30 172.20.255.254"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30",
+            next_hop="172.20.255.254",
+            interface="eth0",
+            virtual_router=None,
+        )
+    conn.send_config_set.assert_called_once_with(["ip route 192.0.2.0/30 172.20.255.254"])
+
+
+def test_an_empty_virtual_router_string_renders_no_vrf_clause():
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)# ip route 192.0.2.0/30 172.20.255.254"
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30",
+            next_hop="172.20.255.254",
+            interface="eth0",
+            virtual_router="",
+        )
+    conn.send_config_set.assert_called_once_with(["ip route 192.0.2.0/30 172.20.255.254"])
+
+
+def test_dry_run_configure_route_records_the_vrf_clause_without_connecting():
+    with patch("netmiko.ConnectHandler") as ch:
+        result = Driver(_DRY_CTX).configure_route(
+            destination="192.0.2.0/30",
+            next_hop="192.0.2.253",
+            interface="dummy0",
+            virtual_router="blue",
+        )
+    ch.assert_not_called()
+    assert result == {"success": True, "simulated": True}
+
+
+# --- X-H: accepted but not installed is a failure ----------------------------
+
+_NOT_INSTALLED_OUTPUT = (
+    "frr(config)# ip route 192.0.2.0/30 192.0.2.253 vrf green\n"
+    "Static Route to 192.0.2.0/30 not installed currently because "
+    "dependent config not fully available\n"
+)
+
+
+def test_configure_route_not_installed_line_reports_failure():
+    """ADR 0014 addendum X-H (issue #755): FRR accepted the route into its
+    configuration but never installed it, and the line carries NO "%" marker, so
+    the "%"-scan cannot see it. Under the rejection contract ("judge by the
+    desired end state") an uninstalled route is not provisioned."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = _NOT_INSTALLED_OUTPUT
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30",
+            next_hop="192.0.2.253",
+            interface="dummy0",
+            virtual_router="green",
+        )
+    assert result["success"] is False
+    assert "not installed currently" in result["error"]
+
+
+def test_configure_route_not_installed_is_a_failure_for_a_default_table_route_too():
+    """The rule is not VRF-specific: any route the device accepts but does not
+    install reports failure."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)# ip route 192.0.2.0/30 192.0.2.253\n"
+        "Static Route to 192.0.2.0/30 not installed currently because "
+        "dependent config not fully available\n"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30", next_hop="192.0.2.253", interface="eth0"
+        )
+    assert result["success"] is False
+    assert "not installed currently" in result["error"]
+
+
+def test_a_percent_rejection_still_wins_over_the_not_installed_line():
+    """When both complaints appear, the "%" rejection is the more specific one
+    and is what the caller sees."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "% Unknown command: ip route bogus\n"
+        "Static Route to 192.0.2.0/30 not installed currently because "
+        "dependent config not fully available\n"
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure_route(
+            destination="192.0.2.0/30", next_hop="192.0.2.253", interface="eth0"
+        )
+    assert result["success"] is False
+    assert result["error"].startswith("% Unknown command")
+
+
+def test_remove_route_does_not_apply_the_not_installed_classification():
+    """That line complains about INSTALLING a route, so it has no meaning on the
+    removal direction; a removal whose output happens to carry it still
+    succeeds."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = _NOT_INSTALLED_OUTPUT
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).remove_route(
+            destination="192.0.2.0/30", next_hop="192.0.2.253", interface="dummy0"
+        )
+    assert result["success"] is True
+
+
 # --- exact command text for both route forms --------------------------------
 
 
