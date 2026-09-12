@@ -31,6 +31,42 @@ _REAL_CTX = {
 }
 _DRY_CTX = {**_REAL_CTX, "dry_run": True}
 
+# The real netmiko save_config() output from the live NOS test lab FRR node,
+# captured 2026-09-12 (per-daemon form, the shape a node with no integrated
+# /etc/frr/frr.conf prints). configure() requires this positive evidence of a
+# save, so a mock that returns "ok" is not a stand-in for it any more.
+_SAVE_OK = (
+    "write mem\n"
+    "Note: this version of vtysh never writes vtysh.conf\n"
+    "Building Configuration...\n"
+    "Configuration saved to /etc/frr/zebra.conf\n"
+    "Configuration saved to /etc/frr/staticd.conf\n"
+    "frr# "
+)
+
+# The same node with an integrated /etc/frr/frr.conf: one line, different
+# wording, still a successful save (captured live the same day).
+_SAVE_OK_INTEGRATED = (
+    "write mem\n"
+    "Note: this version of vtysh never writes vtysh.conf\n"
+    "Building Configuration...\n"
+    "Integrated configuration saved to /etc/frr/frr.conf\n"
+    "[OK]\n"
+    "frr# "
+)
+
+# A save into an unwritable /etc/frr, captured live the same day: no "%"
+# line anywhere and vtysh exits 0, which is exactly why configure() cannot
+# classify persistence by scanning for rejections (issue #779).
+_SAVE_FAILED = (
+    "write mem\n"
+    "Note: this version of vtysh never writes vtysh.conf\n"
+    "Building Configuration...\n"
+    "Can't open configuration file /etc/frr/zebra.conf.XXXXXX.\n"
+    "Can't open configuration file /etc/frr/staticd.conf.XXXXXX.\n"
+    "frr# "
+)
+
 
 # --- dry-run must never touch the wire --------------------------------------
 
@@ -67,7 +103,7 @@ def test_dry_run_login_logout_do_not_connect():
 def test_configure_sends_commands_and_saves():
     conn = MagicMock()
     conn.send_config_set.return_value = "config applied"
-    conn.save_config.return_value = "ok"
+    conn.save_config.return_value = _SAVE_OK
     with patch("netmiko.ConnectHandler", return_value=conn) as ch:
         d = Driver(_REAL_CTX)
         result = d.configure(
@@ -89,7 +125,7 @@ def test_configure_sends_commands_and_saves():
 def test_configure_accepts_single_command_string():
     conn = MagicMock()
     conn.send_config_set.return_value = ""
-    conn.save_config.return_value = ""
+    conn.save_config.return_value = _SAVE_OK
     with patch("netmiko.ConnectHandler", return_value=conn):
         Driver(_REAL_CTX).configure(command="ip route 192.0.2.0/24 blackhole")
     conn.send_config_set.assert_called_once_with(["ip route 192.0.2.0/24 blackhole"])
@@ -124,6 +160,10 @@ def test_configure_rejected_by_device_reports_failure_with_offending_line():
     assert result["success"] is False
     assert result["error"] == "% Unknown command: ip route 999.999.999.0/24 172.17.0.1"
     assert "output" in result
+    # The batch is not "applied": some prefix of it may have landed, the rest
+    # did not (issue #779, item 3).
+    assert result["attempted"] == ["ip route 999.999.999.0/24 172.17.0.1"]
+    assert "applied" not in result
     conn.save_config.assert_not_called()
 
 
@@ -137,7 +177,7 @@ def test_configure_clean_apply_still_succeeds():
         "frr(config)#  end\n"
         "frr# "
     )
-    conn.save_config.return_value = "ok"
+    conn.save_config.return_value = _SAVE_OK
     with patch("netmiko.ConnectHandler", return_value=conn):
         d = Driver(_REAL_CTX)
         result = d.configure(commands=["ip route 192.0.2.0/24 blackhole"])
@@ -161,7 +201,7 @@ def test_configure_carves_out_the_benign_remove_route_line_as_success():
         "frr(config)#  end\n"
         "frr# "
     )
-    conn.save_config.return_value = "ok"
+    conn.save_config.return_value = _SAVE_OK
     with patch("netmiko.ConnectHandler", return_value=conn):
         d = Driver(_REAL_CTX)
         result = d.configure(commands=["no ip route 203.0.113.0/30 172.17.0.1"])
@@ -225,6 +265,161 @@ def test_configure_reports_genuine_failure_when_it_comes_first():
     assert result["success"] is False
     assert result["error"] == "% Unknown command: ip route 999.999.999.0/24 172.17.0.1"
     conn.save_config.assert_not_called()
+
+
+def test_configure_rejects_an_echoed_benign_marker_as_a_genuine_failure():
+    """The substring-carve-out bug (issue #779, item 1). vtysh echoes the
+    offending command back inside its own rejection, so a config line that
+    merely CONTAINS the benign phrase produces a genuine "% Unknown command"
+    line that also contains it. Verified live 2026-09-12:
+
+        $ docker exec nos-test-frr vtysh -c "configure terminal" \
+              -c "ip route Refusing to remove a non-existent route"
+        % Unknown command: ip route Refusing to remove a non-existent route
+
+    An unanchored `marker in line` test called that benign and reported
+    success; the anchored `line.startswith(marker)` test calls it what it is.
+    Nothing upstream filters the phrase: the published config schema accepts
+    any string up to 512 characters."""
+    command = "ip route Refusing to remove a non-existent route"
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        f"frr(config)#  {command}\n"
+        f"% Unknown command: {command}\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure(commands=[command])
+    assert result["success"] is False, (
+        f"an echoed benign phrase inside a genuine rejection must not be carved out: {result!r}"
+    )
+    assert result["error"] == f"% Unknown command: {command}"
+    assert "benign_warnings" not in result
+    conn.save_config.assert_not_called()
+
+
+# --- persistence is classified, not assumed (issue #779, item 2) ------------
+
+
+def test_configure_reports_failure_when_write_memory_could_not_save():
+    """A failed `write memory` prints NO "%" line and vtysh exits 0, so the
+    rejection scan cannot see it. The config reached the running config but is
+    not persisted, so this is a failure, with the offending save line as the
+    error and the commands named "attempted"."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        " configure terminal\n"
+        "frr(config)#  ip route 192.0.2.0/24 blackhole\n"
+        "frr(config)#  end\n"
+        "frr# "
+    )
+    conn.save_config.return_value = _SAVE_FAILED
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure(commands=["ip route 192.0.2.0/24 blackhole"])
+    assert result["success"] is False, f"an unpersisted config is not a success: {result!r}"
+    assert result["error"] == "Can't open configuration file /etc/frr/zebra.conf.XXXXXX."
+    assert result["save_output"] == _SAVE_FAILED
+    assert result["attempted"] == ["ip route 192.0.2.0/24 blackhole"]
+    assert "applied" not in result
+
+
+def test_configure_accepts_the_integrated_save_wording():
+    """The same node prints a different (single-line) save confirmation when
+    it keeps an integrated /etc/frr/frr.conf. Both wordings are a successful
+    save; the check is case-insensitive on "configuration saved to" for
+    exactly this reason."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)#  ip route 192.0.2.0/24 blackhole\nfrr# "
+    conn.save_config.return_value = _SAVE_OK_INTEGRATED
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure(commands=["ip route 192.0.2.0/24 blackhole"])
+    assert result["success"] is True
+    assert "error" not in result
+
+
+def test_configure_reports_failure_when_the_save_says_nothing_at_all():
+    """Positive evidence is required: an empty (or unrecognized) save output
+    proves nothing was written, so it cannot be read as success."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = "frr(config)#  ip route 192.0.2.0/24 blackhole\nfrr# "
+    conn.save_config.return_value = ""
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure(commands=["ip route 192.0.2.0/24 blackhole"])
+    assert result["success"] is False
+    assert result["error"] == "write memory reported no saved configuration file"
+
+
+def test_configure_benign_warnings_survive_a_save_failure():
+    """A benign "%" line is still operator-visible when the save is what
+    failed: the two classifications are independent."""
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "frr(config)#  no ip route 203.0.113.0/30 172.17.0.1\n"
+        "% Refusing to remove a non-existent route\n"
+        "frr# "
+    )
+    conn.save_config.return_value = _SAVE_FAILED
+    with patch("netmiko.ConnectHandler", return_value=conn):
+        result = Driver(_REAL_CTX).configure(commands=["no ip route 203.0.113.0/30 172.17.0.1"])
+    assert result["success"] is False
+    assert result["benign_warnings"] == ["% Refusing to remove a non-existent route"]
+
+
+# --- HERD_port parsing (issue #780) -----------------------------------------
+
+
+def test_blank_port_defaults_to_22_instead_of_raising():
+    """A present-but-blank optional `port` device field reaches the driver as
+    "", and int("") used to raise inside __init__, before any method could
+    run (issue #780)."""
+    conn = MagicMock()
+    conn.send_command.return_value = "FRRouting 8.4_git (r1) on Linux"
+    with patch("netmiko.ConnectHandler", return_value=conn) as ch:
+        result = Driver({**_REAL_CTX, "HERD_port": ""}).status()
+    assert result["reachable"] is True
+    _, kwargs = ch.call_args
+    assert kwargs["port"] == 22
+
+
+def test_missing_port_defaults_to_22():
+    conn = MagicMock()
+    conn.send_command.return_value = "FRRouting 8.4_git (r1) on Linux"
+    with patch("netmiko.ConnectHandler", return_value=conn) as ch:
+        Driver(_REAL_CTX).status()
+    _, kwargs = ch.call_args
+    assert kwargs["port"] == 22
+
+
+def test_numeric_string_port_is_honored():
+    conn = MagicMock()
+    conn.send_command.return_value = "FRRouting 8.4_git (r1) on Linux"
+    with patch("netmiko.ConnectHandler", return_value=conn) as ch:
+        Driver({**_REAL_CTX, "HERD_port": "2224"}).status()
+    _, kwargs = ch.call_args
+    assert kwargs["port"] == 2224
+
+
+def test_non_integer_port_does_not_raise_from_the_constructor():
+    with patch("netmiko.ConnectHandler"):
+        Driver({**_REAL_CTX, "HERD_port": "abc"})  # must not raise
+
+
+def test_non_integer_port_raises_driver_error_from_the_mutating_path():
+    with patch("netmiko.ConnectHandler") as ch:
+        d = Driver({**_REAL_CTX, "HERD_port": "abc"})
+        with pytest.raises(DriverError, match="HERD_port must be an integer"):
+            d.configure(commands=["ip route 192.0.2.0/24 blackhole"])
+    ch.assert_not_called()
+
+
+def test_non_integer_port_degrades_status_to_unreachable():
+    """status() must never raise, whatever the field_data says."""
+    with patch("netmiko.ConnectHandler"):
+        result = Driver({**_REAL_CTX, "HERD_port": "abc"}).status()
+    assert result["reachable"] is False
+    assert "HERD_port must be an integer" in result["error"]
 
 
 def test_dry_run_configure_rejected_command_is_not_evaluated():

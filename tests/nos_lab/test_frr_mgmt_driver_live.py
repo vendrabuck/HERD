@@ -279,6 +279,36 @@ def test_configure_removing_already_absent_route_reports_success():
 
 
 # ---------------------------------------------------------------------------
+# The echoed-marker rejection (issue #779, item 1): FRR quotes the offending
+# command back inside "% Unknown command: <the command>", so a config line
+# that merely CONTAINS the benign "already absent" phrase used to be carved
+# out as benign by an unanchored substring test and reported as success. The
+# published config schema accepts any string up to 512 characters, so nothing
+# upstream filters such a line.
+# ---------------------------------------------------------------------------
+
+
+def test_configure_echoed_benign_marker_is_reported_as_a_genuine_failure():
+    command = "ip route Refusing to remove a non-existent route"
+
+    d = Driver(_context())
+    try:
+        d.login()
+        result = d.configure(commands=[command])
+        assert result["success"] is False, (
+            f"an echoed benign phrase inside a genuine rejection must not be carved out: {result!r}"
+        )
+        assert result["error"].startswith("% Unknown command")
+        assert "benign_warnings" not in result
+
+        # Independent verification: nothing was installed or persisted.
+        assert "Refusing" not in _show_ip_route_static()
+        assert "Refusing" not in _show_running_config()
+    finally:
+        d.logout()
+
+
+# ---------------------------------------------------------------------------
 # The masking bug this ruling closes: a benign line arriving BEFORE a genuine
 # rejection in the same multi-command batch must not hide the genuine one.
 # Driven live in one configure() call: the first line is a no-op removal of
@@ -318,6 +348,100 @@ def test_configure_genuine_failure_after_a_benign_line_is_not_masked():
     finally:
         d.logout()
         _cleanup_route(malformed_destination, next_hop)
+
+
+# ---------------------------------------------------------------------------
+# A config that applied but could not be PERSISTED is a failure (issue #779,
+# item 2). vtysh reports a failed `write memory` with no "%" line at all and
+# exits 0, so the rejection scan cannot see it; configure() has to require
+# positive evidence of a save instead.
+#
+# Making the save fail on demand takes two steps, both verified live
+# 2026-09-12 on this node:
+#
+#   1. Move /etc/frr/frr.conf aside, if present. With an integrated config
+#      file, vtysh hands `write memory` to watchfrr, which runs as ROOT and
+#      saves successfully whatever the directory mode says. Only the
+#      per-daemon path, which vtysh writes itself as the logged-in user, can
+#      be made to fail.
+#   2. chmod 555 /etc/frr, NOT 000. Under 000 vtysh cannot even stat
+#      frr.conf, falls back to treating the config as integrated, and the
+#      root-owned watchfrr write succeeds again (and recreates frr.conf).
+#      555 leaves the directory readable and traversable, so vtysh takes the
+#      per-daemon path and then cannot create its temp files.
+#
+# Both the mode and the stashed file are restored in `finally`, and the
+# restored mode is asserted, so a failure here never leaves the lab node
+# unwritable for the next test.
+# ---------------------------------------------------------------------------
+
+_INTEGRATED_CONFIG = "/etc/frr/frr.conf"
+_INTEGRATED_CONFIG_STASH = "/tmp/frr.conf.herd-live-test"
+
+
+def _etc_frr_mode() -> str:
+    return _docker_exec(FRR_CONTAINER, "stat", "-c", "%a", "/etc/frr").strip()
+
+
+def _try_docker_exec(*args: str) -> int:
+    """Run a command in the lab container, returning its exit status.
+
+    Unlike _docker_exec, a non-zero exit is an answer, not an assertion
+    failure: the stash step below is a "move it if it is there" probe.
+    """
+    return subprocess.run(
+        ["docker", "exec", FRR_CONTAINER, *args],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    ).returncode
+
+
+def test_configure_reports_failure_when_the_startup_config_cannot_be_saved():
+    destination = _unique_test_prefix()
+    next_hop = _frr_connected_nexthop()
+
+    d = Driver(_context())
+    stashed = False
+    try:
+        stashed = (
+            _try_docker_exec("sh", "-c", f"mv -f {_INTEGRATED_CONFIG} {_INTEGRATED_CONFIG_STASH}")
+            == 0
+        )
+        _docker_exec(FRR_CONTAINER, "chmod", "555", "/etc/frr")
+        assert _etc_frr_mode() == "555"
+
+        d.login()
+        result = d.configure(commands=[f"ip route {destination} {next_hop}"])
+
+        # Half 1: the driver's own return value. An unpersisted config is not
+        # a success, and the operator-facing `error` is the line the device
+        # actually printed.
+        assert result["success"] is False, (
+            f"driver reported success for a config it could not persist: {result!r}"
+        )
+        assert "Can't open configuration file" in result["error"], result
+        assert "save_output" in result
+        assert result["attempted"] == [f"ip route {destination} {next_hop}"]
+        assert "applied" not in result
+
+        # Half 2: independent verification (a separate vtysh call, never the
+        # driver's session) that the failure really is about persistence: the
+        # line DID reach the running config, which is exactly why reporting
+        # success here would leave HERD's ledger agreeing with a device that
+        # loses the route on its next daemon restart.
+        assert destination in _show_ip_route_static()
+    finally:
+        d.logout()
+        _docker_exec(FRR_CONTAINER, "chmod", "755", "/etc/frr")
+        _docker_exec(FRR_CONTAINER, "chown", "frr:frr", "/etc/frr")
+        if stashed:
+            # Remove anything recreated while the directory was locked down,
+            # then put the node's own integrated config back.
+            _try_docker_exec("sh", "-c", f"rm -f {_INTEGRATED_CONFIG}")
+            _try_docker_exec("sh", "-c", f"mv -f {_INTEGRATED_CONFIG_STASH} {_INTEGRATED_CONFIG}")
+        _cleanup_route(destination, next_hop)
+        assert _etc_frr_mode() == "755", "the lab node's /etc/frr mode was not restored"
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ Connection params come from the device field_data as HERD_-prefixed context keys
   HERD_ip       host/IP the execution service can reach (e.g. 10.99.0.11)
   HERD_login    SSH username (its login shell is vtysh)
   HERD_password SSH password
-Optional: HERD_port (default 22).
+Optional: HERD_port (default 22; blank means 22, see _parse_port).
 
 dry_run is honored on every mutating method: when set, the commands are recorded
 via record_command(... exit_status="simulated") and NO SSH connection is opened,
@@ -44,6 +44,16 @@ already gone, which is what the caller wanted. This is a concrete instance
 of a device-specific, driver-specific decision; it is not a rule that
 transfers to other vendors or other commands by pattern-matching the string.
 
+That carve-out is ANCHORED at the start of the rendered line, never a
+substring test anywhere in it (issue #779). Verified live 2026-09-12: vtysh
+echoes the offending command back inside its own rejection, so the config
+line `ip route Refusing to remove a non-existent route` comes back as
+"% Unknown command: ip route Refusing to remove a non-existent route", and
+an unanchored `marker in line` test classified that genuine rejection as
+benign and reported success. The published config schema accepts any string
+up to 512 characters, so nothing upstream filters such a line out; the
+anchor is the whole defense.
+
 configure() classifies EVERY "%" line in the batch's output, not just the
 first: it collects every line, partitions them into genuine failures and the
 one known-benign marker above, and reports failure (with the FIRST GENUINE
@@ -57,6 +67,25 @@ still surfaced, under "benign_warnings" in a successful result, so an
 operator can see what the device said even though it did not change the
 outcome.
 
+Persistence is classified too, not assumed (issue #779). configure() ends by
+calling netmiko's save_config() ("write memory"), and vtysh reports a FAILED
+save with no "%" line at all and exit status 0, so the "%" scan above cannot
+see it. Verified live 2026-09-12 against the NOS test lab node
+(docs/NOS_LAB.md): a successful save prints one "Configuration saved to
+/etc/frr/<daemon>.conf" line per daemon, or a single "Integrated
+configuration saved to /etc/frr/frr.conf" line when the node keeps an
+integrated config file, while a save into an unwritable /etc/frr prints
+"Building Configuration..." followed by "Can't open configuration file
+/etc/frr/zebra.conf.XXXXXX." per daemon and nothing else. configure()
+therefore requires positive evidence of a save: any "Can't open configuration
+file" line, or the absence of every "configuration saved to" line, is
+reported as {"success": False, "error": <the offending save line>,
+"save_output": <the write-memory output>}. The commands did reach the running
+config in that case, they just are not persisted, which is why the failure
+payload calls them "attempted" rather than "applied" (a rejected batch may
+also have applied some prefix of its lines, so "applied" was wrong there
+too).
+
 IMPORTANT LIMITATION, stated plainly rather than papered over: this is
 best-effort, the same as drivers/frr_l3. Not every rejected command prints a
 "%" line (see drivers/frr_l3/driver.py's module docstring for a verified live
@@ -67,6 +96,13 @@ confirmed present". This driver deliberately does not read back
 a driver's own work through its own read path is the anti-pattern the live
 NOS-lab tests exist to avoid (tests/nos_lab/test_frr_mgmt_driver_live.py
 verifies independently via a separate `docker exec ... vtysh` call instead).
+
+Keep in sync with drivers/frr_l3/driver.py: the two packages share this
+device, this transport, and this "%"-line dialect, but a driver package is
+uploaded and cached standalone (docs/DRIVERS.md, "Package structure"), so a
+cross-package import would not resolve in the execution sandbox. The
+duplication is deliberate; when the detection or the benign carve-out
+changes here, change it there too.
 """
 
 try:
@@ -81,6 +117,34 @@ class DriverError(Exception):
     """Raised when a real (non-dry-run) operation against the device fails."""
 
 
+def _parse_port(raw):
+    """Return the SSH port for the raw HERD_port context value.
+
+    Missing or blank means the SSH default, 22: an optional device field that
+    is present but empty reaches the driver context as "" verbatim
+    (services/execution/app/services/execution_service.py), and issue #780 is
+    what happens when that is fed straight to int().
+
+    Anything else that is not an integer raises DriverError, and the CALLER
+    decides when that happens. This is why the parse lives here and is called
+    from _connect() rather than from __init__: a constructor that raises
+    takes down status() too, and status() must degrade to
+    {"reachable": False} instead of raising (docs/DRIVERS.md, "Return
+    values"). Keep in sync with drivers/frr_l3/driver.py.
+    """
+    if raw is None:
+        return 22
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return 22
+    try:
+        return int(text)
+    except ValueError:
+        raise DriverError("HERD_port must be an integer") from None
+
+
 def _find_error_lines(output):
     """Return every vtysh "%"-prefixed line in `output`, in order.
 
@@ -93,17 +157,13 @@ def _find_error_lines(output):
     Returns every match, not just the first: a caller that only inspected the
     first "%" line could be fooled by a benign line arriving before a genuine
     one in the same multi-command batch (see configure()'s docstring and the
-    module docstring's classification section). frr_l3's analogous helper
-    (_find_error_line) returns only the first line, which is safe there only
-    because its callers (configure_route/remove_route) always send exactly
-    one command per call.
+    module docstring's classification section).
 
-    Duplicated, not imported, from drivers/frr_l3/driver.py's own
-    _find_error_line: driver packages are uploaded and cached standalone
+    Duplicated, not imported, from drivers/frr_l3/driver.py's helper of the
+    same name: driver packages are uploaded and cached standalone
     (docs/DRIVERS.md, "Package structure"), so a cross-package import would
     not resolve in the execution sandbox. Keep the two in sync if the
-    underlying "%" detection ever changes, even though the two now return
-    different shapes for the reason above.
+    underlying "%" detection ever changes.
     """
     return [line.strip() for line in output.splitlines() if line.strip().startswith("%")]
 
@@ -117,32 +177,77 @@ def _find_error_lines(output):
 # device's complaints are benign is vendor- and command-specific, verified
 # against THIS device, and every driver author has to work out their own
 # (docs/DRIVERS.md, "A driver must report a device rejection as a failure").
-_ALREADY_ABSENT_MARKER = "Refusing to remove a non-existent route"
+#
+# Matched with startswith, never with `in` (issue #779): FRR echoes the
+# offending command inside "% Unknown command: <the command>", so a command
+# that merely CONTAINS this phrase would otherwise have its genuine rejection
+# classified as benign. See the module docstring's anchoring paragraph.
+_ALREADY_ABSENT_MARKER = "% Refusing to remove a non-existent route"
+
+# Save ("write memory") classification, verified live 2026-09-12; see the
+# module docstring's persistence paragraph. The OK marker is matched
+# case-insensitively because vtysh renders the per-daemon form as
+# "Configuration saved to ..." and the integrated form as "Integrated
+# configuration saved to ...".
+_SAVE_OK_MARKER = "configuration saved to"
+_SAVE_FAILURE_MARKER = "can't open configuration file"
 
 
 def _classify_error_lines(error_lines):
     """Partition `error_lines` into (genuine, benign) in their original order.
 
-    "Benign" here means only the one marker above; everything else is
-    genuine. Both lists preserve the order the lines appeared in the device
-    output, so a caller that reports "the first genuine failure" is reporting
-    the first one that actually matters, not merely the first "%" line.
+    "Benign" here means only the one anchored marker above; everything else
+    is genuine. Both lists preserve the order the lines appeared in the
+    device output, so a caller that reports "the first genuine failure" is
+    reporting the first one that actually matters, not merely the first "%"
+    line.
     """
-    genuine = [line for line in error_lines if _ALREADY_ABSENT_MARKER not in line]
-    benign = [line for line in error_lines if _ALREADY_ABSENT_MARKER in line]
+    genuine = [line for line in error_lines if not line.startswith(_ALREADY_ABSENT_MARKER)]
+    benign = [line for line in error_lines if line.startswith(_ALREADY_ABSENT_MARKER)]
     return genuine, benign
+
+
+def _save_failure_line(save_output):
+    """Return the line proving a failed "write memory", or None if it saved.
+
+    Positive evidence is required, not merely the absence of a complaint: a
+    failed save prints no "%" line and exits 0 (module docstring), so
+    "nothing looked wrong" is not usable as success here. Two rules, either
+    of which reports failure:
+
+      - any "Can't open configuration file ..." line, which is what vtysh
+        prints per daemon when it cannot write the file. Reported verbatim,
+        first one only, since that is the operator-facing text.
+      - no "configuration saved to ..." line anywhere in the output, which
+        covers a future wording this driver does not know: with no evidence
+        the config was written, the safe classification is failure.
+    """
+    lines = [line.strip() for line in (save_output or "").splitlines() if line.strip()]
+    for line in lines:
+        if _SAVE_FAILURE_MARKER in line.lower():
+            return line
+    if any(_SAVE_OK_MARKER in line.lower() for line in lines):
+        return None
+    return "write memory reported no saved configuration file"
 
 
 class Driver:
     """FRRouting router driver, SSH-to-vtysh via netmiko."""
 
     def __init__(self, context):
+        """Record the connection context. Deliberately never raises.
+
+        Nothing here parses or validates: a constructor that raises for bad
+        field_data makes status() a hard sandbox failure instead of
+        {"reachable": False} (issue #780). HERD_port is parsed in _connect(),
+        and the missing-host/login check lives in login().
+        """
         self.context = context
         self.dry_run = bool(context.get("dry_run", False))
         self.host = context.get("HERD_ip") or context.get("HERD_ip_address")
         self.username = context.get("HERD_login") or context.get("HERD_username")
         self.password = context.get("HERD_password")
-        self.port = int(context.get("HERD_port", 22))
+        self.port_raw = context.get("HERD_port")
         self._conn = None
 
     # --- published config schema --------------------------------------------
@@ -187,16 +292,22 @@ class Driver:
     # --- connection helpers -------------------------------------------------
 
     def _connect(self):
-        """Open a netmiko session to vtysh. Never called in dry-run."""
+        """Open a netmiko session to vtysh. Never called in dry-run.
+
+        HERD_port is parsed here, not in __init__, so a bad port value raises
+        DriverError from the call that needed the connection and status()
+        still degrades to {"reachable": False} (issue #780).
+        """
         from netmiko import ConnectHandler
 
+        port = _parse_port(self.port_raw)
         if self._conn is None:
             self._conn = ConnectHandler(
                 device_type="cisco_ios",  # vtysh speaks IOS-style config/show
                 host=self.host,
                 username=self.username,
                 password=self.password,
-                port=self.port,
+                port=port,
                 fast_cli=False,
             )
         return self._conn
@@ -234,20 +345,35 @@ class Driver:
         return {"success": True}
 
     def configure(self, **cfg):
-        """Apply config lines to the router.
+        """Apply config lines to the router and persist them.
 
         Accepts `commands`: a list of vtysh config-mode lines (e.g.
         ["ip route 192.0.2.0/24 blackhole"]). Also accepts a single `command`
         string for convenience. netmiko's send_config_set wraps them in
         configure terminal / end.
 
-        See the module docstring's classification section: EVERY "%" line in
-        the output is collected and classified as genuine or benign
-        (currently just the "already absent" removal marker). Any genuine
-        line reports {"success": False, "error": <the first genuine line>,
-        "output": <full output>}; if every "%" line found is benign, this
-        still reports success, with the benign lines surfaced under
-        "benign_warnings" rather than "error".
+        Two independent things are classified, both documented at length in
+        the module docstring:
+
+        1. The config output. EVERY "%" line is collected and partitioned
+           into genuine and benign (currently just the anchored "already
+           absent" removal marker). Any genuine line reports
+           {"success": False, "error": <the first genuine line>, "output":
+           <full output>, "attempted": <the commands>}; if every "%" line
+           found is benign, this is still a success, with the benign lines
+           surfaced under "benign_warnings" rather than "error".
+
+        2. The "write memory" output, which is where a config that applied
+           to the running config but could not be persisted shows up (no "%"
+           line, exit 0). A save that cannot be proven to have happened
+           reports {"success": False, "error": <the offending save line>,
+           "output": <the config output>, "save_output": <the write-memory
+           output>, "attempted": <the commands>}, plus "benign_warnings" if
+           any were seen.
+
+        The failure payloads say "attempted", not "applied": neither of those
+        cases is a batch that landed in full, and the success payload is the
+        only one that keeps "applied".
         """
         commands = cfg.get("commands")
         if commands is None and "command" in cfg:
@@ -272,11 +398,24 @@ class Driver:
                 "success": False,
                 "error": genuine[0],
                 "output": output,
-                "applied": list(commands),
+                "attempted": list(commands),
             }
         record_command("\n".join(commands), response=output)
         # Persist to startup config so the change survives a daemon restart.
         save_output = conn.save_config()
+        save_failure = _save_failure_line(save_output)
+        if save_failure is not None:
+            record_command("write memory", response=save_output, exit_status="error")
+            result = {
+                "success": False,
+                "error": save_failure,
+                "output": output,
+                "save_output": save_output,
+                "attempted": list(commands),
+            }
+            if benign:
+                result["benign_warnings"] = benign
+            return result
         record_command("write memory", response=save_output)
         result = {"success": True, "applied": list(commands), "output": output}
         if benign:
