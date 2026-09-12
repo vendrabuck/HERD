@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- Virtual routers now reach the Layer 3 driver contract (issue #755, ADR 0014
+  addenda X-G, X-H, X-I). `configure_route` and `remove_route` take a
+  `virtual_router` keyword, and a driver opts in by declaring `supports_vrf` in
+  its `driver_metadata.json`; execution passes the keyword only to a declaring
+  driver, because every Layer 3 signature ends in `**_` and a non-declaring one
+  would swallow it in silence and install the route in the default table.
+  A switch whose driver does not declare it still has its VRF routes refused
+  with `l3_vrf_unsupported` and no driver call. A route's virtual router is now
+  validated against the switch's config (`l3_unknown_virtual_router`,
+  `l3_interface_outside_virtual_router`, `l3_interface_bound_to_virtual_router`),
+  by one shared `herd_common.l3_validation` the cabling save gate and execution's
+  drive-time re-validation both import instead of the two hand-synced copies they
+  carried. `drivers/frr_l3` renders the VRF form and now reports a route FRR
+  accepted but never installed as a failure; `drivers/mock_l3` records the VRF;
+  and the checked-in FRR lab node boots with a real VRF fixture so the live
+  suites can prove the success case, not just the refusal.
+
 - Wired the NOS lab dialect tier into `make everything` (Lane's decision,
   2026-09-12): it now runs `make nos-test-dialect` as its own phase, after the
   live LDAP auth phase and before frontend coverage, so a full local gate also

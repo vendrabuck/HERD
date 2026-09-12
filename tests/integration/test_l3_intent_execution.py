@@ -29,6 +29,7 @@ skips or errors at connect time, which is expected. Live-gated at review.
 """
 
 import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -496,3 +497,250 @@ async def test_trunk_hop_with_intent_on_both_ends_drives_both_switches(admin_cli
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch_a['id']}")
         await admin_client.delete(f"/inventory/devices/{switch_b['id']}")
+
+
+# --- addendum X-G: the VRF keyword reaches only a driver that declares support ---
+
+
+async def _route_run_by_destination(client, reservation_id, action, destination, *, timeout=30.0):
+    """Poll for a run of `action` whose destination matches, returning the run
+    itself (not just a bool) so a test can inspect input_params and output."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        for run in await _runs(client, reservation_id, action):
+            if run.get("port_a") == destination:
+                return run
+        await asyncio.sleep(0.5)
+    return None
+
+
+@pytest.fixture
+async def vrf_switch(admin_client, l3_template):
+    """A Layer 3 Switch whose config declares a virtual router, so a VRF route
+    passes the X-I validation the drive-time gate re-runs (the activation path
+    stamps no config version, so the gate always re-validates here)."""
+    switch = await _create_device(
+        admin_client, l3_template["id"], f"mock-l3-vrf-{uuid.uuid4().hex[:8]}"
+    )
+    resp = await admin_client.post(
+        f"/inventory/devices/{switch['id']}/config-versions",
+        json={
+            "config": {
+                "interfaces": INTERFACES,
+                "virtual_routers": [{"name": "blue", "interfaces": ["eth1"]}],
+            },
+            "description": "l3 vrf integration",
+        },
+    )
+    assert resp.status_code == 201, f"config-version create failed: {resp.status_code} {resp.text}"
+    yield switch
+    await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+@pytest.fixture(scope="session")
+async def no_vrf_l3_driver(base_url, admin_token):
+    """The SAME mock_l3 code uploaded with `supports_vrf: false`, so the only
+    difference from `l3_driver` is the capability claim."""
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        verify=False,
+        timeout=30.0,
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ) as client:
+        driver = await create_l3_driver(
+            client,
+            f"mock-l3-novrf-{uuid.uuid4().hex[:8]}",
+            metadata_overrides={"supports_vrf": False},
+        )
+        assert driver["supports_vrf"] is False, driver
+        yield driver
+        await client.delete(f"/inventory/drivers/{driver['id']}")
+
+
+@pytest.fixture(scope="session")
+async def no_vrf_l3_template(base_url, admin_token, no_vrf_l3_driver):
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        verify=False,
+        timeout=30.0,
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ) as client:
+        template = await create_l3_template(
+            client, no_vrf_l3_driver["id"], f"mock-l3-novrf-tmpl-{uuid.uuid4().hex[:8]}"
+        )
+        yield template
+        await client.delete(f"/inventory/templates/{template['id']}")
+
+
+@pytest.fixture
+async def no_vrf_switch(admin_client, no_vrf_l3_template):
+    switch = await _create_device(
+        admin_client, no_vrf_l3_template["id"], f"mock-l3-novrf-{uuid.uuid4().hex[:8]}"
+    )
+    resp = await admin_client.post(
+        f"/inventory/devices/{switch['id']}/config-versions",
+        json={
+            "config": {
+                "interfaces": INTERFACES,
+                "virtual_routers": [{"name": "blue", "interfaces": ["eth1"]}],
+            },
+            "description": "l3 vrf integration (non-declaring driver)",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    yield switch
+    await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+VRF_ROUTE = {
+    "destination": "10.40.0.0/24",
+    "next_hop": "10.0.1.2",
+    "interface": "eth1",
+    "virtual_router": "blue",
+}
+
+
+async def test_vrf_route_reaches_a_declaring_driver_with_the_keyword(
+    admin_client, vrf_switch, fresh_device
+):
+    """ADR 0014 addendum X-G (issue #755), the success half. mock_l3 declares
+    supports_vrf, so the gate lets the route through and the driver is called
+    WITH virtual_router. Both halves are asserted: input_params.method_kwargs
+    proves HERD passed it, and the run's output (mock_l3 echoes its own
+    arguments back) proves the driver actually RECEIVED it rather than the
+    `**_` catch-all swallowing it."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(nats_err)
+    connection = None
+    topology_id = None
+    reservation_id = None
+    try:
+        connection = await _create_connection(
+            admin_client, fresh_device["id"], vrf_switch["id"], "ge-0/0/1"
+        )
+        topology_id = await _create_topology(
+            admin_client, _canvas_with_l3(fresh_device["id"], vrf_switch["id"], [VRF_ROUTE])
+        )
+        reservation = await _reserve(
+            admin_client, [fresh_device["id"], vrf_switch["id"]], topology_id
+        )
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        run = await _route_run_by_destination(
+            admin_client, reservation_id, "configure_route", "10.40.0.0/24"
+        )
+        assert run is not None, "the VRF intent route was never configured"
+        kwargs = run["input_params"]["method_kwargs"]
+        assert kwargs["virtual_router"] == "blue", kwargs
+        echoed = json.loads(run["output"])
+        assert echoed["virtual_router"] == "blue", echoed
+        # The run identity packs the VRF too, so two routes differing only by
+        # VRF cannot collapse into one guarded action.
+        assert run["port_b"].endswith("|blue"), run["port_b"]
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        if connection:
+            await admin_client.delete(f"/cabling/connections/{connection['id']}")
+
+
+async def test_a_default_table_route_still_carries_no_vrf_to_a_non_declaring_driver(
+    admin_client, no_vrf_switch, fresh_device
+):
+    """The trap X-G closes: a non-declaring driver must never be handed the
+    keyword at all, not even as null, because every Layer 3 signature ends in
+    `**_` and would swallow it in silence. A plain default-table route against
+    such a driver drives normally with the pre-X-G keyword set."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(nats_err)
+    connection = None
+    topology_id = None
+    reservation_id = None
+    try:
+        connection = await _create_connection(
+            admin_client, fresh_device["id"], no_vrf_switch["id"], "ge-0/0/1"
+        )
+        topology_id = await _create_topology(
+            admin_client, _canvas_with_l3(fresh_device["id"], no_vrf_switch["id"], [ROUTE_A])
+        )
+        reservation = await _reserve(
+            admin_client, [fresh_device["id"], no_vrf_switch["id"]], topology_id
+        )
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        run = await _route_run_by_destination(
+            admin_client, reservation_id, "configure_route", "10.20.0.0/24"
+        )
+        assert run is not None, "the intent route was never configured"
+        kwargs = run["input_params"]["method_kwargs"]
+        assert "virtual_router" not in kwargs, (
+            f"a driver that never declared supports_vrf was handed the keyword: {kwargs!r}"
+        )
+        assert set(kwargs) == {"destination", "next_hop", "interface"}, kwargs
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        if connection:
+            await admin_client.delete(f"/cabling/connections/{connection['id']}")
+
+
+async def test_vrf_route_on_a_non_declaring_driver_parks_l3_vrf_unsupported(
+    admin_client, no_vrf_switch, fresh_device
+):
+    """The refusal half of X-G, end to end: the SAME driver code and the SAME
+    switch config as the declaring case, differing only in the capability claim,
+    drives nothing and lands the switch FAILED with l3_vrf_unsupported."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(nats_err)
+    connection = None
+    topology_id = None
+    reservation_id = None
+    try:
+        connection = await _create_connection(
+            admin_client, fresh_device["id"], no_vrf_switch["id"], "ge-0/0/1"
+        )
+        topology_id = await _create_topology(
+            admin_client, _canvas_with_l3(fresh_device["id"], no_vrf_switch["id"], [VRF_ROUTE])
+        )
+        reservation = await _reserve(
+            admin_client, [fresh_device["id"], no_vrf_switch["id"]], topology_id
+        )
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        # Nothing is ever driven for this switch.
+        assert await _no_route_run(admin_client, reservation_id, "configure_route"), (
+            "a VRF route was driven against a driver that never declared supports_vrf"
+        )
+
+        deadline = asyncio.get_event_loop().time() + 25.0
+        failed = []
+        while asyncio.get_event_loop().time() < deadline:
+            resp = await admin_client.get(f"/reservations/{reservation_id}/wiring-status")
+            assert resp.status_code == 200, resp.text
+            failed = [
+                row
+                for row in resp.json().get("connections", [])
+                if row["layer"] == "l3" and row["status"] == "FAILED"
+            ]
+            if failed:
+                break
+            await asyncio.sleep(0.5)
+        assert failed, "the switch never landed a FAILED route assignment"
+        assert failed[0]["last_error"] == "l3_vrf_unsupported", failed[0]
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        if connection:
+            await admin_client.delete(f"/cabling/connections/{connection['id']}")

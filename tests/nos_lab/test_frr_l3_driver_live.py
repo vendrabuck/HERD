@@ -47,6 +47,18 @@ FRR_PASSWORD = "netadmin"
 FRR_CONTAINER = "nos-test-frr"
 FRR_INTERFACE = "eth0"
 
+# The VRF fixture infra/nos-test/frr/start.sh creates at boot (ADR 0014 addendum
+# X-G, issue #755; docs/NOS_LAB.md). `blue` maps to routing table 10 and owns
+# `dummy0` at 192.0.2.254/30, so a next hop inside 192.0.2.252/30 resolves
+# through it. The fixture is permanent: FRR refuses `no vrf <name>` while the
+# Linux device exists, so these tests clean up only their own routes.
+VRF_NAME = "blue"
+VRF_TABLE = "10"
+VRF_INTERFACE = "dummy0"
+VRF_MEMBER_SUBNET = ipaddress.ip_network("192.0.2.252/30")
+VRF_NEXT_HOP = "192.0.2.253"
+UNKNOWN_VRF_NAME = "no-such-vrf"
+
 
 def _reachable(host: str, port: int) -> bool:
     try:
@@ -105,9 +117,11 @@ def _show_ip_route_static() -> str:
 def _unique_test_prefix() -> str:
     """Return a random /30 destination prefix inside RFC5737 TEST-NET-1
     (192.0.2.0/24) so concurrent or repeated runs never collide on the
-    destination. 192.0.2.0/24 has 64 non-overlapping /30s."""
+    destination. 192.0.2.0/24 has 64 non-overlapping /30s, minus the one the
+    lab's VRF member interface occupies (VRF_MEMBER_SUBNET): a destination
+    equal to a connected subnet is not a static route the RIB would select."""
     network = ipaddress.ip_network("192.0.2.0/24")
-    subnets = list(network.subnets(new_prefix=30))
+    subnets = [s for s in network.subnets(new_prefix=30) if s != VRF_MEMBER_SUBNET]
     subnet = random.choice(subnets)
     return f"{subnet.network_address}/{subnet.prefixlen}"
 
@@ -330,6 +344,137 @@ def test_configure_route_rejected_by_device_reports_failure_and_installs_nothing
         # Nothing should have been installed, but clean up defensively in case
         # a future regression reintroduces the bug this test guards against.
         _cleanup_route(malformed_destination, next_hop, FRR_INTERFACE)
+
+
+# ---------------------------------------------------------------------------
+# VRF routes (ADR 0014 addenda X-G and X-H, issue #755), against the lab's
+# checked-in VRF fixture. Verification is doubly independent: not only a
+# separate `docker exec` rather than the driver's own session, but TWO
+# channels, the kernel routing table the VRF maps to (`ip route show table 10`,
+# which does not go through FRR at all) and FRR's own per-VRF view.
+# ---------------------------------------------------------------------------
+
+
+def _vrf_kernel_routes() -> str:
+    return _docker_exec(FRR_CONTAINER, "ip", "route", "show", "table", VRF_TABLE)
+
+
+def _vrf_frr_routes() -> str:
+    return _docker_exec(FRR_CONTAINER, "vtysh", "-c", f"show ip route vrf {VRF_NAME} static")
+
+
+def _cleanup_vrf_route(destination: str, next_hop: str | None) -> None:
+    cmd = (
+        f"no ip route {destination} {next_hop} vrf {VRF_NAME}"
+        if next_hop is not None
+        else f"no ip route {destination} {VRF_INTERFACE} vrf {VRF_NAME}"
+    )
+    subprocess.run(
+        ["docker", "exec", FRR_CONTAINER, "vtysh", "-c", "configure terminal", "-c", cmd],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_the_lab_node_carries_the_vrf_fixture():
+    """The precondition the two tests below rest on: start.sh created VRF `blue`
+    (table 10) with `dummy0` as a member. A lab built from an older image would
+    otherwise make the VRF tests fail for a reason that has nothing to do with
+    the driver; `make nos-reset` is the remedy."""
+    links = _docker_exec(FRR_CONTAINER, "ip", "-br", "link")
+    assert VRF_NAME in links, (
+        f"the lab's FRR node has no `{VRF_NAME}` VRF device; rebuild it with "
+        f"`make nos-reset` (see docs/NOS_LAB.md):\n{links}"
+    )
+    assert VRF_INTERFACE in links, f"no `{VRF_INTERFACE}` VRF member interface:\n{links}"
+    addrs = _docker_exec(FRR_CONTAINER, "ip", "-4", "-o", "addr", "show", VRF_INTERFACE)
+    assert "192.0.2.254/30" in addrs, addrs
+
+
+def test_configure_and_remove_a_vrf_route_is_independently_verifiable():
+    destination = _unique_test_prefix()
+
+    d = Driver(_context())
+    try:
+        assert d.login()["success"] is True
+        result = d.configure_route(
+            destination=destination,
+            next_hop=VRF_NEXT_HOP,
+            interface=VRF_INTERFACE,
+            virtual_router=VRF_NAME,
+        )
+        assert result["success"] is True, result
+
+        # Channel 1: the kernel table the VRF maps to, read without FRR.
+        kernel = _vrf_kernel_routes()
+        assert destination in kernel, kernel
+        # Channel 2: FRR's own per-VRF static view.
+        frr_view = _vrf_frr_routes()
+        assert destination in frr_view, frr_view
+        # And it is NOT in the default table: a VRF route that leaked into the
+        # default table is exactly the silent failure X-G exists to prevent.
+        assert destination not in _show_ip_route_static(), (
+            "the VRF route also landed in the default routing table"
+        )
+
+        removed = d.remove_route(
+            destination=destination,
+            next_hop=VRF_NEXT_HOP,
+            interface=VRF_INTERFACE,
+            virtual_router=VRF_NAME,
+        )
+        assert removed["success"] is True, removed
+        assert destination not in _vrf_kernel_routes()
+        assert destination not in _vrf_frr_routes()
+    finally:
+        d.logout()
+        _cleanup_vrf_route(destination, VRF_NEXT_HOP)
+
+
+def test_a_route_naming_an_unknown_vrf_reports_failure():
+    """ADR 0014 addendum X-H: FRR ACCEPTS the route into its configuration (no
+    "%" line at all) but never installs it, answering "Static Route to <prefix>
+    not installed currently because dependent config not fully available". Under
+    the rejection contract that is a failure, not a success."""
+    destination = _unique_test_prefix()
+
+    d = Driver(_context())
+    try:
+        assert d.login()["success"] is True
+        result = d.configure_route(
+            destination=destination,
+            next_hop=VRF_NEXT_HOP,
+            interface=VRF_INTERFACE,
+            virtual_router=UNKNOWN_VRF_NAME,
+        )
+        assert result["success"] is False, (
+            f"driver reported success for a route the device never installed: {result!r}"
+        )
+        assert "not installed currently" in result["error"], result
+
+        # Independent verification: nothing landed in the real VRF's table or in
+        # the default table either.
+        assert destination not in _vrf_kernel_routes()
+        assert destination not in _show_ip_route_static()
+    finally:
+        d.logout()
+        _cleanup_vrf_route(destination, VRF_NEXT_HOP)
+        subprocess.run(
+            [
+                "docker",
+                "exec",
+                FRR_CONTAINER,
+                "vtysh",
+                "-c",
+                "configure terminal",
+                "-c",
+                f"no ip route {destination} {VRF_NEXT_HOP} vrf {UNKNOWN_VRF_NAME}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
 
 
 # ---------------------------------------------------------------------------

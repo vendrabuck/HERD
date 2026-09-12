@@ -16,6 +16,7 @@ stay declared locally where pytest expects to find them.
 """
 
 import io
+import json
 import tarfile
 from pathlib import Path
 
@@ -24,18 +25,32 @@ import httpx
 MOCK_L3_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l3"
 
 
-def mock_l3_tarball() -> bytes:
-    """Package the checked-in drivers/mock_l3 package into a .tar.gz for upload."""
+def mock_l3_tarball(metadata_overrides: dict | None = None) -> bytes:
+    """Package the checked-in drivers/mock_l3 package into a .tar.gz for upload.
+
+    `metadata_overrides` merges into driver_metadata.json before packing, which
+    is how a test uploads the SAME driver code under a DIFFERENT capability
+    claim (ADR 0014 addendum X-G, issue #755: `{"supports_vrf": False}` yields a
+    non-declaring Layer 3 driver whose VRF routes execution must refuse without
+    a driver call). The checked-in package on disk is never modified.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for name in ("driver.py", "driver_metadata.json"):
-            tf.add(MOCK_L3_DIR / name, arcname=name)
+        tf.add(MOCK_L3_DIR / "driver.py", arcname="driver.py")
+        metadata = json.loads((MOCK_L3_DIR / "driver_metadata.json").read_text())
+        metadata.update(metadata_overrides or {})
+        payload = json.dumps(metadata, indent=2).encode("utf-8")
+        info = tarfile.TarInfo(name="driver_metadata.json")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
     return buf.getvalue()
 
 
-async def create_l3_driver(client: httpx.AsyncClient, name: str) -> dict:
+async def create_l3_driver(
+    client: httpx.AsyncClient, name: str, metadata_overrides: dict | None = None
+) -> dict:
     """Upload the mock Layer 3 Switch driver under the given (unique) name."""
-    files = {"file": ("mock_l3.tar.gz", mock_l3_tarball(), "application/gzip")}
+    files = {"file": ("mock_l3.tar.gz", mock_l3_tarball(metadata_overrides), "application/gzip")}
     data = {
         "name": name,
         "connection_type": "Layer 3 Switch",
