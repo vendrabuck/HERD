@@ -751,3 +751,81 @@ way `BulkExporter`'s own docstring warns a real import would). No Alembic revisi
 was needed: `route_assignments` carries no new column, since the pin CONTENT is
 still a plain JSON list and the delta's identity is computed at read time, never
 stored.
+
+## Amendment: VRF reaches the driver contract (2026-09-12, issue #755)
+
+Decided by Lane on 2026-09-12 after a live probe of the checked-in FRR lab node
+(`infra/nos-test/`, docs/NOS_LAB.md). Three facts from that probe drive the shape
+below.
+
+- FRR accepts a VRF static route into its configuration either inside a `vrf <name>`
+  block or as `ip route <prefix> <next_hop> vrf <name>`; both land in the `vrf` block of
+  the running config. Without a Linux VRF device behind that name the route is never
+  installed: vtysh prints `Static Route to <prefix> not installed currently because
+  dependent config not fully available`, a line with no `%` marker, and `show ip route
+  vrf <name>` answers `% VRF <name> not active`. With a VRF device (`ip link add <name>
+  type vrf table <n>`) and a member interface, the route installs in that table.
+- Every shipped Layer 3 driver signature is `configure_route(self, destination,
+  next_hop, interface, **_)`. An extra `virtual_router` keyword is swallowed silently,
+  so a VRF-unaware driver handed a VRF route would install it in the default table and
+  report success.
+- `no vrf <name>` is refused (`% Only inactive VRFs can be deleted`) while the Linux
+  device exists, so a fixture VRF is created once and never deleted by tests.
+
+**X-G (capability-gated VRF in the driver contract).** `configure_route` and
+`remove_route` gain a keyword parameter `virtual_router: str | None = None`.
+`driver_metadata.json` gains an optional boolean `supports_vrf` (default false),
+parallel to `supports_dry_run`; inventory's driver upload parses it the same way and
+execution reads it through the cached metadata. The drive-time gate
+(`_gate_l3_drive_routes`, addendum X-F) becomes capability-conditional: a switch whose
+routes name a `virtual_router` is parked FAILED with `l3_vrf_unsupported` and no driver
+call ONLY when its driver does not declare `supports_vrf`; a declaring driver receives
+`virtual_router` on every route call, null for default-table routes. Execution never
+passes the keyword to a non-declaring driver, so the silent-swallow trap above cannot
+occur. `_route_run_identity` (the execution-run idempotency guard) packs
+`virtual_router` into `port_b` alongside interface and next hop, matching the
+four-field `route_identity_key` (X-E) so two routes differing only by VRF are distinct
+guarded actions.
+
+**X-H (installed is the end state).** Under the rejection contract in docs/DRIVERS.md
+("judge by the desired end state"), a route the device accepted into configuration but
+did not install is a failure. `drivers/frr_l3` classifies the `not installed currently
+because dependent config not fully available` line as genuine for every route, VRF or
+not, and returns `{"success": False}` with that line as `error`. `drivers/frr_l3`
+declares `supports_vrf: true` and renders a VRF route as `ip route <prefix>
+<next_hop_or_interface> vrf <name>` (verified live). `drivers/mock_l3` declares
+`supports_vrf: true` and records the VRF in its transcript so integration tests can
+assert it reached the driver.
+
+**X-I (VRF validated against the switch config, strict).** The per-route validator
+moves from its two copies (cabling's `l3_validation._validate_one_route` and
+execution's mirror in `nats_consumer.py`) into one `herd_common.l3_validation` that
+both import, then gains three fail-closed reasons in the existing vocabulary, applied
+at the save gate and at drive-time re-validation (X-A) alike:
+
+- `l3_unknown_virtual_router`: the route names a VRF that is not in the config's
+  `virtual_routers[].name`.
+- `l3_interface_outside_virtual_router`: the route names a VRF but its interface is
+  not in that VRF's `virtual_routers[].interfaces`.
+- `l3_interface_bound_to_virtual_router`: the route names no VRF but its interface is
+  listed under some VRF (an interface enslaved to a VRF is not in the default table on
+  Linux and FRR, so a default-table route through it can never install).
+
+A config with no `virtual_routers` key behaves as before for routes without a VRF and
+refuses any route naming one with `l3_unknown_virtual_router`. The frontend Routing
+panel maps the first two reasons to the virtual router field and the third to the
+interface field (`resolveRouteProblems` in `frontend/src/lib/l3.ts`).
+
+**Lab fixture.** `infra/nos-test/frr/start.sh` creates a Linux VRF `blue` (table 10)
+with a member dummy interface `dummy0` at `192.0.2.254/30` at boot, so the FRR node
+carries a deterministic VRF the way the SR Linux node carries its baseline. The
+dialect suite proves a VRF route installs (read back through a separate `docker exec`
+of `ip route show table 10` and `vtysh -c "show ip route vrf blue static"`) and that a
+route naming an unknown VRF returns `success: False`. The via-stack feature test adds a
+VRF route to a reservation's intent against a device config that declares
+`virtual_routers: [{name: blue, interfaces: [dummy0]}]`, proves it on the device, and
+proves the save gate refuses an unknown VRF with `l3_unknown_virtual_router`.
+
+**What this closes and leaves open.** Issue #755 closes. Interface-level attachment
+(#756) and the config-content oracle (#763) are unchanged. SR Linux carries no L3
+driver in HERD, so VRF on SR Linux is not exercised.
