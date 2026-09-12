@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- Fixed `drivers/srl_l2` applying part of a batch it reported as failed, and
+  committing configuration staged by an earlier call that died (issue #778). SR Linux
+  stages every `set`/`delete` in a per-user private candidate that only `commit stay`
+  applies, and that candidate outlives the SSH session: netmiko keeps sending after a
+  rejected line, so the old unconditional `commit()` applied the valid PREFIX of a
+  rejected batch (proven live: `admin-state enable` landed on a port HERD believed
+  untouched while the driver returned `success: False`), and any exception path left
+  lines staged for the next call's commit to pick up through the device. `_apply` now
+  discards the candidate at entry, returns failure on a set-time rejection before it
+  ever commits, discards on a commit refusal, and discards in a `finally` on exception
+  paths. The module docstring's "shared session" rationale is replaced with the
+  persistent-candidate fact (the sandbox runs one process per action, so there is no
+  shared session) and gains the best-effort limitation block `docs/DRIVERS.md`
+  requires. Also (issue #780, `srl_l2` only) an optional `HERD_port` that is blank now
+  means 22 instead of raising `ValueError` from the constructor, and a non-integer
+  raises `DriverError("HERD_port must be an integer")` from `_connect`, so `status()`
+  still degrades to `{"reachable": False}` for health polling. New live regression
+  tests in `tests/nos_lab/test_srl_l2_driver_live.py` verify the device independently
+  through a separate `docker exec nos-test-srl sr_cli` session.
+
 - Pinned the NOS lab and Selenium images by digest (issue #783): SR Linux
   (`26.7.2-519`), the FRR base image (no matching version tag; digest only),
   and `selenium/standalone-chrome` (`4.43.0-20260404`), plus the FRR
@@ -13,6 +33,7 @@
   `SEED_NOS=1` message on its default `--nos-only` path; hardened
   `infra/nos-test/frr/start.sh` (`set -e`, an sshd-up check) and extended the
   FRR healthcheck to also probe port 22.
+
 
 - Fixed `pick_dut_template`'s last fallback tier in `seed_devices_public.py`
   (issue #781, follow-up to #775): it returned `items[0]` even when no

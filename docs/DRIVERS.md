@@ -774,15 +774,15 @@ anyone writing the next real L2 driver against different gear:
   may still carry other VLANs on other subinterfaces.
 - Every mutating command is issued as an ABSOLUTE path, `set /...` or `delete /...`,
   never a bare relative one. This is load-bearing: SR Linux's candidate-mode CLI keeps a
-  "current context" that a prior command in the same session can silently change. A
+  "current context" that a prior command in the same session silently changes. A
   command with no trailing scalar value, such as `network-instance vlan100 interface
   ethernet-1/1.100`, is treated as "enter that list entry", and the CLI navigates the
-  session into it; since HERD shares one login/logout session across several mutating
-  calls to the same switch, the NEXT command is then parsed relative to that stale
-  context instead of the root, and an otherwise-correct command fails with a "Parsing
-  error: Unknown token" it would never hit issued alone. A leading `/` roots every
-  command and leaves the session at the top-level context afterward regardless of what
-  the command itself did. This was found empirically against the checked-in lab
+  session into it; one driver call sends its whole command batch down one session in one
+  `send_config_set`, so the NEXT command in that batch is then parsed relative to the
+  stale context instead of the root, and an otherwise-correct command fails with a
+  "Parsing error: Unknown token" it would never hit issued alone. A leading `/` roots
+  every command and leaves the session at the top-level context afterward regardless of
+  what the command itself did. This was found empirically against the checked-in lab
   (`docs/NOS_LAB.md`), not inferred from vendor docs.
 - `create_vlan` and `delete_vlan` are idempotent by construction, not by any
   special-casing in the driver: SR Linux's own candidate/commit model treats redefining
@@ -803,11 +803,22 @@ anyone writing the next real L2 driver against different gear:
   `create_vlan`/`delete_vlan` idempotency from a false success: SR Linux's own
   `"Nothing to commit."` is what BOTH a legitimately idempotent no-op AND a rejected
   `set` that never staged produce, and the error-marker scan, not that text, is what
-  tells them apart. A detected rejection also discards the candidate
-  (`conn._discard()`), because a partially-staged batch (some lines valid, one rejected)
-  can leave the candidate dirty even though nothing committed; since mutating calls to
-  one switch share a login/logout session, an undiscarded dirty candidate would
-  otherwise silently ride along into the next call's commit.
+  tells them apart.
+- Candidate discipline (issue #778), the part most likely to be got wrong in the next
+  candidate-and-commit driver. Two facts, both reproduced live against the lab node:
+  netmiko keeps sending after a rejected line, so a batch whose second line is a
+  `Parsing error:` still stages its first, and a commit then answers "All changes have
+  been committed."; and the per-user PRIVATE CANDIDATE persists across SSH sessions, so
+  lines staged by a call that died are still there for the next call's commit to pick
+  up. The sandbox runs one process per action
+  (`services/execution/app/services/driver_sandbox.py`), so the leak path is the DEVICE,
+  not a shared session. `_apply` therefore discards at ENTRY before it stages anything,
+  returns failure on a set-time rejection BEFORE it ever calls `commit()`, discards on a
+  commit refusal, and discards in a `finally` on any exception path. The entry discard
+  enters candidate mode first: `discard stay` issued in running mode is itself a
+  `Parsing error:`. All of it is best-effort, per the module docstring's IMPORTANT
+  LIMITATION note; a `{"success": True}` means the device reported no error, not that
+  the configuration is proven present.
 
 See `docs/NOS_LAB.md` for the live lab this driver is verified against, including the
 `[FACTORY]` config-mode trap a factory-fresh node hits before its baseline is applied.
