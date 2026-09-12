@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- Tightened the two `tests/nos_lab/` via-stack feature tests so they prove what
+  they claim (issue #782). The FRR Layer 3 test now runs a fork SAVE with a
+  CHANGED route set, which is the only path that exercises `gate_l3_intent`,
+  the staged `reservation.wiring_changed`, and execution's route-set delta
+  reconcile, and it verifies both halves of that delta on the real router; its
+  rejection test pins the device's own `% Unknown command:` wording instead of
+  any non-empty error string; every destination assertion now matches the FULL
+  prefix (the old `split("/")[0]` form matched a leaked neighbouring prefix);
+  and a non-200 from `GET /execution/runs` now fails loudly instead of being
+  swallowed into "the route was never configured". The SR Linux Layer 2 test
+  now activates over an edgeless canvas and adds the edge in the fork save, so
+  the membership is attributable to the save; its device baseline is taken
+  before the reservation exists and scoped to the two ports and the allocated
+  VLAN rather than "no mac-vrf anywhere"; and its device cleanup checks its
+  exit status and reports the `sr_cli` stderr. Both files now probe their
+  preconditions from a session-scoped fixture, so collection touches neither
+  the network nor docker.
+
 - Closed four rejection-classification gaps in the FRR drivers (issue #779)
   and the shared `HERD_port` parsing defect (issue #780). `drivers/frr_mgmt`
   and `drivers/frr_l3` now anchor the benign "already absent" carve-out at the

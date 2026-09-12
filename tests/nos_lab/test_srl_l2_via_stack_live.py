@@ -27,6 +27,14 @@ resolves it through the physical cabling graph into two hops touching
 tests/integration/test_l2_reconcile.py's canvas shape against the mock L2
 driver, but here against the real switch.
 
+The reservation deliberately ACTIVATES over an EDGELESS canvas, and the edge
+arrives in a later fork SAVE. That ordering is what makes the save's effect
+observable: with nothing wired at activation the switch carries no membership
+at all, so the mac-vrf and both subinterface bindings that appear afterwards
+can only have come from the save's connection-driven reconcile. Re-saving the
+same canvas the reservation activated over (the shape this test used to have)
+proves nothing, since activation had already driven that exact set.
+
 Every change is verified independently of the driver's own session, the
 execution run's own success flag, AND HERD's own read of the wiring-status
 surface: a separate `docker exec nos-test-srl sr_cli ...` call, in its own
@@ -114,10 +122,6 @@ def _stack_reachable() -> bool:
         return False
 
 
-_SRL_REACHABLE = _reachable(SRL_HOST, SRL_PORT)
-_LAB_ATTACHED = _SRL_REACHABLE and _lab_attached_to_stack()
-_STACK_REACHABLE = _stack_reachable()
-_PRECONDITIONS_MET = _SRL_REACHABLE and _LAB_ATTACHED and _STACK_REACHABLE
 _NOS_REQUIRED = os.getenv("HERD_TEST_NOS_REQUIRED", "") not in ("", "0")
 
 
@@ -140,23 +144,30 @@ def _credentials_accepted() -> bool:
         return False
 
 
-_CREDENTIALS_OK = _credentials_accepted() if _STACK_REACHABLE else False
-
-
 def _missing_precondition_reason() -> str:
-    if not _SRL_REACHABLE:
+    """Probe every precondition in dependency order and return the first
+    unmet one's message, or "" when all hold.
+
+    Called from a session-scoped fixture, NEVER at import: the repo-root
+    pytest config sets testpaths = ["tests"], so a bare `uv run pytest` from
+    the repo root collects this file, and an import-time probe would make
+    plain collection open a socket, shell out to docker, and log in over
+    HTTPS. The dependency order (and each message) is unchanged; it is only
+    the timing that moved.
+    """
+    if not _reachable(SRL_HOST, SRL_PORT):
         return (
             f"NOS test lab SR Linux node not reachable ({SRL_HOST}:{SRL_PORT}); "
             "start it with `make nos-up`."
         )
-    if not _LAB_ATTACHED:
+    if not _lab_attached_to_stack():
         return (
             "NOS test lab is not attached to the dev stack's Docker network; "
             "run `make nos-attach` (dev stack must be up: `make up`)."
         )
-    if not _STACK_REACHABLE:
+    if not _stack_reachable():
         return f"HERD stack not reachable at {BASE_URL}; run `make up`."
-    if not _CREDENTIALS_OK:
+    if not _credentials_accepted():
         return (
             f"the stack rejected the seed credentials for {SEED_EMAIL!r}. These are read "
             "from the ENVIRONMENT, while the stack seeds its superadmin from .env, so "
@@ -167,16 +178,23 @@ def _missing_precondition_reason() -> str:
     return ""
 
 
-pytestmark = pytest.mark.skipif(
-    not _NOS_REQUIRED and not (_PRECONDITIONS_MET and _CREDENTIALS_OK),
-    reason=_missing_precondition_reason() or "NOS lab + stack preconditions not met",
-)
+@pytest.fixture(scope="session")
+def _nos_precondition_reason() -> str:
+    """The one probe pass for the whole session (each probe is a socket, a
+    docker exec, and two HTTPS logins; running them per test would triple
+    that for no added signal)."""
+    return _missing_precondition_reason()
 
 
 @pytest.fixture(autouse=True)
-def _fail_when_required_but_unavailable():
-    if _NOS_REQUIRED and not (_PRECONDITIONS_MET and _CREDENTIALS_OK):
-        pytest.fail(_missing_precondition_reason())
+def _require_nos_lab_and_stack(_nos_precondition_reason: str) -> None:
+    """Unchanged gating semantics: skip by default, hard-fail (with the same
+    message) under HERD_TEST_NOS_REQUIRED=1."""
+    if not _nos_precondition_reason:
+        return
+    if _NOS_REQUIRED:
+        pytest.fail(_nos_precondition_reason)
+    pytest.skip(_nos_precondition_reason)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +250,59 @@ def _assert_membership_on_device(vlan_id: int, ports: list[str]) -> None:
         assert "type bridged" in subif_info, subif_info
         assert "single-tagged" in subif_info, subif_info
         assert f"vlan-id {vlan_id}" in subif_info, subif_info
+
+
+def _assert_ports_carry_no_subinterfaces(ports: list[str]) -> None:
+    """Baseline, SCOPED to the ports this test will use.
+
+    Deliberately not "no mac-vrf anywhere on the device": an unrelated mac-vrf
+    (a leftover from the dialect suite, or a second lane) says nothing about
+    whether ethernet-1/1 and ethernet-1/2 are free, and asserting on the whole
+    device turns someone else's leftover into a misleading failure of this
+    test. A port with no `subinterface` stanza cannot be a member of any
+    mac-vrf, which is exactly the precondition that matters here.
+    """
+    for port in ports:
+        port_info = _info(f"/interface {port}")
+        assert "subinterface" not in port_info, (
+            f"{port} already carries a subinterface before this test wired anything; "
+            f"the lab is not at baseline:\n{port_info}"
+        )
+
+
+def _remove_membership_from_device(vlan_id: int, ports: list[str]) -> str | None:
+    """Drop any leftover membership for `vlan_id` straight off the switch.
+
+    Piped-script form, mirroring how the lab's own baseline is applied
+    (infra/nos-test/srl/start.sh): sr_cli's "-c" flag means "--commit-at-end",
+    not "run this command", so a batch of deletes plus an explicit
+    "commit stay" is sent on stdin, never via "-c".
+
+    Returns None on success, or a message naming the exit status and stderr.
+    A silently failed cleanup does not stay silent: it resurfaces as the NEXT
+    run's baseline failure, blamed on the wrong test.
+    """
+    net_path = f"/network-instance vlan{vlan_id}"
+    script_lines = ["enter candidate"]
+    for port in ports:
+        script_lines.append(f"delete {net_path} interface {port}.{vlan_id}")
+        script_lines.append(f"delete /interface {port} subinterface {vlan_id}")
+    script_lines.append(f"delete {net_path}")
+    script_lines.append("commit stay")
+    result = subprocess.run(
+        ["docker", "exec", "-i", SRL_CONTAINER, "sr_cli"],
+        input="\n".join(script_lines) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return (
+            f"device cleanup for vlan{vlan_id} failed (exit {result.returncode}); "
+            f"the lab is NOT back at baseline. stderr={result.stderr!r} "
+            f"stdout={result.stdout!r}"
+        )
+    return None
 
 
 def _assert_membership_gone_from_device(vlan_id: int, ports: list[str]) -> None:
@@ -325,6 +396,15 @@ def _canvas_edge(dut_a_id: str, dut_b_id: str) -> dict:
     }
 
 
+def _canvas_no_edges(dut_a_id: str, dut_b_id: str) -> dict:
+    """The same two device nodes with NO edge between them: the shape the
+    reservation activates over, so activation wires nothing and every hop the
+    switch ends up carrying is attributable to the later fork save."""
+    canvas = _canvas_edge(dut_a_id, dut_b_id)
+    canvas["edges"] = []
+    return canvas
+
+
 async def _create_topology(client, canvas: dict) -> str:
     resp = await client.post(
         "/cabling/topologies", json={"name": f"nos-stack-l2-e2e-{uuid.uuid4().hex[:8]}"}
@@ -376,6 +456,30 @@ async def _wiring_status(client, reservation_id: str) -> dict:
 
 def _l2_rows(status: dict) -> list[dict]:
     return [c for c in status.get("connections", []) if c.get("layer") == "l2"]
+
+
+async def _poll_wiring_version_applied(
+    client, reservation_id: str, version: int, timeout: float = 60.0
+) -> dict:
+    """Poll until execution has APPLIED at least fork version `version`, and
+    return that wiring-status payload.
+
+    `last_applied_fork_version` is execution's own monotonic marker, stamped
+    at the END of a wiring_changed pass. Waiting on it is what makes the
+    "activation wired nothing" assertion below a real observation rather than
+    a race the reconcile simply had not reached yet.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    last_status: dict | None = None
+    while asyncio.get_event_loop().time() < deadline:
+        last_status = await _wiring_status(client, reservation_id)
+        applied = last_status.get("last_applied_fork_version")
+        if applied is not None and applied >= version:
+            return last_status
+        await asyncio.sleep(0.5)
+    raise AssertionError(
+        f"execution never applied fork version {version}; last wiring-status: {last_status}"
+    )
 
 
 async def _poll_l2_membership_active(
@@ -447,32 +551,48 @@ async def test_reservation_derives_and_configures_a_real_l2_vlan_membership_via_
         dut_2_id = await _device_id_by_name(client, DUT_2_NAME)
         srl_id = await _device_id_by_name(client, SRL_NAME)
 
-        canvas = _canvas_edge(dut_1_id, dut_2_id)
+        wired_canvas = _canvas_edge(dut_1_id, dut_2_id)
         ports = {SRL_PORT_1, SRL_PORT_2}
+
+        # Baseline, taken BEFORE the reservation exists: nothing HERD does can
+        # race it, and a failure here can only mean the lab really is dirty.
+        # (Taken after activation, as this test used to do, the only thing
+        # separating the assert from the membership it says is absent is the
+        # driver's SSH login, since wiring_changed is already staged.)
+        _assert_ports_carry_no_subinterfaces([SRL_PORT_1, SRL_PORT_2])
+        baseline_summary = _docker_exec("sr_cli", "show network-instance summary")
 
         topology_id = None
         reservation_id = None
         reservation_cancelled = False
         vlan_id: int | None = None
+        body_failed = False
         try:
-            topology_id = await _create_topology(client, canvas)
+            # Activate over an EDGELESS canvas: nothing to wire, so nothing to
+            # derive a membership from. The edge arrives in the fork save
+            # below, which is what makes the save's effect observable.
+            topology_id = await _create_topology(client, _canvas_no_edges(dut_1_id, dut_2_id))
             reservation = await _reserve(client, [dut_1_id, dut_2_id, srl_id], topology_id)
             reservation_id = reservation["id"]
             assert await _poll_active(client, reservation_id), "reservation never activated"
 
-            # Before any wiring intent has been driven, the real device carries
-            # no test VLAN. This snapshot is qualitative (we do not yet know
-            # the VLAN id HERD will allocate); the real assertion is below.
-            baseline_summary = _docker_exec("sr_cli", "show network-instance summary")
-            assert "mac-vrf" not in baseline_summary, baseline_summary
+            # Activation stages a reservation.wiring_changed for the fork's
+            # first version; wait for execution to have APPLIED it before
+            # claiming it wired nothing, otherwise this reads an empty ledger
+            # the reconcile simply had not reached yet.
+            applied = await _poll_wiring_version_applied(client, reservation_id, 1)
+            assert _l2_rows(applied) == [], (
+                "an edgeless canvas must derive no L2 membership at activation; "
+                f"wiring-status: {applied}"
+            )
 
-            # Step 3: explicitly save the fork's wiring so the connection-driven
-            # reconcile runs (ADR 0009). Activation already staged an initial
-            # reservation.wiring_changed for the fork's first version from this
-            # same topology canvas; re-saving the identical canvas here proves
-            # the fork-save path itself drives the full reconcile too, not only
-            # the one-time activation path.
-            saved = await _save_fork(client, reservation_id, canvas)
+            # The save: add the DUT-to-DUT edge. cabling's pathfinder resolves
+            # it through the seeded physical cabling into two hops on the real
+            # switch, reservations stages reservation.wiring_changed, and
+            # execution's connection-driven reconcile derives the membership
+            # (ADR 0009). Everything asserted after this point is therefore
+            # attributable to the SAVE, not to activation.
+            saved = await _save_fork(client, reservation_id, wired_canvas)
             assert saved.status_code == 200, saved.text
 
             # Poll HERD's own wiring-status surface (never the driver's own
@@ -482,6 +602,14 @@ async def test_reservation_derives_and_configures_a_real_l2_vlan_membership_via_
             vlan_id = active_rows[SRL_PORT_1]["vlan"]
             assert vlan_id is not None
             assert active_rows[SRL_PORT_2]["vlan"] == vlan_id, active_rows
+
+            # Now that the allocated id is known, the baseline can be scoped to
+            # the VLAN under test: this exact mac-vrf did not exist before the
+            # reservation, so the one on the device now is the one HERD built.
+            assert f"vlan{vlan_id}" not in baseline_summary, (
+                f"vlan{vlan_id} already existed on the switch before this test "
+                f"reserved anything:\n{baseline_summary}"
+            )
 
             # Independent verification on the REAL device: a fresh docker exec
             # session, never the driver's own. Assert the mac-vrf exists AND
@@ -507,33 +635,26 @@ async def test_reservation_derives_and_configures_a_real_l2_vlan_membership_via_
             # (see the poll helper's docstring), so this polls rather than
             # asserting once.
             await _poll_membership_gone_from_device(vlan_id, [SRL_PORT_1, SRL_PORT_2])
+        except BaseException:
+            # Remembered so the cleanup check below cannot REPLACE a real
+            # failure with a cleanup complaint; it only speaks up when the
+            # body itself passed.
+            body_failed = True
+            raise
         finally:
             # Defense in depth: if an assertion failed before teardown ran (or
             # teardown itself only partially converged), remove any leftover
-            # membership directly so the lab stays re-runnable without a
-            # reset. Piped-script form, mirroring how the lab's own baseline
-            # is applied (infra/nos-test/srl/start.sh): sr_cli's "-c" flag
-            # means "--commit-at-end", not "run this command", so a batch of
-            # deletes plus an explicit "commit stay" is sent on stdin, never
-            # via "-c".
-            if vlan_id is not None:
-                net_path = f"/network-instance vlan{vlan_id}"
-                script_lines = ["enter candidate"]
-                for port in (SRL_PORT_1, SRL_PORT_2):
-                    script_lines.append(f"delete {net_path} interface {port}.{vlan_id}")
-                    script_lines.append(f"delete /interface {port} subinterface {vlan_id}")
-                script_lines.append(f"delete {net_path}")
-                script_lines.append("commit stay")
-                subprocess.run(
-                    ["docker", "exec", "-i", SRL_CONTAINER, "sr_cli"],
-                    input="\n".join(script_lines) + "\n",
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
+            # membership directly so the lab stays re-runnable without a reset.
+            cleanup_error = (
+                _remove_membership_from_device(vlan_id, [SRL_PORT_1, SRL_PORT_2])
+                if vlan_id is not None
+                else None
+            )
             await _cleanup(
                 client,
                 reservation_id=reservation_id,
                 topology_id=topology_id,
                 reservation_cancelled=reservation_cancelled,
             )
+            if cleanup_error is not None and not body_failed:
+                raise AssertionError(cleanup_error)
