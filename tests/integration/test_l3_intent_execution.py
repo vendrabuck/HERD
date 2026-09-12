@@ -634,7 +634,9 @@ async def test_vrf_route_reaches_a_declaring_driver_with_the_keyword(
         assert run is not None, "the VRF intent route was never configured"
         kwargs = run["input_params"]["method_kwargs"]
         assert kwargs["virtual_router"] == "blue", kwargs
-        echoed = json.loads(run["output"])
+        # The run's `output` column stores the driver's whole result payload,
+        # so the driver's own echoed arguments are one level in.
+        echoed = json.loads(run["output"])["output"]
         assert echoed["virtual_router"] == "blue", echoed
         # The run identity packs the VRF too, so two routes differing only by
         # VRF cannot collapse into one guarded action.
