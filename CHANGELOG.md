@@ -116,6 +116,36 @@
   `make nos-attach`); not part of `make test`, `make master`, or
   `make everything`. See `docs/NOS_LAB.md`.
 
+- Made "a driver must report a device rejection as a failure" a binding
+  contract (issue #771): `docs/DRIVERS.md` gains a section beside "Dry-run
+  support" laying out the rule, since both are binding requirements with a
+  stated consequence, return `{"success": False}` on a device rejection
+  rather than raising, put the offending line in `error` since that is what
+  lands in a wiring assignment's `last_error` column, and never verify a
+  driver's own work through its own read path. `drivers/frr_mgmt.configure()`
+  is the fix: it classifies every `%` line in the config output, reports
+  `{"success": False}` with the device's own offending line on any genuine
+  rejection, and counts a batch as clean only when every `%` line found is a
+  recognized benign marker, surfaced under `benign_warnings` instead of
+  masked as a plain success. User-visible consequence: a config apply whose
+  batch includes an idempotent removal (`% Refusing to remove a
+  non-existent route`) now succeeds with `benign_warnings` rather than
+  failing. New opt-in coverage in `tests/nos_lab/test_frr_mgmt_driver_live.py`
+  drives the real driver against the FRR node and independently verifies the
+  rejection case installs nothing.
+
+- Fixed `make seed` failing with "Unknown fields: ip, login, password"
+  when an integration-suite-seeded template (`int-seed-template-*`,
+  Management-backed but declaring only `model`) sorts ahead of a template
+  that declares the fields `get_or_create_device` sends (issue #775).
+  `pick_dut_template` now only considers templates that declare every key
+  the seed will send, preferring a Management-backed one among those, then
+  any usable one, then the previous fallback; the required key set lives in
+  one constant, `SEED_DEVICE_FIELD_KEYS`, which `get_or_create_device`
+  asserts against so the two cannot drift apart.
+  `tests/unit/test_seed_pick_dut_template.py` covers the exact ordering
+  from the bug.
+
 - Added `drivers/frr_l3/`, the first real Layer 3 Switch driver package: SSH-to-vtysh over the same FRRouting node and netmiko `cisco_ios` transport as `drivers/frr_mgmt`, implementing `login`/`logout`/`configure_route`/`remove_route`/`status` per the Layer 3 Switch contract (docs/DRIVERS.md). `configure_route` sends `ip route <destination> <next_hop>`, or `ip route <destination> <interface>` when `next_hop` is `None` (an interface route); `remove_route` sends the same line prefixed with `no `. `supports_dry_run: true` is honored on every mutating method (no session opened, transcript still recorded). Verified live against the checked-in NOS test lab's FRR node (docs/NOS_LAB.md) that both `configure_route` and `remove_route` are idempotent under redelivery: FRR silently no-ops a duplicate route install, and a duplicate removal answers a benign CLI warning rather than an error, so this driver treats both as success, matching the redelivery guarantee the Layer 2 contract states explicitly for `create_vlan`. `tests/unit/test_frr_l3_driver.py` (stack-free, netmiko mocked) and `tests/nos_lab/test_frr_l3_driver_live.py` (opt-in, `HERD_TEST_NOS_REQUIRED=1`) cover it; see docs/DRIVERS.md's new "FRR reference driver" section and docs/NOS_LAB.md.
 
 - Added phase 0 of the emulated-gear test tier (ADR 0010): a checked-in,

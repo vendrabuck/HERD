@@ -225,7 +225,7 @@ make nos-detach
 
   ```bash
   make nos-up
-  HERD_TEST_NOS_REQUIRED=1 uv run pytest tests/nos_lab/ -v
+  HERD_TEST_NOS_REQUIRED=1 uv run pytest tests/nos_lab/test_nos_lab_live.py tests/nos_lab/test_frr_l3_driver_live.py tests/nos_lab/test_frr_mgmt_driver_live.py tests/nos_lab/test_srl_l2_driver_live.py -v
   ```
 
   It creates a VLAN (SR Linux) and a static route (FRR) with a random,
@@ -233,13 +233,27 @@ make nos-detach
   netmiko session that made it (a separate `docker exec` into the
   container, never the driver's own status method), and cleans up
   afterward so the lab stays re-runnable without a reset.
+
+  The other two files in this directory, `test_frr_l3_via_stack_live.py` and
+  `test_srl_l2_via_stack_live.py`, additionally need a running dev stack with
+  the lab attached and seeded (`make up`, `make nos-attach`,
+  `scripts/seed_nos_lab.sh`); see the phase 3a and phase 3b sections above,
+  which already document them.
 - `tests/nos_lab/test_frr_l3_driver_live.py` , opt-in, same gating as above,
   drives the checked-in `drivers/frr_l3` Layer 3 Switch reference driver
   (not raw netmiko) against the FRR node, verifying every route change
   independently via `docker exec ... vtysh` and covering both route forms
   plus the driver's idempotency behavior; see docs/DRIVERS.md's "FRR
   reference driver" section.
-- `tests/nos_lab/test_srl_l2_driver_live.py` , the same opt-in gating,
+- `tests/nos_lab/test_frr_mgmt_driver_live.py` , opt-in, same gating as
+  above, drives the checked-in `drivers/frr_mgmt` Management reference
+  driver (added by #773) against the FRR node: proves a vtysh rejection is
+  classified and reported as `success: False` rather than a clean apply,
+  that an already-absent removal reports success without masking a genuine
+  failure elsewhere in the same batch, and the failed-save case (the
+  startup config fails to persist); see docs/DRIVERS.md's "A driver must
+  report a device rejection as a failure" section.
+- `tests/nos_lab/test_srl_l2_driver_live.py`, the same opt-in gating,
   scoped to the SR Linux node only. Exercises the real
   `drivers/srl_l2/driver.py` (Nokia SR Linux Layer 2 Switch driver, see
   `docs/DRIVERS.md`) end to end: create a VLAN, add a port to it tagged and
