@@ -1,7 +1,6 @@
 """NATS consumer: subscribe to reservation lifecycle events and trigger driver execution."""
 
 import asyncio
-import ipaddress
 import json
 import logging
 import uuid
@@ -10,6 +9,11 @@ from collections.abc import Awaitable, Callable
 import httpx
 from herd_common.jetstream import ensure_stream_exists
 from herd_common.l3_route_identity import route_identity_key
+from herd_common.l3_validation import (
+    usable_interfaces,
+    usable_virtual_routers,
+    validate_one_route,
+)
 from herd_common.outbox import event_dedupe_key
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import select
@@ -2886,75 +2890,31 @@ async def _derive_l3_adjacency(
     return switches
 
 
-def _usable_interfaces_for_drive(raw_interfaces: object) -> dict[str, str | None]:
-    """Extract a name-to-ip map from a config's ``interfaces`` list.
+def _validate_route_at_drive_time(
+    route: dict,
+    interfaces: dict[str, str | None],
+    virtual_routers: dict[str, set[str]] | None = None,
+) -> str | None:
+    """Unpack one route dict into the shared per-route L3 validation pass.
 
-    Execution's own copy of cabling's ``l3_validation._usable_interfaces``
-    (ADR 0014 addendum X-A, issue #34 phase 3): services never import each
-    other's code across the service boundary, and this one small check has
-    exactly one call site each, so it is duplicated rather than promoted to
-    herd_common. Tolerates a driver-published schema that stores any shape in
-    ``interfaces`` (a non-list, or a non-dict/no-name entry, is skipped rather
-    than raising), so a garbled config reports ``l3_switch_unconfigured``
-    (no usable interface names) instead of raising mid-reconcile.
+    ADR 0014 addendum X-A (issue #34 phase 3) re-runs cabling's per-route
+    reasons before any driver call. Addendum X-I (issue #755) moved the pass
+    itself into ``herd_common.l3_validation.validate_one_route``, which cabling's
+    save gate imports too, so the two can no longer drift: before X-I this
+    function was a hand-synced copy of cabling's, which is exactly the
+    arrangement the VRF reasons would have broken. This wrapper only unpacks the
+    plain route dict carried on the fork's ``l3_routes`` payload
+    (``destination``/``next_hop``/``interface``/``virtual_router``), since
+    execution never imports cabling's ``RouteSpec`` across the service boundary.
     """
-    if not isinstance(raw_interfaces, list):
-        return {}
-    result: dict[str, str | None] = {}
-    for entry in raw_interfaces:
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name")
-        if name:
-            result[name] = entry.get("ip")
-    return result
-
-
-def _validate_route_at_drive_time(route: dict, interfaces: dict[str, str | None]) -> str | None:
-    """Re-run cabling's per-route L3 validation reasons against one route dict.
-
-    ADR 0014 addendum X-A (issue #34 phase 3): mirrors
-    ``services/cabling/app/services/l3_validation.py``'s ``_validate_one_route``
-    exactly (same reason vocabulary and evaluation order), operating on a plain
-    route dict (``destination``/``next_hop``/``interface``, as carried on the
-    fork's ``l3_routes`` payload) instead of cabling's ``RouteSpec``, since
-    execution never imports cabling code across the service boundary. Returns
-    the first applicable reason, or None when the route is clean. Interface
-    routes (no ``next_hop``) skip every next-hop check, same as cabling's pass.
-    """
-    destination = route.get("destination")
-    try:
-        ipaddress.ip_network(destination, strict=False)
-    except (ValueError, TypeError):
-        return "l3_bad_destination"
-
-    next_hop = route.get("next_hop")
-    next_hop_addr: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
-    if next_hop is not None:
-        try:
-            next_hop_addr = ipaddress.ip_address(next_hop)
-        except ValueError:
-            return "l3_bad_next_hop"
-
-    interface = route.get("interface")
-    if interface not in interfaces:
-        return "l3_unknown_interface"
-
-    if next_hop_addr is None:
-        return None
-
-    ip_value = interfaces.get(interface)
-    iface = None
-    if ip_value:
-        try:
-            iface = ipaddress.ip_interface(ip_value)
-        except ValueError:
-            iface = None
-    if iface is None or iface.network.prefixlen == iface.network.max_prefixlen:
-        return "l3_next_hop_unverifiable"
-    if next_hop_addr not in iface.network:
-        return "l3_next_hop_outside_interface"
-    return None
+    return validate_one_route(
+        route.get("destination"),
+        route.get("next_hop"),
+        route.get("interface"),
+        route.get("virtual_router"),
+        interfaces=interfaces,
+        virtual_routers=virtual_routers,
+    )
 
 
 async def _gate_l3_drive_routes(
@@ -3017,12 +2977,14 @@ async def _gate_l3_drive_routes(
     if detail is None:
         return [], "l3_switch_unconfigured"
 
-    interfaces = _usable_interfaces_for_drive((detail.get("config") or {}).get("interfaces"))
+    config = detail.get("config") or {}
+    interfaces = usable_interfaces(config.get("interfaces"))
     if not interfaces:
         return [], "l3_switch_unconfigured"
+    virtual_routers = usable_virtual_routers(config.get("virtual_routers"))
 
     for route in routes:
-        reason = _validate_route_at_drive_time(route, interfaces)
+        reason = _validate_route_at_drive_time(route, interfaces, virtual_routers)
         if reason is not None:
             return [], reason
     return routes, None
