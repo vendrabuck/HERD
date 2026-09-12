@@ -216,6 +216,8 @@ master-clean: _clean-images  ## master with all HERD compose images rebuilt --no
 #     an available device always skip there; this second pass runs the same
 #     suite against the now-seeded stack and fails the phase on any skip.
 #   - Adds headless locust stress test after e2e.
+#   - Runs the NOS lab dialect tier (nos-test-dialect) after the live LDAP
+#     phase and before frontend coverage; `master` does not run it.
 #   - On SUCCESS the gate stack is left RUNNING and seeded (a live,
 #     freshly-validated stack at https://localhost); `make gate-down` stops
 #     it, and the next gate run's gate-clean purges it anyway, so every gate
@@ -249,6 +251,9 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 	@echo ""
 	@echo "=== Live LDAP auth tests ==="
 	$(MAKE) _gate-ldap-tests
+	@echo ""
+	@echo "=== NOS lab dialect tests (real SR Linux and FRR, no stack) ==="
+	$(MAKE) nos-test-dialect
 	@echo ""
 	@echo "=== Frontend tests with coverage ==="
 	$(MAKE) coverage-frontend
@@ -781,6 +786,10 @@ nos-test-dialect:  ## Run the NOS lab dialect suites (boots the lab if it is not
 # .env, which only the stack itself reads), so export them before calling
 # this target. Both suites probe the credentials up front and say so
 # instead of failing inside a test.
+#
+# Deliberately NOT wired into master or everything (nightly only, via
+# nightly.yml): it needs a running HERD stack plus the lab, and the two
+# needs together are a heavier local ask than the dialect tier below carries.
 nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running stack and lab)
 	@net=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}_herd-net; \
 	if ! docker network inspect "$$net" >/dev/null 2>&1; then \

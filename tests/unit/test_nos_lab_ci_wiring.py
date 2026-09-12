@@ -66,6 +66,24 @@ def _step_index(steps: list[dict], needle: str) -> int:
     raise AssertionError(f"no step runs {needle!r}; steps: {_step_names(steps)}")
 
 
+def _target_recipe(name: str) -> str:
+    """Return the recipe body of a Makefile target as one string: every
+    tab-indented line following the first `name:` (or `name: deps  ## help`)
+    header, up to the next non-indented line."""
+    header = re.compile(rf"^{re.escape(name)}\s*:")
+    lines = MAKEFILE_PATH.read_text().splitlines()
+    for index, line in enumerate(lines):
+        if not header.match(line):
+            continue
+        recipe = []
+        for follower in lines[index + 1 :]:
+            if not follower.startswith("\t"):
+                break
+            recipe.append(follower)
+        return "\n".join(recipe)
+    raise AssertionError(f"target {name!r} not found in the Makefile")
+
+
 def test_every_nos_lab_test_file_is_classified_exactly_once():
     dialect = set(_makefile_list_variable("NOS_DIALECT_TESTS"))
     feature = set(_makefile_list_variable("NOS_FEATURE_TESTS"))
@@ -145,6 +163,22 @@ def test_nightly_always_stops_the_lab():
     assert steps[index].get("if") == "always()", (
         "the lab teardown must run even when a phase failed, the same way "
         "`Stop LDAP test server` does"
+    )
+
+
+def test_everything_runs_the_dialect_tier_but_master_does_not():
+    """Lane's 2026-09-12 decision: `make everything` gains the NOS lab
+    dialect tier (real SR Linux and FRR, no stack); `make master` does not."""
+    everything_recipe = _target_recipe("everything")
+    assert "$(MAKE) nos-test-dialect" in everything_recipe, (
+        "make everything must invoke nos-test-dialect, after the live LDAP "
+        "phase and before frontend coverage"
+    )
+
+    master_recipe = _target_recipe("master")
+    assert "nos-test-dialect" not in master_recipe, (
+        "make master must NOT run the NOS lab dialect tier; only make "
+        "everything does (decided 2026-09-12)"
     )
 
 

@@ -328,9 +328,14 @@ cannot drift:
   `SUPERADMIN_PASSWORD` (or `SEED_EMAIL` / `SEED_PASSWORD`) first; the
   suites read them from the environment, not from `.env`.
 
-`make master` and `make everything` run neither target. The lab stays opt-in
-there, so a host that never uses it still pays nothing; wiring it into the
-local gates is a separate decision.
+Local gates (decided 2026-09-12): `make everything` runs the dialect tier as
+a phase of its own recipe, after the live LDAP auth phase and before frontend
+coverage; that phase boots the lab if it is not already up and tears down
+only what it started, the same as a standalone `make nos-test-dialect` call.
+`make master` does not run it, and stays untouched. The feature tier is
+nightly-only either way: neither local gate runs `make nos-test-feature`,
+since it needs a running stack plus the lab together, a heavier local ask
+than the dialect tier carries.
 
 `tests/unit/test_nos_lab_ci_wiring.py` pins all of this statically, including
 that every file under `tests/nos_lab/` appears in exactly one of the two

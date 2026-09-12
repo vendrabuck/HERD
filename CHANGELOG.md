@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Wired the NOS lab dialect tier into `make everything` (Lane's decision,
+  2026-09-12): it now runs `make nos-test-dialect` as its own phase, after the
+  live LDAP auth phase and before frontend coverage, so a full local gate also
+  proves the real SR Linux and FRR dialects. `make master` is unchanged and
+  does not run it; the via-stack feature tier stays nightly-only either way.
+  `tests/unit/test_nos_lab_ci_wiring.py` pins both sides of the asymmetry.
+
 - Split the NOS lab suites into two CI tiers (issue #785). The four dialect
   suites, which drive one driver against one lab node with no HERD stack, run
   on every pull request from ci.yml's new advisory `nos-dialect` job; the two
