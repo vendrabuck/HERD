@@ -113,11 +113,19 @@ def reset_caches() -> None:
     _warned_entries.clear()
 
 
-def _warn_once(key: str, message: str, **extra: object) -> None:
+def _warn_once(event: str, key: str, **fields: object) -> None:
+    """Log one line per distinct problem, once.
+
+    The details go in the MESSAGE, not only in `extra`: the shared JSON
+    formatter emits a fixed set of extra keys and would otherwise drop them.
+    The `extra` copy stays so a test can assert on the fields rather than on
+    the wording.
+    """
     if key in _warned_entries:
         return
     _warned_entries.add(key)
-    logger.warning(message, extra=dict(extra))
+    detail = " ".join(f"{name}={value}" for name, value in fields.items())
+    logger.warning("%s %s", event, detail, extra=dict(fields))
 
 
 # --- Registry -----------------------------------------------------------
@@ -159,10 +167,10 @@ def build_source_registry() -> dict[str, CorpusSource]:
             registry[MANUAL_SOURCE_NAME] = CorpusSource(name=MANUAL_SOURCE_NAME, root=MANUAL_ROOT)
         else:
             _warn_once(
-                f"manual:{MANUAL_ROOT}",
                 "docs_source_skipped",
+                f"manual:{MANUAL_ROOT}",
                 source=MANUAL_SOURCE_NAME,
-                path=str(MANUAL_ROOT),
+                corpus_path=str(MANUAL_ROOT),
                 reason="directory not readable",
             )
 
@@ -170,23 +178,25 @@ def build_source_registry() -> dict[str, CorpusSource]:
         entry_key = f"corpus:{name}={path}"
         if not path or not _SOURCE_NAME_RE.match(name) or name in (WEB_SOURCE_NAME,):
             _warn_once(
-                entry_key,
                 "docs_source_skipped",
+                entry_key,
                 source=name,
-                path=path,
+                corpus_path=path,
                 reason="entry must be name=/absolute/path with a lowercase name",
             )
             continue
         if name in registry:
-            _warn_once(entry_key, "docs_source_skipped", source=name, path=path, reason="duplicate")
+            _warn_once(
+                "docs_source_skipped", entry_key, source=name, corpus_path=path, reason="duplicate"
+            )
             continue
         root = Path(path)
         if not root.is_absolute() or not _usable_directory(root):
             _warn_once(
-                entry_key,
                 "docs_source_skipped",
+                entry_key,
                 source=name,
-                path=path,
+                corpus_path=path,
                 reason="directory not readable",
             )
             continue
@@ -216,8 +226,9 @@ def log_source_summary() -> None:
     already logged its own skip line by the time this returns."""
     sources = enabled_sources()
     logger.info(
-        "docs_sources_ready",
-        extra={"sources": sorted(sources), "web_enabled": bool(settings.ai_docs_web_enabled)},
+        "docs_sources_ready sources=%s web_enabled=%s",
+        ",".join(sorted(sources)) or "none",
+        bool(settings.ai_docs_web_enabled),
     )
 
 

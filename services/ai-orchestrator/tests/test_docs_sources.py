@@ -106,7 +106,7 @@ def test_registry_skips_a_missing_directory_and_logs_it_once(tmp_path, monkeypat
     skips = [
         r
         for r in caplog.records
-        if r.message == "docs_source_skipped" and getattr(r, "source", None) == "gone"
+        if "docs_source_skipped" in r.getMessage() and getattr(r, "source", None) == "gone"
     ]
     assert len(skips) == 1
 
