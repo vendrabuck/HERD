@@ -182,6 +182,48 @@ def test_layer3_interface_zone_must_be_in_enum():
     assert "schema validation" in str(exc.value)
 
 
+def test_layer3_interface_accepts_kind_and_port():
+    """ADR 0014 addendum X-J (issue #756): both fields are optional and both are
+    accepted alongside the pre-X-J fields."""
+    config = {
+        "interfaces": [
+            {"name": "eth0", "ip": "10.0.0.1", "zone": "trust", "port": "ge-0/0/1"},
+            {"name": "dummy0", "zone": "trust", "kind": "logical"},
+            {"name": "eth1", "zone": "trust", "kind": "physical", "port": "ge-0/0/2"},
+        ]
+    }
+    assert validate_device_config("Layer 3 Switch", config) is None
+
+
+def test_layer3_interface_kind_must_be_in_enum():
+    with pytest.raises(ConfigValidationError) as exc:
+        validate_device_config(
+            "Layer 3 Switch",
+            {"interfaces": [{"name": "eth0", "zone": "trust", "kind": "virtual"}]},
+        )
+    assert "schema validation" in str(exc.value)
+
+
+def test_layer3_interface_port_must_be_a_non_empty_string():
+    with pytest.raises(ConfigValidationError):
+        validate_device_config(
+            "Layer 3 Switch", {"interfaces": [{"name": "eth0", "zone": "trust", "port": ""}]}
+        )
+    with pytest.raises(ConfigValidationError):
+        validate_device_config(
+            "Layer 3 Switch", {"interfaces": [{"name": "eth0", "zone": "trust", "port": 7}]}
+        )
+
+
+def test_layer3_interface_still_rejects_an_unknown_field():
+    """additionalProperties stays false: X-J adds two named fields, it does not
+    open the interface object up."""
+    with pytest.raises(ConfigValidationError):
+        validate_device_config(
+            "Layer 3 Switch", {"interfaces": [{"name": "eth0", "zone": "trust", "speed": "10G"}]}
+        )
+
+
 def test_layer3_virtual_router_requires_name_and_interfaces():
     with pytest.raises(ConfigValidationError):
         validate_device_config("Layer 3 Switch", {"virtual_routers": [{"name": "vr"}]})

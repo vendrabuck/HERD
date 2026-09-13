@@ -64,6 +64,22 @@ CONFIG_SCHEMAS: dict[str, dict[str, Any]] = {
                             "type": "string",
                             "enum": ["trust", "untrust", "dmz"],
                         },
+                        # ADR 0014 addendum X-J (issue #756). "kind" says whether
+                        # this interface is a physical port of the device
+                        # (the default) or a logical construct (a loopback, an
+                        # SVI, a dummy device enslaved to a VRF), which decides
+                        # whether the X-K interface-level attachment check applies
+                        # to a route naming it. "port" is the HERD inventory port
+                        # name a physical interface corresponds to, for a device
+                        # whose OS names its interfaces differently from the port
+                        # names its inventory record carries; it defaults to
+                        # "name", which is what a config written before X-J, and
+                        # the repo's own eth0-to-eth0 fixtures, rely on.
+                        "kind": {
+                            "type": "string",
+                            "enum": ["physical", "logical"],
+                        },
+                        "port": {"type": "string", "minLength": 1, "maxLength": 64},
                     },
                     "required": ["name", "zone"],
                     "additionalProperties": False,
