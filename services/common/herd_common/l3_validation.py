@@ -22,6 +22,12 @@ amendment, and X-I), first match wins:
 2. ``l3_bad_next_hop``: ``next_hop`` is present but not a parseable address.
 3. ``l3_unknown_interface``: ``interface`` is not among the config's interface
    names.
+3b. ``l3_interface_unwired`` (X-K, issue #756): the route names a PHYSICAL
+   interface (``kind`` absent or ``physical``) whose port (``port``, defaulting
+   to the interface name) carries no resolved hop on this switch. A ``logical``
+   interface (a loopback, an SVI, a dummy device enslaved to a VRF) is exempt,
+   and the switch-level ``l3_switch_unattached`` check stands on its own: this
+   reason is only for a KNOWN physical interface with no hop on its port.
 4. ``l3_unknown_virtual_router`` (X-I): the route names a VRF the config's
    ``virtual_routers`` does not declare. A config with NO ``virtual_routers``
    key declares none, so every VRF-naming route refuses here.
@@ -39,11 +45,43 @@ next-hop-subnet checks. That placement is behavior-preserving for every config
 written before X-I: with no ``virtual_routers`` key the VRF map is empty, so
 steps 4 to 6 cannot fire for a route that names no VRF, and a route that names
 one could never have been drivable anyway.
+
+``l3_interface_unwired`` sits between ``l3_unknown_interface`` and the VRF
+reasons for the same first-match-wins reason the rest of the order has: an
+interface the config does not declare cannot have a port to check, and a route
+whose interface is not even wired is not worth a VRF-membership verdict. Unlike
+the VRF reasons it is NOT behavior-preserving for a config written before X-J:
+such a config declares every interface physical with port equal to name, which
+is the decided strict posture (ADR 0014 addendum X-K), so a switch whose OS
+interface names differ from its HERD port names must declare ``port``.
 """
 
 from __future__ import annotations
 
 import ipaddress
+from dataclasses import dataclass
+
+PHYSICAL = "physical"
+LOGICAL = "logical"
+
+
+@dataclass(frozen=True)
+class InterfaceAttachment:
+    """How one config interface maps onto the switch's physical wiring (ADR 0014
+    addendum X-J, issue #756).
+
+    ``kind`` is ``physical`` or ``logical``; ``port`` is the HERD inventory port
+    name a physical interface corresponds to. Both are already defaulted by
+    ``usable_interface_attachments``, so a consumer never re-applies the
+    defaults itself.
+    """
+
+    kind: str
+    port: str
+
+    @property
+    def is_physical(self) -> bool:
+        return self.kind == PHYSICAL
 
 
 def usable_interfaces(raw_interfaces: object) -> dict[str, str | None]:
@@ -63,6 +101,39 @@ def usable_interfaces(raw_interfaces: object) -> dict[str, str | None]:
         name = entry.get("name")
         if name:
             result[name] = entry.get("ip")
+    return result
+
+
+def usable_interface_attachments(raw_interfaces: object) -> dict[str, InterfaceAttachment]:
+    """Extract a name-to-``InterfaceAttachment`` map from a config's
+    ``interfaces`` list (ADR 0014 addendum X-J, issue #756).
+
+    Deliberately a SIBLING of ``usable_interfaces`` rather than a replacement:
+    that function's name-to-ip contract, and the "no usable interface names
+    means ``l3_switch_unconfigured``" check both callers run on it, are
+    untouched by X-J, and an interface's ip and its wiring are read by
+    different checks.
+
+    Same tolerance as its sibling, extended to the two new fields: a
+    non-string or empty ``port`` falls back to the interface name, and a
+    ``kind`` that is not exactly ``logical`` reads as ``physical``. A garbled
+    value therefore lands on the STRICT side (checked, not exempt), which is
+    the safe direction: the worst case is a refusal a user can fix in the
+    config, not a route driven onto a port nothing is cabled to.
+    """
+    if not isinstance(raw_interfaces, list):
+        return {}
+    result: dict[str, InterfaceAttachment] = {}
+    for entry in raw_interfaces:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        raw_port = entry.get("port")
+        port = raw_port if isinstance(raw_port, str) and raw_port else name
+        kind = LOGICAL if entry.get("kind") == LOGICAL else PHYSICAL
+        result[name] = InterfaceAttachment(kind=kind, port=port)
     return result
 
 
@@ -102,15 +173,29 @@ def validate_one_route(
     *,
     interfaces: dict[str, str | None],
     virtual_routers: dict[str, set[str]] | None = None,
+    interface_attachments: dict[str, InterfaceAttachment] | None = None,
+    wired_ports: set[str] | None = None,
 ) -> str | None:
     """Evaluate one route's per-route reasons in order; return the first that
     applies, or ``None`` when the route is clean.
 
-    ``interfaces`` and ``virtual_routers`` come from ``usable_interfaces`` and
-    ``usable_virtual_routers`` over the switch's latest config. Interface routes
-    (``next_hop`` is None) skip every next-hop check. ``next_hop`` is parsed to
-    an ``ip_address`` once and reused for both the shape check and the
+    ``interfaces``, ``virtual_routers`` and ``interface_attachments`` come from
+    ``usable_interfaces``, ``usable_virtual_routers`` and
+    ``usable_interface_attachments`` over the switch's latest config. Interface
+    routes (``next_hop`` is None) skip every next-hop check. ``next_hop`` is
+    parsed to an ``ip_address`` once and reused for both the shape check and the
     interface-membership check.
+
+    ``wired_ports`` (X-K, issue #756) is the set of THIS switch's port names
+    that carry a resolved hop: cabling derives it from
+    ``resolve_canvas_wiring``'s specs, execution from the fork's intended wires
+    it already fetched. ``None`` means the caller has no resolved hops in hand,
+    and the interface-level check does not run at all (pre-X-K behavior); an
+    EMPTY SET is a different statement, "nothing on this switch is wired", and
+    refuses every physical route. Both production callers pass a real set, and
+    a named test on each side pins that they do; the ``None`` default exists so
+    the pure-function tests below, which are about the other reasons, need not
+    thread a wiring set through every case.
 
     Arguments are typed ``object`` on purpose: execution drives this from plain
     event dicts where a field can be missing or any JSON type, and a malformed
@@ -132,6 +217,19 @@ def validate_one_route(
 
     if interface not in interfaces:
         return "l3_unknown_interface"
+
+    if wired_ports is not None:
+        # X-K (issue #756). An interface the config does not describe at all
+        # (present in `interfaces` but missing from `interface_attachments`,
+        # which only a caller passing mismatched maps can produce) takes the
+        # strict default, physical with port == name, exactly as a config
+        # written before X-J does.
+        attachment = (interface_attachments or {}).get(
+            interface,  # type: ignore[arg-type]
+            InterfaceAttachment(kind=PHYSICAL, port=str(interface)),
+        )
+        if attachment.is_physical and attachment.port not in wired_ports:
+            return "l3_interface_unwired"
 
     if virtual_router:
         # A non-string VRF name can never match a declared one, and feeding it to
@@ -164,6 +262,10 @@ def validate_one_route(
 
 
 __all__ = [
+    "InterfaceAttachment",
+    "LOGICAL",
+    "PHYSICAL",
+    "usable_interface_attachments",
     "usable_interfaces",
     "usable_virtual_routers",
     "validate_one_route",
