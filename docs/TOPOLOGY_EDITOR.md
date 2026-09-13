@@ -206,10 +206,11 @@ The reasons you may see, in plain words:
 | `l3_malformed` | The routing data on this node is not shaped the way the editor writes it; this should not happen through the Routing panel itself. |
 | `l3_not_a_router` | The device is not a Layer 3 Switch, so it cannot carry routes. |
 | `l3_switch_unconfigured` | The switch has no config version, or its config lists no interfaces; import a config first, or configure the switch, then add routes. |
-| `l3_switch_unattached` | Nothing on the canvas actually wires to this switch, so its routes would serve nothing. |
+| `l3_switch_unattached` | Nothing on the canvas actually wires to this switch, so its routes would serve nothing. Which of its interfaces are wired is a separate, per-route check: see `l3_interface_unwired`. |
 | `l3_bad_destination` | The destination is not a valid IP network (e.g. not a parseable address or prefix). |
 | `l3_bad_next_hop` | The next hop is set but is not a valid IP address. |
 | `l3_unknown_interface` | The interface name does not match any interface in the switch's config. |
+| `l3_interface_unwired` | The interface exists in the switch's config and is a physical one, but nothing on the canvas wires the port it maps to. A route out of a port with no cable behind it cannot forward, so the switch being wired somewhere else is not enough. Interfaces the config marks `kind: logical` (loopbacks, SVIs, a dummy interface inside a virtual router) are exempt. |
 | `l3_next_hop_unverifiable` | The next hop is set, but the named interface has no IP address (or no prefix length) to check it against. |
 | `l3_next_hop_outside_interface` | The next hop is set, but it does not fall inside the named interface's own subnet. |
 | `l3_unknown_virtual_router` | The virtual router name does not match any virtual router in the switch's config. A switch whose config declares no virtual routers at all refuses every route that names one. |

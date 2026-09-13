@@ -146,6 +146,9 @@ const ROUTE_PROBLEM_FIELDS: Record<string, RouteProblemField> = {
   l3_next_hop_unverifiable: "next_hop",
   l3_next_hop_outside_interface: "next_hop",
   l3_unknown_interface: "interface",
+  // ADR 0014 addendum X-K (issue #756): the route names a physical interface
+  // whose port carries no resolved hop, so the interface is what is wrong.
+  l3_interface_unwired: "interface",
   l3_interface_bound_to_virtual_router: "interface",
   l3_unknown_virtual_router: "virtual_router",
   l3_interface_outside_virtual_router: "virtual_router",

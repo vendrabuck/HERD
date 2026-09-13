@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- Layer 3 routing intent is now checked at the INTERFACE, not just the switch
+  (issue #756, ADR 0014 addenda X-J and X-K). A `Layer 3 Switch` config's
+  `interfaces` entries take two optional fields, `kind` (`physical`, the
+  default, or `logical`) and `port` (the HERD inventory port name a physical
+  interface maps to, defaulting to the interface's own name). A route out of a
+  physical interface whose port carries no resolved hop is refused with a new
+  reason, `l3_interface_unwired`, at the fork save gate, at topology and
+  reservation-create validation, and again at execution's drive-time
+  re-validation, all through the one shared `herd_common.l3_validation`. A
+  `logical` interface (a loopback, an SVI, a dummy interface enslaved to a
+  virtual router) is exempt and the switch-level `l3_switch_unattached` check
+  is unchanged. Existing configs are read the strict way, every interface
+  physical with its port equal to its name, so a switch whose OS interface
+  names differ from its HERD port names needs `port` declared.
+
 - Virtual routers now reach the Layer 3 driver contract (issue #755, ADR 0014
   addenda X-G, X-H, X-I). `configure_route` and `remove_route` take a
   `virtual_router` keyword, and a driver opts in by declaring `supports_vrf` in
