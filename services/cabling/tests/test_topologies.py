@@ -1,5 +1,5 @@
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import app.services.topology_validation as topology_validation_module
 import pytest
@@ -55,6 +55,25 @@ async def setup_db():
 async def _override_get_db() -> AsyncSession:
     async with TestSessionLocal() as session:
         yield session
+
+
+@pytest.fixture(autouse=True)
+def unfiltered_visibility():
+    """Neutralize the issue #763 device-visibility filter for this suite.
+
+    These tests predate the filter and assert the UNFILTERED validate semantics
+    with a non-admin caller (the topology creator), through an ASGI client whose
+    auth dependency is overridden and which therefore sends no Authorization
+    header. Patching the route's ``resolve_caller_visibility`` to return None is
+    exactly what an admin caller produces: "no visibility filter applies". The
+    filter itself is pinned by the dedicated tests in
+    tests/test_visibility_oracle.py, which patch over this fixture.
+    """
+    with patch(
+        "app.routes.topologies.resolve_caller_visibility",
+        AsyncMock(return_value=None),
+    ):
+        yield
 
 
 @pytest.fixture

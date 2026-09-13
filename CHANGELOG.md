@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- Device visibility now gates the topology validate route and both pathfind
+  routes (issue #763, hardening). For a non-admin caller, a canvas node naming
+  a device outside their device-group visibility is reported as
+  `missing_device` and is excluded from the reachability and Layer 3 passes, so
+  `POST /topologies/{id}/validate` no longer answers interface and subnet
+  questions about gear the caller cannot see; a pathfind pair naming such a
+  device is refused with the same `404 Device not found` an unknown id gets
+  (the batch route reports it per pair through a new `error` field), and a
+  transit hop through one comes back redacted: `PathHop.device_id` is now
+  nullable, with a new `hidden` flag and no port names. Hop counts,
+  reachability and the topology editor are unaffected, admins are not filtered
+  at all, and an unanswerable visibility lookup fails closed with a 503. The
+  open `GET /topologies/{id}` stays open by decision, recorded in
+  `docs/ROLES.md`.
+
 - Layer 3 routing intent is now checked at the INTERFACE, not just the switch
   (issue #756, ADR 0014 addenda X-J and X-K). A `Layer 3 Switch` config's
   `interfaces` entries take two optional fields, `kind` (`physical`, the

@@ -230,11 +230,15 @@ async def test_pathfind_handler_reachable():
     from app.schemas.pathfind import PathfindRequest
 
     a, b = uuid.uuid4(), uuid.uuid4()
+    # Admin caller: no issue #763 visibility filter, so this still pins the
+    # unfiltered pathfind behavior. The filtered paths live in
+    # tests/test_visibility_oracle.py.
     async with TestSession() as db:
         await _seed_cable(db, a, "eth0", b, "eth0")
         result = await pathfind_endpoint(
             body=PathfindRequest(source_device_id=a, target_device_id=b),
-            _=_payload(),
+            payload=_payload(role="admin"),
+            authorization=None,
             db=db,
         )
     assert result.reachable is True
@@ -247,10 +251,12 @@ async def test_pathfind_handler_unreachable():
     from app.schemas.pathfind import PathfindRequest
 
     a, b = uuid.uuid4(), uuid.uuid4()
+    # Admin caller, as above: unfiltered pathfind.
     async with TestSession() as db:
         result = await pathfind_endpoint(
             body=PathfindRequest(source_device_id=a, target_device_id=b),
-            _=_payload(),
+            payload=_payload(role="admin"),
+            authorization=None,
             db=db,
         )
     assert result.reachable is False
@@ -845,7 +851,14 @@ async def test_topology_validate_handler_reports_unreachable_and_missing():
     }
     async with TestSession() as db:
         topo = await _make_topology(db, name="Bad", canvas=canvas, payload=_payload(USER_ID))
-        result = await validate_topology(topology_id=topo.id, payload=_payload(USER_ID), db=db)
+        # Creator AND admin: an admin is exempt from the issue #763 visibility
+        # filter, so this keeps asserting the unfiltered edge classification.
+        result = await validate_topology(
+            topology_id=topo.id,
+            payload=_payload(USER_ID, role="admin"),
+            authorization=None,
+            db=db,
+        )
     assert result.valid is False
     reasons = {e.edge_id: e.reason for e in result.invalid_edges}
     assert reasons["no-path"] == "no_path"
@@ -861,7 +874,9 @@ async def test_topology_validate_handler_forbidden_for_non_owner():
     async with TestSession() as db:
         topo = await _make_topology(db, name="Owned", canvas=None, payload=_payload(USER_ID))
         with pytest.raises(HTTPException) as exc:
-            await validate_topology(topology_id=topo.id, payload=_payload(OTHER_ID), db=db)
+            await validate_topology(
+                topology_id=topo.id, payload=_payload(OTHER_ID), authorization=None, db=db
+            )
     assert exc.value.status_code == 403
 
 
@@ -872,7 +887,9 @@ async def test_topology_validate_handler_not_found():
 
     async with TestSession() as db:
         with pytest.raises(HTTPException) as exc:
-            await validate_topology(topology_id=uuid.uuid4(), payload=_payload(), db=db)
+            await validate_topology(
+                topology_id=uuid.uuid4(), payload=_payload(), authorization=None, db=db
+            )
     assert exc.value.status_code == 404
 
 
@@ -1491,7 +1508,13 @@ async def test_validate_skips_malformed_device_uuid():
     }
     async with TestSession() as db:
         topo = await _make_topology(db, name="Malformed", canvas=canvas, payload=_payload(USER_ID))
-        result = await validate_topology(topology_id=topo.id, payload=_payload(USER_ID), db=db)
+        # Admin caller: unfiltered, as in the handler test above.
+        result = await validate_topology(
+            topology_id=topo.id,
+            payload=_payload(USER_ID, role="admin"),
+            authorization=None,
+            db=db,
+        )
     # nA's device id was unparseable, so the edge has a missing source device.
     assert result.valid is False
     assert result.invalid_edges[0].reason == "missing_device"

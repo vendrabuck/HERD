@@ -111,8 +111,49 @@ def classify_element_edge(
     return "attachment"
 
 
+def redact_invisible_device_nodes(
+    canvas: dict | None,
+    visible_device_ids: set[uuid.UUID],
+) -> dict | None:
+    """Drop every device node whose device is outside ``visible_device_ids``.
+
+    Issue #763: the user-facing topology validate route answers, per device id
+    in the caller's own canvas, whether the device is reachable and (since ADR
+    0014 phase 1) what its interfaces and subnets are. Non-admin device
+    visibility is device-group gated everywhere else, so for a non-admin caller
+    the canvas is redacted here BEFORE validation runs, rather than teaching
+    each pass its own visibility rule.
+
+    A redacted node is removed outright, so every downstream reader
+    (``node_to_device_map``, ``walk_l3_nodes``, ``resolve_canvas_wiring``, the
+    edge BFS, the response's ``device_ids``) treats it exactly as it treats a
+    node that is not on the canvas at all: an edge touching it is reported with
+    the existing ``missing_device`` reason, which is what an edge to a node with
+    no resolvable device already produces, and its ``data.l3`` is never parsed,
+    so no inventory config lookup is made for it.
+
+    Returns the canvas unchanged (the same object) when nothing is hidden.
+    Otherwise returns a shallow copy with a filtered ``nodes`` list; the caller
+    hands us a persisted ORM value, so nothing here mutates the input.
+    """
+    if not canvas:
+        return canvas
+    nodes = canvas.get("nodes") or []
+    device_map = node_to_device_map(canvas)
+    kept = [
+        node
+        for node in nodes
+        if device_map.get(node.get("id")) is None
+        or device_map[node.get("id")] in visible_device_ids
+    ]
+    if len(kept) == len(nodes):
+        return canvas
+    return {**canvas, "nodes": kept}
+
+
 __all__ = [
     "classify_element_edge",
     "node_to_device_map",
     "node_to_element_map",
+    "redact_invisible_device_nodes",
 ]

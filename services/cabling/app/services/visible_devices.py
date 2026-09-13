@@ -6,6 +6,15 @@ cannot otherwise see (device ids and port names) as a reconnaissance step.
 This module resolves the calling user's visible device ids from inventory so
 the route can filter to connections touching at least one of them.
 
+Issue #763 gave the same lookup two more consumers, both for the same reason
+(a route that answered questions about device ids the caller cannot see):
+the user-facing topology validate route, which reports a canvas node naming a
+device outside the caller's visibility as ``missing_device`` rather than
+running the edge and L3 passes against it, and the two pathfind routes, which
+refuse a hidden endpoint and redact hidden transit hops.
+``resolve_caller_visibility`` below is the shared route-side entry point for
+all three (admin means no filter; an unanswerable lookup is a 503).
+
 Distinct from device_group_guard.py's fetch_device_group_ids: that answers
 "what groups is this one device in" (used to enforce the cross-group cabling
 boundary at write time, fail-open on an unverifiable device), while this
@@ -18,6 +27,8 @@ import logging
 import uuid
 
 import httpx
+from fastapi import HTTPException
+from herd_common.auth import ADMIN_ROLES
 from herd_common.internal_client import ForwardedAuth, call_service
 
 from app.config import settings
@@ -71,3 +82,40 @@ async def fetch_visible_device_ids(caller_id: uuid.UUID, authorization: str) -> 
         raise VisibleDevicesUnavailableError(f"inventory returned {resp.status_code}")
     body = resp.json()
     return {uuid.UUID(d) for d in body.get("device_ids", [])}
+
+
+async def resolve_caller_visibility(
+    payload: dict,
+    authorization: str | None,
+    *,
+    unavailable_detail: str,
+) -> set[uuid.UUID] | None:
+    """Resolve the visibility filter that applies to this caller, or None.
+
+    Returns None for an admin or superadmin caller, meaning "no filter
+    applies": admins see the whole fleet and never trigger the inventory
+    lookup. For every other role it returns the caller's visible device id
+    set (possibly empty, a genuine "sees nothing").
+
+    Raises HTTPException 503 with ``unavailable_detail`` when the lookup
+    could not be answered, so each route keeps its own wording while the
+    fail-closed rule itself lives in one place: a non-admin's device
+    visibility is a security boundary and an unverifiable answer must never
+    degrade into an unfiltered one (issue #763, the same rule
+    ``list_connections_endpoint`` applies for issue #719).
+    """
+    if payload.get("role") in ADMIN_ROLES:
+        return None
+    if authorization is None:
+        raise HTTPException(
+            status_code=500,
+            detail="internal: missing Authorization header while resolving device visibility",
+        )
+    try:
+        return await fetch_visible_device_ids(uuid.UUID(payload["sub"]), authorization)
+    except VisibleDevicesUnavailableError as exc:
+        logger.warning(
+            "caller_visibility_unavailable",
+            extra={"caller_id": payload.get("sub"), "error": str(exc)},
+        )
+        raise HTTPException(status_code=503, detail=unavailable_detail) from exc

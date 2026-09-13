@@ -684,7 +684,8 @@
     },
     "PathHop": {
       "properties": {
-        "device_id": "string",
+        "device_id": "anyOf",
+        "hidden": "boolean",
         "port_in": "anyOf",
         "port_out": "anyOf"
       },
@@ -713,6 +714,7 @@
     },
     "PathfindBatchResult": {
       "properties": {
+        "error": "anyOf",
         "hop_count": "integer",
         "paths": "array",
         "reachable": "boolean",
