@@ -147,6 +147,10 @@ async def test_assistant_loop_response_shape_against_live_stack(
             "list_executions_for_reservation",
             "propose_config_change",
             "schedule_config_apply",
+            # ADR 0015 documentation tools: advertised whenever the image
+            # carries the manual, so they can show up on any question.
+            "search_docs",
+            "read_doc",
         }
         assert "arguments_summary" in call
         assert isinstance(call["duration_ms"], int)
@@ -236,3 +240,67 @@ async def test_assistant_reservation_404_for_non_owner(base_url, user_token):
             headers={"Authorization": f"Bearer {user_token}"},
         )
     assert resp.status_code == 404
+
+
+# Live model call with a documentation lookup: the httpx client below allows
+# 180s. Override the global pytest --timeout=30 for the same reason as the
+# tests above; the client timeout remains the real guard.
+@pytest.mark.timeout(210)
+async def test_assistant_answers_a_herd_how_to_from_the_manual(
+    base_url, admin_token, admin_reservation
+):
+    """ADR 0015 (issue #31): a question about HERD itself, which the seed and
+    the six live-data tools cannot answer, must drive a search_docs call over
+    the built-in `herd-manual` corpus followed by a read_doc of a hit.
+
+    This is the test that catches what the unit tests cannot: the manual
+    missing from the ai-orchestrator image (the service has no dev mount, so a
+    stale image is the likely failure), the source registry coming up empty in
+    the container, and the tools never reaching the provider's tool list.
+    """
+    if not ai_provider_configured():
+        pytest.skip("AI provider not configured on this host; live docs lookup not exercised")
+
+    reservation, _device = admin_reservation
+    question = (
+        "According to the HERD user manual, how does LDAP group sync decide "
+        "which directory groups map into HERD groups? Search the documentation "
+        "before answering and name the manual page you used."
+    )
+
+    async with httpx.AsyncClient(verify=False, timeout=180.0) as client:
+        status_resp = await client.get(f"{base_url}/ai/status")
+        if not status_resp.json().get("enabled"):
+            pytest.skip("ai-orchestrator reports disabled; container env may not match runner env")
+
+        resp = await client.post(
+            f"{base_url}/ai/reservations/{reservation['id']}/assistant",
+            json={"question": question},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    calls = body["tool_calls"]
+    names = [c["name"] for c in calls]
+
+    assert "search_docs" in names, (
+        f"a HERD how-to question must reach the documentation tools; saw {names}. "
+        "An empty source registry in the container (no /app/docs/manual) hides them."
+    )
+    first_search = names.index("search_docs")
+    read_positions = [
+        i
+        for i, call in enumerate(calls)
+        if call["name"] == "read_doc" and "herd-manual" in call["arguments_summary"]
+    ]
+    assert read_positions, (
+        f"a search hit must be followed by a read of the manual page; saw {calls}"
+    )
+    assert max(read_positions) > first_search, (
+        f"read_doc must follow the search that found the page; order was {names}"
+    )
+    assert not any(c["name"] in {"search_docs", "read_doc"} and c["error"] for c in calls), (
+        f"documentation tool calls must not error: {calls}"
+    )
+    assert isinstance(body["answer"], str) and body["answer"].strip()
