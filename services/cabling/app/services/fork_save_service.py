@@ -490,6 +490,24 @@ def reconcile_connection_sets(
     return reconcile_by_identity(old_rows, new_specs, _row_identity, _spec_identity)
 
 
+def wired_ports_from_specs(specs: list[WireSpec]) -> dict[uuid.UUID, set[str]]:
+    """Every resolved hop's port, grouped by the device that owns it (ADR 0014
+    addendum X-K, issue #756).
+
+    The interface-level attachment check is defined against this map the same way
+    the switch-level one is defined against ``touched_devices_from_specs``: port
+    constraints honored, transit devices included, and both ends of every hop
+    contributing. A device's entry is exactly the set of ITS OWN port names that
+    carry a hop, which is what a physical interface's declared ``port`` (X-J) is
+    checked against.
+    """
+    ports: dict[uuid.UUID, set[str]] = {}
+    for spec in specs:
+        ports.setdefault(spec.device_a_id, set()).add(spec.port_a)
+        ports.setdefault(spec.device_b_id, set()).add(spec.port_b)
+    return ports
+
+
 def touched_devices_from_specs(specs: list[WireSpec]) -> set[uuid.UUID]:
     """Both endpoints of every resolved hop (R2 review fix on 2ade362c).
 
@@ -499,12 +517,12 @@ def touched_devices_from_specs(specs: list[WireSpec]) -> set[uuid.UUID]:
     nothing) and transit devices on a multi-hop resolved path are included (they
     are never themselves an edge endpoint, but the resolved wiring genuinely
     reaches them).
+
+    Derived from ``wired_ports_from_specs`` (X-K) rather than iterating the specs
+    a second time: a device is touched iff at least one of its ports carries a
+    hop, so the two cannot disagree about what "attached" means.
     """
-    touched: set[uuid.UUID] = set()
-    for spec in specs:
-        touched.add(spec.device_a_id)
-        touched.add(spec.device_b_id)
-    return touched
+    return set(wired_ports_from_specs(specs))
 
 
 def l3_intent_changed(
@@ -533,6 +551,7 @@ def l3_intent_changed(
 async def gate_l3_intent(
     candidates: list[L3NodeCandidate],
     touched_devices: set[uuid.UUID],
+    wired_ports_by_device: dict[uuid.UUID, set[str]],
 ) -> dict[uuid.UUID, uuid.UUID | None]:
     """Run the L3 validation pass over already-parsed, non-malformed, non-empty
     candidates and refuse with 409 on any real (non-``l3_duplicate_route``,
@@ -552,8 +571,13 @@ async def gate_l3_intent(
     Callers must call this BEFORE taking the fork row's ``FOR UPDATE`` lock
     (R3): it makes inventory HTTP calls and must never run while any lock is
     held, nor repeat on a version-race retry.
+
+    ``wired_ports_by_device`` (ADR 0014 addendum X-K, issue #756) rides along
+    from the same resolution as ``touched_devices`` and is likewise required:
+    the save gate is one of the two places that judge a route's interface
+    against the wiring actually in hand.
     """
-    result = await validate_canvas_l3(candidates, [], touched_devices)
+    result = await validate_canvas_l3(candidates, [], touched_devices, wired_ports_by_device)
     real_invalid = [route for route in result.invalid_routes if route_causes_invalid(route)]
     if not real_invalid:
         return result.validated_config_version_ids
@@ -1117,4 +1141,5 @@ __all__ = [
     "resolve_canvas_wiring",
     "save_fork",
     "touched_devices_from_specs",
+    "wired_ports_from_specs",
 ]

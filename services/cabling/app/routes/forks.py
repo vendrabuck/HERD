@@ -56,6 +56,7 @@ from app.services.fork_save_service import (
     resolve_canvas_wiring,
     save_fork,
     touched_devices_from_specs,
+    wired_ports_from_specs,
 )
 from app.services.fork_service import create_fork
 from app.services.l3_intent import merge_candidates_by_device, walk_l3_nodes
@@ -597,7 +598,11 @@ async def save_fork_internal(
         )
         if l3_intent_changed(existing_l3_rows, intended_routes):
             touched_devices = touched_devices_from_specs(wiring_resolution.specs)
-            validated_config_version_ids = await gate_l3_intent(candidates, touched_devices)
+            validated_config_version_ids = await gate_l3_intent(
+                candidates,
+                touched_devices,
+                wired_ports_from_specs(wiring_resolution.specs),
+            )
 
     fork = await _load_fork(db, reservation_id, for_update=True, refresh=True)
     if fork.status == ForkStatus_ARCHIVED:

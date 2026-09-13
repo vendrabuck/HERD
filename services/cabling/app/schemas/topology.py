@@ -142,6 +142,10 @@ class InvalidRoute(BaseModel):
     - ``l3_bad_next_hop``: ``next_hop`` is present and not a parseable IP address.
     - ``l3_unknown_interface``: ``interface`` is not among the config's interface
       names.
+    - ``l3_interface_unwired`` (ADR 0014 addendum X-K, issue #756): ``interface``
+      is a PHYSICAL interface (config ``kind`` absent or ``physical``) whose port
+      (config ``port``, defaulting to the interface name) carries no resolved hop
+      on this switch. A ``logical`` interface is exempt.
     - ``l3_unknown_virtual_router`` (ADR 0014 addendum X-I, issue #755): the route
       names a ``virtual_router`` the config's ``virtual_routers`` does not declare.
       A config with no ``virtual_routers`` key declares none, so every VRF-naming

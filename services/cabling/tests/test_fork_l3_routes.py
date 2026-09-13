@@ -675,7 +675,7 @@ async def test_gate_l3_intent_returns_validated_config_version_ids():
         "app.services.fork_save_service.validate_canvas_l3",
         new=AsyncMock(return_value=_no_invalid({switch: version_id})),
     ):
-        result = await _real_gate_l3_intent(candidates, {switch})
+        result = await _real_gate_l3_intent(candidates, {switch}, {switch: {"eth1"}})
     assert result == {switch: version_id}
 
 
@@ -699,7 +699,7 @@ async def test_gate_l3_intent_409_exact_shape_on_invalid_routes():
         ),
     ):
         with pytest.raises(HTTPException) as exc:
-            await _real_gate_l3_intent(candidates, {switch})
+            await _real_gate_l3_intent(candidates, {switch}, {switch: {"eth1"}})
     assert exc.value.status_code == 409
     assert exc.value.detail == {
         "error": "l3_intent_invalid",
@@ -731,7 +731,7 @@ async def test_gate_l3_intent_ignores_duplicate_route_entries_for_refusal():
             )
         ),
     ):
-        result = await _real_gate_l3_intent(candidates, {switch})
+        result = await _real_gate_l3_intent(candidates, {switch}, {switch: {"eth1"}})
     assert result == {switch: result[switch]}  # returned normally, no raise
 
 

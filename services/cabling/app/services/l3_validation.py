@@ -13,7 +13,10 @@ reason, ``l3_malformed``, and the round-2 amendment's tenth, ``l3_duplicate_rout
 ``touched_devices`` is supplied by the caller (R2 review fix): both devices of
 every hop in ``resolve_canvas_wiring(canvas).specs``, port constraints honored,
 transit devices included. This module never computes it itself and never runs its
-own BFS.
+own BFS. ADR 0014 addendum X-K (issue #756) adds ``wired_ports_by_device`` from the
+same specs (``fork_save_service.wired_ports_from_specs``), the per-device set of
+port names carrying a hop, which the interface-level ``l3_interface_unwired`` check
+resolves a physical interface's declared port against.
 
 Device type and config content come from inventory over the internal token via
 ``herd_common.internal_client.call_service`` (R6 review fix), batched per
@@ -40,7 +43,13 @@ from dataclasses import dataclass, field
 import httpx
 from fastapi import HTTPException
 from herd_common.internal_client import InternalTokenAuth, call_service
-from herd_common.l3_validation import usable_interfaces, usable_virtual_routers, validate_one_route
+from herd_common.l3_validation import (
+    InterfaceAttachment,
+    usable_interface_attachments,
+    usable_interfaces,
+    usable_virtual_routers,
+    validate_one_route,
+)
 
 from app.config import settings
 from app.schemas.topology import InvalidRoute
@@ -196,6 +205,8 @@ def _validate_one_route(
     route: RouteSpec,
     interfaces: dict[str, str | None],
     virtual_routers: dict[str, set[str]] | None = None,
+    interface_attachments: dict[str, InterfaceAttachment] | None = None,
+    wired_ports: set[str] | None = None,
 ) -> str | None:
     """Unpack one ``RouteSpec`` into the shared per-route pass.
 
@@ -207,6 +218,8 @@ def _validate_one_route(
 
     ``virtual_routers`` defaults to "the switch declares none", which is what a
     config written before X-I means and what the pure-function tests pass.
+    ``wired_ports`` defaults to None, "no resolved hops in hand", which skips the
+    X-K interface-level check; ``validate_switch_l3`` always passes the real set.
     """
     return validate_one_route(
         route.destination,
@@ -215,6 +228,8 @@ def _validate_one_route(
         route.virtual_router,
         interfaces=interfaces,
         virtual_routers=virtual_routers,
+        interface_attachments=interface_attachments,
+        wired_ports=wired_ports,
     )
 
 
@@ -225,6 +240,7 @@ async def validate_switch_l3(
     *,
     ctx: L3InventoryContext,
     touched_devices: set[uuid.UUID],
+    wired_ports: set[str],
 ) -> tuple[list[InvalidRoute], uuid.UUID | None]:
     """Evaluate one already-parsed, non-empty route list; returns its InvalidRoute
     entries plus the config version id the routes were judged against (S6),
@@ -236,6 +252,12 @@ async def validate_switch_l3(
     route with a problem contributes one entry. The shape check (``l3_malformed``)
     and the duplicate-collapse check (``l3_duplicate_route``, S12) already ran in
     the caller (``validate_canvas_l3``) before this is ever called.
+
+    ``wired_ports`` (X-K, issue #756) is THIS switch's own hop-carrying port names
+    and is required, not defaulted: the interface-level check must never be
+    silently skipped because a caller forgot to thread the wiring through. It is
+    empty exactly when the switch is unattached, in which case the switch-level
+    check above has already returned.
     """
     if ctx.connection_type(device_id) != LAYER_3_SWITCH_CONNECTION_TYPE:
         return (
@@ -250,6 +272,7 @@ async def validate_switch_l3(
     config = ctx.config(device_id)
     interfaces = usable_interfaces((config or {}).get("interfaces"))
     virtual_routers = usable_virtual_routers((config or {}).get("virtual_routers"))
+    interface_attachments = usable_interface_attachments((config or {}).get("interfaces"))
     if config is None or not interfaces:
         return (
             [
@@ -275,7 +298,9 @@ async def validate_switch_l3(
 
     results: list[InvalidRoute] = []
     for route in routes:
-        reason = _validate_one_route(route, interfaces, virtual_routers)
+        reason = _validate_one_route(
+            route, interfaces, virtual_routers, interface_attachments, wired_ports
+        )
         if reason is not None:
             results.append(
                 InvalidRoute(
@@ -310,6 +335,7 @@ async def validate_canvas_l3(
     candidates: list[L3NodeCandidate],
     malformed: list[L3NodeMalformed],
     touched_devices: set[uuid.UUID],
+    wired_ports_by_device: dict[uuid.UUID, set[str]],
 ) -> L3ValidationResult:
     """Run the L3 validation pass (ADR 0014 Decision 5) over already-parsed
     candidates and malformed entries (S10 review fix, round 2: the caller parses
@@ -320,6 +346,11 @@ async def validate_canvas_l3(
     entries (S12, one per collapsed duplicate in ``candidates``) are always
     included, regardless of switch-level outcome, so nothing vanishes silently;
     neither counts toward ``valid``/gate refusal (see ``route_causes_invalid``).
+
+    ``wired_ports_by_device`` (X-K, issue #756) comes from the same
+    ``resolve_canvas_wiring`` specs as ``touched_devices``
+    (``fork_save_service.wired_ports_from_specs``); each switch is judged against
+    its own entry, empty for a device with no resolved hop.
 
     Returns ``invalid_routes=[]`` and no inventory call at all when both
     ``candidates`` and ``malformed`` are empty. Raises HTTPException 503
@@ -364,7 +395,12 @@ async def validate_canvas_l3(
         validated_config_version_ids: dict[uuid.UUID, uuid.UUID | None] = {}
         for node_id, device_id, routes, _dup in candidates:
             entries, config_version_id = await validate_switch_l3(
-                node_id, device_id, routes, ctx=ctx, touched_devices=touched_devices
+                node_id,
+                device_id,
+                routes,
+                ctx=ctx,
+                touched_devices=touched_devices,
+                wired_ports=wired_ports_by_device.get(device_id, set()),
             )
             invalid_routes.extend(entries)
             if config_version_id is not None:
