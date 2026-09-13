@@ -152,7 +152,7 @@
 
     <h2 class="sec" id="sees">Its reach is your reach</h2>
     <p class="sectitle">What the assistant can see</p>
-    <p>Every lookup the assistant makes runs <strong>as you</strong>; same login, same device-group visibility, same ownership rules. It can't see a device you can't see, or peek into someone else's reservation. There are seven read-only tools:</p>
+    <p>Every lookup the assistant makes runs <strong>as you</strong>; same login, same device-group visibility, same ownership rules. It can't see a device you can't see, or peek into someone else's reservation. There are nine read-only tools:</p>
 
     <div class="hd-card" style="margin:18px 0;">
       <table class="hd-table">
@@ -165,9 +165,12 @@
           <tr><td class="name">Config history</td><td>Recent config versions (metadata only, newest first).</td></tr>
           <tr><td class="name">Find path</td><td>Whether two devices in this reservation can reach each other, and over how many hops.</td></tr>
           <tr><td class="name">Recent executions</td><td>The last driver runs for <em>this</em> reservation; the reservation is pinned server-side, so it can't be redirected at another one.</td></tr>
+          <tr><td class="name">Search docs</td><td>Ranked hits from the HERD user manual (and any documentation your admin has added), by keyword.</td></tr>
+          <tr><td class="name">Read doc</td><td>The text of one manual page or corpus file found by Search docs, one window at a time so a long page can be paged through.</td></tr>
         </tbody>
       </table>
     </div>
+    <p>The last two are on by default (the built-in user manual), so the assistant can answer a "how do I" question by citing the manual instead of guessing. An admin can add more documentation sources, or turn this off, in the deployment configuration.</p>
 
     <h2 class="sec" id="multi">Keeping the thread going</h2>
     <p class="sectitle">Follow-ups &amp; new threads</p>

@@ -67,7 +67,7 @@ unsaved-routing-changes warning). `TopologyEditorPage.tsx` itself is now at 96.7
   file). Calendar rendering, month navigation, and reservation-click handling are
   all untested.
 
-Measured frontend coverage on main is 90.44% lines (1,360 tests, 138 test files).
+Measured frontend coverage on main is 90.46% lines (1,375 tests, 138 test files).
 The files below 85% lines, all predating v0.2.0, grouped by area with a note on
 what a test would still need to cover:
 

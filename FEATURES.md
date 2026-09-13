@@ -153,9 +153,13 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   turning red when the most recent validation found a problem. Both fork write paths
   (save and activation) resolve intent into a `fork_l3_routes` table;
   `/topologies/{id}/validate` and `/validate/internal` run a routing-intent pass with
-  ten refusal reasons, fail-closed on an inventory outage; execution drives the
-  intent-derived route set in precedence over the config-version fallback (see the
-  Reservations section below). See
+  fourteen refusal reasons (including a two-level wiring check: the switch itself must
+  be wired, and a physical interface's mapped port must carry a resolved hop), fail-closed
+  on an inventory outage; a non-admin caller's canvas is redacted to their visible devices
+  first, so a hidden device reports the same reason an unknown one does. Execution drives
+  the intent-derived route set in precedence over the config-version fallback (see the
+  Reservations section below), passing a route's `virtual_router` only to a driver whose
+  package declares `supports_vrf`. See
   [docs/TOPOLOGY_EDITOR.md](docs/TOPOLOGY_EDITOR.md#layer-3-routing-intent-adr-0014-issue-34).
 
 ## Reservations

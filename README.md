@@ -206,7 +206,7 @@ make lint            # ruff check + eslint
 make format          # ruff format + ruff check --fix
 make master          # Full validation: lint + unit + frontend + build + live LDAP + ephemeral stack + integration + e2e + LDAP-mode stack tests + Postgres-live LDAP sync tests (no coverage)
 make master-clean    # Same as master, but wipes herd-* images first and forces a no-cache rebuild
-make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, seed, headless locust load; on success the seeded gate stack is left running (make gate-down to stop)
+make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, the NOS lab dialect tests, seed, headless locust load; on success the seeded gate stack is left running (make gate-down to stop)
 make migrate         # Run Alembic migrations
 make logs            # Tail logs
 make frontend-dev    # Run frontend dev server
@@ -522,11 +522,12 @@ make test-load-ui        # Locust with web UI
 
 ## CI (GitHub Actions)
 
-Three jobs run on push/PR to main, plus a scheduled nightly workflow:
+Four jobs run on push/PR to main, plus a scheduled nightly workflow:
 - **backend**: lockfile drift check (uv lock --check), install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 13 services (pytest), coverage report
 - **frontend**: install deps (npm ci), lint (eslint), test (vitest), build (vite)
 - **integration** (advisory): boots the full ephemeral stack and runs the contract and integration suites
-- **nightly** (scheduled, not on every PR): the heavier suites PR CI skips, contract, integration, e2e, and a seeded headless locust load run
+- **nos-dialect** (advisory): boots the checked-in emulated-gear lab (a real Nokia SR Linux node and a real FRRouting node, `infra/nos-test/`) and runs the four driver-dialect suites against them; no HERD stack involved
+- **nightly** (scheduled, not on every PR): the heavier suites PR CI skips, contract, integration, e2e, a seeded headless locust load run, and the NOS lab's two via-stack feature suites (a real device driven through HERD's own reservation path)
 
 ## Documentation
 
