@@ -33,7 +33,7 @@ The opening seed sent to the model is intentionally narrow:
 - **Reservation**: id, status, start_time, end_time, topology_id, topology_type, purpose, owner_name
 - **Per device (one line each)**: id, name, template_name, status
 
-For everything else, the model calls one of seven read-only tools. Each tool's HTTP call carries your JWT, so existing RBAC and device visibility apply exactly as if you made the call yourself.
+For everything else, the model calls one of seven read-only tools, plus the two documentation tools when a documentation source is enabled. Each tool's HTTP call carries your JWT, so existing RBAC and device visibility apply exactly as if you made the call yourself.
 
 | Tool | Backing endpoint | Returns |
 |---|---|---|
@@ -44,10 +44,75 @@ For everything else, the model calls one of seven read-only tools. Each tool's H
 | `list_device_config_history` | `GET /api/inventory/devices/{id}/config-versions?limit=N` | Recent version metadata (newest first), no payloads |
 | `find_path` | `POST /api/cabling/pathfind` | `{reachable, hop_count, paths}` between two devices in your reservation |
 | `list_executions_for_reservation` | `GET /api/execution/runs?reservation_id={your reservation}&...` | Recent execution runs for this reservation (reservation_id injected server-side, never accepted from the model) |
+| `search_docs` | local documentation corpora (no HTTP) | Up to 10 ranked hits, each `{source, path, title, snippet, score}`. Present only when at least one documentation source is enabled; see Reference material below |
+| `read_doc` | a local corpus file, or an allowlisted https URL when `AI_DOCS_WEB_ENABLED=true` | One window of a page as plain text: `{source, path, title, text, offset, next_offset}`. A non-null `next_offset` means the model can page for more |
 
 The list of executions tool requires a small change in the execution service: previously `/api/execution/runs` was admin-only; iter 2 opens it to non-admin callers when a `reservation_id` filter is supplied AND they own that reservation (verified via a cross-service call to the reservations service with the caller's JWT).
 
 The model is told to call tools only when the seed cannot answer the question. Simple questions ("when does my reservation end?") return in zero tool calls; deeper diagnostic questions ("why did my last apply fail?") call one to a handful.
+
+## Reference material
+
+The seven tools above answer questions about *this* reservation. A question
+about HERD itself ("how does LDAP group sync decide what to map?") has no live
+data behind it, so without reference material the model answers from training
+data. `search_docs` and `read_doc` (ADR 0015, issue #31) give it documentation
+to read instead.
+
+Sources are a registry, and the two tools are advertised only when at least one
+source is enabled. The gate is also enforced at the dispatch boundary: a call
+naming a disabled or unknown source is refused even if the model emits it by
+name, the same discipline the write tools follow.
+
+| Source | Enabled by | What it is |
+|---|---|---|
+| `herd-manual` | on by default; `AI_DOCS_MANUAL_ENABLED=false` removes it | The published HERD user manual, copied into the ai-orchestrator image from `docs/manual/` (bind-mounted from the checkout under `make up`) |
+| operator corpora | `AI_DOCS_CORPUS_DIRS=name=/abs/path,...` | Directories of `.md`, `.txt`, or `.html` files mounted into the container, one source per entry. A missing or unreadable directory is logged once at startup and skipped, never fatal |
+| `web` | `AI_DOCS_WEB_ENABLED=true` plus `AI_DOCS_WEB_ALLOWED_PREFIXES` | Allowlisted https documentation URLs, fetched on demand. Off by default |
+
+Corpora are indexed lazily and re-indexed when the index is older than
+`AI_DOCS_INDEX_TTL_SECONDS` (default 600), so an operator can update a mounted
+corpus without restarting the service. Ranking is plain text: lowercase token
+overlap, length-normalized, with a hit in the page title weighted above a hit
+in the body. There are no embeddings and no vector store. HTML is converted to
+text with the stdlib parser (scripts and styles dropped, block elements
+separated by newlines); markdown and plain text pass through. Hidden files and
+non-text extensions are never indexed or served, and a `read_doc` path is
+resolved under the source root with symlinks followed: anything that lands
+outside the root answers "not found", exactly like a path that does not exist,
+so the tool cannot be used to probe the filesystem.
+
+Web fetching, when an operator turns it on, is bounded on every axis:
+
+- the URL must be `https`, and its normalized form (lowercase host, no
+  userinfo, no query) must match one of the configured prefixes as a plain
+  string prefix, so end each prefix with `/`;
+- the host is resolved and EVERY address must be public. Loopback, private,
+  link-local (where cloud metadata services live), multicast, unspecified,
+  reserved, and IPv4-mapped forms of all of them are refused, so an
+  allowlisted hostname pointed at a service inside the stack fetches nothing;
+- at most 3 redirects are followed, each re-checked against both the allowlist
+  and the address rules, which is why redirects are followed by hand rather
+  than delegated to the HTTP client;
+- the response must declare `text/html`, `text/plain`, or `text/markdown`, and
+  the body is read to at most `AI_DOCS_WEB_MAX_BYTES` (default 524288) and
+  then cut;
+- the request carries no HERD credentials and no caller JWT, only a fixed
+  User-Agent, and it inherits the existing 15-second per-hop timeout.
+
+Everything these tools return is framed exactly like every other tool result:
+truncated to `ASSISTANT_TOOL_RESULT_CHAR_CAP` and sent inside a tool_result
+block the system prompt declares untrusted, with explicit instructions to
+ignore any directives found inside it. That framing is the whole reason a
+documentation page, and a fetched web page in particular, can be put in front
+of the model at all. `read_doc` returns one window at a time rather than a
+whole page, and the window is sized under the result cap so the model always
+receives the text its `next_offset` describes.
+
+The tools are read-only and sit under the assistant's default posture: no
+`AI_WRITE_TOOLS_ENABLED`, and the usual 503 when no AI provider is configured.
+See [ENV_VARS.md](ENV_VARS.md) for the six `AI_DOCS_*` settings and
+`docs/design/0015-assistant-docs-lookup.md` for the decision record.
 
 ## Endpoint
 
@@ -150,6 +215,5 @@ The per-conversation budget above is separate from the optional per-user daily q
 
 ## Future iterations
 
-- Web/docs lookup tools for vendor reference material.
 - Streaming responses (current responses are returned as a single completed turn).
 - Optional cross-reservation conversation memory for users who own multiple related reservations.

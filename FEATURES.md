@@ -271,6 +271,14 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   must opt into dry-run via a `driver_metadata.json` declaring
   `supports_dry_run: true`; the inventory schedule endpoint, AI tool, and
   execution sandbox all refuse dry-runs against drivers that did not opt in.
+- **Assistant documentation lookup** (Shipped): the reservation assistant can
+  search and read reference material instead of answering HERD and vendor
+  questions from training data. The published HERD manual ships in the image as
+  a built-in source; an operator can mount further corpora, and can optionally
+  allow a bounded set of https documentation URLs. The tools are read-only,
+  every result is framed as untrusted text, and a source that is not enabled is
+  refused at the dispatch boundary. See
+  [docs/design/0015-assistant-docs-lookup.md](docs/design/0015-assistant-docs-lookup.md).
 - **AI-assisted recipe authoring** (Shipped): an admin describes a dynamic-resource
   recipe in natural language and the AI drafts the driver package, which is
   validated in the execution sandbox (AST structural checks, a stricter
