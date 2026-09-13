@@ -134,7 +134,7 @@ def _recorder(fail=None):
 CFG_VERSION_ID = "cfg-version-1"
 
 
-def _patches(execute_fn, fork_wires=None, l3_routes=None, driver_metadata=None):
+def _patches(execute_fn, fork_wires=None, l3_routes=None, driver_metadata=None, config_fetch=None):
     async def _device(device_id, client=None):
         found = SWITCHES.get(str(device_id))
         if found is not None:
@@ -149,6 +149,10 @@ def _patches(execute_fn, fork_wires=None, l3_routes=None, driver_metadata=None):
     async def _config(device_id, client=None):
         return {"id": CFG_VERSION_ID, "config": {"routes": CURRENT_CONFIG}}
 
+    # `config_fetch` overrides it for a test that needs the gate's RE-VALIDATING
+    # path (a route with no stamp) to read real `interfaces` (ADR 0014 X-A, X-K).
+    config_side_effect = config_fetch or _config
+
     wires_return = (
         ForkIntent(fork_wires if fork_wires is not None else DEFAULT_FORK_WIRES, l3_routes)
         if l3_routes is not None
@@ -162,7 +166,8 @@ def _patches(execute_fn, fork_wires=None, l3_routes=None, driver_metadata=None):
             "app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=TEMPLATE_DATA)
         ),
         patch(
-            "app.services.nats_consumer._fetch_latest_config", new=AsyncMock(side_effect=_config)
+            "app.services.nats_consumer._fetch_latest_config",
+            new=AsyncMock(side_effect=config_side_effect),
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
@@ -573,6 +578,57 @@ async def test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_pre
     with _patches(execute_fn, fork_wires=[trunk_wire], l3_routes={SW_L3: intent}):
         result = await reattempt_reservation(RES_ID, _db_session_factory())
     assert {d for a, d in calls if a == "configure_route"} == {"10.90.0.0/24"}
+    row = await _l3_row(rid)
+    assert row.status == "ACTIVE"
+    assert result["results"][0]["outcome"] == "reconnected"
+
+
+# --- ADR 0014 addendum X-K (issue #756): the retry channel's wired ports -----
+
+
+async def _config_with_interfaces(device_id, client=None):
+    """A config whose interfaces declare X-J's mapping: eth1 is the physical
+    interface behind port ge-0/0/1 (what DEFAULT_FORK_WIRES cables SW_L3 on),
+    and eth9 is a physical interface with no cable at all."""
+    return {
+        "id": "cfg-version-with-interfaces",
+        "config": {
+            "interfaces": [
+                {"name": "eth1", "ip": "10.77.0.1/24", "port": "ge-0/0/1"},
+                {"name": "eth9", "ip": "10.99.0.1/24"},
+            ],
+            "routes": CURRENT_CONFIG,
+        },
+    }
+
+
+async def test_l3_build_retry_gate_refuses_intent_on_an_unwired_interface():
+    """The retry channel derives the gate's wired ports from the SAME fork fetch
+    its adjacency check uses: a route on eth9 (no hop on its port) is refused
+    with l3_interface_unwired and drives nothing. Drop the `wired_ports=`
+    argument at that call site and this test goes green-to-red."""
+    rid = await _seed_l3_failed("ACTIVE", routes=PINNED, attempts=1)
+    intent = [_intent_route("10.80.0.0/24", "eth9", validated_config_version_id=None)]
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, l3_routes={SW_L3: intent}, config_fetch=_config_with_interfaces):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert calls == [], "no driver call for a route on an unwired interface"
+    row = await _l3_row(rid)
+    assert row.status == "FAILED"
+    assert row.intended == "ACTIVE"
+    assert row.last_error == "l3_interface_unwired"
+    assert result["results"][0]["outcome"] == "still_failed"
+
+
+async def test_l3_build_retry_drives_intent_on_the_interface_that_is_wired():
+    """The positive control for the test above: the same config, a route on
+    eth1, whose declared port IS the one the fork's wires land on."""
+    rid = await _seed_l3_failed("ACTIVE", routes=PINNED, attempts=1)
+    intent = [_intent_route("10.81.0.0/24", "eth1", validated_config_version_id=None)]
+    execute_fn, calls = _recorder()
+    with _patches(execute_fn, l3_routes={SW_L3: intent}, config_fetch=_config_with_interfaces):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert {d for a, d in calls if a == "configure_route"} == {"10.81.0.0/24"}
     row = await _l3_row(rid)
     assert row.status == "ACTIVE"
     assert result["results"][0]["outcome"] == "reconnected"

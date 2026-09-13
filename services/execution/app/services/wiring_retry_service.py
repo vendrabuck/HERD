@@ -635,8 +635,9 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     ADR 0014 addendum X5 (issue #34 phase 3): when the fork carries CURRENT routing
     intent for a still-adjacent switch, the retry drives that intent instead of the
     row's own (possibly stale) `routes`, through the same X-A/X-F gate the reconcile
-    uses (`_gate_l3_drive_routes`); a gate failure re-records the row FAILED with the
-    gate's reason and drives nothing for it this tick. A switch whose intent is gone
+    uses (`_gate_l3_drive_routes`, including its X-K interface-level check against
+    the ports this fork's intended wires land on); a gate failure re-records the row
+    FAILED with the gate's reason and drives nothing for it this tick. A switch whose intent is gone
     (never had any, or it was removed) is driven with the row's own pinned `routes`
     verbatim, unchanged from before phase 3 (addendum X4: intent disappearing is not
     a teardown signal, so the retry keeps reattempting the applied set).
@@ -660,6 +661,7 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
         _fetch_fork_intended_wires,
         _FetchContext,
         _gate_l3_drive_routes,
+        _wired_ports_by_device,
     )
     from app.services.route_service import record_route_failed
 
@@ -693,6 +695,10 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
                 intended_adjacency = await _derive_l3_adjacency(
                     fork_intent, ctx, l3_intent_by_switch
                 )
+                # ADR 0014 addendum X-K (issue #756): the gate judges a route's
+                # interface against the ports THIS fork's intended wires land on,
+                # from the same fetch the adjacency derivation just used.
+                wired_ports = _wired_ports_by_device(fork_intent)
             except TransientUpstreamError as exc:
                 logger.warning(
                     "wiring retry: cannot verify build intent for reservation %s (%s); "
@@ -713,7 +719,11 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
                 if intent_routes:
                     try:
                         clean, reason = await _gate_l3_drive_routes(
-                            switch_id, intent_routes, ctx, get_db_session
+                            switch_id,
+                            intent_routes,
+                            ctx,
+                            get_db_session,
+                            wired_ports=wired_ports.get(switch_id, set()),
                         )
                     except TransientUpstreamError as exc:
                         # Isolated to THIS row (review fix): an inventory 5xx while

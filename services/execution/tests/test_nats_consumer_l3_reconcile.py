@@ -792,13 +792,22 @@ CFG_WITH_INTERFACES_ID = "cfg-version-with-interfaces"
 async def _config_with_interfaces(device_id, client=None):
     """A config carrying `interfaces`, for the X-A re-validation tests: the
     default `_config_fetch`/CONFIG_BY_SWITCH configs carry no `interfaces` key
-    at all (irrelevant to every pre-phase-3 test, which never re-validates)."""
+    at all (irrelevant to every pre-phase-3 test, which never re-validates).
+
+    ADR 0014 addendum X-J/X-K (issue #756): every test switch here is cabled on
+    port `ge-0/0/1` (see `_wire`), so `eth1`, the interface the re-validating
+    tests route through, declares that port explicitly. `eth2` is an SVI
+    (logical, exempt from the interface-level check) and `eth9` is a physical
+    interface with no cable at all, which is what
+    `test_gate_route_on_an_unwired_interface_fails_the_switch` drives.
+    """
     return {
         "id": CFG_WITH_INTERFACES_ID,
         "config": {
             "interfaces": [
-                {"name": "eth1", "ip": "10.20.0.1/24"},
-                {"name": "eth2", "ip": None},
+                {"name": "eth1", "ip": "10.20.0.1/24", "port": "ge-0/0/1"},
+                {"name": "eth2", "ip": None, "kind": "logical"},
+                {"name": "eth9", "ip": "10.99.0.1/24"},
             ],
             "routes": ROUTES,
         },
@@ -1215,6 +1224,91 @@ async def test_gate_reconcile_failure_keeps_previous_pin_via_reconcile_failed_pa
     assert {r["destination"] for r in rows[0].routes} == {"10.20.0.0/24"}, (
         "the previous pin survives a gate failure on the delta path too"
     )
+
+
+# --- X-K: interface-level attachment at drive time (issue #756) -------------
+#
+# The reason vocabulary and its order live in the shared validator's own tests
+# (services/common/tests/test_l3_validation.py). What is pinned HERE is that this
+# side threads the fork's OWN intended wires into the gate: delete the
+# `wired_ports=` argument at either `_gate_l3_drive_routes` call site and
+# `test_gate_route_on_an_unwired_interface_fails_the_switch` goes green-to-red.
+
+
+def test_wired_ports_by_device_groups_both_endpoints_and_skips_malformed_rows():
+    from app.services.nats_consumer import _wired_ports_by_device
+
+    wires = [
+        _wire(DUT1, "eth0", SW_L3, "ge-0/0/1"),
+        _wire(DUT2, "eth1", SW_L3, "ge-0/0/2"),
+        {"device_a_id": DUT1, "port_a": None, "device_b_id": None, "port_b": "ge-0/0/9"},
+    ]
+    assert _wired_ports_by_device(wires) == {
+        DUT1: {"eth0"},
+        DUT2: {"eth1"},
+        SW_L3: {"ge-0/0/1", "ge-0/0/2"},
+    }
+
+
+async def test_gate_route_on_an_unwired_interface_fails_the_switch():
+    """The switch IS adjacent (ge-0/0/1 carries the hop) but the route names
+    eth9, a physical interface with no hop on its port: FAILED, no driver call."""
+    intent = [_intent_route("10.20.0.0/24", "eth9", validated_config_version_id=None)]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_with_interfaces,
+    )
+    assert calls == [], "an unwired interface never reaches the driver"
+    rows = await _rows("FAILED")
+    assert len(rows) == 1
+    assert rows[0].last_error == "l3_interface_unwired"
+    assert rows[0].intended == "ACTIVE"
+
+
+async def test_gate_route_on_a_logical_interface_drives_normally():
+    """eth2 is declared logical (an SVI): it has no port of its own, so the
+    interface-level check does not apply and the switch's adjacency stands."""
+    intent = [_intent_route("10.20.0.0/24", "eth2", validated_config_version_id=None)]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_with_interfaces,
+    )
+    assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
+    assert await _active_switches() == {SW_L3}
+
+
+async def test_gate_declared_port_is_what_the_interface_resolves_against():
+    """eth1's own name is not a port of this switch; only its declared `port`
+    (ge-0/0/1) is, and the route drives because of that mapping. Wire the switch
+    on a DIFFERENT port and the same route refuses."""
+    intent = [_intent_route("10.20.0.0/24", "eth1", validated_config_version_id=None)]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/2")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_with_interfaces,
+    )
+    assert calls == [], "the hop lands on ge-0/0/2, not the port eth1 declares"
+    rows = await _rows("FAILED")
+    assert len(rows) == 1
+    assert rows[0].last_error == "l3_interface_unwired"
+
+
+async def test_gate_current_validation_stamp_skips_the_interface_check_too():
+    """X-A's deliberate gap (the S6 amendment) is unchanged by X-K: a route whose
+    stamp matches the switch's CURRENT config version is trusted verbatim, so an
+    unwired interface on a freshly-validated route still drives. Cabling's save
+    gate is what judged it, against the same wiring."""
+    intent = [
+        _intent_route("10.20.0.0/24", "eth9", validated_config_version_id=CFG_WITH_INTERFACES_ID)
+    ]
+    calls = await _reconcile(
+        [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+        l3_routes={SW_L3: intent},
+        config_fetch=_config_with_interfaces,
+    )
+    assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
 
 
 # --- X-B: explicit intent overrides the inter-switch trunk inference --------

@@ -54,11 +54,19 @@ def _canvas(l3: dict | None, *, with_edge: bool = True) -> dict:
 
 
 async def _seed_physical_connection():
+    """The switch is cabled on the port its config interface `eth1` maps to.
+
+    ADR 0014 addendum X-K (issue #756): a route's interface must land on a port
+    that carries a resolved hop, and `eth1` (the interface every route below
+    names) takes X-J's default port mapping, its own name. Wiring the switch on
+    some other port would make every positive control here refuse with
+    `l3_interface_unwired`, which is the point of the check.
+    """
     async with TestSession() as db:
         db.add(
             Connection(
                 device_a_id=SWITCH,
-                port_a="eth0",
+                port_a="eth1",
                 device_b_id=DUT,
                 port_b="eth0",
                 created_by="tester",
@@ -315,7 +323,7 @@ async def test_transit_device_on_multi_hop_path_counts_as_attached():
         )
         db.add(
             Connection(
-                device_a_id=transit, port_a="p2", device_b_id=SWITCH, port_b="eth0", created_by="t"
+                device_a_id=transit, port_a="p2", device_b_id=SWITCH, port_b="eth1", created_by="t"
             )
         )
         await db.commit()
@@ -596,3 +604,182 @@ def test_inventory_call_timeout_constant_is_pinned():
 
 def test_l3_pass_deadline_constant_is_pinned():
     assert l3_validation._L3_PASS_DEADLINE_SECONDS == 12.0
+
+
+# --- X-K: interface-level attachment (issue #756) ---------------------------
+#
+# The pure per-route ordering lives in services/common/tests/test_l3_validation.py
+# (the shared validator). What is pinned HERE is cabling's half: that the resolved
+# specs' per-device port sets actually REACH that validator. Drop the
+# `wired_ports=` argument in `validate_switch_l3`, or the
+# `wired_ports_from_specs(...)` argument in `topology_validation.py`, and
+# `test_route_on_an_unwired_physical_interface_is_refused` goes green-to-red.
+
+
+def test_wired_ports_from_specs_groups_both_endpoints_by_device():
+    from app.services.fork_save_service import WireSpec, wired_ports_from_specs
+
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    specs = [
+        WireSpec(device_a_id=a, port_a="p1", device_b_id=b, port_b="ge-0/0/1", layer="L1"),
+        WireSpec(device_a_id=b, port_a="ge-0/0/2", device_b_id=c, port_b="p9", layer="L1"),
+    ]
+    assert wired_ports_from_specs(specs) == {
+        a: {"p1"},
+        b: {"ge-0/0/1", "ge-0/0/2"},
+        c: {"p9"},
+    }
+
+
+def test_touched_devices_is_exactly_the_wired_ports_key_set():
+    """The two helpers cannot disagree about what "attached" means: a device is
+    touched iff at least one of its ports carries a hop."""
+    from app.services.fork_save_service import (
+        WireSpec,
+        touched_devices_from_specs,
+        wired_ports_from_specs,
+    )
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    specs = [WireSpec(device_a_id=a, port_a="p1", device_b_id=b, port_b="p2", layer="L1")]
+    assert touched_devices_from_specs(specs) == set(wired_ports_from_specs(specs))
+    assert touched_devices_from_specs([]) == set()
+
+
+@pytest.mark.asyncio
+async def test_route_on_an_unwired_physical_interface_is_refused():
+    """The switch IS attached (eth1 carries the hop), but the route names eth2,
+    a physical interface whose port nothing is cabled to."""
+    await _seed_physical_connection()
+    canvas = _canvas({"routes": [{"destination": "10.20.0.0/24", "interface": "eth2"}]})
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(),
+        config_json=_config_with_interfaces(
+            [
+                {"name": "eth1", "ip": "10.0.0.1/24"},
+                {"name": "eth2", "ip": "10.1.0.1/24"},
+            ]
+        ),
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    assert result.valid is False
+    assert len(result.invalid_routes) == 1
+    entry = result.invalid_routes[0]
+    assert entry.reason == "l3_interface_unwired"
+    assert entry.index == 0
+    assert entry.device_id == SWITCH
+
+
+@pytest.mark.asyncio
+async def test_route_on_a_logical_interface_is_exempt_from_the_wiring_check():
+    await _seed_physical_connection()
+    canvas = _canvas({"routes": [{"destination": "10.20.0.0/24", "interface": "lo0"}]})
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(),
+        config_json=_config_with_interfaces(
+            [
+                {"name": "eth1", "ip": "10.0.0.1/24"},
+                {"name": "lo0", "ip": "10.99.0.1/32", "kind": "logical"},
+            ]
+        ),
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    assert result.valid is True
+    assert result.invalid_routes == []
+
+
+@pytest.mark.asyncio
+async def test_declared_port_resolves_an_interface_named_unlike_its_port():
+    """X-J's explicit mapping: the OS interface name (Ethernet1) and the HERD
+    port name (eth1) differ, and only the declared `port` ties them together."""
+    await _seed_physical_connection()
+    canvas = _canvas({"routes": [{"destination": "10.20.0.0/24", "interface": "Ethernet1"}]})
+    interfaces = [{"name": "Ethernet1", "ip": "10.0.0.1/24", "port": "eth1"}]
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(), config_json=_config_with_interfaces(interfaces)
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    assert result.invalid_routes == []
+
+    # The same config WITHOUT the mapping refuses: the interface's own name is
+    # not a port of this switch.
+    unmapped = [{"name": "Ethernet1", "ip": "10.0.0.1/24"}]
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(), config_json=_config_with_interfaces(unmapped)
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    assert [r.reason for r in result.invalid_routes] == ["l3_interface_unwired"]
+
+
+@pytest.mark.asyncio
+async def test_unattached_switch_still_reports_unattached_not_unwired():
+    """The switch-level check keeps its own reason: an unattached switch reports
+    `l3_switch_unattached` once, not one `l3_interface_unwired` per route."""
+    canvas = _canvas(
+        {
+            "routes": [
+                {"destination": "10.20.0.0/24", "interface": "eth1"},
+                {"destination": "10.21.0.0/24", "interface": "eth1"},
+            ]
+        },
+        with_edge=False,
+    )
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(),
+        config_json=_config_with_interfaces([{"name": "eth1", "ip": "10.0.0.1/24"}]),
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    assert [r.reason for r in result.invalid_routes] == ["l3_switch_unattached"]
+
+
+@pytest.mark.asyncio
+async def test_port_constrained_edge_makes_the_other_port_unwired():
+    """A port-constrained edge resolves to a hop on ONE port only, so a route on
+    the switch's other (cabled but not canvas-resolved) interface refuses: the
+    resolved wiring, not the cable inventory, is what attachment means."""
+    async with TestSession() as db:
+        db.add(
+            Connection(
+                device_a_id=SWITCH, port_a="eth1", device_b_id=DUT, port_b="eth0", created_by="t"
+            )
+        )
+        db.add(
+            Connection(
+                device_a_id=SWITCH, port_a="eth2", device_b_id=DUT, port_b="eth1", created_by="t"
+            )
+        )
+        await db.commit()
+    canvas = {
+        "nodes": [
+            {"id": "dut", "data": {"device": {"id": str(DUT)}}},
+            {
+                "id": "switch",
+                "data": {
+                    "device": {"id": str(SWITCH)},
+                    "l3": {"routes": [{"destination": "10.20.0.0/24", "interface": "eth2"}]},
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "dut",
+                "target": "switch",
+                "data": {"source_port_name": "eth0", "target_port_name": "eth1"},
+            }
+        ],
+    }
+    mock, _calls = _mock_call_service(
+        batch_json=_device_batch_entry(),
+        config_json=_config_with_interfaces(
+            [{"name": "eth1", "ip": "10.0.0.1/24"}, {"name": "eth2", "ip": "10.1.0.1/24"}]
+        ),
+    )
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(canvas)
+    assert [r.reason for r in result.invalid_routes] == ["l3_interface_unwired"]

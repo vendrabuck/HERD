@@ -235,6 +235,12 @@ def _show_ip_route_static() -> str:
 # X-G, issue #755; docs/NOS_LAB.md): `blue` maps to routing table 10 and owns
 # `dummy0` at 192.0.2.254/30. Permanent by design, so this file cleans up only
 # its own routes.
+# A second PHYSICAL interface the switch's HERD config declares and nothing is
+# cabled to (ADR 0014 addendum X-K, issue #756): the reservation's topology wires
+# only ge-0/0/1, so every route through this one is refused at the fork save
+# gate and never reaches the router at all.
+UNWIRED_INTERFACE = "eth1"
+
 VRF_NAME = "blue"
 VRF_TABLE = "10"
 VRF_INTERFACE = "dummy0"
@@ -620,8 +626,18 @@ async def test_reservation_applies_changes_and_removes_real_static_routes_via_st
         )
 
         eth0_cidr = _frr_eth0_cidr()
+        # ADR 0014 addenda X-J and X-K (issue #756). The FRR container's real
+        # interface is `eth0` while the HERD device is cabled on port
+        # `ge-0/0/1`, so the config declares that mapping; `eth1` is a second
+        # PHYSICAL interface with no cable at all, which phase 2b routes out of
+        # to prove the save gate refuses it.
         await _set_config(
-            client, switch["id"], [{"name": "eth0", "ip": eth0_cidr, "zone": "trust"}]
+            client,
+            switch["id"],
+            [
+                {"name": "eth0", "ip": eth0_cidr, "zone": "trust", "port": "ge-0/0/1"},
+                {"name": UNWIRED_INTERFACE, "ip": "192.0.2.129/30", "zone": "trust"},
+            ],
         )
 
         next_hop = _connected_nexthop(eth0_cidr)
@@ -630,6 +646,7 @@ async def test_reservation_applies_changes_and_removes_real_static_routes_via_st
         # both a remove and an add to drive.
         destination = _unique_test_prefix()
         destination_after_save = _unique_test_prefix(exclude=(destination,))
+        destination_unwired = _unique_test_prefix(exclude=(destination, destination_after_save))
         route = {"destination": destination, "next_hop": next_hop, "interface": "eth0"}
         route_after_save = {
             "destination": destination_after_save,
@@ -712,6 +729,34 @@ async def test_reservation_applies_changes_and_removes_real_static_routes_via_st
                 destination_after_save
             ], fork_after_save["l3_routes"]
 
+            # Phase 2b (ADR 0014 addendum X-K, issue #756): the same fork,
+            # plus a route out of `eth1`, a physical interface of this switch
+            # that nothing is cabled to. The save gate refuses the WHOLE save
+            # with l3_interface_unwired, so the refused prefix never reaches the
+            # router and the route phase 2 installed is still there afterwards.
+            route_unwired = {
+                "destination": destination_unwired,
+                "next_hop": "192.0.2.130",
+                "interface": UNWIRED_INTERFACE,
+            }
+            refused = await _save_fork(
+                client,
+                reservation_id,
+                _canvas_with_l3(dut["id"], switch["id"], [route_after_save, route_unwired]),
+            )
+            assert refused.status_code == 409, refused.text
+            refused_detail = refused.json()["detail"]
+            assert refused_detail["error"] == "l3_intent_invalid", refused_detail
+            assert [r["reason"] for r in refused_detail["invalid_routes"]] == [
+                "l3_interface_unwired"
+            ], refused_detail
+
+            # Independent verification on the router: nothing was installed for
+            # the refused prefix, and the wired interface's route still stands.
+            routes_after_refusal = _show_ip_route_static()
+            _assert_route_absent(routes_after_refusal, destination_unwired)
+            _assert_route_installed(routes_after_refusal, destination_after_save)
+
             # Phase 3: remove the route. Cancelling the reservation deprovisions exactly
             # the applied (intent-derived) set (ADR 0014; matches
             # test_l3_intent_execution.py's mock-driver equivalent). A fork
@@ -739,6 +784,7 @@ async def test_reservation_applies_changes_and_removes_real_static_routes_via_st
             # cancel ran).
             _remove_route_on_device(destination, next_hop)
             _remove_route_on_device(destination_after_save, next_hop)
+            _remove_route_on_device(destination_unwired, "192.0.2.130")
             await _cleanup(
                 client,
                 reservation_id=None if reservation_cancelled else reservation_id,
@@ -816,8 +862,14 @@ async def test_rejected_route_records_a_failed_execution_run_via_stack_api():
         )
 
         eth0_cidr = _frr_eth0_cidr()
+        # The `port` mapping (ADR 0014 addendum X-J, issue #756) is what lets a
+        # config interface named anything at all resolve onto the cabled port:
+        # this test's whole point is that the DEVICE rejects the name, so HERD
+        # must not refuse it earlier with l3_interface_unwired.
         await _set_config(
-            client, switch["id"], [{"name": bogus_interface, "ip": eth0_cidr, "zone": "trust"}]
+            client,
+            switch["id"],
+            [{"name": bogus_interface, "ip": eth0_cidr, "zone": "trust", "port": "ge-0/0/1"}],
         )
 
         destination = _unique_test_prefix()
@@ -971,8 +1023,17 @@ async def test_vrf_routing_intent_installs_in_the_real_vrf_via_stack_api():
             client,
             switch["id"],
             [
-                {"name": "eth0", "ip": eth0_cidr, "zone": "trust"},
-                {"name": VRF_INTERFACE, "ip": VRF_INTERFACE_CIDR, "zone": "trust"},
+                {"name": "eth0", "ip": eth0_cidr, "zone": "trust", "port": "ge-0/0/1"},
+                # ADR 0014 addendum X-J (issue #756): dummy0 is a dummy device
+                # enslaved to the VRF, not a port of this switch, so it is
+                # declared logical and exempt from the interface-level
+                # attachment check.
+                {
+                    "name": VRF_INTERFACE,
+                    "ip": VRF_INTERFACE_CIDR,
+                    "zone": "trust",
+                    "kind": "logical",
+                },
             ],
             virtual_routers=[{"name": VRF_NAME, "interfaces": [VRF_INTERFACE]}],
         )

@@ -49,6 +49,14 @@ describe("routeProblemField", () => {
     expect(routeProblemField("l3_interface_bound_to_virtual_router")).toBe("interface");
   });
 
+  it("maps l3_interface_unwired to the interface field (X-K, issue #756)", () => {
+    // The route names a physical interface whose port carries no resolved hop,
+    // so the Interface box is the one to outline: the destination and next hop
+    // may be perfectly fine.
+    expect(routeProblemField("l3_interface_unwired")).toBe("interface");
+    expect([...routeProblemFields([{ reason: "l3_interface_unwired" }])]).toEqual(["interface"]);
+  });
+
   it("keeps the pre-X-I reasons on their own fields", () => {
     expect(routeProblemField("l3_bad_destination")).toBe("destination");
     expect(routeProblemField("l3_bad_next_hop")).toBe("next_hop");

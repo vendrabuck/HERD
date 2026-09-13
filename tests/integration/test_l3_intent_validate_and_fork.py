@@ -29,7 +29,11 @@ pytestmark = pytest.mark.asyncio
 # of its own and inventory falls back to that registry schema. "ip" stays
 # prefixed (a bare address has no real prefix length, which the L3 validation
 # pass's l3_next_hop_unverifiable check would then correctly refuse).
-INTERFACES = [{"name": "eth0", "ip": "10.0.0.1/24", "zone": "trust"}]
+# ADR 0014 addendum X-J (issue #756): the switch is cabled on port "ge-0/0/1"
+# while its config interface is named "eth0", so the mapping is declared. Without
+# it every route below would be refused with l3_interface_unwired, since an
+# interface's port defaults to its own name.
+INTERFACES = [{"name": "eth0", "ip": "10.0.0.1/24", "zone": "trust", "port": "ge-0/0/1"}]
 VALID_ROUTE = {"destination": "10.20.0.0/24", "next_hop": "10.0.0.2", "interface": "eth0"}
 BAD_DESTINATION_ROUTE = {"destination": "not-an-ip", "interface": "eth0"}
 

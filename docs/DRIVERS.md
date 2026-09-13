@@ -1160,6 +1160,25 @@ keys `vlan` (integer 1-4094), `ip` (string), `hostname` (string), `description`
 device's connection type is rejected with 422 and the commit never writes to
 cabling or reservations.
 
+An L3 `interfaces` entry requires `name` and `zone` and accepts `ip`, plus two
+optional fields that describe how the interface relates to the device's physical
+ports (ADR 0014 addendum X-J, issue #756):
+
+| Field | Values | Default | Meaning |
+|---|---|---|---|
+| `kind` | `physical`, `logical` | `physical` | Whether the interface is a port of the device or a logical construct (a loopback, an SVI, a dummy interface enslaved to a virtual router). |
+| `port` | string, 1 to 64 chars | the interface's own `name` | The HERD inventory port name a physical interface corresponds to, for a device whose OS names its interfaces differently from the ports its inventory record carries (for example the OS interface `eth0` on a device cabled through port `ge-0/0/1`). |
+
+HERD reads both when it judges a reservation's Layer 3 routing intent: a route
+out of a PHYSICAL interface is refused (`l3_interface_unwired`) unless the
+topology actually wires the port that interface maps to, while a `logical`
+interface is exempt. A config that declares neither field keeps its old meaning,
+every interface physical with its port equal to its name, and is judged on that
+basis, so a device whose interface names and port names differ needs `port` on
+each physical interface. The fields are HERD's own bookkeeping: they are never
+sent to a driver, which still receives the interface `name` on
+`configure_route`/`remove_route`.
+
 The schema registry lives in
 `services/common/herd_common/device_config.py` (the `config_validator` module
 in the ai-orchestrator service is a thin re-export of it). Adding a new

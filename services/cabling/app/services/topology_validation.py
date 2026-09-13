@@ -32,7 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.topology import InvalidEdge, InvalidRoute, TopologyValidationResponse
 from app.services.canvas_nodes import classify_element_edge, node_to_device_map, node_to_element_map
-from app.services.fork_save_service import resolve_canvas_wiring, touched_devices_from_specs
+from app.services.fork_save_service import (
+    resolve_canvas_wiring,
+    touched_devices_from_specs,
+    wired_ports_from_specs,
+)
 from app.services.l3_intent import canvas_has_l3, walk_l3_nodes
 from app.services.l3_validation import route_causes_invalid, validate_canvas_l3
 from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_batch_async
@@ -212,8 +216,12 @@ async def run_full_topology_validation(
     if check_routes and canvas_has_l3(canvas):
         wiring_resolution = await resolve_canvas_wiring(db, canvas, graph=edge_validation.graph)
         touched_devices = touched_devices_from_specs(wiring_resolution.specs)
+        # ADR 0014 addendum X-K (issue #756): the same resolved specs, grouped as
+        # per-device port sets, so a route naming a physical interface can be
+        # checked against the port that interface actually maps to.
+        wired_ports = wired_ports_from_specs(wiring_resolution.specs)
         candidates, malformed = walk_l3_nodes(canvas)
-        result = await validate_canvas_l3(candidates, malformed, touched_devices)
+        result = await validate_canvas_l3(candidates, malformed, touched_devices, wired_ports)
         invalid_routes = result.invalid_routes
 
     # S12 review fix, round 2: an informational l3_duplicate_route entry never

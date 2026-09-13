@@ -391,6 +391,15 @@ classifies it separately; see docs/DRIVERS.md), and `show ip route vrf <name>`
 answers `% VRF <name> not active`. Without the fixture the lab could only ever
 prove the failure case.
 
+Every device config that names `dummy0` in these tests declares it
+`"kind": "logical"` (ADR 0014 addendum X-J, issue #756). `dummy0` is not a port
+of the FRR node and nothing is cabled to it, so without that declaration HERD's
+interface-level attachment check refuses every route through it with
+`l3_interface_unwired` before the driver is ever called. The same configs give
+the node's real interface `eth0` an explicit `"port"` mapping, because the HERD
+device these tests create is cabled on port `ge-0/0/1` while the container's
+interface is named `eth0`.
+
 Creation is idempotent (each step is skipped when the object already exists) so
 a container restart re-enters it cleanly, and nothing ever deletes it: FRR
 refuses `no vrf <name>` with `% Only inactive VRFs can be deleted` while the

@@ -46,12 +46,26 @@ pytestmark = pytest.mark.asyncio
 # "zone" is required by the Layer 3 Switch registry schema
 # (herd_common/device_config.py) since mock_l3 publishes no config_schema() of
 # its own; "ip" stays prefixed so a route's next_hop can be verified inside it.
+#
+# ADR 0014 addenda X-J and X-K (issue #756) decide the other two fields:
+# - eth0 is the PHYSICAL interface behind the port these tests cable
+#   ("ge-0/0/1"), so it declares that port explicitly; without the mapping a
+#   route through eth0 would be refused with l3_interface_unwired, since the
+#   interface's own name is not a port of the switch.
+# - eth1 is an SVI, declared logical: it has no port of its own, so the
+#   interface-level check does not apply to it and the switch's own attachment
+#   stands. The trunk and VRF scenarios below route through it.
+# - eth2 is a PHYSICAL interface with no cable at all, which is what
+#   test_route_on_an_unwired_interface_is_refused_at_save drives.
 INTERFACES = [
-    {"name": "eth0", "ip": "10.0.0.1/24", "zone": "trust"},
-    {"name": "eth1", "ip": "10.0.1.1/24", "zone": "trust"},
+    {"name": "eth0", "ip": "10.0.0.1/24", "zone": "trust", "port": "ge-0/0/1"},
+    {"name": "eth1", "ip": "10.0.1.1/24", "zone": "trust", "kind": "logical"},
+    {"name": "eth2", "ip": "10.0.2.1/24", "zone": "trust"},
 ]
 ROUTE_A = {"destination": "10.20.0.0/24", "next_hop": "10.0.0.2", "interface": "eth0"}
 ROUTE_B = {"destination": "10.21.0.0/24", "next_hop": "10.0.1.2", "interface": "eth1"}
+# A route out of eth2, whose port nothing is cabled to (X-K, issue #756).
+ROUTE_UNWIRED = {"destination": "10.22.0.0/24", "next_hop": "10.0.2.2", "interface": "eth2"}
 
 
 @pytest.fixture(scope="session")
@@ -497,6 +511,108 @@ async def test_trunk_hop_with_intent_on_both_ends_drives_both_switches(admin_cli
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch_a['id']}")
         await admin_client.delete(f"/inventory/devices/{switch_b['id']}")
+
+
+# --- addendum X-K: interface-level attachment (issue #756) ------------------
+
+
+async def test_route_on_an_unwired_interface_is_refused_at_save(
+    admin_client, l3_switch, fresh_device
+):
+    """The switch has three config interfaces and exactly ONE cabled port:
+    ge-0/0/1, which eth0 declares. A route out of eth0 provisions; adding one out
+    of eth2 (physical, no cable) is refused at the fork save gate with
+    l3_interface_unwired, and nothing for it ever reaches the driver."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(nats_err)
+    connection = None
+    topology_id = None
+    reservation_id = None
+    try:
+        connection = await _create_connection(
+            admin_client, fresh_device["id"], l3_switch["id"], "ge-0/0/1"
+        )
+        topology_id = await _create_topology(
+            admin_client, _canvas_with_l3(fresh_device["id"], l3_switch["id"], [ROUTE_A])
+        )
+        reservation = await _reserve(
+            admin_client, [fresh_device["id"], l3_switch["id"]], topology_id
+        )
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+        # The WIRED interface provisions, so the refusal below is about eth2
+        # alone, not about the switch or this canvas in general.
+        assert await _poll_route_run(
+            admin_client, reservation_id, "configure_route", ROUTE_A["destination"]
+        ), "the route on the wired interface was never configured"
+
+        saved = await _save_fork(
+            admin_client,
+            reservation_id,
+            _canvas_with_l3(fresh_device["id"], l3_switch["id"], [ROUTE_A, ROUTE_UNWIRED]),
+        )
+        assert saved.status_code == 409, saved.text
+        detail = saved.json()["detail"]
+        assert detail["error"] == "l3_intent_invalid", detail
+        assert [r["reason"] for r in detail["invalid_routes"]] == ["l3_interface_unwired"], detail
+        assert detail["invalid_routes"][0]["index"] == 1, detail
+        assert detail["invalid_routes"][0]["device_id"] == l3_switch["id"], detail
+
+        # The refused save changed nothing: the fork still carries exactly the
+        # route it activated with, and the unwired destination never reached the
+        # device (no run of any status names it).
+        fork = await _get_fork(admin_client, reservation_id)
+        assert {r["destination"] for r in fork["l3_routes"]} == {ROUTE_A["destination"]}
+        for status in ("SUCCESS", "FAILED"):
+            runs = await _runs(admin_client, reservation_id, "configure_route", status=status)
+            assert ROUTE_UNWIRED["destination"] not in {r.get("port_a") for r in runs}, (
+                "a route refused at the save gate must never reach the driver"
+            )
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        if connection:
+            await admin_client.delete(f"/cabling/connections/{connection['id']}")
+
+
+async def test_reservation_create_is_refused_for_an_unwired_interface(
+    admin_client, l3_switch, fresh_device
+):
+    """The same refusal at the other gate: creating a reservation from a topology
+    whose switch routes out of an uncabled interface fails with the reservations
+    -side 422, carrying the same reason. No fork, no provisioning, no device."""
+    connection = None
+    topology_id = None
+    try:
+        connection = await _create_connection(
+            admin_client, fresh_device["id"], l3_switch["id"], "ge-0/0/1"
+        )
+        topology_id = await _create_topology(
+            admin_client, _canvas_with_l3(fresh_device["id"], l3_switch["id"], [ROUTE_UNWIRED])
+        )
+        now = datetime.now(timezone.utc)
+        resp = await admin_client.post(
+            "/reservations/",
+            json={
+                "device_ids": [fresh_device["id"], l3_switch["id"]],
+                "topology_id": topology_id,
+                "purpose": "l3 interface attachment integration test",
+                "start_time": now.isoformat(),
+                "end_time": (now + timedelta(hours=1)).isoformat(),
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "topology_routing_intent_invalid", detail
+        assert [r["reason"] for r in detail["invalid_routes"]] == ["l3_interface_unwired"], detail
+    finally:
+        if topology_id:
+            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        if connection:
+            await admin_client.delete(f"/cabling/connections/{connection['id']}")
 
 
 # --- addendum X-G: the VRF keyword reaches only a driver that declares support ---

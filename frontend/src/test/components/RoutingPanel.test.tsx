@@ -315,6 +315,41 @@ describe("RoutingPanel", () => {
       expect(storeRoutes()).toEqual([]);
     });
 
+    it("imports the config's routes verbatim and ignores its interfaces (X-J)", async () => {
+      // ADR 0014 addendum X-J (issue #756) adds `kind` and `port` to a config's
+      // INTERFACES, which Import does not read: it copies `config.routes`, whose
+      // shape X-J does not touch. The two new fields must therefore pass through
+      // this panel untouched, neither imported into a route row nor dropped from
+      // the config (nothing here writes a config back).
+      const config = {
+        interfaces: [
+          { name: "Ethernet1", ip: "10.9.9.1/24", zone: "trust", port: "ge-0/0/1" },
+          { name: "dummy0", ip: "192.0.2.254/30", zone: "trust", kind: "logical" },
+        ],
+        routes: [{ destination: "10.9.9.0/24", interface: "Ethernet1", next_hop: "10.9.9.2" }],
+      };
+      versionsQueryMock.mockReturnValue({ data: { items: [{ id: "cv-1" }] }, isFetching: false });
+      mockVersionDetail({ data: { config } });
+      seedStoreAndRender([]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Import from device config" }));
+
+      await waitFor(() =>
+        expect(storeRoutes()).toEqual([
+          {
+            destination: "10.9.9.0/24",
+            interface: "Ethernet1",
+            next_hop: "10.9.9.2",
+            virtual_router: null,
+          },
+        ]),
+      );
+      expect(config.interfaces).toEqual([
+        { name: "Ethernet1", ip: "10.9.9.1/24", zone: "trust", port: "ge-0/0/1" },
+        { name: "dummy0", ip: "192.0.2.254/30", zone: "trust", kind: "logical" },
+      ]);
+    });
+
     it("an errored fetch toasts the error and changes nothing (review fix F3)", async () => {
       versionsQueryMock.mockReturnValue({ data: { items: [{ id: "cv-1" }] }, isFetching: false });
       mockVersionDetail({ isError: true, error: { response: { data: { detail: "boom" } } } });
