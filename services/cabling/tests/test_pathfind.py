@@ -1,4 +1,5 @@
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base, get_db
@@ -35,6 +36,25 @@ async def setup_db():
 async def _override_get_db() -> AsyncSession:
     async with TestSessionLocal() as session:
         yield session
+
+
+@pytest.fixture(autouse=True)
+def unfiltered_visibility():
+    """Neutralize the issue #763 device-visibility filter for this suite.
+
+    These tests predate the filter and assert the UNFILTERED pathfind semantics
+    with a non-admin caller (the topology creator), through an ASGI client whose
+    auth dependency is overridden and which therefore sends no Authorization
+    header. Patching the route's ``resolve_caller_visibility`` to return None is
+    exactly what an admin caller produces: "no visibility filter applies". The
+    filter itself is pinned by the dedicated tests in
+    tests/test_visibility_oracle.py, which patch over this fixture.
+    """
+    with patch(
+        "app.routes.pathfind.resolve_caller_visibility",
+        AsyncMock(return_value=None),
+    ):
+        yield
 
 
 @pytest.fixture
@@ -676,6 +696,10 @@ async def test_batch_result_matches_single_endpoint_shape(admin_client, user_cli
     entry = batch.json()["results"][0]
     assert entry.pop("source_device_id") == str(a)
     assert entry.pop("target_device_id") == str(c)
+    # `error` is the batch's per-pair refusal channel (issue #763); the single
+    # route refuses with a 404 instead, so it has no such field. It is null on
+    # every normal result, which is what keeps the shapes otherwise identical.
+    assert entry.pop("error") is None
     assert entry == single.json()
 
 
