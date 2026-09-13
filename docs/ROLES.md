@@ -924,6 +924,40 @@ GET /api/cabling/topologies/{topology_id}
 Authorization: Bearer <any-authenticated-token>
 ```
 
+Decided 2026-09-13 (issue #763): this read stays open to every authenticated
+role, canvas and all. Topologies are shared lab artifacts that users hand each
+other to reserve and clone, and once validate and pathfind are visibility
+filtered (below), a bare device id sitting in someone's canvas answers nothing
+on its own: it cannot be turned into reachability, interface names, or subnets
+without a route that now refuses to answer for gear the caller cannot see.
+
+### Validate a topology
+
+```
+POST /api/cabling/topologies/{topology_id}/validate
+Authorization: Bearer <token>   # creator or admin
+```
+
+Returns the canvas's invalid edges and invalid routing intent for the topology
+editor. Admin and superadmin callers are judged against the whole fleet. For a
+non-admin caller the canvas is first filtered to the devices that caller can see
+(the same device-group visibility that gates `GET /api/inventory/devices`): a
+node naming a device outside it is reported through the existing
+`missing_device` reason, exactly as a node whose device reference resolves to
+nothing already is, and it is excluded from both the reachability pass and the
+Layer 3 routing-intent pass, so no interface or subnet question is ever asked
+about it. Issue #763: without that filter the route was a config-content oracle,
+answering per arbitrary device id whether it is a Layer 3 switch, which
+interfaces it has, and which subnets those interfaces carry. If the
+device-visibility lookup cannot be answered, a non-admin's request fails closed
+with a 503 and no partial result; admins never trigger the lookup. The
+service-to-service `POST /validate/internal` (X-Internal-Token, no acting user)
+is unfiltered and unchanged.
+
+A consequence worth stating: a non-admin who somehow has a hidden device on
+their canvas gets no routing-intent feedback for it. That is the intended
+trade; authoring L3 intent on gear you cannot see is not a supported workflow.
+
 ### Create a topology
 
 ```
@@ -1407,6 +1441,34 @@ If the device-visibility lookup cannot be answered, a non-admin's request fails 
 with a 503 rather than falling back to an unfiltered list; admins never trigger this
 lookup at all.
 
+### Find physical paths between devices
+
+```
+POST /api/cabling/pathfind
+POST /api/cabling/pathfind/batch
+Authorization: Bearer <any-authenticated-token>
+```
+
+Resolves every shortest physical cable path between a pair of devices (or, for
+`/batch`, many pairs against one graph build). Admin and superadmin callers get
+whole paths. For a non-admin caller (issue #763):
+
+- a pair naming a device outside the caller's device-group visibility is
+  refused. The single route answers `404 Device not found`, the same answer that
+  caller gets for a device id that does not exist at all, so the refusal itself
+  discloses nothing; the batch route reports that pair in place with
+  `reachable: false` and `error` set to the same wording, leaving the rest of
+  the batch resolved.
+- a transit hop through a device outside the caller's visibility is redacted:
+  `device_id` null, `hidden: true`, and no port names. The hop keeps its
+  position, so `hop_count`, the path count and reachability are exactly what an
+  admin would see and the topology editor keeps working.
+
+Before this, `PathHop.device_id` listed every transit hop to any authenticated
+user, which is how the ids for the validate-route oracle above were obtained in
+the first place. The visibility lookup fails closed here too: a non-admin gets a
+503 rather than an unfiltered path.
+
 ### Create a connection
 
 ```
@@ -1536,8 +1598,11 @@ Authorization: Bearer <admin-token>
 | `/api/cabling/connections/{id}` | GET | yes | yes | yes |
 | `/api/cabling/connections` | POST | | yes | yes |
 | `/api/cabling/connections/{id}` | DELETE | | yes | yes |
+| `/api/cabling/pathfind` | POST | yes, filtered to visible devices | yes | yes |
+| `/api/cabling/pathfind/batch` | POST | yes, filtered to visible devices | yes | yes |
 | `/api/cabling/topologies` | GET | yes | yes | yes |
 | `/api/cabling/topologies/{id}` | GET | yes | yes | yes |
+| `/api/cabling/topologies/{id}/validate` | POST | creator, filtered to visible devices | yes | yes |
 | `/api/cabling/topologies` | POST | yes | yes | yes |
 | `/api/cabling/topologies/{id}` | PUT | creator | yes | yes |
 | `/api/cabling/topologies/{id}` | DELETE | creator | yes | yes |
