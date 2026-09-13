@@ -12,10 +12,16 @@ export interface Connection {
   updated_at: string | null;
 }
 
+// A transit hop through a device outside a non-admin caller's device-group
+// visibility comes back redacted (issue #763): device_id null, hidden true, and
+// no port names. The hop keeps its place in the path, so hop_count and
+// reachability are what they always were; only the identity is withheld. Any
+// consumer that looks a hop up by device_id must tolerate null.
 export interface PathHop {
-  device_id: string;
+  device_id: string | null;
   port_in: string | null;
   port_out: string | null;
+  hidden?: boolean;
 }
 
 export interface PathfindResponse {
@@ -27,6 +33,10 @@ export interface PathfindResponse {
 export interface PathfindBatchResult extends PathfindResponse {
   source_device_id: string;
   target_device_id: string;
+  // Per-pair refusal (issue #763): set when the pair names a device the caller
+  // cannot see, null on every ordinary result, so an unreachable pair stays
+  // distinguishable from a refused one.
+  error?: string | null;
 }
 
 export interface PathfindBatchResponse {

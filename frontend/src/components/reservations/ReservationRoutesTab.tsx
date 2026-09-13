@@ -8,6 +8,15 @@ interface Props {
   deviceIds: string[];
 }
 
+// A hop the server redacted (issue #763: a transit device outside this
+// non-admin caller's visibility) carries no device_id and no port names. It
+// still occupies its place in the path, so it renders as an anonymous hop:
+// never the raw id, never a crash on the null.
+function hopLabel(hop: PathHop, deviceNameMap: Map<string, string> | undefined): string {
+  if (!hop.device_id) return "Hidden device";
+  return deviceNameMap?.get(hop.device_id) ?? hop.device_id.slice(0, 8);
+}
+
 function RouteHops({
   path,
   deviceNameMap,
@@ -21,16 +30,16 @@ function RouteHops({
         <Fragment key={idx}>
           {idx > 0 && (
             <div className="flex items-center gap-0.5 shrink-0 text-xs text-gray-400 font-mono">
-              <span>{path[idx - 1].port_out}</span>
+              {path[idx - 1].port_out && <span>{path[idx - 1].port_out}</span>}
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
               </svg>
-              <span>{hop.port_in}</span>
+              {hop.port_in && <span>{hop.port_in}</span>}
             </div>
           )}
           <div className="shrink-0 px-2.5 py-1.5 rounded border border-gray-200 bg-gray-50 text-center">
             <span className="text-xs font-medium text-gray-800 whitespace-nowrap">
-              {deviceNameMap?.get(hop.device_id) ?? hop.device_id.slice(0, 8)}
+              {hopLabel(hop, deviceNameMap)}
             </span>
           </div>
         </Fragment>

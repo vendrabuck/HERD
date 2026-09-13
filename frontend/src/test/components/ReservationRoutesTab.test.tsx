@@ -143,6 +143,42 @@ describe("ReservationRoutesTab", () => {
     ).toBeInTheDocument();
   });
 
+  it("renders a redacted transit hop anonymously and never shows an id (issue #763)", async () => {
+    server.use(
+      deviceNamesHandler([
+        { id: DEVICE_A, name: "spine-1" },
+        { id: DEVICE_B, name: "leaf-1" },
+      ]),
+      pathfindHandler({
+        [`${DEVICE_A}::${DEVICE_B}`]: {
+          reachable: true,
+          hop_count: 3,
+          paths: [
+            [
+              { device_id: DEVICE_A, port_in: null, port_out: "eth0" },
+              // What the server sends a non-admin for a transit device outside
+              // their visibility: no id, no ports, hidden true.
+              { device_id: null, port_in: null, port_out: null, hidden: true },
+              { device_id: DEVICE_B, port_in: "eth3", port_out: null },
+            ],
+          ],
+        },
+      }),
+    );
+    renderWithProviders(
+      <ReservationRoutesTab deviceIds={[DEVICE_A, DEVICE_B]} />,
+    );
+
+    // The card renders (a null device_id used to throw inside the hop label)
+    // and the hidden hop still occupies its place in the chain.
+    await waitFor(() =>
+      expect(screen.getByText("Hidden device")).toBeInTheDocument(),
+    );
+    expect(screen.getByText("3 hops")).toBeInTheDocument();
+    expect(screen.getAllByText("spine-1").length).toBe(2);
+    expect(screen.queryByText("null")).not.toBeInTheDocument();
+  });
+
   it("renders the error state when the batch pathfind request fails", async () => {
     server.use(
       deviceNamesHandler([]),
