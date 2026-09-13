@@ -10,6 +10,7 @@ import httpx
 from herd_common.jetstream import ensure_stream_exists
 from herd_common.l3_route_identity import route_identity_key
 from herd_common.l3_validation import (
+    usable_interface_attachments,
     usable_interfaces,
     usable_virtual_routers,
     validate_one_route,
@@ -2904,10 +2905,35 @@ async def _derive_l3_adjacency(
     return switches
 
 
+def _wired_ports_by_device(wires: list[dict]) -> dict[str, set[str]]:
+    """Every intended hop's port, grouped by the device id that owns it (ADR 0014
+    addendum X-K, issue #756).
+
+    The execution-side twin of cabling's ``wired_ports_from_specs``, over the same
+    hops in their over-the-wire dict form: cabling's fork rows are exactly what
+    ``_fetch_fork_intended_wires`` returns. Device ids are strings here, matching
+    every other device-id key in this module. A wire missing an endpoint field
+    contributes nothing for that end rather than a ``None`` key, so a malformed row
+    can never make an unrelated switch look wired.
+    """
+    ports: dict[str, set[str]] = {}
+    for wire in wires:
+        for device_key, port_key in (("device_a_id", "port_a"), ("device_b_id", "port_b")):
+            device_id = wire.get(device_key)
+            port = wire.get(port_key)
+            if device_id is None or port is None:
+                continue
+            ports.setdefault(str(device_id), set()).add(str(port))
+    return ports
+
+
 def _validate_route_at_drive_time(
     route: dict,
     interfaces: dict[str, str | None],
     virtual_routers: dict[str, set[str]] | None = None,
+    *,
+    interface_attachments: dict | None = None,
+    wired_ports: set[str] | None = None,
 ) -> str | None:
     """Unpack one route dict into the shared per-route L3 validation pass.
 
@@ -2920,6 +2946,11 @@ def _validate_route_at_drive_time(
     plain route dict carried on the fork's ``l3_routes`` payload
     (``destination``/``next_hop``/``interface``/``virtual_router``), since
     execution never imports cabling's ``RouteSpec`` across the service boundary.
+
+    ``wired_ports`` (addendum X-K, issue #756) is this switch's own hop-carrying
+    port names, derived from the fork's intended wires the caller already
+    fetched, so the interface-level reason is judged here with the same
+    vocabulary and order cabling's save gate uses.
     """
     return validate_one_route(
         route.get("destination"),
@@ -2928,6 +2959,8 @@ def _validate_route_at_drive_time(
         route.get("virtual_router"),
         interfaces=interfaces,
         virtual_routers=virtual_routers,
+        interface_attachments=interface_attachments,
+        wired_ports=wired_ports,
     )
 
 
@@ -2998,6 +3031,8 @@ async def _gate_l3_drive_routes(
     routes: list[dict],
     ctx: "_FetchContext",
     get_db_session,
+    *,
+    wired_ports: set[str],
 ) -> tuple[list[dict], str | None]:
     """Pre-flight gate for one switch's intent-driven route set, before any
     driver call (ADR 0014 addenda X-A and X-F, issue #34 phase 3).
@@ -3030,12 +3065,23 @@ async def _gate_l3_drive_routes(
     per-route reason vocabulary (``l3_switch_unconfigured`` when the switch has
     no config version or no usable interfaces, then per route:
     ``l3_bad_destination``, ``l3_bad_next_hop``, ``l3_unknown_interface``,
-    ``l3_next_hop_unverifiable``, ``l3_next_hop_outside_interface``). The
+    ``l3_interface_unwired``, ``l3_next_hop_unverifiable``,
+    ``l3_next_hop_outside_interface``). The
     attachment check (``l3_switch_unattached``) needs no re-check here: every
     caller of this function already established the switch is adjacent (an
     endpoint of a recorded hop) before calling it, whether through the ordinary
     derivation or the X-B intent override, so attachment is an invariant of
     being called at all, not something this gate re-verifies.
+
+    The INTERFACE-level check (``l3_interface_unwired``, addendum X-K, issue
+    #756) is a different matter and does run here, because switch-level
+    adjacency says nothing about WHICH port a route's interface claims.
+    ``wired_ports`` is required, not defaulted: every caller derives it from the
+    fork's intended wires it has already fetched (``_wired_ports_by_device``),
+    and a silently-skipped check is exactly what the argument being mandatory
+    prevents. Like the rest of X-A it applies only on the re-validating path; a
+    route whose validation stamp is current is trusted verbatim, the S6
+    amendment's deliberate gap, unchanged here.
     """
     if any(route.get("virtual_router") for route in routes):
         if not await _l3_driver_supports_vrf(switch_id, ctx, get_db_session):
@@ -3062,9 +3108,16 @@ async def _gate_l3_drive_routes(
     if not interfaces:
         return [], "l3_switch_unconfigured"
     virtual_routers = usable_virtual_routers(config.get("virtual_routers"))
+    interface_attachments = usable_interface_attachments(config.get("interfaces"))
 
     for route in routes:
-        reason = _validate_route_at_drive_time(route, interfaces, virtual_routers)
+        reason = _validate_route_at_drive_time(
+            route,
+            interfaces,
+            virtual_routers,
+            interface_attachments=interface_attachments,
+            wired_ports=wired_ports,
+        )
         if reason is not None:
             return [], reason
     return routes, None
@@ -3544,6 +3597,10 @@ async def _reconcile_l3_adjacency(
     )
 
     intended = await _derive_l3_adjacency(intended_wires, ctx, l3_intent)
+    # ADR 0014 addendum X-K (issue #756): the same intended wires, grouped as
+    # per-device port sets, so the drive-time gate can judge which PORT a route's
+    # interface claims, not merely that the switch is adjacent.
+    wired_ports = _wired_ports_by_device(intended_wires)
 
     async with get_db_session() as db:
         active_rows = await get_route_assignments(db, reservation_id)
@@ -3576,7 +3633,11 @@ async def _reconcile_l3_adjacency(
         intent_routes = l3_intent.get(switch_id)
         if intent_routes:
             clean, reason = await _gate_l3_drive_routes(
-                switch_id, intent_routes, ctx, get_db_session
+                switch_id,
+                intent_routes,
+                ctx,
+                get_db_session,
+                wired_ports=wired_ports.get(switch_id, set()),
             )
             if reason is not None:
                 async with get_db_session() as db:
@@ -3625,7 +3686,13 @@ async def _reconcile_l3_adjacency(
         intent_keys = _route_set_identity_keys(intent_routes)
         if pinned_keys == intent_keys:
             continue  # unchanged: no drive, no bookkeeping (S5's delta-gating shape)
-        clean, reason = await _gate_l3_drive_routes(switch_id, intent_routes, ctx, get_db_session)
+        clean, reason = await _gate_l3_drive_routes(
+            switch_id,
+            intent_routes,
+            ctx,
+            get_db_session,
+            wired_ports=wired_ports.get(switch_id, set()),
+        )
         if reason is not None:
             async with get_db_session() as db:
                 await record_route_reconcile_failed(
