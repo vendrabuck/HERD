@@ -33,7 +33,7 @@ markers = [
 
 [dependency-groups]
 dev = [
-    "ruff>=0.16.5",
+    "ruff>=0.16.6",
     "pip-audit>=2.10.1",
     "selenium>=4.48.0",
     "playwright>=1.62.0",
