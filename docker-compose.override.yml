@@ -97,6 +97,10 @@ services:
     # gitignored file. Set AI_CA_CERT=/certs/spark-ca.pem to use it.
     volumes:
       - ./spark-ca.pem:/certs/spark-ca.pem:ro
+      # Built-in documentation source (ADR 0015). The image already carries a
+      # copy; this mounts the checkout over it so a manual edit is live without
+      # rebuilding an image that has no code dev mount.
+      - ./docs/manual:/app/docs/manual:ro
 
   traefik:
     command:
