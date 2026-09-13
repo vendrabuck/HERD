@@ -18,9 +18,11 @@ from app.schemas.topology import (
     TopologyUpdate,
     TopologyValidationResponse,
 )
+from app.services.canvas_nodes import redact_invisible_device_nodes
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.topology_validation import run_full_topology_validation
 from app.services.version_service import commit_with_new_version
+from app.services.visible_devices import resolve_caller_visibility
 
 router = APIRouter(prefix="/topologies", tags=["topologies"])
 
@@ -230,6 +232,7 @@ async def validate_topology_internal(
 async def validate_topology(
     topology_id: uuid.UUID,
     payload: dict = Depends(get_current_user_payload),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
     """User-facing validate: returns invalid edges for the topology editor.
@@ -237,6 +240,19 @@ async def validate_topology(
     RBAC: validation reveals which device pairs lack physical paths, so it is
     restricted to the topology creator or admins. Service-to-service callers
     use /validate/internal instead.
+
+    Issue #763: for a NON-ADMIN caller the canvas is first redacted to the
+    devices that caller can see. A canvas may name any device uuid, and this
+    route answers, per named device, whether it is physically reachable and
+    (since ADR 0014 phase 1) whether it is a Layer 3 switch, which interfaces
+    it has, and which subnets those interfaces carry: a config-content oracle
+    for gear outside the caller's device-group visibility. A node naming a
+    hidden device is therefore reported through the EXISTING ``missing_device``
+    reason, indistinguishable from a node whose device reference resolves to
+    nothing, and it is excluded from the edge pass and the L3 pass exactly as
+    such a node already is. Admins are never filtered and never trigger the
+    inventory lookup. The visibility lookup fails CLOSED (503): an
+    unverifiable answer must not degrade into an unfiltered one.
     """
     topology = await db.get(Topology, topology_id)
     if not topology:
@@ -246,7 +262,18 @@ async def validate_topology(
     if str(topology.created_by) != payload["sub"] and user_role not in ("admin", "superadmin"):
         raise HTTPException(status_code=403, detail="Not authorized to validate this topology")
 
-    return await run_full_topology_validation(topology.canvas_data, db)
+    visible_ids = await resolve_caller_visibility(
+        payload,
+        authorization,
+        unavailable_detail=(
+            "Could not verify device visibility; the topology was not validated. Retry the request."
+        ),
+    )
+    canvas = topology.canvas_data
+    if visible_ids is not None:
+        canvas = redact_invisible_device_nodes(canvas, visible_ids)
+
+    return await run_full_topology_validation(canvas, db)
 
 
 @router.delete("/{topology_id}", status_code=status.HTTP_204_NO_CONTENT)
