@@ -81,6 +81,29 @@ class Settings(HerdBaseSettings):
     # can be flipped per environment once a confirmation UI is in place.
     ai_write_tools_enabled: bool = False
 
+    # Documentation lookup tools (ADR 0015, issue #31). Read-only reference
+    # material for the reservation assistant. The built-in manual corpus is on
+    # by default; operator corpora and web fetching are opt-in. The two tools
+    # are advertised only when at least one source is enabled, and the gate is
+    # re-checked at the dispatch boundary, not just in the advertised list.
+    ai_docs_manual_enabled: bool = True
+    # Comma-separated `name=/abs/path` entries, each a directory of .md, .txt,
+    # or .html files mounted into the container. A missing or unreadable
+    # directory is logged once and skipped, never fatal.
+    ai_docs_corpus_dirs: str = ""
+    # Web fetching is off by default: with it off, a read_doc naming the "web"
+    # source is refused at dispatch even if the model emits the call.
+    ai_docs_web_enabled: bool = False
+    # Comma-separated https:// URL prefixes the web source may fetch. End each
+    # prefix with "/" so it cannot match a longer sibling path. An empty list
+    # means nothing is fetchable, so the web source stays effectively off.
+    ai_docs_web_allowed_prefixes: str = ""
+    # Hard cap on the bytes read from one web response before the body is cut.
+    ai_docs_web_max_bytes: int = 524288
+    # Corpus indexes are built lazily and rebuilt when older than this, so an
+    # operator can update a mounted corpus without restarting the service.
+    ai_docs_index_ttl_seconds: int = 600
+
     # AI-assisted recipe authoring (ADR 0005, issue #28). Default off: the
     # feature asks an LLM to draft code that will run against lab
     # infrastructure after admin approval, so an operator must opt in per
