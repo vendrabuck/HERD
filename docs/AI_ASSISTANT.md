@@ -114,6 +114,11 @@ The tools are read-only and sit under the assistant's default posture: no
 See [ENV_VARS.md](ENV_VARS.md) for the six `AI_DOCS_*` settings and
 `docs/design/0015-assistant-docs-lookup.md` for the decision record.
 
+Known limitation of the web source: the public-address check and the HTTP client's
+connection resolve the host name separately, so a DNS-rebinding host could pass the check
+and connect to a private address on the second lookup. Only allowlist hosts you trust; the
+source ships disabled for this reason.
+
 ## Endpoint
 
 `POST /api/ai/reservations/{id}/assistant`

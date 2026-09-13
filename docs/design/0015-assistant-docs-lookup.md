@@ -66,7 +66,12 @@ request carries no HERD credentials and no caller JWT, only a fixed User-Agent; 
 existing per-hop timeout applies. Fetched text goes through the same HTML-to-text
 conversion, then the same tool result cap and untrusted framing as every other tool. The
 IP validation lives in one helper with a resolver seam so unit tests cover every refused
-class without network.
+class without network. Known limitation, recorded at review of PR #810: the address check
+and the HTTP client's own connection resolve the host name separately, so a DNS-rebinding
+host could pass the check and connect to a private address on the second lookup. Closing
+that window needs a transport that pins the validated address and sets the Host header by
+hand; it is deliberately left open because the web source ships disabled and behind an
+operator allowlist of trusted vendor hosts.
 
 **4. Path safety for corpora.** A `read_doc` path is resolved under the source root with
 symlinks followed and the result required to stay inside the root; anything else is
