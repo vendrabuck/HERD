@@ -829,3 +829,49 @@ proves the save gate refuses an unknown VRF with `l3_unknown_virtual_router`.
 **What this closes and leaves open.** Issue #755 closes. Interface-level attachment
 (#756) and the config-content oracle (#763) are unchanged. SR Linux carries no L3
 driver in HERD, so VRF on SR Linux is not exercised.
+
+## Amendment: interface-level attachment (2026-09-12, issue #756)
+
+Decided by Lane on 2026-09-12. `l3_switch_unattached` (Decision 5, S7) asserts only
+that the switch is an endpoint of a resolved hop; a route naming an interface that is
+not the wired one passed. This amendment closes that gap without breaking interfaces
+that are not ports at all.
+
+**X-J (interface kind and port mapping in the config schema).** Each `Layer 3 Switch`
+config `interfaces[]` entry gains two optional fields: `kind`, one of `physical` or
+`logical`, defaulting to `physical`; and `port`, the HERD inventory port name the
+interface corresponds to, defaulting to the interface `name`. The repo's own fixtures
+already name the switch's port and its config interface identically (`eth0`), so the
+default covers them; a switch whose OS names interfaces differently from its inventory
+ports declares `port` explicitly. `dummy0` in the NOS lab VRF fixture, loopbacks, and
+SVIs are declared `kind: logical`.
+
+**X-K (the interface-level check, strict for physical interfaces).** A tenth validation
+reason, `l3_interface_unwired`, runs after `l3_switch_unattached` in the shared
+validator: for a route whose interface is `physical`, the interface's port (X-J) must
+be `port_a` or `port_b` of a resolved hop whose corresponding device is this switch;
+otherwise the route is refused with `l3_interface_unwired`. A `logical` interface is
+exempt and the switch-level attachment stands. The check needs the resolved hops, so
+it runs in cabling's save gate and fork validation, where `resolve_canvas_wiring`'s
+specs are in hand (the validator gains a `wired_ports` argument, the set of this
+switch's port names appearing in the resolved specs; execution's drive-time
+re-validation passes the ports from the fork's intended wires it already fetches, so
+the reason vocabulary stays identical on both sides). A route naming an interface
+absent from the config is still `l3_unknown_interface`; this reason is only for a
+known physical interface with no hop on its port.
+
+**Frontend.** The Routing panel maps `l3_interface_unwired` to the interface field.
+The Import action carries `kind` and `port` through unchanged. `docs/TOPOLOGY_EDITOR.md`
+gains the reason row.
+
+**Tests.** Unit: the shared validator with physical wired, physical unwired, logical
+exempt, explicit `port` mapping, and default-kind behavior. Integration: a mock_l3
+switch with two ports where only one is cabled; a route on the wired interface
+provisions, a route on the unwired one is refused at save with the new reason.
+Live: the via-stack L3 test's throwaway switch config marks `dummy0` logical and adds
+a second physical interface with no cable; a route on it is refused, the existing
+`eth0` route still drives.
+
+**Left open.** #763 (config-content oracle) is unchanged. An interface named in a
+route but absent from the resolved hops because the hop was port-constrained to a
+different port is exactly what this refuses; that is the intent.
