@@ -39,6 +39,13 @@ COPY services/ai-orchestrator/alembic.ini .
 COPY services/ai-orchestrator/migrations/ migrations/
 COPY services/ai-orchestrator/app/ app/
 
+# The built-in `herd-manual` documentation source (ADR 0015, issue #31). The
+# build context is the repo root, so the published manual ships in the image
+# and the assistant can answer HERD how-to questions offline. The dev override
+# bind-mounts the checkout over this path so an edit shows up without a
+# rebuild; this service has no code dev mount, so nothing else here is live.
+COPY docs/manual/ /app/docs/manual/
+
 RUN uv pip install --system --no-deps -e /app/common \
     && uv pip install --system --no-deps --no-sources -e .
 

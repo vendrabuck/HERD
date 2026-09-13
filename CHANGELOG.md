@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- The reservation assistant can now consult documentation instead of answering
+  from training data (issue #31, ADR 0015). Two read-only tools, `search_docs`
+  and `read_doc`, search and page through named sources: the published HERD
+  manual, which now ships inside the ai-orchestrator image, plus any corpus an
+  operator mounts through `AI_DOCS_CORPUS_DIRS`, plus allowlisted https URLs
+  when `AI_DOCS_WEB_ENABLED` is on (off by default). The tools are advertised
+  only when at least one source is enabled and refused at the dispatch
+  boundary otherwise; a web fetch must match an allowed prefix, resolve
+  entirely to public addresses, survive re-validation at each of at most three
+  redirects, declare a text content type, and stay under a byte cap. Results
+  go through the same per-tool size cap and untrusted framing as every other
+  tool result.
+
 - Internal refactor, no behavior change: `GET /connections` (issue #719) now
   resolves its non-admin visibility filter through the shared
   `resolve_caller_visibility` helper (issue #763) instead of an inline copy of

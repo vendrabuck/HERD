@@ -36,6 +36,7 @@ from app.routes.reservation_assistant import router as reservation_assistant_rou
 from app.routes.template_identity import router as template_identity_router
 from app.routes.usage import router as usage_router
 from app.services.ai_client import ai_is_configured, get_provider_construction_status
+from app.services.docs_sources import log_source_summary
 from app.tasks.conversation_sweeper import conversation_sweeper_loop
 
 setup_logging("ai-orchestrator", level=settings.log_level)
@@ -62,6 +63,11 @@ async def lifespan(app: FastAPI):
         script_location=Path(__file__).resolve().parents[1] / "migrations",
         log=logger,
     )
+
+    # Builds the documentation-source registry once at startup so an
+    # unreadable corpus directory is reported here, not on a user's first
+    # question (ADR 0015). A bad entry is skipped, never fatal.
+    log_source_summary()
 
     sweeper_task = asyncio.create_task(
         conversation_sweeper_loop(interval_seconds=settings.assistant_sweeper_interval_seconds)
