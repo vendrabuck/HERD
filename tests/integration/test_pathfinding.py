@@ -148,6 +148,10 @@ async def test_batch_pathfind_resolves_pairs_in_order(admin_client, fresh_device
         first = dict(results[0])
         assert first.pop("source_device_id") == a
         assert first.pop("target_device_id") == c
+        # `error` is the batch's per-pair refusal channel (issue #763), null on
+        # every ordinary result; the single endpoint refuses with a 404 instead
+        # and so carries no such field.
+        assert first.pop("error") is None
         assert first == single
 
         # Unreachable pair uses the single endpoint's no-path shape.
