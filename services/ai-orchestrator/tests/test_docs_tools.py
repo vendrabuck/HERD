@@ -330,3 +330,36 @@ async def test_read_doc_refuses_a_web_page_that_resolves_privately(monkeypatch):
 def test_default_resolver_is_used_when_none_is_injected():
     dispatcher = ToolDispatcher(token="t", reservation_id=RESERVATION_ID)
     assert dispatcher._docs_resolver is docs_web.default_resolver
+
+
+async def test_the_dispatch_gate_refuses_web_before_the_fetch_helper_runs(tmp_path, monkeypatch):
+    """The handler's own flag check is the dispatch-boundary gate, and it is
+    not the fetch helper's identical check wearing a disguise.
+
+    Proven by replacing the helper with one that would happily return a page:
+    with web lookup disabled the refusal must still happen, and the helper must
+    never be reached. Without this, the two redundant checks cover for each
+    other and neither is pinned.
+    """
+    _manual(tmp_path, monkeypatch, {"index.html": "<html><body><p>hello</p></body></html>"})
+    reached: list[str] = []
+
+    async def permissive_fetch(url, **_kwargs):
+        reached.append(url)
+        return {
+            "source": "web",
+            "path": url,
+            "title": "leaked",
+            "text": "this must never reach the model",
+            "offset": 0,
+            "next_offset": None,
+        }
+
+    monkeypatch.setattr(docs_web, "fetch_web_document", permissive_fetch)
+
+    async with _dispatcher() as dispatcher:
+        result = await dispatcher.dispatch("read_doc", {"source": "web", "path": PAGE})
+
+    assert reached == [], "the fetch helper must not be reached while web lookup is disabled"
+    assert result["is_error"] is True
+    assert "web documentation lookup is disabled" in json.loads(result["content"])["message"]

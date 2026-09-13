@@ -531,11 +531,12 @@ def resolve_in_root(root: Path, relative: str) -> Path | None:
         resolved = (resolved_root / candidate).resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
-    if resolved != resolved_root and resolved_root not in resolved.parents:
-        return None
     try:
+        # The one containment check: both paths are fully resolved, so this is
+        # a lexical comparison of real locations. A `../` traversal and a
+        # symlink pointing out of the corpus both land here.
         relative_resolved = resolved.relative_to(resolved_root)
-    except ValueError:  # pragma: no cover - guarded by the parents check above
+    except ValueError:
         return None
     if not _is_indexable(relative_resolved):
         return None
