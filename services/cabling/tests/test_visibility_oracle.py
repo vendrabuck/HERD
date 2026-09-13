@@ -16,6 +16,12 @@ because `resolve_caller_visibility` calls it as a module global) and
 `l3_validation.call_service` (the device-type
 and config reads the L3 pass makes). Every test states what an ADMIN caller sees
 for the same canvas or pair, since the filter must be invisible to admins.
+
+`GET /connections` (issue #719) predates `resolve_caller_visibility` and was
+refactored onto it afterward with no behavior change; the admin-bypass and
+fail-closed pins for it live at the end of this file, alongside the other two
+consumers, for the same reason: they exercise the shared helper, not a route
+that duplicates its logic.
 """
 
 import uuid
@@ -26,6 +32,7 @@ import pytest
 from app.database import Base
 from app.models.connection import Connection
 from app.models.topology import Topology
+from app.routes.connections import list_connections_endpoint
 from app.routes.pathfind import pathfind_batch_endpoint, pathfind_endpoint
 from app.routes.topologies import validate_topology
 from app.schemas.pathfind import PathfindBatchRequest, PathfindRequest
@@ -441,3 +448,49 @@ async def test_batch_non_admin_fails_closed_when_visibility_unavailable():
                     db=db,
                 )
     assert exc.value.status_code == 503
+
+
+# --- connections list: same helper, same admin bypass and fail-closed rule --
+
+
+@pytest.mark.asyncio
+async def test_list_connections_admin_never_calls_the_visibility_lookup():
+    """Admins stay unfiltered and the visibility lookup is never invoked,
+    proving the bypass runs through `resolve_caller_visibility` unchanged
+    after the #719 endpoint moved onto it."""
+    fetch = AsyncMock(return_value=set())
+    async with TestSession() as db:
+        await _seed_chain(db)
+        with patch.object(visible_devices, "fetch_visible_device_ids", fetch):
+            result = await list_connections_endpoint(
+                device_id=None,
+                skip=0,
+                limit=50,
+                payload=_payload(role="admin"),
+                authorization=AUTH,
+                db=db,
+            )
+    assert result.total == 2
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_list_connections_non_admin_fails_closed_when_visibility_unavailable():
+    """An unanswerable visibility lookup is a 503 with NO partial result, same
+    as validate and pathfind: a broken check must never fall back to an
+    unfiltered list."""
+    fetch = AsyncMock(side_effect=VisibleDevicesUnavailableError("inventory down"))
+    async with TestSession() as db:
+        await _seed_chain(db)
+        with patch.object(visible_devices, "fetch_visible_device_ids", fetch):
+            with pytest.raises(HTTPException) as exc:
+                await list_connections_endpoint(
+                    device_id=None,
+                    skip=0,
+                    limit=50,
+                    payload=_payload(),
+                    authorization=AUTH,
+                    db=db,
+                )
+    assert exc.value.status_code == 503
+    assert "device visibility" in exc.value.detail

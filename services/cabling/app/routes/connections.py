@@ -2,7 +2,6 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from herd_common.auth import ADMIN_ROLES
 from herd_common.internal_auth import internal_token_matches
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,10 +22,7 @@ from app.services.connection_service import (
     get_connection,
     list_connections,
 )
-from app.services.visible_devices import (
-    VisibleDevicesUnavailableError,
-    fetch_visible_device_ids,
-)
+from app.services.visible_devices import resolve_caller_visibility
 
 logger = logging.getLogger(__name__)
 
@@ -62,35 +58,23 @@ async def list_connections_endpoint(
     was a reconnaissance step for the fork-membership exploit (#701),
     exposing device ids and port names for gear the caller could not
     otherwise see. Visibility is resolved from inventory by forwarding the
-    caller's own JWT; this fails CLOSED for non-admins (503, nothing
-    returned) if inventory cannot answer, since a broken visibility check
-    must never fall back to an unfiltered list. An empty visible set is a
-    legitimate "sees nothing" and short-circuits to an empty page without
-    querying the database.
+    caller's own JWT via `resolve_caller_visibility` (issue #763's shared
+    entry point, alongside the topology validate and pathfind routes); this
+    fails CLOSED for non-admins (503, nothing returned) if inventory cannot
+    answer, since a broken visibility check must never fall back to an
+    unfiltered list. An empty visible set is a legitimate "sees nothing" and
+    short-circuits to an empty page without querying the database.
     """
-    if payload.get("role") in ADMIN_ROLES:
+    visible_ids = await resolve_caller_visibility(
+        payload,
+        authorization,
+        unavailable_detail=(
+            "Could not verify device visibility; connections were not returned. Retry the request."
+        ),
+    )
+    if visible_ids is None:
         items, total = await list_connections(db, device_id=device_id, skip=skip, limit=limit)
         return PaginatedConnectionResponse(items=items, total=total, skip=skip, limit=limit)
-
-    if authorization is None:
-        raise HTTPException(
-            status_code=500,
-            detail="internal: missing Authorization header while resolving device visibility",
-        )
-    try:
-        visible_ids = await fetch_visible_device_ids(uuid.UUID(payload["sub"]), authorization)
-    except VisibleDevicesUnavailableError as exc:
-        logger.warning(
-            "connections_visibility_unavailable",
-            extra={"caller_id": payload.get("sub"), "error": str(exc)},
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Could not verify device visibility; connections were not "
-                "returned. Retry the request."
-            ),
-        ) from exc
 
     if not visible_ids:
         return PaginatedConnectionResponse(items=[], total=0, skip=skip, limit=limit)

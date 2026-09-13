@@ -139,7 +139,7 @@ async def test_delete_connection_not_found(admin_client):
 async def test_user_can_list(user_client):
     """A non-admin caller with an empty visible set still gets 200 + [] (issue #719)."""
     fetch = AsyncMock(return_value=set())
-    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
         resp = await user_client.get(
             "/connections", headers={"Authorization": "Bearer viewer-token"}
         )
@@ -643,7 +643,7 @@ async def test_non_admin_sees_only_connections_touching_visible_device(admin_cli
     assert resp2.status_code == 201
 
     fetch = AsyncMock(return_value={uuid.UUID(visible_dev)})
-    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
         resp = await user_client.get(
             "/connections", headers={"Authorization": "Bearer viewer-token"}
         )
@@ -689,7 +689,7 @@ async def test_non_admin_visible_set_total_matches_filtered_count(admin_client, 
     assert resp.status_code == 201
 
     fetch = AsyncMock(return_value={uuid.UUID(visible_dev)})
-    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
         resp = await user_client.get(
             "/connections?limit=2", headers={"Authorization": "Bearer viewer-token"}
         )
@@ -704,7 +704,7 @@ async def test_admin_list_connections_never_calls_inventory(admin_client):
     """Admins stay unfiltered and the visibility lookup is never invoked."""
     await admin_client.post("/connections", json=_connection_body())
     fetch = AsyncMock(return_value=set())
-    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
         resp = await admin_client.get("/connections")
     assert resp.status_code == 200
     assert resp.json()["total"] == 1
@@ -716,7 +716,7 @@ async def test_non_admin_empty_visible_set_returns_empty_page(admin_client, user
     """An empty visible-device set answers [] / total 0, no query against real data."""
     await admin_client.post("/connections", json=_connection_body())
     fetch = AsyncMock(return_value=set())
-    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
         resp = await user_client.get(
             "/connections", headers={"Authorization": "Bearer viewer-token"}
         )
@@ -731,7 +731,7 @@ async def test_non_admin_list_connections_inventory_unreachable_503(admin_client
     """Inventory unreachable answers 503 for a non-admin and returns nothing."""
     await admin_client.post("/connections", json=_connection_body())
     fetch = AsyncMock(side_effect=VisibleDevicesUnavailableError("boom"))
-    with patch("app.routes.connections.fetch_visible_device_ids", fetch):
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
         resp = await user_client.get(
             "/connections", headers={"Authorization": "Bearer viewer-token"}
         )

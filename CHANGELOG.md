@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Internal refactor, no behavior change: `GET /connections` (issue #719) now
+  resolves its non-admin visibility filter through the shared
+  `resolve_caller_visibility` helper (issue #763) instead of an inline copy of
+  the admin-check/fetch/503 sequence, the same helper the topology validate
+  and pathfind routes already use. Status codes, detail text, the admin
+  bypass, and the empty-visible-set short circuit are unchanged; the only
+  observable difference is the warning logged on an unanswerable inventory
+  lookup, which now carries the shared event key `caller_visibility_unavailable`
+  instead of the route-local `connections_visibility_unavailable`, matching
+  the other two consumers.
+
 - Device visibility now gates the topology validate route and both pathfind
   routes (issue #763, hardening). For a non-admin caller, a canvas node naming
   a device outside their device-group visibility is reported as
