@@ -314,6 +314,12 @@ existing `HERD_E2E_REQUIRE_NO_SKIP` skip-gate report, when that gate is also act
 that `HERD_E2E_ARTIFACT_DIR` (or its default) points somewhere writable and wasn't cleaned
 up between the failing run and when you looked.
 
+In the nightly GitHub Actions workflow, `HERD_E2E_ARTIFACT_DIR` is pointed into the job
+workspace, so any files written there upload as part of the `nightly-failure-artifacts`
+run artifact (7-day retention) alongside the compose diagnostics; a nightly e2e failure's
+screenshots, page HTML, console logs, and tracebacks are downloadable from the run's
+Actions page, not just the local `<tempdir>/herd-e2e-artifacts` default.
+
 ## Logs and where to look
 
 - **Global tail**: `make logs` (all containers).
