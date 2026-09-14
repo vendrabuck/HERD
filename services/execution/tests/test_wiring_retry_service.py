@@ -874,8 +874,9 @@ async def test_reattempt_rows_skips_id_deleted_before_refresh():
     """_reattempt_rows drives the ORM row objects it is handed directly, then refetches
     by id afterward to read back the outcome. A row deleted in that window (concurrent
     admin cleanup, a race) is silently skipped in the returned outcomes rather than
-    raising a KeyError or synthesizing a fake outcome for it, even though the driver
-    call for it still fired."""
+    raising a KeyError or synthesizing a fake outcome for it. Since issue #817 the
+    driver call for it does not fire either: the per-row claim is a compare-and-swap
+    on (id, status FAILED), which a deleted row cannot satisfy."""
     from app.services.wiring_retry_service import _reattempt_rows
 
     fid = await _seed_failed("0/0/1", "0/0/2", attempts=0)
@@ -907,7 +908,14 @@ async def test_reattempt_rows_skips_id_deleted_before_refresh():
             p.stop()
 
     assert outcomes == [], "a row missing on refresh contributes no outcome, not an error"
-    assert ("connect_ports", "0/0/1", "0/0/2") in calls, "the driver call still fired"
+    # Issue #817 changed this deliberately: the per-row drive claim is a
+    # compare-and-swap on (id, status FAILED), so a row DELETED before its claim can
+    # never be claimed and is never driven. Before the claim the apply keyed off the
+    # port pair alone and fired the driver for a ledger row that no longer existed,
+    # with nothing left to record the outcome against. Not driving it is the point.
+    assert ("connect_ports", "0/0/1", "0/0/2") not in calls, (
+        "the deleted row's driver call must not fire: its claim cannot be taken"
+    )
 
 
 # --- L2/L3 skipped stats in the background tick ------------------------------
