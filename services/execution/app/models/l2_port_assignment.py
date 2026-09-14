@@ -57,6 +57,13 @@ class L2PortAssignment(Base):
     (ACTIVE for join, RELEASED for leave) the row's last write was attempting,
     so the phase 4/5 retry channels can honor it exactly as the L1 retry channel
     does for cross-connects (issue #369).
+
+    `claimed_until` (issue #817) is the per-row drive claim the two wiring retry
+    channels take: a retry stamps it `now + budget` under a compare-and-swap
+    immediately before this row's own driver call and every record path clears it,
+    so the manual channel and the background tick can never drive the same row at
+    once. NULL means unclaimed; a stamp in the past is expired and reclaimable, so
+    a process that dies mid-drive needs no reaper.
     """
 
     __tablename__ = "l2_port_assignments"
@@ -83,3 +90,4 @@ class L2PortAssignment(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
