@@ -23,7 +23,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -297,6 +297,58 @@ async def release_l2_membership(
     return row
 
 
+async def _record_l2_failed_for_row(
+    db: AsyncSession,
+    row_id: uuid.UUID,
+    expected_status: str,
+    *,
+    res_uuid: uuid.UUID,
+    switch_uuid: uuid.UUID,
+    port: str,
+    attempts: int,
+    last_error: str,
+    vlan_uuid: uuid.UUID | None,
+    intended: str,
+) -> L2PortAssignment | None:
+    """The row-identity compare-and-swap behind record_l2_failed's `row_id` path.
+
+    See record_l2_failed's docstring for why the retry channels write by row id
+    (issue #814). One atomic `UPDATE ... WHERE id AND status`, no insert branch:
+    rowcount zero means a concurrent writer moved the row and this failure is stale
+    information about a row that no longer exists in the state it was loaded in.
+    """
+    values: dict = {
+        "status": "FAILED",
+        "intended": intended,
+        "attempts": func.coalesce(L2PortAssignment.attempts, 0) + attempts,
+        "last_error": last_error,
+    }
+    if vlan_uuid is not None:
+        values["vlan_assignment_id"] = vlan_uuid
+    result = await db.execute(
+        update(L2PortAssignment)
+        .where(L2PortAssignment.id == row_id, L2PortAssignment.status == expected_status)
+        .values(**values)
+    )
+    if result.rowcount == 0:
+        await db.rollback()
+        logger.warning(
+            "Ignoring stale L2 %s failure for switch %s port %s, reservation %s: "
+            "row %s is no longer %s (a concurrent writer won)",
+            "build" if intended == "ACTIVE" else "release",
+            switch_uuid,
+            port,
+            res_uuid,
+            row_id,
+            expected_status,
+        )
+        return None
+    await db.commit()
+    return (
+        await db.execute(select(L2PortAssignment).where(L2PortAssignment.id == row_id))
+    ).scalar_one_or_none()
+
+
 async def record_l2_failed(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,
@@ -307,7 +359,9 @@ async def record_l2_failed(
     last_error: str,
     *,
     intended: str,
-) -> L2PortAssignment:
+    row_id: uuid.UUID | None = None,
+    expected_status: str = "FAILED",
+) -> L2PortAssignment | None:
     """Write (or update) a FAILED membership row for a port op that could not be applied.
 
     `intended` (issue #369) is the direction THIS write was attempting: "ACTIVE" for a
@@ -325,10 +379,38 @@ async def record_l2_failed(
     that failed (the port is still genuinely a member), and recording it FAILED is the
     point of issue #369. `vlan_assignment_id` may be None only when a build never resolved
     an allocation; the row keeps its prior allocation in that case.
+
+    `row_id` (issue #814) switches the write from the key-based upsert to a
+    ROW-IDENTITY compare-and-swap, and is what both retry channels pass: a retry
+    records its outcome against the very row it loaded, never against whatever row
+    the key resolves to now. The write is one `UPDATE ... WHERE id = :id AND status
+    = :expected_status`; a `rowcount` of zero means the row was flipped (ACTIVE by a
+    racing reattempt, RELEASED by a save-driven teardown) or deleted while the driver
+    call was in flight, so nothing is written, nothing is INSERTED, and None comes
+    back with the same "a concurrent writer won" warning the #412 guard logs. The key
+    match above deliberately excludes RELEASED rows, so without this a stale retry
+    failure for a released membership found nothing and took the INSERT branch,
+    resurrecting a dead membership as a fresh FAILED intended-ACTIVE zombie row. The
+    fresh-build path passes no `row_id` and keeps the upsert: a build after a release
+    is a legitimate re-add.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
     vlan_uuid = _as_uuid(vlan_assignment_id) if vlan_assignment_id else None
+
+    if row_id is not None:
+        return await _record_l2_failed_for_row(
+            db,
+            row_id,
+            expected_status,
+            res_uuid=res_uuid,
+            switch_uuid=switch_uuid,
+            port=port,
+            attempts=attempts,
+            last_error=last_error,
+            vlan_uuid=vlan_uuid,
+            intended=intended,
+        )
 
     result = await db.execute(
         select(L2PortAssignment).where(

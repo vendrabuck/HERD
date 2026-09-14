@@ -54,6 +54,19 @@ sat FAILED. A stale build is never driven: it is parked FAILED intended RELEASED
 settles through the release-direction machinery on a later pass. An unverifiable
 intended set (fetch failure) drives nothing build-direction for that reservation that
 tick: unverifiable intent never drives hardware (the issue #460 philosophy).
+
+Row-identity failure writes (issue #814): a retry records its outcome against the ROW
+it loaded, never by key. Both channels pass the loaded row ids into the shared applies
+(retry_row_ids), which hand them to record_l1_failed/record_l2_failed/
+record_route_failed as `row_id`, turning the key-based upsert into a compare-and-swap
+on (id, status FAILED). A driver call can take seconds, and in that window the manual
+channel can flip the row ACTIVE and a fork save can then release it; the key upsert
+matches only non-RELEASED rows, so the late failure write found nothing and INSERTED a
+fresh FAILED intended-ACTIVE row, resurrecting a membership the reservation no longer
+intends. Under the CAS that write is a logged no-op. The two channels can still drive
+the same row concurrently (nothing claims a row yet, and neither can corrupt the other
+now that both write by identity); a claim (FOR UPDATE SKIP LOCKED or a claimed stamp)
+is the follow-up the issue names.
 """
 
 from __future__ import annotations
@@ -280,10 +293,19 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
     # they are left out of both apply sets.
     by_res_release: dict[str, dict[str, list[tuple[str, str, str | None]]]] = {}
     build_rows_by_res: dict[str, list[L1ConnectionAssignment]] = {}
+    # (issue #814) reservation -> (switch, canonical pair) -> the id of the row THIS
+    # channel loaded, so every failure write below records against that row under a
+    # compare-and-swap instead of upserting by key onto whatever row the key resolves
+    # to now. Keyed per reservation because two reservations can hold FAILED rows for
+    # the same (switch, pair): the ACTIVE-only partial-unique index does not stop them.
+    retry_ids_by_res: dict[str, dict[tuple[str, str, str], uuid.UUID]] = {}
     for row in rows:
         if row.id in superseded_ids:
             continue
         res_str = str(row.reservation_id)
+        retry_ids_by_res.setdefault(res_str, {})[
+            (str(row.switch_device_id), *canonical_port_pair(row.port_a, row.port_b))
+        ] = row.id
         if row.intended == "RELEASED":
             phys = str(row.physical_connection_id) if row.physical_connection_id else None
             by_res_release.setdefault(res_str, {}).setdefault(str(row.switch_device_id), []).append(
@@ -333,7 +355,13 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
             build_by_switch = by_res_build.get(res_str, {})
             release_by_switch = by_res_release.get(res_str, {})
             await _apply_wiring_pairs(
-                res_str, release_by_switch, build_by_switch, [], ctx, get_db_session
+                res_str,
+                release_by_switch,
+                build_by_switch,
+                [],
+                ctx,
+                get_db_session,
+                retry_row_ids=retry_ids_by_res.get(res_str),
             )
 
     async with get_db_session() as db:
@@ -522,13 +550,19 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
             for va_id, vlan_id in alloc.values():
                 vlan_by_va[va_id] = vlan_id
 
-        # reservation -> {"removes": [...], "adds": [...]} of membership op dicts.
+        # reservation -> {"removes": [...], "adds": [...]} of membership op dicts, plus
+        # (issue #814) reservation -> (switch, port) -> the id of the row THIS channel
+        # loaded, so every failure write inside the apply records against that row under
+        # a compare-and-swap instead of upserting by key. Keyed per reservation because
+        # two reservations can hold FAILED membership rows for the same (switch, port).
         by_res: dict[str, dict[str, list[dict]]] = {}
+        retry_ids_by_res: dict[str, dict[tuple[str, str], uuid.UUID]] = {}
         unresolved_ids: set[uuid.UUID] = set()
         for row in rows:
             if row.id in superseded_ids or row.id in blocked_build_ids:
                 continue
             res_str = str(row.reservation_id)
+            retry_ids_by_res.setdefault(res_str, {})[(str(row.switch_device_id), row.port)] = row.id
             if row.intended == "RELEASED":
                 entry = {
                     "switch_device_id": str(row.switch_device_id),
@@ -556,6 +590,7 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
                             1,
                             f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation for fabric",
                             intended="ACTIVE",
+                            row_id=row.id,
                         )
                     continue
                 va_id, vlan_id = alloc
@@ -572,7 +607,14 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
             by_res.setdefault(res_str, {"removes": [], "adds": []})["adds"].append(entry)
 
         for res_str, sets in by_res.items():
-            await _apply_l2_memberships(res_str, sets["removes"], sets["adds"], ctx, get_db_session)
+            await _apply_l2_memberships(
+                res_str,
+                sets["removes"],
+                sets["adds"],
+                ctx,
+                get_db_session,
+                retry_row_ids=retry_ids_by_res.get(res_str),
+            )
         if superseded_va_ids:
             await _release_orphaned_allocations(superseded_va_ids, get_db_session, ctx)
 
@@ -675,8 +717,13 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     # build rows are kept whole per reservation until their intent is confirmed.
     by_res: dict[str, dict[str, list[dict]]] = {}
     build_rows_by_res: dict[str, list[RouteAssignment]] = {}
+    # (issue #814) reservation -> switch -> the id of the pin row THIS channel loaded,
+    # so every failure write inside the apply records against that row under a
+    # compare-and-swap instead of upserting by (reservation, switch).
+    retry_ids_by_res: dict[str, dict[str, uuid.UUID]] = {}
     for row in rows:
         res_str = str(row.reservation_id)
+        retry_ids_by_res.setdefault(res_str, {})[str(row.device_id)] = row.id
         if row.intended == "RELEASED":
             entry = {"device_id": str(row.device_id), "routes": row.routes or []}
             by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[
@@ -743,7 +790,14 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
                     if reason is not None:
                         async with get_db_session() as db:
                             await record_route_failed(
-                                db, res_str, switch_id, None, 1, reason, intended="ACTIVE"
+                                db,
+                                res_str,
+                                switch_id,
+                                None,
+                                1,
+                                reason,
+                                intended="ACTIVE",
+                                row_id=row.id,
                             )
                         continue
                     entry = {"device_id": switch_id, "routes": clean}
@@ -755,7 +809,12 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
 
         for res_str, sets in by_res.items():
             await _apply_l3_adjacency(
-                res_str, sets["deprovisions"], sets["provisions"], ctx, get_db_session
+                res_str,
+                sets["deprovisions"],
+                sets["provisions"],
+                ctx,
+                get_db_session,
+                retry_row_ids=retry_ids_by_res.get(res_str),
             )
 
     async with get_db_session() as db:
