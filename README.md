@@ -527,7 +527,7 @@ Four jobs run on push/PR to main, plus a scheduled nightly workflow:
 - **frontend**: install deps (npm ci), lint (eslint), test (vitest), build (vite)
 - **integration** (advisory): boots the full ephemeral stack and runs the contract and integration suites
 - **nos-dialect** (advisory): boots the checked-in emulated-gear lab (a real Nokia SR Linux node and a real FRRouting node, `infra/nos-test/`) and runs the four driver-dialect suites against them; no HERD stack involved
-- **nightly** (scheduled, not on every PR): the heavier suites PR CI skips, contract, integration, e2e, a seeded headless locust load run, and the NOS lab's two via-stack feature suites (a real device driven through HERD's own reservation path)
+- **nightly** (scheduled, not on every PR): the heavier suites PR CI skips, contract, integration, e2e, a seeded headless locust load run, and the NOS lab's two via-stack feature suites (a real device driven through HERD's own reservation path). On failure it uploads compose and stack diagnostics plus any e2e failure artifacts (screenshot, page HTML, console log, traceback) as the `nightly-failure-artifacts` GitHub Actions artifact, 7-day retention.
 
 ## Documentation
 
