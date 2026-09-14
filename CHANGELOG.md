@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- The two wiring retry channels can no longer drive the same FAILED row at once
+  (issue #817). The manual endpoint and the background tick both load
+  hardware-retryable FAILED ledger rows and drive them through the same applies;
+  issue #814 stopped a late failure write from corrupting the ledger, but
+  nothing claimed a row before it was driven, so one connection could get two
+  concurrent driver calls, from two execution processes even, since the tick
+  runs in every replica. Each retried row is now claimed by a compare-and-swap
+  on a new nullable `claimed_until` column immediately before that row's own
+  driver call, and a row the other channel holds is skipped with no driver call
+  and no ledger write. The claim is taken at drive time rather than at
+  selection because one batch is driven sequentially behind a per-switch login,
+  so the last row of a batch can reach its driver call minutes after the batch
+  was selected. Its budget is derived from the driver-call timeout and the
+  in-line attempt count rather than a new setting, every record path clears the
+  stamp, and a stamp left behind by a process that died mid-drive expires by
+  itself, so there is no reaper and no heartbeat. The retry outcome vocabulary
+  gains a seventh value, `in_progress`, for a row the other channel was already
+  driving: reporting it beats omitting it, since an absent row reads as one that
+  was already fixed. The L1 and L2 FAILED-to-ACTIVE success flips also moved to
+  the same SQL compare-and-swap L3 already used, so all three layers share one
+  flip discipline.
+
 - A wiring retry no longer resurrects rows that were released while it was
   running (issue #814). Both retry channels (the manual endpoint and the
   background tick) now record a driver failure against the ROW they loaded,
