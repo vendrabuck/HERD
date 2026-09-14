@@ -65,8 +65,21 @@ matches only non-RELEASED rows, so the late failure write found nothing and INSE
 fresh FAILED intended-ACTIVE row, resurrecting a membership the reservation no longer
 intends. Under the CAS that write is a logged no-op. The two channels can still drive
 the same row concurrently (nothing claims a row yet, and neither can corrupt the other
-now that both write by identity); a claim (FOR UPDATE SKIP LOCKED or a claimed stamp)
-is the follow-up the issue names.
+now that both write by identity).
+
+Per-row drive claims (issue #817): the two channels can no longer drive the same row
+at all. Every retried row is claimed immediately before its own driver call by a
+compare-and-swap on the ledger row's `claimed_until` stamp (see wiring_claim), and a
+row the other channel already holds is not driven: the manual channel reports it as
+the seventh retry outcome, "in_progress", and the tick counts it and moves on. The
+claim is per row and taken at drive time, not at selection, because one selected
+batch is driven sequentially behind a per-switch login, so the last row of a batch
+can reach its driver call minutes after the batch was selected. Every record path
+clears the stamp, and a stamp left behind by a process that died mid-drive expires by
+itself, so there is no reaper and no heartbeat. The three per-tick selects also skip
+rows already claimed (FOR UPDATE SKIP LOCKED plus the claim predicate); the
+per-reservation FAILED readers deliberately do NOT, because the reconcile's
+stale-build widening shares them and must keep seeing every FAILED row.
 """
 
 from __future__ import annotations
@@ -105,6 +118,7 @@ from app.services.route_service import (
     failed_route_assignments_for_reservation,
     park_stale_route_build,
 )
+from app.services.wiring_claim import WiringRowClaims, claimable_row_ids
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +237,11 @@ def _l3_outcome(row: RouteAssignment, outcome: str) -> dict:
     }
 
 
-async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) -> list[dict]:
+async def _reattempt_rows(
+    rows: list[L1ConnectionAssignment],
+    get_db_session,
+    claims: WiringRowClaims | None = None,
+) -> list[dict]:
     """Reattempt a list of retryable FAILED rows in their own direction; return outcomes.
 
     Splits the rows by `intended` (issue #369, ADR 0009 Decision 2) before grouping by
@@ -263,6 +281,11 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
     A TransientUpstreamError from resolving a switch during the apply (inventory 5xx)
     still propagates to the caller: the manual endpoint maps it to 503; the background
     tick logs it and moves on. The rows stay FAILED for the next sweep.
+
+    Per-row drive claim (issue #817): a `WiringRowClaims` ledger rides into the apply,
+    which claims each row immediately before its own driver call. A row the OTHER
+    channel claimed first is not driven at all and reads back "in_progress", not
+    "still_failed": nothing failed, another channel is mid-drive on it.
     """
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
@@ -276,6 +299,7 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
     if not rows:
         return []
 
+    claims = claims if claims is not None else WiringRowClaims()
     retry_ids: list[uuid.UUID] = [row.id for row in rows]
 
     # Supersession guard (shared by both channels): a release whose port a newer build
@@ -362,6 +386,7 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
                 ctx,
                 get_db_session,
                 retry_row_ids=retry_ids_by_res.get(res_str),
+                claims=claims,
             )
 
     async with get_db_session() as db:
@@ -387,13 +412,22 @@ async def _reattempt_rows(rows: list[L1ConnectionAssignment], get_db_session) ->
             outcome = "reconnected"
         elif row.status == "RELEASED":
             outcome = "released"
+        elif rid in claims.lost:
+            # The other channel claimed this row before our driver call (issue #817).
+            # Reported after the settled statuses on purpose: if the winner has already
+            # finished, its real outcome is the honest answer.
+            outcome = "in_progress"
         else:
             outcome = "still_failed"
         outcomes.append(_outcome(row, outcome))
     return outcomes
 
 
-async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> list[dict]:
+async def _reattempt_l2_rows(
+    rows: list[L2PortAssignment],
+    get_db_session,
+    claims: WiringRowClaims | None = None,
+) -> list[dict]:
     """Reattempt FAILED L2 membership rows in their own direction; return outcomes.
 
     The L2 analogue of _reattempt_rows. Split by intended: an ACTIVE-intended row is an
@@ -428,6 +462,9 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
     the driver, so it flips RELEASED directly with no driver call and reads back
     "released". A fetch failure drives NOTHING build-direction for that reservation
     this tick (fail-closed, issue #460); release-direction rows are unaffected.
+
+    Per-row drive claim (issue #817), the _reattempt_rows shape: a row the other channel
+    claimed first is never driven and reads back "in_progress".
     """
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import record_l2_failed, release_l2_membership
@@ -445,6 +482,7 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
     if not rows:
         return []
 
+    claims = claims if claims is not None else WiringRowClaims()
     _NIL = uuid.UUID(int=0)
     retry_ids: list[uuid.UUID] = [row.id for row in rows]
 
@@ -614,6 +652,7 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
                 ctx,
                 get_db_session,
                 retry_row_ids=retry_ids_by_res.get(res_str),
+                claims=claims,
             )
         if superseded_va_ids:
             await _release_orphaned_allocations(superseded_va_ids, get_db_session, ctx)
@@ -637,13 +676,20 @@ async def _reattempt_l2_rows(rows: list[L2PortAssignment], get_db_session) -> li
             outcome = "reconnected"
         elif row.status == "RELEASED":
             outcome = "released"
+        elif rid in claims.lost:
+            # The other channel claimed this row before our driver call (issue #817).
+            outcome = "in_progress"
         else:
             outcome = "still_failed"
         outcomes.append(_l2_outcome(row, outcome, vlan_by_va.get(row.vlan_assignment_id)))
     return outcomes
 
 
-async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> list[dict]:
+async def _reattempt_l3_rows(
+    rows: list[RouteAssignment],
+    get_db_session,
+    claims: WiringRowClaims | None = None,
+) -> list[dict]:
     """Reattempt FAILED L3 route pins in their own direction; return outcomes.
 
     The L3 analogue of _reattempt_rows. Split by intended: an ACTIVE-intended row is a
@@ -694,6 +740,9 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     failure never blocks its siblings" guarantee). A gate transport failure for one
     row leaves that row FAILED and undriven this tick, exactly like an ordinary gate
     refusal, but never touches any other row.
+
+    Per-row drive claim (issue #817), the _reattempt_rows shape: a pin the other channel
+    claimed first is never driven and reads back "in_progress".
     """
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
@@ -710,6 +759,7 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
     if not rows:
         return []
 
+    claims = claims if claims is not None else WiringRowClaims()
     retry_ids: list[uuid.UUID] = [row.id for row in rows]
 
     # reservation -> {"deprovisions": [...], "provisions": [...]} of {device_id, routes}.
@@ -815,6 +865,7 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
                 ctx,
                 get_db_session,
                 retry_row_ids=retry_ids_by_res.get(res_str),
+                claims=claims,
             )
 
     async with get_db_session() as db:
@@ -834,6 +885,9 @@ async def _reattempt_l3_rows(rows: list[RouteAssignment], get_db_session) -> lis
             outcome = "reconnected"
         elif row.status == "RELEASED":
             outcome = "released"
+        elif rid in claims.lost:
+            # The other channel claimed this pin before our driver call (issue #817).
+            outcome = "in_progress"
         else:
             outcome = "still_failed"
         outcomes.append(_l3_outcome(row, outcome))
@@ -855,8 +909,16 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
     connection identity, the post-retry status/attempts/last_error, and an `outcome` of
     "reconnected" (a build succeeded), "released" (a release succeeded, issue #369),
     "superseded" (a release a newer build already made redundant, no driver call),
-    "still_failed", "not_retryable", or "frozen" (a build refused on a frozen
-    reservation).
+    "still_failed", "not_retryable", "frozen" (a build refused on a frozen
+    reservation), or "in_progress" (issue #817: the background tick holds this row's
+    drive claim, so this call drove nothing for it).
+
+    The claim is checked twice, deliberately. Rows already claimed when this call starts
+    are reported "in_progress" up front, before any driver work, through
+    claimable_row_ids; a row claimed in the window between that check and its own driver
+    call loses the per-row compare-and-swap inside the apply and is reported the same way
+    from the read-back. Reporting the row rather than omitting it is the issue #817
+    decision: an absent row reads to the caller as one that was already fixed.
     """
     res_str = str(reservation_id)
     async with get_db_session() as db:
@@ -906,9 +968,35 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
         else:
             results.append(_l3_outcome(row, "not_retryable"))
 
-    results.extend(await _reattempt_rows(retryable, get_db_session))
-    results.extend(await _reattempt_l2_rows(retryable_l2, get_db_session))
-    results.extend(await _reattempt_l3_rows(retryable_l3, get_db_session))
+    # Per-row drive claim (issue #817): a row the background tick is already driving is
+    # reported "in_progress" without a driver call. The unfiltered per-reservation
+    # readers above are what let this call still SEE such a row (they are shared with
+    # the reconcile's stale-build widening and deliberately carry no claim predicate;
+    # see wiring_claim's module docstring), and claimable_row_ids is the retry-only
+    # reader that says which of them are free right now.
+    claims = WiringRowClaims()
+    async with get_db_session() as db:
+        free_l1 = await claimable_row_ids(db, L1ConnectionAssignment, [r.id for r in retryable])
+        free_l2 = await claimable_row_ids(db, L2PortAssignment, [r.id for r in retryable_l2])
+        free_l3 = await claimable_row_ids(db, RouteAssignment, [r.id for r in retryable_l3])
+
+    for row in retryable:
+        if row.id not in free_l1:
+            results.append(_outcome(row, "in_progress"))
+    for row in retryable_l2:
+        if row.id not in free_l2:
+            results.append(_l2_outcome(row, "in_progress"))
+    for row in retryable_l3:
+        if row.id not in free_l3:
+            results.append(_l3_outcome(row, "in_progress"))
+
+    retryable = [row for row in retryable if row.id in free_l1]
+    retryable_l2 = [row for row in retryable_l2 if row.id in free_l2]
+    retryable_l3 = [row for row in retryable_l3 if row.id in free_l3]
+
+    results.extend(await _reattempt_rows(retryable, get_db_session, claims))
+    results.extend(await _reattempt_l2_rows(retryable_l2, get_db_session, claims))
+    results.extend(await _reattempt_l3_rows(retryable_l3, get_db_session, claims))
     return {"reservation_id": res_str, "results": results}
 
 
@@ -927,9 +1015,18 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     batch cap bounds one tick exactly as the health scheduler's batch cap does; a repeat
     failure accumulates attempts, so a row converges toward the cap and eventually stops
     being swept.
+
+    Per-row drive claim (issue #817): the three selects skip rows another channel already
+    holds, and each row is claimed again by a compare-and-swap immediately before its own
+    driver call, so the tick never drives a row the manual endpoint is working on. Such a
+    row is simply left alone and counted in the additive `in_progress` stat.
     """
     batch = max(1, settings.wiring_retry_batch_size)
     max_attempts = settings.wiring_retry_max_attempts
+    # One claim ledger for the whole tick (issue #817): the three selects already
+    # skipped rows claimed before the tick started, and the per-row compare-and-swap
+    # inside each apply catches a row the manual channel claimed since.
+    claims = WiringRowClaims()
 
     async with get_db_session() as db:
         due = await due_failed_rows(db, batch, max_attempts)
@@ -946,6 +1043,9 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         "released": 0,
         "superseded": 0,
         "still_failed": 0,
+        # Rows the manual channel was already driving when this tick reached them
+        # (issue #817): additive counter, the tick's view of a lost claim.
+        "in_progress": 0,
         "skipped_frozen": 0,
         "skipped_not_retryable": 0,
         "l1_rows_retried": 0,
@@ -1002,10 +1102,12 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
                 stats["superseded"] += 1
             elif o["outcome"] == "still_failed":
                 stats["still_failed"] += 1
+            elif o["outcome"] == "in_progress":
+                stats["in_progress"] += 1
 
     if to_retry:
         try:
-            outcomes = await _reattempt_rows(to_retry, get_db_session)
+            outcomes = await _reattempt_rows(to_retry, get_db_session, claims)
         except Exception:
             # A TransientUpstreamError (or any resolve failure) must never wedge the
             # loop: the rows stay FAILED and the next tick re-sweeps them.
@@ -1018,7 +1120,7 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
 
     if to_retry_l2:
         try:
-            outcomes_l2 = await _reattempt_l2_rows(to_retry_l2, get_db_session)
+            outcomes_l2 = await _reattempt_l2_rows(to_retry_l2, get_db_session, claims)
         except Exception:
             logger.warning(
                 "wiring retry tick: L2 reattempt failed; rows stay FAILED", exc_info=True
@@ -1029,7 +1131,7 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
 
     if to_retry_l3:
         try:
-            outcomes_l3 = await _reattempt_l3_rows(to_retry_l3, get_db_session)
+            outcomes_l3 = await _reattempt_l3_rows(to_retry_l3, get_db_session, claims)
         except Exception:
             logger.warning(
                 "wiring retry tick: L3 reattempt failed; rows stay FAILED", exc_info=True

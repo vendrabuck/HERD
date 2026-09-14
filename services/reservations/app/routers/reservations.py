@@ -1055,6 +1055,12 @@ async def retry_reservation_wiring(
     Proxies execution's internal retry endpoint and relays its structured per-connection
     outcomes verbatim, including execution's own 409 (wiring frozen, build-only) and its
     503 (upstream unavailable); an unreachable execution service maps to 503.
+
+    The relayed outcome vocabulary is seven-valued: reconnected, released, superseded,
+    still_failed, not_retryable, frozen, and (issue #817) in_progress, a row the
+    background retry channel already holds the drive claim for, so this call drove
+    nothing for it. `outcome` is a plain string here and downstream, so a new value
+    changes no schema.
     """
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")

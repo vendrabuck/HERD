@@ -301,7 +301,7 @@
     <ol class="legend">
       <li><b>A healthy connection.</b> The switch, the layer-specific detail (an L1 port pair, an L2 port and VLAN, or an L3 route count), an <span class="badge active">ACTIVE</span> status, and the attempt count. Released rows show a gray RELEASED instead.</li>
       <li><b>A failed connection.</b> The status goes red and the driver's actual error is printed underneath. <strong>Your saved wiring is not rolled back</strong> &mdash; the intent stays durable, only the hardware apply failed.</li>
-      <li><b>Retry failed.</b> Reattempts every retryable failed row across all layers at once; a toast summarizes how many reconnected, released, are still failing, or are not retryable. The button appears only while the reservation is <span class="badge active">ACTIVE</span> and something is actually retryable.</li>
+      <li><b>Retry failed.</b> Reattempts every retryable failed row across all layers at once; a toast summarizes how many reconnected, released, are still failing, are not retryable, or were already being retried by HERD's own background channel and so were left alone. The button appears only while the reservation is <span class="badge active">ACTIVE</span> and something is actually retryable.</li>
     </ol>
 
     <div class="callout tip">

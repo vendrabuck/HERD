@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l2_port_assignment import L2PortAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
+from app.services.wiring_claim import unclaimed
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,8 @@ async def record_l2_membership_active(
         # settlement (the #424 supersession) needs one tick, not a driver call.
         stale.attempts = 0
         stale.last_error = STALE_JOIN_SUPERSEDED_PENDING_REMOVAL
+        # Parked for the release channel; it holds no drive claim (issue #817).
+        stale.claimed_until = None
         logger.warning(
             "Parking stale ACTIVE L2 membership of frozen reservation %s on "
             "switch %s port %s FAILED intended RELEASED: reservation %s "
@@ -202,6 +205,8 @@ async def record_l2_membership_active(
             # so the pending remove drives the real fabric VLAN.
             row.vlan_assignment_id = vlan_uuid
             row.last_error = FROZEN_JOIN_PENDING_REMOVAL
+            # This write finalizes the row for the release channel (issue #817).
+            row.claimed_until = None
         await db.commit()
         await db.refresh(row)
         logger.warning(
@@ -215,11 +220,40 @@ async def record_l2_membership_active(
 
     reusable = await _find_reusable_failed(db, res_uuid, switch_uuid, port)
     if reusable is not None:
-        reusable.status = "ACTIVE"
-        reusable.intended = "ACTIVE"
-        reusable.vlan_assignment_id = vlan_uuid
-        reusable.last_error = None
-        reusable.released_at = None
+        result = await db.execute(
+            update(L2PortAssignment)
+            .where(
+                L2PortAssignment.id == reusable.id,
+                L2PortAssignment.status == "FAILED",
+            )
+            .values(
+                status="ACTIVE",
+                intended="ACTIVE",
+                vlan_assignment_id=vlan_uuid,
+                last_error=None,
+                released_at=None,
+                # The row is settled ACTIVE, so it holds no drive claim (issue #817).
+                claimed_until=None,
+            )
+        )
+        if result.rowcount == 0:
+            # A concurrent writer (the consumer apply and either retry channel all
+            # reach this function) flipped or released the row between our SELECT and
+            # this UPDATE: never overwrite the winner, re-read and return its row
+            # as-is. The same SQL compare-and-swap record_route_active uses, aligned
+            # here by issue #817 so all three layers share one flip discipline.
+            await db.rollback()
+            winner = (
+                await db.execute(select(L2PortAssignment).where(L2PortAssignment.id == reusable.id))
+            ).scalar_one_or_none()
+            logger.info(
+                "stale reattempt writer skipped for switch %s port %s, reservation %s: "
+                "row already flipped by a concurrent writer",
+                switch_uuid,
+                port,
+                res_uuid,
+            )
+            return winner
         await db.commit()
         await db.refresh(reusable)
         logger.info(
@@ -287,6 +321,8 @@ async def release_l2_membership(
     row.intended = "RELEASED"
     row.last_error = None
     row.released_at = datetime.now(timezone.utc)
+    # A settled row holds no drive claim (issue #817).
+    row.claimed_until = None
     await db.commit()
     logger.info(
         "Released L2 membership for switch %s port %s, reservation %s",
@@ -322,6 +358,8 @@ async def _record_l2_failed_for_row(
         "intended": intended,
         "attempts": func.coalesce(L2PortAssignment.attempts, 0) + attempts,
         "last_error": last_error,
+        # The drive this failure records is over, so release the claim (issue #817).
+        "claimed_until": None,
     }
     if vlan_uuid is not None:
         values["vlan_assignment_id"] = vlan_uuid
@@ -435,6 +473,8 @@ async def record_l2_failed(
         row.intended = intended
         row.attempts = (row.attempts or 0) + attempts
         row.last_error = last_error
+        # The drive this failure records is over, so release the claim (issue #817).
+        row.claimed_until = None
         if vlan_uuid is not None:
             row.vlan_assignment_id = vlan_uuid
         await db.commit()
@@ -484,6 +524,8 @@ async def park_stale_l2_build(
     row.intended = "RELEASED"
     row.attempts = 0
     row.last_error = reason
+    # Parking hands the row to the release channel; drop the claim (issue #817).
+    row.claimed_until = None
     await db.commit()
     logger.warning(
         "Build intent gone for L2 membership %s (switch %s port %s, reservation %s); "
@@ -632,20 +674,30 @@ async def due_failed_l2_rows(
     db: AsyncSession,
     limit: int,
     max_attempts: int,
+    now: datetime | None = None,
 ) -> list[L2PortAssignment]:
     """FAILED membership rows still under the attempts cap, oldest first, batch-capped.
 
     The background auto-retry channel's per-tick L2 candidate set, the due_failed_rows
     analogue. Retryability and the frozen guard are applied by the caller.
+
+    RETRY-ONLY, so it also filters on the issue #817 drive claim and takes FOR UPDATE
+    SKIP LOCKED, exactly like due_failed_rows: a row another channel is currently
+    driving is not a candidate. The per-row compare-and-swap in
+    wiring_claim.WiringRowClaims.claim is the real guard; the reconcile's stale-build
+    widening reader deliberately carries neither (see wiring_claim's module docstring).
     """
+    now = now or datetime.now(timezone.utc)
     result = await db.execute(
         select(L2PortAssignment)
         .where(
             L2PortAssignment.status == "FAILED",
             L2PortAssignment.attempts < max_attempts,
+            unclaimed(L2PortAssignment, now),
         )
         .order_by(L2PortAssignment.created_at.asc())
         .limit(limit)
+        .with_for_update(skip_locked=True)
     )
     return list(result.scalars().all())
 

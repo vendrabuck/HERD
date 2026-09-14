@@ -439,7 +439,8 @@ export function useReservationWiringStatus(reservationId: string | null | undefi
 // Summarize a retry response's per-connection outcomes into the counts the endpoint
 // reports for the toast. Every outcome is counted so the parts always sum to
 // results.length (ADR 0009 phase 3, issue #369: released and superseded were previously
-// dropped, and frozen is new for ended-reservation build rows).
+// dropped, and frozen is new for ended-reservation build rows; issue #817 adds
+// in_progress for a row the background retry channel was already driving).
 export function summarizeWiringRetry(result: WiringRetryResponse): {
   reconnected: number;
   released: number;
@@ -447,6 +448,7 @@ export function summarizeWiringRetry(result: WiringRetryResponse): {
   still_failed: number;
   not_retryable: number;
   frozen: number;
+  in_progress: number;
 } {
   const counts = {
     reconnected: 0,
@@ -455,6 +457,7 @@ export function summarizeWiringRetry(result: WiringRetryResponse): {
     still_failed: 0,
     not_retryable: 0,
     frozen: 0,
+    in_progress: 0,
   };
   for (const r of result.results) {
     if (r.outcome === "reconnected") counts.reconnected += 1;
@@ -463,6 +466,7 @@ export function summarizeWiringRetry(result: WiringRetryResponse): {
     else if (r.outcome === "still_failed") counts.still_failed += 1;
     else if (r.outcome === "not_retryable") counts.not_retryable += 1;
     else if (r.outcome === "frozen") counts.frozen += 1;
+    else if (r.outcome === "in_progress") counts.in_progress += 1;
   }
   return counts;
 }
@@ -472,8 +476,15 @@ export function useRetryReservationWiring() {
   return useMutation({
     mutationFn: (reservationId: string) => retryReservationWiring(reservationId),
     onSuccess: (result, reservationId) => {
-      const { reconnected, released, superseded, still_failed, not_retryable, frozen } =
-        summarizeWiringRetry(result);
+      const {
+        reconnected,
+        released,
+        superseded,
+        still_failed,
+        not_retryable,
+        frozen,
+        in_progress,
+      } = summarizeWiringRetry(result);
       const parts = [
         `${reconnected} reconnected`,
         `${released} released`,
@@ -481,14 +492,18 @@ export function useRetryReservationWiring() {
         `${not_retryable} not retryable`,
       ];
       // Superseded is rare and frozen is unreachable from the ACTIVE-only button, so
-      // show each only when it actually happened to keep the common toast short.
+      // show each only when it actually happened to keep the common toast short. The
+      // same applies to in_progress (issue #817): the background channel was already
+      // retrying those rows, so they are worth naming but usually absent.
       if (superseded > 0) parts.push(`${superseded} superseded`);
       if (frozen > 0) parts.push(`${frozen} frozen`);
+      if (in_progress > 0) parts.push(`${in_progress} already retrying`);
       const summary = `Retry complete: ${parts.join(", ")}`;
       if (
         still_failed === 0 &&
         not_retryable === 0 &&
         frozen === 0 &&
+        in_progress === 0 &&
         reconnected + released + superseded > 0
       ) {
         toast.success(summary);

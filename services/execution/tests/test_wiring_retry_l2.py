@@ -570,4 +570,11 @@ async def test_reattempt_l2_rows_skips_id_deleted_before_refresh():
         outcomes = await _reattempt_l2_rows(rows, _db_session_factory())
 
     assert outcomes == [], "a row missing on refresh contributes no outcome, not an error"
-    assert ("add_to_vlan", "0/0/1") in calls, "the driver call still fired"
+    # Issue #817 changed this deliberately: the per-row drive claim is a
+    # compare-and-swap on (id, status FAILED), so a row DELETED before its claim can
+    # never be claimed and is never driven. Before the claim the apply keyed off the
+    # port pair alone and fired the driver for a ledger row that no longer existed,
+    # with nothing left to record the outcome against. Not driving it is the point.
+    assert ("add_to_vlan", "0/0/1") not in calls, (
+        "the deleted row's driver call must not fire: its claim cannot be taken"
+    )

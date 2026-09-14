@@ -486,7 +486,14 @@ async def test_reattempt_l3_rows_skips_id_deleted_before_refresh():
         outcomes = await _reattempt_l3_rows(rows, _db_session_factory())
 
     assert outcomes == [], "a row missing on refresh contributes no outcome, not an error"
-    assert calls, "the driver call still fired"
+    # Issue #817 changed this deliberately: the per-row drive claim is a
+    # compare-and-swap on (id, status FAILED), so a row DELETED before its claim can
+    # never be claimed and is never driven. Before the claim the apply keyed off the
+    # port pair alone and fired the driver for a ledger row that no longer existed,
+    # with nothing left to record the outcome against. Not driving it is the point.
+    assert not any(c[0] in ("configure_route", "remove_route") for c in calls), (
+        "the deleted pin's driver call must not fire: its claim cannot be taken"
+    )
 
 
 # --- ADR 0014 addendum X5 (issue #34 phase 3): retry-channel intent revalidation ---

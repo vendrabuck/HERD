@@ -379,14 +379,17 @@ export interface WiringStatusResponse {
 // release a newer build already made redundant (no driver call), "still_failed" a
 // reattempt failed again, "not_retryable" a pinned unresolvable intent (recovery is a
 // re-save), "frozen" a build refused on an ended reservation (release-direction rows
-// still retry; ADR 0009 phase 3, issue #369).
+// still retry; ADR 0009 phase 3, issue #369), "in_progress" the background retry
+// channel holds this row's drive claim, so this call drove nothing for it and the
+// row is neither fixed nor failed yet (issue #817).
 export type WiringRetryOutcomeKind =
   | "reconnected"
   | "released"
   | "superseded"
   | "still_failed"
   | "not_retryable"
-  | "frozen";
+  | "frozen"
+  | "in_progress";
 
 // Layered since ADR 0009 phases 4-5 (issue #416): `layer` is "l1" for a cross-connect row
 // (port_a/port_b/physical_connection_id populated), "l2" for a VLAN membership row

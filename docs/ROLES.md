@@ -1055,7 +1055,9 @@ terminal statuses `COMPLETED`/`CANCELLED`/`FAILED`, and returns `409` only for
 `PENDING`/`PENDING_PROVISION` (there is no provisioned wiring to reattempt yet).
 On an ended reservation the freeze is direction-scoped (ADR 0009 phase 3): a
 build is still refused (execution reports it `frozen` or relays its own `409`),
-while a stuck release-direction disconnect may finish:
+while a stuck release-direction disconnect may finish. A row the background
+retry channel is already driving is reported `in_progress` and left alone
+(issue #817), so a retry never doubles a driver call:
 
 ```
 GET  /api/reservations/{reservation_id}/wiring-status   # owner or admin, any status

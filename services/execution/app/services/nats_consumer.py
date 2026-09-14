@@ -5,6 +5,7 @@ import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
 import httpx
 from herd_common.jetstream import ensure_stream_exists
@@ -20,8 +21,14 @@ from herd_common.retry import retry_with_backoff
 from sqlalchemy import select
 
 from app.config import settings
+from app.models.l1_connection_assignment import L1ConnectionAssignment
+from app.models.l2_port_assignment import L2PortAssignment
+from app.models.route_assignment import RouteAssignment
 from app.services.execution_service import driver_result_failed
 from app.services.health_scheduler import apply_reservation_event_tiers
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from app.services.wiring_claim import WiringRowClaims
 
 logger = logging.getLogger(__name__)
 
@@ -1438,6 +1445,7 @@ async def _apply_wiring_pairs(
     ctx: "_FetchContext",
     get_db_session,
     retry_row_ids: dict[tuple[str, str, str], uuid.UUID] | None = None,
+    claims: "WiringRowClaims | None" = None,
 ) -> None:
     """Apply an L1 reconcile: release the released pairs, then build the built ones.
 
@@ -1463,6 +1471,12 @@ async def _apply_wiring_pairs(
     nothing at all if a concurrent writer flipped or released that row while the
     driver call was in flight. The reconcile path passes nothing and keeps the upsert
     (a build after a release is a legitimate re-add).
+
+    `claims` (issue #817) is the retry pass's per-row claim ledger, passed together
+    with `retry_row_ids`: each retried row is claimed by a compare-and-swap on
+    `claimed_until` immediately before its own driver call, and a row another channel
+    already holds is not driven at all. The reconcile path passes neither and claims
+    nothing; it drives the intended set, not a loaded FAILED row.
     """
     from datetime import datetime, timezone
 
@@ -1664,6 +1678,7 @@ async def _apply_wiring_pairs(
                     port_b,
                     phys,
                     retry_row_id=_retry_id(switch_id, port_a, port_b),
+                    claims=claims,
                 )
 
             # Build the built pairs.
@@ -1686,6 +1701,7 @@ async def _apply_wiring_pairs(
                     port_b,
                     phys,
                     retry_row_id=_retry_id(switch_id, port_a, port_b),
+                    claims=claims,
                 )
 
             # Logout once per switch.
@@ -1732,6 +1748,7 @@ async def _apply_one_port_action(
     port_b: str,
     phys: str | None,
     retry_row_id: uuid.UUID | None = None,
+    claims: "WiringRowClaims | None" = None,
 ) -> None:
     """Apply one connect/disconnect cross-connect, flipping its assignment row.
 
@@ -1744,6 +1761,13 @@ async def _apply_one_port_action(
     this pair; it makes the failure write a row-identity compare-and-swap, so a row a
     concurrent writer flipped or released while this driver call ran is left alone
     instead of being resurrected as a new FAILED row. None on the reconcile path.
+
+    `claims` (issue #817) claims `retry_row_id` immediately before the driver call:
+    a row the other retry channel already holds returns without an execution_run, a
+    driver call, or a ledger write, so the two channels can never drive one row at
+    once. The claim is per row and taken HERE, not at selection, because a selected
+    batch is driven sequentially behind a per-switch login and the last row of a
+    batch can reach its driver call minutes after selection.
     """
     from datetime import datetime, timezone
 
@@ -1757,6 +1781,9 @@ async def _apply_one_port_action(
         record_l1_failed,
         release_l1_connection,
     )
+
+    if claims is not None and not await claims.claim(db, L1ConnectionAssignment, retry_row_id):
+        return
 
     redacted = redact_context_for_logging(context, password_keys)
     port_kwargs = {"port_a": port_a, "port_b": port_b}
@@ -2326,6 +2353,7 @@ async def _apply_l2_memberships(
     get_db_session,
     define_allocation_ids: set | None = None,
     retry_row_ids: dict[tuple[str, str], uuid.UUID] | None = None,
+    claims: "WiringRowClaims | None" = None,
 ) -> None:
     """Apply an L2 membership reconcile: leave the removed ports, then join the added ones.
 
@@ -2364,6 +2392,11 @@ async def _apply_l2_memberships(
     and INSERT a fresh FAILED intended-ACTIVE zombie row for a membership the
     reservation no longer intends. The reconcile path passes nothing and keeps the
     upsert (a join after a release is a legitimate re-add).
+
+    `claims` (issue #817) is the retry pass's per-row claim ledger, passed together with
+    `retry_row_ids`: each retried row is claimed by a compare-and-swap on `claimed_until`
+    immediately before its own driver call, so the manual channel and the background tick
+    can never drive one row at once. The reconcile path passes neither and claims nothing.
     """
     from datetime import datetime, timezone
 
@@ -2568,6 +2601,7 @@ async def _apply_l2_memberships(
                     r["vlan_id"],
                     r["vlan_assignment_id"],
                     retry_row_id=_retry_id(switch_id, r["port"]),
+                    claims=claims,
                 )
             for a in switch_adds:
                 if await is_membership_active(db, res_uuid, switch_uuid, a["port"]):
@@ -2586,6 +2620,7 @@ async def _apply_l2_memberships(
                     a["vlan_id"],
                     a["vlan_assignment_id"],
                     retry_row_id=_retry_id(switch_id, a["port"]),
+                    claims=claims,
                 )
 
             logout_run = await create_execution_run(
@@ -2633,6 +2668,7 @@ async def _apply_one_vlan_action(
     vlan_id: int,
     vlan_assignment_id,
     retry_row_id: uuid.UUID | None = None,
+    claims: "WiringRowClaims | None" = None,
 ) -> None:
     """Apply one add_to_vlan/remove_from_vlan membership op, flipping its ledger row.
 
@@ -2645,6 +2681,11 @@ async def _apply_one_vlan_action(
     this membership; it makes the failure write a row-identity compare-and-swap, so a
     row a concurrent writer flipped or released while this driver call ran is left
     alone instead of being resurrected as a new FAILED row. None on the reconcile path.
+
+    `claims` (issue #817) claims `retry_row_id` immediately before the driver call: a
+    row the other retry channel already holds returns without an execution_run, a
+    driver call, or a ledger write. Taken here rather than at selection because a
+    selected batch is driven sequentially behind a per-switch login.
     """
     from datetime import datetime, timezone
 
@@ -2658,6 +2699,9 @@ async def _apply_one_vlan_action(
         record_l2_membership_active,
         release_l2_membership,
     )
+
+    if claims is not None and not await claims.claim(db, L2PortAssignment, retry_row_id):
+        return
 
     redacted = redact_context_for_logging(context, password_keys)
     method_kwargs = (
@@ -3267,6 +3311,7 @@ async def _apply_l3_adjacency(
     get_db_session,
     reconciles: list[dict] | None = None,
     retry_row_ids: dict[str, uuid.UUID] | None = None,
+    claims: "WiringRowClaims | None" = None,
 ) -> None:
     """Apply an L3 adjacency reconcile: deprovision departed switches, provision new
     ones, and reconcile the route-set delta on switches that stayed adjacent but
@@ -3328,6 +3373,13 @@ async def _apply_l3_adjacency(
     writer flipped or released that row while the driver calls were in flight. The
     reconcile path passes nothing and keeps the upsert (a provision after a release is
     a legitimate re-pin).
+
+    `claims` (issue #817) is the retry pass's per-row claim ledger, passed together
+    with `retry_row_ids`. An L3 row IS the per-switch pin, so its claim is taken once
+    per work item, immediately before that switch's login and route drive: a pin the
+    other retry channel already holds is skipped with no driver call and no ledger
+    write. A reconcile item never carries a retry row id, so it never claims.
+
     """
     from datetime import datetime, timezone
 
@@ -3464,6 +3516,14 @@ async def _apply_l3_adjacency(
                         row_id=retry_ids.get(switch_id),
                     )
             continue
+
+        # Per-row drive claim (issue #817): an L3 row is the whole per-switch pin, so
+        # the claim is taken here, immediately before this switch's first driver call,
+        # and a pin the other retry channel holds is left entirely alone.
+        if claims is not None:
+            async with get_db_session() as db:
+                if not await claims.claim(db, RouteAssignment, retry_ids.get(switch_id)):
+                    continue
 
         redacted = redact_context_for_logging(context, password_keys)
         async with get_db_session() as db:

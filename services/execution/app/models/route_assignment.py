@@ -47,6 +47,13 @@ class RouteAssignment(Base):
     pin CONTENT (`routes`) is captured once at first provision and reused for the
     life of the pin; phase 5 changes only the row's STATUS lifecycle (driver-gated)
     and WHEN a switch is provisioned/deprovisioned (adjacency gained/lost).
+
+    `claimed_until` (issue #817) is the per-row drive claim the two wiring retry
+    channels take: a retry stamps it `now + budget` under a compare-and-swap
+    immediately before this row's own driver call and every record path clears it,
+    so the manual channel and the background tick can never drive the same row at
+    once. NULL means unclaimed; a stamp in the past is expired and reclaimable, so
+    a process that dies mid-drive needs no reaper.
     """
 
     __tablename__ = "route_assignments"
@@ -68,3 +75,4 @@ class RouteAssignment(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
