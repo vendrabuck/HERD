@@ -51,6 +51,12 @@ concurrency:
 jobs:
   full-stack:
     runs-on: ubuntu-latest
+    env:
+      # Per-test e2e failure artifacts (screenshot, page, console, traceback) are
+      # written under this directory by tests/e2e/conftest.py; pointing it into the
+      # workspace lets the failure upload below carry them. Without this they land
+      # in the runner's temp dir and are lost with the job.
+      HERD_E2E_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -189,6 +195,7 @@ jobs:
             compose-logs.txt
             logs-*.txt
             nos-lab-logs.txt
+            e2e-artifacts/**
           retention-days: 7
 
       - name: Stop LDAP test server
