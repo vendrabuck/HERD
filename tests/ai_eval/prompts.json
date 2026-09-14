@@ -1,0 +1,62 @@
+[
+  {
+    "id": "two-tier-basic",
+    "prompt": "Connect a router to a core switch for a simple two-tier network.",
+    "min_devices": 2,
+    "min_edges": 1
+  },
+  {
+    "id": "firewall-inline",
+    "prompt": "Put a firewall inline between the internet-facing router and the internal switch.",
+    "min_devices": 3,
+    "min_edges": 2
+  },
+  {
+    "id": "ha-firewall-pair",
+    "prompt": "Two firewalls behind a core switch, set up as an active and standby failover pair.",
+    "min_devices": 3,
+    "min_edges": 2
+  },
+  {
+    "id": "lb-web-tier",
+    "prompt": "A load balancer distributing traffic across two web servers, all behind one switch.",
+    "min_devices": 4,
+    "min_edges": 3
+  },
+  {
+    "id": "small-office",
+    "prompt": "A small branch office: one router, one switch, and a Windows 10 workstation.",
+    "min_devices": 3,
+    "min_edges": 2
+  },
+  {
+    "id": "switch-chain",
+    "prompt": "Chain three switches together, with a router on one end and a firewall on the other.",
+    "min_devices": 5,
+    "min_edges": 4
+  },
+  {
+    "id": "storage-fanout",
+    "prompt": "A storage array connected to a switch, with two servers reading from it through that same switch.",
+    "min_devices": 4,
+    "min_edges": 3
+  },
+  {
+    "id": "redundant-web-tier",
+    "prompt": "A redundant web tier: a router, a firewall, a core switch, two load balancers, and four servers behind them.",
+    "min_devices": 9,
+    "min_edges": 8
+  },
+  {
+    "id": "two-branch-uplink",
+    "prompt": "Two independent branch setups, each with its own router and switch, uplinked through a shared core switch.",
+    "min_devices": 5,
+    "min_edges": 4
+  },
+  {
+    "id": "mixed-clients",
+    "prompt": "A mixed client environment: a Windows 11 laptop, a macOS laptop, and an Ubuntu server, all connected through one switch.",
+    "min_devices": 4,
+    "min_edges": 3
+  }
+]
