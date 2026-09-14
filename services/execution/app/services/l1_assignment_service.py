@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
+from app.services.wiring_claim import unclaimed
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,8 @@ async def record_l1_connect(
         existing.status = "RELEASED"
         existing.intended = "RELEASED"
         existing.released_at = datetime.now(timezone.utc)
+        # A settled row holds no drive claim (issue #817).
+        existing.claimed_until = None
         # Flush the release NOW: SQLAlchemy flushes inserts before updates, so without
         # this the ACTIVE insert below would hit the active-unique index while the
         # stale row is still ACTIVE in the database.
@@ -117,12 +120,45 @@ async def record_l1_connect(
     # above), and reservation-scoped so it never adopts another reservation's failure.
     reusable = await _find_reusable_failed(db, res_uuid, switch_uuid, ca, cb)
     if reusable is not None:
-        reusable.status = "ACTIVE"
-        reusable.intended = "ACTIVE"
-        reusable.last_error = None
-        reusable.released_at = None
+        values: dict = {
+            "status": "ACTIVE",
+            "intended": "ACTIVE",
+            "last_error": None,
+            "released_at": None,
+            # The row is settled ACTIVE, so it holds no drive claim (issue #817).
+            "claimed_until": None,
+        }
         if physical_connection_id and reusable.physical_connection_id is None:
-            reusable.physical_connection_id = _as_uuid(physical_connection_id)
+            values["physical_connection_id"] = _as_uuid(physical_connection_id)
+        result = await db.execute(
+            update(L1ConnectionAssignment)
+            .where(
+                L1ConnectionAssignment.id == reusable.id,
+                L1ConnectionAssignment.status == "FAILED",
+            )
+            .values(**values)
+        )
+        if result.rowcount == 0:
+            # A concurrent writer (the consumer apply and either retry channel all
+            # reach this function) flipped or released the row between our SELECT and
+            # this UPDATE: never overwrite the winner, re-read and return its row
+            # as-is. The same SQL compare-and-swap record_route_active uses, aligned
+            # here by issue #817 so all three layers share one flip discipline.
+            await db.rollback()
+            winner = (
+                await db.execute(
+                    select(L1ConnectionAssignment).where(L1ConnectionAssignment.id == reusable.id)
+                )
+            ).scalar_one_or_none()
+            logger.info(
+                "stale reattempt writer skipped for switch %s pair (%s, %s), "
+                "reservation %s: row already flipped by a concurrent writer",
+                switch_uuid,
+                ca,
+                cb,
+                res_uuid,
+            )
+            return winner
         await db.commit()
         await db.refresh(reusable)
         logger.info(
@@ -199,6 +235,8 @@ async def release_l1_connection(
     row.intended = "RELEASED"
     row.last_error = None
     row.released_at = datetime.now(timezone.utc)
+    # A settled row holds no drive claim (issue #817).
+    row.claimed_until = None
     await db.commit()
     logger.info(
         "Released L1 assignment for switch %s pair (%s, %s), reservation %s",
@@ -292,6 +330,9 @@ async def _park_frozen_build(
         row.status = "FAILED"
         row.intended = "RELEASED"
         row.last_error = FROZEN_BUILD_PENDING_RELEASE
+        # This write finalizes the row for the release channel; drop the claim so the
+        # pending disconnect is drivable at once (issue #817).
+        row.claimed_until = None
     await db.commit()
     await db.refresh(row)
     logger.warning(
@@ -457,6 +498,7 @@ async def due_failed_rows(
     db: AsyncSession,
     limit: int,
     max_attempts: int,
+    now: datetime | None = None,
 ) -> list[L1ConnectionAssignment]:
     """FAILED rows still under the total-attempts cap, oldest first, batch-capped.
 
@@ -466,15 +508,27 @@ async def due_failed_rows(
     one tick exactly as the health scheduler's batch cap does. Retryability by reason
     and the frozen-reservation guard are applied by the caller, since neither is a
     clean SQL predicate here.
+
+    RETRY-ONLY, so it also filters on the issue #817 drive claim: a row another
+    channel is currently driving is not a candidate, and the select takes FOR UPDATE
+    SKIP LOCKED (the health scheduler's `_due_rows` idiom). The real race guard is
+    the per-row compare-and-swap in wiring_claim.WiringRowClaims.claim, taken
+    immediately before the driver call; this predicate only avoids loading rows that
+    would be skipped there anyway. The reconcile's stale-build widening reader
+    (failed_assignments_for_reservation) deliberately has neither, see
+    wiring_claim's module docstring.
     """
+    now = now or datetime.now(timezone.utc)
     result = await db.execute(
         select(L1ConnectionAssignment)
         .where(
             L1ConnectionAssignment.status == "FAILED",
             L1ConnectionAssignment.attempts < max_attempts,
+            unclaimed(L1ConnectionAssignment, now),
         )
         .order_by(L1ConnectionAssignment.created_at.asc())
         .limit(limit)
+        .with_for_update(skip_locked=True)
     )
     return list(result.scalars().all())
 
@@ -613,6 +667,8 @@ async def _record_l1_failed_for_row(
         "intended": intended,
         "attempts": func.coalesce(L1ConnectionAssignment.attempts, 0) + attempts,
         "last_error": last_error,
+        # The drive this failure records is over, so release the claim (issue #817).
+        "claimed_until": None,
     }
     result = await db.execute(
         update(L1ConnectionAssignment)
@@ -758,6 +814,8 @@ async def record_l1_failed(
         row.intended = intended
         row.attempts = (row.attempts or 0) + attempts
         row.last_error = last_error
+        # The drive this failure records is over, so release the claim (issue #817).
+        row.claimed_until = None
         if physical_connection_id and row.physical_connection_id is None:
             row.physical_connection_id = _as_uuid(physical_connection_id)
         await db.commit()
@@ -808,6 +866,8 @@ async def park_stale_l1_build(
     row.intended = "RELEASED"
     row.attempts = 0
     row.last_error = reason
+    # Parking hands the row to the release channel; drop the claim (issue #817).
+    row.claimed_until = None
     await db.commit()
     logger.warning(
         "Build intent gone for L1 assignment %s (switch %s pair (%s, %s), reservation %s); "

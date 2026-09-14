@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.route_assignment import RouteAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
+from app.services.wiring_claim import unclaimed
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,8 @@ async def record_route_active(
             row.status = "FAILED"
             row.intended = "RELEASED"
             row.last_error = FROZEN_PROVISION_PENDING_REMOVAL
+            # This write finalizes the row for the release channel (issue #817).
+            row.claimed_until = None
         await db.commit()
         await db.refresh(row)
         logger.warning(
@@ -189,6 +192,8 @@ async def record_route_active(
                 routes=routes,
                 last_error=None,
                 released_at=None,
+                # The row is settled ACTIVE, so it holds no drive claim (issue #817).
+                claimed_until=None,
             )
         )
         if result.rowcount == 0:
@@ -437,6 +442,8 @@ async def record_route_reconcile_failed(
     row.intended = "ACTIVE"
     row.attempts = (row.attempts or 0) + attempts
     row.last_error = last_error
+    # The drive this failure records is over, so release the claim (issue #817).
+    row.claimed_until = None
     await db.commit()
     await db.refresh(row)
     logger.warning(
@@ -472,6 +479,8 @@ async def _record_route_failed_for_row(
         "intended": intended,
         "attempts": func.coalesce(RouteAssignment.attempts, 0) + attempts,
         "last_error": last_error,
+        # The drive this failure records is over, so release the claim (issue #817).
+        "claimed_until": None,
     }
     if routes is not None:
         values["routes"] = routes
@@ -582,6 +591,8 @@ async def record_route_failed(
         row.intended = intended
         row.attempts = (row.attempts or 0) + attempts
         row.last_error = last_error
+        # The drive this failure records is over, so release the claim (issue #817).
+        row.claimed_until = None
         if routes is not None:
             row.routes = routes
         await db.commit()
@@ -639,6 +650,8 @@ async def release_route_membership(
     row.intended = "RELEASED"
     row.last_error = None
     row.released_at = datetime.now(timezone.utc)
+    # A settled row holds no drive claim (issue #817).
+    row.claimed_until = None
     await db.commit()
     logger.info(
         "Released route pin for L3 switch %s in reservation %s (adjacency ended)",
@@ -671,6 +684,8 @@ async def park_stale_route_build(
     row.intended = "RELEASED"
     row.attempts = 0
     row.last_error = reason
+    # Parking hands the row to the release channel; drop the claim (issue #817).
+    row.claimed_until = None
     await db.commit()
     logger.warning(
         "Build intent gone for L3 route pin %s (switch %s, reservation %s); "
@@ -778,19 +793,29 @@ async def due_failed_route_rows(
     db: AsyncSession,
     limit: int,
     max_attempts: int,
+    now: datetime | None = None,
 ) -> list[RouteAssignment]:
     """FAILED route pins still under the attempts cap, oldest first, batch-capped.
 
     The background auto-retry channel's per-tick L3 candidate set, the due_failed_rows
     analogue. Retryability and the frozen guard are applied by the caller.
+
+    RETRY-ONLY, so it also filters on the issue #817 drive claim and takes FOR UPDATE
+    SKIP LOCKED, exactly like due_failed_rows: a row another channel is currently
+    driving is not a candidate. The per-row compare-and-swap in
+    wiring_claim.WiringRowClaims.claim is the real guard; the reconcile's stale-build
+    widening reader deliberately carries neither (see wiring_claim's module docstring).
     """
+    now = now or datetime.now(timezone.utc)
     result = await db.execute(
         select(RouteAssignment)
         .where(
             RouteAssignment.status == "FAILED",
             RouteAssignment.attempts < max_attempts,
+            unclaimed(RouteAssignment, now),
         )
         .order_by(RouteAssignment.created_at.asc())
         .limit(limit)
+        .with_for_update(skip_locked=True)
     )
     return list(result.scalars().all())
