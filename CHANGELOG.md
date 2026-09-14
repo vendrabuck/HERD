@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- A wiring retry no longer resurrects rows that were released while it was
+  running (issue #814). Both retry channels (the manual endpoint and the
+  background tick) now record a driver failure against the ROW they loaded,
+  under a compare-and-swap on (id, status FAILED), instead of upserting by
+  (reservation, switch, port/pair). The upsert matched only non-RELEASED rows,
+  so a retry whose rows were flipped ACTIVE by the manual channel and then
+  released by a fork save during its driver call found nothing and INSERTED a
+  fresh FAILED row, leaving zombie build-direction failures for wiring the
+  reservation no longer intends (four L2 membership rows where two were
+  correct). The stale write is now a logged no-op at all three layers; the
+  fresh-build path keeps its upsert, since a build after a release is a
+  legitimate re-add.
+
 - The reservation assistant can now consult documentation instead of answering
   from training data (issue #31, ADR 0015). Two read-only tools, `search_docs`
   and `read_doc`, search and page through named sources: the published HERD

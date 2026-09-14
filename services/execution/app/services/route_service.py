@@ -13,7 +13,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -448,6 +448,56 @@ async def record_route_reconcile_failed(
     return row
 
 
+async def _record_route_failed_for_row(
+    db: AsyncSession,
+    row_id: uuid.UUID,
+    expected_status: str,
+    *,
+    res_uuid: uuid.UUID,
+    dev_uuid: uuid.UUID,
+    routes: list[dict] | None,
+    attempts: int,
+    last_error: str | None,
+    intended: str,
+) -> RouteAssignment | None:
+    """The row-identity compare-and-swap behind record_route_failed's `row_id` path.
+
+    See record_route_failed's docstring for why the retry channels write by row id
+    (issue #814). One atomic `UPDATE ... WHERE id AND status`, no insert branch:
+    rowcount zero means a concurrent writer moved the row and this failure is stale
+    information about a row that no longer exists in the state it was loaded in.
+    """
+    values: dict = {
+        "status": "FAILED",
+        "intended": intended,
+        "attempts": func.coalesce(RouteAssignment.attempts, 0) + attempts,
+        "last_error": last_error,
+    }
+    if routes is not None:
+        values["routes"] = routes
+    result = await db.execute(
+        update(RouteAssignment)
+        .where(RouteAssignment.id == row_id, RouteAssignment.status == expected_status)
+        .values(**values)
+    )
+    if result.rowcount == 0:
+        await db.rollback()
+        logger.warning(
+            "Ignoring stale L3 %s failure for switch %s, reservation %s: "
+            "row %s is no longer %s (a concurrent writer won)",
+            "build" if intended == "ACTIVE" else "release",
+            dev_uuid,
+            res_uuid,
+            row_id,
+            expected_status,
+        )
+        return None
+    await db.commit()
+    return (
+        await db.execute(select(RouteAssignment).where(RouteAssignment.id == row_id))
+    ).scalar_one_or_none()
+
+
 async def record_route_failed(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,
@@ -457,7 +507,9 @@ async def record_route_failed(
     last_error: str | None,
     *,
     intended: str,
-) -> RouteAssignment:
+    row_id: uuid.UUID | None = None,
+    expected_status: str = "FAILED",
+) -> RouteAssignment | None:
     """Write (or update) a FAILED route pin for a switch whose provision/removal failed.
 
     `intended` (issue #369) is the direction THIS write was attempting: "ACTIVE" for a
@@ -473,9 +525,36 @@ async def record_route_failed(
     and recording it FAILED is the point of issue #369. `routes` is stored so the pinned
     set survives the failure and the retry re-drives it verbatim; None keeps the row's
     existing pin.
+
+    `row_id` (issue #814) switches the write from the key-based upsert to a
+    ROW-IDENTITY compare-and-swap, and is what both retry channels pass: a retry
+    records its outcome against the very row it loaded, never against whatever row
+    the key resolves to now. The write is one `UPDATE ... WHERE id = :id AND status
+    = :expected_status`; a `rowcount` of zero means the row was flipped (ACTIVE by a
+    racing reattempt, RELEASED by a save-driven teardown) or deleted while the driver
+    call was in flight, so nothing is written, nothing is INSERTED, and None comes
+    back with the same "a concurrent writer won" warning the #412 guard logs. Without
+    it a stale retry failure whose row had moved on to RELEASED fell through to the
+    insert branch and resurrected the pin as a fresh FAILED row (the L2 shape of the
+    bug; this path shares the upsert, so it shares the fix). The fresh-build path
+    passes no `row_id` and keeps the upsert: a provision after a release is a
+    legitimate re-pin.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)
+
+    if row_id is not None:
+        return await _record_route_failed_for_row(
+            db,
+            row_id,
+            expected_status,
+            res_uuid=res_uuid,
+            dev_uuid=dev_uuid,
+            routes=routes,
+            attempts=attempts,
+            last_error=last_error,
+            intended=intended,
+        )
 
     row = (
         (

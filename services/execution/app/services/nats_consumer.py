@@ -1437,6 +1437,7 @@ async def _apply_wiring_pairs(
     unresolvable: list[tuple[dict, str, str]],
     ctx: "_FetchContext",
     get_db_session,
+    retry_row_ids: dict[tuple[str, str, str], uuid.UUID] | None = None,
 ) -> None:
     """Apply an L1 reconcile: release the released pairs, then build the built ones.
 
@@ -1453,6 +1454,15 @@ async def _apply_wiring_pairs(
     caller resolved them from: (wire, reason, intended), so a hop that fell out of
     the RELEASE side of a delta parks FAILED with intended RELEASED, not the
     build-direction default.
+
+    `retry_row_ids` (issue #814) is passed ONLY by the retry channels, which call
+    this per reservation: it maps (switch_id, canonical pair) to the id of the FAILED
+    row that channel loaded, and every failure write for a mapped pair goes through
+    record_l1_failed's row-identity compare-and-swap instead of the key-based upsert.
+    A retry therefore records its outcome against the row it started from, and writes
+    nothing at all if a concurrent writer flipped or released that row while the
+    driver call was in flight. The reconcile path passes nothing and keeps the upsert
+    (a build after a release is a legitimate re-add).
     """
     from datetime import datetime, timezone
 
@@ -1465,12 +1475,17 @@ async def _apply_wiring_pairs(
         update_execution_run,
     )
     from app.services.l1_assignment_service import (
+        canonical_port_pair,
         is_pair_active,
         pair_needs_release,
         record_l1_failed,
     )
 
     res_uuid = uuid.UUID(reservation_id)
+    retry_ids = retry_row_ids or {}
+
+    def _retry_id(switch_id: str, port_a: str, port_b: str) -> uuid.UUID | None:
+        return retry_ids.get((switch_id, *canonical_port_pair(port_a, port_b)))
 
     # Unresolvable hops (Decision 5): a recorded endpoint is gone, or the hop set is
     # not a simple chain so its pairing is unrecoverable. A verbatim apply cannot
@@ -1545,6 +1560,7 @@ async def _apply_wiring_pairs(
                         load_error,
                         phys,
                         intended="ACTIVE",
+                        row_id=_retry_id(switch_id, port_a, port_b),
                     )
                 for port_a, port_b, phys in release_pairs:
                     if await pair_needs_release(db, res_uuid, switch_uuid, port_a, port_b):
@@ -1558,6 +1574,7 @@ async def _apply_wiring_pairs(
                             load_error,
                             phys,
                             intended="RELEASED",
+                            row_id=_retry_id(switch_id, port_a, port_b),
                         )
             continue
 
@@ -1607,6 +1624,7 @@ async def _apply_wiring_pairs(
                         f"driver login failed: {login_err}",
                         phys,
                         intended="ACTIVE",
+                        row_id=_retry_id(switch_id, port_a, port_b),
                     )
                 for port_a, port_b, phys in release_pairs:
                     if await pair_needs_release(db, res_uuid, switch_uuid, port_a, port_b):
@@ -1620,6 +1638,7 @@ async def _apply_wiring_pairs(
                             f"driver login failed: {login_err}",
                             phys,
                             intended="RELEASED",
+                            row_id=_retry_id(switch_id, port_a, port_b),
                         )
                 continue
 
@@ -1644,6 +1663,7 @@ async def _apply_wiring_pairs(
                     port_a,
                     port_b,
                     phys,
+                    retry_row_id=_retry_id(switch_id, port_a, port_b),
                 )
 
             # Build the built pairs.
@@ -1665,6 +1685,7 @@ async def _apply_wiring_pairs(
                     port_a,
                     port_b,
                     phys,
+                    retry_row_id=_retry_id(switch_id, port_a, port_b),
                 )
 
             # Logout once per switch.
@@ -1710,6 +1731,7 @@ async def _apply_one_port_action(
     port_a: str,
     port_b: str,
     phys: str | None,
+    retry_row_id: uuid.UUID | None = None,
 ) -> None:
     """Apply one connect/disconnect cross-connect, flipping its assignment row.
 
@@ -1717,6 +1739,11 @@ async def _apply_one_port_action(
     success flips the l1_connection_assignments projection (ACTIVE on connect,
     RELEASED on disconnect); on exhausting the retry cap it lands a FAILED row with the
     attempts and last_error, leaving siblings untouched (ADR 0007 Decision 6).
+
+    `retry_row_id` (issue #814) is the id of the FAILED row a retry channel loaded for
+    this pair; it makes the failure write a row-identity compare-and-swap, so a row a
+    concurrent writer flipped or released while this driver call ran is left alone
+    instead of being resurrected as a new FAILED row. None on the reconcile path.
     """
     from datetime import datetime, timezone
 
@@ -1782,6 +1809,7 @@ async def _apply_one_port_action(
             err,
             phys,
             intended="ACTIVE" if action == "connect_ports" else "RELEASED",
+            row_id=retry_row_id,
         )
 
 
@@ -2297,6 +2325,7 @@ async def _apply_l2_memberships(
     ctx: "_FetchContext",
     get_db_session,
     define_allocation_ids: set | None = None,
+    retry_row_ids: dict[tuple[str, str], uuid.UUID] | None = None,
 ) -> None:
     """Apply an L2 membership reconcile: leave the removed ports, then join the added ones.
 
@@ -2325,6 +2354,16 @@ async def _apply_l2_memberships(
         type) and their driver calls are skipped; removes are unaffected (a switch
         with a live membership was necessarily already defined).
       - Undefine: _release_orphaned_allocations drives delete_vlan on last-free.
+
+    `retry_row_ids` (issue #814) is passed ONLY by the retry channels, which call this
+    per reservation: it maps (switch_id, port) to the id of the FAILED membership row
+    that channel loaded, and every failure write for a mapped membership goes through
+    record_l2_failed's row-identity compare-and-swap instead of the key-based upsert.
+    That upsert matches only non-RELEASED rows, so a retry whose rows were flipped
+    ACTIVE and then RELEASED while its driver call was in flight used to find nothing
+    and INSERT a fresh FAILED intended-ACTIVE zombie row for a membership the
+    reservation no longer intends. The reconcile path passes nothing and keeps the
+    upsert (a join after a release is a legitimate re-add).
     """
     from datetime import datetime, timezone
 
@@ -2343,6 +2382,11 @@ async def _apply_l2_memberships(
     )
 
     res_uuid = uuid.UUID(reservation_id)
+    retry_ids = retry_row_ids or {}
+
+    def _retry_id(switch_id, port: str) -> uuid.UUID | None:
+        return retry_ids.get((str(switch_id), port))
+
     touched_allocations: set[uuid.UUID] = {uuid.UUID(str(r["vlan_assignment_id"])) for r in removes}
 
     define_ids = {uuid.UUID(str(a["vlan_assignment_id"])) for a in adds}
@@ -2370,6 +2414,7 @@ async def _apply_l2_memberships(
                     attempts,
                     park_error,
                     intended="ACTIVE",
+                    row_id=_retry_id(a["switch_device_id"], a["port"]),
                 )
 
     removes_by_switch: dict[str, list[dict]] = {}
@@ -2431,6 +2476,7 @@ async def _apply_l2_memberships(
                         0,
                         load_error,
                         intended="ACTIVE",
+                        row_id=_retry_id(switch_id, a["port"]),
                     )
                 for r in switch_removes:
                     if await membership_needs_remove(db, res_uuid, switch_uuid, r["port"]):
@@ -2443,6 +2489,7 @@ async def _apply_l2_memberships(
                             0,
                             load_error,
                             intended="RELEASED",
+                            row_id=_retry_id(switch_id, r["port"]),
                         )
             continue
 
@@ -2486,6 +2533,7 @@ async def _apply_l2_memberships(
                         login_attempts,
                         f"driver login failed: {login_err}",
                         intended="ACTIVE",
+                        row_id=_retry_id(switch_id, a["port"]),
                     )
                 for r in switch_removes:
                     if await membership_needs_remove(db, res_uuid, switch_uuid, r["port"]):
@@ -2498,6 +2546,7 @@ async def _apply_l2_memberships(
                             login_attempts,
                             f"driver login failed: {login_err}",
                             intended="RELEASED",
+                            row_id=_retry_id(switch_id, r["port"]),
                         )
                 continue
 
@@ -2518,6 +2567,7 @@ async def _apply_l2_memberships(
                     r["port"],
                     r["vlan_id"],
                     r["vlan_assignment_id"],
+                    retry_row_id=_retry_id(switch_id, r["port"]),
                 )
             for a in switch_adds:
                 if await is_membership_active(db, res_uuid, switch_uuid, a["port"]):
@@ -2535,6 +2585,7 @@ async def _apply_l2_memberships(
                     a["port"],
                     a["vlan_id"],
                     a["vlan_assignment_id"],
+                    retry_row_id=_retry_id(switch_id, a["port"]),
                 )
 
             logout_run = await create_execution_run(
@@ -2581,6 +2632,7 @@ async def _apply_one_vlan_action(
     port: str,
     vlan_id: int,
     vlan_assignment_id,
+    retry_row_id: uuid.UUID | None = None,
 ) -> None:
     """Apply one add_to_vlan/remove_from_vlan membership op, flipping its ledger row.
 
@@ -2588,6 +2640,11 @@ async def _apply_one_vlan_action(
     driver RESULT (Decision 3), and on success flips the l2_port_assignments projection
     (ACTIVE on add, RELEASED on remove); on exhausting the retry cap it lands a FAILED
     row tagged with the op's direction, leaving siblings untouched (Decision 6).
+
+    `retry_row_id` (issue #814) is the id of the FAILED row a retry channel loaded for
+    this membership; it makes the failure write a row-identity compare-and-swap, so a
+    row a concurrent writer flipped or released while this driver call ran is left
+    alone instead of being resurrected as a new FAILED row. None on the reconcile path.
     """
     from datetime import datetime, timezone
 
@@ -2655,6 +2712,7 @@ async def _apply_one_vlan_action(
             attempts,
             err,
             intended="ACTIVE" if action == "add_to_vlan" else "RELEASED",
+            row_id=retry_row_id,
         )
 
 
@@ -3208,6 +3266,7 @@ async def _apply_l3_adjacency(
     ctx: "_FetchContext",
     get_db_session,
     reconciles: list[dict] | None = None,
+    retry_row_ids: dict[str, uuid.UUID] | None = None,
 ) -> None:
     """Apply an L3 adjacency reconcile: deprovision departed switches, provision new
     ones, and reconcile the route-set delta on switches that stayed adjacent but
@@ -3259,6 +3318,16 @@ async def _apply_l3_adjacency(
     RELEASED with its PRIOR pin intact (a superset of what a frozen partial drive
     actually removed, which is safe: removing an already-removed route is
     idempotent) rather than this function trying to compute a partial pin itself.
+
+    `retry_row_ids` (issue #814) is passed ONLY by the retry channels, which call this
+    per reservation and only ever with deprovisions/provisions (never reconciles): it
+    maps switch_id to the id of the FAILED pin row that channel loaded, and every
+    failure write for a mapped switch goes through record_route_failed's row-identity
+    compare-and-swap instead of the key-based upsert. A retry therefore records its
+    outcome against the row it started from, and writes nothing at all if a concurrent
+    writer flipped or released that row while the driver calls were in flight. The
+    reconcile path passes nothing and keeps the upsert (a provision after a release is
+    a legitimate re-pin).
     """
     from datetime import datetime, timezone
 
@@ -3281,6 +3350,7 @@ async def _apply_l3_adjacency(
     )
 
     res_uuid = uuid.UUID(reservation_id)
+    retry_ids = retry_row_ids or {}
     work = (
         [("deprovision", d) for d in deprovisions]
         + [("provision", p) for p in provisions]
@@ -3384,7 +3454,14 @@ async def _apply_l3_adjacency(
                     )
                 else:
                     await record_route_failed(
-                        db, res_uuid, switch_id, routes, 0, load_error, intended=intended
+                        db,
+                        res_uuid,
+                        switch_id,
+                        routes,
+                        0,
+                        load_error,
+                        intended=intended,
+                        row_id=retry_ids.get(switch_id),
                     )
             continue
 
@@ -3436,6 +3513,7 @@ async def _apply_l3_adjacency(
                         login_attempts,
                         f"driver login failed: {login_err}",
                         intended=intended,
+                        row_id=retry_ids.get(switch_id),
                     )
                 continue
 
@@ -3534,6 +3612,7 @@ async def _apply_l3_adjacency(
                     switch_attempts or 1,
                     switch_last_error,
                     intended=intended,
+                    row_id=retry_ids.get(switch_id),
                 )
 
 

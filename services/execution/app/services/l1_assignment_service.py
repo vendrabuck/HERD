@@ -12,7 +12,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -587,6 +587,70 @@ async def supersede_release_if_reclaimed(
     return True
 
 
+async def _record_l1_failed_for_row(
+    db: AsyncSession,
+    row_id: uuid.UUID,
+    expected_status: str,
+    *,
+    switch_uuid: uuid.UUID,
+    ca: str,
+    cb: str,
+    res_uuid: uuid.UUID,
+    attempts: int,
+    last_error: str,
+    physical_connection_id: uuid.UUID | str | None,
+    intended: str,
+) -> L1ConnectionAssignment | None:
+    """The row-identity compare-and-swap behind record_l1_failed's `row_id` path.
+
+    See record_l1_failed's docstring for why the retry channels write by row id
+    (issue #814). One atomic `UPDATE ... WHERE id AND status`, no insert branch:
+    rowcount zero means a concurrent writer moved the row and this failure is stale
+    information about a row that no longer exists in the state it was loaded in.
+    """
+    values: dict = {
+        "status": "FAILED",
+        "intended": intended,
+        "attempts": func.coalesce(L1ConnectionAssignment.attempts, 0) + attempts,
+        "last_error": last_error,
+    }
+    result = await db.execute(
+        update(L1ConnectionAssignment)
+        .where(
+            L1ConnectionAssignment.id == row_id,
+            L1ConnectionAssignment.status == expected_status,
+        )
+        .values(**values)
+    )
+    if result.rowcount == 0:
+        await db.rollback()
+        logger.warning(
+            "Ignoring stale L1 %s failure for switch %s pair (%s, %s), reservation %s: "
+            "row %s is no longer %s (a concurrent writer won)",
+            "build" if intended == "ACTIVE" else "release",
+            switch_uuid,
+            ca,
+            cb,
+            res_uuid,
+            row_id,
+            expected_status,
+        )
+        return None
+    if physical_connection_id:
+        await db.execute(
+            update(L1ConnectionAssignment)
+            .where(
+                L1ConnectionAssignment.id == row_id,
+                L1ConnectionAssignment.physical_connection_id.is_(None),
+            )
+            .values(physical_connection_id=_as_uuid(physical_connection_id))
+        )
+    await db.commit()
+    return (
+        await db.execute(select(L1ConnectionAssignment).where(L1ConnectionAssignment.id == row_id))
+    ).scalar_one_or_none()
+
+
 async def record_l1_failed(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,
@@ -598,7 +662,9 @@ async def record_l1_failed(
     physical_connection_id: uuid.UUID | str | None = None,
     *,
     intended: str,
-) -> L1ConnectionAssignment:
+    row_id: uuid.UUID | None = None,
+    expected_status: str = "FAILED",
+) -> L1ConnectionAssignment | None:
     """Write (or update) a FAILED row for a cross-connect that could not be applied.
 
     `intended` (ADR 0009 Decision 2, issue #369) is the direction THIS write was
@@ -618,10 +684,39 @@ async def record_l1_failed(
     running total), so the phase-4 total-attempts cap counts every driver call ever
     spent on the connection, across the in-line apply and every reattempt. Feeds the
     Decision 6 per-connection retry/manual channel (phase 4).
+
+    `row_id` (issue #814) switches the write from the key-based upsert above to a
+    ROW-IDENTITY compare-and-swap, and is what both retry channels pass: a retry
+    records its outcome against the very row it loaded, never against whatever row
+    the key resolves to now. The write is one `UPDATE ... WHERE id = :id AND status
+    = :expected_status`; a `rowcount` of zero means the row was flipped (ACTIVE by a
+    racing reattempt, RELEASED by a save-driven teardown) or deleted while the driver
+    call was in flight, so nothing is written, nothing is INSERTED, and None comes
+    back with the same "a concurrent writer won" warning the #412 guard logs. Without
+    it a stale retry failure whose row had moved on to RELEASED fell through to the
+    insert branch and resurrected the connection as a fresh FAILED row (the L2 shape
+    of the bug; this path shares the upsert, so it shares the fix). The fresh-build
+    path passes no `row_id` and keeps the upsert: a build after a release is a
+    legitimate re-add.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
     ca, cb = canonical_port_pair(port_a, port_b)
+
+    if row_id is not None:
+        return await _record_l1_failed_for_row(
+            db,
+            row_id,
+            expected_status,
+            switch_uuid=switch_uuid,
+            ca=ca,
+            cb=cb,
+            res_uuid=res_uuid,
+            attempts=attempts,
+            last_error=last_error,
+            physical_connection_id=physical_connection_id,
+            intended=intended,
+        )
 
     result = await db.execute(
         select(L1ConnectionAssignment).where(
