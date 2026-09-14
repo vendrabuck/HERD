@@ -137,6 +137,7 @@ describe("reservation wiring status api", () => {
         { id: "e", layer: "l2", switch_device_id: SW_ID, port_a: null, port_b: null, port: "9", vlan: 120, vlan_assignment_id: null, physical_connection_id: null, outcome: "released", status: "RELEASED", attempts: 2, last_error: null },
         { id: "f", layer: "l1", switch_device_id: SW_ID, port_a: "11", port_b: "12", physical_connection_id: null, outcome: "superseded", status: "RELEASED", attempts: 1, last_error: null },
         { id: "g", layer: "l1", switch_device_id: SW_ID, port_a: "13", port_b: "14", physical_connection_id: null, outcome: "frozen", status: "FAILED", attempts: 3, last_error: "boom" },
+        { id: "h", layer: "l1", switch_device_id: SW_ID, port_a: "15", port_b: "16", physical_connection_id: null, outcome: "in_progress", status: "FAILED", attempts: 1, last_error: "driver timeout" },
       ],
     };
     const counts = summarizeWiringRetry(resp);
@@ -147,6 +148,7 @@ describe("reservation wiring status api", () => {
       still_failed: 1,
       not_retryable: 1,
       frozen: 1,
+      in_progress: 1,
     });
     const total =
       counts.reconnected +
@@ -154,7 +156,8 @@ describe("reservation wiring status api", () => {
       counts.superseded +
       counts.still_failed +
       counts.not_retryable +
-      counts.frozen;
+      counts.frozen +
+      counts.in_progress;
     expect(total).toBe(resp.results.length);
   });
 

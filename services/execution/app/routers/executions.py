@@ -491,6 +491,11 @@ class WiringRetryOutcome(BaseModel):
     pin (route_count populated, no port fields). The layer-specific fields are optional so a
     row omits the ones that do not apply; existing L1 consumers read the same fields they
     always did.
+
+    `outcome` is seven-valued: "reconnected", "released", "superseded", "still_failed",
+    "not_retryable", "frozen", and (issue #817) "in_progress", meaning the other retry
+    channel holds this row's drive claim so this call drove nothing for it. It is a
+    plain string, not an enum, so the added value does not change the published schema.
     """
 
     id: uuid.UUID
