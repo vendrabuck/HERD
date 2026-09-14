@@ -819,7 +819,12 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # cabling.reservation_fork/fork_versions/fork_connections/connections tables, so
 # they need the gate's ALREADY-MIGRATED schema, not a throwaway server; each
 # creates a few throwaway rows per test (random ids) and deletes them in a
-# finally, so they leave the gate's seeded data untouched.
+# finally, so they leave the gate's seeded data untouched. The execution suite
+# added for issue #817 (the wiring retry drive claim) is in that same category:
+# it runs both retry channels as real concurrent tasks against the gate's
+# execution ledger tables, proving one row reaches the driver exactly once.
+# tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
+# written and then wired into nothing.
 _gate-pg-live-tests:
 	@pguser=$$(grep -E '^POSTGRES_USER=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
 	pgpass=$$(grep -E '^POSTGRES_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
@@ -839,7 +844,9 @@ _gate-pg-live-tests:
 	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_fork_port_claim_race_live_pg.py -v) && \
 	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
-		uv run pytest tests/test_l3_route_key_width_live_pg.py -v)
+		uv run pytest tests/test_l3_route_key_width_live_pg.py -v) && \
+	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_wiring_retry_claim_race_live_pg.py -v)
 
 # Gate phase used by master and everything, run after test-e2e (issue #572):
 # proves the STACK, not just the directory, can authenticate against LDAP.
