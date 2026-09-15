@@ -2,97 +2,42 @@
 
 ## [Unreleased]
 
-- An admin can now classify one reservation's purpose on demand instead of waiting for
-  the background sweep to reach it (issue #808). `POST
-  /admin/purpose-review/{reservation_id}/classify` runs the sweep's own single-row
-  classifier synchronously for exactly that reservation and returns its outcome (`ok`,
-  `timeout`, `transient`, `failed`, or `forbidden`, all still 200; `feature_off`
-  answers 503 instead, matching how other AI-gated endpoints respond when
-  unconfigured); 404 for an unknown reservation, 409 `not_eligible` before the
-  reservation reaches a terminal state, 409 `already_suggested` once a suggestion
-  already exists. It deliberately ignores `purpose_classify_max_attempts`, so it
-  doubles as a way to retry one exhausted row without running the global backfill, and
-  the sweep's oldest-first fairness is unchanged. The single-row classifier moved from
-  the expiration task to `purpose_service.classify_purpose_one` so the new router does
-  not import from `tasks/`; the sweep reconciler now calls it from its new home. Fixes
-  the reused-stack flake in `test_purpose_review_flow.py` (the test now triggers its
-  own reservation directly instead of waiting on the sweep's backlog), and the
-  now-unused `classify_sweep_first` pytest marker and its collection-reordering hook
-  are removed.
+## [0.5.0] - 2026-09-15
 
-- The two wiring retry channels can no longer drive the same FAILED row at once
-  (issue #817). The manual endpoint and the background tick both load
-  hardware-retryable FAILED ledger rows and drive them through the same applies;
-  issue #814 stopped a late failure write from corrupting the ledger, but
-  nothing claimed a row before it was driven, so one connection could get two
-  concurrent driver calls, from two execution processes even, since the tick
-  runs in every replica. Each retried row is now claimed by a compare-and-swap
-  on a new nullable `claimed_until` column immediately before that row's own
-  driver call, and a row the other channel holds is skipped with no driver call
-  and no ledger write. The claim is taken at drive time rather than at
-  selection because one batch is driven sequentially behind a per-switch login,
-  so the last row of a batch can reach its driver call minutes after the batch
-  was selected. Its budget is derived from the driver-call timeout and the
-  in-line attempt count rather than a new setting, every record path clears the
-  stamp, and a stamp left behind by a process that died mid-drive expires by
-  itself, so there is no reaper and no heartbeat. The retry outcome vocabulary
-  gains a seventh value, `in_progress`, for a row the other channel was already
-  driving: reporting it beats omitting it, since an absent row reads as one that
-  was already fixed. The L1 and L2 FAILED-to-ACTIVE success flips also moved to
-  the same SQL compare-and-swap L3 already used, so all three layers share one
-  flip discipline.
+- Shipped first-class Layer 3 routing intent end to end (ADR 0014, issue #34, phases 1
+  to 4): routes declared on a Layer 3 switch node in the topology editor, validated at
+  save against the switch's config with fourteen refusal reasons, resolved into
+  `fork_l3_routes` on activation and save, and driven by the execution service in
+  precedence over config-version routes. The three follow-ups closed too: virtual
+  routers reach the driver contract behind a `supports_vrf` capability (#755), attachment
+  is checked at the interface, not just the switch (#756), and a non-admin's canvas is
+  redacted to their visible devices before validation and pathfinding (#763).
+- Shipped the emulated-gear test tier (ADR 0010, phases 0 to 3b): a checked-in NOS lab
+  (FRRouting and Nokia SR Linux, images pinned by digest), the first two real driver
+  packages, `frr_l3` (Layer 3 Switch) and `srl_l2` (Layer 2 Switch), a binding driver
+  contract that a device rejection is a failure, and two CI tiers (issue #785): the
+  dialect suites on every PR and inside `make everything`, the via-stack feature suites
+  nightly.
+- The reservation assistant can consult documentation (ADR 0015, issue #31): `search_docs`
+  and `read_doc` over the built-in manual, operator corpora, and allowlisted https
+  sources, advertised only when a source is enabled and refused at the dispatch boundary
+  otherwise.
+- Wiring retry hardening: retry failure writes are by row identity (#814), the two retry
+  channels claim a row before driving it so a driver is never called twice for one row
+  (#817, a seventh retry outcome `in_progress`), and the nightly uploads per-test e2e
+  artifacts on failure (#813).
+- Seeding moved into the `seedtools` package with a subcommand CLI (`full`, `acl`, `frr`,
+  `nos`; issue #791), replacing the root script and both shell wrappers.
+- Purpose classification gains an admin per-reservation trigger,
+  `POST /admin/purpose-review/{id}/classify` (#808), the operator's retry for one row
+  without a global backfill.
+- Consolidations and fixes from the 2026-09-12 review of the driver batch (#778 to #784),
+  `GET /connections` on the shared visibility helper (#809), and the frontend test runner
+  on vitest 5 with a temporary jest-dom type shim (#806).
 
-- A wiring retry no longer resurrects rows that were released while it was
-  running (issue #814). Both retry channels (the manual endpoint and the
-  background tick) now record a driver failure against the ROW they loaded,
-  under a compare-and-swap on (id, status FAILED), instead of upserting by
-  (reservation, switch, port/pair). The upsert matched only non-RELEASED rows,
-  so a retry whose rows were flipped ACTIVE by the manual channel and then
-  released by a fork save during its driver call found nothing and INSERTED a
-  fresh FAILED row, leaving zombie build-direction failures for wiring the
-  reservation no longer intends (four L2 membership rows where two were
-  correct). The stale write is now a logged no-op at all three layers; the
-  fresh-build path keeps its upsert, since a build after a release is a
-  legitimate re-add.
+### Delivery detail
 
-- The reservation assistant can now consult documentation instead of answering
-  from training data (issue #31, ADR 0015). Two read-only tools, `search_docs`
-  and `read_doc`, search and page through named sources: the published HERD
-  manual, which now ships inside the ai-orchestrator image, plus any corpus an
-  operator mounts through `AI_DOCS_CORPUS_DIRS`, plus allowlisted https URLs
-  when `AI_DOCS_WEB_ENABLED` is on (off by default). The tools are advertised
-  only when at least one source is enabled and refused at the dispatch
-  boundary otherwise; a web fetch must match an allowed prefix, resolve
-  entirely to public addresses, survive re-validation at each of at most three
-  redirects, declare a text content type, and stay under a byte cap. Results
-  go through the same per-tool size cap and untrusted framing as every other
-  tool result.
-
-- Internal refactor, no behavior change: `GET /connections` (issue #719) now
-  resolves its non-admin visibility filter through the shared
-  `resolve_caller_visibility` helper (issue #763) instead of an inline copy of
-  the admin-check/fetch/503 sequence, the same helper the topology validate
-  and pathfind routes already use. Status codes, detail text, the admin
-  bypass, and the empty-visible-set short circuit are unchanged; the only
-  observable difference is the warning logged on an unanswerable inventory
-  lookup, which now carries the shared event key `caller_visibility_unavailable`
-  instead of the route-local `connections_visibility_unavailable`, matching
-  the other two consumers.
-
-- Device visibility now gates the topology validate route and both pathfind
-  routes (issue #763, hardening). For a non-admin caller, a canvas node naming
-  a device outside their device-group visibility is reported as
-  `missing_device` and is excluded from the reachability and Layer 3 passes, so
-  `POST /topologies/{id}/validate` no longer answers interface and subnet
-  questions about gear the caller cannot see; a pathfind pair naming such a
-  device is refused with the same `404 Device not found` an unknown id gets
-  (the batch route reports it per pair through a new `error` field), and a
-  transit hop through one comes back redacted: `PathHop.device_id` is now
-  nullable, with a new `hidden` flag and no port names. Hop counts,
-  reachability and the topology editor are unaffected, admins are not filtered
-  at all, and an unanswerable visibility lookup fails closed with a 503. The
-  open `GET /topologies/{id}` stays open by decision, recorded in
-  `docs/ROLES.md`.
+#### Layer 3 routing intent
 
 - Layer 3 routing intent is now checked at the INTERFACE, not just the switch
   (issue #756, ADR 0014 addenda X-J and X-K). A `Layer 3 Switch` config's
@@ -108,7 +53,6 @@
   is unchanged. Existing configs are read the strict way, every interface
   physical with its port equal to its name, so a switch whose OS interface
   names differ from its HERD port names needs `port` declared.
-
 - Virtual routers now reach the Layer 3 driver contract (issue #755, ADR 0014
   addenda X-G, X-H, X-I). `configure_route` and `remove_route` take a
   `virtual_router` keyword, and a driver opts in by declaring `supports_vrf` in
@@ -125,232 +69,6 @@
   accepted but never installed as a failure; `drivers/mock_l3` records the VRF;
   and the checked-in FRR lab node boots with a real VRF fixture so the live
   suites can prove the success case, not just the refusal.
-
-- Wired the NOS lab dialect tier into `make everything` (Lane's decision,
-  2026-09-12): it now runs `make nos-test-dialect` as its own phase, after the
-  live LDAP auth phase and before frontend coverage, so a full local gate also
-  proves the real SR Linux and FRR dialects. `make master` is unchanged and
-  does not run it; the via-stack feature tier stays nightly-only either way.
-  `tests/unit/test_nos_lab_ci_wiring.py` pins both sides of the asymmetry.
-
-- Split the NOS lab suites into two CI tiers (issue #785). The four dialect
-  suites, which drive one driver against one lab node with no HERD stack, run
-  on every pull request from ci.yml's new advisory `nos-dialect` job; the two
-  via-stack feature suites, which drive a real SR Linux and a real FRR node
-  through HERD's own reservation path, run in nightly after the seed step and
-  before the load test. Both go through new Makefile targets,
-  `make nos-test-dialect` (boots the lab if it is not already up, tears down
-  only what it started) and `make nos-test-feature` (attaches the lab, seeds
-  it, always detaches), so a workflow and a local run share one recipe.
-  `tests/unit/test_nos_lab_ci_wiring.py` fails if a new file under
-  `tests/nos_lab/` belongs to neither tier. Neither target is wired into
-  `make master` or `make everything`.
-
-- Moved seeding into a `seedtools/` package with a subcommand CLI and retired
-  the root module and both shell wrappers (issue #791). `seed_devices_public.py`
-  (2,637 lines), `scripts/seed_frr_demo.sh`, and `scripts/seed_nos_lab.sh` are
-  gone; `python -m seedtools full | acl | frr | nos` replaces them, with
-  `--full` on `frr` and `nos` layering a demo onto the whole population the way
-  the wrappers did, and `make seed`, `make seed-frr`, and `make seed-nos` as
-  the front doors. Credential resolution lives once in `seedtools/client.py`
-  (SEED_*, then SUPERADMIN_* from the environment, then SUPERADMIN_* read from
-  `.env`, then a generic placeholder), so the Makefile recipe and the two
-  wrappers no longer each re-implement it, and the personal default address the
-  root module carried is gone. Behavior is otherwise unchanged: the same
-  section headers print, every subcommand is still re-runnable, and SEED_FRR=1
-  / SEED_NOS=1 still layer the demos onto `full`. The four seed unit tests now
-  import the package instead of loading a file by path.
-
-- Tightened the two `tests/nos_lab/` via-stack feature tests so they prove what
-  they claim (issue #782). The FRR Layer 3 test now runs a fork SAVE with a
-  CHANGED route set, which is the only path that exercises `gate_l3_intent`,
-  the staged `reservation.wiring_changed`, and execution's route-set delta
-  reconcile, and it verifies both halves of that delta on the real router; its
-  rejection test pins the device's own `% Unknown command:` wording instead of
-  any non-empty error string; every destination assertion now matches the FULL
-  prefix (the old `split("/")[0]` form matched a leaked neighbouring prefix);
-  and a non-200 from `GET /execution/runs` now fails loudly instead of being
-  swallowed into "the route was never configured". The SR Linux Layer 2 test
-  now activates over an edgeless canvas and adds the edge in the fork save, so
-  the membership is attributable to the save; its device baseline is taken
-  before the reservation exists and scoped to the two ports and the allocated
-  VLAN rather than "no mac-vrf anywhere"; and its device cleanup checks its
-  exit status and reports the `sr_cli` stderr. Both files now probe their
-  preconditions from a session-scoped fixture, so collection touches neither
-  the network nor docker.
-
-- Closed four rejection-classification gaps in the FRR drivers (issue #779)
-  and the shared `HERD_port` parsing defect (issue #780). `drivers/frr_mgmt`
-  and `drivers/frr_l3` now anchor the benign "already absent" carve-out at the
-  START of the device's line instead of testing for it anywhere in the line:
-  FRR quotes the offending command back inside `% Unknown command: ...`, so a
-  config line containing that phrase had its genuine rejection reported as
-  success (verified live on the NOS test lab node). `frr_mgmt.configure()` now
-  classifies its `write memory` output instead of assuming it worked, since a
-  failed save prints no `%` line and exits 0; it requires a
-  `configuration saved to ...` line and reports `{"success": False}` with the
-  offending save line otherwise, and its failure payload calls the commands
-  `attempted` rather than `applied`. `frr_l3` got `frr_mgmt`'s
-  collect-and-partition scanner, so `remove_route` reports the first GENUINE
-  line and treats a response as `already_absent` only when every `%` line in
-  it is benign. Both drivers now parse `HERD_port` in `_connect()` rather than
-  the constructor, treating blank or missing as 22 and raising
-  `DriverError("HERD_port must be an integer")` otherwise, so a device with a
-  present-but-empty `port` field degrades to `{"reachable": False}` instead of
-  failing the sandbox before any method runs. `docs/DRIVERS.md` gained the
-  anchoring and persist-classification rules, the Hypervisor
-  `create_instance`/`destroy_instance` exception to "an absent key stays
-  success", and a note that `frr_l3` deliberately does not persist its
-  reservation-scoped routes.
-
-- Fixed `drivers/srl_l2` applying part of a batch it reported as failed, and
-  committing configuration staged by an earlier call that died (issue #778). SR Linux
-  stages every `set`/`delete` in a per-user private candidate that only `commit stay`
-  applies, and that candidate outlives the SSH session: netmiko keeps sending after a
-  rejected line, so the old unconditional `commit()` applied the valid PREFIX of a
-  rejected batch (proven live: `admin-state enable` landed on a port HERD believed
-  untouched while the driver returned `success: False`), and any exception path left
-  lines staged for the next call's commit to pick up through the device. `_apply` now
-  discards the candidate at entry, returns failure on a set-time rejection before it
-  ever commits, discards on a commit refusal, and discards in a `finally` on exception
-  paths. The module docstring's "shared session" rationale is replaced with the
-  persistent-candidate fact (the sandbox runs one process per action, so there is no
-  shared session) and gains the best-effort limitation block `docs/DRIVERS.md`
-  requires. Also (issue #780, `srl_l2` only) an optional `HERD_port` that is blank now
-  means 22 instead of raising `ValueError` from the constructor, and a non-integer
-  raises `DriverError("HERD_port must be an integer")` from `_connect`, so `status()`
-  still degrades to `{"reachable": False}` for health polling. New live regression
-  tests in `tests/nos_lab/test_srl_l2_driver_live.py` verify the device independently
-  through a separate `docker exec nos-test-srl sr_cli` session.
-
-- Pinned the NOS lab and Selenium images by digest (issue #783): SR Linux
-  (`26.7.2-519`), the FRR base image (no matching version tag; digest only),
-  and `selenium/standalone-chrome` (`4.43.0-20260404`), plus the FRR
-  Dockerfile's `apk add openssh` version; added `--wait-timeout 120` to the
-  Selenium `up --wait` recreate; tightened the Makefile `down`-line test
-  regex to catch `@`/`-`/`VAR=value`-prefixed and conditional spellings;
-  made `nos-detach` report per-container attachment and exit non-zero on a
-  real disconnect error; fixed `scripts/seed_nos_lab.sh`'s misleading
-  `SEED_NOS=1` message on its default `--nos-only` path; hardened
-  `infra/nos-test/frr/start.sh` (`set -e`, an sshd-up check) and extended the
-  FRR healthcheck to also probe port 22.
-
-- Fixed `pick_dut_template`'s last fallback tier in `seed_devices_public.py`
-  (issue #781, follow-up to #775): it returned `items[0]` even when no
-  template declared the seed fields, guaranteeing a create that fails
-  inventory validation. It now returns `None` in that case, which the caller
-  already handled by skipping ACL fixture seeding. Also hardened
-  `template_field_keys` to skip fieldless entries and gave the
-  `get_or_create_device` field-key assert a message.
-
-- Shipped phase 3b of the emulated-gear test tier (ADR 0010), the Layer 2
-  counterpart of phase 3a's Layer 3 proof: `tests/nos_lab/test_srl_l2_via_stack_live.py`
-  proves HERD derives a Layer 2 VLAN membership from a reservation's wiring and
-  configures it on the REAL Nokia SR Linux node entirely through HERD's own API,
-  execution service, and driver sandbox (drivers/srl_l2), not by calling the driver
-  directly. It reuses the seeded `nos-lab-dut-1`/`nos-lab-dut-2`/`nos-lab-srl`
-  devices and cabling (`scripts/seed_nos_lab.sh`), wires the two DUTs together on a
-  topology canvas with no switch node (cabling's pathfinder resolves it through the
-  real switch's `ethernet-1/1`/`ethernet-1/2` ports), activates a reservation over
-  it, and saves the fork to drive the connection-driven L2 reconcile (ADR 0009).
-  It reads the VLAN id HERD allocated from the reservation's own
-  `GET /reservations/{id}/wiring-status` surface instead of assuming a number,
-  independently verifies on the real device (a separate `docker exec nos-test-srl
-  sr_cli` session, never the driver's own session) that the `mac-vrf`
-  network-instance exists AND both subinterfaces are bound into it, cancels the
-  reservation, and independently verifies both the port bindings and the VLAN
-  definition are gone, cross-checking HERD's own ledger (RELEASED) against the
-  device at each step. `delete_vlan` runs in its own driver session shortly after
-  the membership ledger flips RELEASED, so the teardown-side device check polls
-  rather than asserting once. Same gating and cleanup discipline as
-  `test_frr_l3_via_stack_live.py`; see docs/NOS_LAB.md.
-
-- Shipped phase 3a of the emulated-gear test tier (ADR 0010): the checked-in
-  NOS test lab can now be wired into a running HERD stack so HERD drives the
-  real devices through its OWN execution service and driver sandbox, not by
-  calling a driver directly. New Makefile targets `nos-attach`/`nos-detach`
-  connect/disconnect the lab containers (`nos-test-srl`, `nos-test-frr`) to
-  the dev stack's Docker network, so the execution service reaches them by
-  CONTAINER NAME over Docker DNS (container IPs are not stable across a
-  recreate; container names are). `seed_devices_public.py` gained
-  `seed_nos_lab` (gated by `SEED_NOS=1`, mirroring `seed_frr_demo`'s
-  `SEED_FRR=1` shape): it registers the real `drivers/srl_l2` and
-  `drivers/frr_l3` packages, one device template each, the two lab devices
-  with `field_data.ip` set to the container name, two placeholder DUT
-  devices, and cabling to the SR Linux node's `ethernet-1/1`/`ethernet-1/2`
-  ports, laying the groundwork for a later phase to derive an L2 VLAN
-  membership from recorded L1 hops (ADR 0009); a new `--nos-only` seed-script
-  mode and `scripts/seed_nos_lab.sh` wrapper mirror the existing `--acl-only`/
-  `seed_frr_demo.sh` pattern. `tests/nos_lab/test_frr_l3_via_stack_live.py`
-  is the end-to-end proof: it drives a real static route onto the real FRR
-  node entirely through HERD's API (a reservation whose fork carries L3
-  routing intent, ADR 0009/0014), independently verifies the change via
-  `docker exec ... vtysh`, removes it via reservation cancellation, and
-  proves a device-rejected route lands as a FAILED execution run with the
-  device's own error text, not a false success. `tests/unit/test_seed_nos_lab_driver.py`
-  pins the new driver-zip-from-disk helper. Opt-in, needs both the lab
-  (`make nos-up`) and a stack with the lab attached (`make up`,
-  `make nos-attach`); not part of `make test`, `make master`, or
-  `make everything`. See `docs/NOS_LAB.md`.
-
-- Made "a driver must report a device rejection as a failure" a binding
-  contract (issue #771): `docs/DRIVERS.md` gains a section beside "Dry-run
-  support" laying out the rule, since both are binding requirements with a
-  stated consequence, return `{"success": False}` on a device rejection
-  rather than raising, put the offending line in `error` since that is what
-  lands in a wiring assignment's `last_error` column, and never verify a
-  driver's own work through its own read path. `drivers/frr_mgmt.configure()`
-  is the fix: it classifies every `%` line in the config output, reports
-  `{"success": False}` with the device's own offending line on any genuine
-  rejection, and counts a batch as clean only when every `%` line found is a
-  recognized benign marker, surfaced under `benign_warnings` instead of
-  masked as a plain success. User-visible consequence: a config apply whose
-  batch includes an idempotent removal (`% Refusing to remove a
-  non-existent route`) now succeeds with `benign_warnings` rather than
-  failing. New opt-in coverage in `tests/nos_lab/test_frr_mgmt_driver_live.py`
-  drives the real driver against the FRR node and independently verifies the
-  rejection case installs nothing.
-
-- Fixed `make seed` failing with "Unknown fields: ip, login, password"
-  when an integration-suite-seeded template (`int-seed-template-*`,
-  Management-backed but declaring only `model`) sorts ahead of a template
-  that declares the fields `get_or_create_device` sends (issue #775).
-  `pick_dut_template` now only considers templates that declare every key
-  the seed will send, preferring a Management-backed one among those, then
-  any usable one, then the previous fallback; the required key set lives in
-  one constant, `SEED_DEVICE_FIELD_KEYS`, which `get_or_create_device`
-  asserts against so the two cannot drift apart.
-  `tests/unit/test_seed_pick_dut_template.py` covers the exact ordering
-  from the bug.
-
-- Added `drivers/frr_l3/`, the first real Layer 3 Switch driver package: SSH-to-vtysh over the same FRRouting node and netmiko `cisco_ios` transport as `drivers/frr_mgmt`, implementing `login`/`logout`/`configure_route`/`remove_route`/`status` per the Layer 3 Switch contract (docs/DRIVERS.md). `configure_route` sends `ip route <destination> <next_hop>`, or `ip route <destination> <interface>` when `next_hop` is `None` (an interface route); `remove_route` sends the same line prefixed with `no `. `supports_dry_run: true` is honored on every mutating method (no session opened, transcript still recorded). Verified live against the checked-in NOS test lab's FRR node (docs/NOS_LAB.md) that both `configure_route` and `remove_route` are idempotent under redelivery: FRR silently no-ops a duplicate route install, and a duplicate removal answers a benign CLI warning rather than an error, so this driver treats both as success, matching the redelivery guarantee the Layer 2 contract states explicitly for `create_vlan`. `tests/unit/test_frr_l3_driver.py` (stack-free, netmiko mocked) and `tests/nos_lab/test_frr_l3_driver_live.py` (opt-in, `HERD_TEST_NOS_REQUIRED=1`) cover it; see docs/DRIVERS.md's new "FRR reference driver" section and docs/NOS_LAB.md.
-
-- Added phase 0 of the emulated-gear test tier (ADR 0010): a checked-in,
-  license-free network-OS lab (`infra/nos-test/`) with two nodes, Nokia SR
-  Linux (Layer 2, netmiko `nokia_srl`) and FRRouting over SSH-to-vtysh
-  (Layer 3 / Cisco dialect, netmiko `cisco_ios`), modeled on
-  `infra/ldap-test/`'s stateless, seed-on-boot shape. SR Linux needs a small
-  checked-in CLI baseline (`infra/nos-test/srl/baseline.cli`) applied and
-  saved on every boot to clear a factory-fresh device's `[FACTORY]`
-  config-prompt tag, which otherwise breaks netmiko 4.7.0's
-  `nokia_srl.check_config_mode` regex. New Makefile targets `nos-up`,
-  `nos-down`, `nos-status`, `nos-logs`, `nos-reset` (opt-in only, not part of
-  `make test`, `make master`, or `make everything`); `tests/unit/test_nos_lab_compose.py`
-  pins the compose file's stateless shape and port non-collision with the
-  dev/gate stacks; `tests/nos_lab/test_nos_lab_live.py` is an opt-in live
-  suite (`HERD_TEST_NOS_REQUIRED=1`, mirroring the LDAP live-suite
-  convention) that creates and independently verifies a VLAN on SR Linux
-  and a static route on FRR. See `docs/NOS_LAB.md`.
-
-- Fixed the stack-lifecycle Makefile targets so a `make everything` gate cannot be
-  blocked by a leftover e2e Selenium container: every compose `down` (`down`, `clean`,
-  `clean-data`, `gate-clean`, `_clean-images`, `_master-stack-down`) now enables the
-  `e2e` profile, since a profile-gated service that is not enabled is neither active
-  nor an orphan and survived a plain `down` holding host port 4444. The e2e recreate
-  now uses `--wait` against a new Grid healthcheck on the Selenium service, so the
-  first Playwright page load no longer races the new container's network setup
-  (`net::ERR_NETWORK_CHANGED`, the recurring first-test login timeout). Pinned by
-  `tests/unit/test_makefile_stack_lifecycle.py`.
 - Shipped phase 1 of first-class Layer 3 routing intent (ADR 0014, issue #34):
   cabling migration 0011 adds `fork_l3_routes`, a canvas parser reads
   `data.l3.routes` on Layer 3 Switch device nodes, both fork write paths (fork
@@ -427,6 +145,179 @@
   Routing panel mockup in the wiring section, `user-live-editing.html#fork`
   gains one sentence on the fork-diff "Routing changed" line, and
   `glossary.html` gains a Routing intent term.
+
+#### Emulated-gear tier and drivers
+
+- Wired the NOS lab dialect tier into `make everything` (Lane's decision,
+  2026-09-12): it now runs `make nos-test-dialect` as its own phase, after the
+  live LDAP auth phase and before frontend coverage, so a full local gate also
+  proves the real SR Linux and FRR dialects. `make master` is unchanged and
+  does not run it; the via-stack feature tier stays nightly-only either way.
+  `tests/unit/test_nos_lab_ci_wiring.py` pins both sides of the asymmetry.
+- Split the NOS lab suites into two CI tiers (issue #785). The four dialect
+  suites, which drive one driver against one lab node with no HERD stack, run
+  on every pull request from ci.yml's new advisory `nos-dialect` job; the two
+  via-stack feature suites, which drive a real SR Linux and a real FRR node
+  through HERD's own reservation path, run in nightly after the seed step and
+  before the load test. Both go through new Makefile targets,
+  `make nos-test-dialect` (boots the lab if it is not already up, tears down
+  only what it started) and `make nos-test-feature` (attaches the lab, seeds
+  it, always detaches), so a workflow and a local run share one recipe.
+  `tests/unit/test_nos_lab_ci_wiring.py` fails if a new file under
+  `tests/nos_lab/` belongs to neither tier. Neither target is wired into
+  `make master` or `make everything`.
+- Tightened the two `tests/nos_lab/` via-stack feature tests so they prove what
+  they claim (issue #782). The FRR Layer 3 test now runs a fork SAVE with a
+  CHANGED route set, which is the only path that exercises `gate_l3_intent`,
+  the staged `reservation.wiring_changed`, and execution's route-set delta
+  reconcile, and it verifies both halves of that delta on the real router; its
+  rejection test pins the device's own `% Unknown command:` wording instead of
+  any non-empty error string; every destination assertion now matches the FULL
+  prefix (the old `split("/")[0]` form matched a leaked neighbouring prefix);
+  and a non-200 from `GET /execution/runs` now fails loudly instead of being
+  swallowed into "the route was never configured". The SR Linux Layer 2 test
+  now activates over an edgeless canvas and adds the edge in the fork save, so
+  the membership is attributable to the save; its device baseline is taken
+  before the reservation exists and scoped to the two ports and the allocated
+  VLAN rather than "no mac-vrf anywhere"; and its device cleanup checks its
+  exit status and reports the `sr_cli` stderr. Both files now probe their
+  preconditions from a session-scoped fixture, so collection touches neither
+  the network nor docker.
+- Closed four rejection-classification gaps in the FRR drivers (issue #779)
+  and the shared `HERD_port` parsing defect (issue #780). `drivers/frr_mgmt`
+  and `drivers/frr_l3` now anchor the benign "already absent" carve-out at the
+  START of the device's line instead of testing for it anywhere in the line:
+  FRR quotes the offending command back inside `% Unknown command: ...`, so a
+  config line containing that phrase had its genuine rejection reported as
+  success (verified live on the NOS test lab node). `frr_mgmt.configure()` now
+  classifies its `write memory` output instead of assuming it worked, since a
+  failed save prints no `%` line and exits 0; it requires a
+  `configuration saved to ...` line and reports `{"success": False}` with the
+  offending save line otherwise, and its failure payload calls the commands
+  `attempted` rather than `applied`. `frr_l3` got `frr_mgmt`'s
+  collect-and-partition scanner, so `remove_route` reports the first GENUINE
+  line and treats a response as `already_absent` only when every `%` line in
+  it is benign. Both drivers now parse `HERD_port` in `_connect()` rather than
+  the constructor, treating blank or missing as 22 and raising
+  `DriverError("HERD_port must be an integer")` otherwise, so a device with a
+  present-but-empty `port` field degrades to `{"reachable": False}` instead of
+  failing the sandbox before any method runs. `docs/DRIVERS.md` gained the
+  anchoring and persist-classification rules, the Hypervisor
+  `create_instance`/`destroy_instance` exception to "an absent key stays
+  success", and a note that `frr_l3` deliberately does not persist its
+  reservation-scoped routes.
+- Fixed `drivers/srl_l2` applying part of a batch it reported as failed, and
+  committing configuration staged by an earlier call that died (issue #778). SR Linux
+  stages every `set`/`delete` in a per-user private candidate that only `commit stay`
+  applies, and that candidate outlives the SSH session: netmiko keeps sending after a
+  rejected line, so the old unconditional `commit()` applied the valid PREFIX of a
+  rejected batch (proven live: `admin-state enable` landed on a port HERD believed
+  untouched while the driver returned `success: False`), and any exception path left
+  lines staged for the next call's commit to pick up through the device. `_apply` now
+  discards the candidate at entry, returns failure on a set-time rejection before it
+  ever commits, discards on a commit refusal, and discards in a `finally` on exception
+  paths. The module docstring's "shared session" rationale is replaced with the
+  persistent-candidate fact (the sandbox runs one process per action, so there is no
+  shared session) and gains the best-effort limitation block `docs/DRIVERS.md`
+  requires. Also (issue #780, `srl_l2` only) an optional `HERD_port` that is blank now
+  means 22 instead of raising `ValueError` from the constructor, and a non-integer
+  raises `DriverError("HERD_port must be an integer")` from `_connect`, so `status()`
+  still degrades to `{"reachable": False}` for health polling. New live regression
+  tests in `tests/nos_lab/test_srl_l2_driver_live.py` verify the device independently
+  through a separate `docker exec nos-test-srl sr_cli` session.
+- Pinned the NOS lab and Selenium images by digest (issue #783): SR Linux
+  (`26.7.2-519`), the FRR base image (no matching version tag; digest only),
+  and `selenium/standalone-chrome` (`4.43.0-20260404`), plus the FRR
+  Dockerfile's `apk add openssh` version; added `--wait-timeout 120` to the
+  Selenium `up --wait` recreate; tightened the Makefile `down`-line test
+  regex to catch `@`/`-`/`VAR=value`-prefixed and conditional spellings;
+  made `nos-detach` report per-container attachment and exit non-zero on a
+  real disconnect error; fixed `scripts/seed_nos_lab.sh`'s misleading
+  `SEED_NOS=1` message on its default `--nos-only` path; hardened
+  `infra/nos-test/frr/start.sh` (`set -e`, an sshd-up check) and extended the
+  FRR healthcheck to also probe port 22.
+- Shipped phase 3b of the emulated-gear test tier (ADR 0010), the Layer 2
+  counterpart of phase 3a's Layer 3 proof: `tests/nos_lab/test_srl_l2_via_stack_live.py`
+  proves HERD derives a Layer 2 VLAN membership from a reservation's wiring and
+  configures it on the REAL Nokia SR Linux node entirely through HERD's own API,
+  execution service, and driver sandbox (drivers/srl_l2), not by calling the driver
+  directly. It reuses the seeded `nos-lab-dut-1`/`nos-lab-dut-2`/`nos-lab-srl`
+  devices and cabling (`scripts/seed_nos_lab.sh`), wires the two DUTs together on a
+  topology canvas with no switch node (cabling's pathfinder resolves it through the
+  real switch's `ethernet-1/1`/`ethernet-1/2` ports), activates a reservation over
+  it, and saves the fork to drive the connection-driven L2 reconcile (ADR 0009).
+  It reads the VLAN id HERD allocated from the reservation's own
+  `GET /reservations/{id}/wiring-status` surface instead of assuming a number,
+  independently verifies on the real device (a separate `docker exec nos-test-srl
+  sr_cli` session, never the driver's own session) that the `mac-vrf`
+  network-instance exists AND both subinterfaces are bound into it, cancels the
+  reservation, and independently verifies both the port bindings and the VLAN
+  definition are gone, cross-checking HERD's own ledger (RELEASED) against the
+  device at each step. `delete_vlan` runs in its own driver session shortly after
+  the membership ledger flips RELEASED, so the teardown-side device check polls
+  rather than asserting once. Same gating and cleanup discipline as
+  `test_frr_l3_via_stack_live.py`; see docs/NOS_LAB.md.
+- Shipped phase 3a of the emulated-gear test tier (ADR 0010): the checked-in
+  NOS test lab can now be wired into a running HERD stack so HERD drives the
+  real devices through its OWN execution service and driver sandbox, not by
+  calling a driver directly. New Makefile targets `nos-attach`/`nos-detach`
+  connect/disconnect the lab containers (`nos-test-srl`, `nos-test-frr`) to
+  the dev stack's Docker network, so the execution service reaches them by
+  CONTAINER NAME over Docker DNS (container IPs are not stable across a
+  recreate; container names are). `seed_devices_public.py` gained
+  `seed_nos_lab` (gated by `SEED_NOS=1`, mirroring `seed_frr_demo`'s
+  `SEED_FRR=1` shape): it registers the real `drivers/srl_l2` and
+  `drivers/frr_l3` packages, one device template each, the two lab devices
+  with `field_data.ip` set to the container name, two placeholder DUT
+  devices, and cabling to the SR Linux node's `ethernet-1/1`/`ethernet-1/2`
+  ports, laying the groundwork for a later phase to derive an L2 VLAN
+  membership from recorded L1 hops (ADR 0009); a new `--nos-only` seed-script
+  mode and `scripts/seed_nos_lab.sh` wrapper mirror the existing `--acl-only`/
+  `seed_frr_demo.sh` pattern. `tests/nos_lab/test_frr_l3_via_stack_live.py`
+  is the end-to-end proof: it drives a real static route onto the real FRR
+  node entirely through HERD's API (a reservation whose fork carries L3
+  routing intent, ADR 0009/0014), independently verifies the change via
+  `docker exec ... vtysh`, removes it via reservation cancellation, and
+  proves a device-rejected route lands as a FAILED execution run with the
+  device's own error text, not a false success. `tests/unit/test_seed_nos_lab_driver.py`
+  pins the new driver-zip-from-disk helper. Opt-in, needs both the lab
+  (`make nos-up`) and a stack with the lab attached (`make up`,
+  `make nos-attach`); not part of `make test`, `make master`, or
+  `make everything`. See `docs/NOS_LAB.md`.
+- Made "a driver must report a device rejection as a failure" a binding
+  contract (issue #771): `docs/DRIVERS.md` gains a section beside "Dry-run
+  support" laying out the rule, since both are binding requirements with a
+  stated consequence, return `{"success": False}` on a device rejection
+  rather than raising, put the offending line in `error` since that is what
+  lands in a wiring assignment's `last_error` column, and never verify a
+  driver's own work through its own read path. `drivers/frr_mgmt.configure()`
+  is the fix: it classifies every `%` line in the config output, reports
+  `{"success": False}` with the device's own offending line on any genuine
+  rejection, and counts a batch as clean only when every `%` line found is a
+  recognized benign marker, surfaced under `benign_warnings` instead of
+  masked as a plain success. User-visible consequence: a config apply whose
+  batch includes an idempotent removal (`% Refusing to remove a
+  non-existent route`) now succeeds with `benign_warnings` rather than
+  failing. New opt-in coverage in `tests/nos_lab/test_frr_mgmt_driver_live.py`
+  drives the real driver against the FRR node and independently verifies the
+  rejection case installs nothing.
+- Added `drivers/frr_l3/`, the first real Layer 3 Switch driver package: SSH-to-vtysh over the same FRRouting node and netmiko `cisco_ios` transport as `drivers/frr_mgmt`, implementing `login`/`logout`/`configure_route`/`remove_route`/`status` per the Layer 3 Switch contract (docs/DRIVERS.md). `configure_route` sends `ip route <destination> <next_hop>`, or `ip route <destination> <interface>` when `next_hop` is `None` (an interface route); `remove_route` sends the same line prefixed with `no `. `supports_dry_run: true` is honored on every mutating method (no session opened, transcript still recorded). Verified live against the checked-in NOS test lab's FRR node (docs/NOS_LAB.md) that both `configure_route` and `remove_route` are idempotent under redelivery: FRR silently no-ops a duplicate route install, and a duplicate removal answers a benign CLI warning rather than an error, so this driver treats both as success, matching the redelivery guarantee the Layer 2 contract states explicitly for `create_vlan`. `tests/unit/test_frr_l3_driver.py` (stack-free, netmiko mocked) and `tests/nos_lab/test_frr_l3_driver_live.py` (opt-in, `HERD_TEST_NOS_REQUIRED=1`) cover it; see docs/DRIVERS.md's new "FRR reference driver" section and docs/NOS_LAB.md.
+- Added phase 0 of the emulated-gear test tier (ADR 0010): a checked-in,
+  license-free network-OS lab (`infra/nos-test/`) with two nodes, Nokia SR
+  Linux (Layer 2, netmiko `nokia_srl`) and FRRouting over SSH-to-vtysh
+  (Layer 3 / Cisco dialect, netmiko `cisco_ios`), modeled on
+  `infra/ldap-test/`'s stateless, seed-on-boot shape. SR Linux needs a small
+  checked-in CLI baseline (`infra/nos-test/srl/baseline.cli`) applied and
+  saved on every boot to clear a factory-fresh device's `[FACTORY]`
+  config-prompt tag, which otherwise breaks netmiko 4.7.0's
+  `nokia_srl.check_config_mode` regex. New Makefile targets `nos-up`,
+  `nos-down`, `nos-status`, `nos-logs`, `nos-reset` (opt-in only, not part of
+  `make test`, `make master`, or `make everything`); `tests/unit/test_nos_lab_compose.py`
+  pins the compose file's stateless shape and port non-collision with the
+  dev/gate stacks; `tests/nos_lab/test_nos_lab_live.py` is an opt-in live
+  suite (`HERD_TEST_NOS_REQUIRED=1`, mirroring the LDAP live-suite
+  convention) that creates and independently verifies a VLAN on SR Linux
+  and a static route on FRR. See `docs/NOS_LAB.md`.
 - Added `drivers/srl_l2/`, HERD's first real (non-mock) Layer 2 Switch
   driver: Nokia SR Linux over SSH via netmiko's `nokia_srl` platform,
   modeled structurally on `drivers/frr_mgmt/` (HERD_-prefixed connection
@@ -445,6 +336,160 @@
   `tests/unit/test_srl_l2_driver.py` pins the exact command text for the
   tagged and untagged forms and the commit-per-mutating-op invariant with
   netmiko mocked. See `docs/DRIVERS.md` and `docs/NOS_LAB.md`.
+
+#### AI orchestrator
+
+- The reservation assistant can now consult documentation instead of answering
+  from training data (issue #31, ADR 0015). Two read-only tools, `search_docs`
+  and `read_doc`, search and page through named sources: the published HERD
+  manual, which now ships inside the ai-orchestrator image, plus any corpus an
+  operator mounts through `AI_DOCS_CORPUS_DIRS`, plus allowlisted https URLs
+  when `AI_DOCS_WEB_ENABLED` is on (off by default). The tools are advertised
+  only when at least one source is enabled and refused at the dispatch
+  boundary otherwise; a web fetch must match an allowed prefix, resolve
+  entirely to public addresses, survive re-validation at each of at most three
+  redirects, declare a text content type, and stay under a byte cap. Results
+  go through the same per-tool size cap and untrusted framing as every other
+  tool result.
+
+#### Wiring retry and execution
+
+- The two wiring retry channels can no longer drive the same FAILED row at once
+  (issue #817). The manual endpoint and the background tick both load
+  hardware-retryable FAILED ledger rows and drive them through the same applies;
+  issue #814 stopped a late failure write from corrupting the ledger, but
+  nothing claimed a row before it was driven, so one connection could get two
+  concurrent driver calls, from two execution processes even, since the tick
+  runs in every replica. Each retried row is now claimed by a compare-and-swap
+  on a new nullable `claimed_until` column immediately before that row's own
+  driver call, and a row the other channel holds is skipped with no driver call
+  and no ledger write. The claim is taken at drive time rather than at
+  selection because one batch is driven sequentially behind a per-switch login,
+  so the last row of a batch can reach its driver call minutes after the batch
+  was selected. Its budget is derived from the driver-call timeout and the
+  in-line attempt count rather than a new setting, every record path clears the
+  stamp, and a stamp left behind by a process that died mid-drive expires by
+  itself, so there is no reaper and no heartbeat. The retry outcome vocabulary
+  gains a seventh value, `in_progress`, for a row the other channel was already
+  driving: reporting it beats omitting it, since an absent row reads as one that
+  was already fixed. The L1 and L2 FAILED-to-ACTIVE success flips also moved to
+  the same SQL compare-and-swap L3 already used, so all three layers share one
+  flip discipline.
+- A wiring retry no longer resurrects rows that were released while it was
+  running (issue #814). Both retry channels (the manual endpoint and the
+  background tick) now record a driver failure against the ROW they loaded,
+  under a compare-and-swap on (id, status FAILED), instead of upserting by
+  (reservation, switch, port/pair). The upsert matched only non-RELEASED rows,
+  so a retry whose rows were flipped ACTIVE by the manual channel and then
+  released by a fork save during its driver call found nothing and INSERTED a
+  fresh FAILED row, leaving zombie build-direction failures for wiring the
+  reservation no longer intends (four L2 membership rows where two were
+  correct). The stale write is now a logged no-op at all three layers; the
+  fresh-build path keeps its upsert, since a build after a release is a
+  legitimate re-add.
+
+#### Purpose classification
+
+- An admin can now classify one reservation's purpose on demand instead of waiting for
+  the background sweep to reach it (issue #808). `POST
+  /admin/purpose-review/{reservation_id}/classify` runs the sweep's own single-row
+  classifier synchronously for exactly that reservation and returns its outcome (`ok`,
+  `timeout`, `transient`, `failed`, or `forbidden`, all still 200; `feature_off`
+  answers 503 instead, matching how other AI-gated endpoints respond when
+  unconfigured); 404 for an unknown reservation, 409 `not_eligible` before the
+  reservation reaches a terminal state, 409 `already_suggested` once a suggestion
+  already exists. It deliberately ignores `purpose_classify_max_attempts`, so it
+  doubles as a way to retry one exhausted row without running the global backfill, and
+  the sweep's oldest-first fairness is unchanged. The single-row classifier moved from
+  the expiration task to `purpose_service.classify_purpose_one` so the new router does
+  not import from `tasks/`; the sweep reconciler now calls it from its new home. Fixes
+  the reused-stack flake in `test_purpose_review_flow.py` (the test now triggers its
+  own reservation directly instead of waiting on the sweep's backlog), and the
+  now-unused `classify_sweep_first` pytest marker and its collection-reordering hook
+  are removed.
+
+#### Seeding, CI, and tooling
+
+- Nightly now uploads the per-test e2e artifact directory on failure (PR #813): the
+  workflow sets `HERD_E2E_ARTIFACT_DIR` into the workspace so the failure upload carries
+  each failed test's screenshot, page HTML, console log, and traceback alongside the
+  compose logs; `tests/unit/test_nightly_e2e_artifacts_wiring.py` pins the wiring.
+- Moved the frontend test runner to vitest 5 and `@vitest/coverage-v8` 5 (PR #806,
+  superseding Dependabot #796 and #800, which each failed alone on a peer conflict).
+  jest-dom 7.0.1 augments vitest's `Assertion` with one type parameter and vitest 5's
+  has two, so every matcher vanished from the type system (1220 `tsc` errors);
+  `frontend/src/test/vitest-jest-dom.d.ts` is a temporary shim that re-augments the
+  two-parameter shape until jest-dom ships a compatible release (upstream
+  testing-library/jest-dom#738). Runtime was never affected: the same 1372 tests pass
+  before and after.
+- Moved seeding into a `seedtools/` package with a subcommand CLI and retired
+  the root module and both shell wrappers (issue #791). `seed_devices_public.py`
+  (2,637 lines), `scripts/seed_frr_demo.sh`, and `scripts/seed_nos_lab.sh` are
+  gone; `python -m seedtools full | acl | frr | nos` replaces them, with
+  `--full` on `frr` and `nos` layering a demo onto the whole population the way
+  the wrappers did, and `make seed`, `make seed-frr`, and `make seed-nos` as
+  the front doors. Credential resolution lives once in `seedtools/client.py`
+  (SEED_*, then SUPERADMIN_* from the environment, then SUPERADMIN_* read from
+  `.env`, then a generic placeholder), so the Makefile recipe and the two
+  wrappers no longer each re-implement it, and the personal default address the
+  root module carried is gone. Behavior is otherwise unchanged: the same
+  section headers print, every subcommand is still re-runnable, and SEED_FRR=1
+  / SEED_NOS=1 still layer the demos onto `full`. The four seed unit tests now
+  import the package instead of loading a file by path.
+- Fixed `pick_dut_template`'s last fallback tier in `seed_devices_public.py`
+  (issue #781, follow-up to #775): it returned `items[0]` even when no
+  template declared the seed fields, guaranteeing a create that fails
+  inventory validation. It now returns `None` in that case, which the caller
+  already handled by skipping ACL fixture seeding. Also hardened
+  `template_field_keys` to skip fieldless entries and gave the
+  `get_or_create_device` field-key assert a message.
+- Fixed `make seed` failing with "Unknown fields: ip, login, password"
+  when an integration-suite-seeded template (`int-seed-template-*`,
+  Management-backed but declaring only `model`) sorts ahead of a template
+  that declares the fields `get_or_create_device` sends (issue #775).
+  `pick_dut_template` now only considers templates that declare every key
+  the seed will send, preferring a Management-backed one among those, then
+  any usable one, then the previous fallback; the required key set lives in
+  one constant, `SEED_DEVICE_FIELD_KEYS`, which `get_or_create_device`
+  asserts against so the two cannot drift apart.
+  `tests/unit/test_seed_pick_dut_template.py` covers the exact ordering
+  from the bug.
+- Fixed the stack-lifecycle Makefile targets so a `make everything` gate cannot be
+  blocked by a leftover e2e Selenium container: every compose `down` (`down`, `clean`,
+  `clean-data`, `gate-clean`, `_clean-images`, `_master-stack-down`) now enables the
+  `e2e` profile, since a profile-gated service that is not enabled is neither active
+  nor an orphan and survived a plain `down` holding host port 4444. The e2e recreate
+  now uses `--wait` against a new Grid healthcheck on the Selenium service, so the
+  first Playwright page load no longer races the new container's network setup
+  (`net::ERR_NETWORK_CHANGED`, the recurring first-test login timeout). Pinned by
+  `tests/unit/test_makefile_stack_lifecycle.py`.
+
+#### Visibility and security
+
+- Internal refactor, no behavior change: `GET /connections` (issue #719) now
+  resolves its non-admin visibility filter through the shared
+  `resolve_caller_visibility` helper (issue #763) instead of an inline copy of
+  the admin-check/fetch/503 sequence, the same helper the topology validate
+  and pathfind routes already use. Status codes, detail text, the admin
+  bypass, and the empty-visible-set short circuit are unchanged; the only
+  observable difference is the warning logged on an unanswerable inventory
+  lookup, which now carries the shared event key `caller_visibility_unavailable`
+  instead of the route-local `connections_visibility_unavailable`, matching
+  the other two consumers.
+- Device visibility now gates the topology validate route and both pathfind
+  routes (issue #763, hardening). For a non-admin caller, a canvas node naming
+  a device outside their device-group visibility is reported as
+  `missing_device` and is excluded from the reachability and Layer 3 passes, so
+  `POST /topologies/{id}/validate` no longer answers interface and subnet
+  questions about gear the caller cannot see; a pathfind pair naming such a
+  device is refused with the same `404 Device not found` an unknown id gets
+  (the batch route reports it per pair through a new `error` field), and a
+  transit hop through one comes back redacted: `PathHop.device_id` is now
+  nullable, with a new `hidden` flag and no port names. Hop counts,
+  reachability and the topology editor are unaffected, admins are not filtered
+  at all, and an unanswerable visibility lookup fails closed with a 503. The
+  open `GET /topologies/{id}` stays open by decision, recorded in
+  `docs/ROLES.md`.
 
 ## [0.4.0] - 2026-09-05
 
