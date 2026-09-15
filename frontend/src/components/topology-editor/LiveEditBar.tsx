@@ -4,6 +4,13 @@ interface LiveEditBarProps {
   deviceCount: number;
   invalidEdgeCount: number;
   isCommitting: boolean;
+  // False until the reservation's fork has been fetched and hydrated onto the
+  // canvas (TopologyEditorPage's forkLoaded state). Committing before then
+  // would save whatever is currently in the store, which is an empty canvas
+  // in the hydration window: the fork save would release live wiring and the
+  // device-set PATCH would send an empty device_ids, which the reservations
+  // schema rejects with 422. The button stays disabled until this is true.
+  forkLoaded: boolean;
   autosaveStatus?: ForkAutosaveStatus;
   onCommit: () => void;
   onCancel: () => void;
@@ -27,11 +34,17 @@ export function LiveEditBar({
   deviceCount,
   invalidEdgeCount,
   isCommitting,
+  forkLoaded,
   autosaveStatus,
   onCommit,
   onCancel,
 }: LiveEditBarProps) {
   const blocked = invalidEdgeCount > 0;
+  const commitLabel = isCommitting
+    ? "Committing..."
+    : !forkLoaded
+      ? "Loading fork..."
+      : "Commit to reservation";
   return (
     <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 bg-white border-2 border-blue-400 rounded-lg shadow-lg px-4 py-3 max-w-2xl">
       <div className="flex items-start gap-4">
@@ -76,7 +89,7 @@ export function LiveEditBar({
           </button>
           <button
             onClick={onCommit}
-            disabled={blocked || isCommitting}
+            disabled={blocked || isCommitting || !forkLoaded}
             title={
               blocked
                 ? `Cannot commit: ${invalidEdgeCount} edge${invalidEdgeCount !== 1 ? "s" : ""} have no physical path`
@@ -84,7 +97,7 @@ export function LiveEditBar({
             }
             className="text-sm px-3 py-1 rounded text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {isCommitting ? "Committing..." : "Commit to reservation"}
+            {commitLabel}
           </button>
         </div>
       </div>

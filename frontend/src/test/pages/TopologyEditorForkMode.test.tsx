@@ -170,6 +170,73 @@ describe("TopologyEditorPage live-edit fork mode", () => {
     expect(screen.getByText("EDITING LIVE RESERVATION")).toBeInTheDocument();
   });
 
+  it("disables Commit and reads 'Loading fork...' until the fork hydrates; a click during that window issues no fork save or device PATCH", async () => {
+    // The fork GET is held open deliberately, reproducing the window between
+    // the reservation query resolving (isLoading flips false, the canvas and
+    // LiveEditBar render) and hydrateAndLoadCanvas finishing: before this
+    // fix, the store held no nodes and the Commit button was fully enabled
+    // in that window, so a click there saved an empty canvas as a new fork
+    // version and then PATCHed an empty device_ids (422 from the
+    // reservations schema).
+    let resolveFork: (value: unknown) => void = () => {};
+    const forkGate = new Promise((resolve) => {
+      resolveFork = resolve;
+    });
+    let forkSaveHit = false;
+    let devicePatchHit = false;
+
+    server.use(
+      http.get(`/api/reservations/${RES_ID}/fork`, async () => {
+        await forkGate;
+        return HttpResponse.json(makeFork());
+      }),
+      http.get(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 500 }),
+      ),
+      http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
+      http.post(`/api/reservations/${RES_ID}/fork/save`, () => {
+        forkSaveHit = true;
+        return HttpResponse.json({
+          fork_id: "fork-1",
+          version_number: 2,
+          released: [],
+          built: [],
+          unchanged_count: 0,
+        });
+      }),
+      http.patch(`/api/reservations/${RES_ID}`, () => {
+        devicePatchHit = true;
+        return HttpResponse.json(RESERVATION);
+      }),
+    );
+
+    renderPage();
+
+    const loadingCommit = await screen.findByRole("button", { name: "Loading fork..." });
+    expect(loadingCommit).toBeDisabled();
+
+    // A disabled button dispatches no click handler, in jsdom as in a real
+    // browser; this is the one reachable way a user could try to commit
+    // during hydration, and it must reach neither endpoint.
+    fireEvent.click(loadingCommit);
+    expect(forkSaveHit).toBe(false);
+    expect(devicePatchHit).toBe(false);
+
+    // Once the fork resolves and the canvas hydrates, the button flips to
+    // its normal enabled state and a real click behaves as the existing
+    // happy-path test expects.
+    resolveFork(undefined);
+    await waitFor(() =>
+      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("fork-node"),
+    );
+    const readyCommit = await screen.findByRole("button", { name: "Commit to reservation" });
+    expect(readyCommit).toBeEnabled();
+
+    fireEvent.click(readyCommit);
+    await waitFor(() => expect(forkSaveHit).toBe(true));
+  });
+
   it("commit calls the fork save and the device PATCH, never the parent topology PUT", async () => {
     let forkSaveHit = false;
     let parentPutHit = false;

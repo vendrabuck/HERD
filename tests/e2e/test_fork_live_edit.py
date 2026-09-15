@@ -461,6 +461,11 @@ def test_restore_then_save_via_fork_readback_pw(pw_page):
 
         pw_page.goto(f"{HOST_BASE_URL}/topology/{topology['id']}?reservationId={reservation['id']}")
         expect(pw_page.locator(".react-flow")).to_be_visible(timeout=15_000)
+        # .react-flow is visible before the reservation's fork has hydrated onto
+        # the canvas; wait for an actual device node so Commit is clicked only
+        # once the fork has loaded (LiveEditBar disables Commit and reads
+        # "Loading fork..." until then).
+        expect(pw_page.locator(".react-flow__node").first).to_be_visible(timeout=15_000)
 
         # Commit once with no edits to create version 2 (identical canvas).
         pw_page.get_by_role("button", name="Commit to reservation").click()

@@ -11,6 +11,7 @@ function makeBar(overrides: Partial<Parameters<typeof LiveEditBar>[0]> = {}) {
       deviceCount={3}
       invalidEdgeCount={0}
       isCommitting={false}
+      forkLoaded={true}
       onCommit={onCommit}
       onCancel={onCancel}
       {...overrides}
@@ -58,5 +59,21 @@ describe("LiveEditBar", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onCommit).not.toHaveBeenCalled();
     expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it("disables commit and reads 'Loading fork...' while the fork has not hydrated yet", () => {
+    const { onCommit } = makeBar({ forkLoaded: false });
+    const commit = screen.getByRole("button", { name: "Loading fork..." });
+    expect(commit).toBeDisabled();
+    fireEvent.click(commit);
+    expect(onCommit).not.toHaveBeenCalled();
+    // Cancel stays available: the user can still back out of live edit while
+    // the fork is loading.
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
+  });
+
+  it("committing takes priority over the loading label if both were somehow true", () => {
+    makeBar({ forkLoaded: false, isCommitting: true });
+    expect(screen.getByRole("button", { name: "Committing..." })).toBeDisabled();
   });
 });

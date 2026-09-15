@@ -1160,6 +1160,19 @@ function TopologyEditorInner() {
   // Blocked when any edge is unreachable; the backend enforces the same rule.
   const handleCommitToReservation = useCallback(async () => {
     if (!reservationId) return;
+    // LiveEditBar disables the Commit button until forkLoaded, but a
+    // keyboard activation or a programmatic trigger could still reach this
+    // handler in the hydration window (fork fetched, hydrateAndLoadCanvas
+    // not yet finished). The store holds no nodes until forkLoaded flips, so
+    // committing now would save an empty canvas as a new fork version
+    // (releasing any wiring the fork already holds) and then PATCH an empty
+    // device_ids, which the reservations schema 422s. Guard here too, before
+    // computing device sets, so the disabled button is defense in depth
+    // rather than the only guard.
+    if (!forkLoaded) {
+      toast.error("The reservation fork is still loading; try again in a moment");
+      return;
+    }
     if (hasInvalidEdges) {
       toast.error("Fix unreachable edges before committing");
       return;
@@ -1271,6 +1284,7 @@ function TopologyEditorInner() {
     }
   }, [
     reservationId,
+    forkLoaded,
     hasInvalidEdges,
     liveReservation,
     saveFork,
@@ -1569,6 +1583,7 @@ function TopologyEditorInner() {
               deviceCount={allDeviceIds.length}
               invalidEdgeCount={invalidEdges.length}
               isCommitting={isCommitting}
+              forkLoaded={forkLoaded}
               autosaveStatus={autosave.status}
               onCommit={handleCommitToReservation}
               onCancel={handleCancelLiveEdit}
