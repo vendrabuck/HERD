@@ -48,7 +48,7 @@ in their JWT access token and enforced independently by each service.
 | List device health snapshots (all devices) | | yes | yes |
 | Set `poll_interval_seconds` on a device or template | | yes | yes |
 | Set a reservation's purpose category | creator | yes | yes |
-| Review, accept, dismiss, or backfill AI purpose suggestions | | yes | yes |
+| Review, accept, dismiss, backfill, or trigger AI purpose suggestions | | yes | yes |
 | List all user accounts | | yes | yes |
 | Promote a user to admin | | | yes |
 | Demote an admin to user | | | yes |
@@ -1102,13 +1102,14 @@ Authorization: Bearer <token>   # owner or admin
 ```
 
 Phase 2's AI suggestions wait for an admin on the Purpose Review page
-(`/admin/purpose-review`) rather than applying automatically. All four
+(`/admin/purpose-review`) rather than applying automatically. All five
 endpoints below are admin-only:
 
 ```
 GET  /api/reservations/admin/purpose-review                       # paginated review queue
 POST /api/reservations/admin/purpose-review/{reservation_id}/accept    # accept the suggestion or a chosen override
 POST /api/reservations/admin/purpose-review/{reservation_id}/dismiss   # decline, keeps the suggestion for metrics
+POST /api/reservations/admin/purpose-review/{reservation_id}/classify  # classify this one reservation now (issue #808)
 POST /api/reservations/admin/purpose/backfill                     # mark eligible reservations for the classify sweep
 Authorization: Bearer <token>   # admin or superadmin
 ```
@@ -1593,6 +1594,7 @@ Authorization: Bearer <admin-token>
 | `/api/reservations/admin/purpose-review` | GET | | yes | yes |
 | `/api/reservations/admin/purpose-review/{id}/accept` | POST | | yes | yes |
 | `/api/reservations/admin/purpose-review/{id}/dismiss` | POST | | yes | yes |
+| `/api/reservations/admin/purpose-review/{id}/classify` | POST | | yes | yes |
 | `/api/reservations/admin/purpose/backfill` | POST | | yes | yes |
 | `/api/reservations/reports/utilization` | GET | | yes | yes |
 | `/api/reservations/reports/utilization.csv` | GET | | yes | yes |

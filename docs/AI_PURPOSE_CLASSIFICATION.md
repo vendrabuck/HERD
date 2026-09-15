@@ -5,9 +5,12 @@ Phase 2 of issue #646 (lab purpose classification). Phase 1 (the manual
 the reservations service; see `docs/design/0013-lab-purpose-classification.md`
 (ADR 0013) for the full decision record, including the taxonomy and the
 confirmed-versus-suggested split. This document covers phase 2's two
-AI-orchestrator endpoints only: what they take, what they return, which
-signals feed the model, and the privacy tradeoff of including reservation
-assistant transcripts.
+AI-orchestrator endpoints: what they take, what they return, which signals
+feed the model, and the privacy tradeoff of including reservation assistant
+transcripts; plus the reservations-service endpoint that calls the internal
+one on demand for a single reservation (issue #808, below), since its
+contract is defined entirely in terms of the internal endpoint's own outcome
+taxonomy.
 
 Both endpoints are dark by default behind `AI_PURPOSE_CLASSIFICATION_ENABLED`
 (see `docs/ENV_VARS.md`) and additionally require the AI provider to be
@@ -156,6 +159,58 @@ The reconciler's outcome taxonomy, all documented in
   Increments `purpose_classify_attempts`; this and `timeout` are the only
   outcomes that affect the row's attempt cap.
 
+## The on-demand per-reservation trigger (issue #808)
+
+`POST /api/reservations/admin/purpose-review/{reservation_id}/classify`,
+admin-only (see `docs/ROLES.md`), runs `classify_purpose_one` (the exact
+function backing the reconciler above) for exactly one reservation,
+synchronously, instead of waiting for that reservation's turn in the
+sweep's oldest-requested-first queue. It was added to fix a reused-stack
+flake in `tests/integration/test_purpose_review_flow.py`: a slow local
+classifier plus a long sweep backlog could push a freshly cancelled test
+reservation's suggestion past the test's poll budget, purely from queue
+position (issue #808). Operationally it doubles as the retry path for one
+exhausted row, since it does not check `purpose_classify_max_attempts`; an
+operator who wants the whole backlog retried still uses
+`POST /admin/purpose/backfill`.
+
+No request body; the path carries the reservation id. Response:
+
+```json
+{
+  "reservation_id": "…uuid…",
+  "outcome": "ok",
+  "purpose_suggestion": {"top_category": "qa_regression", "...": "..."}
+}
+```
+
+`outcome` is exactly the taxonomy above (`ok`, `timeout`, `transient`,
+`forbidden`, `failed`); `purpose_suggestion` is the stored suggestion after
+this call (only `ok` ever sets one) or null. Every one of those outcomes is
+still a 200: the endpoint call itself succeeded, the classification attempt
+did or did not, and `outcome` says which. The one exception is
+`feature_off` (403 with the disabled marker, or 404, exactly as the
+reconciler reads them): the trigger answers 503
+`{"error": "purpose_classification_disabled"}` instead, matching how other
+AI-gated endpoints in this codebase answer when unconfigured, since from
+this endpoint's own caller's point of view "the classifier is not available
+right now" is the same shape of problem `ai_is_configured()` being false
+is elsewhere.
+
+Two more responses have nothing to do with the classifier: 404 for an
+unknown reservation, and two 409s ahead of any orchestrator call:
+`{"error": "not_eligible"}` when `purpose_classify_requested_at` is still
+null (the reservation has not reached a terminal state), and
+`{"error": "already_suggested"}` when `purpose_suggestion` is already set
+(dismiss or override it through the accept/dismiss endpoints first).
+
+Concurrency with the sweep is accepted, not locked: the sweep may be
+classifying the same row in the same window the trigger is called for it
+(both become eligible the moment `purpose_classify_requested_at` is set).
+Both write the same suggestion shape through independent short sessions; the
+last commit wins. There is no claim column and no row lock, the same
+posture the rest of this reconciler's writes already take.
+
 ## Signals
 
 Both endpoints assemble a compact, XML-tagged prompt block from whatever
@@ -246,12 +301,16 @@ is no other acting user for a background call.
 
 ## Operating it
 
-Neither endpoint here is where an admin actually works with suggestions day
-to day; that surface, the review queue, accept/override/dismiss, and the
-`Classify history` backfill action, lives in the reservations service and is
-described in `docs/ADMIN_HANDBOOK.md` (the Utilization report section,
-"Purpose review" and "Classify history (backfill)" entries). This document
-covers the two orchestrator endpoints those features call.
+Neither orchestrator endpoint is where an admin actually works with
+suggestions day to day; that surface, the review queue, accept/override/
+dismiss, and the `Classify history` backfill action, lives in the
+reservations service and is described in `docs/ADMIN_HANDBOOK.md` (the
+Utilization report section, "Purpose review" and "Classify history
+(backfill)" entries). The `POST /admin/purpose-review/{id}/classify` trigger
+(issue #808) is API-only as of this writing, no Purpose Review page button
+yet; an operator reaches for it from a terminal (or an admin script) when
+one reservation's suggestion needs a nudge without waiting on the sweep or
+running a full backfill.
 
 Privacy, restated from above since it is the one operating decision most
 likely to matter to a deployment: the end-of-reservation pass resends the
