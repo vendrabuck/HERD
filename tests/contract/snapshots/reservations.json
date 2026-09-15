@@ -18,6 +18,10 @@
     ],
     [
       "POST",
+      "/admin/purpose-review/{reservation_id}/classify"
+    ],
+    [
+      "POST",
       "/admin/purpose-review/{reservation_id}/dismiss"
     ],
     [
@@ -338,6 +342,18 @@
         "purpose_category": "anyOf"
       },
       "required": [],
+      "type": "object"
+    },
+    "PurposeClassifyTriggerResponse": {
+      "properties": {
+        "outcome": "string",
+        "purpose_suggestion": "anyOf",
+        "reservation_id": "string"
+      },
+      "required": [
+        "outcome",
+        "reservation_id"
+      ],
       "type": "object"
     },
     "PurposeReviewAcceptBody": {

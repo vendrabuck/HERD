@@ -36,14 +36,15 @@ POLL_TIMEOUT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 2
 
 
-def _reservation_body(device_id: str, *, in_the_past: bool = True) -> dict:
+def _reservation_body(device_id: str, *, future: bool = False) -> dict:
+    """A reservation starting now (the default, matching the original test's
+    shape: it starts immediately so it can be cancelled right away) or, with
+    future=True, starting in an hour so it stays PENDING (not yet terminal)
+    for the not_eligible test.
+    """
     now = datetime.now(timezone.utc)
-    if in_the_past:
-        start = now - timedelta(minutes=10)
-        end = now - timedelta(minutes=5)
-    else:
-        start = now + timedelta(hours=1)
-        end = now + timedelta(hours=1, minutes=5)
+    start = now + timedelta(hours=1) if future else now
+    end = start + timedelta(minutes=5)
     return {
         "device_ids": [device_id],
         "purpose": "replicating a customer support case against the FRR driver",
@@ -130,7 +131,7 @@ async def test_trigger_not_eligible_before_terminal(admin_client, fresh_device):
     the eligibility check runs before any call to the orchestrator.
     """
     create = await admin_client.post(
-        "/reservations/", json=_reservation_body(fresh_device["id"], in_the_past=False)
+        "/reservations/", json=_reservation_body(fresh_device["id"], future=True)
     )
     assert create.status_code == 201, create.text
     reservation_id = create.json()["id"]
