@@ -34,6 +34,9 @@
 - Consolidations and fixes from the 2026-09-12 review of the driver batch (#778 to #784),
   `GET /connections` on the shared visibility helper (#809), and the frontend test runner
   on vitest 5 with a temporary jest-dom type shim (#806).
+- fix(frontend): the live-edit Commit button is disabled until the reservation fork
+  has hydrated; an early click saved an empty fork version and failed the device-set
+  update with 422 (#824, PR #832).
 
 ### Delivery detail
 
