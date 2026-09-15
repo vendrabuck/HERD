@@ -596,7 +596,10 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
     # test's row is somewhere in that real result and unclaimed, not that it is the
     # only row, and drive only this test's own preselected row forward.
     async with session_factory() as db:
-        preselected = await due_failed_rows(db, 20, 10)
+        # 10000, not the production batch size: created_at ascending means older
+        # foreign rows sort first, so a small limit could push this test's own row
+        # out of the result on a gate ledger holding more due rows than that.
+        preselected = await due_failed_rows(db, 10000, 10)
     preselected_by_id = {r.id: r for r in preselected}
     assert row_id in preselected_by_id, (
         "the background channel must have loaded the row while it was still unclaimed"
