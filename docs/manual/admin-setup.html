@@ -20,7 +20,7 @@
     <a href="admin-setup.html" class="active">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-4-0.html">Release 0.4.0</a>
+    <a href="release-0-5-0.html">Release 0.5.0</a>
   </nav>
 </header>
 
@@ -134,6 +134,8 @@
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
       <div><p>Drivers are reference-counted: you can't delete one while a template points at it. Remove or repoint the template first.</p></div>
     </div>
+
+    <p>Two driver packages for real network operating systems ship with HERD, under <code>drivers/</code> in the repository: <code>frr_l3</code> (FRRouting, connection type Layer 3 Switch) and <code>srl_l2</code> (Nokia SR Linux, connection type Layer 2 Switch). Upload either one exactly as it is. A driver must report a device's rejection of a command as a failure, so a refused change is never shown as applied; a driver that can place a route in a virtual router declares <code>supports_vrf</code> in its metadata, and HERD refuses a route that names a virtual router on any driver that does not. Both packages are exercised against a lab of the real operating systems in the project's own tests on every change (<a href="https://github.com/vendrabuck/HERD/blob/main/docs/NOS_LAB.md">docs/NOS_LAB.md</a>).</p>
 
     <p class="sectitle" id="templates">Step 2 &middot; Create a template</p>
     <p>A template defines the fields a class of device carries and points at the driver that runs it. Go to <b>Templates &rarr; New template</b>.</p>
