@@ -27,7 +27,7 @@ HERD can propose a lab topology from a natural-language prompt by calling the co
 
 ## What the LLM proposes
 
-The orchestrator constrains the LLM's output via a tool schema built per request. The `template_name` field is restricted to an enum of the templates currently visible to you, so a provider that honors schema enums cannot return a name outside your inventory. The orchestrator also validates the response after the fact and, on a repairable mistake (an unknown template, an over-count, a duplicate role across devices or elements, an edge to a role that was never defined, or an edge connecting two elements directly), re-prompts the model once with the exact allow-list before giving up. Each proposed device has:
+The orchestrator constrains the LLM's output via a tool schema built per request. The `template_name` field is restricted to an enum of the templates currently visible to you, so a provider that honors schema enums cannot return a name outside your inventory. The orchestrator also validates the response after the fact and, on a repairable mistake (an unknown template, an over-count, a duplicate role across devices or elements, an edge to a role that was never defined, an edge connecting two elements directly, an edge connecting a role to itself, or the same device-to-device connection proposed twice), re-prompts the model with the exact allow-list before giving up. The number of re-prompts is `AI_GENERATE_MAX_REPAIRS` (default 2, range 0-5; see [ENV_VARS.md](ENV_VARS.md)); `0` fails the request on the first repairable mistake instead of spending a second provider call. Each proposed device has:
 
 - `role` (unique within the proposal; e.g. `fw-a`, `fw-b`, `core-sw-1`)
 - `template_name` (must match a real template in your inventory exactly; no invented names)
@@ -87,10 +87,15 @@ Click **Commit**. The orchestrator:
 1. Validates every device's config against the allowlist (fails with 422 here if anything is off; nothing is written).
 2. Creates the topology in the cabling service.
 3. Saves the canvas data.
-4. Creates a reservation.
-5. If **Apply device configs** is checked, calls the execution service's `POST /execute` per configured device.
+4. Checks the saved canvas is actually wireable (see [Commit-time wireability check](#commit-time-wireability-check) below).
+5. Creates a reservation.
+6. If **Apply device configs** is checked, calls the execution service's `POST /execute` per configured device.
 
 On success, you're navigated to the new topology's page. The toast summarizes anything that went wrong (e.g., "Topology created, but 2 device configs failed to apply").
+
+### Commit-time wireability check
+
+Before creating the reservation, the orchestrator calls cabling's own `POST /topologies/{id}/validate` against the canvas it just saved. This catches an edge the LLM proposed between two devices with no physical cable path between them (a fabric with no matching cable, or two devices on unrelated fabrics) before a reservation is ever created, rather than only surfacing it later as reservations' own generic connectivity check. A failure here shows "Commit failed: cannot wire this topology" followed by one line per bad edge, named by role (e.g. `fw-a to sw-a: no cable path`), and the topology is deleted (see [Rollback behavior](#rollback-behavior)). If cabling cannot answer the question at all (an outage, a timeout), the commit fails closed with a 503 rather than proceeding as if the canvas had passed.
 
 ### What "Apply device configs" actually does
 
@@ -102,9 +107,10 @@ On success, you're navigated to the new topology's page. The toast summarizes an
 
 If anything during the commit fails after the topology is created:
 
-- Canvas save fails -> topology deleted, error surfaced.
-- Reservation create fails -> topology deleted, error surfaced.
-- Config apply fails (per-device) -> **no rollback**; the topology and reservation persist, the failure is recorded in the response.
+- Canvas save fails: topology deleted, error surfaced.
+- Wireability check fails (an unwireable edge, or cabling could not answer): topology deleted, error surfaced.
+- Reservation create fails: topology deleted, error surfaced.
+- Config apply fails (per-device): **no rollback**; the topology and reservation persist, the failure is recorded in the response.
 
 If the initial topology creation fails, nothing is rolled back because there is nothing to undo.
 

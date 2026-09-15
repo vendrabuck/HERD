@@ -2,7 +2,7 @@ import logging
 from typing import Literal
 
 from herd_common.base_settings import HerdBaseSettings
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,15 @@ class Settings(HerdBaseSettings):
     ai_api_key: str = ""
     ai_model: str = "claude-sonnet-4-6"
     ai_max_tokens: int = 4096
+    # Bounded auto-repair for topology generation (commit-side fail-fast
+    # hardening, diagnosis option 3): how many times to re-prompt the model
+    # after a repairable proposal-validation failure (unknown template,
+    # over-count, duplicate role, dangling edge role, element_to_element
+    # edge, self-loop edge, duplicate device-to-device edge) before giving
+    # up. 0 disables repair: the first repairable mistake fails the request
+    # immediately instead of spending a second provider call. Replaces the
+    # old hardcoded MAX_REPAIR_ATTEMPTS constant in app/services/generator.py.
+    ai_generate_max_repairs: int = Field(default=2, ge=0, le=5)
     # Per-user daily token budget (input + output) across all AI features:
     # topology generation, the reservation assistant, and template-identity
     # suggestions. 0 (default) disables enforcement entirely and writes no

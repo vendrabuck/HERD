@@ -24,6 +24,22 @@ RESERVATION_ID = "22222222-2222-2222-2222-222222222222"
 DEVICE_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 DEVICE_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
+VALIDATE_URL = f"{CABLING_URL}/topologies/{TOPOLOGY_ID}/validate"
+
+
+def _mock_valid_validate(mock):
+    """Register a passing commit-time wireability-validate response.
+
+    Every test below that reaches _create_reservation now also crosses the
+    new POST /topologies/{id}/validate call first (issue diagnosis option
+    3); this stubs it as valid so the existing happy-path assertions are
+    unaffected. respx's assert_all_called=True means a route registered but
+    never hit fails the test, so this must NOT be added to a test whose flow
+    never reaches the validate call (canvas-save failure, topology-create
+    failure, or a pre-topology 503).
+    """
+    return mock.post(VALIDATE_URL).respond(200, json={"valid": True, "invalid_edges": []})
+
 
 def _user_token() -> str:
     payload = {
@@ -100,6 +116,7 @@ async def test_commit_happy_path_creates_topology_and_reservation(async_client):
             201, json={"id": TOPOLOGY_ID, "name": "AI proposal test"}
         )
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").mock(side_effect=_capture_canvas)
+        _mock_valid_validate(mock)
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
 
         headers = {"Authorization": f"Bearer {_user_token()}"}
@@ -153,6 +170,7 @@ async def test_commit_with_element_produces_canvas_with_element_and_attachment(a
         )
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").mock(side_effect=_capture_canvas)
+        _mock_valid_validate(mock)
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
 
         headers = {"Authorization": f"Bearer {_user_token()}"}
@@ -196,6 +214,7 @@ async def test_commit_rolls_back_topology_when_reservation_fails(async_client):
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        _mock_valid_validate(mock)
         mock.post(f"{RESERVATIONS_URL}/").respond(
             409, json={"detail": "conflicts with another reservation"}
         )
@@ -207,6 +226,93 @@ async def test_commit_rolls_back_topology_when_reservation_fails(async_client):
 
     assert resp.status_code == 409
     assert "conflicts" in resp.json()["detail"]
+    assert rollback.called
+
+
+# --- Commit-time wireability fail-fast (diagnosis option 3) --------------
+#
+# Before this, an AI proposal whose edges have no physical cable path was
+# only caught when reservations' own create-time validate 422ed with an
+# opaque string detail; the reservation-create call never even runs now,
+# because cabling's own /validate is checked right after the canvas save.
+
+
+async def test_commit_rejects_unwireable_topology_with_structured_detail(async_client):
+    """An invalid canvas (no physical path between two proposed devices)
+    fails the commit with a structured 422 naming the proposal's ROLES (not
+    node or device ids, which mean nothing to the user), deletes the
+    topology, and never reaches reservation creation."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
+        mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        mock.post(VALIDATE_URL).respond(
+            200,
+            json={
+                "valid": False,
+                "invalid_edges": [
+                    {
+                        "edge_id": "e1",
+                        "source_device_id": DEVICE_A,
+                        "target_device_id": DEVICE_B,
+                        "layer": "L2",
+                        "reason": "no_path",
+                    }
+                ],
+            },
+        )
+        rollback = mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(204)
+        # No /reservations/ route registered: if the committer reached it
+        # anyway, respx would raise for the unmocked call.
+
+        headers = {"Authorization": f"Bearer {_user_token()}"}
+        async with async_client as client:
+            resp = await client.post("/commit", json=_commit_body(), headers=headers)
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "topology_unwireable"
+    assert detail["invalid_edges"] == [
+        {"edge_id": "e1", "source_role": "fw-a", "target_role": "fw-b", "reason": "no_path"}
+    ]
+    assert "1" in detail["message"]
+    assert rollback.called
+
+
+async def test_commit_validate_5xx_fails_closed_with_503(async_client):
+    """cabling failing to answer the wireability question at all is not the
+    same as a clean pass (#717's fail-closed rule): 503, rollback, no
+    reservation created."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
+        mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        mock.post(VALIDATE_URL).respond(503, json={"detail": "cabling db unavailable"})
+        rollback = mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(204)
+
+        headers = {"Authorization": f"Bearer {_user_token()}"}
+        async with async_client as client:
+            resp = await client.post("/commit", json=_commit_body(), headers=headers)
+
+    assert resp.status_code == 503
+    assert "cabling db unavailable" in resp.json()["detail"]
+    assert rollback.called
+
+
+async def test_commit_validate_transport_failure_fails_closed_with_503(async_client):
+    """An unreachable cabling service during validate is the same failure
+    class as a 5xx: fail closed rather than silently proceeding to create a
+    reservation for a topology that was never actually checked."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
+        mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        mock.post(VALIDATE_URL).mock(side_effect=httpx.ConnectError("cabling unreachable"))
+        rollback = mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(204)
+
+        headers = {"Authorization": f"Bearer {_user_token()}"}
+        async with async_client as client:
+            resp = await client.post("/commit", json=_commit_body(), headers=headers)
+
+    assert resp.status_code == 503
+    assert "cabling unreachable" in resp.json()["detail"]
     assert rollback.called
 
 
@@ -289,6 +395,7 @@ async def test_commit_apply_configs_calls_execution_per_device(async_client):
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        _mock_valid_validate(mock)
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
         mock.post(f"{EXECUTION_URL}/execute").mock(side_effect=_capture_execute)
 
@@ -331,6 +438,7 @@ async def test_commit_apply_configs_records_failure_without_rollback(async_clien
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        _mock_valid_validate(mock)
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
         mock.post(f"{EXECUTION_URL}/execute").respond(403, json={"detail": "admin required"})
 
@@ -366,6 +474,7 @@ async def test_commit_skips_execution_when_apply_configs_false(async_client):
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        _mock_valid_validate(mock)
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
         # No /execute route is registered; if it's called, respx raises.
 
@@ -384,9 +493,14 @@ async def test_commit_forwards_user_jwt_to_upstream(async_client):
         captured_headers["topology"] = request.headers.get("authorization", "")
         return httpx.Response(201, json={"id": TOPOLOGY_ID})
 
+    def _capture_validate(request: httpx.Request) -> httpx.Response:
+        captured_headers["validate"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json={"valid": True, "invalid_edges": []})
+
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").mock(side_effect=_capture)
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        mock.post(VALIDATE_URL).mock(side_effect=_capture_validate)
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
 
         token = _user_token()
@@ -396,6 +510,7 @@ async def test_commit_forwards_user_jwt_to_upstream(async_client):
 
     assert resp.status_code == 200
     assert captured_headers["topology"] == f"Bearer {token}"
+    assert captured_headers["validate"] == f"Bearer {token}"
 
 
 # --- Config validation (B8): LLM-proposed kwargs must match the registry ---
@@ -496,6 +611,7 @@ async def test_commit_allows_no_config_on_unknown_connection_type(async_client):
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        _mock_valid_validate(mock)
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": RESERVATION_ID})
 
         headers = {"Authorization": f"Bearer {_user_token()}"}

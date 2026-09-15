@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 
 from pydantic import ValidationError
 
+from app.config import settings
 from app.schemas.generate import ExtractedFile, GenerateResponse
 from app.services.ai_client import (
     AI_PROVIDER_UNREACHABLE_DETAIL,
@@ -35,11 +36,11 @@ class GeneratorError(Exception):
         self.message = message
 
 
-# How many times to re-prompt the model after a repairable validation failure.
-# 1 retry (2 attempts total) covers the common case (a hallucinated template
-# name or an over-count) without unbounded latency; weak local models that
-# ignore the schema enum still get one corrective shot.
-MAX_REPAIR_ATTEMPTS = 1
+# How many times to re-prompt the model after a repairable validation failure
+# is settings.ai_generate_max_repairs (env AI_GENERATE_MAX_REPAIRS, default 2).
+# A hardcoded constant used to live here; it is now an operator-tunable
+# setting so a weak local model that repeatedly ignores corrective feedback
+# can be given more (or fewer) shots without a code change.
 
 
 async def generate_topology(
@@ -75,7 +76,8 @@ async def generate_topology(
     # provider call that spends tokens, so the quota must see the sum, not just
     # the final successful call.
     total_usage = Usage()
-    for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
+    max_repairs = settings.ai_generate_max_repairs
+    for attempt in range(max_repairs + 1):
         try:
             raw, attempt_usage = await ai.propose_topology(
                 inventory_block=inventory.to_prompt_block(),
@@ -113,7 +115,7 @@ async def generate_topology(
         try:
             _validate_against_inventory(candidate, inventory)
         except GeneratorError as e:
-            if attempt >= MAX_REPAIR_ATTEMPTS:
+            if attempt >= max_repairs:
                 raise
             logger.info("ai_proposal_repair_retry", extra={"attempt": attempt, "reason": e.message})
             repair_feedback = _repair_feedback(e.message, template_names)
@@ -139,8 +141,9 @@ def _repair_feedback(error_message: str, template_names: list[str]) -> str:
         f"Use ONLY these template_name values, spelled exactly: {allowed}. "
         "Do not exceed the available count for any template, keep role names "
         "unique across devices and elements, ensure every edge references a "
-        "device or element role you defined, and never connect two elements "
-        "directly to each other."
+        "device or element role you defined, never connect two elements "
+        "directly to each other, never connect a role to itself, and never "
+        "propose the same device-to-device connection more than once."
     )
 
 
@@ -180,19 +183,48 @@ def _validate_against_inventory(response: GenerateResponse, inventory: Inventory
     device_role_set = set(device_roles)
     element_role_set = set(element_roles)
     role_set = device_role_set | element_role_set
+
+    # Device-to-device edges seen so far, keyed by the unordered role pair, to
+    # catch a duplicate connection between the same two devices (diagnosis
+    # option 3: the committer emits one canvas edge per proposed edge with no
+    # ports, and a repeated pair is never a legitimate topology). Element
+    # attachments are excluded on purpose: several attachments from distinct
+    # devices to the SAME element role are legal (that is the whole point of
+    # a shared element), and two attachments from one device to one element
+    # would already be rejected some other way (the committer only ever
+    # claims one port per attachment, never producing a duplicate wire).
+    seen_device_pairs: set[frozenset[str]] = set()
+
     for edge in response.edges:
         if edge.source_role not in role_set or edge.target_role not in role_set:
             raise GeneratorError(
                 502,
-                f"Edge references unknown role: {edge.source_role} -> {edge.target_role}",
+                f"Edge references unknown role: {edge.source_role} to {edge.target_role}",
+            )
+        if edge.source_role == edge.target_role:
+            raise GeneratorError(
+                502,
+                "AI proposed a self-loop edge, which is not allowed: a role cannot "
+                f"connect to itself ({edge.source_role}).",
             )
         if edge.source_role in element_role_set and edge.target_role in element_role_set:
             raise GeneratorError(
                 502,
                 "AI proposed an element_to_element edge, which is not allowed: "
-                f"{edge.source_role} -> {edge.target_role}. Attach each element to a "
+                f"{edge.source_role} to {edge.target_role}. Attach each element to a "
                 "device instead.",
             )
+        is_attachment = edge.source_role in element_role_set or edge.target_role in element_role_set
+        if not is_attachment:
+            pair = frozenset((edge.source_role, edge.target_role))
+            if pair in seen_device_pairs:
+                raise GeneratorError(
+                    502,
+                    "AI proposed a duplicate edge between the same two devices: "
+                    f"{edge.source_role} and {edge.target_role} are already connected. "
+                    "Remove the duplicate.",
+                )
+            seen_device_pairs.add(pair)
 
 
 async def _resolve_devices(

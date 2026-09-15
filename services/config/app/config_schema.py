@@ -466,6 +466,22 @@ CONFIG_SCHEMA = [
         ),
     },
     {
+        "key": "AI_GENERATE_MAX_REPAIRS",
+        "label": "AI Generate Max Repairs",
+        "type": "number",
+        "required": False,
+        "group": "AI Integration",
+        "secret": False,
+        "default": 2,
+        "description": (
+            "How many times the topology generator re-prompts the model after a "
+            "repairable proposal mistake (unknown template, over-count, duplicate "
+            "role, dangling edge role, element_to_element edge, self-loop edge, "
+            "duplicate device-to-device edge) before giving up. 0 disables repair. "
+            "Range 0-5."
+        ),
+    },
+    {
         "key": "ANTHROPIC_API_KEY",
         "label": "Anthropic API Key (deprecated)",
         "type": "password",
