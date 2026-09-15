@@ -121,3 +121,43 @@ If the initial topology creation fails, nothing is rolled back because there is 
 - **Stale-proposal guards**: the frontend drops any response whose resolved device is null, and any response that references a device already on the canvas.
 - **No window generation**: the LLM doesn't pick times; the commit dialog does.
 - **Model**: `claude-sonnet-4-6` by default, configurable via `AI_MODEL`. Use Opus if you want higher quality at higher cost; use Haiku for cheaper quick proposals.
+
+## Measuring proposal wireability
+
+A proposal can name valid templates and stay within their available counts and still be
+unwireable in practice: `_resolve_devices` (`services/ai-orchestrator/app/services/generator.py`)
+assigns the first N AVAILABLE devices per template to each proposed role without consulting the
+cabling graph at all, so two devices of the right templates can land on opposite, unconnected
+parts of the fabric. Today that only ever surfaces downstream, at reservation-create time, when
+cabling's validator finally runs a path check. There was no repeatable way to measure how often
+this actually happens, or to tell whether a resolver fix improved it, so `tests/ai_eval/` adds one.
+
+The harness is a scored evaluation, not a product feature: `tests/ai_eval/prompts.json` is a
+checked-in set of about ten prompts in plain lab-engineer language (never a template name
+verbatim, so the model still has to choose one), each with a stated minimum device and edge
+count. `tests/ai_eval/test_generate_eval.py` runs every prompt against a live stack several times,
+resolves each proposal into a throwaway topology the same way the committer would (device nodes
+and device-to-device edges only; a proposed network element is skipped, since an element edge
+never becomes a hop and so never touches pathfinding), calls cabling's validate endpoint, and
+scores the result. A run passes when validate reports zero invalid edges AND the proposal met the
+prompt's device and edge minimums; a proposal that wires cleanly but only names one device for a
+"two firewalls" prompt does not count as a pass. `tests/ai_eval/scoring.py` holds this scoring
+logic as pure, stack-free functions and is unit-tested directly in `tests/unit/test_ai_eval_scoring.py`,
+which runs in CI with no stack.
+
+This is a measurement tool, not a gate: the suite itself never asserts a pass rate, only that at
+least one run completed and a report was written. It is opt-in and needs a running, seeded stack
+(`make seed`) with an AI provider configured, so it is not part of `make master`, `make
+everything`, or CI. Run it with `make ai-eval`, or directly as `HERD_AI_EVAL=1 uv run pytest
+tests/ai_eval/ -v -s`. Env vars:
+
+- `HERD_AI_EVAL` (required, set to `1`): the opt-in switch; the suite skips at module load without it.
+- `HERD_AI_EVAL_N` (default `3`): how many times to repeat each prompt.
+- `HERD_AI_EVAL_OUT` (default `ai-eval-results.json` in the current directory): where the full set
+  of per-run records plus the summary (pass rate, invalid-edge reason counts, latency percentiles)
+  is written.
+
+Every throwaway topology the suite creates is named with an `ai-eval-` prefix and deleted in a
+`finally` block after validation, so a leftover from an interrupted run is easy to spot and clean
+up by name. Compare a `HERD_AI_EVAL_OUT` report from before and after a resolver change to see
+whether the fix actually moved the pass rate.

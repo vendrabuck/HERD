@@ -10,8 +10,10 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # workspace ruff config's default discovery and lint/format must target it
 # explicitly. Add new repo-root packages or scripts here so they are linted and
 # format-checked locally and in CI. Today this is the seedtools seeding package
-# (issue #791) and the CI image-vs-lock guard script (issue #593).
-ROOT_PY := seedtools/ scripts/check_image_matches_lock.py
+# (issue #791), the CI image-vs-lock guard script (issue #593), and the AI
+# generate evaluation harness (tests/ai_eval/; the rest of tests/ is not
+# covered by make lint or CI's ruff steps).
+ROOT_PY := seedtools/ scripts/check_image_matches_lock.py tests/ai_eval/
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh
@@ -55,7 +57,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix coverage-,$(SERVICES)) \
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
-	test-frontend test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap \
+	test-frontend test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
@@ -454,6 +456,16 @@ test-load:  ## Run headless locust load test (needs a running stack)
 
 test-load-ui:  ## Run locust with its web UI (needs a running stack)
 	cd tests/load && uv run locust -f locustfile.py --host $${HERD_BASE_URL:-https://localhost}
+
+# Opt-in, scored measurement of AI topology-generator proposal wireability
+# (see docs/AI_GENERATE.md, "Measuring proposal wireability"): how often a
+# generated proposal's device pairs actually have a physical path between
+# them once resolved to real devices, versus just naming valid templates.
+# Needs a running, seeded stack with an AI provider configured; the suite
+# itself skips unless HERD_AI_EVAL=1 is set. This is a measurement, not a
+# gate, so it is deliberately NOT wired into master, everything, or CI.
+ai-eval:  ## Run the opt-in AI generate wireability measurement (needs a seeded stack + AI provider)
+	HERD_AI_EVAL=1 uv run pytest tests/ai_eval/ -v -s
 
 # Shared body for test-e2e and test-e2e-seeded (issue #629), so the two
 # cannot drift apart. HERD_E2E_REQUIRE_NO_SKIP is whatever the caller's
