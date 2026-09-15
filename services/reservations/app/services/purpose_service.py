@@ -23,17 +23,36 @@ A reservation becomes eligible for the background classifier the moment
 `backfill_purpose_classification` (the admin endpoint) are the only two
 writers of that column, and both are idempotent (they only ever set it from
 null).
+
+`classify_purpose_one` (issue #646 phase 2; issue #706 amendment; moved here
+from app/tasks/expiration.py by issue #808) is the single-row classifier
+call: it opens its own short-lived sessions rather than taking a caller's
+AsyncSession, since it runs a read, an HTTP call to the AI orchestrator, and
+a write as separate transactions, and it never raises (every outcome, from a
+stored suggestion to a transport error, is returned as a string; see its own
+docstring for the full outcome taxonomy). It has two callers: the sweep
+reconciler (app/tasks/expiration.py's _run_purpose_classify_reconcile, which
+enforces purpose_classify_max_attempts in its own SELECT before calling this
+function at all) and the admin on-demand trigger
+(POST /admin/purpose-review/{id}/classify, issue #808), which calls it
+directly for one reservation and therefore does not go through that cap.
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 
+import httpx
+from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.pagination import paginate
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.reservation import Reservation, ReservationStatus
+from app.database import AsyncSessionLocal
+from app.models.reservation import Reservation, ReservationDynamicRequest, ReservationStatus
+
+logger = logging.getLogger(__name__)
 
 # The same three terminal statuses the fork-archive best-effort call and the
 # expiration sweep's archive reconciler use (app/tasks/expiration.py's
@@ -80,6 +99,309 @@ def stamp_purpose_classify_requested(reservation: Reservation) -> None:
     """
     if reservation.purpose_classify_requested_at is None:
         reservation.purpose_classify_requested_at = datetime.now(timezone.utc)
+
+
+# Purpose-classify reconciler (issue #646 phase 2, ADR 0013; issue #706
+# amendment; 2026-09-05 timeout-is-per-row amendment). Status codes the
+# orchestrator can answer that mean "try again later", never a per-row
+# rejection: a 429 (this caller's or the daily quota's rate limit), a
+# 502/503/504 (misconfiguration or an outage, including the
+# AI_NOT_CONFIGURED_DETAIL 503 from ai_is_configured()), or any transport
+# error OTHER than a timeout (a connection error, most likely). A per-call
+# timeout is deliberately excluded from this transient set: see
+# classify_purpose_one's "timeout" outcome for why.
+_PURPOSE_CLASSIFY_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
+# The structured 403 marker the orchestrator's flag refusal carries (issue
+# #706): only this detail shape (or, for a pre-fix orchestrator image, the
+# exact legacy plain-string detail below) means "the feature is off there".
+# Any other 403 (an internal-token mismatch, most likely) is a different
+# problem and must not be logged or treated as feature-off.
+_PURPOSE_CLASSIFICATION_DISABLED_MARKER = "purpose_classification_disabled"
+_LEGACY_PURPOSE_CLASSIFICATION_DISABLED_DETAIL = "Purpose classification is disabled"
+
+
+def _dynamic_requests_classify_payload(
+    dynamic_requests: list[ReservationDynamicRequest],
+) -> list[dict] | None:
+    """Group a reservation's dynamic request rows into {template_id, count}.
+
+    Each ReservationDynamicRequest row is one requested instance (issue #32
+    deliberately has no per-row count, so N rows of the same template_id means
+    N instances); the classify-purpose contract wants one entry per distinct
+    template with its count. None (not an empty list) for a physical-only
+    reservation, matching the contract's `[...] | null`.
+    """
+    if not dynamic_requests:
+        return None
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for dr in dynamic_requests:
+        tid = str(dr.template_id)
+        if tid not in counts:
+            order.append(tid)
+        counts[tid] = counts.get(tid, 0) + 1
+    return [{"template_id": tid, "count": counts[tid]} for tid in order]
+
+
+async def _bump_purpose_classify_attempts(reservation_id: uuid.UUID) -> None:
+    """Increment purpose_classify_attempts for one row, in its own transaction."""
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None:
+            return
+        res.purpose_classify_attempts += 1
+        await db.commit()
+
+
+def _purpose_classify_403_is_feature_off(resp) -> tuple[bool, object]:
+    """Decide whether a 403 from the orchestrator means "the feature is off
+    there" (issue #706), and return the detail for logging either way.
+
+    A 403 on this route is reachable two ways: the flag-off refusal, and an
+    internal-token mismatch (see docs/AI_PURPOSE_CLASSIFICATION.md and
+    services/ai-orchestrator/app/routes/purpose_classification.py). Only the
+    flag-off refusal is "not available yet"; a bad token is a configuration
+    problem on THIS side (an out-of-sync INTERNAL_API_TOKEN) that will not
+    resolve itself on a later tick or a later row. The flag-off refusal is
+    the structured detail ``{"error": "purpose_classification_disabled",
+    ...}``; a pre-fix orchestrator image instead answers the exact legacy
+    plain-string detail, which is accepted as a fallback so a mixed-version
+    deployment still reads it as feature-off rather than burning attempts.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return False, None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict) and detail.get("error") == _PURPOSE_CLASSIFICATION_DISABLED_MARKER:
+        return True, detail
+    if detail == _LEGACY_PURPOSE_CLASSIFICATION_DISABLED_DETAIL:
+        return True, detail
+    return False, detail
+
+
+async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
+    """Classify one reservation's purpose via the AI orchestrator; never raises.
+
+    Returns one of:
+
+    - "ok": a suggestion was stored, or the row was already resolved by a
+      concurrent writer.
+    - "feature_off": the orchestrator answered 403 carrying the
+      purpose-classification-disabled marker (or, for a pre-fix orchestrator
+      image, the legacy plain-string detail), meaning
+      AI_PURPOSE_CLASSIFICATION_ENABLED is off there; or answered 404,
+      meaning the running orchestrator image predates POST
+      /internal/classify-purpose (a mixed-version deployment where only
+      reservations has been upgraded). Either way the row is left untouched
+      and no attempt is counted.
+    - "forbidden" (issue #706): the orchestrator answered 403 WITHOUT the
+      feature-off marker, most likely an internal-token mismatch on this
+      side. Not "not available yet" and not a per-row rejection either: the
+      row is left untouched, no attempt counted, but this is logged at
+      WARNING (not the feature_off case's INFO) since it is a configuration
+      problem an operator needs to see and fix.
+    - "timeout" (2026-09-05 amendment, issue #706 follow-up): the call raised
+      httpx.TimeoutException. A timeout is per-row evidence, not
+      provider-wide evidence: it costs the provider up to
+      purpose_classify_timeout_seconds trying to answer THIS row, so it
+      counts against the row's own attempt cap (purpose_classify_attempts is
+      incremented) and the reconciler loop CONTINUES to the next row rather
+      than ending the tick. A row that never finishes in time stops being
+      retried once purpose_classify_attempts reaches
+      purpose_classify_max_attempts; the admin backfill endpoint resets a
+      row's attempts to give it another try. Trade-off, stated honestly: a
+      provider that is uniformly slower than the timeout burns every eligible
+      row's attempts before ever finishing one, which the backfill endpoint
+      recovers from; the alternative (the pre-fix behavior, treating a
+      timeout as tick-ending) instead let one slow row stall the whole queue
+      behind it forever, which is worse.
+    - "transient" (issue #706): the orchestrator answered 429, 502, 503, or
+      504 (rate limit, misconfiguration, or an outage, including the
+      AI_NOT_CONFIGURED_DETAIL 503 case), or the call raised a transport
+      error OTHER than a timeout (e.g. httpx.ConnectError). The row is left
+      untouched and no attempt is counted: a sustained transient condition
+      would otherwise burn a row's whole attempt cap before it ever gets a
+      real classification try.
+    - "failed": any other non-200 status, a 200 with an unparseable body,
+      purpose_classify_attempts is incremented.
+
+    Each outcome that mutates the row does so in its own session/commit, so
+    one row's failure never affects another row in the same batch.
+
+    Two callers (issue #808): app/tasks/expiration.py's
+    _run_purpose_classify_reconcile (the sweep, which enforces
+    purpose_classify_max_attempts before calling this at all) and
+    routers/purpose_review.py's POST /admin/purpose-review/{id}/classify (the
+    on-demand trigger, which does not check that cap: it is the operator's
+    way to retry one exhausted row directly). Concurrency between the two is
+    accepted, not locked: if the sweep and the trigger classify the same row
+    at the same time, both write the same suggestion shape and the last
+    commit wins; there is no claim column.
+    """
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None or res.purpose_suggestion is not None:
+            # Already resolved by a concurrent writer (another instance's
+            # sweep tick, or an admin action) since this row was selected for
+            # the batch: nothing to do.
+            return "ok"
+        payload = {
+            "reservation_id": str(res.id),
+            "categories": list(settings.purpose_categories),
+            "purpose": res.purpose,
+            "user_id": str(res.user_id),
+            "device_ids": [str(d) for d in res.device_ids],
+            "topology_id": str(res.topology_id) if res.topology_id else None,
+            "dynamic_requests": _dynamic_requests_classify_payload(res.dynamic_requests),
+            "start_time": res.start_time.isoformat(),
+            "end_time": res.end_time.isoformat(),
+            "status": res.status.value,
+        }
+
+    try:
+        resp = await call_service(
+            settings.ai_orchestrator_service_url,
+            "POST",
+            "/internal/classify-purpose",
+            json_body=payload,
+            timeout=settings.purpose_classify_timeout_seconds,
+            auth=InternalTokenAuth(token=settings.internal_api_token),
+        )
+    except httpx.TimeoutException:
+        logger.warning(
+            "Purpose classify reconcile: call to the orchestrator timed out for "
+            "%s after %s seconds; a timeout is per-row evidence, not a "
+            "provider-wide outage, so it counts against this row's attempt cap "
+            "and the reconciler continues to the next row",
+            reservation_id,
+            settings.purpose_classify_timeout_seconds,
+            extra={
+                "action": "purpose_classify_timeout",
+                "reservation_id": str(reservation_id),
+                "timeout_seconds": settings.purpose_classify_timeout_seconds,
+            },
+        )
+        await _bump_purpose_classify_attempts(reservation_id)
+        return "timeout"
+    except Exception:
+        logger.warning(
+            "Purpose classify reconcile: call to the orchestrator failed for %s "
+            "(a transport error, not a timeout); treating this as transient for "
+            "this tick, no attempt counted",
+            reservation_id,
+            exc_info=True,
+            extra={
+                "action": "purpose_classify_transient",
+                "reservation_id": str(reservation_id),
+                "status_code": None,
+            },
+        )
+        return "transient"
+
+    if resp.status_code in _PURPOSE_CLASSIFY_TRANSIENT_STATUS_CODES:
+        logger.warning(
+            "Purpose classify reconcile: orchestrator returned %s for %s "
+            "(rate limit, misconfiguration, or an outage); treating this as "
+            "transient for this tick, no attempt counted",
+            resp.status_code,
+            reservation_id,
+            extra={
+                "action": "purpose_classify_transient",
+                "reservation_id": str(reservation_id),
+                "status_code": resp.status_code,
+            },
+        )
+        return "transient"
+
+    if resp.status_code == 403:
+        is_feature_off, detail = _purpose_classify_403_is_feature_off(resp)
+        if is_feature_off:
+            logger.info(
+                "Purpose classify reconcile: the orchestrator answered 403 for %s "
+                "(AI_PURPOSE_CLASSIFICATION_ENABLED is off there); treating this as "
+                "feature-off for this tick",
+                reservation_id,
+                extra={
+                    "action": "purpose_classify_feature_off",
+                    "reservation_id": str(reservation_id),
+                    "status_code": 403,
+                },
+            )
+            return "feature_off"
+        logger.warning(
+            "Purpose classify reconcile: orchestrator returned 403 for %s that is "
+            "NOT the feature-off marker (detail=%r); this looks like an "
+            "internal-token mismatch, not the flag being off; ending this tick, "
+            "no attempt counted",
+            reservation_id,
+            detail,
+            extra={
+                "action": "purpose_classify_forbidden",
+                "reservation_id": str(reservation_id),
+                "status_code": 403,
+            },
+        )
+        return "forbidden"
+
+    if resp.status_code == 404:
+        # The running orchestrator image predates this endpoint entirely (a
+        # mixed-version deployment mid-upgrade, or a stack where only
+        # reservations was updated). "Not available yet", not a per-row
+        # failure, so no attempt is counted; kept distinguishable from the 403
+        # case in the log message so an operator can tell a flag flip from a
+        # stale image.
+        logger.info(
+            "Purpose classify reconcile: the orchestrator answered 404 for %s "
+            "(it does not expose POST /internal/classify-purpose yet); treating "
+            "this as feature-off for this tick",
+            reservation_id,
+            extra={
+                "action": "purpose_classify_feature_off",
+                "reservation_id": str(reservation_id),
+                "status_code": 404,
+            },
+        )
+        return "feature_off"
+
+    if resp.status_code != 200:
+        logger.warning(
+            "Purpose classify reconcile: orchestrator returned %s for %s",
+            resp.status_code,
+            reservation_id,
+            extra={
+                "action": "purpose_classify_bad_status",
+                "reservation_id": str(reservation_id),
+                "status_code": resp.status_code,
+            },
+        )
+        await _bump_purpose_classify_attempts(reservation_id)
+        return "failed"
+
+    try:
+        suggestion = resp.json()
+    except ValueError:
+        logger.warning(
+            "Purpose classify reconcile: unparseable 200 body for %s",
+            reservation_id,
+            extra={"action": "purpose_classify_bad_body", "reservation_id": str(reservation_id)},
+        )
+        await _bump_purpose_classify_attempts(reservation_id)
+        return "failed"
+
+    async with AsyncSessionLocal() as db:
+        res = await db.get(Reservation, reservation_id)
+        if res is None:
+            return "ok"
+        res.purpose_suggestion = suggestion
+        res.purpose_suggested_at = datetime.now(timezone.utc)
+        await db.commit()
+    logger.info(
+        "Purpose classify reconcile: stored a suggestion for %s",
+        reservation_id,
+        extra={"action": "purpose_classify_stored", "reservation_id": str(reservation_id)},
+    )
+    return "ok"
 
 
 async def list_purpose_review_items(
