@@ -36,6 +36,29 @@ Env contract identical to services/cabling/tests/test_fork_restore_save_race_liv
 
 Every test uses a fresh random reservation_id (no cross-schema FKs, so nothing else
 references it) and deletes its own rows in a finally.
+
+Gate-ledger scoping (issue #819). The Makefile comment above `_gate-pg-live-tests`
+records that this suite, like the cabling live-pg suites before it, runs against the
+gate's ALREADY-MIGRATED, ALREADY-USED execution schema and must leave its data alone;
+it is not a throwaway database. The nightly of 2026-09-15 found this suite broke that
+contract: the gate's execution ledger already held FAILED rows from the seeded e2e
+phase that runs earlier in the same gate, `run_wiring_retry_tick`'s real
+`due_failed_rows`/`due_failed_l2_rows`/`due_failed_route_rows` selects picked those
+foreign rows up alongside the test's own row, `stats["rows_due"]` counted them, and
+(when a foreign row's switch happened to resolve through the patched `_fetch_device`)
+the tick drove and flipped them through the slow stub, mutating rows this suite does
+not own. Every test now patches the three `due_failed_*` names as imported by
+`wiring_retry_service` (see `_patches`) with wrappers that call the REAL query, so the
+claim predicate and its `FOR UPDATE SKIP LOCKED` are still exercised end to end, and
+then keep only the rows whose `reservation_id` is this test's own. The background
+channel's view of the ledger is therefore scoped to one reservation without touching
+the selection SQL itself. `test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas`
+calls `due_failed_rows` directly (bypassing the tick, and so the scoping patch, by
+design) and now asserts its own row is somewhere IN that real, unscoped result rather
+than the only row in it, and drives only its own preselected row forward. Every test
+also snapshots every OTHER reservation's ledger rows before and after the race and
+asserts nothing about them changed, so a regression here fails loudly instead of
+quietly corrupting a shared gate stack again.
 """
 
 from __future__ import annotations
@@ -53,8 +76,11 @@ from app.models.l2_port_assignment import L2PortAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.models.route_assignment import RouteAssignment
 from app.models.vlan_assignment import VlanAssignment
+from app.services.l1_assignment_service import due_failed_rows as _real_due_failed_rows
+from app.services.l2_membership_service import due_failed_l2_rows as _real_due_failed_l2_rows
+from app.services.route_service import due_failed_route_rows as _real_due_failed_route_rows
 from app.services.wiring_retry_service import reattempt_reservation, run_wiring_retry_tick
-from sqlalchemy import delete, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
@@ -207,7 +233,24 @@ def _slow_driver_stub():
     return execute_fn, calls
 
 
-def _patches(execute_fn):
+def _scope_to_reservation(real_fn, reservation_id: uuid.UUID):
+    """Wrap a real `due_failed_*` query so it answers for ONE reservation only.
+
+    The real function still runs with the real arguments: the FAILED/attempts-cap
+    predicate and the `FOR UPDATE SKIP LOCKED` claim exclusion are exercised exactly
+    as the tick would exercise them. Only the returned rows are narrowed, after the
+    fact, to this test's own reservation, so a gate ledger holding other reservations'
+    FAILED rows (issue #819) never becomes a candidate for this test's tick.
+    """
+
+    async def _scoped(db, limit, max_attempts, now=None):
+        rows = await real_fn(db, limit, max_attempts, now)
+        return [r for r in rows if r.reservation_id == reservation_id]
+
+    return _scoped
+
+
+def _patches(execute_fn, reservation_id: uuid.UUID):
     async def _device(device_id, client=None):
         if str(device_id) == str(SWITCH_ID):
             return SWITCH_DATA
@@ -226,7 +269,43 @@ def _patches(execute_fn):
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        # issue #819: scope the background channel's ledger view to this test's own
+        # reservation, on every test, so a used gate ledger's foreign FAILED rows are
+        # never selected, driven, or counted by this test's tick.
+        patch(
+            "app.services.wiring_retry_service.due_failed_rows",
+            new=_scope_to_reservation(_real_due_failed_rows, reservation_id),
+        ),
+        patch(
+            "app.services.wiring_retry_service.due_failed_l2_rows",
+            new=_scope_to_reservation(_real_due_failed_l2_rows, reservation_id),
+        ),
+        patch(
+            "app.services.wiring_retry_service.due_failed_route_rows",
+            new=_scope_to_reservation(_real_due_failed_route_rows, reservation_id),
+        ),
     ]
+
+
+async def _foreign_ledger_snapshot(session_factory, reservation_id: uuid.UUID) -> dict:
+    """Every ledger row NOT owned by this test, keyed by (kind, id): (status, claimed_until).
+
+    On a throwaway empty Postgres this is an empty dict and the comparison callers
+    make against it is trivially true. On the gate's used ledger it is nonempty, and
+    it is the load-bearing check (issue #819) that a scoped tick left every other
+    reservation's rows completely alone: unchanged status, unchanged claimed_until.
+    """
+    rows: dict[tuple[str, uuid.UUID], tuple[str, object]] = {}
+    async with session_factory() as db:
+        for kind, model in (
+            ("l1", L1ConnectionAssignment),
+            ("l2", L2PortAssignment),
+            ("l3", RouteAssignment),
+        ):
+            result = await db.execute(select(model).where(model.reservation_id != reservation_id))
+            for row in result.scalars().all():
+                rows[(kind, row.id)] = (row.status, row.claimed_until)
+    return rows
 
 
 async def _cleanup(session_factory, reservation_id: uuid.UUID) -> None:
@@ -286,7 +365,8 @@ async def test_l1_row_is_driven_exactly_once_across_both_channels(session_factor
         row_id = row.id
 
     execute_fn, calls = _slow_driver_stub()
-    patches = _patches(execute_fn)
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
@@ -305,10 +385,19 @@ async def test_l1_row_is_driven_exactly_once_across_both_channels(session_factor
     # tick selects, so the tick's own claim predicate excludes the row before its
     # drive-time compare-and-swap is even reached: nothing due, nothing driven,
     # nothing counted as failed. The drive-time loss is proved by
-    # test_a_simultaneous_start_makes_the_loser_report_in_progress below.
-    assert stats["rows_due"] == 0, "a claimed row is not a candidate for the other channel"
+    # test_a_simultaneous_start_makes_the_loser_report_in_progress below. rows_due is
+    # scoped to this reservation (issue #819), so a used gate ledger's foreign FAILED
+    # rows never make this assertion fail.
+    assert stats["rows_due"] == 0, (
+        "a claimed row is not a candidate for the other channel, in this reservation's "
+        "scoped view of the ledger"
+    )
     assert stats["rows_retried"] == 0
     assert stats["still_failed"] == 0
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before, (
+        "a scoped tick must never change another reservation's ledger rows"
+    )
 
 
 @pytest.mark.asyncio
@@ -338,7 +427,8 @@ async def test_l2_row_is_driven_exactly_once_across_both_channels(session_factor
         row_id = row.id
 
     execute_fn, calls = _slow_driver_stub()
-    patches = _patches(execute_fn)
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
@@ -354,9 +444,15 @@ async def test_l2_row_is_driven_exactly_once_across_both_channels(session_factor
     )
     outcomes = {r["id"]: r["outcome"] for r in manual["results"]}
     assert outcomes == {str(row_id): "released"}
-    assert stats["rows_due"] == 0
+    # Scoped to this reservation (issue #819): a used gate ledger's foreign FAILED
+    # rows never make this assertion fail.
+    assert stats["rows_due"] == 0, "the tick's ledger view is scoped to this reservation"
     assert stats["rows_retried"] == 0
     assert stats["still_failed"] == 0
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before, (
+        "a scoped tick must never change another reservation's ledger rows"
+    )
 
 
 @pytest.mark.asyncio
@@ -378,7 +474,8 @@ async def test_l3_pin_is_driven_exactly_once_across_both_channels(session_factor
         row_id = row.id
 
     execute_fn, calls = _slow_driver_stub()
-    patches = _patches(execute_fn)
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
@@ -393,9 +490,15 @@ async def test_l3_pin_is_driven_exactly_once_across_both_channels(session_factor
     )
     outcomes = {r["id"]: r["outcome"] for r in manual["results"]}
     assert outcomes == {str(row_id): "released"}
-    assert stats["rows_due"] == 0
+    # Scoped to this reservation (issue #819): a used gate ledger's foreign FAILED
+    # rows never make this assertion fail.
+    assert stats["rows_due"] == 0, "the tick's ledger view is scoped to this reservation"
     assert stats["rows_retried"] == 0
     assert stats["still_failed"] == 0
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before, (
+        "a scoped tick must never change another reservation's ledger rows"
+    )
 
 
 @pytest.mark.asyncio
@@ -420,7 +523,8 @@ async def test_the_manual_channel_reports_in_progress_when_the_tick_wins(session
         row_id = row.id
 
     execute_fn, calls = _slow_driver_stub()
-    patches = _patches(execute_fn)
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
@@ -441,6 +545,10 @@ async def test_the_manual_channel_reports_in_progress_when_the_tick_wins(session
         "the losing manual call must REPORT the row, as in_progress"
     )
     assert stats["released"] == 1, "the tick, holding the claim, drove and released it"
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before, (
+        "a scoped tick must never change another reservation's ledger rows"
+    )
 
 
 @pytest.mark.asyncio
@@ -481,15 +589,27 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
         await db.commit()
         row_id = row.id
 
-    # The tick's own selection, run while the row is genuinely free.
+    # The tick's own selection, UNSCOPED and real (issue #819: this call bypasses
+    # run_wiring_retry_tick, and so the scoping patch in _patches, on purpose, to
+    # prove the claim exclusion on the real query directly). On a used gate ledger
+    # this can return other reservations' unclaimed FAILED rows too, so assert this
+    # test's row is somewhere in that real result and unclaimed, not that it is the
+    # only row, and drive only this test's own preselected row forward.
     async with session_factory() as db:
-        preselected = await due_failed_rows(db, 20, 10)
-    assert [r.id for r in preselected] == [row_id], (
+        # 10000, not the production batch size: created_at ascending means older
+        # foreign rows sort first, so a small limit could push this test's own row
+        # out of the result on a gate ledger holding more due rows than that.
+        preselected = await due_failed_rows(db, 10000, 10)
+    preselected_by_id = {r.id: r for r in preselected}
+    assert row_id in preselected_by_id, (
         "the background channel must have loaded the row while it was still unclaimed"
     )
+    own_row = preselected_by_id[row_id]
+    assert own_row.claimed_until is None, "the row must have been unclaimed at selection time"
 
     execute_fn, calls = _slow_driver_stub()
-    patches = _patches(execute_fn)
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
@@ -507,9 +627,10 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
         else:
             pytest.fail("the manual channel never took the claim")
 
-        # Now the background channel reaches its driver call with a row it selected
-        # before the claim existed.
-        outcomes = await _reattempt_rows(preselected, _session_ctx(session_factory))
+        # Now the background channel reaches its driver call with ONLY the row it
+        # itself preselected for this test, never any foreign row the same real
+        # query might have also returned (issue #819).
+        outcomes = await _reattempt_rows([own_row], _session_ctx(session_factory))
         manual_result = await manual
     finally:
         for p in patches:
@@ -524,4 +645,8 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
     )
     assert [r["outcome"] for r in manual_result["results"]] == ["released"], (
         "the claim holder drove the row and reported the real outcome"
+    )
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before, (
+        "a scoped tick must never change another reservation's ledger rows"
     )
