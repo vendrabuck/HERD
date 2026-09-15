@@ -20,7 +20,7 @@
     <a href="admin-setup.html" class="active">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-4-0.html">Release 0.4.0</a>
+    <a href="release-0-5-0.html">Release 0.5.0</a>
   </nav>
 </header>
 
@@ -133,6 +133,8 @@
     <h2 class="sec" id="backfill">The catch-up tool</h2>
     <p class="sectitle">Classify history</p>
     <p>Reservations that ended before this feature existed, or that a stack outage skipped, never automatically get a suggestion on their own. <b>Classify history</b> marks every terminal reservation (<span class="badge completed">COMPLETED</span>, <span class="badge cancelled">CANCELLED</span>, or <span class="badge failed">FAILED</span>) that has neither a confirmed category nor a suggestion yet as eligible for the same background pass that runs at reservation end, and separately gives a fresh set of attempts to any row that already used up its retries without ever getting a suggestion (a mixed-version deployment where the classify endpoint briefly didn't exist is the usual cause). It reports how many reservations it marked, and running it again once the background pass has caught up reports zero: safe to click more than once.</p>
+    <p>A single reservation does not have to wait for either the sweep or a backfill. <code>POST /api/reservations/admin/purpose-review/{reservation_id}/classify</code> runs the same classifier the background pass uses, for that one reservation, and answers with its outcome as a 200: <code>ok</code> with the new suggestion, or <code>timeout</code>, <code>transient</code>, <code>failed</code>, or <code>forbidden</code>. It answers 503 when purpose classification is off, 409 <code>not_eligible</code> while the reservation has not ended yet, and 409 <code>already_suggested</code> when a suggestion already exists, so dismiss or override that one first. It ignores the per-reservation attempt cap on purpose, which makes it the way to retry one exhausted reservation without running <b>Classify history</b>, which retries every exhausted row. There is no button for this on the page yet: in this release it is an API call only.</p>
+
     <div class="callout calm">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
       <div><p>Marking a reservation eligible does not classify it instantly: it joins the same background queue everything else uses, so suggestions from a large backfill trickle in over the next several sweep ticks rather than appearing all at once.</p></div>

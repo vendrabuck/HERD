@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html" class="active">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-4-0.html">Release 0.4.0</a>
+    <a href="release-0-5-0.html">Release 0.5.0</a>
   </nav>
 </header>
 
@@ -103,6 +103,12 @@
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"Can't drop the device here"</span></summary>
       <div class="acc-body"><p>You're trying to mix a <span class="badge physical">PHYSICAL</span> device with a <span class="badge cloud">CLOUD</span> one. They can't share a topology &mdash; start a separate one for the other type.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">A route refused with "l3_vrf_unsupported"</span></summary>
+      <div class="acc-body"><p>The route names a <b>virtual router</b>, and the switch's driver does not declare <code>supports_vrf</code>, so HERD refused the route instead of installing it in the default routing table. Nothing was sent to the device, and the route stays in the <b>Wiring</b> tab as failed until the intent or the driver changes. Two fixes: remove the virtual router from the route in the topology editor's Routing panel, or have an admin upload a driver that supports virtual routers (the shipped <code>frr_l3</code> package does). See <a href="user-topology.html#connect">routing intent</a>.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Retry reported rows as "already retrying"</span></summary>
+      <div class="acc-body"><p>HERD's own background retry was working on those rows when you pressed <b>Retry failed</b>, so your retry left them alone rather than driving the same connection twice. Nothing is wrong and nothing is lost: check the <a href="user-live-editing.html#wiring">Wiring tab</a> again in a minute for the background channel's result.</p></div></details>
 
     <h2 class="sec" id="ai">AI weirdness</h2>
     <p class="sectitle">AI generation problems</p>
