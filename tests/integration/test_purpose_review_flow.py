@@ -1,29 +1,30 @@
 """End-to-end integration: AI purpose-suggestion review and backfill (issue
-#646 phase 2, ADR 0013 points 8-11).
+#646 phase 2, ADR 0013 points 8-11), plus the on-demand per-reservation
+trigger (issue #808).
 
 Assumes a running HERD stack (make up / make everything's ephemeral stack).
 The dev/test override pins EXPIRATION_INTERVAL_SECONDS=5, so the sweep
-reconciler ticks often enough for the AI-gated test's poll loop to fit inside
-a normal test timeout.
+reconciler ticks often enough for the backfill test in this file to fit
+inside a normal test timeout.
 
-Ordering note (2026-09-05, issue #706): the purpose-classify sweep classifies
-its backlog oldest-`purpose_classify_requested_at`-first and serially, at
-model speed, one row per tick. The test below,
-`test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review`,
-carries `@pytest.mark.classify_sweep_first` so
-`tests/integration/conftest.py`'s `pytest_collection_modifyitems` runs it
-before the rest of this suite: every other integration test in this
-directory that cancels or completes a reservation also stamps
-`purpose_classify_requested_at`, and if those ran first they would queue
-ahead of this test's own reservation and push it past this test's poll
-budget purely on ordering, not a reconciler defect. On a REUSED dev stack
-that already carries a purpose-classify backlog from earlier runs, this test
-can still time out even running first: that is stack history, not a
-regression (`make everything` boots a fresh stack per run, so the gate is
-unaffected).
+History (issue #808): this file's first test used to wait on the global
+sweep reconciler, which classifies its backlog oldest-`purpose_classify_
+requested_at`-first and serially, at model speed, one row per tick. On a
+reused dev stack carrying a purpose-classify backlog from earlier runs, the
+sweep could take longer than the test's poll budget to reach this test's own
+reservation, purely from queue position, not a reconciler defect (observed
+twice, 2026-09-12 and 2026-09-13; see issue #808). The fix is
+POST /admin/purpose-review/{id}/classify (issue #808): the test now triggers
+classification for its own reservation directly instead of waiting for the
+sweep's turn, so it no longer depends on the sweep's backlog or on running
+before the rest of this suite. `@pytest.mark.classify_sweep_first` and its
+supporting `tests/integration/conftest.py` reordering hook are removed by
+the same change: this was their only consumer (confirmed by grep across the
+repo before removal).
 """
 
 import asyncio
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -31,44 +32,47 @@ from _ai_helpers import ai_provider_configured
 
 pytestmark = pytest.mark.asyncio
 
-POLL_TIMEOUT_SECONDS = 60
-POLL_INTERVAL_SECONDS = 3
+POLL_TIMEOUT_SECONDS = 15
+POLL_INTERVAL_SECONDS = 2
 
 
-def _reservation_body(device_id: str) -> dict:
+def _reservation_body(device_id: str, *, in_the_past: bool = True) -> dict:
     now = datetime.now(timezone.utc)
+    if in_the_past:
+        start = now - timedelta(minutes=10)
+        end = now - timedelta(minutes=5)
+    else:
+        start = now + timedelta(hours=1)
+        end = now + timedelta(hours=1, minutes=5)
     return {
         "device_ids": [device_id],
         "purpose": "replicating a customer support case against the FRR driver",
-        "start_time": now.isoformat(),
-        "end_time": (now + timedelta(minutes=5)).isoformat(),
+        "start_time": start.isoformat(),
+        "end_time": end.isoformat(),
     }
 
 
 @pytest.mark.seeded_skip_ok("needs AI_* env")
-@pytest.mark.classify_sweep_first
-@pytest.mark.timeout(90)
+@pytest.mark.timeout(60)
 async def test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review(
     admin_client, fresh_device
 ):
-    """A cancelled reservation is stamped eligible, the sweep reconciler
-    classifies it via the live AI provider, and the suggestion surfaces on
-    the admin review list (ADR 0013 point 10). Skipped when no AI provider is
-    configured on this host (nightly and the plain gate stack have no AI_*
-    env): the sweep would otherwise never produce a suggestion to poll for.
+    """A cancelled reservation is stamped eligible, the on-demand trigger
+    (issue #808) classifies it synchronously via the live AI provider, and
+    the suggestion surfaces on the admin review list (ADR 0013 point 10).
+    Skipped when no AI provider is configured on this host (nightly and the
+    plain gate stack have no AI_* env): the trigger would otherwise always
+    answer feature_off.
 
-    Runs before the rest of this module's suite (see the module docstring's
-    2026-09-05 ordering note, issue #706): `classify_sweep_first` moves it to
-    the front of collection so the sweep's oldest-first, serial, model-speed
-    queue has not already been filled by other tests' own cancelled or
-    completed reservations by the time this one polls for its suggestion.
-    `@pytest.mark.timeout(90)` overrides the suite's global `--timeout=30`
-    (POLL_TIMEOUT_SECONDS below is 60s, plus room for the request/poll
-    overhead around it), the same override pattern used elsewhere in this
-    suite for a test whose legitimate runtime exceeds the default.
+    `@pytest.mark.timeout(60)` overrides the suite's global `--timeout=30`:
+    the trigger's own call to the orchestrator is bounded by
+    purpose_classify_timeout_seconds (default 30s, and the local vLLM setup
+    this test was written against has been observed answering in 7 to 50s),
+    plus POLL_TIMEOUT_SECONDS (15s) for the read-after-write poll below, plus
+    overhead for the create/cancel/dismiss calls around both.
     """
     if not ai_provider_configured():
-        pytest.skip("AI provider not configured on this host; sweep classifier not exercised")
+        pytest.skip("AI provider not configured on this host; classifier not exercised")
 
     create = await admin_client.post("/reservations/", json=_reservation_body(fresh_device["id"]))
     assert create.status_code == 201, create.text
@@ -77,6 +81,19 @@ async def test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review(
     try:
         cancel = await admin_client.delete(f"/reservations/{reservation_id}")
         assert cancel.status_code == 204, cancel.text
+
+        trigger = await admin_client.post(
+            f"/reservations/admin/purpose-review/{reservation_id}/classify"
+        )
+        assert trigger.status_code == 200, trigger.text
+        trigger_body = trigger.json()
+        assert trigger_body["outcome"] == "ok", (
+            f"expected outcome 'ok', got {trigger_body['outcome']!r}; check the "
+            "reservations and ai-orchestrator service logs for action=purpose_classify_* "
+            "and confirm AI_PURPOSE_CLASSIFICATION_ENABLED is set on the ai-orchestrator "
+            "container"
+        )
+        assert trigger_body["purpose_suggestion"]["top_category"]
 
         deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT_SECONDS
         found = None
@@ -95,9 +112,8 @@ async def test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review(
 
         assert found is not None, (
             "reservation never surfaced on the admin review list within "
-            f"{POLL_TIMEOUT_SECONDS}s; check the reservations service logs for "
-            "action=purpose_classify_* and confirm AI_PURPOSE_CLASSIFICATION_ENABLED "
-            "is set on the ai-orchestrator container"
+            f"{POLL_TIMEOUT_SECONDS}s of a 200 'ok' trigger response, a read-after-write "
+            "gap across the gateway wider than expected"
         )
         assert found["purpose_suggestion"]["top_category"]
         assert found["purpose_category"] is None
@@ -105,6 +121,33 @@ async def test_cancelled_reservation_gets_a_suggestion_visible_in_admin_review(
         # Best-effort: the reservation is already CANCELLED (terminal), so
         # this is just cleanup of the admin review queue, not a state check.
         await admin_client.post(f"/reservations/admin/purpose-review/{reservation_id}/dismiss")
+
+
+async def test_trigger_not_eligible_before_terminal(admin_client, fresh_device):
+    """A reservation that has not reached a terminal state yet (PENDING,
+    since it starts in the future) has no purpose_classify_requested_at, so
+    the trigger 409s not_eligible (issue #808). Does not need AI configured:
+    the eligibility check runs before any call to the orchestrator.
+    """
+    create = await admin_client.post(
+        "/reservations/", json=_reservation_body(fresh_device["id"], in_the_past=False)
+    )
+    assert create.status_code == 201, create.text
+    reservation_id = create.json()["id"]
+
+    try:
+        resp = await admin_client.post(
+            f"/reservations/admin/purpose-review/{reservation_id}/classify"
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"] == {"error": "not_eligible"}
+    finally:
+        await admin_client.delete(f"/reservations/{reservation_id}")
+
+
+async def test_trigger_is_admin_only(user_client):
+    resp = await user_client.post(f"/reservations/admin/purpose-review/{uuid.uuid4()}/classify")
+    assert resp.status_code == 403
 
 
 async def test_backfill_marks_and_is_idempotent(admin_client, fresh_device):
