@@ -1,7 +1,10 @@
 """The end-of-reservation purpose-classification sweep reconciler (issue #646
 phase 2, ADR 0013 point 8's second pass; issue #706's outcome-taxonomy fix):
 app.tasks.expiration._run_purpose_classify_reconcile and its per-row helper
-_classify_purpose_one.
+app.services.purpose_service.classify_purpose_one (moved there from this
+module by issue #808, which added a second caller, the on-demand admin
+trigger; call_service is patched at its new home,
+app.services.purpose_service, not app.tasks.expiration).
 """
 
 import logging
@@ -106,7 +109,7 @@ async def _get(rid: uuid.UUID) -> Reservation:
 async def test_reconcile_stores_suggestion_on_200():
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5), dynamic=True)
     call = AsyncMock(return_value=_suggestion_response("qa_regression"))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
 
     res = await _get(rid)
@@ -128,7 +131,7 @@ async def test_reconcile_stores_suggestion_on_200():
 async def test_reconcile_no_dynamic_requests_sends_null():
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=_suggestion_response())
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
     sent = call.await_args.kwargs["json_body"]
     assert sent["dynamic_requests"] is None
@@ -143,7 +146,7 @@ async def test_reconcile_403_structured_marker_ends_tick_without_touching_any_ro
     rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
     rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(403, json={"detail": _FEATURE_OFF_DETAIL}))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
 
     # Only the first (oldest-requested) row was even attempted; the tick ended
@@ -162,7 +165,7 @@ async def test_reconcile_403_legacy_string_detail_is_still_feature_off():
     that as feature-off (the documented fallback), not burn an attempt."""
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(403, json={"detail": _LEGACY_FEATURE_OFF_DETAIL}))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
     res = await _get(rid)
     assert res.purpose_suggestion is None
@@ -180,7 +183,7 @@ async def test_reconcile_403_bad_token_is_not_feature_off(caplog):
     rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
     rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(403, json={"detail": "Invalid internal token"}))
-    with patch("app.tasks.expiration.call_service", call), caplog.at_level(logging.WARNING):
+    with patch("app.services.purpose_service.call_service", call), caplog.at_level(logging.WARNING):
         await _run_purpose_classify_reconcile()
 
     call.assert_awaited_once()
@@ -202,7 +205,7 @@ async def test_reconcile_404_ends_tick_without_touching_any_row():
     rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
     rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(404, json={"detail": "not found"}))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
 
     call.assert_awaited_once()
@@ -221,7 +224,7 @@ async def test_reconcile_404_then_later_tick_still_untouched():
     """
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(404, json={"detail": "not found"}))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         for _ in range(3):
             await _run_purpose_classify_reconcile()
 
@@ -236,7 +239,7 @@ async def test_reconcile_500_increments_attempts():
     per-row failure and bumps attempts, unlike the transient codes below."""
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(500, text="internal error"))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
     res = await _get(rid)
     assert res.purpose_suggestion is None
@@ -254,7 +257,7 @@ async def test_reconcile_transient_status_ends_tick_without_bump(status_code):
     rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
     rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(status_code, text="unavailable"))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
 
     call.assert_awaited_once()
@@ -270,7 +273,7 @@ async def test_reconcile_sustained_429_three_ticks_leave_attempts_at_zero():
     midnight, hundreds of ticks; none of them may burn this row's attempt cap."""
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(return_value=httpx.Response(429, text="rate limited"))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         for _ in range(3):
             await _run_purpose_classify_reconcile()
     res = await _get(rid)
@@ -289,7 +292,7 @@ async def test_reconcile_timeout_bumps_attempts_and_does_not_end_tick():
     rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
     rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(side_effect=[httpx.TimeoutException("timed out"), _suggestion_response()])
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
 
     assert call.await_count == 2
@@ -314,7 +317,7 @@ async def test_reconcile_timeout_head_of_line_row_stops_blocking_after_cap():
     """
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         for _ in range(settings.purpose_classify_max_attempts + 1):
             await _run_purpose_classify_reconcile()
 
@@ -328,7 +331,7 @@ async def test_reconcile_timeout_head_of_line_row_stops_blocking_after_cap():
 async def test_reconcile_transport_error_never_raises_and_is_transient():
     rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
     call = AsyncMock(side_effect=httpx.ConnectError("down"))
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         # Must not raise.
         await _run_purpose_classify_reconcile()
     res = await _get(rid)
@@ -343,7 +346,7 @@ async def test_reconcile_skips_rows_at_attempt_cap():
         purpose_classify_attempts=settings.purpose_classify_max_attempts,
     )
     call = AsyncMock(return_value=_suggestion_response())
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
     call.assert_not_awaited()
     res = await _get(rid)
@@ -355,7 +358,7 @@ async def test_reconcile_skips_rows_at_attempt_cap():
 async def test_reconcile_ignores_rows_not_yet_requested():
     await _insert(purpose_classify_requested_at=None)
     call = AsyncMock(return_value=_suggestion_response())
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
     call.assert_not_awaited()
 
@@ -367,7 +370,7 @@ async def test_reconcile_ignores_rows_already_suggested():
         purpose_suggestion={"top_category": "training"},
     )
     call = AsyncMock(return_value=_suggestion_response())
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
     call.assert_not_awaited()
 
@@ -380,7 +383,7 @@ async def test_reconcile_respects_batch_size(monkeypatch):
         for i in range(3)
     ]
     call = AsyncMock(return_value=_suggestion_response())
-    with patch("app.tasks.expiration.call_service", call):
+    with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
     assert call.await_count == 2
 
@@ -402,6 +405,6 @@ async def test_reconcile_oldest_requested_first():
         seen_order.append(uuid.UUID(kwargs["json_body"]["reservation_id"]))
         return _suggestion_response()
 
-    with patch("app.tasks.expiration.call_service", AsyncMock(side_effect=_fake_call)):
+    with patch("app.services.purpose_service.call_service", AsyncMock(side_effect=_fake_call)):
         await _run_purpose_classify_reconcile()
     assert seen_order == [older, newer]

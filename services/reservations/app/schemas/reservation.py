@@ -200,6 +200,22 @@ class PurposeBackfillResponse(BaseModel):
     marked: int
 
 
+class PurposeClassifyTriggerResponse(BaseModel):
+    """Body of POST /admin/purpose-review/{id}/classify (issue #808).
+
+    outcome is the reconciler's own outcome vocabulary
+    (app.services.purpose_service.classify_purpose_one): "ok", "timeout",
+    "transient", "failed", or "forbidden". A non-"ok" outcome still answers
+    200: the request itself succeeded, the classification attempt did not,
+    and outcome says why. purpose_suggestion is the stored suggestion after
+    this call (only "ok" ever sets one) or null.
+    """
+
+    reservation_id: uuid.UUID
+    outcome: str
+    purpose_suggestion: dict[str, Any] | None = None
+
+
 class DynamicRequestResponse(BaseModel):
     """A booked dynamic instance request; `id` is the execution-side request_id."""
 

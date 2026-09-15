@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- An admin can now classify one reservation's purpose on demand instead of waiting for
+  the background sweep to reach it (issue #808). `POST
+  /admin/purpose-review/{reservation_id}/classify` runs the sweep's own single-row
+  classifier synchronously for exactly that reservation and returns its outcome (`ok`,
+  `timeout`, `transient`, `failed`, or `forbidden`, all still 200; `feature_off`
+  answers 503 instead, matching how other AI-gated endpoints respond when
+  unconfigured); 404 for an unknown reservation, 409 `not_eligible` before the
+  reservation reaches a terminal state, 409 `already_suggested` once a suggestion
+  already exists. It deliberately ignores `purpose_classify_max_attempts`, so it
+  doubles as a way to retry one exhausted row without running the global backfill, and
+  the sweep's oldest-first fairness is unchanged. The single-row classifier moved from
+  the expiration task to `purpose_service.classify_purpose_one` so the new router does
+  not import from `tasks/`; the sweep reconciler now calls it from its new home. Fixes
+  the reused-stack flake in `test_purpose_review_flow.py` (the test now triggers its
+  own reservation directly instead of waiting on the sweep's backlog), and the
+  now-unused `classify_sweep_first` pytest marker and its collection-reordering hook
+  are removed.
+
 - The two wiring retry channels can no longer drive the same FAILED row at once
   (issue #817). The manual endpoint and the background tick both load
   hardware-retryable FAILED ledger rows and drive them through the same applies;

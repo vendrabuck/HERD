@@ -554,3 +554,21 @@ Phase 2 pins, as delivered:
 - Any automatic write of an AI suggestion into `purpose_category`.
 - Uploaded file contents as a classifier signal.
 - A dedicated event for category edits.
+
+## Addendum 2026-09-15: on-demand per-reservation trigger
+
+Issue #808. `test_purpose_review_flow.py`'s AI-gated integration test flaked
+twice on a reused dev stack (2026-09-12 and 2026-09-13) because it waited on
+the sweep reconciler's global backlog: the sweep classifies oldest-requested-
+first and serially, at model speed, so a stack carrying reservations from
+earlier suites could push the test's own row past its poll budget on queue
+position alone, no reconciler defect involved. The sweep's FIFO fairness
+(oldest-first, one row per tick) is unchanged; the fix instead gives the test,
+and an operator, a way to skip the queue for one row:
+`POST /admin/purpose-review/{id}/classify` runs the reconciler's own
+single-row classifier synchronously for exactly that reservation. It
+deliberately ignores `purpose_classify_max_attempts`, so it doubles as the
+retry path for one exhausted row without an operator reaching for the
+global `POST /admin/purpose/backfill`. The integration test now calls it
+directly instead of waiting on the sweep, and no longer needs to run first
+in its suite.
