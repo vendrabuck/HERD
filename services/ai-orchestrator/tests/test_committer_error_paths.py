@@ -387,6 +387,9 @@ async def test_commit_unexpected_error_rolls_back_and_wraps_502(monkeypatch):
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        mock.post(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}/validate").respond(
+            200, json={"valid": True, "invalid_edges": []}
+        )
         # Reservation responds 201 but with NO "id" key: _create_reservation does
         # resp.json()["id"], raising KeyError, which is the non-CommitError branch.
         mock.post(f"{RESERVATIONS_URL}/").respond(201, json={})
@@ -397,4 +400,47 @@ async def test_commit_unexpected_error_rolls_back_and_wraps_502(monkeypatch):
 
     assert exc.value.status_code == 502
     assert "Unexpected upstream failure" in exc.value.message
+    assert rollback.called
+
+
+# --- _validate_topology_wireable: fail CLOSED on an unanswerable 200 -------
+#
+# A 200 is not automatically a pass: cabling could return one with a body
+# that is not valid JSON, or valid JSON with no boolean `valid` key at all
+# (a malformed or unexpected response shape). Both mean the question was
+# never actually answered, so both must fail closed with a 503, the same as
+# a transport failure or a 5xx, not be read as an implicit "valid: true".
+
+
+async def test_commit_validate_non_json_200_body_fails_closed_with_503():
+    """A 200 whose body is not valid JSON is not a pass: fail closed rather
+    than silently proceeding to create a reservation for an unchecked canvas."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
+        mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        mock.post(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}/validate").respond(200, text="not json")
+        rollback = mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(204)
+
+        with pytest.raises(CommitError) as exc:
+            await committer.commit_proposal(_req(), "user-bearer", "user-1")
+
+    assert exc.value.status_code == 503
+    assert "Failed to validate topology wireability" in exc.value.message
+    assert rollback.called
+
+
+async def test_commit_validate_body_missing_valid_key_fails_closed_with_503():
+    """A 200 with valid JSON but no boolean `valid` key (e.g. an empty object)
+    is likewise an unanswerable question, not an implicit pass."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
+        mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
+        mock.post(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}/validate").respond(200, json={})
+        rollback = mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(204)
+
+        with pytest.raises(CommitError) as exc:
+            await committer.commit_proposal(_req(), "user-bearer", "user-1")
+
+    assert exc.value.status_code == 503
+    assert "Failed to validate topology wireability" in exc.value.message
     assert rollback.called

@@ -153,6 +153,31 @@ export interface AICommitResponse {
   config_results: DeviceConfigResult[];
 }
 
+// One edge the commit-time wireability check (cabling's own
+// POST /topologies/{id}/validate, called before the reservation is
+// created) rejected, named by the proposal's ROLES rather than node or
+// device ids, which mean nothing to the user. `reason` mirrors cabling's
+// InvalidEdge.reason vocabulary (services/cabling/app/schemas/topology.py):
+// currently `missing_device`, `no_path`, `element_to_element`, or
+// `element_edge_no_port`, though only `no_path` and `missing_device` can
+// occur for an AI-committed canvas in practice.
+export interface AICommitInvalidEdge {
+  edge_id: string;
+  source_role: string;
+  target_role: string;
+  reason: string;
+}
+
+// The structured 422 app.services.committer._validate_topology_wireable
+// raises when the just-saved canvas has no physical path for one or more
+// proposed edges (commit-side fail-fast hardening). Relayed verbatim as the
+// commit route's HTTPException detail.
+export interface AICommitTopologyUnwireableDetail {
+  error: "topology_unwireable";
+  invalid_edges: AICommitInvalidEdge[];
+  message: string;
+}
+
 export interface SuggestIdentityRequest {
   name: string;
   description?: string | null;

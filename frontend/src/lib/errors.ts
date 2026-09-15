@@ -1,3 +1,5 @@
+import type { AICommitTopologyUnwireableDetail } from "@/types/ai.types";
+
 /**
  * A HERD backend service returns error detail as either a plain string or,
  * on a pydantic validation failure, a list of error objects. Passing that
@@ -43,4 +45,26 @@ export function structuredDetail<T>(
     return detail as T;
   }
   return null;
+}
+
+/**
+ * Narrows an axios error's response detail to the structured commit-time
+ * wireability 422 (commit-side fail-fast hardening): an AI proposal whose
+ * canvas save succeeded but has an edge with no physical cable path between
+ * the two devices. Returns null for any other shape (a plain-string 422,
+ * a different status, or a 422 for some other reason), so the caller keeps
+ * the existing generic "Commit failed: <detail>" toast as its fallback.
+ * Same shape and style as the fork narrowers in api/reservations.ts
+ * (forkConflictDetail, forkDeviceNotMemberDetail, and the ADR 0014 L3
+ * narrowers), kept here instead since this detail belongs to the AI commit
+ * flow, not a fork.
+ */
+export function aiCommitTopologyUnwireableDetail(
+  err: unknown,
+): AICommitTopologyUnwireableDetail | null {
+  return structuredDetail<AICommitTopologyUnwireableDetail>(
+    err,
+    422,
+    (d) => d.error === "topology_unwireable" && Array.isArray(d.invalid_edges),
+  );
 }

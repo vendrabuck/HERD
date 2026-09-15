@@ -4,11 +4,26 @@ import { isAxiosError } from "axios";
 
 import { Modal } from "@/components/ui/Modal";
 import { useAICommit } from "@/api/ai";
+import { aiCommitTopologyUnwireableDetail } from "@/lib/errors";
 import type {
   AICommitRequest,
   AICommitResponse,
   AIGenerateResponse,
 } from "@/types/ai.types";
+
+// Plain-words rendering of cabling's InvalidEdge.reason vocabulary (see
+// AICommitTopologyUnwireableDetail); a reason this dialog has not seen
+// before falls back to the raw string rather than hiding it.
+const INVALID_EDGE_REASON_TEXT: Record<string, string> = {
+  no_path: "no cable path",
+  missing_device: "device not found",
+  element_to_element: "cannot connect two elements directly",
+  element_edge_no_port: "element has no available port",
+};
+
+function invalidEdgeReasonText(reason: string): string {
+  return INVALID_EDGE_REASON_TEXT[reason] ?? reason;
+}
 
 interface AICommitDialogProps {
   open: boolean;
@@ -111,7 +126,13 @@ function CommitForm({ proposal, onClose, onCommitted }: FormProps) {
       onCommitted(result);
       onClose();
     } catch (err) {
-      if (isAxiosError(err)) {
+      const unwireable = aiCommitTopologyUnwireableDetail(err);
+      if (unwireable) {
+        const lines = unwireable.invalid_edges.map(
+          (edge) => `${edge.source_role} to ${edge.target_role}: ${invalidEdgeReasonText(edge.reason)}`,
+        );
+        toast.error(`Commit failed: cannot wire this topology\n${lines.join("\n")}`);
+      } else if (isAxiosError(err)) {
         const detail = err.response?.data?.detail;
         toast.error(detail ? `Commit failed: ${detail}` : "Commit failed");
       } else {

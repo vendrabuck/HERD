@@ -210,4 +210,45 @@ describe("AICommitDialog", () => {
     renderDialog(null);
     expect(screen.queryByLabelText("Topology name")).not.toBeInTheDocument();
   });
+
+  it("toasts a plain-words per-edge list for a structured topology_unwireable 422", async () => {
+    server.use(
+      http.post("/api/ai/commit", () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "topology_unwireable",
+              invalid_edges: [
+                { edge_id: "e1", source_role: "fw-a", target_role: "sw-a", reason: "no_path" },
+              ],
+              message: "1 proposed connection cannot be wired with the current cabling",
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderDialog();
+    fireEvent.click(screen.getByRole("button", { name: "Commit" }));
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Commit failed: cannot wire this topology\nfw-a to sw-a: no cable path",
+      ),
+    );
+  });
+
+  it("falls back to the generic detail toast for a non-topology_unwireable 422", async () => {
+    server.use(
+      http.post("/api/ai/commit", () =>
+        HttpResponse.json({ detail: "some other structured problem" }, { status: 422 }),
+      ),
+    );
+    renderDialog();
+    fireEvent.click(screen.getByRole("button", { name: "Commit" }));
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Commit failed: some other structured problem",
+      ),
+    );
+  });
 });

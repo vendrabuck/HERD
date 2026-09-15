@@ -6,11 +6,14 @@ The flow:
      the device-side port, issue #632).
   2. POST /cabling/topologies to create an empty topology.
   3. PUT /cabling/topologies/{id} with the built canvas_data.
-  4. POST /reservations/ for the proposal's devices, tagged with topology_id.
+  4. POST /cabling/topologies/{id}/validate to fail fast on an unwireable
+     proposal (an edge with no physical cable path) before a reservation is
+     ever created (commit-side fail-fast hardening, diagnosis option 3).
+  5. POST /reservations/ for the proposal's devices, tagged with topology_id.
 
-If step 3 or 4 fails, the topology is deleted to roll back so the user does
-not end up with a dangling empty topology. All upstream calls use the caller's
-JWT so existing RBAC and device-visibility rules apply.
+If step 3, 4, or 5 fails, the topology is deleted to roll back so the user
+does not end up with a dangling empty topology. All upstream calls use the
+caller's JWT so existing RBAC and device-visibility rules apply.
 """
 
 import logging
@@ -37,9 +40,17 @@ HTTP_TIMEOUT = 15.0
 
 
 class CommitError(Exception):
-    """Raised when an upstream service rejects the commit."""
+    """Raised when an upstream service rejects the commit.
 
-    def __init__(self, status_code: int, message: str) -> None:
+    `message` is usually a plain string, but the commit-time wireability
+    check (`_validate_topology_wireable`) raises with a structured dict
+    detail (`{"error": "topology_unwireable", ...}`) so the frontend can
+    narrow it the same way it narrows other structured 4xx bodies; the route
+    passes `message` straight through to `HTTPException(status_code, detail)`,
+    which serializes either shape unchanged.
+    """
+
+    def __init__(self, status_code: int, message: str | dict[str, Any]) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
@@ -291,6 +302,105 @@ async def _update_topology_canvas(
         raise CommitError(resp.status_code, f"Failed to save canvas: {_detail(resp)}")
 
 
+async def _validate_topology_wireable(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    topology_id: str,
+    role_by_device_id: dict[str, str],
+) -> None:
+    """Fail fast when the just-saved canvas has no physical wiring path.
+
+    Diagnosis option 3: before this, an edge the AI proposed between two
+    devices with no cable between them surfaced only when
+    `_create_reservation` called into reservations, whose
+    `_validate_topology_connectivity` 422s with a single opaque STRING detail
+    ("Topology has unreachable edges in the cabling graph: ...") built from
+    cabling's own validate response. Calling cabling's user-facing
+    `POST /topologies/{id}/validate` here, right after the canvas PUT and
+    before the reservation is ever created, gets the SAME structured
+    `TopologyValidationResponse` reservations computes internally, but early
+    enough to report it with the proposal's ROLE names (node ids and device
+    ids mean nothing to the user) instead of a generic sentence. This is the
+    first line of defense; `_create_reservation`'s own 422 stays as the
+    second, in case of a race between the two calls.
+
+    A transport failure, a 5xx, a 200 whose body is not valid JSON, or a 200
+    whose body has no boolean `valid` key all mean cabling could not actually
+    answer the question, which is not the same as a clean pass: every one of
+    those fails closed with a 503 (the same rule `_fetch_device_ports`
+    follows for issue #717, and the same rule `_fetch_fork_intended_wires`
+    follows service-side). Only an explicit `valid: true` proceeds.
+    """
+    url = f"{settings.cabling_service_url.rstrip('/')}/topologies/{topology_id}/validate"
+    try:
+        resp = await client.post(url, headers=headers)
+    except Exception as e:
+        logger.warning("ai_commit_validate_unreachable", extra={"topology_id": topology_id})
+        raise CommitError(503, f"Failed to validate topology wireability: {e}") from e
+    if resp.status_code >= 500:
+        logger.warning(
+            "ai_commit_validate_failed",
+            extra={"topology_id": topology_id, "status_code": resp.status_code},
+        )
+        raise CommitError(503, f"Failed to validate topology wireability: {_detail(resp)}")
+    if resp.status_code >= 400:
+        # Not expected against a topology this same request just created with
+        # the same JWT (creator-or-admin is always satisfied), but fail
+        # closed on an unexpected 4xx rather than silently proceeding.
+        raise CommitError(resp.status_code, f"Failed to validate topology: {_detail(resp)}")
+
+    try:
+        result = resp.json()
+    except ValueError:
+        # A 200 with an unparseable body means cabling could not actually
+        # answer the question either, same as a transport failure or a 5xx:
+        # fail closed rather than reading silence as a pass.
+        logger.warning("ai_commit_validate_unparseable_body", extra={"topology_id": topology_id})
+        raise CommitError(
+            503, "Failed to validate topology wireability: response body was not JSON"
+        )
+    if not isinstance(result, dict) or not isinstance(result.get("valid"), bool):
+        # No boolean `valid` key at all is likewise an unanswerable question,
+        # not an implicit pass: only an explicit `valid: true` proceeds.
+        logger.warning("ai_commit_validate_missing_valid_key", extra={"topology_id": topology_id})
+        raise CommitError(
+            503, "Failed to validate topology wireability: response had no boolean 'valid' field"
+        )
+    if result["valid"]:
+        return
+
+    def _role(device_id: str | None) -> str:
+        if not device_id:
+            return "unknown"
+        return role_by_device_id.get(device_id, device_id)
+
+    invalid_edges = [
+        {
+            "edge_id": edge.get("edge_id"),
+            "source_role": _role(edge.get("source_device_id")),
+            "target_role": _role(edge.get("target_device_id")),
+            "reason": edge.get("reason"),
+        }
+        for edge in result.get("invalid_edges", [])
+    ]
+    logger.warning(
+        "ai_commit_topology_unwireable",
+        extra={"topology_id": topology_id, "invalid_edge_count": len(invalid_edges)},
+    )
+    raise CommitError(
+        422,
+        {
+            "error": "topology_unwireable",
+            "invalid_edges": invalid_edges,
+            "message": (
+                f"{len(invalid_edges)} proposed connection"
+                f"{'' if len(invalid_edges) == 1 else 's'} cannot be wired with the "
+                "current cabling; see invalid_edges for which ones and why."
+            ),
+        },
+    )
+
+
 async def _delete_topology(
     client: httpx.AsyncClient, headers: dict[str, str], topology_id: str
 ) -> None:
@@ -399,10 +509,10 @@ async def commit_proposal(
     Validates every device config upfront so the request fails fast with a 422
     before we write to any upstream service. This is the guardrail between
     LLM-proposed kwargs and driver method_kwargs. If topology creation succeeds
-    but canvas or reservation fails, the topology is deleted to roll back so the
-    user does not end up with a dangling empty topology. All upstream calls
-    carry the user's JWT so existing RBAC rules apply (device visibility, admin-only
-    config apply, etc.).
+    but the canvas save, the wireability validate, or the reservation create
+    fails, the topology is deleted to roll back so the user does not end up
+    with a dangling empty topology. All upstream calls carry the user's JWT so
+    existing RBAC rules apply (device visibility, admin-only config apply, etc.).
     """
     # Validate every device's config up-front so the request fails fast with
     # a clear 422 before we write to cabling or reservations. This is the
@@ -414,6 +524,7 @@ async def commit_proposal(
             raise CommitError(422, str(exc)) from exc
 
     headers = {"Authorization": f"Bearer {user_bearer_token}"}
+    role_by_device_id = {d.device_id: d.role for d in req.devices}
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         # Built inside the client block: an element attachment edge needs a
@@ -422,11 +533,16 @@ async def commit_proposal(
         topology_id = await _create_topology(client, headers, req.topology_name)
         try:
             await _update_topology_canvas(client, headers, topology_id, canvas_data)
+            # Commit-time fail-fast (diagnosis option 3): check wireability
+            # before spending a reservation create call, and before the user
+            # sees reservations' generic string-detail 422.
+            await _validate_topology_wireable(client, headers, topology_id, role_by_device_id)
             reservation_id = await _create_reservation(client, headers, req, topology_id)
         except CommitError:
-            # Canvas or reservation failed: delete the empty topology so the user
-            # does not end up with a dangling stub. This rollback is best-effort and
-            # swallows errors so a delete failure does not mask the root cause.
+            # Canvas save, wireability validate, or reservation create failed:
+            # delete the empty topology so the user does not end up with a
+            # dangling stub. This rollback is best-effort and swallows errors
+            # so a delete failure does not mask the root cause.
             await _delete_topology(client, headers, topology_id)
             raise
         except Exception as e:

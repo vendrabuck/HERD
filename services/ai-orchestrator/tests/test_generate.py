@@ -453,13 +453,127 @@ async def test_generate_device_only_proposal_defaults_elements_to_empty(async_cl
     assert resp.json()["elements"] == []
 
 
+# --- Self-loop and duplicate device-to-device edges (commit-side fail-fast
+# hardening, diagnosis option 3): the committer writes a device-to-device
+# edge into canvas_data with no ports, so a self-loop or a repeated pair
+# between the same two devices was never rejected before it reached cabling.
+
+
+async def test_generate_rejects_self_loop_edge(async_client, monkeypatch):
+    """An edge whose source and target role are the same is rejected: a
+    device (or element) cannot be wired to itself."""
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "self loop",
+            "devices": [{"role": "a", "template_name": "EX3400"}],
+            "edges": [{"source_role": "a", "target_role": "a", "layer": "L2"}],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert "self-loop" in detail
+    assert "a" in detail
+
+
+async def test_generate_repairs_self_loop_edge_on_retry(async_client, monkeypatch):
+    """A self-loop on the first attempt is repairable and succeeds after the
+    model drops it on retry."""
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    _override_ai_sequence(
+        [
+            {
+                "purpose": "first try",
+                "devices": [
+                    {"role": "a", "template_name": "EX3400"},
+                    {"role": "b", "template_name": "EX3400"},
+                ],
+                "edges": [{"source_role": "a", "target_role": "a", "layer": "L2"}],
+            },
+            {
+                "purpose": "repaired",
+                "devices": [
+                    {"role": "a", "template_name": "EX3400"},
+                    {"role": "b", "template_name": "EX3400"},
+                ],
+                "edges": [{"source_role": "a", "target_role": "b", "layer": "L2"}],
+            },
+        ]
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["edges"] == [{"source_role": "a", "target_role": "b", "layer": "L2"}]
+
+
+async def test_generate_rejects_duplicate_device_to_device_edge(async_client, monkeypatch):
+    """The same unordered role pair proposed twice is rejected, regardless of
+    which side is listed as source vs target."""
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "duplicate edge",
+            "devices": [
+                {"role": "a", "template_name": "EX3400"},
+                {"role": "b", "template_name": "EX3400"},
+            ],
+            "edges": [
+                {"source_role": "a", "target_role": "b", "layer": "L2"},
+                {"source_role": "b", "target_role": "a", "layer": "L3"},
+            ],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert "duplicate edge" in detail
+    assert "a" in detail and "b" in detail
+
+
+async def test_generate_allows_two_devices_attached_to_the_same_element(async_client, monkeypatch):
+    """The duplicate-edge rule excludes element attachments: two distinct
+    devices attaching to the SAME element role is a legitimate shared-element
+    topology (issue #632), not a duplicate."""
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "shared element",
+            "devices": [
+                {"role": "a", "template_name": "EX3400"},
+                {"role": "b", "template_name": "EX3400"},
+            ],
+            "edges": [
+                {"source_role": "a", "target_role": "seg", "layer": "L2"},
+                {"source_role": "b", "target_role": "seg", "layer": "L2"},
+            ],
+            "elements": [{"role": "seg", "element_type": "vlan_segment", "label": "Seg"}],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["edges"]) == 2
+
+
 async def test_generate_repair_loop_caps_at_max_repair_attempts_for_element_error(
     async_client, monkeypatch
 ):
     """The element_to_element rejection is repairable (fed back via
-    _repair_feedback) and retried once (MAX_REPAIR_ATTEMPTS=1); a model that
-    keeps making the same mistake exhausts retries after exactly
-    MAX_REPAIR_ATTEMPTS + 1 total calls, not more."""
+    _repair_feedback) and retried once (ai_generate_max_repairs patched to
+    1); a model that keeps making the same mistake exhausts retries after
+    exactly max_repairs + 1 total calls, not more."""
+    monkeypatch.setattr(config_module.settings, "ai_generate_max_repairs", 1)
     calls: list[str] = []
 
     class StubAI:
@@ -495,13 +609,51 @@ async def test_generate_repair_loop_caps_at_max_repair_attempts_for_element_erro
         resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
 
     assert resp.status_code == 502
-    assert len(calls) == generator_module.MAX_REPAIR_ATTEMPTS + 1
+    assert len(calls) == config_module.settings.ai_generate_max_repairs + 1 == 2
     # The retry call carries the exact corrective wording the model can act
     # on: the element_to_element identifier plus the "never connect two
     # elements" guidance from _repair_feedback.
     assert calls[0] == ""
     assert "element_to_element" in calls[1]
     assert "never connect two elements directly" in calls[1]
+
+
+async def test_generate_zero_max_repairs_disables_retry(async_client, monkeypatch):
+    """ai_generate_max_repairs=0 means the first repairable mistake fails
+    immediately: exactly one provider call, no repair round trip."""
+    monkeypatch.setattr(config_module.settings, "ai_generate_max_repairs", 0)
+    calls: list[str] = []
+
+    class StubAI:
+        async def propose_topology(
+            self,
+            *,
+            inventory_block: str,
+            user_prompt: str,
+            file_context: str = "",
+            template_names: list[str] | None = None,
+            repair_feedback: str = "",
+        ):
+            calls.append(repair_feedback)
+            return (
+                {
+                    "purpose": "self loop always",
+                    "devices": [{"role": "a", "template_name": "EX3400"}],
+                    "edges": [{"source_role": "a", "target_role": "a", "layer": "L2"}],
+                },
+                Usage(input_tokens=10, output_tokens=20),
+            )
+
+    app.dependency_overrides[get_ai_client] = lambda: StubAI()
+    _override_inventory({"EX3400": 10})
+    _override_resolver(monkeypatch)
+
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+
+    assert resp.status_code == 502
+    assert len(calls) == 1
 
 
 async def test_generate_surfaces_ai_error(async_client, monkeypatch):
