@@ -16,6 +16,8 @@ from app.services.ai_client import (
     AIProviderUnavailableError,
     get_ai_client,
 )
+from app.services.cabling_client import CablingUnavailableError
+from app.services.generator import CABLING_UNAVAILABLE_DETAIL
 from app.services.inventory_client import InventorySummary
 from app.services.llm_provider import Usage
 from fastapi import HTTPException
@@ -144,6 +146,85 @@ def _override_resolver(monkeypatch, *, shortfall_template: str | None = None):
         ]
 
     monkeypatch.setattr(generator_module, "fetch_available_devices", _fake)
+    # Resolution now asks cabling which candidate device pairs have a physical
+    # path (the cabling-aware resolver). Every test that reaches resolution
+    # needs an answer, so the default here is "everything is cabled to
+    # everything"; the tests that care install their own stub afterwards,
+    # which wins because monkeypatch applies in call order.
+    _override_pathfind(monkeypatch)
+
+
+def _all_reachable(pairs: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    """A pathfind batch answer where every requested pair has a path."""
+    return [
+        {
+            "source_device_id": source,
+            "target_device_id": target,
+            "reachable": True,
+            "hop_count": 2,
+            "paths": [
+                [
+                    {"device_id": source, "port_in": None, "port_out": f"p{idx}"},
+                    {"device_id": target, "port_in": f"p{idx}", "port_out": None},
+                ]
+            ],
+            "error": None,
+        }
+        for idx, (source, target) in enumerate(pairs)
+    ]
+
+
+def _override_pathfind(
+    monkeypatch,
+    *,
+    reachable: set[tuple[str, str]] | None = None,
+    raises: Exception | None = None,
+    record: list[list[tuple[str, str]]] | None = None,
+):
+    """Stub the cabling batch pathfinder.
+
+    With no arguments every pair is reachable. `reachable` restricts it to an
+    explicit set of unordered device-id pairs; `raises` simulates the cabling
+    outage the resolver must fail closed on.
+    """
+
+    async def _fake(token: str, pairs: list[tuple[str, str]]):
+        if record is not None:
+            record.append(list(pairs))
+        if raises is not None:
+            raise raises
+        results = _all_reachable(pairs)
+        if reachable is None:
+            return results
+        allowed = {tuple(sorted(pair)) for pair in reachable}
+        for result in results:
+            key = tuple(sorted((result["source_device_id"], result["target_device_id"])))
+            if key not in allowed:
+                result["reachable"] = False
+                result["hop_count"] = 0
+                result["paths"] = []
+        return results
+
+    monkeypatch.setattr(generator_module, "fetch_pathfind_batch", _fake)
+
+
+def _override_ai_recording(response: dict[str, Any], sink: list[str]):
+    """Return the same proposal every call, recording each repair note."""
+
+    class RecordingAI:
+        async def propose_topology(
+            self,
+            *,
+            inventory_block: str,
+            user_prompt: str,
+            file_context: str = "",
+            template_names: list[str] | None = None,
+            repair_feedback: str = "",
+        ):
+            sink.append(repair_feedback)
+            return response, Usage(input_tokens=10, output_tokens=20)
+
+    app.dependency_overrides[get_ai_client] = lambda: RecordingAI()
 
 
 async def test_health(async_client):
@@ -950,3 +1031,208 @@ async def test_generate_records_usage_when_quota_enabled(async_client, monkeypat
     # _override_ai stubs Usage(input_tokens=10, output_tokens=20) -> 30 total.
     async with _TestSessionLocal() as db:
         assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 30
+
+
+# --- Cabling-aware device resolution -------------------------------------
+
+
+async def test_generate_resolves_to_the_reachable_devices_not_the_first_listed(
+    async_client, monkeypatch
+):
+    """The first candidate of each template has no cable path to the other's.
+
+    Positional slotting (the pre-resolver behavior) would return
+    dev-EX3400-0 and dev-Client-0, which cabling cannot connect; the search
+    must instead pick the one pair that is actually cabled.
+    """
+    _override_inventory({"EX3400": 8, "Client": 8})
+    _override_resolver(monkeypatch)
+    _override_pathfind(monkeypatch, reachable={("dev-EX3400-2", "dev-Client-3")})
+    _override_ai(
+        {
+            "purpose": "one link",
+            "devices": [
+                {"role": "fw", "template_name": "EX3400"},
+                {"role": "client", "template_name": "Client"},
+            ],
+            "edges": [{"source_role": "fw", "target_role": "client", "layer": "L2"}],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    resolved = {d["role"]: d["device"]["id"] for d in resp.json()["devices"]}
+    assert resolved == {"fw": "dev-EX3400-2", "client": "dev-Client-3"}
+
+
+async def test_generate_unconnectable_repairs_then_returns_structured_422(
+    async_client, monkeypatch
+):
+    """Nothing is cabled between the two templates, so generation FAILS.
+
+    The proposal is never returned flagged and the edge is never dropped: the
+    model gets one corrective re-prompt naming the template pair, and the
+    second failure is the structured 422. ai_generate_max_repairs is patched
+    to 1 so exactly one repair round trip happens (matching the fixed
+    devices/edges in this proposal, which never becomes wireable).
+    """
+    monkeypatch.setattr(config_module.settings, "ai_generate_max_repairs", 1)
+    _override_inventory({"EX3400": 8, "Client": 8})
+    _override_resolver(monkeypatch)
+    _override_pathfind(monkeypatch, reachable=set())
+    prompts: list[str] = []
+    _override_ai_recording(
+        {
+            "purpose": "unwireable",
+            "devices": [
+                {"role": "fw", "template_name": "EX3400"},
+                {"role": "client", "template_name": "Client"},
+            ],
+            "edges": [{"source_role": "fw", "target_role": "client", "layer": "L2"}],
+        },
+        prompts,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+
+    assert resp.status_code == 422, resp.text
+    # The retry carried the template-pair repair note; the first call did not.
+    assert len(prompts) == 2
+    assert prompts[0] == ""
+    assert "no cabled path exists between any available" in prompts[1]
+    assert "EX3400" in prompts[1] and "Client" in prompts[1]
+
+    detail = resp.json()["detail"]
+    assert detail["error"] == "topology_unconnectable"
+    assert detail["pairs"] == [
+        {
+            "source_role": "fw",
+            "target_role": "client",
+            "source_template": "EX3400",
+            "target_template": "Client",
+        }
+    ]
+    assert isinstance(detail["message"], str) and detail["message"]
+
+
+async def test_generate_503_when_pathfind_is_unavailable(async_client, monkeypatch):
+    """A cabling outage fails CLOSED: no proposal, and reachability is never assumed."""
+    _override_inventory({"EX3400": 8, "Client": 8})
+    _override_resolver(monkeypatch)
+    _override_pathfind(monkeypatch, raises=CablingUnavailableError("boom"))
+    _override_ai(
+        {
+            "purpose": "one link",
+            "devices": [
+                {"role": "fw", "template_name": "EX3400"},
+                {"role": "client", "template_name": "Client"},
+            ],
+            "edges": [{"source_role": "fw", "target_role": "client", "layer": "L2"}],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == CABLING_UNAVAILABLE_DETAIL
+
+
+async def test_generate_fetches_the_configured_candidate_count(async_client, monkeypatch):
+    """The inventory request asks for the candidate cap, never fewer than the roles."""
+    monkeypatch.setattr(config_module.settings, "ai_resolver_candidates_per_template", 3)
+    requested: dict[str, int] = {}
+
+    async def _fake(token: str, template_id: str, count: int):
+        template_name = template_id.removeprefix("tpl-")
+        requested[template_name] = count
+        return [
+            {"id": f"dev-{template_name}-{i}", "name": f"{template_name}-{i}"} for i in range(count)
+        ]
+
+    monkeypatch.setattr(generator_module, "fetch_available_devices", _fake)
+    _override_pathfind(monkeypatch)
+    _override_inventory({"EX3400": 8, "Client": 8})
+    _override_ai(
+        {
+            "purpose": "four of one, one of the other",
+            "devices": [
+                {"role": "fw-a", "template_name": "EX3400"},
+                {"role": "fw-b", "template_name": "EX3400"},
+                {"role": "fw-c", "template_name": "EX3400"},
+                {"role": "fw-d", "template_name": "EX3400"},
+                {"role": "client", "template_name": "Client"},
+            ],
+            "edges": [],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    # Client has one role, so it gets the cap; EX3400 has four roles, which is
+    # above the cap, so the fetch widens to the role count rather than
+    # tripping the inventory-shift check.
+    assert requested == {"EX3400": 4, "Client": 3}
+
+
+async def test_generate_candidate_cap_above_availability_is_not_an_inventory_shift(
+    async_client, monkeypatch
+):
+    """Asking for 8 candidates and getting 2 is fine when only 2 roles need devices."""
+
+    async def _fake(token: str, template_id: str, count: int):
+        template_name = template_id.removeprefix("tpl-")
+        return [
+            {"id": f"dev-{template_name}-{i}", "name": f"{template_name}-{i}"}
+            for i in range(min(count, 2))
+        ]
+
+    monkeypatch.setattr(generator_module, "fetch_available_devices", _fake)
+    _override_pathfind(monkeypatch)
+    _override_inventory({"EX3400": 2})
+    _override_ai(
+        {
+            "purpose": "pair",
+            "devices": [
+                {"role": "fw-a", "template_name": "EX3400"},
+                {"role": "fw-b", "template_name": "EX3400"},
+            ],
+            "edges": [{"source_role": "fw-a", "target_role": "fw-b", "layer": "L2"}],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    ids = {d["device"]["id"] for d in resp.json()["devices"]}
+    assert ids == {"dev-EX3400-0", "dev-EX3400-1"}
+
+
+async def test_generate_ignores_element_edges_in_the_feasibility_check(async_client, monkeypatch):
+    """An element attachment never becomes a hop, so it asks for no path.
+
+    With NOTHING reachable, a device-to-element-only proposal still resolves:
+    the only pairs the resolver could have asked about are device pairs, and
+    there are none.
+    """
+    _override_inventory({"EX3400": 8})
+    _override_resolver(monkeypatch)
+    asked: list[list[tuple[str, str]]] = []
+    _override_pathfind(monkeypatch, reachable=set(), record=asked)
+    _override_ai(
+        {
+            "purpose": "one device on a vlan segment",
+            "devices": [{"role": "fw", "template_name": "EX3400"}],
+            "elements": [{"role": "vlan-10", "element_type": "vlan_segment", "label": "VLAN 10"}],
+            "edges": [{"source_role": "fw", "target_role": "vlan-10", "layer": "L2"}],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["devices"][0]["device"]["id"] == "dev-EX3400-0"
+    # No device-to-device edge, so cabling was never asked anything.
+    assert asked == []

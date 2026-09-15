@@ -145,7 +145,11 @@ async def generate(
             extracted_files=extracted,
         )
     except GeneratorError as e:
-        raise HTTPException(e.status_code, e.message) from e
+        # A GeneratorError carries a structured `detail` only when the failure
+        # has machine-readable data the frontend renders (the unconnectable
+        # 422's role/template pairs). Every other failure keeps its plain
+        # string, so this stays a superset of the previous behavior.
+        raise HTTPException(e.status_code, e.detail if e.detail is not None else e.message) from e
 
     await usage_repo.record_usage(
         db,

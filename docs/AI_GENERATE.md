@@ -40,6 +40,37 @@ The LLM may also propose a **network element** (issue #632, ADR 0012 at [`docs/d
 
 The LLM does **not** propose start/end times for the reservation. Those come from you when you commit.
 
+## Cabling-aware device resolution
+
+The model proposes roles over template names; it never sees device ids, ports, or cables. Turning those roles into concrete devices is the orchestrator's job, and it consults the cabling graph while doing it, so a proposal cannot resolve onto two devices with no cable path between them.
+
+The steps, after a proposal passes inventory validation:
+
+1. **Candidate fetch.** For every template the proposal uses, the orchestrator fetches up to `AI_RESOLVER_CANDIDATES_PER_TEMPLATE` (default 8) AVAILABLE DUT devices, and never fewer than the number of roles that template carries. The caller's own token is used, so device-group visibility applies exactly as it does in the inventory summary. Fewer devices than roles still means the inventory shifted mid-generation, and still returns 409.
+2. **Feasibility.** Each proposed device-to-device edge turns its two roles' candidate sets into candidate device pairs. All of them, deduplicated, go to cabling's `POST /pathfind/batch`, which answers per pair whether a physical path exists. Edges touching a network element are skipped: an element attachment never becomes a cable hop, and the committer picks the device-side port itself at commit time. If cabling cannot answer (transport error or a 5xx), generation fails with 503 and no proposal is returned; reachability is never assumed.
+3. **Assignment search.** A deterministic backtracking search picks one distinct device per role such that every edge's chosen pair is reachable. Roles are tried most-constrained first (fewest candidates, then most edges) and candidates in inventory order, so the same lab and the same proposal produce the same assignment. Per-port capacity is deliberately not judged here: which port each wire lands on is decided later, by the fork-save resolver, and HERD's own topology validator judges reachability only, so a bound here would refuse topologies the system otherwise accepts. The search is capped at `AI_RESOLVER_MAX_SEARCH_STEPS` candidate trials (default 5000).
+
+When no assignment exists, the orchestrator does not return a flagged proposal and does not drop the offending edge. It re-prompts the model once, with a note naming each template pair that has no cabled path ("no cabled path exists between any available A and any available B in this lab; choose different templates for those roles or drop the edge"). If the retry is still unconnectable, the request fails with HTTP 422 and a structured body:
+
+```json
+{
+  "detail": {
+    "error": "topology_unconnectable",
+    "pairs": [
+      {
+        "source_role": "fw-a",
+        "target_role": "client",
+        "source_template": "EX3400",
+        "target_template": "Ubuntu Client"
+      }
+    ],
+    "message": "The lab has no cabled path for 1 proposed connection; the topology cannot be built from the devices currently available."
+  }
+}
+```
+
+The AI dialog renders each pair as a "source role to target role" line so you can see which connection the lab cannot carry.
+
 ## File uploads
 
 The AI dialog lets you attach reference files to give the LLM context without having to paste everything into the prompt. Rules:
@@ -124,6 +155,8 @@ If the initial topology creation fails, nothing is rolled back because there is 
 ## Known limits and behaviors
 
 - **Inventory shifted during generation (409)**: a device became unavailable between the LLM's proposal and the resolver's fetch. Regenerate.
+- **Unconnectable topology (422)**: no combination of available devices can carry every proposed edge, even after the corrective retry. The response names the role pairs and their templates; see [Cabling-aware device resolution](#cabling-aware-device-resolution).
+- **Cabling unavailable (503)**: the feasibility check could not reach the cabling service, so nothing was resolved. Retry.
 - **Stale-proposal guards**: the frontend drops any response whose resolved device is null, and any response that references a device already on the canvas.
 - **No window generation**: the LLM doesn't pick times; the commit dialog does.
 - **Model**: `claude-sonnet-4-6` by default, configurable via `AI_MODEL`. Use Opus if you want higher quality at higher cost; use Haiku for cheaper quick proposals.

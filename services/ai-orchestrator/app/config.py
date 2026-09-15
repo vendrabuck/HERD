@@ -144,6 +144,19 @@ class Settings(HerdBaseSettings):
     # which has no reservation yet and therefore no transcript to send.
     ai_purpose_include_transcripts: bool = True
 
+    # Cabling-aware device resolution for the topology generator. The
+    # resolver fetches this many AVAILABLE candidate devices per proposed
+    # template (never fewer than the number of roles of that template) and
+    # searches for a combination the cabling graph can actually connect.
+    # Larger means a better chance of finding a wiring in a sparsely cabled
+    # lab, at the cost of more pathfind pairs (worst case quadratic in this
+    # value per edge); the cap keeps that bounded.
+    ai_resolver_candidates_per_template: int = Field(default=8, ge=1, le=50)
+    # Hard ceiling on candidate trials in the backtracking search. Reaching it
+    # reports the proposal infeasible rather than running longer: a bounded
+    # wrong answer the user can act on beats an unbounded request.
+    ai_resolver_max_search_steps: int = Field(default=5000, ge=1)
+
     inventory_service_url: str = "http://inventory:8000"
     cabling_service_url: str = "http://cabling:8000"
     reservations_service_url: str = "http://reservations:8000"
