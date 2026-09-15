@@ -4,6 +4,7 @@ import { isAxiosError } from "axios";
 
 import { Modal } from "@/components/ui/Modal";
 import { useAIGenerate } from "@/api/ai";
+import { formatUnconnectableDetail, topologyUnconnectableDetail } from "@/lib/errors";
 import type { AIGenerateResponse } from "@/types/ai.types";
 
 interface AIDialogProps {
@@ -71,6 +72,16 @@ export function AIDialog({ open, onClose, onProposal }: AIDialogProps) {
       reset();
       onClose();
     } catch (err) {
+      // The generator refuses a proposal whose edges no available devices can
+      // carry rather than returning it flagged, so this is a real outcome the
+      // user has to act on: name the connections the lab cannot make.
+      const unconnectable = topologyUnconnectableDetail(err);
+      if (unconnectable) {
+        toast.error(formatUnconnectableDetail(unconnectable), {
+          style: { whiteSpace: "pre-line" },
+        });
+        return;
+      }
       if (isAxiosError(err)) {
         if (err.response?.status === 503) {
           const detail = err.response.data?.detail;

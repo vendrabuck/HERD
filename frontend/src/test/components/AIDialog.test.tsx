@@ -134,6 +134,56 @@ describe("AIDialog", () => {
     expect(message).not.toMatch(/ANTHROPIC_API_KEY/);
   });
 
+  it("names each unwireable connection on the structured 422", async () => {
+    server.use(
+      http.post("/api/ai/generate", () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "topology_unconnectable",
+              pairs: [
+                {
+                  source_role: "fw-a",
+                  target_role: "client",
+                  source_template: "EX3400",
+                  target_template: "Ubuntu Client",
+                },
+              ],
+              message: "The lab has no cabled path for 1 proposed connection.",
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderDialog();
+    fireEvent.change(screen.getByLabelText("Prompt"), {
+      target: { value: "go" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    const message = toastError.mock.calls[0][0] as string;
+    expect(message).toContain("The lab has no cabled path for 1 proposed connection.");
+    expect(message).toContain("fw-a to client");
+    // Not the generic fallback: the proposal failed for a specific reason.
+    expect(message).not.toBe("Failed to generate topology");
+  });
+
+  it("keeps the plain-string fallback for a 422 that is not structured", async () => {
+    server.use(
+      http.post("/api/ai/generate", () =>
+        HttpResponse.json({ detail: "Unprocessable" }, { status: 422 }),
+      ),
+    );
+    renderDialog();
+    fireEvent.change(screen.getByLabelText("Prompt"), {
+      target: { value: "go" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError.mock.calls[0][0]).toBe("Failed to generate topology");
+  });
+
   it("toasts the 502 upstream detail", async () => {
     server.use(
       http.post("/api/ai/generate", () =>

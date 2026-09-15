@@ -482,6 +482,36 @@ CONFIG_SCHEMA = [
         ),
     },
     {
+        "key": "AI_RESOLVER_CANDIDATES_PER_TEMPLATE",
+        "label": "AI Resolver Candidates Per Template",
+        "type": "number",
+        "required": False,
+        "group": "AI Integration",
+        "secret": False,
+        "default": 8,
+        "description": (
+            "How many AVAILABLE devices per proposed template the AI topology "
+            "resolver considers when picking devices the cabling graph can "
+            "actually connect. Never fewer than the number of roles of that "
+            "template. Raise it for a sparsely cabled lab; each extra candidate "
+            "costs more pathfind work. Range 1 to 50."
+        ),
+    },
+    {
+        "key": "AI_RESOLVER_MAX_SEARCH_STEPS",
+        "label": "AI Resolver Max Search Steps",
+        "type": "number",
+        "required": False,
+        "group": "AI Integration",
+        "secret": False,
+        "default": 5000,
+        "description": (
+            "Hard ceiling on candidate trials in the resolver's assignment "
+            "search. On exhaustion the proposal is reported unconnectable "
+            "rather than searched longer."
+        ),
+    },
+    {
         "key": "ANTHROPIC_API_KEY",
         "label": "Anthropic API Key (deprecated)",
         "type": "password",
