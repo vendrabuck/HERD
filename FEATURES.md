@@ -257,8 +257,17 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **LLM-driven topology generation** (Shipped): natural-language prompts plus
   optional PDFs, tarballs, or text files generate topology proposals as ghost
-  nodes for human review. Accept transactionally creates the topology and books
-  the reservation, with optional per-device config push. Feature-gated by the
+  nodes for human review. The model proposes roles and templates only; a
+  cabling-aware resolver assigns each role to a concrete device the live
+  cabling graph can actually connect (a deterministic backtracking search over
+  candidate devices, feasibility checked through cabling's batch pathfinder),
+  re-prompting the model with the unwireable template pairs before failing
+  with a structured 422 `topology_unconnectable` (issue #828). Accept
+  transactionally creates the topology and books the reservation, with
+  optional per-device config push; committing also re-validates the saved
+  canvas against cabling before the reservation is created, failing with a
+  structured 422 `topology_unwireable` (or a 503 on a cabling outage) rather
+  than only surfacing an unwired edge later (issue #827). Feature-gated by the
   presence of an AI provider configuration. The model can also propose shared
   network elements (VLAN segment, subnet, external cloud, patch trunk) and
   attach devices to them, with the committer choosing the actual device port

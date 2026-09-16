@@ -47,10 +47,10 @@ The model proposes roles over template names; it never sees device ids, ports, o
 The steps, after a proposal passes inventory validation:
 
 1. **Candidate fetch.** For every template the proposal uses, the orchestrator fetches up to `AI_RESOLVER_CANDIDATES_PER_TEMPLATE` (default 8) AVAILABLE DUT devices, and never fewer than the number of roles that template carries. The caller's own token is used, so device-group visibility applies exactly as it does in the inventory summary. Fewer devices than roles still means the inventory shifted mid-generation, and still returns 409.
-2. **Feasibility.** Each proposed device-to-device edge turns its two roles' candidate sets into candidate device pairs. All of them, deduplicated, go to cabling's `POST /pathfind/batch`, which answers per pair whether a physical path exists. Edges touching a network element are skipped: an element attachment never becomes a cable hop, and the committer picks the device-side port itself at commit time. If cabling cannot answer (transport error or a 5xx), generation fails with 503 and no proposal is returned; reachability is never assumed.
+2. **Feasibility.** Each proposed device-to-device edge turns its two roles' candidate sets into candidate device pairs. All of them, deduplicated, go to cabling's `POST /pathfind/batch`, which answers per pair whether a physical path exists. Edges touching a network element are skipped: an element attachment never becomes a cable hop, and the committer picks the device-side port itself at commit time. If cabling cannot answer (a transport error or any non-200 response), generation fails with 503 and no proposal is returned; reachability is never assumed.
 3. **Assignment search.** A deterministic backtracking search picks one distinct device per role such that every edge's chosen pair is reachable. Roles are tried most-constrained first (fewest candidates, then most edges) and candidates in inventory order, so the same lab and the same proposal produce the same assignment. Per-port capacity is deliberately not judged here: which port each wire lands on is decided later, by the fork-save resolver, and HERD's own topology validator judges reachability only, so a bound here would refuse topologies the system otherwise accepts. The search is capped at `AI_RESOLVER_MAX_SEARCH_STEPS` candidate trials (default 5000).
 
-When no assignment exists, the orchestrator does not return a flagged proposal and does not drop the offending edge. It re-prompts the model once, with a note naming each template pair that has no cabled path ("no cabled path exists between any available A and any available B in this lab; choose different templates for those roles or drop the edge"). If the retry is still unconnectable, the request fails with HTTP 422 and a structured body:
+When no assignment exists, the orchestrator does not return a flagged proposal and does not drop the offending edge. It re-prompts the model, with a note naming each template pair that has no cabled path ("no cabled path exists between any available A and any available B in this lab; choose different templates for those roles or drop the edge"), spending from the same `AI_GENERATE_MAX_REPAIRS` re-prompt budget shared with the other repairable mistakes above. Once that budget is exhausted and the proposal is still unconnectable, the request fails with HTTP 422 and a structured body:
 
 ```json
 {
@@ -164,12 +164,18 @@ If the initial topology creation fails, nothing is rolled back because there is 
 ## Measuring proposal wireability
 
 A proposal can name valid templates and stay within their available counts and still be
-unwireable in practice: `_resolve_devices` (`services/ai-orchestrator/app/services/generator.py`)
-assigns the first N AVAILABLE devices per template to each proposed role without consulting the
-cabling graph at all, so two devices of the right templates can land on opposite, unconnected
-parts of the fabric. Today that only ever surfaces downstream, at reservation-create time, when
-cabling's validator finally runs a path check. There was no repeatable way to measure how often
-this actually happens, or to tell whether a resolver fix improved it, so `tests/ai_eval/` adds one.
+unwireable in practice: the resolver's backtracking search can fail to find a consistent
+assignment in a sparsely cabled lab, and a caller that reaches `/commit` directly bypasses
+generation's resolver entirely. `_resolve_devices` (`services/ai-orchestrator/app/services/generator.py`)
+now consults cabling's batch pathfinder before assigning devices to roles (see [Cabling-aware
+device resolution](#cabling-aware-device-resolution) above), and the commit step runs a second
+check against the saved canvas (see [Commit-time wireability check](#commit-time-wireability-check)
+above). Before either of those shipped, the resolver assigned the first N AVAILABLE devices per
+template with no cabling awareness at all, and an unwireable proposal surfaced only downstream, at
+reservation-create time, when cabling's validator finally ran a path check; that gap is why this
+harness exists. There was no repeatable way to measure how often a generated proposal ends up
+unwireable end to end, or to tell whether a resolver or fail-fast change actually moves the pass
+rate, so `tests/ai_eval/` adds one.
 
 The harness is a scored evaluation, not a product feature: `tests/ai_eval/prompts.json` is a
 checked-in set of about ten prompts in plain lab-engineer language (never a template name

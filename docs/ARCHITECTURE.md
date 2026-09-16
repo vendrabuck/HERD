@@ -214,9 +214,10 @@ judges each against inventory's live device type and config content, fetched
 in batches over the internal token (`POST /internal/devices/batch`, added for
 this pass) and per-switch config-version reads bounded by a 12s overall
 deadline (4s per call). It surfaces up to fourteen `invalid_routes` reasons
-(malformed shape, not a router, unconfigured, unattached, a duplicate route,
-and nine per-route checks: destination/next-hop IP shape, interface identity,
-interface-level wiring, and virtual-router membership) and fails closed with a
+(four switch-level checks: malformed shape, not a router, unconfigured,
+unattached; and ten per-route checks: destination/next-hop IP shape, interface
+identity, interface-level wiring, virtual-router membership, and a duplicate
+route detector) and fails closed with a
 503 `l3_config_unavailable` on an inventory outage rather than silently
 passing. A non-admin caller's canvas is filtered to their visible devices
 first (issue #763), so a hidden switch or DUT reports the same
@@ -329,13 +330,13 @@ accepted design and [DRIVERS.md](DRIVERS.md) for the Hypervisor driver contract.
 
 Calls a configurable LLM provider via tool-use with a strict JSON schema. The provider is selected by `AI_PROVIDER`: `anthropic` (AsyncAnthropic SDK) or `openai_compat` (AsyncOpenAI SDK against any compatible chat-completions endpoint, including vLLM, Ollama, LM Studio, OpenAI, and Azure OpenAI). The orchestrator code sits above an `LLMProvider` Protocol with neutral `Message`, `ContentBlock`, `ToolSchema`, and `ProviderResponse` types; SDK-specific translation is isolated to one file per provider under `services/ai-orchestrator/app/services/providers/`. Three user-facing surfaces:
 
-**Topology generation** (`/api/ai/generate` -> `/api/ai/commit`):
+**Topology generation** (`/api/ai/generate` to `/api/ai/commit`):
 
-1. `/api/ai/generate` (multipart POST with `prompt` + optional `files[]`) returns a validated proposal with resolved device UUIDs.
+1. `/api/ai/generate` (multipart POST with `prompt` + optional `files[]`) proposes roles over template names, validates the proposal against inventory, then resolves each role to a concrete device the cabling graph can actually connect (`app/services/resolver.py`, a deterministic backtracking search checked through cabling's `POST /pathfind/batch`), returning a validated proposal with resolved device UUIDs.
 2. User reviews as ghost nodes, accepts or rejects.
-3. `/api/ai/commit` creates the topology, saves canvas, creates reservation, optionally calls `/execute` per device with allowlisted configs.
+3. `/api/ai/commit` creates the topology, saves canvas, re-validates the saved canvas is wireable against cabling before creating the reservation, then creates the reservation and optionally calls `/execute` per device with allowlisted configs.
 
-Per-device `config` is validated against a registry (`Management` only today; allowlist of `vlan`/`ip`/`hostname`/`description`) before any upstream write. The LLM's tool schema is locked down to the same keys so the model can't emit others at generation time. The tool is built per request: `template_name` carries a JSON Schema enum of the caller's visible templates, so an enum-honoring provider cannot name a template outside the live inventory. The orchestrator still validates the proposal and, on a repairable failure (unknown template, over-count, duplicate role, dangling edge), re-prompts the model once with the allow-list before returning a 502.
+Per-device `config` is validated against a registry (`Management` only today; allowlist of `vlan`/`ip`/`hostname`/`description`) before any upstream write. The LLM's tool schema is locked down to the same keys so the model can't emit others at generation time. The tool is built per request: `template_name` carries a JSON Schema enum of the caller's visible templates, so an enum-honoring provider cannot name a template outside the live inventory. The orchestrator still validates the proposal and, on a repairable failure (unknown template, over-count, duplicate role, dangling edge role, a self-loop edge, a duplicate device-to-device edge, or a proposal the cabling graph cannot wire), re-prompts the model with corrective feedback, up to `AI_GENERATE_MAX_REPAIRS` times (default 2), before failing: a schema or inventory-validation failure returns 502, an unwireable proposal returns a structured 422 `topology_unconnectable`, and a cabling outage during the feasibility check returns 503. The commit-time wireability check can likewise fail with a structured 422 `topology_unwireable` or a 503. See [AI_GENERATE.md](AI_GENERATE.md) for the full flow.
 
 **Reservation assistant** (`/api/ai/reservations/{id}/assistant`):
 
