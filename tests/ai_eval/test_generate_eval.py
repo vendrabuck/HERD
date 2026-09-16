@@ -2,12 +2,15 @@
 
 This is a MEASUREMENT, not a gate: it does not assert a pass rate, only that
 the harness ran and wrote a report. See docs/AI_GENERATE.md, "Measuring
-proposal wireability", for why this exists (the resolver in
-services/ai-orchestrator/app/services/generator.py assigns the first N
+proposal wireability", for why this exists. It was written against the older
+behavior, where the resolver in
+services/ai-orchestrator/app/services/generator.py assigned the first N
 AVAILABLE devices per template without consulting the cabling graph, so a
-proposal can come back with device pairs that are correct at the template
-level but have no physical path between them; today that is only ever
-discovered downstream, at reservation-create time).
+proposal could come back correct at the template level with no physical path
+between its device pairs, discovered only downstream at reservation-create
+time. Issue #828 made resolution cabling-aware and #827 added a commit-time
+wireability check; this harness is how that change was measured, and it stays
+the way any later change to generation or resolution is judged.
 
 Requires a running, seeded HERD stack (`make seed`) with an AI provider
 configured, reached host-side the same way tests/integration/ reaches it.

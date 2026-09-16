@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+- AI topology generation gained cabling-aware device resolution (issue #828, PR #836):
+  the resolver (`services/ai-orchestrator/app/services/resolver.py`) assigns concrete
+  devices to proposed roles with a deterministic backtracking search over candidates
+  the cabling graph can actually connect, checked through cabling's `POST
+  /pathfind/batch`, replacing the previous first-N-available assignment. An infeasible
+  proposal gets a corrective re-prompt naming the unconnectable template pairs before
+  failing with a structured 422 `topology_unconnectable`. A stricter per-port capacity
+  bound was tried and removed before merge: it refused topologies HERD's own validator
+  accepts. New settings `AI_RESOLVER_CANDIDATES_PER_TEMPLATE` (default 8) and
+  `AI_RESOLVER_MAX_SEARCH_STEPS` (default 5000).
+- Commit-time wireability fail-fast for AI-generated topologies (issue #827, PR #835):
+  the committer calls cabling's `POST /topologies/{id}/validate` against the just-saved
+  canvas, before the reservation is created, raising a structured 422
+  `topology_unwireable` (or a 503 when cabling cannot answer) instead of only
+  surfacing the problem later through reservations' generic connectivity check.
+  Generation also now rejects a self-loop edge and a duplicate device-to-device edge
+  as repairable mistakes. The repair cap is now the setting `AI_GENERATE_MAX_REPAIRS`
+  (default 2), replacing a hardcoded single retry.
+- Added an opt-in evaluation harness for AI topology generation (issue #826, PR #833):
+  `tests/ai_eval/` scores the generator's end-to-end wireability pass rate against a
+  running, seeded stack with an AI provider configured. Skips unless
+  `HERD_AI_EVAL=1`; never runs in a gate or CI. Run with `make ai-eval`.
+
 ## [0.5.0] - 2026-09-15
 
 - Shipped first-class Layer 3 routing intent end to end (ADR 0014, issue #34, phases 1
