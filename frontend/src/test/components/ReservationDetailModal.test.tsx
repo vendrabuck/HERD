@@ -167,8 +167,20 @@ describe("ReservationDetailModal", () => {
     expect(screen.queryByRole("button", { name: "Cancel", hidden: true })).not.toBeInTheDocument();
   });
 
-  it("hides Release and Cancel when the reservation is not ACTIVE", () => {
+  it("shows Cancel but hides Release for a PENDING reservation (issue #841)", () => {
     renderModal({ status: "PENDING" });
+    expect(screen.queryByRole("button", { name: "Release", hidden: true })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel", hidden: true })).toBeInTheDocument();
+  });
+
+  it("shows Cancel but hides Release for a PENDING_PROVISION reservation", () => {
+    renderModal({ status: "PENDING_PROVISION" });
+    expect(screen.queryByRole("button", { name: "Release", hidden: true })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel", hidden: true })).toBeInTheDocument();
+  });
+
+  it("hides Release and Cancel for a terminal (CANCELLED) reservation", () => {
+    renderModal({ status: "CANCELLED" });
     expect(screen.queryByRole("button", { name: "Release", hidden: true })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel", hidden: true })).not.toBeInTheDocument();
   });

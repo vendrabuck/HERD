@@ -9,11 +9,12 @@ showModal, so its buttons are regular DOM elements (clickable directly);
 this is not a window.confirm browser alert, which would need Selenium's
 Alert API instead.
 
-The row's Cancel and Release actions render only while the reservation is
-ACTIVE, and a freshly created exclusive reservation starts in
-PENDING_PROVISION until the execution pipeline provisions it. Each test
-therefore polls the API until the transient reservation reaches ACTIVE and
-skips (rather than fails) if the stack never activates it.
+The row's Release action renders only while the reservation is ACTIVE (Cancel
+also renders on PENDING and PENDING_PROVISION since issue #841), and a freshly
+created exclusive reservation starts in PENDING_PROVISION until the execution
+pipeline provisions it. These tests exercise the ACTIVE row, so each one polls
+the API until the transient reservation reaches ACTIVE and skips (rather than
+fails) if the stack never activates it.
 
 Every ReservationRow mounts its own (closed) ConfirmDialog sharing the same
 element ids, so assertions target the single `dialog[open]` element rather

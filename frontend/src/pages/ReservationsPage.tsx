@@ -4,6 +4,7 @@ import { useCancelReservation, useReleaseReservation, usePaginatedReservations }
 import { useAllDeviceNames } from "@/api/inventory";
 import { useAuthStore } from "@/stores/authStore";
 import { isAdminRole } from "@/lib/roles";
+import { canCancel, canRelease } from "@/lib/reservationStatus";
 import { Pagination } from "@/components/ui/Pagination";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
@@ -54,24 +55,28 @@ function ReservationRow({
         </div>
       </td>
       <td className="px-4 py-3 text-sm" onClick={(e) => e.stopPropagation()}>
-        {reservation.status === "ACTIVE" && (
+        {(canRelease(reservation.status) || canCancel(reservation.status)) && (
           <div className="flex gap-1">
-            <button
-              onClick={() => release.mutate(reservation.id)}
-              disabled={release.isPending}
-              aria-label={`Release reservation ${shortId}`}
-              className="text-xs text-green-600 hover:text-green-800 px-2 py-1 rounded hover:bg-green-50 disabled:opacity-50"
-            >
-              Release
-            </button>
-            <button
-              onClick={() => setConfirmCancelOpen(true)}
-              disabled={cancel.isPending}
-              aria-label={`Cancel reservation ${shortId}`}
-              className="text-xs text-red-600 hover:text-red-800 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-50"
-            >
-              Cancel
-            </button>
+            {canRelease(reservation.status) && (
+              <button
+                onClick={() => release.mutate(reservation.id)}
+                disabled={release.isPending}
+                aria-label={`Release reservation ${shortId}`}
+                className="text-xs text-green-600 hover:text-green-800 px-2 py-1 rounded hover:bg-green-50 disabled:opacity-50"
+              >
+                Release
+              </button>
+            )}
+            {canCancel(reservation.status) && (
+              <button
+                onClick={() => setConfirmCancelOpen(true)}
+                disabled={cancel.isPending}
+                aria-label={`Cancel reservation ${shortId}`}
+                className="text-xs text-red-600 hover:text-red-800 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            )}
           </div>
         )}
         <ConfirmDialog
