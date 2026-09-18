@@ -9,7 +9,7 @@ correctness lives in test_anthropic_provider.py.
 from typing import Any
 
 import pytest
-from app.services.ai_client import AIClient, AIError
+from app.services.ai_client import NO_SUMMARY_FALLBACK_ANSWER, AIClient, AIError
 from app.services.llm_provider import (
     LLMProvider,
     Message,
@@ -352,6 +352,99 @@ async def test_tool_loop_one_tool_call_then_text():
     assert isinstance(result_block, ToolResultBlock)
     assert result_block.tool_use_id == "toolu_abc"
     assert result_block.is_error is False
+
+
+# --- no text after tools ran this turn (issue #848) ---
+#
+# The two-case rule: no text AND no tool dispatched still raises unchanged
+# (test_tool_loop_iteration_cap_with_no_text_raises_aierror and the exact-
+# wording tests in test_reservation_assistant.py pin that). No text AND at
+# least one tool dispatched must fall back to the fixed constant instead of
+# raising, since the tool's side effects (an inventory write) already ran.
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_no_text_after_successful_tool_returns_fallback():
+    provider = _FakeProvider(
+        responses=[
+            _resp(
+                [_tool_use("get_device", {"device_id": "dev-a"}, "toolu_1")],
+                stop_reason="tool_use",
+            ),
+            _resp([], stop_reason="end_turn"),
+        ]
+    )
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher(returns=[{"content": '{"ok":true}', "is_error": False}])
+    turn = await client.answer_reservation_question_with_tools(
+        messages=_msgs("<reservation/>", "configure it"),
+        dispatcher=dispatcher,
+    )
+    assert turn.answer == NO_SUMMARY_FALLBACK_ANSWER
+    assert dispatcher.dispatch_calls == [("get_device", {"device_id": "dev-a"})]
+    # The final segment must carry the fallback as a real TextBlock, not empty
+    # content, so a later turn's replayed history is never an empty assistant
+    # message.
+    final_blocks = turn.segments[-1].assistant_blocks
+    assert len(final_blocks) == 1
+    assert isinstance(final_blocks[0], TextBlock)
+    # Literal wording pin (not just the imported constant), so an accidental
+    # wording change to NO_SUMMARY_FALLBACK_ANSWER itself is caught too.
+    assert final_blocks[0].text == (
+        "I ran the steps above but did not produce a summary. Check the tool "
+        "results for what was done, or ask me again."
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_no_text_after_failed_tool_returns_fallback():
+    """A dispatched tool that errored still ran: the fallback applies the same
+    way as a successful dispatch (the model tried, the loop must not pretend
+    nothing happened)."""
+    provider = _FakeProvider(
+        responses=[
+            _resp(
+                [_tool_use("get_device", {"device_id": "dev-a"}, "toolu_1")],
+                stop_reason="tool_use",
+            ),
+            _resp([], stop_reason="end_turn"),
+        ]
+    )
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher(
+        returns=[{"content": '{"is_error":true,"message":"boom"}', "is_error": True}]
+    )
+    turn = await client.answer_reservation_question_with_tools(
+        messages=_msgs("<reservation/>", "configure it"),
+        dispatcher=dispatcher,
+    )
+    assert turn.answer == NO_SUMMARY_FALLBACK_ANSWER
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_no_text_after_tools_logs_warning(caplog):
+    import logging as _logging
+
+    provider = _FakeProvider(
+        responses=[
+            _resp(
+                [_tool_use("get_device_ports", {"device_id": "dev-a"}, "toolu_9")],
+                stop_reason="tool_use",
+            ),
+            _resp([], stop_reason="end_turn"),
+        ]
+    )
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher(returns=[{"content": "[]", "is_error": False}])
+    with caplog.at_level(_logging.WARNING):
+        await client.answer_reservation_question_with_tools(
+            messages=_msgs("<reservation/>", "configure it"),
+            dispatcher=dispatcher,
+        )
+    warnings = [r for r in caplog.records if r.message == "ai_assistant_no_text_after_tools"]
+    assert len(warnings) == 1
+    assert warnings[0].iteration == 2
+    assert warnings[0].tool_names == ["get_device_ports"]
 
 
 @pytest.mark.asyncio
@@ -821,6 +914,67 @@ async def test_streaming_empty_final_text_raises():
             messages=_msgs("<reservation>r1</reservation>", "Q?"),
             dispatcher=_FakeDispatcher(),
         )
+
+
+# --- no text after tools ran this turn, streaming twin (issue #848) ---
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_text_after_successful_tool_returns_fallback():
+    provider = _StreamingFakeProvider(
+        turns=[
+            (
+                [],
+                _resp(
+                    [_tool_use("get_device", {"device_id": "dev-a"}, "toolu_1")],
+                    stop_reason="tool_use",
+                ),
+            ),
+            ([], _resp([], stop_reason="end_turn")),
+        ]
+    )
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher(returns=[{"content": '{"ok":true}', "is_error": False}])
+    events = await _collect_stream(
+        client,
+        messages=_msgs("<reservation/>", "configure it"),
+        dispatcher=dispatcher,
+    )
+    done = events[-1]
+    assert done.type == "done"
+    assert done.result.answer == NO_SUMMARY_FALLBACK_ANSWER
+    # The client must actually receive the fallback text as a token, not just
+    # find it in the done payload: nothing else streams it since the turn had
+    # no real text to stream live.
+    tokens = [e.text for e in events if e.type == "token"]
+    assert NO_SUMMARY_FALLBACK_ANSWER in tokens
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_text_after_failed_tool_returns_fallback():
+    provider = _StreamingFakeProvider(
+        turns=[
+            (
+                [],
+                _resp(
+                    [_tool_use("get_device", {"device_id": "dev-a"}, "toolu_1")],
+                    stop_reason="tool_use",
+                ),
+            ),
+            ([], _resp([], stop_reason="end_turn")),
+        ]
+    )
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher(
+        returns=[{"content": '{"is_error":true,"message":"boom"}', "is_error": True}]
+    )
+    events = await _collect_stream(
+        client,
+        messages=_msgs("<reservation/>", "configure it"),
+        dispatcher=dispatcher,
+    )
+    done = events[-1]
+    assert done.result.answer == NO_SUMMARY_FALLBACK_ANSWER
 
 
 class _StreamingCapFakeProvider:

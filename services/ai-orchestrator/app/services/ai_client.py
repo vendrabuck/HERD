@@ -61,6 +61,7 @@ __all__ = [
     "AIError",
     "AIProviderUnavailableError",
     "AssistantTurnResult",
+    "NO_SUMMARY_FALLBACK_ANSWER",
     "TurnSegment",
     "ai_is_configured",
     "get_ai_client",
@@ -77,6 +78,18 @@ AI_NOT_CONFIGURED_DETAIL = "AI orchestrator is not configured"
 # without echoing the raw transport exception to the client (CWE-209); the full
 # error is logged server-side by the route.
 AI_PROVIDER_UNREACHABLE_DETAIL = "AI provider is unreachable"
+
+# Issue #848: a turn that dispatched at least one tool call before ending with
+# no text must not be treated as a failed call. Tool side effects (inventory
+# writes) already happened; raising AIError there rolls back the conversation
+# record while the write persists, so the user is told the call failed even
+# though something real ran. This fixed string stands in for the missing
+# model summary: no model output, no exception text, just a plain pointer to
+# the tool results and an invitation to ask again.
+NO_SUMMARY_FALLBACK_ANSWER = (
+    "I ran the steps above but did not produce a summary. Check the tool "
+    "results for what was done, or ask me again."
+)
 
 
 @dataclass(frozen=True)
@@ -763,6 +776,11 @@ class AIClient:
         aggregated = Usage()
         final_stop_reason = ""
         iteration = 0
+        # Names of every tool dispatched so far THIS call (issue #848): local,
+        # per-turn state, not the dispatcher's own call_log, so the fallback
+        # decision below never depends on whether the dispatcher happens to be
+        # reused across turns.
+        dispatched_tool_names: list[str] = []
 
         neutral_tools = [_tool_definition_to_schema(t) for t in get_active_tool_definitions()]
 
@@ -794,8 +812,22 @@ class AIClient:
             if final_stop_reason != "tool_use" or not tool_use_blocks:
                 answer = _extract_text(resp.content)
                 if not answer:
-                    raise AIError("AI returned no text content")
-                segments.append(TurnSegment(assistant_blocks=list(resp.content)))
+                    if not dispatched_tool_names:
+                        raise AIError("AI returned no text content")
+                    # A tool already ran and its side effects are real; falling
+                    # back here (instead of raising) is what keeps the route
+                    # from rolling back a turn whose writes already landed.
+                    logger.warning(
+                        "ai_assistant_no_text_after_tools",
+                        extra={
+                            "iteration": iteration,
+                            "tool_names": dispatched_tool_names,
+                        },
+                    )
+                    answer = NO_SUMMARY_FALLBACK_ANSWER
+                    segments.append(TurnSegment(assistant_blocks=[TextBlock(text=answer)]))
+                else:
+                    segments.append(TurnSegment(assistant_blocks=list(resp.content)))
                 return AssistantTurnResult(
                     answer=answer,
                     usage=aggregated,
@@ -804,6 +836,7 @@ class AIClient:
                     segments=segments,
                 )
 
+            dispatched_tool_names.extend(block.name for block in tool_use_blocks)
             working_messages.append(Message(role="assistant", content=list(resp.content)))
             dispatch_coros = [
                 dispatcher.dispatch(block.name, block.input or {}) for block in tool_use_blocks
@@ -914,6 +947,9 @@ class AIClient:
         aggregated = Usage()
         final_stop_reason = ""
         iteration = 0
+        # Names of every tool dispatched so far THIS call (issue #848); see the
+        # buffered loop's identical tracker for why this stays local state.
+        dispatched_tool_names: list[str] = []
         neutral_tools = [_tool_definition_to_schema(t) for t in get_active_tool_definitions()]
 
         while iteration < max_iterations:
@@ -962,8 +998,26 @@ class AIClient:
                 # Final answer: tokens already streamed live above.
                 answer = _extract_text(resp.content)
                 if not answer:
-                    raise AIError("AI returned no text content")
-                segments.append(TurnSegment(assistant_blocks=list(resp.content)))
+                    if not dispatched_tool_names:
+                        raise AIError("AI returned no text content")
+                    # Same two-case rule as the buffered loop: a tool already
+                    # ran, so fall back instead of raising and losing the turn.
+                    logger.warning(
+                        "ai_assistant_no_text_after_tools",
+                        extra={
+                            "iteration": iteration,
+                            "tool_names": dispatched_tool_names,
+                        },
+                    )
+                    answer = NO_SUMMARY_FALLBACK_ANSWER
+                    segments.append(TurnSegment(assistant_blocks=[TextBlock(text=answer)]))
+                    # No live tokens were streamed for this turn (there was no
+                    # text to stream), so the client must still receive the
+                    # fallback text before done, same as the no-call_stream
+                    # buffered-fallback branch above.
+                    yield AssistantToken(text=answer)
+                else:
+                    segments.append(TurnSegment(assistant_blocks=list(resp.content)))
                 yield AssistantDone(
                     result=AssistantTurnResult(
                         answer=answer,
@@ -975,6 +1029,7 @@ class AIClient:
                 )
                 return
 
+            dispatched_tool_names.extend(block.name for block in tool_use_blocks)
             # Tool turn: any tokens streamed this iteration were pre-tool
             # narration. Tell the client to discard them (interim=True) and show
             # which tools are running.
