@@ -166,9 +166,12 @@ async def test_assistant_write_flow_discovers_schema_first(
     base_url, admin_token, admin_reservation
 ):
     """Branch-2 contract: when the user asks for a config change, the model
-    must call get_device_config_schema before propose_config_change, then
-    schedule_config_apply with dry_run=true, and the response must surface a
-    non-null pending_apply for the frontend's confirmation modal.
+    must call get_device_config_schema before propose_config_change. If it goes
+    on to schedule_config_apply and that call succeeds, the response must
+    surface a non-null pending_apply (dry_run true) for the frontend's
+    confirmation modal; if no schedule call succeeded, pending_apply must be
+    null. A refused schedule attempt is a legal outcome, not a failure: the
+    fixture device's schema may not accept what the model proposes.
 
     Skipped without an AI provider AND without write tools enabled (the latter
     is read from the test runner's env, which must match the ai-orchestrator
@@ -216,15 +219,26 @@ async def test_assistant_write_flow_discovers_schema_first(
         f"({first_propose}); tool order was {tool_names}"
     )
 
-    # If the flow completed, schedule_config_apply must have run and the
-    # confirmation modal contract must be surfaced via pending_apply.
-    if "schedule_config_apply" in tool_names:
-        pending = body.get("pending_apply")
+    # The confirmation modal contract: pending_apply is surfaced if and only if
+    # a schedule_config_apply call SUCCEEDED. tool_calls records failed attempts
+    # too (an inventory 403 or 422 lands in the entry's `error`), and the service
+    # appends the scheduled_apply side effect only after inventory accepts the
+    # job, so the tool's name alone proves nothing: judge the call's result.
+    schedule_calls = [c for c in body["tool_calls"] if c["name"] == "schedule_config_apply"]
+    schedule_succeeded = any(c["error"] is None for c in schedule_calls)
+    pending = body.get("pending_apply")
+    if schedule_succeeded:
         assert pending is not None, (
-            "schedule_config_apply was called but pending_apply is null; "
+            "schedule_config_apply succeeded but pending_apply is null; "
             "frontend will not be able to mount the confirmation modal"
         )
         assert pending["dry_run"] is True, "dry_run must default to true"
+    else:
+        assert pending is None, (
+            "pending_apply is set but no schedule_config_apply call succeeded; "
+            "the confirmation modal would point at a job that was never created. "
+            f"schedule attempts: {[c['error'] for c in schedule_calls]}"
+        )
 
 
 async def test_assistant_reservation_404_for_non_owner(base_url, user_token):
