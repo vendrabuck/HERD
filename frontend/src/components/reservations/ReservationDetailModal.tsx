@@ -14,6 +14,7 @@ import { useAIStatus } from "@/api/ai";
 import { useAuthStore } from "@/stores/authStore";
 import { errorDetail } from "@/lib/errors";
 import { isAdminRole } from "@/lib/roles";
+import { canCancel, canRelease } from "@/lib/reservationStatus";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import { ReservationInventoryTab } from "./ReservationInventoryTab";
 import { ReservationRoutesTab } from "./ReservationRoutesTab";
@@ -111,7 +112,8 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
       toast.error(errorDetail(err, "Failed to update purpose category"));
     }
   };
-  const canAct = isOwner && reservation.status === "ACTIVE";
+  const canReleaseAct = isOwner && canRelease(reservation.status);
+  const canCancelAct = isOwner && canCancel(reservation.status);
   const canEdit = isOwner && (reservation.status === "ACTIVE" || reservation.status === "PENDING");
   // The fork is editable only while the reservation is ACTIVE (ADR 0006); after
   // it ends the fork is the frozen, read-only as-built record. A fork exists only
@@ -288,22 +290,26 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
                 </ul>
               </div>
             )}
-            {canAct && (
+            {(canReleaseAct || canCancelAct) && (
               <div className="flex gap-2 pt-2 border-t border-gray-200">
-                <button
-                  onClick={() => release.mutate(reservation.id, { onSuccess: onClose })}
-                  disabled={release.isPending}
-                  className="text-sm px-3 py-1.5 rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
-                >
-                  Release
-                </button>
-                <button
-                  onClick={() => setConfirmCancelOpen(true)}
-                  disabled={cancel.isPending}
-                  className="text-sm px-3 py-1.5 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
-                >
-                  Cancel
-                </button>
+                {canReleaseAct && (
+                  <button
+                    onClick={() => release.mutate(reservation.id, { onSuccess: onClose })}
+                    disabled={release.isPending}
+                    className="text-sm px-3 py-1.5 rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
+                  >
+                    Release
+                  </button>
+                )}
+                {canCancelAct && (
+                  <button
+                    onClick={() => setConfirmCancelOpen(true)}
+                    disabled={cancel.isPending}
+                    className="text-sm px-3 py-1.5 rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                )}
               </div>
             )}
           </div>

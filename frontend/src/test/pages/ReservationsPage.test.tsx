@@ -80,6 +80,10 @@ const RESERVATION = {
   purpose: "fw test",
 };
 
+function reservationWithStatus(status: string) {
+  return { ...RESERVATION, status };
+}
+
 beforeEach(() => {
   setRole(null);
   server.use(
@@ -265,6 +269,109 @@ describe("ReservationsPage", () => {
 
     await waitFor(() => expect(cancelCalls).toEqual([RESERVATION.id]));
     expect(screen.queryByRole("button", { name: "Cancel reservation" })).not.toBeInTheDocument();
+  });
+
+  it("shows Cancel but not Release for a PENDING reservation (issue #841)", async () => {
+    const pending = reservationWithStatus("PENDING");
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [pending], total: 1, skip: 0, limit: 50 }),
+      ),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    await screen.findByRole("button", {
+      name: `Cancel reservation ${pending.id.slice(0, 8)}`,
+    });
+    expect(
+      screen.queryByRole("button", {
+        name: `Release reservation ${pending.id.slice(0, 8)}`,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows Cancel but not Release for a PENDING_PROVISION reservation", async () => {
+    const pendingProvision = reservationWithStatus("PENDING_PROVISION");
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [pendingProvision], total: 1, skip: 0, limit: 50 }),
+      ),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    await screen.findByRole("button", {
+      name: `Cancel reservation ${pendingProvision.id.slice(0, 8)}`,
+    });
+    expect(
+      screen.queryByRole("button", {
+        name: `Release reservation ${pendingProvision.id.slice(0, 8)}`,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows both Release and Cancel for an ACTIVE reservation (regression guard)", async () => {
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 50 }),
+      ),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    await screen.findByRole("button", {
+      name: `Release reservation ${RESERVATION.id.slice(0, 8)}`,
+    });
+    expect(
+      screen.getByRole("button", {
+        name: `Cancel reservation ${RESERVATION.id.slice(0, 8)}`,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows neither Release nor Cancel for a terminal (CANCELLED) reservation", async () => {
+    const cancelled = reservationWithStatus("CANCELLED");
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [cancelled], total: 1, skip: 0, limit: 50 }),
+      ),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+    expect(
+      screen.queryByRole("button", {
+        name: `Cancel reservation ${cancelled.id.slice(0, 8)}`,
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: `Release reservation ${cancelled.id.slice(0, 8)}`,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("cancels a PENDING reservation through the confirm dialog", async () => {
+    const pending = reservationWithStatus("PENDING");
+    const cancelCalls: string[] = [];
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [pending], total: 1, skip: 0, limit: 50 }),
+      ),
+      http.delete("/api/reservations/:id", ({ params }) => {
+        cancelCalls.push(params.id as string);
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderWithProviders(<ReservationsPage />);
+
+    const cancelButton = await screen.findByRole("button", {
+      name: `Cancel reservation ${pending.id.slice(0, 8)}`,
+    });
+    fireEvent.click(cancelButton);
+
+    const confirmButton = await screen.findByRole("button", { name: "Cancel reservation" });
+    fireEvent.click(confirmButton);
+
+    await waitFor(() => expect(cancelCalls).toEqual([pending.id]));
   });
 
   it("closes the detail modal when its onClose fires", async () => {
