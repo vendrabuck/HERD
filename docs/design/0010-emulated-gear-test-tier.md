@@ -1,12 +1,13 @@
 # Decision: Emulated-Gear Test Tier for Driver Dialects
 
-Status: Proposed. This is a proposal for review, not an accepted decision. Every
-decision below is framed as a recommendation with the tradeoffs stated, and the
-open questions at the end are the calls that need a human before any of this is
-built. Nothing here is final and no code is written yet. It introduces a fourth
-driver-testing tier between the deterministic mocks and real hardware, built on the
-external `network-simulator` project. Context verified against the live HERD-public
-tree and the `network-simulator` working tree on 2026-07-28.
+Status: Shipped, phases 0 to 3b (see the status amendment below for what was
+actually built and the CI placement). The L1 emulation phase remains unbuilt,
+blocked on `network-simulator` having no socket transport. The body below was
+written as a proposal for review, before any of this was accepted or built;
+it introduces a fourth driver-testing tier between the deterministic mocks and
+real hardware. It is kept as originally written except for the amendment.
+Context verified against the live HERD-public tree and the `network-simulator`
+working tree on 2026-07-28.
 
 ## Status amendment, 2026-09-12
 
