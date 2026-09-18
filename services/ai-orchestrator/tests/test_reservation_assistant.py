@@ -1075,6 +1075,138 @@ async def test_buffered_no_text_exact_error_wording():
             )
 
 
+# --- No text after tools ran: fallback instead of rollback (issue #848) ---
+#
+# A turn that dispatches a tool and then ends with no text must NOT roll back:
+# the tool's side effect (an inventory write) already happened, so a 502 here
+# would tell the user the call failed while the write persists. This exercises
+# the real loop through a real AIClient + real ToolDispatcher (never a stub),
+# so the route-level persistence and 200 response are proven end to end.
+
+
+async def test_buffered_no_text_after_tool_dispatch_returns_fallback_and_persists(async_client):
+    """A provider that dispatches one tool and then ends the turn with no text
+    must return 200 with the fixed fallback answer, list the dispatched tool,
+    and persist the turn (no rollback, no orphan). The dispatched tool name is
+    deliberately not a real tool so dispatch fails closed with no network call
+    (ToolDispatcher's "unknown tool" path): the same fallback rule applies
+    whether the dispatch succeeded or errored, and this keeps the test
+    hermetic.
+    """
+    from app.services.ai_client import NO_SUMMARY_FALLBACK_ANSWER, AIClient
+    from app.services.llm_provider import ProviderResponse, ToolUseBlock, Usage
+
+    _override_seed()
+
+    class ToolThenNoTextProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return ProviderResponse(
+                    content=[ToolUseBlock(id="toolu_1", name="not_a_real_tool", input={})],
+                    stop_reason="tool_use",
+                    usage=Usage(input_tokens=6, output_tokens=4),
+                    raw_model="test-model",
+                )
+            return ProviderResponse(
+                content=[],
+                stop_reason="end_turn",
+                usage=Usage(input_tokens=3, output_tokens=0),
+                raw_model="test-model",
+            )
+
+    app.dependency_overrides[get_ai_client] = lambda: AIClient(
+        provider=ToolThenNoTextProvider(), max_tokens=64
+    )
+
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "act on it"}, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["answer"] == NO_SUMMARY_FALLBACK_ANSWER
+    assert [t["name"] for t in body["tool_calls"]] == ["not_a_real_tool"]
+
+    conv_id = body["conversation_id"]
+    rows = await _load_db_messages(conv_id)
+    _assert_no_orphan_trailing_user(rows)
+    # The tool-dispatch iteration persists as ASSISTANT (the tool_use block)
+    # plus TOOL (the echoed tool_result); the closing fallback iteration
+    # persists as its own ASSISTANT row.
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "TOOL", "ASSISTANT"]
+
+
+async def test_buffered_no_text_after_tool_dispatch_surfaces_pending_apply(async_client):
+    """The fallback-answer turn still surfaces pending_apply when a
+    schedule_config_apply call succeeded in the same turn, so the confirmation
+    modal opens exactly as it would for a normal text answer. Route-level: a
+    stub AI (as the rest of this file's tool_calls/pending_apply tests do)
+    records the scheduled_apply side effect directly on the dispatcher, since
+    driving a real schedule_config_apply tool call would need a live inventory
+    service this suite does not have. The AssistantTurnResult it returns is
+    exactly the shape the real AIClient now produces for this case (answer ==
+    NO_SUMMARY_FALLBACK_ANSWER, a well-formed final TextBlock segment), so the
+    route's handling of that shape is what's under test here.
+    """
+    job_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    device_id = uuid.uuid4()
+
+    from app.services.ai_client import NO_SUMMARY_FALLBACK_ANSWER
+
+    class SchedulingNoTextAI:
+        async def answer_reservation_question_with_tools(self, *, messages, dispatcher, **kw):
+            dispatcher.call_log.append(
+                ToolCallRecord(
+                    name="schedule_config_apply",
+                    arguments_summary="device_id=... dry_run=True",
+                    duration_ms=12,
+                    error=None,
+                )
+            )
+            dispatcher.side_effects.append(
+                {
+                    "kind": "scheduled_apply",
+                    "job_id": str(job_id),
+                    "version_id": str(version_id),
+                    "device_id": str(device_id),
+                    "dry_run": True,
+                    "scheduled_for": "2026-05-19T10:00:00+00:00",
+                }
+            )
+            return AssistantTurnResult(
+                answer=NO_SUMMARY_FALLBACK_ANSWER,
+                usage=SimpleNamespace(input_tokens=6, output_tokens=0),
+                stop_reason="end_turn",
+                iteration=2,
+                segments=[
+                    TurnSegment(assistant_blocks=[TextBlock(text=NO_SUMMARY_FALLBACK_ANSWER)])
+                ],
+            )
+
+    _override_seed()
+    app.dependency_overrides[get_ai_client] = lambda: SchedulingNoTextAI()
+
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "apply it"}, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["answer"] == NO_SUMMARY_FALLBACK_ANSWER
+    assert body["pending_apply"] is not None
+    assert body["pending_apply"]["job_id"] == str(job_id)
+    assert body["pending_apply"]["dry_run"] is True
+
+    rows = await _load_db_messages(body["conversation_id"])
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+
+
 async def test_stream_failure_leaves_no_orphan_and_next_turn_succeeds(async_client):
     """Streaming: turn 2 fails after the stream opened; the error event must not
     leave the user message orphaned, and turn 3 must still succeed.
