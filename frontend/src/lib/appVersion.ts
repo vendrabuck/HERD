@@ -23,8 +23,8 @@ interface ParsedVersion {
 /**
  * Parses a version string in either the backend's PEP 440 spelling
  * ("0.6.0.dev0") or the frontend's semver spelling ("0.6.0-dev") of "still
- * in development on this release number". Returns null for anything else
- * (a plain release like "0.6.0", or an unrecognized shape).
+ * in development on this release number", or a plain final release such as
+ * "0.6.0". Returns null for any other shape.
  */
 function parseVersion(version: string): ParsedVersion | null {
   const pep440Dev = /^(\d+\.\d+\.\d+)\.dev\d*$/.exec(version);
