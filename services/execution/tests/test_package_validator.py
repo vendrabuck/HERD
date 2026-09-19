@@ -269,6 +269,11 @@ def test_method_exception_fails_dry_run():
     by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
     assert by_action["status"]["passed"] is False
     assert by_action["login"]["passed"] is True
+    # The report keeps the exception MESSAGE, not only its class: it is the
+    # repair signal the recipe-authoring loop feeds back to the model, and
+    # validation runs against a synthetic context with nothing real to leak.
+    # The execute path deliberately stores the class name alone (issue #840).
+    assert by_action["status"]["error"] == "RuntimeError: boom"
 
 
 def test_driver_level_failure_verdict_fails_dry_run():

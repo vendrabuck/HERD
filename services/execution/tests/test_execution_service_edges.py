@@ -403,6 +403,17 @@ async def test_run_driver_action_raised_exception_logs_full_text_with_run_id(
     assert matching[0].exception_class == "RuntimeError"
     assert matching[0].exception_message == "connection refused to 10.9.9.9"
 
+    # What an operator actually reads is the line herd_common's JSONFormatter
+    # emits, and that formatter keeps only a fixed allowlist of extra keys, so
+    # the asserts above would pass even if the diagnosis never reached the
+    # container log. Format the record for real and check the text survived.
+    from herd_common.logging import JSONFormatter
+
+    line = JSONFormatter("execution").format(matching[0])
+    assert "connection refused to 10.9.9.9" in line
+    assert "RuntimeError" in line
+    assert str(run.id) in line
+
 
 @pytest.mark.asyncio
 async def test_run_driver_action_returned_failure_keeps_driver_message(db, monkeypatch):

@@ -520,8 +520,16 @@ async def run_driver_action(
             # no further than this log record: never into the run row or an
             # API response, since it can carry hosts, paths, or
             # credential-adjacent text.
+            # The text goes in the MESSAGE, not only in `extra`: herd_common's
+            # JsonFormatter emits a fixed allowlist of extra keys, and run_id,
+            # exception_class, and exception_message are not on it, so a
+            # record carrying them only as extras would reach the container
+            # log with the diagnosis stripped.
             logger.error(
-                "Driver call raised an exception",
+                "Driver call raised %s on run %s: %s",
+                exception_class,
+                run.id,
+                result.get("exception_message"),
                 extra={
                     "run_id": str(run.id),
                     "exception_class": exception_class,
