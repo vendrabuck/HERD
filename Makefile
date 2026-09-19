@@ -44,13 +44,39 @@ GATE_COMPOSE := docker compose -p $(GATE_PROJECT)
 # _gate-ldap-stack-tests supports.
 DEV_PROJECT := $(shell printf '%s' '$(notdir $(CURDIR))' | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-' | sed 's/^[^a-z0-9]*//')
 
+# Build identifier (issue #846), computed on the HOST because .git is in no
+# Docker build context. HERD_BUILD is `git describe --tags --always --dirty`:
+# the tag alone at a tagged commit, otherwise `vX.Y.Z-N-g<hash>` counting
+# commits since the last tag, or a bare short hash when there are no tags
+# reachable (a shallow CI checkout). HERD_BUILD_DATE is the HEAD COMMIT date
+# in UTC ISO 8601, not the wall clock: a wall-clock value would change on
+# every `make up` and recreate all 13 containers, while the commit date is
+# stable for a given commit and reproducible. Both degrade to `dev` (empty
+# for the date) when git is missing or CURDIR is not a repository. The
+# ifeq/origin guard, not a plain `?=`, keeps the git calls out of every make
+# invocation once a value is already exported (CI or a release script sets
+# one): origin reports "undefined" only when nothing, including the
+# environment, has given the variable a value yet.
+ifeq ($(origin HERD_BUILD), undefined)
+HERD_BUILD := $(shell git describe --tags --always --dirty 2>/dev/null)
+ifeq ($(strip $(HERD_BUILD)),)
+HERD_BUILD := dev
+endif
+endif
+export HERD_BUILD
+
+ifeq ($(origin HERD_BUILD_DATE), undefined)
+HERD_BUILD_DATE := $(shell TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd 2>/dev/null)
+endif
+export HERD_BUILD_DATE
+
 # Coverage package name per service. Most are app/; common ships herd_common/.
 cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 
 # Self-documenting help is the default goal: a bare `make` prints the target list.
 .DEFAULT_GOAL := help
 
-.PHONY: help audit master master-quick master-clean everything everything-noload \
+.PHONY: help version audit master master-quick master-clean everything everything-noload \
 	up dev prod down build logs restart \
 	migrate test coverage \
 	$(addprefix test-,$(SERVICES)) \
@@ -90,6 +116,10 @@ help:  ## Show this help (the default target)
 	@echo "  shell-<svc>     open a bash shell in one DB service container"
 	@echo "  SERVICES    = $(SERVICES)"
 	@echo "  DB_SERVICES = $(DB_SERVICES)"
+
+version:  ## Show the build string and date every image would be stamped with
+	@echo "HERD_BUILD=$(HERD_BUILD)"
+	@echo "HERD_BUILD_DATE=$(HERD_BUILD_DATE)"
 
 # -- Audit (dependency / security) --------------------------------------------
 #

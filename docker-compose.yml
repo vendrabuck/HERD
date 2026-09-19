@@ -4,6 +4,9 @@ services:
     build:
       context: .
       dockerfile: services/config/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -155,6 +158,9 @@ services:
     build:
       context: .
       dockerfile: services/auth/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     volumes:
       - herd-config:/etc/herd:ro
     environment:
@@ -217,6 +223,9 @@ services:
     build:
       context: .
       dockerfile: services/inventory/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: inventory
@@ -254,6 +263,9 @@ services:
     build:
       context: .
       dockerfile: services/reservations/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: reservations
@@ -297,6 +309,9 @@ services:
     build:
       context: .
       dockerfile: services/integration/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: integration
@@ -338,6 +353,9 @@ services:
     build:
       context: .
       dockerfile: services/secrets/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: secrets
@@ -383,6 +401,9 @@ services:
     build:
       context: .
       dockerfile: services/acl/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: acl
@@ -420,6 +441,9 @@ services:
     build:
       context: .
       dockerfile: services/user-profile/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: user_profile
@@ -457,6 +481,9 @@ services:
     build:
       context: .
       dockerfile: services/notifications/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: notifications
@@ -499,6 +526,9 @@ services:
     build:
       context: .
       dockerfile: services/cabling/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: cabling
@@ -536,6 +566,9 @@ services:
     build:
       context: .
       dockerfile: services/execution/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: execution
@@ -582,6 +615,9 @@ services:
     build:
       context: .
       dockerfile: services/ai-orchestrator/Dockerfile
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: ai_orchestrator
@@ -645,6 +681,8 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_AI_CHAT_ENABLED: ${VITE_AI_CHAT_ENABLED:-false}
+        VITE_HERD_BUILD: ${HERD_BUILD:-dev}
+        VITE_HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
