@@ -16,8 +16,10 @@ import pytest
 from herd_common.device_config import (
     ALLOWED_CONFIG_KEYS,
     CONFIG_SCHEMAS,
+    CONFIGURE_CONNECTION_TYPES,
     ConfigValidationError,
     PublishedSchemaError,
+    connection_type_supports_configure,
     validate_device_config,
     validate_device_config_with_schema,
 )
@@ -380,3 +382,36 @@ def test_published_schema_invalid_schema_is_rejected():
     not_a_schema = {"type": "not-a-real-type"}
     with pytest.raises(PublishedSchemaError):
         validate_device_config_with_schema("Management", {"x": 1}, schema=not_a_schema)
+
+
+# --- connection_type_supports_configure (issue #839) -------------------------
+#
+# Capability comes from the driver CONTRACT (REQUIRED_METHODS in
+# services/execution/app/services/driver_loader.py), not a declared flag: only
+# the Management contract requires `configure`. The parity test that pins
+# CONFIGURE_CONNECTION_TYPES against REQUIRED_METHODS directly lives in
+# services/execution/tests (this package cannot import execution's module).
+
+
+def test_configure_connection_types_is_management_only():
+    assert CONFIGURE_CONNECTION_TYPES == frozenset({"Management"})
+
+
+def test_connection_type_supports_configure_true_for_management():
+    assert connection_type_supports_configure("Management") is True
+
+
+@pytest.mark.parametrize(
+    "connection_type",
+    ["Layer 1 Switch", "Layer 2 Switch", "Layer 3 Switch", "Hypervisor"],
+)
+def test_connection_type_supports_configure_false_for_other_known_types(connection_type):
+    assert connection_type_supports_configure(connection_type) is False
+
+
+def test_connection_type_supports_configure_false_for_none():
+    assert connection_type_supports_configure(None) is False
+
+
+def test_connection_type_supports_configure_false_for_unknown_string():
+    assert connection_type_supports_configure("Some Made-Up Type") is False

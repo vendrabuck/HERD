@@ -29,7 +29,11 @@ from app.schemas.device_config import (
 )
 from app.services.config_diff import render_unified_diff
 from app.services.device_visibility import _resolve_visible_device_ids
-from app.services.manage_guard import _is_admin, _user_can_manage_device
+from app.services.manage_guard import (
+    _assert_driver_can_configure,
+    _is_admin,
+    _user_can_manage_device,
+)
 from app.services.published_schema import published_schema_for_device
 from app.services.reservation_guard import find_blocking_reservations_for_device
 
@@ -420,6 +424,13 @@ async def apply_config_version(
                     "manage permission required on this device (or active reservation ownership)"
                 ),
             )
+
+    # Driver-capability gate (issue #839): after authorization so an
+    # unauthorized caller learns nothing new about the device's driver, and
+    # before the call to execution below, so an apply that can never succeed
+    # is refused up front rather than reaching the runner. Raises 409 with a
+    # structured detail on refusal.
+    _assert_driver_can_configure(device)
 
     url = f"{settings.execution_service_url.rstrip('/')}/execute"
     body = {

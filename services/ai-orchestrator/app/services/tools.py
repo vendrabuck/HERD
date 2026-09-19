@@ -878,11 +878,16 @@ class ToolDispatcher:
             "reservation_id": str(self._reservation_id),
         }
         resp = await self._http.post(url, json=body, headers=self._auth_headers)
-        if resp.status_code in (403, 422):
+        if resp.status_code in (403, 409, 422):
             try:
                 detail = resp.json().get("detail", str(resp.status_code))
             except ValueError:
                 detail = str(resp.status_code)
+            # A 409 driver_cannot_configure detail (issue #839) is a structured
+            # dict, not a string: surface its plain-English `message` so the
+            # model can tell the user why, rather than a Python dict repr.
+            if isinstance(detail, dict) and "message" in detail:
+                detail = detail["message"]
             raise ToolError(str(detail))
         resp.raise_for_status()
         data = resp.json()

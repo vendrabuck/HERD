@@ -96,5 +96,15 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(str(e), file=sys.stderr)
+        # Structured, not plain text (issue #840): the parent (driver_sandbox.py)
+        # needs to tell "the driver call raised" apart from every other failure
+        # shape on stderr, so it can store only the exception CLASS on a run a
+        # user can read, never the message (which can carry hosts, paths, or
+        # credential-adjacent text) or a traceback. The full message still goes
+        # out on this same stderr line for the parent to log; it just never
+        # reaches an API response or a database row past that point.
+        print(
+            json.dumps({"exception_class": type(e).__name__, "message": str(e)}),
+            file=sys.stderr,
+        )
         sys.exit(1)

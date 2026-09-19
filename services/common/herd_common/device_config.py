@@ -18,6 +18,31 @@ from typing import Any
 
 import jsonschema
 
+# Connection types whose driver CONTRACT includes `configure` (issue #839).
+# Capability comes from the contract, not a declared flag and not code
+# inspection: services/execution/app/services/driver_loader.py's
+# REQUIRED_METHODS lists the methods a connection type's driver must implement,
+# enforced at driver load, and only "Management" requires `configure`. A
+# config APPLY is therefore only ever attempted against a Management driver;
+# see connection_type_supports_configure below and the parity test in
+# services/execution/tests that pins this set against REQUIRED_METHODS
+# directly, so the two cannot silently drift apart.
+CONFIGURE_CONNECTION_TYPES: frozenset[str] = frozenset({"Management"})
+
+
+def connection_type_supports_configure(connection_type: str | None) -> bool:
+    """Whether a driver's connection type contract includes `configure`.
+
+    True only for a connection type in CONFIGURE_CONNECTION_TYPES (today just
+    "Management"); False for every other known type, an unknown string, and
+    None. This governs the config-apply GATE only: config VERSIONS remain
+    creatable for every connection type CONFIG_SCHEMAS below covers, since a
+    Layer 2 or Layer 3 Switch config version stores routing/VLAN intent
+    (ADR 0014) that nothing ever applies through this generic path.
+    """
+    return connection_type in CONFIGURE_CONNECTION_TYPES
+
+
 CONFIG_SCHEMAS: dict[str, dict[str, Any]] = {
     "Management": {
         "type": "object",

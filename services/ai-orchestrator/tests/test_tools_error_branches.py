@@ -182,3 +182,48 @@ async def test_schedule_config_apply_403_non_json_body_uses_status_code():
     body = json.loads(result["content"])
     # Non-JSON 403 body: detail falls back to the bare status code string.
     assert body["message"] == "403"
+
+
+# --- schedule_config_apply: 409 driver_cannot_configure (issue #839) ---
+
+
+async def test_schedule_config_apply_409_structured_detail_surfaces_message():
+    """Inventory's 409 detail is a structured dict, not a string; the tool
+    must surface its plain-English `message`, not a Python dict repr, and
+    must not record the scheduled-apply side effect (no pending_apply)."""
+    structured_detail = {
+        "error": "driver_cannot_configure",
+        "connection_type": "Layer 3 Switch",
+        "driver": "frr_l3",
+        "message": (
+            "This device's driver implements the Layer 3 Switch contract, "
+            "which has no configure method, so a config apply cannot run. "
+            "Config versions on this device store intent only."
+        ),
+    }
+    routes = [
+        (
+            lambda r: (
+                r.method == "POST"
+                and r.url.path.endswith(f"/config-versions/{VERSION_ID}/schedule")
+            ),
+            httpx.Response(409, json={"detail": structured_detail}),
+        ),
+    ]
+    async with _dispatcher_with(routes) as dispatcher:
+        result = await dispatcher.dispatch(
+            "schedule_config_apply",
+            {
+                "device_id": str(DEVICE_ID),
+                "version_id": VERSION_ID,
+                "delay_seconds": 30,
+            },
+        )
+    assert result["is_error"] is True
+    body = json.loads(result["content"])
+    assert body["message"] == structured_detail["message"]
+    # A dict repr (e.g. "{'error': 'driver_cannot_configure', ...}") must not
+    # leak through as the surfaced text.
+    assert "driver_cannot_configure" not in body["message"]
+    # No side effect: the caller never got a job to confirm or cancel.
+    assert dispatcher.side_effects == []

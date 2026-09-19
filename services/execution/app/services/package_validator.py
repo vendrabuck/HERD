@@ -296,6 +296,24 @@ def _method_passed(result: dict) -> bool:
     return True
 
 
+def _validation_error_text(result: dict) -> str | None:
+    """The error text a validation report carries for one sandbox result.
+
+    The sandbox reduces a raised driver exception to its class name (issue
+    #840), because on the execute path that text lands on a run row a user can
+    read and may carry hosts, paths, or credential-adjacent text. Validation is
+    the deliberate exception: it runs an admin's own drafted package against a
+    synthetic context with no real host or credential in it, and the exception
+    message is the repair signal the recipe-authoring loop feeds back to the
+    model (ADR 0005). So rebuild "Class: message" here from the fields the
+    sandbox passes alongside the sanitized error.
+    """
+    exception_class = result.get("exception_class")
+    if exception_class:
+        return f"{exception_class}: {result.get('exception_message', '')}"
+    return result.get("error")
+
+
 def _run_dry_run_lifecycle(package_dir: Path) -> dict:
     metadata = read_driver_metadata(package_dir)
     context, password_keys = _synthetic_context()
@@ -330,7 +348,7 @@ def _run_dry_run_lifecycle(package_dir: Path) -> dict:
                 "passed": ok,
                 "success": bool(result.get("success")),
                 "output": output,
-                "error": result.get("error"),
+                "error": _validation_error_text(result),
                 "duration_ms": result.get("duration_ms"),
                 "transcript": result.get("transcript") or [],
             }
@@ -342,7 +360,7 @@ def _run_dry_run_lifecycle(package_dir: Path) -> dict:
 def _extract_schema_section(package_dir: Path) -> dict:
     result = extract_config_schema(str(package_dir))
     if not result.get("success"):
-        return {"present": False, "schema": None, "error": result.get("error")}
+        return {"present": False, "schema": None, "error": _validation_error_text(result)}
     output = result.get("output") or {}
     if not output.get("has_schema"):
         return {"present": False, "schema": None, "error": None}
