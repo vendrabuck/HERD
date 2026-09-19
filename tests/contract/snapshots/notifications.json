@@ -31,6 +31,10 @@
     [
       "PATCH",
       "/notifications/{notification_id}/read"
+    ],
+    [
+      "GET",
+      "/version"
     ]
   ],
   "schemas": {
@@ -111,6 +115,20 @@
       },
       "required": [
         "count"
+      ],
+      "type": "object"
+    },
+    "VersionResponse": {
+      "properties": {
+        "build": "string",
+        "build_date": "anyOf",
+        "service": "string",
+        "version": "string"
+      },
+      "required": [
+        "build",
+        "service",
+        "version"
       ],
       "type": "object"
     }

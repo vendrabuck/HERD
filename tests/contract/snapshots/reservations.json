@@ -73,6 +73,10 @@
       "/reports/utilization.csv"
     ],
     [
+      "GET",
+      "/version"
+    ],
+    [
       "DELETE",
       "/{reservation_id}"
     ],
@@ -565,6 +569,20 @@
         "total_reservations",
         "window_end",
         "window_start"
+      ],
+      "type": "object"
+    },
+    "VersionResponse": {
+      "properties": {
+        "build": "string",
+        "build_date": "anyOf",
+        "service": "string",
+        "version": "string"
+      },
+      "required": [
+        "build",
+        "service",
+        "version"
       ],
       "type": "object"
     }

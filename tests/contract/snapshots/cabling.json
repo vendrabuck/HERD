@@ -163,6 +163,10 @@
     [
       "POST",
       "/topologies/{topology_id}/versions/{version_id}/restore"
+    ],
+    [
+      "GET",
+      "/version"
     ]
   ],
   "schemas": {
@@ -992,6 +996,20 @@
         "name",
         "topology_id",
         "version_number"
+      ],
+      "type": "object"
+    },
+    "VersionResponse": {
+      "properties": {
+        "build": "string",
+        "build_date": "anyOf",
+        "service": "string",
+        "version": "string"
+      },
+      "required": [
+        "build",
+        "service",
+        "version"
       ],
       "type": "object"
     }

@@ -35,6 +35,10 @@
     [
       "GET",
       "/resources"
+    ],
+    [
+      "GET",
+      "/version"
     ]
   ],
   "schemas": {
@@ -146,6 +150,20 @@
       "required": [
         "resource_id",
         "resource_type"
+      ],
+      "type": "object"
+    },
+    "VersionResponse": {
+      "properties": {
+        "build": "string",
+        "build_date": "anyOf",
+        "service": "string",
+        "version": "string"
+      },
+      "required": [
+        "build",
+        "service",
+        "version"
       ],
       "type": "object"
     }
