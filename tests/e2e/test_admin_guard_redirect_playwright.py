@@ -36,7 +36,7 @@ import pytest
 
 from .conftest import HOST_BASE_URL, pw_login
 
-# The 15 AdminGuard-guarded paths pinned in frontend/src/test/routes.test.tsx's
+# The 16 AdminGuard-guarded paths pinned in frontend/src/test/routes.test.tsx's
 # EXPECTED_ADMIN_GUARDED_PATHS, minus the 2 already covered live by the
 # Selenium test_register_and_roles.py (/admin/users, /reporting). The two
 # :id placeholders below stand in for /admin/groups/:id and
@@ -55,6 +55,7 @@ REMAINING_GUARDED_PATHS = [
     "/admin/hypervisors",
     "/admin/ldap-sync",
     "/admin/purpose-review",
+    "/admin/about",
 ]
 
 

@@ -23,6 +23,7 @@ vi.mock("react-hot-toast", () => ({
 
 import { server } from "../mocks/server";
 import { LoginPage } from "@/pages/LoginPage";
+import { APP_VERSION } from "@/lib/appVersion";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -49,6 +50,14 @@ describe("LoginPage", () => {
     expect(pw).toBeInTheDocument();
     expect(pw.placeholder).toBe("password");
     expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  });
+
+  it("shows the injected app version, and nothing else version-shaped (issue #846)", () => {
+    renderWithProviders(<LoginPage />);
+    const version = screen.getByTestId("app-version-login");
+    expect(version).toHaveTextContent(`v${APP_VERSION}`);
+    // Anonymous visitors see the version only, never a build string or date.
+    expect(version.textContent).toBe(`v${APP_VERSION}`);
   });
 
   it("shows the unconfigured banner and disables fields when configured=false", async () => {

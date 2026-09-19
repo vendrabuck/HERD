@@ -5,6 +5,7 @@ import { Wrench } from "lucide-react";
 import { useLogin } from "@/api/auth";
 import { useConfigStatus } from "@/api/config";
 import { Button } from "@/components/ui/Button";
+import { APP_VERSION } from "@/lib/appVersion";
 
 export function LoginPage() {
   const navigate = useNavigate();
@@ -36,7 +37,12 @@ export function LoginPage() {
             <div className="w-12 h-12 rounded-lg bg-slate-800 flex items-center justify-center shrink-0">
               <span className="font-mono font-bold text-2xl text-sky-400">H</span>
             </div>
-            <h1 className="text-2xl font-bold text-gray-900">HERD</h1>
+            <span className="flex items-baseline gap-1.5">
+              <h1 className="text-2xl font-bold text-gray-900">HERD</h1>
+              <span data-testid="app-version-login" className="text-xs text-gray-400">
+                v{APP_VERSION}
+              </span>
+            </span>
           </div>
           <p className="text-sm text-gray-500 mt-1">Hardware Environment Replication and Deployment</p>
         </div>
