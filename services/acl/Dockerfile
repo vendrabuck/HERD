@@ -43,6 +43,16 @@ RUN uv pip install --system --no-deps -e /app/common \
     && uv pip install --system --no-deps --no-sources -e .
 
 RUN useradd --no-create-home --shell /bin/false appuser
+
+# Build identifier (issue #846), stamped in as late as possible so a changed
+# build string invalidates only this metadata layer, never the uv export /
+# pip install or source COPY layers above. Computed on the host by the
+# Makefile and passed in as build args; the ENV line is what makes the value
+# visible to the running process, since an ARG does not persist on its own.
+ARG HERD_BUILD=dev
+ARG HERD_BUILD_DATE=
+ENV HERD_BUILD=${HERD_BUILD} HERD_BUILD_DATE=${HERD_BUILD_DATE}
+
 USER appuser
 
 EXPOSE 8000

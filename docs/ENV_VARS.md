@@ -398,6 +398,33 @@ consumed via its own NATS durable consumer.
 | `WEBHOOK_DELIVERY_ATTEMPTS` | `4` | Maximum delivery attempts (including the first) before a webhook delivery is recorded as dead-lettered. |
 | `WEBHOOK_TEST_SINK_ENABLED` | `false` | When true, exposes a test-only sink endpoint used to assert webhook deliveries in integration tests. Leave off outside test environments. |
 
+## Build identifier (issue #846)
+
+Two Docker build args, not runtime configuration: they are computed on the HOST by the
+Makefile (`.git` is in no Docker build context) and passed into every service image and
+the frontend image at `docker compose build` time. They are not part of the config
+schema and never appear in `config.json` or the config editor.
+
+| Variable | Default | Set by | Purpose |
+|---|---|---|---|
+| `HERD_BUILD` | `dev` | Makefile, computed unless already set | `git describe --tags --always --dirty` run against the checkout. The tag alone at a tagged release commit (`v0.5.0`); otherwise `vX.Y.Z-N-g<hash>` counting commits since the last tag; a bare short hash when no tag is reachable (a shallow clone with no tags fetched, the default for `actions/checkout` in `ci.yml` and `nightly.yml`); a `-dirty` suffix when the working tree has uncommitted changes. |
+| `HERD_BUILD_DATE` | (empty) | Makefile, computed unless already set | The HEAD commit date, normalized to UTC ISO 8601 (`TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd`). Deliberately the commit date, not the wall clock at build time: a wall-clock value changes on every `make up`, which would change every image ID and recreate all 13 containers on every start, while the commit date is stable for a given commit and reproducible. |
+
+Both variables degrade without error when git is missing or the checkout is not a
+repository: `HERD_BUILD` falls back to the literal `dev` and `HERD_BUILD_DATE` to an
+empty string, and a build with no args given still succeeds. `make version` (alias
+`make build-info`) prints what the Makefile computed without building anything. A value
+already present in the environment (set by CI or a release script) is used as-is and
+skips the git calls; the Makefile guards the computation with `$(origin ...)`, not a
+plain `?=` default, specifically so an exported value always wins. A bare `docker compose build`
+invoked outside the Makefile (as the `integration` job in `ci.yml` and the full-stack
+job in `nightly.yml` both do) passes neither var, so those images report `HERD_BUILD=dev`
+and an empty `HERD_BUILD_DATE`; that is the documented degraded case, not a bug. Backend
+services surface both as env vars (`ENV HERD_BUILD=... HERD_BUILD_DATE=...` near the end
+of each `services/*/Dockerfile`, after the dependency-install layers so a build-string
+change never invalidates the slow `uv export`/`uv pip install` layers); the frontend
+receives the `VITE_`-prefixed equivalents below.
+
 ## Frontend (Vite build-time)
 
 These are baked into the bundle at build time (Vite reads `VITE_*` env vars during `npm run build`). To flip a flag you rebuild the frontend image (`docker compose up -d --build frontend`).
@@ -405,6 +432,8 @@ These are baked into the bundle at build time (Vite reads `VITE_*` env vars duri
 | Variable | Default | Purpose |
 |---|---|---|
 | `VITE_AI_CHAT_ENABLED` | `false` | Render the multi-turn chat UI for the reservation assistant. When `false` the legacy single-shot UI renders instead and each request is independent. Flip to `true` per environment after smoke-testing the round-trip. |
+| `VITE_HERD_BUILD` | `dev` | The build identifier, mapped in `docker-compose.yml` from the host `HERD_BUILD` value described above (Vite only bakes in vars that carry the `VITE_` prefix). |
+| `VITE_HERD_BUILD_DATE` | (empty) | The build date, mapped from the host `HERD_BUILD_DATE` value described above. |
 
 ## E2E test runner
 
