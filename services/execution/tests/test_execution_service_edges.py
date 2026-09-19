@@ -329,6 +329,105 @@ async def test_run_driver_action_falsy_success_value_records_failed(db, monkeypa
     assert run.error == "driver reported failure"
 
 
+# --- run_driver_action raised-exception handling (issue #840) ---
+#
+# A driver call that RAISED (sandbox transport failure, result["success"] is
+# False, with exception_class/exception_message set by driver_sandbox.py) must
+# never store or return the raw exception text: only the class name. This is
+# distinct from a driver that RETURNS {"success": False}, covered above,
+# which keeps the driver's own message verbatim.
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_raised_exception_stores_class_name_only(db, monkeypatch):
+    """error is 'driver raised <Class>'; the secret-looking message text
+    appears nowhere in the stored run.error or in run.output."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(
+            return_value={
+                "success": False,
+                "output": None,
+                "error": "driver raised AttributeError",
+                "exception_class": "AttributeError",
+                "exception_message": (
+                    "'Driver' object has no attribute 'configure' at host "
+                    "10.9.9.9 with token sekrit-token-value"
+                ),
+                "duration_ms": 4,
+            }
+        ),
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+    assert run.status == "FAILED"
+    assert run.error == "driver raised AttributeError"
+    # The secret-looking substring must not leak into anything persisted.
+    assert "sekrit-token-value" not in (run.error or "")
+    assert "10.9.9.9" not in (run.error or "")
+    assert run.output is None
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_raised_exception_logs_full_text_with_run_id(
+    db, monkeypatch, caplog
+):
+    """The full exception text goes to the service log, tagged with run_id,
+    even though it never reaches the stored/returned error."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(
+            return_value={
+                "success": False,
+                "output": None,
+                "error": "driver raised RuntimeError",
+                "exception_class": "RuntimeError",
+                "exception_message": "connection refused to 10.9.9.9",
+                "duration_ms": 4,
+            }
+        ),
+    )
+
+    with caplog.at_level("ERROR"):
+        run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+
+    assert run.status == "FAILED"
+    matching = [r for r in caplog.records if getattr(r, "run_id", None) == str(run.id)]
+    assert len(matching) == 1
+    assert matching[0].exception_class == "RuntimeError"
+    assert matching[0].exception_message == "connection refused to 10.9.9.9"
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_returned_failure_keeps_driver_message(db, monkeypatch):
+    """A driver that RAISES no exception but RETURNS a failure keeps its own
+    message verbatim; this is the pre-existing rule #370 path, unaffected by
+    the raised-exception handling above."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "execute_driver_method",
+        MagicMock(
+            return_value={
+                "success": True,
+                "output": {"success": False, "error": "vtysh: command rejected"},
+                "duration_ms": 6,
+            }
+        ),
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+    assert run.status == "FAILED"
+    assert run.error == "vtysh: command rejected"
+
+
 # --- run_driver_action configure validation: published schema vs registry ---
 
 # A driver-published schema shaped like the FRR Management driver's: it accepts

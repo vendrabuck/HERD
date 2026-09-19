@@ -511,6 +511,23 @@ async def run_driver_action(
         )
     else:
         error_msg = result.get("error", "Unknown error")
+        exception_class = result.get("exception_class")
+        if exception_class:
+            # The driver call (or its instantiation, or driver loading inside
+            # the sandbox) raised (issue #840). error_msg is already the safe,
+            # class-name-only string (driver_sandbox.py builds it); the full
+            # exception text is logged here, where run_id is known, and goes
+            # no further than this log record: never into the run row or an
+            # API response, since it can carry hosts, paths, or
+            # credential-adjacent text.
+            logger.error(
+                "Driver call raised an exception",
+                extra={
+                    "run_id": str(run.id),
+                    "exception_class": exception_class,
+                    "exception_message": result.get("exception_message"),
+                },
+            )
         is_timeout = "timed out" in (error_msg or "")
         run = await update_execution_run(
             db,

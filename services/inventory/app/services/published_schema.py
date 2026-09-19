@@ -35,7 +35,15 @@ _MEMO: dict[tuple[str, str], tuple[float, dict | None]] = {}
 _MEMO_TTL_SECONDS = 30.0
 
 
-def _driver_for_device(device: Device) -> DriverPackage | None:
+def driver_for_device(device: Device) -> DriverPackage | None:
+    """Resolve a device's driver package, or None if unresolvable.
+
+    Both `device.template` and `template.driver` are eager (`lazy="joined"`)
+    relationships (see app/models/device.py and app/models/template.py), so
+    this is a plain attribute walk with no extra query. Public because
+    manage_guard and apply_scheduler share this lookup (issue #839); do not
+    add a second copy.
+    """
     template = device.template
     return template.driver if template else None
 
@@ -93,7 +101,7 @@ async def published_schema_for_device(device: Device) -> dict | None:
     the single resolution point shared by the create/restore write paths and the
     admin-readable proxy route.
     """
-    driver = _driver_for_device(device)
+    driver = driver_for_device(device)
     if driver is None:
         return None
     return await _fetch_published_schema(driver)

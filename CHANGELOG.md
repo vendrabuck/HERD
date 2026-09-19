@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- Gated device-config apply on driver capability and stopped leaking raw driver
+  exception text (issues #839 and #840): inventory's two apply entry points
+  (`POST /devices/{id}/config-versions/{vid}/apply` and `.../schedule`) now refuse with
+  a structured 409 `driver_cannot_configure` when the device's driver connection type
+  has no `configure` in its contract (today, every type except Management), checked
+  right after authorization and before any call to execution or job row creation; the
+  apply_scheduler background loop carries the same check at fire time for jobs queued
+  before this change or a driver swapped after scheduling. Config-version
+  create/list/read/restore are unaffected on every connection type. New
+  `herd_common.device_config.CONFIGURE_CONNECTION_TYPES` /
+  `connection_type_supports_configure`, kept in parity with execution's
+  `REQUIRED_METHODS` by a dedicated test. The AI assistant's `schedule_config_apply`
+  tool surfaces the 409's plain-English message instead of a dict repr. Separately, a
+  driver method (or its instantiation, or driver loading) that RAISES now stores and
+  returns only the exception class name (e.g. `"driver raised AttributeError"`), never
+  the message, on an execution run and an apply job's `error` field; the full text
+  still goes to the execution service log, tagged with `run_id`. A driver that RETURNS
+  a failure verdict (`{"success": false, ...}`) is unaffected and keeps its own
+  message. See `docs/DRIVERS.md` for the full rule and the `frr_l3`/`frr_mgmt` pairing
+  example.
 - AI topology generation gained cabling-aware device resolution (issue #828, PR #836):
   the resolver (`services/ai-orchestrator/app/services/resolver.py`) assigns concrete
   devices to proposed roles with a deterministic backtracking search over candidates

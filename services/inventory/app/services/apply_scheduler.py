@@ -29,14 +29,25 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from herd_common.acl import user_has_manage_or_owns_active_reservation_internal
+from herd_common.device_config import connection_type_supports_configure
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
+from app.models.device import Device
 from app.models.device_config_apply_job import DeviceConfigApplyJob
 from app.models.device_config_version import DeviceConfigVersion
+from app.services.published_schema import driver_for_device
 
 logger = logging.getLogger(__name__)
+
+# Pinned (issues #839/#840): tests match on this exact string. Fired when a
+# job's device driver can no longer (or never could) configure at fire time,
+# e.g. a job queued before the schedule-time gate existed, or a driver swap
+# between scheduling and firing.
+DRIVER_CANNOT_CONFIGURE_ERROR = (
+    "driver cannot configure: the device's driver contract has no configure method"
+)
 
 
 async def _due_jobs(db: AsyncSession, now: datetime, limit: int = 10) -> list[DeviceConfigApplyJob]:
@@ -282,6 +293,24 @@ async def fire_job(
         job.fired_at = datetime.now(timezone.utc)
         await db.commit()
         return
+
+    # Driver-capability gate, re-checked at fire time (issues #839/#840): the
+    # schedule-time gate in apply_jobs.schedule_apply_job cannot see a driver
+    # swapped after scheduling, and a job queued before that gate existed can
+    # still be sitting pending. Uses the device's CURRENT driver, not the
+    # version's frozen connection_type, so a swap is caught. A device row that
+    # cannot be resolved is left alone (matches the schedule-time gate's
+    # no-driver no-op); execution's own /execute/internal call is what would
+    # surface that failure instead.
+    device = await db.get(Device, job.device_id)
+    if device is not None:
+        driver = driver_for_device(device)
+        if driver is not None and not connection_type_supports_configure(driver.connection_type):
+            job.status = "failed"
+            job.error = DRIVER_CANNOT_CONFIGURE_ERROR
+            job.fired_at = datetime.now(timezone.utc)
+            await db.commit()
+            return
 
     new_status, run_id, error = await _post_internal_execute(client, job, version.config)
     job.status = new_status

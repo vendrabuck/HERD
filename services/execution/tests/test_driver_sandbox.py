@@ -137,10 +137,17 @@ def test_execute_status():
 
 
 def test_execute_failing_driver():
+    """A driver method that raises (issue #840): 'error' is class-name-only,
+    never the raw message (which can carry secret-adjacent text), and the raw
+    message survives only in the new exception_message field for the caller
+    to log."""
     driver_dir = _make_driver_dir(FAILING_DRIVER)
     result = execute_driver_method(driver_dir, "login", {"HERD_device_id": "test"}, timeout=10)
     assert result["success"] is False
-    assert "Connection refused" in result["error"]
+    assert result["error"] == "driver raised RuntimeError"
+    assert "Connection refused" not in result["error"]
+    assert result["exception_class"] == "RuntimeError"
+    assert result["exception_message"] == "Connection refused"
 
 
 def test_execute_timeout():

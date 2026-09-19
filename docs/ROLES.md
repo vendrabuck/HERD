@@ -460,6 +460,15 @@ administering their reserved devices. Admins who want to keep AI-driven writes
 off-limits for specific devices can revoke device visibility from the topology so
 the device cannot be reserved in the first place.
 
+The two apply endpoints (`.../apply` and `.../schedule`) carry a second, narrower gate
+after this authorization check (issue #839): a caller who passes manage-or-reservation
+still gets a `409 {"error": "driver_cannot_configure", ...}` if the device's driver
+connection type has no `configure` in its contract (today, every type except
+Management). The 409 always runs after the 403 check, never before, so an unauthorized
+caller learns nothing about the device's driver. Config-version create/list/read/restore
+are unaffected by this gate on every connection type; see `docs/DRIVERS.md` for the
+full rule.
+
 Read paths (list config versions, get version detail, diff) are not gated by this
 manage-or-reservation-ownership widening. As of issue #718, they instead carry the
 same plain group-visibility gate as `GET /devices/{id}` and `GET /devices/{id}/ports`:

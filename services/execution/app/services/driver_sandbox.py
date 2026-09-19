@@ -128,7 +128,15 @@ def execute_driver_method(
         dict with keys: success (bool), output (dict or None), error (str or None),
         duration_ms (int), transcript (list[dict]). Transcript rows come from
         the driver's `record_command` calls; runs whose drivers do not use the
-        helper return an empty list.
+        helper return an empty list. When the driver call (or its
+        instantiation, or driver loading inside the child) RAISED (issue
+        #840), two extra keys are present: exception_class (str, e.g.
+        "AttributeError") and exception_message (str, the raw exception
+        text). `error` is then already the safe, class-name-only string
+        (f"driver raised {exception_class}"); exception_message is for the
+        caller to LOG ONLY, since it can carry hosts, paths, or
+        credential-adjacent text, and must never be stored on a row or
+        returned to an API caller.
 
     Raises:
         Nothing; errors are captured in the return dict.
@@ -263,8 +271,37 @@ def execute_driver_method(
                     error = (
                         f"driver killed by signal {-result.returncode} (likely a resource limit)"
                     )
-                else:
-                    error = result.stderr or result.stdout or "Unknown error"
+                    return {
+                        "success": False,
+                        "output": None,
+                        "error": error,
+                        "duration_ms": elapsed_ms,
+                        "transcript": transcript,
+                    }
+                # A positive returncode means _runner.py's own except-and-exit-1
+                # handler ran, which prints structured JSON (issue #840): a
+                # driver method (or its instantiation, or driver loading inside
+                # the child) raised. Surface only the exception CLASS as
+                # 'error' (what a caller may store or return); the full
+                # exception_message rides along for the caller to LOG, never to
+                # persist or return, since it can carry hosts, paths, or
+                # credential-adjacent text. A stderr that does not parse as
+                # that JSON shape (an older _runner.py, or a failure that never
+                # reached its handler) falls back to the old plain-text
+                # behavior unchanged.
+                parsed_exception = _parse_driver_exception(result.stderr)
+                if parsed_exception is not None:
+                    exception_class, exception_message = parsed_exception
+                    return {
+                        "success": False,
+                        "output": None,
+                        "error": f"driver raised {exception_class}",
+                        "exception_class": exception_class,
+                        "exception_message": exception_message,
+                        "duration_ms": elapsed_ms,
+                        "transcript": transcript,
+                    }
+                error = result.stderr or result.stdout or "Unknown error"
                 return {
                     "success": False,
                     "output": None,
@@ -312,6 +349,31 @@ def extract_config_schema(driver_path: str, timeout: int | None = None) -> dict:
         context={},
         timeout=timeout,
     )
+
+
+def _parse_driver_exception(stderr: str | None) -> tuple[str, str] | None:
+    """Parse _runner.py's structured "driver raised" stderr line (issue #840).
+
+    On any exception escaping main(), _runner.py prints a single JSON line
+    {"exception_class": ..., "message": ...} to stderr instead of plain
+    text. Returns (exception_class, message) on a match; returns None for
+    anything else (empty stderr, non-JSON text, JSON that is not that exact
+    shape), which tells the caller to fall back to treating stderr as plain
+    text, matching the pre-#840 behavior.
+    """
+    if not stderr or not stderr.strip():
+        return None
+    try:
+        parsed = json.loads(stderr.strip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    exception_class = parsed.get("exception_class")
+    message = parsed.get("message")
+    if not isinstance(exception_class, str) or not isinstance(message, str):
+        return None
+    return exception_class, message
 
 
 def _read_transcript(path: str | None) -> list[dict]:

@@ -83,7 +83,12 @@ class Driver:
 
 def test_extract_schema_that_raises_is_failed_run():
     """A config_schema() that raises surfaces as a failed run (success=False),
-    never an unhandled crash; the caller falls back to the registry."""
+    never an unhandled crash; the caller falls back to the registry.
+
+    `error` is class-name-only (issue #840: the sandbox never returns raw
+    exception text on 'error', even here where nothing downstream stores or
+    returns it; extract_config_schema_json only logs it and returns None).
+    The raw message survives on exception_message for that log line."""
     code = """
 class Driver:
     def __init__(self, context):
@@ -97,7 +102,9 @@ class Driver:
         result = extract_config_schema(tmpdir.name)
     assert result["success"] is False
     assert result["output"] is None
-    assert "schema build blew up" in (result["error"] or "")
+    assert result["error"] == "driver raised RuntimeError"
+    assert result["exception_class"] == "RuntimeError"
+    assert result["exception_message"] == "schema build blew up"
 
 
 # --- (d) classmethod invoked WITHOUT instantiation ---------------------------

@@ -31,7 +31,11 @@ from app.schemas.device_config import (
     ApplyJobsInternalSummary,
     PaginatedApplyJobs,
 )
-from app.services.manage_guard import _is_admin, _user_can_manage_device
+from app.services.manage_guard import (
+    _assert_driver_can_configure,
+    _is_admin,
+    _user_can_manage_device,
+)
 
 APPLY_JOBS_SUMMARY_NAME_CAP = 20
 
@@ -194,6 +198,13 @@ async def schedule_apply_job(
                     "manage permission required on this device (or active reservation ownership)"
                 ),
             )
+
+    # Driver-capability gate (issue #839): after authorization so an
+    # unauthorized caller learns nothing new about the device's driver, and
+    # before the reservation/dry-run checks and job creation below, so an
+    # apply that can never succeed is refused up front rather than reaching
+    # the runner. Raises 409 with a structured detail on refusal.
+    _assert_driver_can_configure(device)
 
     # Reservation-id validation (issue #704): an optional reservation_id must
     # actually be an active reservation the caller owns that contains this

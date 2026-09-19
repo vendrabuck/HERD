@@ -26,6 +26,31 @@ dynamic template's `driver_id` instead of a device's, and it is invoked by a ded
 create/teardown flow rather than the L1/L2/L3 reservation lifecycle. See the dedicated
 section below.
 
+### Apply versus config versions: which contract runs configure (issue #839)
+
+A device-config APPLY (`POST /devices/{id}/config-versions/{vid}/apply`, `.../schedule`,
+and the AI assistant's `schedule_config_apply` tool) only ever runs against a driver
+whose connection type's contract includes `configure`. Looking at the table above, that
+is Management alone today. Inventory judges this by the device's driver CONNECTION TYPE,
+not by whether the driver class happens to define a `configure` method: a Layer 2 or
+Layer 3 Switch driver that implements `configure` (as the `mock_l3` test driver does) is
+still refused, with a structured 409 `driver_cannot_configure` detail naming the
+connection type and driver.
+
+Creating, listing, reading, and restoring config VERSIONS is unaffected on every
+connection type. On a Layer 2 or Layer 3 Switch, a config version is how VLAN and
+routing intent is stored (ADR 0014); nothing ever applies it through this generic path,
+because execution derives the actual VLAN/route provisioning from resolved topology
+hops, not from a pushed config blob. Only the APPLY step is gated.
+
+If a physical box needs both layer-specific provisioning (VLANs, routes) and a generic
+config push (e.g. a full running-config change), pair two driver packages against the
+same device family: one with the Layer 2 or Layer 3 Switch connection type for the
+provisioning contract, and a separate one with the Management connection type for
+`configure`. `drivers/frr_l3` (routes) and `drivers/frr_mgmt` (configure, via vtysh
+commands) are the checked-in worked example of this pairing for the same underlying FRR
+router.
+
 ---
 
 ## Package structure
@@ -1018,12 +1043,17 @@ The interface argument is the L3 switch's own interface name (as stored in the s
 config version), not a DUT-side name, consistent with the switch-side identity rule for
 L1 and L2 ports.
 
-### Optional configure support
+### configure is not part of this contract (issue #839)
 
-`configure(**config)` is not part of the required L3 method set, but inventory apply
-jobs and the AI dry-run-then-confirm flow invoke `configure`. An L3 driver that should
-also accept full config pushes through those paths must implement it; the checked-in
-`drivers/mock_l3` package is the worked example.
+`configure(**config)` is not part of the required L3 method set, and inventory's two
+apply entry points (`POST /devices/{id}/config-versions/{vid}/apply` and
+`.../schedule`) now refuse to invoke it against a Layer 3 Switch device at all: a
+config APPLY is only ever attempted against a driver whose connection type's contract
+includes `configure`, which today is Management alone (see "Apply versus config
+versions: which contract runs `configure`" below). Implementing `configure` on an L3
+driver, as `mock_l3` still does for test coverage, no longer makes it reachable
+through either apply route; the gate is judged by connection type, not by inspecting
+what the driver class happens to define.
 
 ---
 

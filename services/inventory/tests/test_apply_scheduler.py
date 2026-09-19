@@ -13,11 +13,15 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 from app.database import Base
+from app.models.device import Device, DeviceStatus
 from app.models.device_config_apply_job import DeviceConfigApplyJob
 from app.models.device_config_version import DeviceConfigVersion
+from app.models.driver_package import DriverPackage
+from app.models.template import DeviceTemplate
 from app.services import apply_scheduler
 from app.services.apply_scheduler import (
     CREATOR_UNAUTHORIZED_ERROR,
+    DRIVER_CANNOT_CONFIGURE_ERROR,
     _due_jobs,
     _mark_failed_in_fresh_session,
     _post_internal_execute,
@@ -25,6 +29,7 @@ from app.services.apply_scheduler import (
     _resweep_stale_running,
     fire_job,
 )
+from herd_common.enums import TopologyType
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
@@ -123,6 +128,70 @@ async def _seed_version_and_job(
     db.add(job)
     await db.commit()
     return version, job
+
+
+_driver_counter = 0
+
+
+async def _seed_device_version_and_job(
+    db,
+    *,
+    connection_type: str,
+    scheduled_for: datetime,
+) -> tuple[Device, DeviceConfigVersion, DeviceConfigApplyJob]:
+    """Like _seed_version_and_job, but with a REAL Device/Template/Driver row
+    (issue #839/#840 fire-time gate needs the device's current driver, not
+    the version's frozen connection_type)."""
+    global _driver_counter
+    _driver_counter += 1
+    driver = DriverPackage(
+        name=f"SchedDrv{_driver_counter}",
+        connection_type=connection_type,
+        filename="d.zip",
+        storage_key=f"drivers/sched-{_driver_counter}",
+        size_bytes=10,
+        sha256=f"sha-{_driver_counter}",
+        uploaded_by="admin",
+    )
+    db.add(driver)
+    await db.flush()
+    template = DeviceTemplate(
+        name=f"SchedTpl{_driver_counter}",
+        driver_id=driver.id,
+        sections=[],
+    )
+    db.add(template)
+    await db.flush()
+    device = Device(
+        name=f"sched-dev-{_driver_counter}",
+        template_id=template.id,
+        topology_type=TopologyType.PHYSICAL,
+        status=DeviceStatus.AVAILABLE,
+        field_data={},
+    )
+    db.add(device)
+    await db.flush()
+    version = DeviceConfigVersion(
+        device_id=device.id,
+        version_number=1,
+        connection_type=connection_type,
+        config={"vlan": 100} if connection_type == "Management" else {"routes": []},
+        created_by=uuid.uuid4(),
+        author_name="alice",
+    )
+    db.add(version)
+    await db.flush()
+    job = DeviceConfigApplyJob(
+        device_id=device.id,
+        version_id=version.id,
+        scheduled_for=scheduled_for,
+        status="pending",
+        created_by=uuid.uuid4(),
+        author_name="alice",
+    )
+    db.add(job)
+    await db.commit()
+    return device, version, job
 
 
 @pytest.mark.asyncio
@@ -875,3 +944,98 @@ async def test_run_scheduler_loop_backs_off_on_db_failure_then_recovers(monkeypa
         "expected backoff to double after failed tick and reset on successful tick: "
         f"sleeps[0]={sleeps[0]} should exceed sleeps[1]={sleeps[1]}"
     )
+
+
+# --- Fire-time driver-capability gate (issues #839/#840) --------------------
+
+
+@pytest.mark.asyncio
+async def test_fire_job_fails_when_driver_cannot_configure(monkeypatch):
+    """A job whose device's CURRENT driver has no configure contract (e.g.
+    queued before the schedule-time gate existed, or the driver was swapped
+    after scheduling) fails at fire time with the pinned error and never
+    calls execution."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        device, _version, job = await _seed_device_version_and_job(
+            db, connection_type="Layer 3 Switch", scheduled_for=now
+        )
+        # Force fire_job's db.get(Device, ...) to issue a fresh, eager-joined
+        # SELECT rather than returning the just-created, relationship-unloaded
+        # object straight out of this session's identity map (this session
+        # doubles as both the seeder and fire_job's caller, unlike production,
+        # where the scheduler loop always uses its own fresh session). Expire
+        # only `device`, not the whole session: expiring `job` too would make
+        # fire_job's own `job.id` access hit the same sync-lazy-load trap.
+        db.expire(device)
+
+        monkeypatch.setattr(
+            "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+        )
+        _patch_creator_authorized(monkeypatch)
+        client = FakeClient(
+            post_responses={
+                "/execute/internal": FakeResponse(201, {"id": "x", "status": "SUCCESS"}),
+            }
+        )
+        await fire_job(db, job, client)
+        await db.refresh(job)
+        assert job.status == "failed"
+        assert job.error == DRIVER_CANNOT_CONFIGURE_ERROR
+        assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_fire_job_proceeds_when_driver_can_configure(monkeypatch):
+    """Control case: a Management-driver device is unaffected and still fires
+    normally through to success."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        device, _version, job = await _seed_device_version_and_job(
+            db, connection_type="Management", scheduled_for=now
+        )
+        db.expire(device)
+
+        monkeypatch.setattr(
+            "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+        )
+        _patch_creator_authorized(monkeypatch)
+        client = FakeClient(
+            post_responses={
+                "/execute/internal": FakeResponse(
+                    201, {"id": "11111111-1111-1111-1111-111111111111", "status": "SUCCESS"}
+                ),
+            }
+        )
+        await fire_job(db, job, client)
+        await db.refresh(job)
+        assert job.status == "success"
+        assert len(client.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_fire_job_unresolvable_device_is_left_to_existing_behavior(monkeypatch):
+    """Pin today's behavior for a job whose device row cannot be resolved at
+    all (issue #839's 'no driver resolvable' rule, extended: no Device row is
+    an even more extreme case). The gate is a no-op and firing proceeds
+    exactly as it did before this change, calling execution."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        # _seed_version_and_job uses a synthetic device_id with NO Device row.
+        _, job = await _seed_version_and_job(db, scheduled_for=now)
+
+        monkeypatch.setattr(
+            "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+        )
+        _patch_creator_authorized(monkeypatch)
+        run_id = "22222222-2222-2222-2222-222222222222"
+        client = FakeClient(
+            post_responses={
+                "/execute/internal": FakeResponse(201, {"id": run_id, "status": "SUCCESS"}),
+            }
+        )
+        await fire_job(db, job, client)
+        await db.refresh(job)
+        assert job.status == "success"
+        assert str(job.run_id) == run_id
+        assert len(client.posts) == 1
