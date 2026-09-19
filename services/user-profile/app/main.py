@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route, service_version
 
 from app.config import settings
 from app.database import Base, engine
@@ -28,7 +29,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD User Profile Service",
     description="User preferences and saved filters for HERD",
-    version="0.1.0",
+    version=service_version("herd-user-profile"),
     lifespan=lifespan,
 )
 
@@ -42,3 +43,6 @@ app.include_router(preferences_router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "user-profile"}
+
+
+add_version_route(app, service="user-profile", distribution="herd-user-profile")

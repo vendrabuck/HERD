@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from herd_common.version import add_version_route, service_version
 from pydantic import BaseModel, field_validator
 
 from app.auth import create_session_token, require_config_session
@@ -28,7 +29,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="HERD Config Service", lifespan=lifespan)
+app = FastAPI(
+    title="HERD Config Service",
+    version=service_version("herd-config"),
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,6 +74,9 @@ class SaveSettingsRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "config"}
+
+
+add_version_route(app, service="config", distribution="herd-config")
 
 
 @app.get("/status")

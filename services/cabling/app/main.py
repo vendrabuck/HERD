@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route, service_version
 
 from app.config import settings
 from app.database import Base, engine
@@ -46,7 +47,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD Cabling Service",
     description="Backend connection management between lab devices",
-    version="0.1.0",
+    version=service_version("herd-cabling"),
     lifespan=lifespan,
 )
 
@@ -67,3 +68,6 @@ app.include_router(versions_router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "cabling"}
+
+
+add_version_route(app, service="cabling", distribution="herd-cabling")

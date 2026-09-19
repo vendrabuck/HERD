@@ -24,6 +24,7 @@ from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route, service_version
 
 from app.config import settings, warn_if_anthropic_api_key_unused
 from app.database import Base, engine
@@ -85,7 +86,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD AI Orchestrator Service",
     description="LLM-driven topology construction and device configuration",
-    version="0.1.0",
+    version=service_version("herd-ai-orchestrator"),
     lifespan=lifespan,
 )
 
@@ -106,6 +107,9 @@ app.include_router(purpose_classification_router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "ai-orchestrator"}
+
+
+add_version_route(app, service="ai-orchestrator", distribution="herd-ai-orchestrator")
 
 
 @app.get("/status")

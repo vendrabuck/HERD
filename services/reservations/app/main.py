@@ -9,6 +9,7 @@ from herd_common.jetstream import ensure_stream
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.outbox import run_outbox_relay
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route, service_version
 
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
@@ -121,7 +122,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD Reservations Service",
     description="Lab equipment reservation management for HERD",
-    version="0.1.0",
+    version=service_version("herd-reservations"),
     lifespan=lifespan,
 )
 
@@ -134,6 +135,8 @@ app.add_middleware(RequestLoggingMiddleware)
 async def health():
     return {"status": "ok", "service": "reservations"}
 
+
+add_version_route(app, service="reservations", distribution="herd-reservations")
 
 app.include_router(reservations_router)
 app.include_router(purpose_review_router)

@@ -9,6 +9,7 @@ from herd_common.consumer_schema_gate import (
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route
 
 from app.config import settings
 from app.database import Base, engine
@@ -52,6 +53,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD API v1",
     description="Versioned, stable external API facade for HERD",
+    # This is the published /api/v1 facade CONTRACT version (also pinned in
+    # docs/api/v1-openapi.json), a different thing from the product build
+    # version. Do not point it at service_version("herd-integration"); the
+    # product version is reported only through the /version endpoint below,
+    # and that endpoint is excluded from this OpenAPI document for the same
+    # reason (issue #846).
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -70,3 +77,14 @@ if settings.webhook_test_sink_enabled:
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "integration"}
+
+
+# include_in_schema=False: /api/v1 is the published external API contract,
+# and product build info must not enter it even though the route still
+# answers (issue #846).
+add_version_route(
+    app,
+    service="integration",
+    distribution="herd-integration",
+    include_in_schema=False,
+)

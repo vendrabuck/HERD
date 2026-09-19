@@ -9,6 +9,7 @@ from herd_common.consumer_schema_gate import (
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route, service_version
 
 from app.config import settings
 from app.database import Base, engine
@@ -47,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD Notifications Service",
     description="Event-driven in-app notifications for HERD",
-    version="0.1.0",
+    version=service_version("herd-notifications"),
     lifespan=lifespan,
 )
 
@@ -61,3 +62,6 @@ app.include_router(notifications_router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "notifications"}
+
+
+add_version_route(app, service="notifications", distribution="herd-notifications")

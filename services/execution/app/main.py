@@ -13,6 +13,7 @@ from herd_common.jetstream import ensure_stream
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.outbox import run_outbox_relay
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route, service_version
 
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
@@ -185,7 +186,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD Execution Service",
     description="Driver execution engine for infrastructure devices",
-    version="0.1.0",
+    version=service_version("herd-execution"),
     lifespan=lifespan,
 )
 
@@ -219,3 +220,9 @@ mount_api_routers(app)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "execution"}
+
+
+# Registered unconditionally, like /health above: EXECUTION_POLLER_ONLY mounts
+# no API routers via mount_api_routers, but both liveness endpoints must still
+# answer on a poller-only replica.
+add_version_route(app, service="execution", distribution="herd-execution")
