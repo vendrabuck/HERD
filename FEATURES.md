@@ -380,6 +380,13 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   (Issue #620.)
 - **Structured JSON logging** (Shipped): every service emits JSON logs with request
   middleware and business-event logging; per-service log level configurable.
+- **Version and build visibility** (Shipped): the login page and the app header show
+  the running version, and an admin-only About page lists the version, build, and
+  build date of the frontend and of every backend service, read live from each
+  service's `GET /version`. A service that does not answer shows as unreachable in its
+  own row, and a service whose version or build differs from the frontend's is flagged,
+  which is how a partly rebuilt stack becomes visible. The build string is derived from
+  the release tags (`git describe`), so it needs no counter to maintain. (Issue #846.)
 - **Config service** (Shipped): zero-database web UI for configuring HERD on first
   start. Values saved through the UI take precedence over `.env`; an auto-bootstrapped
   config file stays subordinate, so pure-`.env` setups behave unchanged.

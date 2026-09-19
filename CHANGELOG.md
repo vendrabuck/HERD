@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- Version and build visibility (issue #846). Every service now reports its real
+  version: `FastAPI(version=...)` reads the package version from its own
+  `pyproject.toml` through `herd_common.version.service_version`, replacing the
+  hardcoded `0.1.0` that eleven services had carried since the first release, so each
+  `/docs` page and `/openapi.json` is correct and a release bump needs no second edit.
+  Every service answers an unauthenticated `GET /version` with `service`, `version`,
+  `build`, and `build_date`. The integration service keeps its `1.0.0` facade
+  contract version, and its `/version` is excluded from the published `/api/v1`
+  OpenAPI document. The build string is `git describe --tags --always --dirty`
+  (`v0.5.0` at a release commit, otherwise `vX.Y.Z-N-g<hash>`, where N is the number
+  of commits since the tag), computed on the host by the Makefile and passed to every
+  image as a late build arg so the dependency layers stay cached; the build date is
+  the HEAD commit date, not the wall clock, so an unchanged commit produces unchanged
+  images. A bare `docker compose build` outside the Makefile reports `dev`. `make
+  version` prints both values. The frontend shows its version on the login page and
+  beside the HERD wordmark, and a new admin-only About page (`/admin/about`, last item
+  in the Administration menu) lists the version, build, and build date of the frontend
+  and of all 12 services, marks a service that does not answer as unreachable in its
+  own row, and flags a row whose version or build differs from the frontend's; it
+  treats the PEP 440 and semver spellings of one pre-release (`0.6.0.dev0` and
+  `0.6.0-dev`) as the same, and never flags a `dev` build. See `docs/ENV_VARS.md` for
+  `HERD_BUILD` and `HERD_BUILD_DATE`.
 - Gated device-config apply on driver capability and stopped leaking raw driver
   exception text (issues #839 and #840): inventory's two apply entry points
   (`POST /devices/{id}/config-versions/{vid}/apply` and `.../schedule`) now refuse with
