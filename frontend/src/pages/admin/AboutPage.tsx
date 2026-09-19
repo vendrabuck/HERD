@@ -1,12 +1,13 @@
 import { RefreshCw } from "lucide-react";
-import { APP_VERSION, APP_BUILD, APP_BUILD_DATE, sameRelease, buildsDiffer } from "@/lib/appVersion";
+import {
+  APP_VERSION,
+  APP_BUILD,
+  APP_BUILD_DATE,
+  sameRelease,
+  buildsDiffer,
+  formatBuildDate,
+} from "@/lib/appVersion";
 import { useServiceVersions } from "@/api/about";
-
-function formatBuildDate(iso: string | null): string {
-  if (!iso) return "-";
-  const parsed = new Date(iso);
-  return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleString();
-}
 
 export function AboutPage() {
   const rows = useServiceVersions();

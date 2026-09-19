@@ -69,3 +69,18 @@ export function buildsDiffer(a: string, b: string): boolean {
   if (a === "dev" || b === "dev") return false;
   return a !== b;
 }
+
+/**
+ * A build date for display: always UTC and labeled as such, e.g.
+ * "2026-09-19 22:18 UTC". Not toLocaleString(): that renders in the viewer's
+ * own locale and timezone with no zone shown, so the same image reads as a
+ * different time in every browser, and none of them matches what
+ * `make version` prints on the host (ISO 8601 UTC). Returns "-" for null and
+ * the raw string for anything that does not parse as a date.
+ */
+export function formatBuildDate(iso: string | null): string {
+  if (!iso) return "-";
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return iso;
+  return `${parsed.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}

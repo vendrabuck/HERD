@@ -8,7 +8,10 @@ API, per the pw_browser fixture's docstring in conftest.py) and the shared
 pw_login/pw_api helpers.
 
 Mutates nothing (only ever reads /version and /admin/about), so there is no
-baseline to restore.
+baseline to restore. The non-admin redirect for /admin/about is covered by
+test_admin_guard_redirect_playwright.py's path list, which registers ONE
+account for every admin route rather than one more per page (auth exposes no
+user-delete endpoint, so every such account persists).
 
 Depends on two sibling lanes of issue #846 that are separate parallel
 branches: the backend lane's GET /version endpoint on all 12 services, and
@@ -19,15 +22,9 @@ every service reports "dev"/"unreachable" rather than a real build string;
 this test only asserts the displayed version/build MATCH the API's own
 answer, so it holds either way.
 
-NOT RUN by this agent (no Docker stack in this worktree, and this agent must
-not touch the running stack). Requires the live gate (`make test-e2e` or
-`make test-e2e-seeded`) to execute.
+Needs a running stack (`make test-e2e` or `make test-e2e-seeded`).
 """
 
-import uuid
-
-import httpx
-import pytest
 from playwright.sync_api import expect
 
 from .conftest import HOST_BASE_URL, pw_api, pw_login
@@ -80,26 +77,8 @@ def test_about_page_service_versions_match_the_api_readback(pw_page):
             continue
 
         body = resp.json()
-        expect(row.get_by_text("reachable")).to_be_visible()
+        # exact=True matters: get_by_text is a substring match by default, so a
+        # bare "reachable" also matches "unreachable" and would prove nothing.
+        expect(row.get_by_text("reachable", exact=True)).to_be_visible()
         expect(row).to_contain_text(body["version"])
-
-
-def test_non_admin_redirected_from_about_page(pw_page):
-    """A non-admin visiting /admin/about is redirected like any other admin
-    route (mirrors tests/e2e/test_admin_guard_redirect_playwright.py)."""
-    suffix = uuid.uuid4().hex[:8]
-    email = f"e2e-about-{suffix}@example.com"
-    password = f"e2e-about-{suffix}-pw1!"
-    with httpx.Client(verify=False, timeout=30.0) as client:
-        resp = client.post(
-            f"{HOST_BASE_URL}/api/auth/register",
-            json={"email": email, "username": f"e2e-about-{suffix}", "password": password},
-        )
-    if resp.status_code == 409:
-        pytest.skip("local registration disabled (AUTH_METHOD=ldap); cannot provision a user")
-    assert resp.status_code == 201, resp.text
-
-    pw_login(pw_page, email, password)
-    pw_page.goto(f"{HOST_BASE_URL}/admin/about")
-    pw_page.wait_for_url("**/topology**")
-    assert "/admin" not in pw_page.url
+        expect(row).to_contain_text(body["build"])

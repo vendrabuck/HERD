@@ -1,4 +1,11 @@
-import { APP_VERSION, APP_BUILD, APP_BUILD_DATE, sameRelease, buildsDiffer } from "@/lib/appVersion";
+import {
+  APP_VERSION,
+  APP_BUILD,
+  APP_BUILD_DATE,
+  sameRelease,
+  buildsDiffer,
+  formatBuildDate,
+} from "@/lib/appVersion";
 import pkg from "../../../package.json";
 
 describe("appVersion constants", () => {
@@ -67,5 +74,23 @@ describe("buildsDiffer", () => {
     expect(buildsDiffer("dev", "v0.5.0-16-gb29c8812")).toBe(false);
     expect(buildsDiffer("v0.5.0-16-gb29c8812", "dev")).toBe(false);
     expect(buildsDiffer("dev", "dev")).toBe(false);
+  });
+});
+
+describe("formatBuildDate", () => {
+  it("renders UTC with a label, matching what make version prints on the host", () => {
+    expect(formatBuildDate("2026-09-19T22:18:54Z")).toBe("2026-09-19 22:18 UTC");
+  });
+
+  it("converts an offset timestamp to UTC instead of showing the viewer's local time", () => {
+    expect(formatBuildDate("2026-09-19T15:18:54-07:00")).toBe("2026-09-19 22:18 UTC");
+  });
+
+  it("renders a dash for a missing date", () => {
+    expect(formatBuildDate(null)).toBe("-");
+  });
+
+  it("returns an unparseable string unchanged", () => {
+    expect(formatBuildDate("not a date")).toBe("not a date");
   });
 });

@@ -66,6 +66,8 @@ describe("AboutPage", () => {
     expect(screen.getByText("Frontend")).toBeInTheDocument();
     expect(screen.getByText(APP_VERSION)).toBeInTheDocument();
     expect(screen.getByText(APP_BUILD)).toBeInTheDocument();
+    // UTC and labeled, never the viewer's locale: see formatBuildDate.
+    expect(screen.getByText("2026-09-10 00:00 UTC")).toBeInTheDocument();
   });
 
   it("renders all 12 services once every /version call answers", async () => {
