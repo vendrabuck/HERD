@@ -9,6 +9,7 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import type { User } from "@/types/auth.types";
+import { APP_VERSION } from "@/lib/appVersion";
 
 function user(overrides: Partial<User> = {}): User {
   return {
@@ -111,6 +112,11 @@ describe("AppLayout", () => {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
     expect(screen.getByText("page content")).toBeInTheDocument();
+  });
+
+  it("shows the injected app version beside the HERD wordmark (issue #846)", () => {
+    renderLayout("/inventory");
+    expect(screen.getByTestId("app-version-header")).toHaveTextContent(`v${APP_VERSION}`);
   });
 
   it("does not render the Administration menu for a plain user", async () => {

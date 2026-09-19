@@ -6,6 +6,7 @@ import { isAdminRole } from "@/lib/roles";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
+import { APP_VERSION } from "@/lib/appVersion";
 
 const NAV_ITEMS = [
   { to: "/inventory", label: "Inventory" },
@@ -40,7 +41,12 @@ export function AppLayout() {
     <div className="flex flex-col h-screen overflow-hidden bg-gray-100">
       <header className="flex items-center justify-between px-4 py-2 bg-gray-900 text-white shrink-0 border-b border-gray-800">
         <div className="flex items-center gap-4">
-          <span className="font-bold text-lg tracking-tight">HERD</span>
+          <span className="flex items-baseline gap-1.5">
+            <span className="font-bold text-lg tracking-tight">HERD</span>
+            <span data-testid="app-version-header" className="text-xs text-gray-400 font-normal">
+              v{APP_VERSION}
+            </span>
+          </span>
           <nav className="flex gap-1">
             {NAV_ITEMS.map((item) => (
               <NavLink

@@ -11,7 +11,13 @@ export default tseslint.config(
     files: ["**/*.{ts,tsx}"],
     languageOptions: {
       ecmaVersion: 2020,
-      globals: globals.browser,
+      globals: {
+        ...globals.browser,
+        // vite.config.ts's define block (issue #846); see vite-env.d.ts.
+        __APP_VERSION__: "readonly",
+        __APP_BUILD__: "readonly",
+        __APP_BUILD_DATE__: "readonly",
+      },
     },
     plugins: {
       "react-hooks": reactHooks,
