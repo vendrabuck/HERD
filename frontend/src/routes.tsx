@@ -23,6 +23,7 @@ import { ConnectionsPage } from "@/pages/admin/ConnectionsPage";
 import { GrantsPage } from "@/pages/admin/GrantsPage";
 import { LdapSyncPage } from "@/pages/admin/LdapSyncPage";
 import { PurposeReviewPage } from "@/pages/admin/PurposeReviewPage";
+import { AboutPage } from "@/pages/admin/AboutPage";
 import { TemplatesPage } from "@/pages/TemplatesPage";
 import { TemplateEditorPage } from "@/pages/TemplateEditorPage";
 import { TopologyTemplatesPage } from "@/pages/TopologyTemplatesPage";
@@ -92,6 +93,7 @@ export const appRouteElements = (
         <Route path="/admin/hypervisors" element={<HypervisorsPage />} />
         <Route path="/admin/ldap-sync" element={<LdapSyncPage />} />
         <Route path="/admin/purpose-review" element={<PurposeReviewPage />} />
+        <Route path="/admin/about" element={<AboutPage />} />
       </Route>
     </Route>
     <Route path="/dashboard" element={<Navigate to="/topology" replace />} />

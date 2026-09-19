@@ -74,6 +74,7 @@ const ADMIN_DROPDOWN_ENTRIES: [string, string][] = [
   ["/admin/hypervisors", "Hypervisors"],
   ["/admin/ldap-sync", "LDAP Sync"],
   ["/admin/users", "Users"],
+  ["/admin/about", "About"],
 ];
 
 beforeEach(() => {
