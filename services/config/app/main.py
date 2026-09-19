@@ -18,6 +18,7 @@ from app.config_store import (
     verify_password,
 )
 from app.docker_ctl import restart_services
+from app.version import add_version_route, service_version
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="HERD Config Service", lifespan=lifespan)
+app = FastAPI(
+    title="HERD Config Service",
+    version=service_version(),
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,6 +74,9 @@ class SaveSettingsRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "config"}
+
+
+add_version_route(app)
 
 
 @app.get("/status")

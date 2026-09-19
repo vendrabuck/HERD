@@ -55,6 +55,10 @@
     [
       "POST",
       "/runs/{run_id}/retry"
+    ],
+    [
+      "GET",
+      "/version"
     ]
   ],
   "schemas": {
@@ -276,6 +280,20 @@
         "schema",
         "structural",
         "valid"
+      ],
+      "type": "object"
+    },
+    "VersionResponse": {
+      "properties": {
+        "build": "string",
+        "build_date": "anyOf",
+        "service": "string",
+        "version": "string"
+      },
+      "required": [
+        "build",
+        "service",
+        "version"
       ],
       "type": "object"
     },

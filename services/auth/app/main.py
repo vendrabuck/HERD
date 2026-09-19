@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.version import add_version_route, service_version
 
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine
@@ -122,7 +123,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HERD Auth Service",
     description="Authentication and authorization for HERD",
-    version="0.1.0",
+    version=service_version("herd-auth"),
     lifespan=lifespan,
 )
 
@@ -141,3 +142,6 @@ app.include_router(tokens_router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "auth"}
+
+
+add_version_route(app, service="auth", distribution="herd-auth")

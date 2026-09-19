@@ -55,6 +55,10 @@
     [
       "GET",
       "/usage"
+    ],
+    [
+      "GET",
+      "/version"
     ]
   ],
   "schemas": {
@@ -427,6 +431,20 @@
         "arguments_summary",
         "duration_ms",
         "name"
+      ],
+      "type": "object"
+    },
+    "VersionResponse": {
+      "properties": {
+        "build": "string",
+        "build_date": "anyOf",
+        "service": "string",
+        "version": "string"
+      },
+      "required": [
+        "build",
+        "service",
+        "version"
       ],
       "type": "object"
     }
