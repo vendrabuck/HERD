@@ -56,7 +56,7 @@ Reservation status shows as a colored badge. The full set of states:
 
 Transitions you can trigger:
 
-- **Cancel** (`CANCELLED`): stops an active reservation and releases its devices. (The Cancel and Release actions appear in the UI for `ACTIVE` reservations.)
+- **Cancel** (`CANCELLED`): stops a reservation and releases its devices. Available on `PENDING`, `PENDING_PROVISION`, and `ACTIVE` reservations. (The Release action appears in the UI only for `ACTIVE` reservations.)
 - **Release** (`COMPLETED`): ends an `ACTIVE` reservation early. Frees the devices immediately.
 
 Transitions the system runs automatically:

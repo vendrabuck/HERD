@@ -1439,7 +1439,7 @@ class Driver:
         return {"success": True, "output": {"reachable": True}}
 ```
 
-For a Management driver, every method must return a dict shaped `{success: bool, output: dict | None, error: str | None}`. (Layer 1 and Layer 2 drivers follow their own return-value contracts: see the L1 and L2 return-value tables earlier in this document, where `status` returns `{reachable: bool}` and the action methods return `{success: bool}`.) A raised exception is caught by the sandbox and surfaced as `success: False` with the exception text in `error`.
+For a Management driver, every method must return a dict shaped `{success: bool, output: dict | None, error: str | None}`. (Layer 1 and Layer 2 drivers follow their own return-value contracts: see the L1 and L2 return-value tables earlier in this document, where `status` returns `{reachable: bool}` and the action methods return `{success: bool}`.) A raised exception is caught by the sandbox and surfaced as `success: False` with a sanitized `error` (issue #840): only `driver raised <ExceptionClassName>`, never the raw exception text, since that text can carry hosts, paths, or credential-adjacent detail. A failure the driver itself RETURNS (rather than raises) keeps whatever message the driver put in `error`.
 
 ### 3. Package it
 
@@ -1499,6 +1499,6 @@ Update `driver.py`, rebuild the archive, upload via **Drivers > Edit > Replace f
 
 - **`TIMEOUT`**: your method took longer than `EXECUTION_TIMEOUT_SECONDS` (default 30). Raise it if the device is legitimately slow, or speed up the driver.
 - **`FAILED` with `Driver class not found`**: the package root doesn't contain a `driver.py` with a `Driver` class, or the class is missing one of the required methods for its connection type.
-- **`FAILED` with an exception traceback in `error`**: the driver method raised. Check the traceback; most common cause is a credentials or network issue inside `login()`.
+- **`FAILED` with `error` reading `driver raised <ExceptionClassName>`**: the driver method raised (issue #840). The run row and any API response only ever carry the class name; the raw exception text is logged server-side on the execution service (`docker compose logs execution`, or `make logs`), keyed by the run id, and never stored or returned since it can carry hosts, paths, or credential-adjacent text. Check that log line for the actual message; most common cause is a credentials or network issue inside `login()`.
 - **Debugging locally**: run `python -c "from driver import Driver; d = Driver({...}); print(d.status())"` from the package dir. The execution service uses the same import path; if it works locally it will work in the sandbox.
 

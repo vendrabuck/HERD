@@ -133,7 +133,7 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 ## E2E
 
-`tests/e2e/` has 52 files and 163 tests (123 Selenium, 40 Playwright). Remaining UI gaps:
+`tests/e2e/` has 56 files and 164 tests (120 Selenium, 44 Playwright; see README.md's Testing section for the source gate run). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
