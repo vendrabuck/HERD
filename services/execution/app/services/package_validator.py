@@ -311,7 +311,10 @@ def _validation_error_text(result: dict) -> str | None:
     exception_class = result.get("exception_class")
     if exception_class:
         return f"{exception_class}: {result.get('exception_message', '')}"
-    return result.get("error")
+    error = result.get("error")
+    if not result.get("success") and error and result.get("stderr"):
+        return f"{error}: {result['stderr'].strip()}"
+    return error
 
 
 def _run_dry_run_lifecycle(package_dir: Path) -> dict:

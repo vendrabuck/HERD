@@ -216,20 +216,68 @@ def test_success_with_empty_stderr_leaves_both_error_and_stderr_none(monkeypatch
     assert result["stderr"] is None
 
 
-def test_failure_path_still_sources_error_from_stderr(monkeypatch):
-    """Unchanged behavior: on a non-zero, non-signal returncode, 'error' is
-    still populated from stderr (falling back to stdout, then a default)."""
+def test_unstructured_failure_never_stores_raw_stderr_as_error(monkeypatch):
+    """A non-zero, non-signal returncode whose stderr carries NO structured line
+    (an older _runner.py, or a child that died before its handler ran): 'error'
+    is a pinned string and the raw output rides on 'stderr' for the caller to
+    log. Before issue #840's follow-up this test pinned the opposite, 'error'
+    sourced straight from stderr, which is the leak."""
     driver_dir = _make_driver_dir(VALID_DRIVER)
 
     class _Failed:
         returncode = 1
         stdout = ""
-        stderr = "driver raised ValueError: bad config"
+        stderr = "could not connect to 10.9.9.9:22 as admin"
 
     monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Failed())
     result = execute_driver_method(driver_dir, "login", {}, timeout=10)
     assert result["success"] is False
-    assert result["error"] == "driver raised ValueError: bad config"
+    assert result["error"] == "driver process exited with status 1"
+    assert "10.9.9.9" not in result["error"]
+    assert result["stderr"] == "could not connect to 10.9.9.9:22 as admin"
+    assert "exception_class" not in result
+
+
+def test_raise_behind_stderr_noise_is_still_sanitized(monkeypatch):
+    """The realistic failure: a network driver cannot reach its device, so the
+    child's stderr holds a warning and a library log record AHEAD of the
+    runner's structured line. Parsing the whole stream fails on the noise and
+    used to fall through to storing raw stderr, message and host included. Only
+    the last line is the runner's, so only the last line is parsed."""
+    driver_dir = _make_driver_dir(VALID_DRIVER)
+    structured = json.dumps(
+        {
+            "exception_class": "NetmikoTimeoutException",
+            "message": "TCP connection to device failed: 10.9.9.9:22 user admin",
+        }
+    )
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+        stderr = (
+            "DeprecationWarning: something benign\n"
+            "paramiko.transport: Error reading SSH protocol banner\n\n" + structured + "\n"
+        )
+
+    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Failed())
+    result = execute_driver_method(driver_dir, "login", {}, timeout=10)
+    assert result["success"] is False
+    assert result["error"] == "driver raised NetmikoTimeoutException"
+    assert "10.9.9.9" not in result["error"]
+    assert result["exception_class"] == "NetmikoTimeoutException"
+    assert result["exception_message"] == "TCP connection to device failed: 10.9.9.9:22 user admin"
+
+
+def test_parser_reads_only_the_last_line():
+    from app.services.driver_sandbox import _parse_driver_exception
+
+    line = json.dumps({"exception_class": "ValueError", "message": "bad"})
+    assert _parse_driver_exception(line) == ("ValueError", "bad")
+    assert _parse_driver_exception("noise\n" + line + "\n\n") == ("ValueError", "bad")
+    # A structured line that is NOT last is not the runner's exit line.
+    assert _parse_driver_exception(line + "\ntrailing noise") is None
+    assert _parse_driver_exception("   \n") is None
 
 
 # --- dry-run gate (lines 147-149, 157-158) ---
