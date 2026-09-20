@@ -42,8 +42,12 @@
   the message, on an execution run and an apply job's `error` field; the full text
   still goes to the execution service log, tagged with `run_id`. A driver that RETURNS
   a failure verdict (`{"success": false, ...}`) is unaffected and keeps its own
-  message. See `docs/DRIVERS.md` for the full rule and the `frr_l3`/`frr_mgmt` pairing
-  example.
+  message. The sandbox reads only the LAST stderr line for the runner's structured
+  exception record, so a warning or a library log record ahead of it (the normal case
+  when a network driver cannot reach its device) no longer defeats the sanitizing, and
+  a child that fails with no structured line stores the pinned `driver process exited
+  with status N` rather than its raw stderr, which is logged instead. See
+  `docs/DRIVERS.md` for the full rule and the `frr_l3`/`frr_mgmt` pairing example.
 - AI topology generation gained cabling-aware device resolution (issue #828, PR #836):
   the resolver (`services/ai-orchestrator/app/services/resolver.py`) assigns concrete
   devices to proposed roles with a deterministic backtracking search over candidates

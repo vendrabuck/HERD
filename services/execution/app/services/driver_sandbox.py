@@ -301,11 +301,18 @@ def execute_driver_method(
                         "duration_ms": elapsed_ms,
                         "transcript": transcript,
                     }
-                error = result.stderr or result.stdout or "Unknown error"
+                # No structured line at all: an older _runner.py, or a child
+                # that died before its handler ran. The raw stderr is NOT
+                # stored as 'error' (issue #840): a caller may persist or return
+                # 'error', and unstructured child output can carry the same
+                # hosts, paths, and credential-adjacent text an exception
+                # message can. It rides on the separate 'stderr' key, exactly
+                # as it does on a clean exit (issue #394), for callers to LOG.
                 return {
                     "success": False,
                     "output": None,
-                    "error": error,
+                    "error": f"driver process exited with status {result.returncode}",
+                    "stderr": result.stderr or result.stdout or None,
                     "duration_ms": elapsed_ms,
                     "transcript": transcript,
                 }
@@ -360,11 +367,20 @@ def _parse_driver_exception(stderr: str | None) -> tuple[str, str] | None:
     anything else (empty stderr, non-JSON text, JSON that is not that exact
     shape), which tells the caller to fall back to treating stderr as plain
     text, matching the pre-#840 behavior.
+
+    Only the LAST non-empty line is parsed. The handler's line is the last
+    thing the child writes before it exits, but it is rarely the only thing on
+    stderr: a Python warning, a paramiko or netmiko log record, or a driver's
+    own print all land ahead of it. Parsing the whole stream would fail on any
+    of those and drop the caller into the unstructured branch, which is worst
+    exactly when a network driver cannot reach its device: the noisy case and
+    the case whose message names a host.
     """
     if not stderr or not stderr.strip():
         return None
+    last_line = stderr.strip().splitlines()[-1].strip()
     try:
-        parsed = json.loads(stderr.strip())
+        parsed = json.loads(last_line)
     except json.JSONDecodeError:
         return None
     if not isinstance(parsed, dict):

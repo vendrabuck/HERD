@@ -512,6 +512,14 @@ async def run_driver_action(
     else:
         error_msg = result.get("error", "Unknown error")
         exception_class = result.get("exception_class")
+        if not exception_class and result.get("stderr"):
+            # The child failed without a structured line (issue #840): 'error'
+            # is a pinned string, and the unstructured output is logged here
+            # and goes no further. In the MESSAGE, since JSONFormatter drops
+            # extra keys that are not on its allowlist.
+            logger.error(
+                "Driver process failed on run %s (%s): %s", run.id, error_msg, result["stderr"]
+            )
         if exception_class:
             # The driver call (or its instantiation, or driver loading inside
             # the sandbox) raised (issue #840). error_msg is already the safe,
