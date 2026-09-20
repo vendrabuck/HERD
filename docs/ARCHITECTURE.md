@@ -145,6 +145,7 @@ Transitions (from state, to state, trigger):
 | PENDING_PROVISION | ACTIVE | inventory status flip succeeds (physical-only reservations), or the execution service's provision-result callback reports success (dynamic-carrying reservations) |
 | PENDING_PROVISION | FAILED | provisioning retries exhausted (physical-only reservations), or the provision-result callback reports failure, or the provisioning timeout backstop fires with no callback (dynamic-carrying reservations) |
 | PENDING_PROVISION | PENDING | scheduled-path flip failure retries next tick, or the restart backstop reclaims a physical-only reservation stranded past `PROVISION_TIMEOUT_SECONDS` (issue #318) |
+| PENDING_PROVISION | CANCELLED | user cancels while provisioning is in flight |
 | ACTIVE | COMPLETED | end_time passes (expiration task) |
 | ACTIVE | CANCELLED | user cancels an active hold |
 
