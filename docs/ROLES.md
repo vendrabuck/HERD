@@ -1641,6 +1641,17 @@ Authorization: Bearer <admin-token>
 | `/api/acl/health` | GET | open | open | open |
 | `/api/execution/health` | GET | open | open | open |
 | `/api/user-profile/health` | GET | open | open | open |
+| `/api/<service>/version` | GET | open | open | open |
+
+`GET /version` (issue #846) is unauthenticated on all 12 services, exactly like `/health`,
+and returns `service`, `version`, `build` (the `git describe` string, which includes the
+short commit hash), and `build_date`. Through the gateway it is `/api/<service>/version`,
+with two irregular prefixes: `/api/ai/version` for ai-orchestrator and `/api/v1/version`
+for integration. That last one answers on the published external facade but is
+deliberately excluded from its OpenAPI document, so it is not part of the `/api/v1`
+contract. The web UI shows only the version before login; the API itself returns the
+full build string to any caller, so treat the commit hash as public on a reachable
+deployment.
 
 `POST /api/auth/logout` carries no auth dependency; it revokes the refresh token passed
 in the request body, mirroring `/login` and `/refresh`. `PATCH /api/reservations/{id}`

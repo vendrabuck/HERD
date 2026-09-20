@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- Reservations can be cancelled from the UI before they are active (issue #841): the
+  reservations table and the reservation detail modal gated BOTH Release and Cancel on
+  `status === "ACTIVE"`, so a PENDING or PENDING_PROVISION reservation had no Cancel
+  button even though the API allows it. The gates now live once as `canCancel` and
+  `canRelease` in `frontend/src/lib/reservationStatus.ts` and match the backend's rule
+  exactly: cancel on every non-terminal status, release on ACTIVE only.
+- The reservation assistant no longer reports failure for a turn whose tools already ran
+  (issue #848): when the model ends a turn with no text AFTER at least one tool was
+  dispatched, the assistant returns 200 with a fixed fallback answer, the real
+  `tool_calls`, and `pending_apply` when a schedule call succeeded, and persists the
+  turn. It used to return 502 and roll the conversation back while the tools' writes
+  stayed in inventory. A no-text turn with no tool run still returns 502 and rolls back.
+- `AI_GENERATE_MAX_REPAIRS`, `AI_RESOLVER_CANDIDATES_PER_TEMPLATE`, and
+  `AI_RESOLVER_MAX_SEARCH_STEPS` now reach the ai-orchestrator container (issue #849).
+  They were listed in `.env.example` and documented, but `docker-compose.yml` never
+  passed them through, so setting them in `.env` did nothing. A repo-root unit test
+  fails when an active `AI_*` key in `.env.example` is missing from the compose block.
 - Version and build visibility (issue #846). Every service now reports its real
   version: `FastAPI(version=...)` reads the package version from its own
   `pyproject.toml` through `herd_common.version.service_version`, replacing the
