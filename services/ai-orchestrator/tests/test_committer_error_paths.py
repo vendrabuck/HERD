@@ -331,7 +331,12 @@ async def test_apply_configs_records_request_exception_as_failed():
 
 
 async def test_apply_configs_handles_non_json_success_body():
-    """A 200 with a non-JSON body defaults run_status to SUCCESS (payload={})."""
+    """A 200 with a non-JSON body defaults run_status to FAILED (payload={}).
+
+    Issue #870, mirroring issue #720's rule on inventory's apply scheduler: a
+    response with no status is never a success, so a malformed or status-less
+    200 body cannot be silently counted as applied.
+    """
     req = _req(
         devices=[
             CommitDevice(
@@ -347,8 +352,8 @@ async def test_apply_configs_handles_non_json_success_body():
                 client, {"Authorization": "Bearer t"}, req, "user-1", RESERVATION_ID
             )
     assert len(results) == 1
-    # payload={} so status defaults to SUCCESS, run_id None, error None.
-    assert results[0].status == "success"
+    # payload={} so status defaults to FAILED (fail closed), run_id None.
+    assert results[0].status == "failed"
     assert results[0].run_id is None
     assert results[0].error is None
 
@@ -374,6 +379,103 @@ async def test_apply_configs_non_success_status_marks_failed():
     assert results[0].status == "failed"
     assert results[0].error == "driver refused"
     assert results[0].run_id == "run-1"
+
+
+# --- _apply_configs: execution's #870 configure gate reported in plain words ---
+
+
+async def test_apply_configs_driver_cannot_configure_reports_plain_message():
+    """A 409 driver_cannot_configure from execution (issue #870: a Layer 3
+    Switch's contract has no configure) is reported with the structured
+    detail's `message`, not _detail's stringified-whole-dict fallback, and is
+    NOT counted as applied (status stays "failed")."""
+    req = _req(
+        devices=[
+            CommitDevice(
+                role="l3-a",
+                device_id=DEVICE_A,
+                config={"routes": []},
+                connection_type="Layer 3 Switch",
+            )
+        ],
+        apply_configs=True,
+    )
+    message = (
+        "This device's driver implements the Layer 3 Switch contract, which "
+        "has no configure method, so a config apply cannot run. Config "
+        "versions on this device store intent only."
+    )
+    async with httpx.AsyncClient() as client:
+        with respx.mock as mock:
+            mock.post(f"{EXECUTION_URL}/execute").respond(
+                409,
+                json={
+                    "detail": {
+                        "error": "driver_cannot_configure",
+                        "connection_type": "Layer 3 Switch",
+                        "driver": "frr_l3",
+                        "message": message,
+                    }
+                },
+            )
+            results = await _apply_configs(
+                client, {"Authorization": "Bearer t"}, req, "user-1", RESERVATION_ID
+            )
+    assert len(results) == 1
+    assert results[0].status == "failed"
+    assert results[0].error == message
+    # Plain words, not a Python-dict repr of the structured detail.
+    assert "driver_cannot_configure" not in results[0].error
+
+
+async def test_apply_configs_device_has_no_driver_reports_plain_message():
+    """A 409 device_has_no_driver from execution (issue #870) is likewise
+    reported with the structured detail's `message`."""
+    req = _req(
+        devices=[
+            CommitDevice(
+                role="fw-a", device_id=DEVICE_A, config={"vlan": 10}, connection_type="Management"
+            )
+        ],
+        apply_configs=True,
+    )
+    message = "Device fw-a has no driver assigned, so no action can run against it."
+    async with httpx.AsyncClient() as client:
+        with respx.mock as mock:
+            mock.post(f"{EXECUTION_URL}/execute").respond(
+                409,
+                json={"detail": {"error": "device_has_no_driver", "message": message}},
+            )
+            results = await _apply_configs(
+                client, {"Authorization": "Bearer t"}, req, "user-1", RESERVATION_ID
+            )
+    assert len(results) == 1
+    assert results[0].status == "failed"
+    assert results[0].error == message
+
+
+async def test_apply_configs_other_409_falls_back_to_generic_detail():
+    """A 409 that is NOT one of execution's #870 structured shapes (e.g. a
+    plain string detail from some other guard) keeps the existing generic
+    _detail(resp) rendering; only the two known error codes get the
+    plain-words treatment."""
+    req = _req(
+        devices=[
+            CommitDevice(
+                role="fw-a", device_id=DEVICE_A, config={"vlan": 10}, connection_type="Management"
+            )
+        ],
+        apply_configs=True,
+    )
+    async with httpx.AsyncClient() as client:
+        with respx.mock as mock:
+            mock.post(f"{EXECUTION_URL}/execute").respond(409, json={"detail": "conflict"})
+            results = await _apply_configs(
+                client, {"Authorization": "Bearer t"}, req, "user-1", RESERVATION_ID
+            )
+    assert len(results) == 1
+    assert results[0].status == "failed"
+    assert results[0].error == "conflict"
 
 
 # --- commit_proposal: unexpected non-CommitError triggers rollback (244-246) ---
