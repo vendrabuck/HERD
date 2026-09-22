@@ -50,7 +50,7 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Frontend: pages and components
 
-**37 page test files exist today**, covering every page under `frontend/src/pages/`
+**38 page test files exist today**, covering every page under `frontend/src/pages/`
 except `ReservationCalendarPage`. The 2026-08-30 coverage batch (PRs #650 to #660)
 added direct suites for the seven pages this register used to list as untested
 (`AddDevicePage`, `DeviceGroupsPage`, `GroupDetailPage`, `GroupsPage`, `UsersPage`,
