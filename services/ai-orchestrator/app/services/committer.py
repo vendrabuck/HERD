@@ -66,6 +66,23 @@ def _detail(resp: httpx.Response) -> str:
     return str(body)
 
 
+def _structured_detail(resp: httpx.Response) -> dict[str, Any] | None:
+    """Return an HTTP error response's `detail` object, or None.
+
+    None covers a non-JSON body, a bare-string `detail` (the common FastAPI
+    HTTPException shape), or no `detail` key at all. Used to read a plain-words
+    `message` out of a structured 409 (issue #870) instead of `_detail`'s
+    stringified-whole-dict fallback.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if isinstance(body, dict) and isinstance(body.get("detail"), dict):
+        return body["detail"]
+    return None
+
+
 # Splits a port name into alternating non-digit/digit runs so "eth2" sorts
 # before "eth10" (issue #632, D2's natural port order). re.split with a
 # capturing group always alternates str/int-able chunks at the same parity
@@ -473,12 +490,26 @@ async def _apply_configs(
             )
             continue
         if resp.status_code >= 400:
+            error_text = _detail(resp)
+            # A 409 driver_cannot_configure/device_has_no_driver (issue #870:
+            # execution now refuses a configure the driver's contract cannot
+            # run, before this endpoint bypassed that gate entirely) carries a
+            # structured detail whose `message` is plain words for the
+            # operator; the generic _detail(resp) above stringifies the whole
+            # dict instead, which reads as a stack-trace-shaped blob.
+            if resp.status_code == 409:
+                structured = _structured_detail(resp)
+                if structured and structured.get("error") in (
+                    "driver_cannot_configure",
+                    "device_has_no_driver",
+                ):
+                    error_text = structured.get("message") or error_text
             results.append(
                 DeviceConfigResult(
                     role=device.role,
                     device_id=device.device_id,
                     status="failed",
-                    error=_detail(resp),
+                    error=error_text,
                 )
             )
             continue
@@ -486,7 +517,10 @@ async def _apply_configs(
             payload = resp.json()
         except ValueError:
             payload = {}
-        run_status = str(payload.get("status", "SUCCESS")).upper()
+        # Safe default (issue #720's rule, applied here per issue #870): a
+        # response with no status is never a success, so a device never gets
+        # counted as applied on a malformed or status-less payload.
+        run_status = str(payload.get("status", "FAILED")).upper()
         results.append(
             DeviceConfigResult(
                 role=device.role,

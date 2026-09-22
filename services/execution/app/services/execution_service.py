@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from herd_common.device_config import (
     ConfigValidationError,
     PublishedSchemaError,
+    connection_type_supports_configure,
     validate_device_config,
     validate_device_config_with_schema,
 )
@@ -346,6 +347,57 @@ def driver_result_failed(result: dict) -> tuple[bool, str | None]:
     return False, None
 
 
+def _assert_action_permitted(device_data: dict, action: str) -> None:
+    """Refuse an action before any run row is created or driver loaded (issue #870).
+
+    Execution accepted `configure` for any connection type: inventory's
+    `_assert_driver_can_configure` (services/manage_guard.py) gates its own two
+    apply routes, but execution's `/execute` and `/execute/internal` (and the AI
+    commit path, which POSTs straight to `/execute`) never checked the driver's
+    contract at all, so an apply against a driver whose contract has no
+    `configure` (anything outside
+    herd_common.device_config.CONFIGURE_CONNECTION_TYPES) was accepted and only
+    failed at drive time, deep inside the sandbox. Mirrors inventory's 409
+    detail shape (error/connection_type/driver/message) so both surfaces read
+    the same way to a caller.
+
+    A device with no resolvable driver (`driver_id` missing or null: no driver
+    on the device's template) is refused here for EVERY action, not only
+    configure, because there is nothing to load; inventory's gate deliberately
+    no-ops on this case for apply scheduling, but execution has no scheduling
+    row to leave alone, only a driver load about to hit `uuid.UUID(None)`.
+    """
+    if device_data.get("driver_id") is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "device_has_no_driver",
+                "message": (
+                    f"Device {device_data.get('name') or device_data.get('id')} has no "
+                    "driver assigned, so no action can run against it."
+                ),
+            },
+        )
+    if action != "configure":
+        return
+    connection_type = device_data.get("connection_type")
+    if connection_type_supports_configure(connection_type):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "driver_cannot_configure",
+            "connection_type": connection_type,
+            "driver": device_data.get("driver_name"),
+            "message": (
+                f"This device's driver implements the {connection_type} "
+                "contract, which has no configure method, so a config apply "
+                "cannot run. Config versions on this device store intent only."
+            ),
+        },
+    )
+
+
 async def run_driver_action(
     db: AsyncSession,
     device_data: dict,
@@ -359,6 +411,7 @@ async def run_driver_action(
     dry_run: bool = False,
 ) -> ExecutionRun:
     """Core execution logic: build context, load driver, run in sandbox, record result."""
+    _assert_action_permitted(device_data, action)
     device_id = uuid.UUID(device_data["id"])
     driver_id = uuid.UUID(device_data["driver_id"])
     driver_sha256 = device_data.get("driver_sha256", "unknown")
