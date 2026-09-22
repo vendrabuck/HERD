@@ -49,3 +49,10 @@ class AssistantResponse(BaseModel):
     tool_iterations: int = 0
     conversation_id: str | None = None
     pending_apply: PendingApply | None = None
+    # Issue #871: set to a pinned reason code ("timeout", "provider_unavailable",
+    # or "ai_error") when a later failure struck after a write tool already
+    # produced a real side effect. The turn still returns 200 with real
+    # tool_calls/pending_apply and a fixed answer text instead of rolling back;
+    # None on every ordinary response, including the #848 no-text-after-tools
+    # fallback, which is a completed turn, not an incomplete one.
+    incomplete: str | None = None

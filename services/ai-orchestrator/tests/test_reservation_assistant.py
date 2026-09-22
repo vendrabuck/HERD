@@ -16,13 +16,14 @@ from app.services import usage_repo
 from app.services.ai_client import (
     AI_NOT_CONFIGURED_DETAIL,
     AI_PROVIDER_UNREACHABLE_DETAIL,
+    INCOMPLETE_AFTER_TOOLS_ANSWER,
     AIError,
     AIProviderUnavailableError,
     AssistantTurnResult,
     TurnSegment,
     get_ai_client,
 )
-from app.services.llm_provider import TextBlock
+from app.services.llm_provider import TextBlock, ToolResultBlock, ToolUseBlock
 from app.services.reservation_context import (
     ReservationNotFoundError,
     ReservationSeed,
@@ -124,7 +125,18 @@ def _override_ai(
     iterations: int = 1,
     input_tokens: int = 42,
     output_tokens: int = 17,
+    pre_raise_tool_calls: list[ToolCallRecord] | None = None,
+    pre_raise_side_effects: list[dict] | None = None,
+    pre_raise_segments: list[TurnSegment] | None = None,
 ):
+    """`pre_raise_*` (issue #871) simulate whatever the real loop would have
+    already dispatched/recorded on an EARLIER iteration before a LATER
+    provider call raises: they populate the dispatcher and the route's shared
+    `segments` list before the stub raises, so a route test can exercise the
+    side-effect-present branch without a real AIClient. All three default to
+    empty, so every existing `raises=` caller is unaffected.
+    """
+
     class StubAI:
         async def answer_reservation_question_with_tools(
             self,
@@ -133,15 +145,21 @@ def _override_ai(
             dispatcher,
             max_iterations=8,
             per_call_timeout_s=20.0,
+            segments=None,
+            usage=None,
         ):
             if raises is not None:
+                dispatcher.call_log.extend(pre_raise_tool_calls or [])
+                dispatcher.side_effects.extend(pre_raise_side_effects or [])
+                if segments is not None:
+                    segments.extend(pre_raise_segments or [])
                 raise raises
             # Mirror the real dispatcher's call_log API so the route can read it.
             dispatcher.call_log.extend(tool_calls or [])
-            usage = SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens)
+            result_usage = SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens)
             return AssistantTurnResult(
                 answer=answer,
-                usage=usage,
+                usage=result_usage,
                 stop_reason="end_turn",
                 iteration=iterations,
                 segments=[TurnSegment(assistant_blocks=[TextBlock(text=answer)])],
@@ -576,19 +594,38 @@ async def test_second_turn_with_other_users_conversation_id_returns_404(async_cl
 # --- Streaming endpoint (SSE) ---
 
 
-def _override_streaming_ai(events, *, raises: Exception | None = None):
+def _override_streaming_ai(
+    events,
+    *,
+    raises: Exception | None = None,
+    pre_raise_tool_calls: list[ToolCallRecord] | None = None,
+    pre_raise_side_effects: list[dict] | None = None,
+    pre_raise_segments: list[TurnSegment] | None = None,
+):
     """Override get_ai_client with a stub whose streaming method yields `events`.
 
     `events` is a list of AssistantStatus/AssistantToken/AssistantDone instances
     (built in-test), letting a route test assert the exact SSE framing without a
-    real provider.
+    real provider. `pre_raise_*` (issue #871) mirror `_override_ai`'s: see that
+    docstring.
     """
 
     class StreamStubAI:
         async def answer_reservation_question_streaming(
-            self, *, messages, dispatcher, max_iterations=8, per_call_timeout_s=20.0
+            self,
+            *,
+            messages,
+            dispatcher,
+            max_iterations=8,
+            per_call_timeout_s=20.0,
+            segments=None,
+            usage=None,
         ):
             if raises is not None:
+                dispatcher.call_log.extend(pre_raise_tool_calls or [])
+                dispatcher.side_effects.extend(pre_raise_side_effects or [])
+                if segments is not None:
+                    segments.extend(pre_raise_segments or [])
                 raise raises
             for ev in events:
                 yield ev
@@ -871,9 +908,7 @@ async def test_stream_overall_timeout_emits_error_and_leaves_no_orphan(async_cli
     monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.05)
 
     class SlowStreamAI:
-        async def answer_reservation_question_streaming(
-            self, *, messages, dispatcher, max_iterations=8, per_call_timeout_s=20.0
-        ):
+        async def answer_reservation_question_streaming(self, **kwargs):
             await asyncio.sleep(1)
             yield  # never reached: the deadline fires during the sleep above
 
@@ -1271,3 +1306,231 @@ async def test_stream_no_answer_leaves_no_orphan(async_client):
         rows = await _load_db_messages(conv_id)
     _assert_no_orphan_trailing_user(rows)
     assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+
+
+# --- Turn survives a LATER failure once a write tool already ran (issue #871) ---
+#
+# #848 fixed the case where the model itself ends a turn with no text after a
+# tool ran. At least three other exits rolled a turn back the same way even
+# though a write tool's side effect (dispatcher.side_effects) was already
+# real: a per-call timeout, an unreachable provider, and any other AIError
+# including the tool-iteration budget being exhausted. The fix lives in the
+# route (not ai_client.py): when dispatcher.side_effects is non-empty at the
+# moment one of these exceptions surfaces, the turn is persisted and the
+# route returns 200 with the real tool_calls/pending_apply, a fixed answer
+# (INCOMPLETE_AFTER_TOOLS_ANSWER), and `incomplete` set to a reason code,
+# instead of rolling back and returning an error status. A turn that fails
+# with NO side effect keeps today's behavior unchanged; that half of the
+# matrix is already covered by the existing, unmodified tests
+# test_ai_error_returns_502, test_overall_timeout_returns_504,
+# test_buffered_provider_unreachable_returns_503 (buffered) and
+# test_stream_emits_error_event_on_ai_failure,
+# test_stream_overall_timeout_emits_error_and_leaves_no_orphan,
+# test_stream_provider_unreachable_emits_error_event (streaming).
+
+# {TimeoutError, AIProviderUnavailableError, AIError, AIError(iteration cap)}:
+# the route only branches on exception TYPE, so the two AIError cases (a
+# generic failure and the iteration-cap wording ai_client.py raises at
+# ai_client.py:896/:1090) exercise the identical except clause; both are
+# parametrized to prove the route does not accidentally special-case the
+# message.
+_INCOMPLETE_CASES = [
+    pytest.param(TimeoutError("overall deadline"), "timeout", id="timeout"),
+    pytest.param(
+        AIProviderUnavailableError("connection refused"),
+        "provider_unavailable",
+        id="provider_unavailable",
+    ),
+    pytest.param(AIError("provider exploded mid-turn"), "ai_error", id="ai_error"),
+    pytest.param(
+        AIError("AI exhausted 3 tool iterations and returned no text"),
+        "ai_error",
+        id="ai_error_iteration_cap",
+    ),
+]
+
+
+def _pre_raise_write_tool_state(job_id: uuid.UUID, version_id: uuid.UUID, device_id: uuid.UUID):
+    """A one-tool-ran-before-the-failure fixture (issue #871): the dispatcher
+    recorded a successful schedule_config_apply call and its side effect, and
+    the loop recorded the matching completed TurnSegment, exactly as the real
+    loop would have on an earlier iteration before a LATER provider call
+    raises. Returns (tool_calls, side_effects, segments) for
+    `_override_ai`/`_override_streaming_ai`'s `pre_raise_*` kwargs.
+    """
+    tool_calls = [
+        ToolCallRecord(
+            name="schedule_config_apply",
+            arguments_summary=f"device_id={device_id} dry_run=True",
+            duration_ms=15,
+            error=None,
+        )
+    ]
+    side_effects = [
+        {
+            "kind": "scheduled_apply",
+            "job_id": str(job_id),
+            "version_id": str(version_id),
+            "device_id": str(device_id),
+            "dry_run": True,
+            "scheduled_for": "2026-05-19T10:00:00+00:00",
+        }
+    ]
+    segments = [
+        TurnSegment(
+            assistant_blocks=[ToolUseBlock(id="toolu_1", name="schedule_config_apply", input={})],
+            tool_result_blocks=[
+                ToolResultBlock(
+                    tool_use_id="toolu_1",
+                    content='{"job_id": "scheduled"}',
+                    is_error=False,
+                )
+            ],
+        )
+    ]
+    return tool_calls, side_effects, segments
+
+
+@pytest.mark.parametrize("exc, reason", _INCOMPLETE_CASES)
+async def test_buffered_incomplete_turn_with_side_effect_persists_and_returns_200(
+    async_client, exc, reason
+):
+    job_id, version_id, device_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    tool_calls, side_effects, segments = _pre_raise_write_tool_state(job_id, version_id, device_id)
+    _override_seed()
+    _override_ai(
+        raises=exc,
+        pre_raise_tool_calls=tool_calls,
+        pre_raise_side_effects=side_effects,
+        pre_raise_segments=segments,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "apply it"}, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["answer"] == INCOMPLETE_AFTER_TOOLS_ANSWER
+    assert body["incomplete"] == reason
+    assert body["stop_reason"] == "incomplete"
+    assert [t["name"] for t in body["tool_calls"]] == ["schedule_config_apply"]
+    assert body["pending_apply"] is not None
+    assert body["pending_apply"]["job_id"] == str(job_id)
+    assert body["pending_apply"]["dry_run"] is True
+    # The raw exception text must never reach the client (CWE-209).
+    assert str(exc) not in json.dumps(body)
+
+    rows = await _load_db_messages(body["conversation_id"])
+    _assert_no_orphan_trailing_user(rows)
+    # The completed tool round-trip persists (ASSISTANT tool_use + TOOL
+    # result), then the closing incomplete-answer message (ASSISTANT); no
+    # dangling tool_use without its result, no empty assistant message.
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "TOOL", "ASSISTANT"]
+
+
+@pytest.mark.parametrize("exc, reason", _INCOMPLETE_CASES)
+async def test_stream_incomplete_turn_with_side_effect_returns_done_event(
+    async_client, exc, reason
+):
+    job_id, version_id, device_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    tool_calls, side_effects, segments = _pre_raise_write_tool_state(job_id, version_id, device_id)
+    _override_seed()
+    _override_streaming_ai(
+        [],
+        raises=exc,
+        pre_raise_tool_calls=tool_calls,
+        pre_raise_side_effects=side_effects,
+        pre_raise_segments=segments,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "apply it"}, headers=headers)
+
+    # The stream opened (200); the incomplete turn rides the normal `done`
+    # event, not an `error` event, so the client can open the confirmation
+    # modal exactly as it would for an ordinary completed turn.
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    assert events[-1][0] == "done"
+    data = events[-1][1]
+    assert data["answer"] == INCOMPLETE_AFTER_TOOLS_ANSWER
+    assert data["incomplete"] == reason
+    assert data["stop_reason"] == "incomplete"
+    assert [t["name"] for t in data["tool_calls"]] == ["schedule_config_apply"]
+    assert data["pending_apply"]["job_id"] == str(job_id)
+    assert str(exc) not in json.dumps(data)
+
+    rows = await _load_db_messages(data["conversation_id"])
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "TOOL", "ASSISTANT"]
+
+
+async def test_buffered_incomplete_turn_next_turn_replays_without_error(async_client):
+    """After an incomplete turn persists, the conversation must not be wedged:
+    a follow-up turn on the same conversation_id succeeds normally, proving
+    the persisted history (ending on a real TextBlock) replays cleanly.
+    """
+    job_id, version_id, device_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    tool_calls, side_effects, segments = _pre_raise_write_tool_state(job_id, version_id, device_id)
+    _override_seed()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        _override_ai(
+            raises=AIProviderUnavailableError("connection refused"),
+            pre_raise_tool_calls=tool_calls,
+            pre_raise_side_effects=side_effects,
+            pre_raise_segments=segments,
+        )
+        incomplete = await client.post(_url(), json={"question": "apply it"}, headers=headers)
+        assert incomplete.status_code == 200, incomplete.text
+        conv_id = incomplete.json()["conversation_id"]
+
+        _override_ai(answer="all clear now")
+        follow_up = await client.post(
+            _url(),
+            json={"question": "did it work?", "conversation_id": conv_id},
+            headers=headers,
+        )
+    assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["answer"] == "all clear now"
+
+    rows = await _load_db_messages(conv_id)
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == [
+        "USER",
+        "ASSISTANT",
+        "TOOL",
+        "ASSISTANT",
+        "USER",
+        "ASSISTANT",
+    ]
+
+
+async def test_buffered_incomplete_turn_with_no_side_effect_still_rolls_back(async_client):
+    """Sanity check on the discriminator itself: the SAME exception type that
+    triggers the incomplete-turn path above must fall through to today's
+    rollback-and-502 behavior when dispatcher.side_effects is empty (no
+    pre_raise_* given). Duplicates test_ai_error_returns_502's assertion from
+    the issue #871 matrix's other axis so both halves of the matrix are
+    visible together.
+    """
+    _override_seed()
+    _override_ai(raises=AIProviderUnavailableError("connection refused"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "hi"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_PROVIDER_UNREACHABLE_DETAIL
+
+    from app.models.conversation import AssistantConversation, AssistantMessage
+    from sqlalchemy import func, select
+
+    async with _TestSessionLocal() as db:
+        conv_count = (
+            await db.execute(select(func.count()).select_from(AssistantConversation))
+        ).scalar_one()
+        msg_count = (
+            await db.execute(select(func.count()).select_from(AssistantMessage))
+        ).scalar_one()
+    assert conv_count == 0
+    assert msg_count == 0

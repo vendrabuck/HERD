@@ -454,6 +454,45 @@ describe("AIAssistantChat (Branch 3, streaming)", () => {
     expect((lastCall as { job_id: string }).job_id).toBe("job-abc");
   });
 
+  it("still opens the confirmation modal from pending_apply on an incomplete turn (issue #871)", async () => {
+    // A `done` event can carry `incomplete` (e.g. "timeout") when a write
+    // tool already ran before a later failure cut the turn short; the
+    // response is still a normal 200/done, so the confirmation-modal wiring
+    // must not special-case it.
+    const onPendingApply = vi.fn();
+    server.use(
+      http.post(STREAM_URL, () =>
+        sseStream([
+          doneFrame({
+            answer:
+              "The steps above ran, but the assistant could not finish this reply. " +
+              "Review the results before continuing.",
+            incomplete: "timeout",
+            pending_apply: {
+              job_id: "job-xyz",
+              version_id: "v-2",
+              device_id: "d-2",
+              dry_run: true,
+              scheduled_for: "2026-05-29T03:00:00Z",
+            },
+          }),
+        ]),
+      ),
+    );
+
+    renderWithProviders(<ChatHarness onPendingApply={onPendingApply} />);
+    fireEvent.change(screen.getByTestId("assistant-input"), {
+      target: { value: "apply something" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await waitFor(() => expect(onPendingApply).toHaveBeenCalled());
+    const lastCall = onPendingApply.mock.calls[onPendingApply.mock.calls.length - 1][0];
+    expect(lastCall).not.toBeNull();
+    expect((lastCall as { job_id: string }).job_id).toBe("job-xyz");
+    expect(screen.getByText(/could not finish this reply/)).toBeInTheDocument();
+  });
+
   it("shows a tool status while tools run and discards interim tokens", async () => {
     server.use(
       http.post(STREAM_URL, () =>

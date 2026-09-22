@@ -61,6 +61,7 @@ __all__ = [
     "AIError",
     "AIProviderUnavailableError",
     "AssistantTurnResult",
+    "INCOMPLETE_AFTER_TOOLS_ANSWER",
     "NO_SUMMARY_FALLBACK_ANSWER",
     "TurnSegment",
     "ai_is_configured",
@@ -89,6 +90,20 @@ AI_PROVIDER_UNREACHABLE_DETAIL = "AI provider is unreachable"
 NO_SUMMARY_FALLBACK_ANSWER = (
     "I ran the steps above but did not produce a summary. Check the tool "
     "results for what was done, or ask me again."
+)
+
+# Issue #871: NO_SUMMARY_FALLBACK_ANSWER's sibling for a LATER failure in the
+# same turn (a per-call timeout, an unreachable provider, or the tool-iteration
+# budget being exhausted after at least one tool already dispatched). Those
+# failures propagate out of the two loop methods below as raised exceptions,
+# so this fix does not live here: the route persists the turn itself once it
+# sees dispatcher.side_effects is non-empty, and uses this string as the
+# closing assistant message. Kept beside NO_SUMMARY_FALLBACK_ANSWER because
+# both stand in for a missing model summary when tool writes already landed;
+# unlike that constant, this one is never chosen by this module.
+INCOMPLETE_AFTER_TOOLS_ANSWER = (
+    "The steps above ran, but the assistant could not finish this reply. "
+    "Review the results before continuing."
 )
 
 
@@ -755,6 +770,8 @@ class AIClient:
         dispatcher: "ToolDispatcher",
         max_iterations: int = 8,
         per_call_timeout_s: float = 20.0,
+        segments: list[TurnSegment] | None = None,
+        usage: Usage | None = None,
     ) -> AssistantTurnResult:
         """Run a tool-use loop against a pre-built messages list.
 
@@ -769,11 +786,17 @@ class AIClient:
         each as a new AssistantMessage row in position order.
 
         Raises AIError on model failure, no usable text, or per-call timeout.
+
+        `segments` and `usage`, when passed, are the SAME objects mutated in
+        place as the loop runs (not copied): a caller that passes its own list
+        and Usage() can still read whatever completed before a later
+        exception unwinds this call (issue #871). Both default to a fresh,
+        loop-local object when omitted, matching the prior behavior exactly.
         """
         # Defensive copy so the loop's appends do not mutate the caller's list.
         working_messages: list[Message] = list(messages)
-        segments: list[TurnSegment] = []
-        aggregated = Usage()
+        segments = segments if segments is not None else []
+        aggregated = usage if usage is not None else Usage()
         final_stop_reason = ""
         iteration = 0
         # Names of every tool dispatched so far THIS call (issue #848): local,
@@ -910,6 +933,8 @@ class AIClient:
         dispatcher: "ToolDispatcher",
         max_iterations: int = 8,
         per_call_timeout_s: float = 20.0,
+        segments: list[TurnSegment] | None = None,
+        usage: Usage | None = None,
     ) -> "AsyncIterator[AssistantStreamEvent]":
         """Streaming twin of answer_reservation_question_with_tools.
 
@@ -928,6 +953,12 @@ class AIClient:
         final (non-tool_use) turn's tokens are the real answer and are kept. If
         the provider lacks call_stream, fall back to the buffered method and emit
         its result as a single done event.
+
+        `segments` and `usage` carry the same shared-mutable-object contract as
+        the buffered method (issue #871): forwarded verbatim to the buffered
+        fallback below, and used directly (not copied) in the native streaming
+        loop, so a caller-supplied object still reflects whatever completed if
+        this call raises partway through.
         """
         if not hasattr(self._provider, "call_stream"):
             result = await self.answer_reservation_question_with_tools(
@@ -935,6 +966,8 @@ class AIClient:
                 dispatcher=dispatcher,
                 max_iterations=max_iterations,
                 per_call_timeout_s=per_call_timeout_s,
+                segments=segments,
+                usage=usage,
             )
             for block in result.segments[-1].assistant_blocks:
                 if isinstance(block, TextBlock) and block.text:
@@ -943,8 +976,8 @@ class AIClient:
             return
 
         working_messages: list[Message] = list(messages)
-        segments: list[TurnSegment] = []
-        aggregated = Usage()
+        segments = segments if segments is not None else []
+        aggregated = usage if usage is not None else Usage()
         final_stop_reason = ""
         iteration = 0
         # Names of every tool dispatched so far THIS call (issue #848); see the

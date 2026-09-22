@@ -9,7 +9,7 @@ correctness lives in test_anthropic_provider.py.
 from typing import Any
 
 import pytest
-from app.services.ai_client import NO_SUMMARY_FALLBACK_ANSWER, AIClient, AIError
+from app.services.ai_client import NO_SUMMARY_FALLBACK_ANSWER, AIClient, AIError, TurnSegment
 from app.services.llm_provider import (
     LLMProvider,
     Message,
@@ -537,6 +537,79 @@ async def test_tool_loop_iteration_cap_with_no_text_raises_aierror():
     assert "exhausted" in str(exc.value).lower()
 
 
+# --- shared-mutable segments/usage output params (issue #871) ---
+#
+# The route (services/ai-orchestrator/app/routes/reservation_assistant.py)
+# needs to know what a tool loop completed even when it raises partway
+# through, so it can persist an already-real write instead of rolling the
+# turn back. Rather than adding another return path here (patching this one
+# call site at a time does not converge, per issue #871), the loop accepts
+# the caller's own `segments` list and `usage` object and mutates them in
+# place as it runs; these tests pin that contract directly against the client,
+# independent of the route.
+
+
+class _RaiseOnSecondCallProvider:
+    """Returns `first_response` on the first call, then raises `exc` on every
+    call after that: models a tool call that succeeds on iteration one and a
+    provider failure (timeout, unreachable, or any other AIError) on
+    iteration two."""
+
+    def __init__(self, first_response: ProviderResponse, exc: BaseException) -> None:
+        self._first = first_response
+        self._exc = exc
+        self.calls = 0
+
+    async def call(self, **kwargs: Any) -> ProviderResponse:
+        self.calls += 1
+        if self.calls == 1:
+            return self._first
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_with_tools_segments_and_usage_reflect_partial_progress_on_raise():
+    """A caller-supplied `segments` list and `usage` object are the SAME
+    objects the loop mutates (not copies): after the second call raises, they
+    still hold the first iteration's completed tool round-trip and its token
+    counts."""
+    tool_turn = _resp(
+        [_tool_use("get_device", {"device_id": "d"}, "toolu_1")], stop_reason="tool_use"
+    )
+    provider = _RaiseOnSecondCallProvider(tool_turn, AIError("boom on iteration two"))
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher(returns=[{"content": '{"ok":true}', "is_error": False}])
+    caller_segments: list = []
+    caller_usage = Usage()
+
+    with pytest.raises(AIError, match="boom on iteration two"):
+        await client.answer_reservation_question_with_tools(
+            messages=_msgs("<reservation/>", "configure it"),
+            dispatcher=dispatcher,
+            segments=caller_segments,
+            usage=caller_usage,
+        )
+
+    assert len(caller_segments) == 1
+    assert caller_segments[0].tool_result_blocks
+    assert caller_usage.input_tokens == 10
+    assert caller_usage.output_tokens == 20
+
+
+@pytest.mark.asyncio
+async def test_with_tools_omitted_segments_and_usage_default_to_fresh_objects():
+    """Omitting segments/usage (every existing caller) must behave exactly as
+    before: a fresh, loop-local list and Usage(), never shared state leaking
+    between calls."""
+    provider = _FakeProvider(responses=[_resp([TextBlock(text="ok")])])
+    client = _make_client(provider)
+    turn = await client.answer_reservation_question_with_tools(
+        messages=_msgs("<reservation/>", "?"),
+        dispatcher=_FakeDispatcher(),
+    )
+    assert turn.segments == [TurnSegment(assistant_blocks=[TextBlock(text="ok")])]
+
+
 @pytest.mark.asyncio
 async def test_tool_loop_propagates_provider_timeout_as_aierror():
     """Provider raises AIError on its own timeout; AIClient propagates."""
@@ -1056,3 +1129,51 @@ async def test_streaming_iteration_cap_no_text_raises_aierror():
             dispatcher=_FakeDispatcher(),
             max_iterations=1,
         )
+
+
+class _RaiseOnSecondStreamProvider:
+    """Streaming twin of _RaiseOnSecondCallProvider: the first call_stream
+    yields one tool-use turn, the second raises."""
+
+    def __init__(self, first_response: ProviderResponse, exc: BaseException) -> None:
+        self._first = first_response
+        self._exc = exc
+        self.calls = 0
+
+    async def call(self, **kwargs: Any) -> ProviderResponse:
+        raise AssertionError("streaming path must use call_stream")
+
+    async def call_stream(self, **kwargs: Any):
+        self.calls += 1
+        if self.calls == 1:
+            yield StreamDone(response=self._first)
+            return
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_streaming_segments_and_usage_reflect_partial_progress_on_raise():
+    """Streaming twin of test_with_tools_segments_and_usage_reflect_partial_progress_on_raise:
+    the same shared-mutable contract holds for the native streaming loop."""
+    tool_turn = _resp(
+        [_tool_use("get_device", {"device_id": "d"}, "toolu_1")], stop_reason="tool_use"
+    )
+    provider = _RaiseOnSecondStreamProvider(tool_turn, AIError("boom on iteration two"))
+    client = _make_client(provider)
+    dispatcher = _FakeDispatcher(returns=[{"content": '{"ok":true}', "is_error": False}])
+    caller_segments: list = []
+    caller_usage = Usage()
+
+    with pytest.raises(AIError, match="boom on iteration two"):
+        await _collect_stream(
+            client,
+            messages=_msgs("<reservation/>", "configure it"),
+            dispatcher=dispatcher,
+            segments=caller_segments,
+            usage=caller_usage,
+        )
+
+    assert len(caller_segments) == 1
+    assert caller_segments[0].tool_result_blocks
+    assert caller_usage.input_tokens == 10
+    assert caller_usage.output_tokens == 20
