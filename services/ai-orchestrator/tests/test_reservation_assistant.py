@@ -1534,3 +1534,215 @@ async def test_buffered_incomplete_turn_with_no_side_effect_still_rolls_back(asy
         ).scalar_one()
     assert conv_count == 0
     assert msg_count == 0
+
+
+# --- Mid-dispatch cancellation gap: a landed side effect whose iteration
+# never reached `segments` (issue #871 review follow-up) ---
+#
+# `asyncio.gather` over a multi-tool dispatch (answer_reservation_question_
+# with_tools's per-iteration dispatch) can be cancelled by the overall
+# deadline AFTER one sibling call already recorded its side effect and
+# BEFORE a concurrent sibling completes: that whole iteration then never
+# reaches segments.append (see ToolDispatcher.dispatch's docstring), so the
+# response is still correct (tool_calls/pending_apply read straight off
+# dispatcher.call_log/side_effects, not off segments), but the persisted
+# closing message must name what actually landed instead of silently
+# referring to nothing. These tests reproduce the real race (a genuine
+# asyncio.gather cancelled mid-flight, not a hand-built stub of the outcome)
+# by monkeypatching the ToolDispatcher the route constructs with a fake
+# whose "slow_tool" dispatch never returns before the short overall
+# deadline, while "schedule_config_apply" completes immediately.
+
+_GAP_JOB_ID = uuid.uuid4()
+_GAP_VERSION_ID = uuid.uuid4()
+_GAP_DEVICE_ID = uuid.uuid4()
+
+
+class _GatherGapFakeDispatcher:
+    """Route-level test double standing in for the real ToolDispatcher
+    (monkeypatched into app.routes.reservation_assistant.ToolDispatcher for
+    these tests only, matching its constructor keywords and the async
+    context manager + dispatch() interface the route and AIClient use):
+    dispatch("schedule_config_apply", ...) completes immediately and records
+    a side effect plus a call_log entry exactly like the real
+    _tool_schedule_config_apply handler; dispatch("slow_tool", ...) never
+    returns within the test's short overall deadline, so a concurrent
+    asyncio.gather over both is still awaiting the slow one when the
+    deadline cancels it.
+    """
+
+    def __init__(self, *, token, reservation_id, char_cap=8000, **_kwargs):
+        self.call_log: list[ToolCallRecord] = []
+        self.side_effects: list[dict] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return None
+
+    async def dispatch(self, tool_name, tool_input):
+        if tool_name == "schedule_config_apply":
+            self.call_log.append(
+                ToolCallRecord(
+                    name=tool_name,
+                    arguments_summary=str(tool_input)[:50],
+                    duration_ms=1,
+                    error=None,
+                )
+            )
+            self.side_effects.append(
+                {
+                    "kind": "scheduled_apply",
+                    "tool": "schedule_config_apply",
+                    "job_id": str(_GAP_JOB_ID),
+                    "version_id": str(_GAP_VERSION_ID),
+                    "device_id": str(_GAP_DEVICE_ID),
+                    "dry_run": True,
+                    "scheduled_for": "2026-05-19T10:00:00+00:00",
+                }
+            )
+            return {"content": '{"job_id": "scheduled"}', "is_error": False}
+        # slow_tool: has no internal await that finishes before the overall
+        # deadline, so the deadline always cancels this one, never the fast
+        # sibling above (which has no await at all and completes on its
+        # first scheduling turn).
+        await asyncio.sleep(999)
+        raise AssertionError("unreachable: the overall deadline must cancel this first")
+
+
+class _GatherGapStubAI:
+    """Mirrors one iteration of the real tool loop (both tools from a single
+    tool_use turn dispatched concurrently) closely enough to reproduce the
+    real cancellation race, without needing a real LLM response to drive it.
+    """
+
+    async def answer_reservation_question_with_tools(
+        self,
+        *,
+        messages,
+        dispatcher,
+        max_iterations=8,
+        per_call_timeout_s=20.0,
+        segments=None,
+        usage=None,
+    ):
+        await asyncio.gather(
+            dispatcher.dispatch("schedule_config_apply", {"device_id": str(_GAP_DEVICE_ID)}),
+            dispatcher.dispatch("slow_tool", {}),
+        )
+        raise AssertionError("unreachable: the overall deadline must cancel the gather first")
+
+
+class _GatherGapStreamStubAI:
+    """Streaming twin of _GatherGapStubAI."""
+
+    async def answer_reservation_question_streaming(
+        self,
+        *,
+        messages,
+        dispatcher,
+        max_iterations=8,
+        per_call_timeout_s=20.0,
+        segments=None,
+        usage=None,
+    ):
+        from app.services.ai_client import AssistantStatus
+
+        yield AssistantStatus(message="running tools", tools=["schedule_config_apply", "slow_tool"])
+        await asyncio.gather(
+            dispatcher.dispatch("schedule_config_apply", {"device_id": str(_GAP_DEVICE_ID)}),
+            dispatcher.dispatch("slow_tool", {}),
+        )
+        raise AssertionError("unreachable: the overall deadline must cancel the gather first")
+
+
+async def test_buffered_mid_dispatch_gap_names_landed_tool_in_closing_message(
+    async_client, monkeypatch
+):
+    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.05)
+    monkeypatch.setattr("app.routes.reservation_assistant.ToolDispatcher", _GatherGapFakeDispatcher)
+    _override_seed()
+    app.dependency_overrides[get_ai_client] = lambda: _GatherGapStubAI()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "apply it"}, headers=headers)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["incomplete"] == "timeout"
+        assert body["stop_reason"] == "incomplete"
+        assert body["pending_apply"] is not None
+        assert body["pending_apply"]["job_id"] == str(_GAP_JOB_ID)
+        # The landed tool has no matching tool_use in any persisted segment
+        # (its iteration never reached segments.append), so the closing
+        # message names it explicitly, past the plain pinned prefix.
+        assert body["answer"].startswith(INCOMPLETE_AFTER_TOOLS_ANSWER)
+        assert "schedule_config_apply" in body["answer"]
+
+        conv_id = body["conversation_id"]
+        rows = await _load_db_messages(conv_id)
+        _assert_no_orphan_trailing_user(rows)
+        # No tool round-trip persisted (the interrupted iteration never
+        # reached segments.append): just the user turn and the closing
+        # message naming what actually landed.
+        assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+        assert len(rows[-1][1]) == 1
+        assert "schedule_config_apply" in rows[-1][1][0]["text"]
+
+        # Next turn on the same conversation must replay cleanly (no wedge).
+        _override_ai(answer="all clear now")
+        follow_up = await client.post(
+            _url(),
+            json={"question": "did it work?", "conversation_id": conv_id},
+            headers=headers,
+        )
+    assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["answer"] == "all clear now"
+
+    rows = await _load_db_messages(conv_id)
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "USER", "ASSISTANT"]
+
+
+async def test_stream_mid_dispatch_gap_names_landed_tool_in_closing_message(
+    async_client, monkeypatch
+):
+    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.05)
+    monkeypatch.setattr("app.routes.reservation_assistant.ToolDispatcher", _GatherGapFakeDispatcher)
+    _override_seed()
+    app.dependency_overrides[get_ai_client] = lambda: _GatherGapStreamStubAI()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "apply it"}, headers=headers)
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        # The incomplete turn rides the normal `done` event, not `error`.
+        assert events[-1][0] == "done"
+        data = events[-1][1]
+        assert data["incomplete"] == "timeout"
+        assert data["stop_reason"] == "incomplete"
+        assert data["pending_apply"] is not None
+        assert data["pending_apply"]["job_id"] == str(_GAP_JOB_ID)
+        assert data["answer"].startswith(INCOMPLETE_AFTER_TOOLS_ANSWER)
+        assert "schedule_config_apply" in data["answer"]
+
+        conv_id = data["conversation_id"]
+        rows = await _load_db_messages(conv_id)
+        _assert_no_orphan_trailing_user(rows)
+        assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+        assert len(rows[-1][1]) == 1
+        assert "schedule_config_apply" in rows[-1][1][0]["text"]
+
+        # Next turn on the same conversation must replay cleanly (no wedge).
+        _override_ai(answer="all clear now")
+        follow_up = await client.post(
+            _url(),
+            json={"question": "did it work?", "conversation_id": conv_id},
+            headers=headers,
+        )
+    assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["answer"] == "all clear now"
+
+    rows = await _load_db_messages(conv_id)
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "USER", "ASSISTANT"]
