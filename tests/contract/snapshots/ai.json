@@ -76,6 +76,7 @@
       "properties": {
         "answer": "string",
         "conversation_id": "anyOf",
+        "incomplete": "anyOf",
         "input_tokens": "integer",
         "model": "string",
         "output_tokens": "integer",
