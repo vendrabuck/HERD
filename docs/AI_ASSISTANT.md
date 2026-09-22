@@ -164,8 +164,10 @@ Errors:
 - 404: reservation does not exist or caller does not own it; **or** a `conversation_id` was supplied that does not exist, was created by a different user, or belongs to a different reservation (404 not 403 to avoid leaking existence)
 - 422: question empty or longer than 4000 characters
 - 502: the LLM call failed, or it ended a turn with no text content before any tool ran. If a tool already ran in that turn, the assistant instead returns 200 with a fixed fallback answer ("I ran the steps above but did not produce a summary...") and persists the turn, since the tool's side effects are real and should not be discarded.
-- 503: no AI provider configured (`AI_PROVIDER=anthropic` needs `AI_API_KEY` or `AI_BASE_URL` set, either one; `AI_PROVIDER=openai_compat` needs `AI_BASE_URL` set)
+- 503: no AI provider configured (`AI_PROVIDER=anthropic` needs `AI_API_KEY` or `AI_BASE_URL` set, either one; `AI_PROVIDER=openai_compat` needs `AI_BASE_URL` set), or a configured provider is unreachable
 - 504: assistant or seed gather exceeded its deadline (90s overall by default; configurable)
+
+The three statuses above (502/503/504) all have the same carve-out: if a write tool already produced a real side effect (a scheduled config apply, for example) before the failure struck on a LATER step of the same turn, the assistant does not roll the turn back either. It returns 200 instead, with the real `tool_calls` and `pending_apply` from what ran, a fixed answer ("The steps above ran, but the assistant could not finish this reply. Review the results before continuing."), `stop_reason: "incomplete"`, and `incomplete` set to a reason code: `"timeout"`, `"provider_unavailable"`, or `"ai_error"` (the last one also covers the tool-iteration budget being exhausted). `incomplete` is `null` on every ordinary response, including the no-text-after-tools fallback above. A turn that fails before any tool produced a side effect keeps the plain error status and rollback described above.
 
 Note: the iter-1 413 response (rendered context exceeded a size ceiling) no longer exists. Per-tool-result truncation handles oversized payloads instead, with a `... [truncated: N chars omitted]` marker appended to the affected tool result.
 
@@ -179,8 +181,8 @@ Event types (each frame is `event: <type>` then `data: <json>`):
 
 - `status`: a progress signal, `{ "message": "analyzing" | "running tools", "tools": ["get_device_ports", ...], "interim": false }`. `interim` is `true` on the status that follows a tool turn's narration text, the client's cue to discard the provisional tokens streamed so far in that turn before the tools run.
 - `token`: one chunk of the final answer text, `{ "text": "..." }`. Only real answer text is streamed; a reasoning model's internal thinking is dropped.
-- `done`: the fully-assembled turn, carrying the same JSON object the buffered endpoint returns (`answer`, `model`, token counts, `stop_reason`, `tool_calls`, `tool_iterations`, `conversation_id`, `pending_apply`).
-- `error`: `{ "message": "..." }` for a failure after the stream opened (timeout or LLM failure).
+- `done`: the fully-assembled turn, carrying the same JSON object the buffered endpoint returns (`answer`, `model`, token counts, `stop_reason`, `tool_calls`, `tool_iterations`, `conversation_id`, `pending_apply`, `incomplete`).
+- `error`: `{ "message": "..." }` for a failure after the stream opened (timeout or LLM failure) that struck before any write tool produced a side effect. Once a write tool has produced one, the same failure instead rides the ordinary `done` event with `incomplete` set (see the Errors section above); the stream never emits both for one turn.
 
 The conversation is persisted after the stream completes, so a `conversation_id` from a streamed `done` event can be passed to either endpoint to continue the thread. The buffered endpoint remains available; streaming is opt-in per request by calling the `/stream` path.
 

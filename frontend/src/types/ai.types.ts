@@ -234,6 +234,12 @@ export interface AssistantResponse {
   tool_iterations: number;
   conversation_id: string | null;
   pending_apply?: PendingApply | null;
+  // Issue #871: set to a pinned reason code ("timeout", "provider_unavailable",
+  // or "ai_error") when a write tool already ran before a later failure cut
+  // the turn short. The turn still returns 200 with real tool_calls and
+  // pending_apply and a fixed answer text; null/absent on every ordinary
+  // response.
+  incomplete?: string | null;
 }
 
 export interface CommandLogEntry {

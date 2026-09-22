@@ -460,6 +460,20 @@ class ToolDispatcher:
         model can recover from; the finally block records all attempts (success,
         error, write-gate rejection) in call_log so the route can surface the
         full attempt history in conversation metadata and usage logs.
+
+        A caller that awaits several dispatch() calls concurrently via
+        asyncio.gather (the tool loop's per-iteration dispatch) can have this
+        coroutine cancelled mid-handler if a SIBLING call is still running when
+        the whole gather is cancelled (e.g. the assistant route's overall
+        deadline). asyncio.CancelledError is a BaseException, so it passes
+        through every except clause here untouched, still runs the finally
+        block (call_log gets an entry), and re-raises out of dispatch() and out
+        of the gather: the caller's per-iteration bookkeeping after that gather
+        call (appending a TurnSegment) never runs, even though a call that
+        landed before the cancellation (its side effect already recorded) is
+        real. See answer_reservation_question_with_tools's gather call and
+        reservation_assistant.py's _finalize_incomplete_turn for how the route
+        surfaces that gap rather than silently losing it.
         """
         started = time.monotonic()
         error: str | None = None
@@ -894,10 +908,16 @@ class ToolDispatcher:
 
         # Record the side effect for the route handler to surface as
         # `pending_apply` on the response. The frontend uses this to render
-        # the confirm-or-cancel modal.
+        # the confirm-or-cancel modal. `tool` names the dispatched tool
+        # verbatim (issue #871 review follow-up): the route uses it to name a
+        # landed side effect in the closing message if the mid-dispatch
+        # cancellation gap (see ToolDispatcher.dispatch's docstring, and
+        # answer_reservation_question_with_tools's gather call) meant this
+        # iteration was never persisted.
         self.side_effects.append(
             {
                 "kind": "scheduled_apply",
+                "tool": "schedule_config_apply",
                 "job_id": data["id"],
                 "version_id": str(version_id),
                 "device_id": str(device_id),

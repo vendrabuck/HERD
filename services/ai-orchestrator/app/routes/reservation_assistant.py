@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -36,12 +37,15 @@ from app.services import conversation_repo, usage_repo
 from app.services.ai_client import (
     AI_NOT_CONFIGURED_DETAIL,
     AI_PROVIDER_UNREACHABLE_DETAIL,
+    INCOMPLETE_AFTER_TOOLS_ANSWER,
     AIClient,
     AIError,
     AIProviderUnavailableError,
+    TurnSegment,
     ai_is_configured,
     get_ai_client,
 )
+from app.services.llm_provider import TextBlock, ToolUseBlock, Usage
 from app.services.reservation_context import (
     ContextDeadlineExceededError,
     ReservationNotFoundError,
@@ -52,6 +56,24 @@ from app.services.reservation_context import (
 from app.services.tools import ToolDispatcher
 
 logger = logging.getLogger(__name__)
+
+# Issue #871: reason codes for AssistantResponse.incomplete, one per except
+# branch below that now checks dispatcher.side_effects before rolling back.
+# Pinned strings (not the exception's own text) so the client and tests match
+# on an exact, stable value instead of a raw exception message.
+INCOMPLETE_REASON_TIMEOUT = "timeout"
+INCOMPLETE_REASON_PROVIDER_UNAVAILABLE = "provider_unavailable"
+INCOMPLETE_REASON_AI_ERROR = "ai_error"
+
+# Issue #871 review follow-up: header for the landed-actions list appended to
+# INCOMPLETE_AFTER_TOOLS_ANSWER when a side effect landed but its iteration
+# never made it into `segments` (see _closing_incomplete_text below).
+INCOMPLETE_LANDED_ACTIONS_HEADER = "Actions that landed before the failure:"
+
+# Fallback tool name per dispatcher.side_effects `kind`, used only when an
+# entry has no `tool` key of its own (every entry ToolDispatcher records
+# today does; this only guards a hand-built entry, e.g. in a test double).
+_SIDE_EFFECT_KIND_TOOL_NAMES = {"scheduled_apply": "schedule_config_apply"}
 
 get_current_user, _require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -164,6 +186,77 @@ async def _prepare_turn(
     return conversation, messages
 
 
+def _pending_apply_from_side_effects(dispatcher: ToolDispatcher) -> PendingApply | None:
+    """Build PendingApply from the most recent scheduled_apply side effect, if
+    any. Shared by the normal persistence path (_persist_turn) and the
+    incomplete-turn path (_finalize_incomplete_turn, issue #871) so both read
+    dispatcher.side_effects the same way.
+    """
+    for entry in reversed(dispatcher.side_effects):
+        if entry.get("kind") == "scheduled_apply":
+            return PendingApply(
+                job_id=entry["job_id"],
+                version_id=entry["version_id"],
+                device_id=entry["device_id"],
+                dry_run=entry["dry_run"],
+                scheduled_for=entry["scheduled_for"],
+            )
+    return None
+
+
+def _tool_call_summaries(call_log) -> list[ToolCallSummary]:
+    return [
+        ToolCallSummary(
+            name=rec.name,
+            arguments_summary=rec.arguments_summary,
+            duration_ms=rec.duration_ms,
+            error=rec.error,
+        )
+        for rec in call_log
+    ]
+
+
+def _closing_incomplete_text(*, segments: list[TurnSegment], dispatcher: ToolDispatcher) -> str:
+    """The closing assistant text for an incomplete turn (issue #871 review
+    follow-up: the mid-dispatch cancellation gap).
+
+    Ordinarily this is just INCOMPLETE_AFTER_TOOLS_ANSWER: the normal case is
+    that every side effect's iteration fully completed and was appended to
+    `segments` before the LATER failure struck. But `asyncio.gather` over a
+    multi-tool dispatch (see ToolDispatcher.dispatch's docstring) can be
+    cancelled after one sibling call already landed its side effect and
+    before a concurrent sibling finishes: that whole iteration then never
+    reaches segments.append, so the persisted history holds no tool_use for a
+    write that genuinely happened. Detect that gap by matching each
+    dispatcher.side_effects entry against a tool_use block of the same name
+    recorded in `segments` (a plain per-name count match, since side_effects
+    carries no iteration index to compare against); any side effect left
+    unmatched is named explicitly in an appended, deterministic list, so the
+    closing message is never a dangling reference to nothing.
+    """
+    recorded_names: Counter[str] = Counter(
+        block.name
+        for segment in segments
+        for block in segment.assistant_blocks
+        if isinstance(block, ToolUseBlock)
+    )
+    unrecorded: list[str] = []
+    for entry in dispatcher.side_effects:
+        name = entry.get("tool") or _SIDE_EFFECT_KIND_TOOL_NAMES.get(
+            entry.get("kind"), entry.get("kind") or "a tool"
+        )
+        if recorded_names[name] > 0:
+            recorded_names[name] -= 1
+        else:
+            unrecorded.append(name)
+
+    if not unrecorded:
+        return INCOMPLETE_AFTER_TOOLS_ANSWER
+
+    landed_lines = "\n".join(f"- {name}" for name in unrecorded)
+    return f"{INCOMPLETE_AFTER_TOOLS_ANSWER}\n\n{INCOMPLETE_LANDED_ACTIONS_HEADER}\n{landed_lines}"
+
+
 async def _persist_turn(
     *,
     db: AsyncSession,
@@ -190,18 +283,92 @@ async def _persist_turn(
 
     await usage_repo.record_usage(db, user_id, turn.usage, fallback_text=question + turn.answer)
 
-    pending_apply: PendingApply | None = None
-    for entry in reversed(dispatcher.side_effects):
-        if entry.get("kind") == "scheduled_apply":
-            pending_apply = PendingApply(
-                job_id=entry["job_id"],
-                version_id=entry["version_id"],
-                device_id=entry["device_id"],
-                dry_run=entry["dry_run"],
-                scheduled_for=entry["scheduled_for"],
-            )
-            break
-    return pending_apply
+    return _pending_apply_from_side_effects(dispatcher)
+
+
+async def _finalize_incomplete_turn(
+    *,
+    db: AsyncSession,
+    conversation,
+    dispatcher: ToolDispatcher | None,
+    segments: list[TurnSegment],
+    usage: Usage,
+    user_id: uuid.UUID,
+    question: str,
+    reason: str,
+) -> AssistantResponse | None:
+    """Issue #871: a later failure (per-call timeout, an unreachable provider,
+    or any other AIError including the tool-iteration budget being exhausted)
+    that surfaces AFTER at least one write tool already produced a real side
+    effect must not roll back the turn: the write already landed, and
+    returning an error status here would tell the user the call failed while
+    hiding the only record of what ran (see issue #848 for the sibling case
+    inside the loop itself, and docs/AI_ASSISTANT.md's Errors section for the
+    user-facing contract).
+
+    Persists whatever complete segments the loop produced before the failure,
+    then closes the turn with one more assistant message carrying a real
+    TextBlock (see _closing_incomplete_text) so the persisted history always
+    ends in usable text and the next turn never replays an empty or dangling
+    assistant message. Returns a 200-shaped AssistantResponse with the real
+    tool_calls and pending_apply, `stop_reason="incomplete"`, and
+    `incomplete` set to the caller's reason code.
+
+    Returns None when there is no dispatcher or it recorded no side effect:
+    the caller falls through to today's rollback-and-raise behavior,
+    unchanged.
+    """
+    if dispatcher is None or not dispatcher.side_effects:
+        return None
+
+    for segment in segments:
+        await conversation_repo.append_assistant_turn(
+            db,
+            conversation=conversation,
+            assistant_blocks=segment.assistant_blocks,
+            tool_result_blocks=segment.tool_result_blocks or None,
+        )
+    # Close the turn with a real TextBlock, mirroring #848's fallback-answer
+    # rule, so the conversation never ends on a dangling tool_use/tool_result
+    # pair and the next turn's reconstructed history is always replayable.
+    # _closing_incomplete_text names any side effect the loop's segments
+    # never recorded (the mid-dispatch cancellation gap), so this message is
+    # never a bare reference to nothing when that happened.
+    closing_text = _closing_incomplete_text(segments=segments, dispatcher=dispatcher)
+    await conversation_repo.append_assistant_turn(
+        db,
+        conversation=conversation,
+        assistant_blocks=[TextBlock(text=closing_text)],
+        tool_result_blocks=None,
+    )
+    await conversation_repo.evict_to_budget(db, conversation=conversation)
+    await conversation_repo.touch(db, conversation=conversation)
+    await db.commit()
+
+    await usage_repo.record_usage(db, user_id, usage, fallback_text=question + closing_text)
+
+    # Reason lives in the message string, not `extra`: herd_common's
+    # JSONFormatter only forwards a fixed allowlist of `extra` keys into the
+    # container log (see issue #840, which hit the same gotcha), so a reason
+    # passed only via extra would never reach it.
+    logger.warning("ai_assistant_incomplete_after_tools: reason=%s", reason)
+
+    return AssistantResponse(
+        answer=closing_text,
+        model=settings.ai_model,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        stop_reason="incomplete",
+        tool_calls=_tool_call_summaries(dispatcher.call_log),
+        # Approximate: counts only the iterations that fully completed (a real
+        # assistant turn plus its tool_result echo) before the failure. The
+        # in-flight iteration that was interrupted is not counted, since there
+        # is no way to tell it happened without a text/tool_use block for it.
+        tool_iterations=len(segments),
+        conversation_id=str(conversation.id),
+        pending_apply=_pending_apply_from_side_effects(dispatcher),
+        incomplete=reason,
+    )
 
 
 @router.post("/{reservation_id}/assistant", response_model=AssistantResponse)
@@ -230,6 +397,14 @@ async def reservation_assistant(
     )
 
     pending_apply: PendingApply | None = None
+    dispatcher: ToolDispatcher | None = None
+    # Issue #871: shared-mutable output params (see AIClient's docstring).
+    # partial_segments/partial_usage are mutated in place by the loop below,
+    # so they still hold whatever completed if a later failure raises out of
+    # it, letting the except branches persist a real, non-empty turn instead
+    # of rolling back writes that already landed.
+    partial_segments: list[TurnSegment] = []
+    partial_usage = Usage()
     try:
         async with asyncio.timeout(settings.assistant_overall_deadline_s):
             async with ToolDispatcher(
@@ -242,6 +417,8 @@ async def reservation_assistant(
                     dispatcher=dispatcher,
                     max_iterations=settings.assistant_max_tool_iterations,
                     per_call_timeout_s=settings.assistant_per_call_timeout_s,
+                    segments=partial_segments,
+                    usage=partial_usage,
                 )
                 pending_apply = await _persist_turn(
                     db=db,
@@ -253,6 +430,18 @@ async def reservation_assistant(
                 )
                 call_log = list(dispatcher.call_log)
     except asyncio.TimeoutError as exc:
+        incomplete_response = await _finalize_incomplete_turn(
+            db=db,
+            conversation=conversation,
+            dispatcher=dispatcher,
+            segments=partial_segments,
+            usage=partial_usage,
+            user_id=user_id,
+            question=body.question,
+            reason=INCOMPLETE_REASON_TIMEOUT,
+        )
+        if incomplete_response is not None:
+            return incomplete_response
         # Wedge-bug fix: discard the flushed-but-uncommitted user turn so a
         # timed-out turn leaves no orphan trailing user message. If we committed
         # the user turn without the assistant reply, the next turn's reconstructed
@@ -264,6 +453,18 @@ async def reservation_assistant(
             f"Assistant did not respond within {settings.assistant_overall_deadline_s:.0f}s",
         ) from exc
     except AIProviderUnavailableError as exc:
+        incomplete_response = await _finalize_incomplete_turn(
+            db=db,
+            conversation=conversation,
+            dispatcher=dispatcher,
+            segments=partial_segments,
+            usage=partial_usage,
+            user_id=user_id,
+            question=body.question,
+            reason=INCOMPLETE_REASON_PROVIDER_UNAVAILABLE,
+        )
+        if incomplete_response is not None:
+            return incomplete_response
         # Configured but unreachable endpoint: a 503, matching the issue #131
         # standardization. Caught before AIError (its subclass); rolls back the
         # flushed user turn like the other failure branches so no orphan persists.
@@ -274,6 +475,18 @@ async def reservation_assistant(
             AI_PROVIDER_UNREACHABLE_DETAIL,
         ) from exc
     except AIError as exc:
+        incomplete_response = await _finalize_incomplete_turn(
+            db=db,
+            conversation=conversation,
+            dispatcher=dispatcher,
+            segments=partial_segments,
+            usage=partial_usage,
+            user_id=user_id,
+            question=body.question,
+            reason=INCOMPLETE_REASON_AI_ERROR,
+        )
+        if incomplete_response is not None:
+            return incomplete_response
         # Roll back first so the failed turn's user message never persists, then
         # log the exception detail server-side and return a generic message so a
         # backend exception string is never exposed to the client (CWE-209).
@@ -284,15 +497,7 @@ async def reservation_assistant(
             "Assistant call failed",
         ) from exc
 
-    tool_calls = [
-        ToolCallSummary(
-            name=rec.name,
-            arguments_summary=rec.arguments_summary,
-            duration_ms=rec.duration_ms,
-            error=rec.error,
-        )
-        for rec in call_log
-    ]
+    tool_calls = _tool_call_summaries(call_log)
 
     logger.info(
         "ai_reservation_assistant",
@@ -364,6 +569,11 @@ async def reservation_assistant_stream(
     )
 
     async def _event_stream() -> AsyncIterator[str]:
+        dispatcher: ToolDispatcher | None = None
+        # Issue #871: same shared-mutable-output-param plumbing as the
+        # buffered endpoint; see the comment there and AIClient's docstring.
+        partial_segments: list[TurnSegment] = []
+        partial_usage = Usage()
         try:
             async with asyncio.timeout(settings.assistant_overall_deadline_s):
                 async with ToolDispatcher(
@@ -377,6 +587,8 @@ async def reservation_assistant_stream(
                         dispatcher=dispatcher,
                         max_iterations=settings.assistant_max_tool_iterations,
                         per_call_timeout_s=settings.assistant_per_call_timeout_s,
+                        segments=partial_segments,
+                        usage=partial_usage,
                     ):
                         if ev.type == "status":
                             yield _sse(
@@ -418,21 +630,26 @@ async def reservation_assistant_stream(
                         input_tokens=turn.usage.input_tokens,
                         output_tokens=turn.usage.output_tokens,
                         stop_reason=turn.stop_reason,
-                        tool_calls=[
-                            ToolCallSummary(
-                                name=rec.name,
-                                arguments_summary=rec.arguments_summary,
-                                duration_ms=rec.duration_ms,
-                                error=rec.error,
-                            )
-                            for rec in dispatcher.call_log
-                        ],
+                        tool_calls=_tool_call_summaries(dispatcher.call_log),
                         tool_iterations=turn.iteration,
                         conversation_id=str(conversation.id),
                         pending_apply=pending_apply,
                     )
                     yield _sse("done", payload.model_dump(mode="json"))
         except asyncio.TimeoutError:
+            incomplete_response = await _finalize_incomplete_turn(
+                db=db,
+                conversation=conversation,
+                dispatcher=dispatcher,
+                segments=partial_segments,
+                usage=partial_usage,
+                user_id=user_id,
+                question=body.question,
+                reason=INCOMPLETE_REASON_TIMEOUT,
+            )
+            if incomplete_response is not None:
+                yield _sse("done", incomplete_response.model_dump(mode="json"))
+                return
             # Discard the flushed-but-uncommitted user turn so a timed-out turn
             # leaves no orphan trailing user message.
             await db.rollback()
@@ -446,6 +663,19 @@ async def reservation_assistant_stream(
                 },
             )
         except AIProviderUnavailableError as exc:
+            incomplete_response = await _finalize_incomplete_turn(
+                db=db,
+                conversation=conversation,
+                dispatcher=dispatcher,
+                segments=partial_segments,
+                usage=partial_usage,
+                user_id=user_id,
+                question=body.question,
+                reason=INCOMPLETE_REASON_PROVIDER_UNAVAILABLE,
+            )
+            if incomplete_response is not None:
+                yield _sse("done", incomplete_response.model_dump(mode="json"))
+                return
             # A configured-but-unreachable provider that fails once the stream has
             # already opened: a 503 status line is no longer possible, so surface
             # it as the existing `error` event shape with a diagnosable message
@@ -455,6 +685,19 @@ async def reservation_assistant_stream(
             logger.warning("ai_assistant_stream_provider_unreachable: %s", exc)
             yield _sse("error", {"message": AI_PROVIDER_UNREACHABLE_DETAIL})
         except AIError:
+            incomplete_response = await _finalize_incomplete_turn(
+                db=db,
+                conversation=conversation,
+                dispatcher=dispatcher,
+                segments=partial_segments,
+                usage=partial_usage,
+                user_id=user_id,
+                question=body.question,
+                reason=INCOMPLETE_REASON_AI_ERROR,
+            )
+            if incomplete_response is not None:
+                yield _sse("done", incomplete_response.model_dump(mode="json"))
+                return
             # Log the exception detail server-side; the client-facing error frame
             # carries a generic message so no backend exception string leaks
             # (CWE-209 stack-trace exposure). Roll back first so the failed turn's
