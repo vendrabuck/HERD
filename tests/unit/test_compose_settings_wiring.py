@@ -22,8 +22,9 @@ field, not just ai-orchestrator's AI_/ASSISTANT_/UPLOAD_ knobs:
     (a) docker-compose.yml's base environment block for that service passes
         it through via an explicit ${VAR...} reference (anywhere on the
         right-hand side; the container-side key is always the field name
-        upper-cased -- HerdBaseSettings/pydantic-settings default env-var
-        naming, and no service declares a field alias), or
+        upper-cased, HerdBaseSettings/pydantic-settings default env-var
+        naming; test_no_settings_field_declares_an_alias below verifies no
+        field overrides that with an alias), or
     (b) it is listed in _EXEMPTIONS below with a one-line reason.
 
 Compose passes an env var to a service only through an explicit ${VAR} line
@@ -42,6 +43,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -52,11 +54,26 @@ COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
 ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 SERVICES_DIR = REPO_ROOT / "services"
 
-# The 11 services with a pydantic Settings model (every one subclasses
-# herd_common.base_settings.HerdBaseSettings). `config` is stateless -- no
-# Settings model, no app/config.py -- and is deliberately excluded (see
-# CLAUDE.md, "Config service and settings precedence": "the config service is
-# the exception, it has no Settings model").
+
+def _discover_service_names() -> list[str]:
+    """Every services/<name>/app/config.py on disk, by structure rather than
+    a hardcoded name list: a new service that follows this repo's Settings
+    convention (every service's Settings model subclasses
+    herd_common.base_settings.HerdBaseSettings and lives at app/config.py)
+    is picked up automatically. The config service is excluded because it
+    has no app/config.py at all (it is stateless, see docs/ENV_VARS.md
+    "Config service"), not because its name is filtered out anywhere here;
+    test_service_names_matches_discovered_services below turns that fact
+    into an assertion instead of a silent assumption.
+    """
+    return sorted(path.parent.parent.name for path in SERVICES_DIR.glob("*/app/config.py"))
+
+
+# Kept as a literal, ordered list (roughly service-dependency order) for
+# stable, readable failure output across the test functions below, rather
+# than iterating _discover_service_names() directly everywhere.
+# test_service_names_matches_discovered_services asserts this stays in sync
+# with what is actually on disk.
 SERVICE_NAMES = [
     "auth",
     "inventory",
@@ -98,15 +115,20 @@ for name, field in Settings.model_fields.items():
         default = field.default_factory()
     else:
         default = field.default
-    data[name] = {"required": required, "default": default}
+    data[name] = {
+        "required": required,
+        "default": default,
+        "alias": field.alias,
+        "validation_alias": field.validation_alias,
+    }
 print(json.dumps(data, default=str))
 """
 
 
 @lru_cache(maxsize=None)
 def _load_settings_fields(service: str) -> dict:
-    """Return {field_name: {"required": bool, "default": Any}} for a
-    service's Settings model.
+    """Return {field_name: {"required", "default", "alias",
+    "validation_alias"}} for a service's Settings model.
 
     Import strategy: every service's config.py lives at `app/config.py` under
     the SAME top-level package name `app` (services/auth/app,
@@ -116,7 +138,7 @@ def _load_settings_fields(service: str) -> dict:
     loading the second service's code, so a single in-process loop over all
     11 services would only ever see the first one's fields. A subprocess per
     service sidesteps this cleanly (fresh sys.modules, fresh cwd) and was
-    chosen over the two alternatives named in the task brief:
+    chosen over two other approaches:
 
     - importlib with a synthetic unique module name per service would still
       leave `app.config`'s own imports (herd_common, pydantic_settings, ...)
@@ -133,18 +155,21 @@ def _load_settings_fields(service: str) -> dict:
       evaluator that is itself one more thing to keep in sync with
       config.py's grammar.
 
-    A subprocess also exactly mirrors how the repo already runs each
-    service's own tests ("each service runs pytest from its own dir", per
-    CLAUDE.md's Tests section), so `cwd=services/<svc>` plus `uv run` needs no
-    extra setup beyond the `uv sync --all-extras` this test suite already
-    assumes.
+    Uses `sys.executable` directly (the interpreter already running this
+    test, i.e. the workspace venv that `uv sync --all-extras` populated with
+    every service's editable install), not `uv run`: shelling out to `uv`
+    from inside a test can trigger a sync or install and needs `uv` on
+    PATH, neither of which this introspection needs once the workspace venv
+    already has every service installed. `-c` gives the child cwd as
+    sys.path[0] (an empty string, resolved against the process's actual
+    working directory), so `cwd=services/<svc>` is enough for `app.config`
+    to resolve to that service's own code.
     """
     service_dir = SERVICES_DIR / service
     env = dict(os.environ)
-    env.pop("VIRTUAL_ENV", None)
     env.update(_DUMMY_ENV)
     result = subprocess.run(
-        ["uv", "run", "python", "-c", _INTROSPECT_SCRIPT],
+        [sys.executable, "-c", _INTROSPECT_SCRIPT],
         cwd=service_dir,
         env=env,
         capture_output=True,
@@ -153,15 +178,10 @@ def _load_settings_fields(service: str) -> dict:
     )
     assert result.returncode == 0, (
         f"failed to introspect {service}'s Settings model via "
-        f"`uv run python -c ...` in {service_dir}:\n"
+        f"`{sys.executable} -c ...` in {service_dir}:\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )
-    # uv may print informational lines (venv creation, package install) to
-    # stdout on a cold cache in addition to the script's own final line; the
-    # JSON payload is always the last non-empty line.
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    assert lines, f"{service}: introspection script produced no output"
-    return json.loads(lines[-1])
+    return json.loads(result.stdout.strip())
 
 
 @lru_cache(maxsize=None)
@@ -191,7 +211,7 @@ def _is_wired(environment: dict, field_name: str) -> bool:
     operator-facing var by design (SECRET_KEY's value is `${AUTH_SECRET_KEY}`,
     not `${SECRET_KEY}`; DATABASE_URL's value interpolates
     `${POSTGRES_USER}`/`${POSTGRES_PASSWORD}`/`${POSTGRES_DB}`, not
-    `${DATABASE_URL}` -- see docs/ENV_VARS.md "Database URLs (auto-computed)"
+    `${DATABASE_URL}`, see docs/ENV_VARS.md "Database URLs (auto-computed)"
     and the AUTH_SECRET_KEY row in the Required table). What matters for the
     invariant is only whether SOME .env value can reach this field at
     container-creation time; a pure literal (e.g. "http://inventory:8000" or
@@ -368,7 +388,7 @@ _EXEMPTIONS: dict[str, dict[str, str]] = {
 # Fields that are correctly wired (docker-compose.yml passes them through by
 # their own name), but whose compose ${VAR:-default} is DELIBERATELY not the
 # Settings field's own default. cors_origins is the one case today:
-# docs/ENV_VARS.md's "Web / CORS / TLS" section documents it explicitly --
+# docs/ENV_VARS.md's "Web / CORS / TLS" section documents it explicitly:
 # every service's Settings model defaults cors_origins to "" (so the
 # in-process unit tests, which never see docker-compose.yml, get no CORS
 # middleware origins), while docker-compose.yml supplies
@@ -385,6 +405,48 @@ _CORS_ORIGINS_MISMATCH_REASON = (
 _DEFAULT_MISMATCH_EXEMPTIONS: dict[str, dict[str, str]] = {
     service: {"cors_origins": _CORS_ORIGINS_MISMATCH_REASON} for service in SERVICE_NAMES
 }
+
+
+def test_service_names_matches_discovered_services():
+    """SERVICE_NAMES is a literal list (for stable, readable failure output
+    in the other tests here), not the source of truth; this test is that
+    source of truth's check. A new services/<name>/app/config.py (or a
+    removed one) must fail here until SERVICE_NAMES is updated to match,
+    rather than silently going unchecked or crashing on a missing
+    _EXEMPTIONS/_DEFAULT_MISMATCH_EXEMPTIONS entry elsewhere."""
+    discovered = _discover_service_names()
+    assert discovered, f"no services/*/app/config.py found under {SERVICES_DIR}"
+    assert sorted(SERVICE_NAMES) == discovered, (
+        "SERVICE_NAMES has drifted from the services/*/app/config.py files on "
+        f"disk: discovered={discovered!r} SERVICE_NAMES={sorted(SERVICE_NAMES)!r}"
+    )
+    assert "config" not in discovered, (
+        "the config service now has an app/config.py (a Settings model), but "
+        "this test suite still assumes it is stateless and has none; add it "
+        "to SERVICE_NAMES and give it an _EXEMPTIONS entry if it needs one"
+    )
+
+
+def test_no_settings_field_declares_an_alias():
+    """_is_wired (and every other check in this file) assumes the
+    container-side env var name is always the field name upper-cased, the
+    pydantic-settings default derivation with no alias in play. If a
+    service ever adds `Field(alias=...)` or a `validation_alias`, that
+    assumption silently breaks the wiring check for that one field without
+    anything here noticing; fail loudly instead so the derivation gets
+    updated deliberately."""
+    failures = []
+    for service in SERVICE_NAMES:
+        fields = _load_settings_fields(service)
+        for field_name, meta in fields.items():
+            if meta.get("alias") or meta.get("validation_alias"):
+                failures.append(
+                    f"{service}.{field_name}: alias={meta.get('alias')!r} "
+                    f"validation_alias={meta.get('validation_alias')!r}; this "
+                    "test's env-var-name derivation (field name upper-cased) "
+                    "needs updating to honor it"
+                )
+    assert not failures, "fields declaring an alias:\n" + "\n".join(sorted(failures))
 
 
 def test_every_settings_field_is_wired_or_exempt():
