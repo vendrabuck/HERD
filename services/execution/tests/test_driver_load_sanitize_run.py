@@ -1,6 +1,6 @@
 """End-to-end proof that a driver-LOAD failure never stores foreign exception
-text on the ExecutionRun row (issue #870, the "still storing str(exc)" item
-CLAUDE.md's driver-packages section calls out).
+text on the ExecutionRun row (the driver-load follow-up to issue #840's
+class-name-only rule).
 
 run_driver_action's `except (DriverPackageError, ValueError, RuntimeError) as
 e:` branch (execution_service.py) stores `str(e)` on the run row verbatim; the
