@@ -253,6 +253,109 @@ class Driver:
                 await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
 
 
+# --- Foreign exception text never reaches the raised message (issue #870) --
+#
+# load_driver's three raise sites that can embed a FOREIGN exception's text
+# (download: httpx; extract: zipfile/tarfile/OSError; validate: whatever
+# driver.py's own import raised) must keep only the exception's class name in
+# the message that ultimately lands on the run row (execution_service.py
+# stores str(e) verbatim on the driver-LOAD except branch). The full text
+# still goes to the service log, which run_driver_action.py's precedent
+# insists on checking via a real formatted JSONFormatter record, not just
+# caplog's raw LogRecord attributes (extra-key dropping is invisible to
+# caplog).
+
+_SENTINEL = "http://secret-internal-host/leak"
+
+
+@pytest.mark.asyncio
+async def test_load_driver_download_failure_sanitizes_foreign_text(db, caplog):
+    with (
+        patch(
+            "app.services.driver_loader.download_driver_package",
+            new=AsyncMock(side_effect=Exception(f"boom at {_SENTINEL}")),
+        ),
+        caplog.at_level("ERROR"),
+    ):
+        with pytest.raises(RuntimeError) as exc:
+            await load_driver(db, uuid.uuid4(), "sha", "d.zip", "Layer 1 Switch")
+
+    message = str(exc.value)
+    assert message.endswith("Exception")
+    assert _SENTINEL not in message
+
+    from herd_common.logging import JSONFormatter
+
+    formatted = [JSONFormatter("execution").format(r) for r in caplog.records]
+    assert any(_SENTINEL in line for line in formatted)
+
+
+@pytest.mark.asyncio
+async def test_load_driver_extraction_failure_sanitizes_foreign_text(db, caplog):
+    with tempfile.TemporaryDirectory() as cache_root:
+        with (
+            patch(
+                "app.services.driver_loader.download_driver_package",
+                new=AsyncMock(return_value=b"not a zip"),
+            ),
+            patch("app.services.driver_loader.settings") as mock_settings,
+            patch(
+                "app.services.driver_loader.extract_driver_package",
+                side_effect=zipfile.BadZipFile(f"boom at {_SENTINEL}"),
+            ),
+            caplog.at_level("ERROR"),
+        ):
+            mock_settings.driver_cache_path = cache_root
+            mock_settings.inventory_service_url = "http://test"
+            mock_settings.internal_api_token = "token"
+            with pytest.raises(DriverPackageError) as exc:
+                await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
+
+    message = str(exc.value)
+    assert message.endswith("BadZipFile")
+    assert _SENTINEL not in message
+
+    from herd_common.logging import JSONFormatter
+
+    formatted = [JSONFormatter("execution").format(r) for r in caplog.records]
+    assert any(_SENTINEL in line for line in formatted)
+
+
+@pytest.mark.asyncio
+async def test_load_driver_validate_import_failure_sanitizes_foreign_text(db, caplog):
+    """driver.py itself raising at import time (SyntaxError, ImportError, or
+    anything else the package author's code does) must not leak into the
+    DriverPackageError message; validate_driver keeps only the class name."""
+    # A driver.py that raises at module-exec time, embedding the sentinel the
+    # way a real import failure could embed a container filesystem path.
+    driver_code = f"raise RuntimeError({_SENTINEL!r})\n"
+    zip_bytes = _make_zip(driver_code)
+
+    with tempfile.TemporaryDirectory() as cache_root:
+        with (
+            patch(
+                "app.services.driver_loader.download_driver_package",
+                new=AsyncMock(return_value=zip_bytes),
+            ),
+            patch("app.services.driver_loader.settings") as mock_settings,
+            caplog.at_level("ERROR"),
+        ):
+            mock_settings.driver_cache_path = cache_root
+            mock_settings.inventory_service_url = "http://test"
+            mock_settings.internal_api_token = "token"
+            with pytest.raises(DriverPackageError) as exc:
+                await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
+
+    message = str(exc.value)
+    assert message == "Driver validation failed: Failed to load driver.py: RuntimeError"
+    assert _SENTINEL not in message
+
+    from herd_common.logging import JSONFormatter
+
+    formatted = [JSONFormatter("execution").format(r) for r in caplog.records]
+    assert any(_SENTINEL in line for line in formatted)
+
+
 # --- config_schema_json capture (issue #23) ---
 
 

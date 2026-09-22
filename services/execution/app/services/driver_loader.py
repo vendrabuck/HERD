@@ -137,7 +137,14 @@ def validate_driver(driver_dir: Path, connection_type: str) -> list[str]:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception as e:
-        errors.append(f"Failed to load driver.py: {e}")
+        # e is whatever driver.py's own import raised (SyntaxError, ImportError,
+        # ...); its text can carry the extraction path inside the container
+        # (e.g. a SyntaxError's filename), so only the class name is kept in the
+        # errors list, which load_driver folds into a DriverPackageError that
+        # is stored on the run row (issue #840/#870). The full text goes in the
+        # log MESSAGE, not `extra`, since JSONFormatter drops unlisted extra keys.
+        logger.error("Failed to load driver.py at %s: %s", driver_py, e)
+        errors.append(f"Failed to load driver.py: {type(e).__name__}")
         return errors
 
     if not hasattr(module, "Driver"):
@@ -295,15 +302,24 @@ async def load_driver(
     try:
         package_bytes = await download_driver_package(driver_id)
     except Exception as e:
-        raise RuntimeError(f"Failed to download driver {driver_id}: {e}") from e
+        # e is a foreign (httpx) exception and can carry the inventory service's
+        # internal URL; only the class name is kept in the raised message, which
+        # run_driver_action stores verbatim on the run row (issue #870). The full
+        # text goes in the log MESSAGE, not `extra`, since JSONFormatter drops
+        # unlisted extra keys.
+        logger.error("Failed to download driver %s: %s", driver_id, e)
+        raise RuntimeError(f"Failed to download driver {driver_id}: {type(e).__name__}") from e
 
     # Extract
     dest_dir = Path(settings.driver_cache_path) / str(driver_id)
     try:
         extract_driver_package(package_bytes, driver_filename, dest_dir)
     except Exception as e:
+        # e is a foreign (zipfile/tarfile/OSError) exception and can carry local
+        # filesystem paths; same class-name-only treatment as the download above.
+        logger.error("Failed to extract driver %s: %s", driver_id, e)
         shutil.rmtree(dest_dir, ignore_errors=True)
-        raise DriverPackageError(f"Failed to extract driver {driver_id}: {e}") from e
+        raise DriverPackageError(f"Failed to extract driver {driver_id}: {type(e).__name__}") from e
 
     # Validate
     errors = validate_driver(dest_dir, connection_type)

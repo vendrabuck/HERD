@@ -705,7 +705,13 @@ async def test_broken_package_dlqs_on_first_delivery_with_failure_callback():
     posted.assert_awaited_once()
     assert posted.await_args.kwargs["succeeded"] is False
     assert posted.await_args.kwargs["device_ids"] == []
-    assert _VALIDATION_MSG in posted.await_args.kwargs["error"]
+    # The reason posted to reservations is class-name-only (issue #870): the
+    # diagnosable message (_VALIDATION_MSG) never leaves this service, since
+    # it can carry driver-package internals. It IS still fully readable in
+    # this process's log via exc_info, per process_reservation_message's
+    # "Permanent error processing NATS message" record.
+    assert posted.await_args.kwargs["error"] == "provisioning failed: PermanentEventError"
+    assert _VALIDATION_MSG not in posted.await_args.kwargs["error"]
 
 
 async def test_broken_package_leaves_row_creating_for_teardown():

@@ -393,6 +393,87 @@ async def test_process_message_permanent_error_dlqs_on_first_delivery(caplog):
 
 
 @pytest.mark.asyncio
+async def test_process_message_permanent_error_sanitizes_provision_failure_reason(caplog):
+    """Issue #870: the reason posted to reservations' provision-result callback
+    for a dead-lettered provision_requested is class-name-only. str(exc) can
+    carry foreign text (a driver-package path, an httpx error's URL); none of
+    it may reach reservations' stored failure detail, even though the full
+    text IS still readable in THIS service's own log via exc_info.
+    """
+    import logging
+
+    js = _make_js()
+    payload = json.dumps(
+        {"event": "reservation.provision_requested", "reservation_id": "res-1"}
+    ).encode()
+    msg = _make_msg(payload, num_delivered=1)
+    sentinel = "http://secret-internal-host/leak"
+    handler = AsyncMock(side_effect=PermanentEventError(f"boom at {sentinel}"))
+
+    posted = AsyncMock()
+    with (
+        patch("app.services.nats_consumer._post_provision_result", new=posted),
+        caplog.at_level(logging.ERROR),
+    ):
+        result = await process_reservation_message(
+            msg, js, handler, session_factory=lambda: None, max_deliver=NATS_MAX_DELIVER
+        )
+
+    assert result == "dlq"
+    posted.assert_awaited_once()
+    assert posted.await_args.kwargs["error"] == "provisioning failed: PermanentEventError"
+    assert sentinel not in posted.await_args.kwargs["error"]
+
+    # The full text survives in the log: JSONFormatter emits exc_info (unlike
+    # `extra`, whose keys off its allowlist are silently dropped).
+    from herd_common.logging import JSONFormatter
+
+    permanent_records = [
+        r for r in caplog.records if getattr(r, "action", None) == "nats_dlq_permanent"
+    ]
+    assert len(permanent_records) == 1
+    formatted = JSONFormatter("execution").format(permanent_records[0])
+    assert sentinel in formatted
+
+
+@pytest.mark.asyncio
+async def test_process_message_max_deliver_sanitizes_provision_failure_reason(caplog):
+    """Same sanitizing at the max-deliver-exhausted DLQ branch (issue #870)."""
+    import logging
+
+    js = _make_js()
+    payload = json.dumps(
+        {"event": "reservation.provision_requested", "reservation_id": "res-1"}
+    ).encode()
+    msg = _make_msg(payload, num_delivered=NATS_MAX_DELIVER)
+    sentinel = "connection refused to 10.9.9.9:5432"
+    handler = AsyncMock(side_effect=RuntimeError(f"upstream failure: {sentinel}"))
+
+    posted = AsyncMock()
+    with (
+        patch("app.services.nats_consumer._post_provision_result", new=posted),
+        caplog.at_level(logging.ERROR),
+    ):
+        result = await process_reservation_message(
+            msg, js, handler, session_factory=lambda: None, max_deliver=NATS_MAX_DELIVER
+        )
+
+    assert result == "dlq"
+    posted.assert_awaited_once()
+    assert posted.await_args.kwargs["error"] == "provisioning failed: RuntimeError"
+    assert sentinel not in posted.await_args.kwargs["error"]
+
+    from herd_common.logging import JSONFormatter
+
+    exhausted_records = [
+        r for r in caplog.records if getattr(r, "action", None) == "nats_dlq_exhausted"
+    ]
+    assert len(exhausted_records) == 1
+    formatted = JSONFormatter("execution").format(exhausted_records[0])
+    assert sentinel in formatted
+
+
+@pytest.mark.asyncio
 async def test_process_message_dlq_publish_failure_does_not_propagate():
     """If the DLQ publish itself fails, we still ack so the loop keeps draining."""
     js = _make_js()

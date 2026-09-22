@@ -4373,7 +4373,15 @@ async def process_reservation_message(
         # provisioning failed so it can transition to FAILED and publish
         # reservation.failed (whose teardown handler owns instance cleanup); we
         # do NOT tear down here. No-op for every other event.
-        await _maybe_post_provision_failure(event_data, str(exc))
+        # The reason is class-name-only (issue #870, matching the sandbox's
+        # "driver raised <ClassName>" convention): str(exc) can carry foreign
+        # exception text, and this reason rides all the way into reservations'
+        # stored failure detail. The full text is already in this log record's
+        # "exception" field via exc_info above (JSONFormatter emits exc_info,
+        # unlike `extra`, whose keys off its allowlist are dropped).
+        await _maybe_post_provision_failure(
+            event_data, f"provisioning failed: {type(exc).__name__}"
+        )
         await msg.ack()
         return "dlq"
     except Exception as exc:
@@ -4395,7 +4403,12 @@ async def process_reservation_message(
             # Same failure callback as the permanent branch: a provision_requested
             # that exhausted retries reports failure so reservations fails the
             # reservation and its teardown handler cleans up. No-op otherwise.
-            await _maybe_post_provision_failure(event_data, str(exc))
+            # Same class-name-only reason as the permanent branch above (issue
+            # #870); the full text is already in this log record's "exception"
+            # field via exc_info.
+            await _maybe_post_provision_failure(
+                event_data, f"provisioning failed: {type(exc).__name__}"
+            )
             await msg.ack()
             return "dlq"
         # Transient error: NAK so JetStream applies the backoff delay and redelivers.
