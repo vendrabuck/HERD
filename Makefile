@@ -13,7 +13,7 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # (issue #791), the CI image-vs-lock guard script (issue #593), and the AI
 # generate evaluation harness (tests/ai_eval/; the rest of tests/ is not
 # covered by make lint or CI's ruff steps).
-ROOT_PY := seedtools/ scripts/check_image_matches_lock.py tests/ai_eval/
+ROOT_PY := seedtools/ scripts/check_image_matches_lock.py tests/ai_eval/ tests/unit/
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh
