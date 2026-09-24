@@ -73,7 +73,6 @@ class Settings(HerdBaseSettings):
     health_poll_registry_refresh_seconds: int = 300
     health_poll_max_consecutive_failures: int = 3
     health_poll_backoff_cap_seconds: int = 3600
-    health_poll_minimum_interval_seconds: int = 30
 
     # ROADMAP #13 iter 2: emit a NATS event on bad-news / recovery
     # transitions so notifications can fan out an alert. Toggle off to
