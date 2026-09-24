@@ -7,7 +7,7 @@ import {
   buildsDiffer,
   formatBuildDate,
 } from "@/lib/appVersion";
-import { useServiceVersions } from "@/api/about";
+import { useServiceVersions, InvalidVersionResponseError } from "@/api/about";
 
 export function AboutPage() {
   const rows = useServiceVersions();
@@ -65,8 +65,17 @@ export function AboutPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {rows.map(({ service, data, isLoading, isError }) => {
+                {rows.map(({ service, data, isLoading, isError, error }) => {
                   const reachable = !isLoading && !isError && !!data;
+                  // A 200 whose body fails the ServiceVersion shape check
+                  // (a proxy's HTML error page, a truncated JSON body) is
+                  // distinct from a transport failure: the call answered,
+                  // but the answer cannot be trusted, so it gets its own
+                  // "invalid response" state rather than being folded into
+                  // either "reachable" (which would show fabricated skew
+                  // comparisons against garbage data) or "unreachable"
+                  // (which would hide that the service DID respond).
+                  const invalidResponse = isError && error instanceof InvalidVersionResponseError;
                   const versionDiffers = reachable && !sameRelease(data.version, APP_VERSION);
                   const buildDiffers = reachable && buildsDiffer(data.build, APP_BUILD);
                   const skew = versionDiffers || buildDiffers;
@@ -117,6 +126,10 @@ export function AboutPage() {
                           <span className="text-xs text-gray-400">Loading...</span>
                         ) : reachable ? (
                           <span className="text-xs font-medium text-green-700">reachable</span>
+                        ) : invalidResponse ? (
+                          <span className="text-xs font-medium text-amber-700">
+                            invalid response
+                          </span>
                         ) : (
                           <span className="text-xs font-medium text-red-600">unreachable</span>
                         )}

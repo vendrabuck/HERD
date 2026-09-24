@@ -61,6 +61,56 @@ describe("sameRelease", () => {
   });
 });
 
+describe("sameRelease: release candidates (issue #874)", () => {
+  it("treats matching PEP 440 and semver rc spellings of the same rc as the same", () => {
+    expect(sameRelease("0.6.0rc1", "0.6.0-rc.1")).toBe(true);
+    expect(sameRelease("0.6.0-rc.1", "0.6.0rc1")).toBe(true);
+  });
+
+  it("treats two equal rc numbers, both PEP 440, as the same", () => {
+    expect(sameRelease("0.6.0rc1", "0.6.0rc1")).toBe(true);
+  });
+
+  it("treats two equal rc numbers, both semver, as the same", () => {
+    expect(sameRelease("0.6.0-rc.1", "0.6.0-rc.1")).toBe(true);
+  });
+
+  it("does not match different rc numbers on the same release", () => {
+    expect(sameRelease("0.6.0rc1", "0.6.0-rc.2")).toBe(false);
+    expect(sameRelease("0.6.0-rc.2", "0.6.0rc1")).toBe(false);
+  });
+
+  it("does not match an rc against a final release of the same number", () => {
+    expect(sameRelease("0.6.0rc1", "0.6.0")).toBe(false);
+    expect(sameRelease("0.6.0", "0.6.0rc1")).toBe(false);
+  });
+
+  it("does not match an rc against a dev build of the same number", () => {
+    expect(sameRelease("0.6.0rc1", "0.6.0-dev")).toBe(false);
+    expect(sameRelease("0.6.0-dev", "0.6.0rc1")).toBe(false);
+    expect(sameRelease("0.6.0rc1", "0.6.0.dev0")).toBe(false);
+  });
+
+  it("does not match an rc against a different release number", () => {
+    expect(sameRelease("0.6.0rc1", "0.5.0-rc.1")).toBe(false);
+  });
+
+  it("fails closed on a semver rc missing its dot (not the frontend's spelling)", () => {
+    expect(sameRelease("0.6.0-rc1", "0.6.0-rc1")).toBe(false);
+    expect(sameRelease("0.6.0-rc1", "0.6.0rc1")).toBe(false);
+  });
+
+  it("fails closed on a post-release", () => {
+    expect(sameRelease("0.6.0.post1", "0.6.0.post1")).toBe(false);
+    expect(sameRelease("0.6.0.post1", "0.6.0")).toBe(false);
+  });
+
+  it("fails closed on garbage on either side, even against a valid rc", () => {
+    expect(sameRelease("garbage", "0.6.0rc1")).toBe(false);
+    expect(sameRelease("0.6.0rc1", "garbage")).toBe(false);
+  });
+});
+
 describe("buildsDiffer", () => {
   it("is false for two identical build strings", () => {
     expect(buildsDiffer("v0.5.0-16-gb29c8812", "v0.5.0-16-gb29c8812")).toBe(false);
