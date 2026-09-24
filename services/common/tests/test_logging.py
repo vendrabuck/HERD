@@ -195,6 +195,11 @@ REDACTED_KEYS = [
     "bearer",
     "private_key",
     "ssh_key",
+    # SNMP community strings are credentials; the "context" extra carries
+    # HERD_-prefixed device field_data, so a plain-text template field named
+    # e.g. HERD_snmp_community would otherwise reach the log (#872 follow-up).
+    "snmp_community",
+    "community",
 ]
 
 

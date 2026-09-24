@@ -47,10 +47,15 @@ ENVELOPE_KEYS: frozenset[str] = frozenset(
 # api_tokens, and bearer_tokens, all of which are credential-bearing, not
 # counters. The two real counters are already covered by the input_/output_
 # prefix exclusions above, so the plural carve-out was redundant AND a hole;
-# removed rather than narrowed further.
+# removed rather than narrowed further. A counting or config-shaped key that
+# merely CONTAINS "token" and is not one of those two carved-out shapes
+# (max_tokens, total_tokens, tokenizer, ...) IS redacted by design: an
+# over-redacted counter fails safe (a number goes missing from the log), an
+# under-redacted secret does not, so the carve-out list stays narrow and
+# exact rather than growing to chase every future counter name.
 _REDACT_KEY_PATTERN = re.compile(
     r"password|passwd|secret|authorization|api[-_]?key|kek|cookie|credential"
-    r"|jwt|bearer|private[-_]?key|ssh[-_]?key"
+    r"|jwt|bearer|private[-_]?key|ssh[-_]?key|community"
     r"|(?<!input_)(?<!output_)token(?!_id)(?!_count)",
     re.IGNORECASE,
 )
