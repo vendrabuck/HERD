@@ -10,8 +10,11 @@ Covers:
 - run_driver_action driver-result gating (issue #370): a returned
   {"success": False} records FAILED with the output preserved; a bare-data
   output without a success key stays SUCCESS.
+- run_driver_action "Starting driver execution" log line (issue #872
+  follow-up): method_kwargs values never reach the log, only the key names.
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -486,6 +489,47 @@ async def test_configure_accepts_commands_when_driver_publishes_schema(db, monke
         method_kwargs={"commands": ["ip route 192.0.2.0/24 blackhole"]},
     )
     assert run.status == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_start_log_omits_method_kwargs_values(db, monkeypatch, caplog):
+    """Issue #872 follow-up: the "Starting driver execution" log line used to
+    pass the raw method_kwargs dict through `extra`. The old fixed-allowlist
+    JSONFormatter silently dropped it, but once that formatter started
+    emitting every extra, the raw dict became a leak: for a "configure"
+    action, method_kwargs IS the device config, and a free-text line inside
+    it (a "username ... secret ..." vtysh command, an SNMP community) can
+    carry a credential that no key-name redaction rule catches, because the
+    secret material lives inside a VALUE, not under a credential-shaped key.
+    Only the key names may reach the log; the raw values must not."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        ex_service,
+        "get_driver_config_schema",
+        AsyncMock(return_value=_FRR_PUBLISHED_SCHEMA),
+    )
+    monkeypatch.setattr(ex_service, "execute_driver_method", MagicMock(side_effect=_ok_method))
+
+    secret_value = "S3cr3t-Do-Not-Leak-71fa"
+    method_kwargs = {"commands": [f"username admin secret {secret_value}"]}
+
+    with caplog.at_level("INFO"):
+        run = await run_driver_action(
+            db, _device_data(), _template_data(), "configure", USER_ID, method_kwargs=method_kwargs
+        )
+    assert run.status == "SUCCESS"
+
+    matching = [r for r in caplog.records if r.getMessage() == "Starting driver execution"]
+    assert len(matching) == 1
+
+    from herd_common.logging import JSONFormatter
+
+    line = JSONFormatter("execution").format(matching[0])
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output.get("method_kwarg_keys") == ["commands"]
+    assert "method_kwargs" not in output
 
 
 @pytest.mark.asyncio

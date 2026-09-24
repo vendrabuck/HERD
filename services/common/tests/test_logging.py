@@ -1,5 +1,7 @@
+import datetime
 import json
 import logging
+import uuid
 
 import pytest
 from fastapi import FastAPI
@@ -19,6 +21,26 @@ def _make_record(msg="test message", level=logging.INFO, **extras):
     )
     for key, value in extras.items():
         setattr(record, key, value)
+    return record
+
+
+def _record_with_extra(key, value):
+    """Build a record and set one extra by name via setattr.
+
+    Unlike _make_record(**{key: value}), this never risks the extra name
+    colliding with _make_record's own "msg"/"level" parameters (relevant for
+    an envelope-collision test that sets an extra literally named "level").
+    """
+    record = logging.LogRecord(
+        name="test.logger",
+        level=logging.INFO,
+        pathname="test.py",
+        lineno=1,
+        msg="test message",
+        args=(),
+        exc_info=None,
+    )
+    setattr(record, key, value)
     return record
 
 
@@ -71,6 +93,263 @@ def test_json_formatter_includes_exception():
     assert "exception" in output
     assert "ValueError" in output["exception"]
     assert "boom" in output["exception"]
+
+
+def test_json_formatter_emits_unlisted_extras():
+    # Issue #872: any extra, not just the old eleven-key allowlist, must
+    # reach the formatted line.
+    formatter = JSONFormatter("svc")
+    record = _make_record(iteration=3, tool_names=["a", "b"])
+    output = json.loads(formatter.format(record))
+    assert output["iteration"] == 3
+    assert output["tool_names"] == ["a", "b"]
+
+
+def test_json_formatter_old_allowlisted_keys_unchanged():
+    formatter = JSONFormatter("svc")
+    record = _make_record(
+        method="GET",
+        path="/api/test",
+        status_code=200,
+        duration_ms=12.5,
+        user_id="u1",
+        action="login",
+        email="a@example.com",
+        username="alice",
+        role="admin",
+        device_id="d1",
+        reservation_id="r1",
+    )
+    output = json.loads(formatter.format(record))
+    assert output["method"] == "GET"
+    assert output["path"] == "/api/test"
+    assert output["status_code"] == 200
+    assert output["duration_ms"] == 12.5
+    assert output["user_id"] == "u1"
+    assert output["action"] == "login"
+    assert output["email"] == "a@example.com"
+    assert output["username"] == "alice"
+    assert output["role"] == "admin"
+    assert output["device_id"] == "d1"
+    assert output["reservation_id"] == "r1"
+
+
+@pytest.mark.parametrize("colliding_key", ["service", "level", "timestamp", "logger", "exception"])
+def test_json_formatter_envelope_collision_renamed(colliding_key):
+    formatter = JSONFormatter("svc")
+    record = _record_with_extra(colliding_key, "attacker-supplied")
+    output = json.loads(formatter.format(record))
+    # The envelope value survives untouched.
+    if colliding_key == "exception":
+        assert "exception" not in output  # no exc_info on this record
+    else:
+        assert output[colliding_key] != "attacker-supplied"
+    # The colliding extra is renamed rather than dropped or overwriting.
+    assert output[f"extra_{colliding_key}"] == "attacker-supplied"
+
+
+def test_json_formatter_envelope_collision_exception_with_real_exc_info():
+    import sys
+
+    formatter = JSONFormatter("svc")
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            name="test",
+            level=logging.ERROR,
+            pathname="test.py",
+            lineno=1,
+            msg="error happened",
+            args=(),
+            exc_info=sys.exc_info(),
+        )
+    record.exception = "attacker-supplied"
+    output = json.loads(formatter.format(record))
+    assert "ValueError" in output["exception"]
+    assert output["extra_exception"] == "attacker-supplied"
+
+
+REDACTED_KEYS = [
+    "password",
+    "access_token",
+    "internal_token",
+    "Authorization",
+    "client_secret",
+    "api_key",
+    "AI_API_KEY",
+    "kek",
+    "session_cookie",
+    "credentials",
+    # Plurals (#872 follow-up: a redundant (?!s(?:_|$)) exclusion swallowed
+    # these; the two real token-counting keys are already covered by the
+    # input_/output_ prefix exclusions, so the plural carve-out was a hole,
+    # not a needed guard).
+    "tokens",
+    "access_tokens",
+    "refresh_tokens",
+    "api_tokens",
+    "bearer_tokens",
+    # New credential shapes (#872 follow-up).
+    "jwt",
+    "bearer",
+    "private_key",
+    "ssh_key",
+    # SNMP community strings are credentials; the "context" extra carries
+    # HERD_-prefixed device field_data, so a plain-text template field named
+    # e.g. HERD_snmp_community would otherwise reach the log (#872 follow-up).
+    "snmp_community",
+    "community",
+]
+
+
+@pytest.mark.parametrize("key", REDACTED_KEYS)
+def test_json_formatter_redacts_credential_shaped_keys(key):
+    formatter = JSONFormatter("svc")
+    secret_value = "sekrit-value-do-not-leak-8f2a"
+    record = _make_record(**{key: secret_value})
+    line = formatter.format(record)
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output[key] == "[redacted]"
+
+
+NON_REDACTED_KEYS = {
+    # ai_client token metering (#848/#872): counts, not secrets.
+    "input_tokens": 120,
+    "output_tokens": 45,
+    # a database row id, not the token value itself.
+    "token_id": "tok-1",
+    # same counting shape as input_tokens/output_tokens.
+    "token_count": 3,
+    "error": "boom",
+    "reason": "not_found",
+    "device_id": "d1",
+}
+
+
+@pytest.mark.parametrize("key,value", list(NON_REDACTED_KEYS.items()))
+def test_json_formatter_does_not_redact_lookalike_keys(key, value):
+    formatter = JSONFormatter("svc")
+    record = _make_record(**{key: value})
+    output = json.loads(formatter.format(record))
+    assert output[key] == value
+
+
+def test_json_formatter_redacts_nested_dict_key():
+    # A top-level key like "payload" is not itself credential-shaped, but a
+    # credential-shaped key nested inside it must still be caught.
+    formatter = JSONFormatter("svc")
+    secret_value = "nested-secret-do-not-leak-a91c"
+    record = _make_record(payload={"auth": {"password": secret_value}, "user": "alice"})
+    line = formatter.format(record)
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output["payload"]["auth"]["password"] == "[redacted]"
+    assert output["payload"]["user"] == "alice"
+
+
+def test_json_formatter_redacts_dict_inside_list():
+    formatter = JSONFormatter("svc")
+    secret_value = "list-nested-secret-do-not-leak-77bd"
+    record = _make_record(
+        items=[{"name": "a", "token": secret_value}, {"name": "b", "token": "other"}]
+    )
+    line = formatter.format(record)
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output["items"][0]["name"] == "a"
+    assert output["items"][0]["token"] == "[redacted]"
+    assert output["items"][1]["token"] == "[redacted]"
+
+
+def test_json_formatter_redaction_depth_cap():
+    formatter = JSONFormatter("svc")
+    secret_value = "too-deep-to-reach-do-not-leak-33fe"
+    # Build a dict nested well past _MAX_REDACT_DEPTH (8), with a password
+    # key buried at the bottom.
+    deep = {"password": secret_value}
+    for _ in range(12):
+        deep = {"nested": deep}
+    record = _make_record(payload=deep)
+    line = formatter.format(record)
+    # Either the depth cap or the redaction catches it first; either way the
+    # secret value itself must never reach the line.
+    assert secret_value not in line
+    output = json.loads(line)
+    node = output["payload"]
+    saw_depth_limit = False
+    for _ in range(20):
+        if node == "<depth limit>":
+            saw_depth_limit = True
+            break
+        if isinstance(node, dict) and "nested" in node:
+            node = node["nested"]
+            continue
+        break
+    assert saw_depth_limit, f"expected to hit the depth cap, got: {output['payload']!r}"
+
+
+def test_json_formatter_redaction_does_not_mutate_caller_object():
+    formatter = JSONFormatter("svc")
+    original = {"auth": {"password": "sekrit"}, "list": [{"token": "sekrit2"}]}
+    # Keep independent equality snapshots since we assert against the
+    # original structure again after formatting.
+    import copy
+
+    snapshot = copy.deepcopy(original)
+    record = _make_record(payload=original)
+    formatter.format(record)
+    assert original == snapshot
+    assert original["auth"]["password"] == "sekrit"
+    assert original["list"][0]["token"] == "sekrit2"
+
+
+def test_json_formatter_redacts_non_string_nested_keys():
+    formatter = JSONFormatter("svc")
+    secret_value = "int-key-nested-secret-do-not-leak-5c10"
+    # A dict with a non-string key; matching must coerce it with str() and
+    # must not crash on it.
+    record = _make_record(payload={"outer": {1: "fine", "password": secret_value}})
+    line = formatter.format(record)
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output["payload"]["outer"]["password"] == "[redacted]"
+    assert output["payload"]["outer"]["1"] == "fine"
+
+
+def test_json_formatter_omits_reserved_attributes():
+    formatter = JSONFormatter("svc")
+    record = _make_record("hello")
+    output = json.loads(formatter.format(record))
+    for reserved in ("args", "msg", "levelno", "pathname", "taskName", "funcName", "process"):
+        assert reserved not in output
+
+
+def test_json_formatter_omits_none_extra():
+    formatter = JSONFormatter("svc")
+    record = _make_record(some_extra=None)
+    output = json.loads(formatter.format(record))
+    assert "some_extra" not in output
+
+
+def test_json_formatter_serializes_uuid_datetime_and_raising_object():
+    class Raises:
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    formatter = JSONFormatter("svc")
+    record = _make_record(
+        a_uuid=uuid.uuid4(),
+        a_datetime=datetime.datetime(2026, 9, 24, 12, 0, 0),
+        a_bad_object=Raises(),
+        a_fine_value="still here",
+    )
+    output = json.loads(formatter.format(record))
+    assert isinstance(output["a_uuid"], str)
+    assert isinstance(output["a_datetime"], str)
+    assert output["a_bad_object"] == "<unserializable>"
+    assert output["a_fine_value"] == "still here"
 
 
 def test_setup_logging_configures_root_logger():
