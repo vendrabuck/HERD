@@ -349,14 +349,6 @@ _EXEMPTIONS: dict[str, dict[str, str]] = {
         "acl_service_url": _SERVICE_URL_REASON,
         "reservations_service_url": _SERVICE_URL_REASON,
         "secrets_service_url": _SERVICE_URL_REASON,
-        "health_poll_minimum_interval_seconds": (
-            "documented in docs/ENV_VARS.md as 'Currently unused: the "
-            "30-second floor on poll_interval_seconds is the hardcoded "
-            "MIN_POLL_INTERVAL_SECONDS in inventory's app/schemas/device.py, "
-            "so changing this variable has no effect'; wiring it through "
-            "compose would not make it take effect and would misleadingly "
-            "suggest it does. A dead field, not a compose-wiring gap."
-        ),
     },
     "ai-orchestrator": {
         "db_schema": _DB_SCHEMA_REASON,

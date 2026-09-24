@@ -6,9 +6,12 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models.device import DeviceStatus, TopologyType
 
-# Minimum opt-in poll cadence. Matches the scheduler tick floor in the
-# execution service: scheduling below this is meaningless because the tick
-# rate would dominate.
+# Minimum opt-in poll cadence. The execution scheduler only claims due rows
+# once per tick (HEALTH_POLL_SCHEDULER_TICK_SECONDS, default 30 seconds), so
+# a device's effective poll period is always at least one tick regardless of
+# a lower configured interval. This constant must equal execution's default
+# tick length so the API refuses cadences the scheduler cannot honor at the
+# default; tests/unit/test_poll_floor_parity.py enforces that equality.
 MIN_POLL_INTERVAL_SECONDS = 30
 
 # Matches the devices.name column width (String(255), app/models/device.py).

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Removed the dead `HEALTH_POLL_MINIMUM_INTERVAL_SECONDS` setting from the execution
+  service (issue #880). The variable was declared with a default and documented in
+  `docs/ENV_VARS.md`, but it was never passed through by `docker-compose.yml` and
+  nothing in the health scheduler read it: it never had any effect, in a container or
+  otherwise. The real floor on `poll_interval_seconds` remains inventory's hardcoded
+  `MIN_POLL_INTERVAL_SECONDS`. An operator who had set this variable loses nothing by
+  its removal, since it never changed any behavior.
 - Reservations can be cancelled from the UI before they are active (issue #841): the
   reservations table and the reservation detail modal gated BOTH Release and Cancel on
   `status === "ACTIVE"`, so a PENDING or PENDING_PROVISION reservation had no Cancel
