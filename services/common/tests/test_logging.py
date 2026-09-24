@@ -181,6 +181,20 @@ REDACTED_KEYS = [
     "kek",
     "session_cookie",
     "credentials",
+    # Plurals (#872 follow-up: a redundant (?!s(?:_|$)) exclusion swallowed
+    # these; the two real token-counting keys are already covered by the
+    # input_/output_ prefix exclusions, so the plural carve-out was a hole,
+    # not a needed guard).
+    "tokens",
+    "access_tokens",
+    "refresh_tokens",
+    "api_tokens",
+    "bearer_tokens",
+    # New credential shapes (#872 follow-up).
+    "jwt",
+    "bearer",
+    "private_key",
+    "ssh_key",
 ]
 
 
@@ -215,6 +229,88 @@ def test_json_formatter_does_not_redact_lookalike_keys(key, value):
     record = _make_record(**{key: value})
     output = json.loads(formatter.format(record))
     assert output[key] == value
+
+
+def test_json_formatter_redacts_nested_dict_key():
+    # A top-level key like "payload" is not itself credential-shaped, but a
+    # credential-shaped key nested inside it must still be caught.
+    formatter = JSONFormatter("svc")
+    secret_value = "nested-secret-do-not-leak-a91c"
+    record = _make_record(payload={"auth": {"password": secret_value}, "user": "alice"})
+    line = formatter.format(record)
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output["payload"]["auth"]["password"] == "[redacted]"
+    assert output["payload"]["user"] == "alice"
+
+
+def test_json_formatter_redacts_dict_inside_list():
+    formatter = JSONFormatter("svc")
+    secret_value = "list-nested-secret-do-not-leak-77bd"
+    record = _make_record(
+        items=[{"name": "a", "token": secret_value}, {"name": "b", "token": "other"}]
+    )
+    line = formatter.format(record)
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output["items"][0]["name"] == "a"
+    assert output["items"][0]["token"] == "[redacted]"
+    assert output["items"][1]["token"] == "[redacted]"
+
+
+def test_json_formatter_redaction_depth_cap():
+    formatter = JSONFormatter("svc")
+    secret_value = "too-deep-to-reach-do-not-leak-33fe"
+    # Build a dict nested well past _MAX_REDACT_DEPTH (8), with a password
+    # key buried at the bottom.
+    deep = {"password": secret_value}
+    for _ in range(12):
+        deep = {"nested": deep}
+    record = _make_record(payload=deep)
+    line = formatter.format(record)
+    # Either the depth cap or the redaction catches it first; either way the
+    # secret value itself must never reach the line.
+    assert secret_value not in line
+    output = json.loads(line)
+    node = output["payload"]
+    saw_depth_limit = False
+    for _ in range(20):
+        if node == "<depth limit>":
+            saw_depth_limit = True
+            break
+        if isinstance(node, dict) and "nested" in node:
+            node = node["nested"]
+            continue
+        break
+    assert saw_depth_limit, f"expected to hit the depth cap, got: {output['payload']!r}"
+
+
+def test_json_formatter_redaction_does_not_mutate_caller_object():
+    formatter = JSONFormatter("svc")
+    original = {"auth": {"password": "sekrit"}, "list": [{"token": "sekrit2"}]}
+    # Keep independent equality snapshots since we assert against the
+    # original structure again after formatting.
+    import copy
+
+    snapshot = copy.deepcopy(original)
+    record = _make_record(payload=original)
+    formatter.format(record)
+    assert original == snapshot
+    assert original["auth"]["password"] == "sekrit"
+    assert original["list"][0]["token"] == "sekrit2"
+
+
+def test_json_formatter_redacts_non_string_nested_keys():
+    formatter = JSONFormatter("svc")
+    secret_value = "int-key-nested-secret-do-not-leak-5c10"
+    # A dict with a non-string key; matching must coerce it with str() and
+    # must not crash on it.
+    record = _make_record(payload={"outer": {1: "fine", "password": secret_value}})
+    line = formatter.format(record)
+    assert secret_value not in line
+    output = json.loads(line)
+    assert output["payload"]["outer"]["password"] == "[redacted]"
+    assert output["payload"]["outer"]["1"] == "fine"
 
 
 def test_json_formatter_omits_reserved_attributes():

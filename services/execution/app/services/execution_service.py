@@ -432,7 +432,16 @@ async def run_driver_action(
             "context": redacted,
             "port_a": port_a,
             "port_b": port_b,
-            "method_kwargs": method_kwargs,
+            # Not the raw method_kwargs dict: for "configure" this carries
+            # the device config verbatim (BGP passwords, SNMP communities,
+            # free-text "username ... secret ..." lines), which
+            # JSONFormatter's key-name redaction cannot catch because the
+            # secret material lives inside a VALUE, not under a
+            # credential-shaped key (issue #872 follow-up). Only the key
+            # names are queryable context; the values are not logged here at
+            # all (they still land in the ExecutionRun row via
+            # create_execution_run, which is unrelated to this log line).
+            "method_kwarg_keys": sorted(method_kwargs) if method_kwargs else None,
         },
     )
 
