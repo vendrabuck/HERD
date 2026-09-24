@@ -4,7 +4,7 @@ import { cn } from "@/lib/cn";
  * Single source of truth for status-badge color tokens. Keyed by the backend
  * enum string, value is the pale -100 background + saturated -700/800 text pair
  * the design system prescribes. Centralizes maps that were previously duplicated
- * in InventoryPage, ReservationsPage, ReservationPanel, and DeviceHealthBadge.
+ * in InventoryPage, ReservationsPage, and DeviceHealthBadge.
  *
  * Tokens are preserved verbatim from those call sites so existing tests that
  * assert on the class strings (DeviceHealthBadge.test.tsx) keep passing.

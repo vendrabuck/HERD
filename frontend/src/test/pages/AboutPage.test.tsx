@@ -156,6 +156,61 @@ describe("AboutPage", () => {
     expect(within(rowFor("Secrets")).queryByText("differs")).not.toBeInTheDocument();
   });
 
+  it("renders 'invalid response' with dashed cells and no 'differs' for a malformed 200 body (issue #874)", async () => {
+    mockAllServicesOk();
+    server.use(
+      // A proxy or gateway serving an HTML error page with a 200 status: the
+      // body fails the ServiceVersion shape check in fetchServiceVersion.
+      http.get("/api/cabling/version", () => HttpResponse.text("<html>502</html>")),
+    );
+    renderWithProviders(<AboutPage />);
+
+    const row = rowFor("Cabling");
+    await waitFor(() =>
+      expect(within(row).getByText("invalid response")).toBeInTheDocument(),
+    );
+    // Exact match, never confused with "reachable"/"unreachable" by a
+    // substring matcher (the same trap the e2e suite documents).
+    expect(within(row).queryByText("reachable", { exact: true })).not.toBeInTheDocument();
+    expect(within(row).queryByText("unreachable")).not.toBeInTheDocument();
+    expect(within(row).queryByText("differs")).not.toBeInTheDocument();
+    // Version/build/build-date cells all read "-", the same as unreachable.
+    const dashes = within(row).getAllByText("-");
+    expect(dashes.length).toBe(3);
+  });
+
+  it("still renders 'unreachable' (not 'invalid response') for an ordinary transport/HTTP failure", async () => {
+    mockAllServicesOk();
+    server.use(
+      http.get("/api/inventory/version", () => HttpResponse.json({ detail: "down" }, { status: 503 })),
+    );
+    renderWithProviders(<AboutPage />);
+
+    const row = rowFor("Inventory");
+    await waitFor(() => expect(within(row).getByText("unreachable")).toBeInTheDocument());
+    expect(within(row).queryByText("invalid response")).not.toBeInTheDocument();
+  });
+
+  it("still flags an ordinary well-formed mismatched body as 'differs', not 'invalid response'", async () => {
+    mockAllServicesOk();
+    server.use(
+      http.get("/api/auth/version", () =>
+        HttpResponse.json({
+          service: "auth",
+          version: "0.5.0",
+          build: APP_BUILD,
+          build_date: "2026-09-15T03:04:05Z",
+        }),
+      ),
+    );
+    renderWithProviders(<AboutPage />);
+
+    const row = rowFor("Auth");
+    await waitFor(() => expect(within(row).getByText("differs")).toBeInTheDocument());
+    expect(within(row).getByText("reachable")).toBeInTheDocument();
+    expect(within(row).queryByText("invalid response")).not.toBeInTheDocument();
+  });
+
   it("Refresh re-fetches every service", async () => {
     let acls = 0;
     mockAllServicesOk();

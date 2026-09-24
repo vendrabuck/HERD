@@ -8,6 +8,34 @@ export interface ServiceVersion {
   build_date: string | null;
 }
 
+/**
+ * Thrown by fetchServiceVersion when a GET /version call comes back 200 but
+ * the body does not match ServiceVersion's shape (issue #874): a proxy or
+ * gateway serving an HTML error page with a 200 status, a JSON body missing
+ * a required field, or a field of the wrong type. Kept distinct from a
+ * network/transport failure so the About page can tell "answered, but the
+ * answer is not to be trusted" apart from "did not answer at all" instead of
+ * rendering both as an honest "reachable".
+ */
+export class InvalidVersionResponseError extends Error {
+  constructor(readonly service: string) {
+    super(`service "${service}" returned a malformed /version response`);
+    this.name = "InvalidVersionResponseError";
+  }
+}
+
+/** True when every field of `body` matches ServiceVersion's shape. */
+function isServiceVersion(body: unknown): body is ServiceVersion {
+  if (typeof body !== "object" || body === null) return false;
+  const candidate = body as Record<string, unknown>;
+  return (
+    typeof candidate.service === "string" &&
+    typeof candidate.version === "string" &&
+    typeof candidate.build === "string" &&
+    (candidate.build_date === null || typeof candidate.build_date === "string")
+  );
+}
+
 export interface ServiceDescriptor {
   /** Stable key; also the "service" field the backend's own /version reports. */
   name: string;
@@ -38,7 +66,10 @@ export const SERVICES: ServiceDescriptor[] = [
 ];
 
 export async function fetchServiceVersion(service: ServiceDescriptor): Promise<ServiceVersion> {
-  const resp = await apiClient.get<ServiceVersion>(service.path);
+  const resp = await apiClient.get<unknown>(service.path);
+  if (!isServiceVersion(resp.data)) {
+    throw new InvalidVersionResponseError(service.name);
+  }
   return resp.data;
 }
 

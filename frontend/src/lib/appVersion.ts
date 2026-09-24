@@ -15,48 +15,81 @@ export const APP_BUILD: string = __APP_BUILD__;
 /** ISO 8601 UTC, or null when unset (unbuilt-through-the-Makefile case). */
 export const APP_BUILD_DATE: string | null = __APP_BUILD_DATE__ ? __APP_BUILD_DATE__ : null;
 
+/**
+ * A version's pre-release marker: "dev" (still in development on the
+ * release, the dev counter itself is never compared), an rc with its number
+ * (the number DOES matter: rc1 and rc2 are different pre-releases), or null
+ * for a plain final release.
+ */
+type Prerelease = "dev" | { rc: number } | null;
+
 interface ParsedVersion {
   release: string;
-  dev: boolean;
+  pre: Prerelease;
 }
 
 /**
- * Parses a version string in either the backend's PEP 440 spelling
- * ("0.6.0.dev0") or the frontend's semver spelling ("0.6.0-dev") of "still
- * in development on this release number", or a plain final release such as
- * "0.6.0". Returns null for any other shape.
+ * Parses a version string in either the backend's PEP 440 spelling or the
+ * frontend's semver spelling of a release, its dev pre-release, or its
+ * release-candidate pre-release:
+ *
+ * - final: "0.6.0" (both spellings share this shape)
+ * - dev: PEP 440 "0.6.0.dev0", semver "0.6.0-dev" (the devN counter is
+ *   parsed but never compared, so any devN counts as the same pre-release)
+ * - rc: PEP 440 "0.6.0rc1", semver "0.6.0-rc.1" (the rc number IS compared)
+ *
+ * Anything else fails closed and returns null: post-releases such as
+ * "0.6.0.post1", a semver rc missing its dot ("0.6.0-rc1"), and plain
+ * garbage all count as unparseable rather than being guessed at.
  */
 function parseVersion(version: string): ParsedVersion | null {
   const pep440Dev = /^(\d+\.\d+\.\d+)\.dev\d*$/.exec(version);
   if (pep440Dev) {
-    return { release: pep440Dev[1], dev: true };
+    return { release: pep440Dev[1], pre: "dev" };
   }
   const semverDev = /^(\d+\.\d+\.\d+)-dev$/.exec(version);
   if (semverDev) {
-    return { release: semverDev[1], dev: true };
+    return { release: semverDev[1], pre: "dev" };
+  }
+  const pep440Rc = /^(\d+\.\d+\.\d+)rc(\d+)$/.exec(version);
+  if (pep440Rc) {
+    return { release: pep440Rc[1], pre: { rc: Number(pep440Rc[2]) } };
+  }
+  const semverRc = /^(\d+\.\d+\.\d+)-rc\.(\d+)$/.exec(version);
+  if (semverRc) {
+    return { release: semverRc[1], pre: { rc: Number(semverRc[2]) } };
   }
   const final = /^(\d+\.\d+\.\d+)$/.exec(version);
   if (final) {
-    return { release: final[1], dev: false };
+    return { release: final[1], pre: null };
   }
   return null;
 }
 
+/** True when two Prerelease values name the same pre-release state. */
+function samePrerelease(a: Prerelease, b: Prerelease): boolean {
+  if (a === "dev" || b === "dev") return a === b;
+  if (a === null || b === null) return a === b;
+  return a.rc === b.rc;
+}
+
 /**
  * True when two version strings name the same release, tolerating the PEP
- * 440 (backend, "0.6.0.dev0") versus semver (frontend, "0.6.0-dev") spelling
- * of the same pre-release. "0.6.0" and "0.6.0.dev0" are NOT the same (one is
- * a tagged release, the other still in development on it); "0.5.0" and
- * "0.6.0" are not (different release numbers). An unparseable string never
- * matches anything, including an identical unparseable string on the other
- * side: the About page fails closed and flags it rather than silently
- * assuming a match.
+ * 440 (backend) versus semver (frontend) spelling of the same pre-release,
+ * dev or rc. "0.6.0" and "0.6.0.dev0" are NOT the same (one is a tagged
+ * release, the other still in development on it); "0.6.0rc1" and
+ * "0.6.0-rc.1" ARE the same; "0.6.0rc1" and "0.6.0-rc.2" are NOT (the rc
+ * number matters); "0.6.0rc1" and "0.6.0-dev" are NOT (different pre-release
+ * kinds); "0.5.0" and "0.6.0" are not (different release numbers). An
+ * unparseable string never matches anything, including an identical
+ * unparseable string on the other side: the About page fails closed and
+ * flags it rather than silently assuming a match.
  */
 export function sameRelease(backendVersion: string, frontendVersion: string): boolean {
   const backend = parseVersion(backendVersion);
   const frontend = parseVersion(frontendVersion);
   if (!backend || !frontend) return false;
-  return backend.release === frontend.release && backend.dev === frontend.dev;
+  return backend.release === frontend.release && samePrerelease(backend.pre, frontend.pre);
 }
 
 /**
