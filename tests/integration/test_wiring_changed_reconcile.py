@@ -297,6 +297,68 @@ async def _poll_active(client, reservation_id: str, *, timeout: float = 12.0) ->
     return False
 
 
+_TERMINAL_RUN_STATUSES = {"SUCCESS", "FAILED"}
+
+
+async def _find_in_flight_run(
+    client, reservation_id: str, device_id: str, action: str | None = None
+) -> dict | None:
+    """Most recent execution run for (reservation, device) that has not yet reached a
+    terminal status, optionally restricted to a single `action`, or None.
+
+    GET /execution/runs has no `action` filter, so it is applied client-side,
+    mirroring `_count_success_runs` above. "In flight" means not yet SUCCESS/FAILED,
+    not a literal RUNNING status: `_apply_one_port_action` and the per-switch login
+    step (nats_consumer.py, shared by the reconcile consumer and both retry channels)
+    create the run row PENDING and write a terminal status only once the driver call
+    returns; there is no separate RUNNING marker on this path (unlike
+    execution_service.run_driver_action's ad-hoc driver-execute path, which does set
+    RUNNING). Checking "not terminal" rather than hardcoding PENDING keeps this
+    honest if that ever changes.
+    """
+    resp = await client.get(
+        "/execution/runs",
+        params={"reservation_id": reservation_id, "device_id": device_id, "limit": 50},
+    )
+    if resp.status_code != 200:
+        return None
+    for run in resp.json().get("items", []):
+        if run["status"] in _TERMINAL_RUN_STATUSES:
+            continue
+        if action is not None and run["action"] != action:
+            continue
+        return run
+    return None
+
+
+async def _poll_run_in_flight(
+    client,
+    reservation_id: str,
+    device_id: str,
+    action: str | None = None,
+    *,
+    timeout: float = 6.0,
+) -> dict | None:
+    """Poll until an in-flight (non-terminal) execution run for (reservation, device)
+    appears, optionally restricted to a single `action`.
+
+    Issue #817: since the background retry tick can claim a FAILED row's
+    `claimed_until` stamp before a concurrent manual retry call does, WHICHEVER
+    channel wins the claim is the one that actually enters the driver call and owns
+    this run row; the loser's own HTTP call returns "in_progress" almost immediately
+    without ever touching the driver. A test that wants to prove a writer is
+    genuinely mid-drive must poll the run ledger, not assume the channel it itself
+    fired is the one driving.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        run = await _find_in_flight_run(client, reservation_id, device_id, action)
+        if run is not None:
+            return run
+        await asyncio.sleep(0.25)
+    return None
+
+
 async def test_failed_build_surfaces_and_manual_retry_recovers(
     admin_client, l1_template, fresh_devices
 ):
@@ -502,9 +564,21 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
        winner's: row ACTIVE, no FAILED residue, attempts not inflated. The
        issue #412 guard is one of the mechanisms this contract rests on.
 
-    Vacuity canary: retry-2 must complete while retry-1 is still in flight; if
-    retry-1 ever finishes first the interleaving collapsed and the canary
-    fails loudly instead of letting the test pass without exercising the race.
+    Vacuity canary: retry-2 must land while SOME writer is genuinely mid-drive
+    on connect_ports, proven through the execution run ledger (a non-terminal,
+    i.e. not yet SUCCESS/FAILED, run row), not through `stale_writer.done()`.
+    Issue #817: since the background retry tick can claim the same FAILED
+    row's `claimed_until` stamp before retry-1's own HTTP call does, retry-1
+    is not necessarily the writer that blocks - whichever channel wins the
+    claim is the one that actually drives, and the loser answers
+    "in_progress" immediately without ever touching the driver. `task.done()`
+    on retry-1 alone would misread a tick-driven attempt as vacuity even
+    though the race is genuinely being exercised (by the tick instead of
+    retry-1). The run ledger check is channel-agnostic: it only cares that a
+    writer was in flight (per-switch login, then its own connect_ports
+    attempt) when the winner landed. If the drive finishes before the winner
+    runs, the canary still fails loudly instead of letting the test pass
+    without exercising the race.
     """
     nats_err = await probe_nats()
     if nats_err:
@@ -558,9 +632,23 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
         stale_writer = asyncio.create_task(
             admin_client.post(f"/reservations/{reservation_id}/wiring/retry")
         )
-        # Let retry-1 fetch its (armed) context and enter its first sleeping
-        # connect attempt before the knobs change under it.
-        await asyncio.sleep(2.0)
+        # Wait for a writer to actually be mid-drive before the knobs change
+        # under it, WITHOUT waiting so long that it has already claimed the
+        # connect_ports row: issue #817's claim is taken immediately before
+        # the driver call inside the shared apply, and a batch is driven
+        # sequentially behind a per-switch login, so the row is still
+        # unclaimed while that login is in flight. Watch specifically for the
+        # per-switch "login" run (issue #817: this may be retry-1's own call,
+        # or the background tick if it wins the race to start first) going
+        # non-terminal: that proves a writer has fetched the armed context and
+        # is blocked in it, while leaving the connect_ports row's claim still
+        # open for the winner below to take.
+        in_flight = await _poll_run_in_flight(admin_client, reservation_id, switch["id"], "login")
+        assert in_flight is not None, (
+            "no writer (retry-1's own call or the background tick, issue #817) "
+            "ever entered its per-switch login before the knobs changed; the "
+            "interleaving never got set up"
+        )
 
         # Step 3: clear the knobs and run the winner to completion mid-window.
         upd = await admin_client.put(
@@ -570,9 +658,17 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
         assert upd.status_code == 200, upd.text
         winner_resp = await admin_client.post(f"/reservations/{reservation_id}/wiring/retry")
         assert winner_resp.status_code == 200, winner_resp.text
-        assert not stale_writer.done(), (
-            "retry-1 finished before the winner ran; the issue #412 interleaving "
-            "collapsed and this test is not exercising the race"
+
+        # Vacuity canary (issue #817-aware, see the docstring above): prove a
+        # writer was STILL mid-drive (login or, by now, its own connect_ports
+        # attempt) when the winner landed via the run ledger, channel-agnostic
+        # and action-agnostic, rather than `stale_writer.done()`, which only
+        # proves retry-1's own HTTP call was pending and would misread a
+        # tick-driven attempt as a collapsed race.
+        still_in_flight = await _find_in_flight_run(admin_client, reservation_id, switch["id"])
+        assert still_in_flight is not None, (
+            "the concurrent writer's drive finished before the winner ran; the "
+            "interleaving collapsed and this test is not exercising the race"
         )
         won = await _poll_wiring_conn(
             admin_client, reservation_id, lambda c: c["status"] == "ACTIVE", timeout=10.0
@@ -580,7 +676,10 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
         assert won is not None, "the winning retry never flipped the row ACTIVE"
         attempts_after_win = won["attempts"]
 
-        # Step 4: the stale writer completes; its failure must be ignored.
+        # Step 4: retry-1's own call completes; whatever it reports (a real
+        # "still_failed" outcome if it won the claim, or an immediate
+        # "in_progress" if the tick did, issue #817) is dropped in favor of
+        # the winner's ACTIVE row below.
         stale_resp = await stale_writer
         assert stale_resp.status_code == 200, stale_resp.text
 
