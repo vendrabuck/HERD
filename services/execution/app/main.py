@@ -63,12 +63,15 @@ async def _ensure_dlq_stream(app: FastAPI) -> None:
 
     Every consumer routes poison and retry-exhausted messages to a 4-token
     DLQ subject (herd.reservations.dlq.execution, herd.reservations.dlq.notifications,
-    herd.health.dlq.notifications). Those subjects are deliberately one token
-    longer than any consumer's 3-token filter so a DLQ'd message is never
-    redelivered to the consumer that failed it; the flip side is that no
-    producing stream captures them, so without this stream _publish_to_dlq
-    publishes into the void and the message is lost. The "herd.*.dlq.>" pattern
-    binds all current and future DLQ subjects into one inspectable stream.
+    herd.health.dlq.notifications, herd.reservations.dlq.integration, and
+    herd.health.dlq.integration, the latter two owned by the integration
+    service's two webhook consumers, issue #831). Those subjects are
+    deliberately one token longer than any consumer's 3-token filter so a
+    DLQ'd message is never redelivered to the consumer that failed it; the
+    flip side is that no producing stream captures them, so without this
+    stream _publish_to_dlq publishes into the void and the message is lost.
+    The "herd.*.dlq.>" pattern binds all current and future DLQ subjects
+    into one inspectable stream.
 
     Idempotent: ensure_stream creates the stream if it does not exist, or
     updates it in place if it exists with a different configuration (e.g. a

@@ -452,16 +452,19 @@ the new `/settings` page.
 A stable, versioned external surface for automation (issue #33), separate from the
 internal endpoints the web UI calls. Two halves: an inbound `/api/v1` HTTP facade for
 reserving and releasing devices from CI/CD pipelines and test-automation systems, and
-outbound webhooks that POST reservation lifecycle events to admin-registered endpoints.
+outbound webhooks that POST reservation lifecycle and device-health events to
+admin-registered endpoints.
 The facade forwards the caller's identity to the internal services, so RBAC,
 device-group visibility, and ACL grants apply to an automation client exactly as they
 do to an interactive user. Automation authenticates with a long-lived, admin-minted API
 token (`/api/auth/tokens`, owned by the auth service) exchanged for a short-lived access
 JWT; a token's role can never exceed its principal's own role. Outbound webhook
 deliveries are HMAC-signed, retried up to `WEBHOOK_DELIVERY_ATTEMPTS` times, and recorded
-in a delivery ledger with a dead-letter record on exhaustion. Its own durable NATS
-consumer (`integration-webhooks-consumer`) drives delivery off the same reservation
-lifecycle stream execution and notifications consume. See
+in a delivery ledger with a dead-letter record on exhaustion. Two durable NATS
+consumers drive delivery: `integration-webhooks-consumer` off the same reservation
+lifecycle stream execution and notifications consume, and
+`integration-webhooks-health-consumer` off the device-health stream notifications'
+own health consumer consumes. See
 [docs/EXTERNAL_API.md](docs/EXTERNAL_API.md) for the full contract.
 
 ### Secrets Service

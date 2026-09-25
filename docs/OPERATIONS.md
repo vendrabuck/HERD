@@ -75,11 +75,13 @@ If a migration fails mid-flight, the service stays down. Fix the cause, re-run `
 
 ## Inspecting the NATS DLQ
 
-Three durable consumers feed off two source streams (`HERD_RESERVATIONS` for `herd.reservations.*`, `HERD_HEALTH` for `herd.health.*`). Each consumer routes its failures to its own 4-token DLQ subject so one consumer's failures do not mask another's. All DLQ subjects are captured by a single dedicated `HERD_DLQ` stream (`herd.*.dlq.>` subjects), created by the execution service at startup. The DLQ subjects are deliberately one token longer than any consumer's 3-token filter, so a DLQ'd message is never redelivered to the consumer that failed it:
+Five durable consumers feed off two source streams (`HERD_RESERVATIONS` for `herd.reservations.*`, `HERD_HEALTH` for `herd.health.*`). Each consumer routes its failures to its own 4-token DLQ subject so one consumer's failures do not mask another's. All DLQ subjects are captured by a single dedicated `HERD_DLQ` stream (`herd.*.dlq.>` subjects), created by the execution service at startup. The DLQ subjects are deliberately one token longer than any consumer's 3-token filter, so a DLQ'd message is never redelivered to the consumer that failed it:
 
 - `execution` consumer (`execution-consumer`), DLQ `herd.reservations.dlq.execution`
 - `notifications` consumer (`notifications-consumer`), DLQ `herd.reservations.dlq.notifications`
 - `notifications` health consumer (`notifications-health-consumer`), DLQ `herd.health.dlq.notifications`
+- `integration` webhooks consumer (`integration-webhooks-consumer`), DLQ `herd.reservations.dlq.integration`
+- `integration` webhooks health consumer (`integration-webhooks-health-consumer`, issue #831), DLQ `herd.health.dlq.integration`
 
 Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate. Inspect with the `nats` CLI (install via `brew install nats-io/nats-tools/nats` or the binary from github.com/nats-io/natscli):
 
@@ -91,6 +93,8 @@ docker compose exec nats nats stream info HERD_DLQ
 docker compose exec nats nats sub 'herd.reservations.dlq.execution' --last-per-subject     # execution
 docker compose exec nats nats sub 'herd.reservations.dlq.notifications' --last-per-subject  # notifications (reservations)
 docker compose exec nats nats sub 'herd.health.dlq.notifications' --last-per-subject        # notifications (health)
+docker compose exec nats nats sub 'herd.reservations.dlq.integration' --last-per-subject    # integration webhooks (reservations)
+docker compose exec nats nats sub 'herd.health.dlq.integration' --last-per-subject          # integration webhooks (health)
 
 # Or use a durable pull consumer to walk messages one at a time
 docker compose exec nats nats consumer add HERD_DLQ dlq-inspector \
@@ -102,7 +106,7 @@ Each DLQ message is a verbatim copy of the original event payload. Reservation e
 
 ### Replaying a DLQ message
 
-Once you understand what made the message fail and have fixed the underlying cause, re-publish it on the original subject. Every durable consumer bound to that subject reprocesses it: for `herd.reservations.*` that is both execution and notifications; for `herd.health.*` it is notifications only (execution publishes health events, it does not consume them):
+Once you understand what made the message fail and have fixed the underlying cause, re-publish it on the original subject. Every durable consumer bound to that subject reprocesses it: for `herd.reservations.*` that is execution, notifications, and integration's webhooks consumer; for `herd.health.*` it is notifications and integration's webhooks health consumer (execution publishes health events, it does not consume them). A `herd.health.*` replay therefore reaches integration's webhook subscribers too, subject to its own delivery ledger: a target the ledger already marked `delivered` for that event is skipped (idempotent on `(subscription_id, event_id)`), but a target marked `dead` is POSTed to again, since only `delivered` short-circuits a redelivery.
 
 ```bash
 docker compose exec nats nats pub 'herd.reservations.created' "$(cat msg.json)"
@@ -119,6 +123,10 @@ docker compose exec nats nats stream purge HERD_DLQ \
   --subject 'herd.reservations.dlq.notifications'
 docker compose exec nats nats stream purge HERD_DLQ \
   --subject 'herd.health.dlq.notifications'
+docker compose exec nats nats stream purge HERD_DLQ \
+  --subject 'herd.reservations.dlq.integration'
+docker compose exec nats nats stream purge HERD_DLQ \
+  --subject 'herd.health.dlq.integration'
 ```
 
 ### JetStream durability
