@@ -408,6 +408,54 @@ def test_safe_json_loads_decodes_well_formed_object():
     assert _safe_json_loads('{"id": "dev", "n": 1}') == {"id": "dev", "n": 1}
 
 
+def test_safe_json_loads_malformed_never_logs_raw_content(caplog):
+    """Issue #887: a malformed tool-call arguments string is model output and
+    can carry a credential-shaped fragment (a truncated password value the
+    model echoed or hallucinated). The warning must carry only the failure's
+    SHAPE (length, decoder error position, error class, tool name), never the
+    raw text, in the extra dict AND once formatted through JSONFormatter.
+    """
+    from herd_common.logging import JSONFormatter
+
+    credential_fragment = '{"password": "S3cr3t-Do-Not-Leak-9c2"'  # malformed: unterminated
+    with caplog.at_level("WARNING"):
+        result = _safe_json_loads(credential_fragment, tool_name="schedule_config_apply")
+
+    assert result == {}
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+
+    # Not present as a raw string anywhere on the record's own extras.
+    for value in vars(record).values():
+        assert "S3cr3t-Do-Not-Leak-9c2" not in str(value)
+        assert "password" not in str(value)
+
+    assert record.tool_name == "schedule_config_apply"
+    assert record.raw_length == len(credential_fragment)
+    assert record.error_kind == "JSONDecodeError"
+    assert isinstance(record.error_position, int)
+
+    formatted = JSONFormatter("ai-orchestrator").format(record)
+    assert "S3cr3t-Do-Not-Leak-9c2" not in formatted
+    assert "password" not in formatted
+    assert '"raw_length"' in formatted
+    assert '"error_position"' in formatted
+    assert '"error_kind": "JSONDecodeError"' in formatted
+    assert '"tool_name": "schedule_config_apply"' in formatted
+
+
+def test_safe_json_loads_type_error_has_no_error_position(caplog):
+    """A non-str/bytes argument (TypeError from json.loads) has no .pos; the
+    warning must degrade to error_position=None rather than raising."""
+    with caplog.at_level("WARNING"):
+        result = _safe_json_loads(12345, tool_name="get_device")  # type: ignore[arg-type]
+
+    assert result == {}
+    record = caplog.records[0]
+    assert record.error_kind == "TypeError"
+    assert record.error_position is None
+
+
 @pytest.mark.asyncio
 async def test_malformed_tool_arguments_surface_as_empty_input():
     """The dispatcher's argument validator catches the empty-args case."""

@@ -210,6 +210,41 @@ async def test_execute_with_ports(admin_client):
 
 @pytest.mark.asyncio
 async def test_execute_driver_load_failure(admin_client):
+    resp = await _execute_with_load_failure(admin_client, ValueError("Missing driver.py"))
+    assert resp.status_code == 201  # run record created, status=FAILED
+    data = resp.json()
+    assert data["status"] == "FAILED"
+    # A load-failure error is a fixed, HERD-authored string carrying only a
+    # class name (issue #840, extended to driver-load failures): never the
+    # raw exception text, which drove the API response before this fix.
+    assert data["error"] == "driver load failed: ValueError"
+    assert "Missing driver.py" not in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_execute_driver_load_failure_never_returns_foreign_text(admin_client):
+    """A load failure whose cause carries a distinctive foreign string (a
+    wrapped storage/library exception, per issue #840/#887) must never surface
+    it on the API response; only the class name of the underlying cause may
+    appear, and the row-stored sentinel proof lives in
+    test_driver_load_sanitize_run.py.
+    """
+    sentinel = "http://secret-internal-host/leak"
+    inner = RuntimeError(f"boom at {sentinel}")
+    exc = ValueError("Driver validation failed")
+    exc.__cause__ = inner
+
+    resp = await _execute_with_load_failure(admin_client, exc)
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["status"] == "FAILED"
+    assert data["error"] == "driver load failed: RuntimeError"
+    body_text = resp.text
+    assert sentinel not in body_text
+    assert "Driver validation failed" not in body_text
+
+
+async def _execute_with_load_failure(admin_client, load_driver_exc: Exception):
     with (
         patch(
             "app.routers.executions.fetch_device",
@@ -222,10 +257,10 @@ async def test_execute_driver_load_failure(admin_client):
         patch(
             "app.services.execution_service.load_driver",
             new_callable=AsyncMock,
-            side_effect=ValueError("Driver validation failed: Missing driver.py"),
+            side_effect=load_driver_exc,
         ),
     ):
-        resp = await admin_client.post(
+        return await admin_client.post(
             "/execute",
             json={
                 "device_id": DEVICE_ID,
@@ -233,10 +268,6 @@ async def test_execute_driver_load_failure(admin_client):
                 "user_id": USER_ID,
             },
         )
-    assert resp.status_code == 201  # run record created, status=FAILED
-    data = resp.json()
-    assert data["status"] == "FAILED"
-    assert "Missing driver.py" in data["error"]
 
 
 @pytest.mark.asyncio
