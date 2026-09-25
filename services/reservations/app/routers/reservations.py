@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -68,6 +68,18 @@ FLEET_DEFAULT_STATUS_FILTER = [ReservationStatus.ACTIVE, ReservationStatus.COMPL
 router = APIRouter(tags=["reservations"])
 bearer_scheme = HTTPBearer()
 
+# Sortable fields on the reservations list (issue #844): an explicit allowlist so
+# an unrecognized sort_by is a 422 (FastAPI's Literal validation) rather than a
+# silent no-op or an SQL-injection-shaped free-text column name. Kept as a
+# module-level Literal (not an app/schemas/ enum) since it is query-param-only,
+# never a response field. sort_by/sort_dir default to today's ordering
+# (created_at desc); see reservation_service._reservation_order_by for the
+# ORDER BY it builds and its id tiebreak.
+ReservationSortField = Literal[
+    "start_time", "end_time", "status", "purpose_category", "user_id", "created_at"
+]
+ReservationSortDir = Literal["asc", "desc"]
+
 
 @router.post("/", response_model=ReservationResponse, status_code=status.HTTP_201_CREATED)
 async def create_new_reservation(
@@ -127,20 +139,40 @@ async def get_my_reservations(
         False,
         description="Admin only: list every user's reservations instead of just your own.",
     ),
+    sort_by: ReservationSortField = Query(
+        "created_at",
+        description=(
+            "Field to sort by. Defaults to created_at, today's ordering. "
+            "Tiebroken by id for stable pagination."
+        ),
+    ),
+    sort_dir: ReservationSortDir = Query(
+        "desc",
+        description="Sort direction. Defaults to desc (today's ordering: newest first).",
+    ),
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
 ):
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")
+    # Visibility is resolved before ordering: the `all` gate below decides which
+    # ROW SET the caller can see at all, and each branch's own query (the owner
+    # filter in list_user_reservations, no filter in list_all_reservations) applies
+    # that row set before ORDER BY / OFFSET / LIMIT ever run. A caller can therefore
+    # never use sort_by/sort_dir to learn anything about a row outside that set.
     if all:
         if role not in ("admin", "superadmin"):
             raise HTTPException(
                 status_code=403,
                 detail="Only admins can list all reservations",
             )
-        reservations, total = await list_all_reservations(db, skip=skip, limit=limit)
+        reservations, total = await list_all_reservations(
+            db, skip=skip, limit=limit, sort_by=sort_by, sort_dir=sort_dir
+        )
     else:
-        reservations, total = await list_user_reservations(db, user_id, skip=skip, limit=limit)
+        reservations, total = await list_user_reservations(
+            db, user_id, skip=skip, limit=limit, sort_by=sort_by, sort_dir=sort_dir
+        )
     return PaginatedReservationResponse(
         items=reservations,
         total=total,
