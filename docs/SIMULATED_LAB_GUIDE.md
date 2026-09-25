@@ -88,7 +88,8 @@ one time.
 3. **Give `nos-lab-frr` a config version that maps its real interface to its
    HERD port name.** The FRR container's real Linux interface is `eth0`; the
    HERD port you just cabled is named `eth1`. Open `nos-lab-frr`'s device page,
-   add a config version whose `interfaces` entry declares
+   scroll to **Configuration history**, click **New version**, and in the
+   **Config (JSON)** box enter a config whose `interfaces` entry declares
    `{"name": "eth0", "ip": "<the container's eth0 CIDR>", "zone": "trust",
    "port": "eth1"}`. This mapping (ADR 0014 addenda X-J/X-K) is what lets HERD's
    interface-level wiring check resolve `eth0` to a cabled port; without it, a
@@ -184,7 +185,7 @@ on the device.
 
 | Knob | Effect | Worked example |
 |---|---|---|
-| `mock_fail_actions` | Comma-separated action names that return `success: False` instead of succeeding. Drives the FAILED-row path. | Set `field_data.mock_fail_actions` to `add_to_vlan` on an L2 switch device, then reconcile a fork that wires a port into a VLAN: the membership lands as a FAILED row (`tests/integration/test_l2_reconcile.py`'s `test_failure_gating_and_manual_retry`). Clear the field back to an empty string and retry; it converges to ACTIVE. |
+| `mock_fail_actions` | Comma-separated action names that return `success: False` instead of succeeding. Drives the FAILED-row path. | Set `field_data.mock_fail_actions` to `add_to_vlan` on an L2 switch device, then reconcile a fork that wires a port into a VLAN: the membership lands as a FAILED row (`tests/integration/test_l2_reconcile.py`'s `test_l2_failed_add_surfaces_and_manual_retry_recovers`). Clear the field back to an empty string and retry; it converges to ACTIVE. |
 | `mock_raise_actions` | Comma-separated action names that raise an exception instead of returning a result. Drives the transient-NAK path, and on exhaustion, the DLQ. | Set `field_data.mock_raise_actions` to `configure_route` on an L3 switch device before a fork save that provisions a route: the execution consumer NAKs and redelivers instead of recording a clean failure, which is what the DLQ-retention integration tests exercise. |
 | `mock_sleep_ms` | Per-call sleep, in milliseconds, before the driver call returns. Exercises the sandbox's own action timeout. | Set `field_data.mock_sleep_ms` to a value larger than the execution service's configured action timeout on any mock driver's device to prove a slow driver call is killed and reported rather than hanging the consumer. |
 
