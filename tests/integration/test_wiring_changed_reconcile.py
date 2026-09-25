@@ -569,7 +569,7 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
     i.e. not yet SUCCESS/FAILED, run row), not through `stale_writer.done()`.
     Issue #817: since the background retry tick can claim the same FAILED
     row's `claimed_until` stamp before retry-1's own HTTP call does, retry-1
-    is not necessarily the writer that blocks - whichever channel wins the
+    is not necessarily the writer that blocks: whichever channel wins the
     claim is the one that actually drives, and the loser answers
     "in_progress" immediately without ever touching the driver. `task.done()`
     on retry-1 alone would misread a tick-driven attempt as vacuity even
