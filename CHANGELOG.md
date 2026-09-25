@@ -97,8 +97,8 @@
   `driver_cannot_configure` shape inventory's apply endpoints already used, and reject
   ANY action against a device with no resolvable driver with a 409
   `device_has_no_driver`, both before any run row is created. This closes the gap left
-  by inventory's own #839 gate, which the AI assistant's `schedule_config_apply` tool
-  bypasses by posting straight to `/execute`. Driver LOAD failures (a bad archive, a
+  by inventory's own #839 gate, which the AI commit path (`committer.py`) bypasses by
+  posting `configure` straight to `/execute`. Driver LOAD failures (a bad archive, a
   missing `Driver` class, an import error) are now sanitized the same way method-raise
   failures already were: the stored and returned error is the fixed string `driver
   load failed: <ExceptionClassName>`, with the full text going only to the execution

@@ -44,10 +44,12 @@ in `services/execution/app/services/execution_service.py`, issue #870): both
 `POST /execute` and `POST /execute/internal` refuse a `configure` action against a
 connection type outside `herd_common.device_config.CONFIGURE_CONNECTION_TYPES` with the
 same 409 `driver_cannot_configure` shape, before any run row is created or the driver is
-loaded. This matters because the AI assistant's `schedule_config_apply` tool posts
-straight to `/execute` rather than going through inventory's apply endpoints, so
-execution's own gate is what actually stops it; inventory's gate alone would not have
-covered that path. Execution's gate also refuses ANY action, not only `configure`,
+loaded. This matters because the AI commit path (`committer.py` in the ai-orchestrator,
+applying proposal configs after a topology commit) posts `configure` straight to
+`/execute` rather than going through inventory's apply endpoints, so execution's own
+gate is what stops it; inventory's gate alone did not cover that path. The assistant's
+`schedule_config_apply` tool goes through inventory's apply endpoint and meets
+inventory's gate first. Execution's gate also refuses ANY action, not only `configure`,
 against a device with no resolvable driver (`driver_id` missing or null), with a
 structured 409 `device_has_no_driver`, since there is nothing to load.
 

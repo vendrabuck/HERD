@@ -474,8 +474,9 @@ Execution carries an independent copy of the same contract check (issue #870):
 connection type outside the same allowlist with the identical 409 `driver_cannot_configure`
 shape, and refuse ANY action against a device with no resolvable driver with a 409
 `device_has_no_driver`, both before any run row is created. This is the gate that
-actually stops the AI assistant's `schedule_config_apply` tool, which posts straight to
-`/execute` rather than going through either of inventory's apply endpoints above.
+stops the AI commit path (`committer.py`), which posts `configure` straight to `/execute`
+rather than going through either of inventory's apply endpoints above; the assistant's
+`schedule_config_apply` tool uses inventory's apply endpoint and meets inventory's gate.
 
 Read paths (list config versions, get version detail, diff) are not gated by this
 manage-or-reservation-ownership widening. As of issue #718, they instead carry the
