@@ -473,8 +473,8 @@ async def run_driver_action(
         # reachable by a non-admin with a manage grant). The stored error is
         # a fixed, HERD-authored string carrying only a class name: the
         # underlying cause's class when e wraps one via __cause__, else e's
-        # own class. The full text goes in the log MESSAGE only, since
-        # JSONFormatter drops extra keys that are not on its allowlist.
+        # own class. The full text goes in the log MESSAGE, where an operator
+        # reads it, and nowhere that a caller can.
         cause = e.__cause__
         cause_class = type(cause).__name__ if cause is not None else type(e).__name__
         sanitized_error = f"driver load failed: {cause_class}"
