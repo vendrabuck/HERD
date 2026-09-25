@@ -19,9 +19,12 @@ not usable as a 2xx target.
 
 import asyncio
 import json
+import os
 import socket
+import uuid
 from datetime import datetime, timedelta, timezone
 
+import nats
 import pytest
 from _nats_helpers import fetch_reservation_event
 
@@ -33,6 +36,17 @@ DEAD_TARGET = "http://reservations:8000/this-route-404s"
 
 POLL_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 1.0
+
+# Issue #831: the health subscription's stream/subject, mirroring
+# services/execution/app/services/health_scheduler.py's HEALTH_NATS_SUBJECT.
+HEALTH_STREAM = "HERD_HEALTH"
+HEALTH_NATS_SUBJECT = "herd.health.status_changed"
+# herd_common is not on the integration test environment's import path (no
+# tests/integration file imports it), so these mirror
+# herd_common.outbox.NATS_MSG_ID_HEADER and herd_common.outbox.EVENT_ID_FIELD
+# rather than importing them (same approach as test_health_alerting_flow.py).
+_NATS_MSG_ID_HEADER = "Nats-Msg-Id"
+_EVENT_ID_FIELD = "event_id"
 
 
 def _nats_reachable() -> bool:
@@ -61,17 +75,66 @@ def _reservation_body(device_id: str, purpose_category: str | None = None) -> di
     return body
 
 
-async def _register_webhook(admin_client, target_url: str) -> dict:
+async def _register_webhook(
+    admin_client, target_url: str, event_types: list[str] | None = None
+) -> dict:
     resp = await admin_client.post(
         "/v1/webhooks",
         json={
             "target_url": target_url,
-            "event_types": ["reservation.created"],
+            "event_types": event_types or ["reservation.created"],
             "description": "integration webhook test",
         },
     )
     assert resp.status_code == 201, resp.text
     return resp.json()
+
+
+def _health_transition_payload(device_id: str) -> dict:
+    """Mirrors the payload shape execution's health scheduler stages (see
+    services/execution/app/services/health_scheduler.py and
+    tests/integration/test_health_alerting_flow.py's _event_payload)."""
+    return {
+        "event": "device.health_transition",
+        "event_id": str(uuid.uuid4()),
+        "device_id": device_id,
+        "device_name": f"webhook-health-test-{device_id[:8]}",
+        "old_status": "HEALTHY",
+        "new_status": "UNREACHABLE",
+        "transition_kind": "bad_news",
+        "consecutive_failures": 3,
+        "last_run_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _publish_health_event(payload: dict) -> None:
+    """Publish straight to HERD_HEALTH / herd.health.status_changed, bypassing
+    the outbox producer (execution's health scheduler). The caller must have
+    stamped payload["event_id"]; this sets the matching Nats-Msg-Id header so
+    the outbox relay's contract is mirrored exactly (issue #611): without it
+    the consumer's dedupe key falls back to `<stream>:<sequence>`, and a
+    container-recreated NATS (no volume) resets sequences while Postgres keeps
+    prior rows under those same keys, so a rerun's insert would be swallowed
+    as a redelivery. Same pattern as test_health_alerting_flow.py's
+    _publish_health_event and test_failed_teardown.py's _publish_event.
+    """
+    nats_url = os.getenv("NATS_URL_HOST", "nats://localhost:4222")
+    nc = await nats.connect(nats_url, connect_timeout=5)
+    try:
+        js = nc.jetstream()
+        # Confirm the stream exists rather than re-declaring it: the stream is
+        # created by execution's lifespan, and add_stream against an existing
+        # stream with a different config (e.g. a configured max_age, issue
+        # #620) raises instead of returning it.
+        await js.stream_info(HEALTH_STREAM)
+        await js.publish(
+            HEALTH_NATS_SUBJECT,
+            json.dumps(payload).encode(),
+            headers={_NATS_MSG_ID_HEADER: payload[_EVENT_ID_FIELD]},
+        )
+    finally:
+        await nc.close()
 
 
 async def _poll_for_status(
@@ -192,3 +255,55 @@ async def test_webhooks_require_admin(user_client):
         json={"target_url": "https://example.invalid/hook", "event_types": ["reservation.created"]},
     )
     assert resp.status_code == 403, resp.text
+
+
+async def test_device_health_transition_event_type_accepted(admin_client):
+    """Issue #831: the registration validator now accepts
+    device.health_transition alongside the six reservation lifecycle events."""
+    resp = await admin_client.post(
+        "/v1/webhooks",
+        json={
+            "target_url": "https://example.invalid/hook",
+            "event_types": ["device.health_transition"],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    webhook_id = resp.json()["id"]
+    await admin_client.delete(f"/v1/webhooks/{webhook_id}")
+
+
+async def test_webhook_delivered_for_health_transition(admin_client, fresh_device):
+    """Issue #831: a subscription for device.health_transition receives a
+    signed delivery when a health event is published on HERD_HEALTH, proving
+    the integration service's second durable consumer (herd.health.*) is
+    wired end to end, independently of the reservations consumer.
+
+    The event is published directly to HERD_HEALTH rather than driven through
+    the real health-polling scheduler (which needs minutes against a live
+    driver to fail a device N times); the producer side is exhaustively
+    covered by execution's own unit tests. This proves the integration
+    service's consumer + delivery path, matching
+    test_health_alerting_flow.py's approach for the notifications consumer.
+    """
+    webhook = await _register_webhook(
+        admin_client, ECHO_TARGET, event_types=["device.health_transition"]
+    )
+    webhook_id = webhook["id"]
+    assert webhook["secret"]
+
+    payload = _health_transition_payload(fresh_device["id"])
+    try:
+        await _publish_health_event(payload)
+
+        rows = await _poll_for_status(
+            admin_client, webhook_id, {"delivered"}, event_id=payload["event_id"]
+        )
+        delivered = [r for r in rows if r["status"] == "delivered"]
+        assert delivered, f"no delivered row for event {payload['event_id']}; ledger={rows}"
+        # Idempotent, same as the reservation.created case: exactly one
+        # delivered row for this event_id.
+        assert len(delivered) == 1, f"expected exactly one delivered row, got {delivered}"
+        assert delivered[0]["event_type"] == "device.health_transition"
+        assert delivered[0]["response_status"] == 200
+    finally:
+        await admin_client.delete(f"/v1/webhooks/{webhook_id}")

@@ -1,12 +1,26 @@
-"""NATS consumer: fan reservation lifecycle events out to registered webhooks.
+"""NATS consumer: fan reservation lifecycle and device health events out to
+registered webhooks.
 
-A durable pull consumer on HERD_RESERVATIONS (subject herd.reservations.*) loads
-every active subscription matching the event and POSTs a signed copy to each,
-concurrently. The delivery ledger (app.services.delivery) is the durable record:
-a slow or failing receiver lands a `dead` ledger row, it never NAKs the NATS
-message, so one bad target cannot re-fan-out to the others or stall the stream.
-The message is NAK'd / dead-lettered only on an undecodable payload or an
-unexpected consumer-loop error, mirroring the notifications consumer.
+Two durable pull consumers, mirroring the notifications service's shape
+(services/notifications/app/services/nats_consumer.py):
+
+- HERD_RESERVATIONS / herd.reservations.* (reservation lifecycle events)
+- HERD_HEALTH / herd.health.* (issue #831: device.health_transition)
+
+Both route through the same `handle_event`, since every payload on both
+streams carries the same `event` discriminator key (reservation payloads use
+it, e.g. "reservation.created"; execution's health scheduler stamps
+"device.health_transition" under the identical key, see
+services/execution/app/services/health_scheduler.py); `handle_event` needs no
+per-stream branching to read it. Distinct durable consumer names and DLQ
+subjects, so a stuck health-event subscriber cannot block reservation
+delivery and vice versa. `load_matching_targets` fans a message out to every
+active WebhookSubscription whose `event_types` lists that event name
+(app.services.delivery). The delivery ledger is the durable record: a slow or
+failing receiver lands a `dead` ledger row, it never NAKs the NATS message, so
+one bad target cannot re-fan-out to the others or stall the stream. The
+message is NAK'd / dead-lettered only on an undecodable payload or an
+unexpected consumer-loop error.
 """
 
 import asyncio
@@ -33,6 +47,15 @@ NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.integration"
 NATS_FETCH_TIMEOUT_SECONDS = 5
 
+# Issue #831: second durable consumer for device.health_transition events on
+# HERD_HEALTH. Own stream, subject filter, durable name, and DLQ subject; same
+# max_deliver/ack_wait/backoff/fetch-timeout knobs and the same batch == 1
+# rule (issue #648) as the reservations consumer.
+HEALTH_STREAM = "HERD_HEALTH"
+HEALTH_SUBJECT_PATTERN = "herd.health.*"
+HEALTH_DURABLE = "integration-webhooks-health-consumer"
+HEALTH_DLQ_SUBJECT = "herd.health.dlq.integration"
+
 
 async def handle_event(
     event_data: dict,
@@ -40,7 +63,8 @@ async def handle_event(
     session_factory: Callable,
     dedupe_key: str | None,
 ) -> None:
-    """Fan one reservation event out to every matching active subscription.
+    """Fan one reservation or health event out to every matching active
+    subscription.
 
     `dedupe_key` is the stable payload event_id used as the per-subscription
     delivery idempotency key. Delivery failures are recorded in the ledger, not
@@ -48,7 +72,7 @@ async def handle_event(
     """
     event_name = event_data.get("event")
     if not event_name:
-        logger.debug("Reservation event missing `event` field; nothing to deliver")
+        logger.debug("Event missing `event` field; nothing to deliver")
         return
     targets = await load_matching_targets(session_factory, event_name)
     if not targets:
@@ -148,7 +172,13 @@ async def process_message(
 
 
 async def start_nats_consumer(app) -> None:
-    """Start the webhook delivery consumer as a background task during lifespan."""
+    """Start both webhook delivery consumers as background tasks during lifespan.
+
+    Two subscriptions, set up identically apart from their stream/subject/
+    durable/DLQ knobs (see the module docstring): HERD_RESERVATIONS /
+    herd.reservations.* (the original consumer) and HERD_HEALTH /
+    herd.health.* (issue #831). Both dispatch to the same `handle_event`.
+    """
     import nats
     from nats.js.api import ConsumerConfig
 
@@ -163,57 +193,77 @@ async def start_nats_consumer(app) -> None:
 
         from app.database import AsyncSessionLocal
 
-        try:
-            await ensure_stream_exists(js, name=NATS_STREAM, subjects=[NATS_SUBJECT_PATTERN])
-        except Exception:
-            logger.warning("Could not create/update NATS stream %s", NATS_STREAM, exc_info=True)
+        async def _make_subscription(
+            stream: str,
+            subject_pattern: str,
+            durable: str,
+            dlq_subject: str,
+        ):
+            try:
+                await ensure_stream_exists(js, name=stream, subjects=[subject_pattern])
+            except Exception:
+                logger.warning("Could not create/update NATS stream %s", stream, exc_info=True)
 
-        psub = await js.pull_subscribe(
-            NATS_SUBJECT_PATTERN,
-            durable=NATS_DURABLE,
-            config=ConsumerConfig(
-                max_deliver=NATS_MAX_DELIVER,
-                ack_wait=NATS_ACK_WAIT_SECONDS,
-                backoff=NATS_BACKOFF_SECONDS,
-            ),
-        )
+            psub = await js.pull_subscribe(
+                subject_pattern,
+                durable=durable,
+                config=ConsumerConfig(
+                    max_deliver=NATS_MAX_DELIVER,
+                    ack_wait=NATS_ACK_WAIT_SECONDS,
+                    backoff=NATS_BACKOFF_SECONDS,
+                ),
+            )
 
-        async def _consumer_loop():
-            while True:
-                try:
-                    # batch is deliberately 1: nats-py's multi-message fetch holds
-                    # already-received messages until the batch fills or the
-                    # deadline expires, which added up to NATS_FETCH_TIMEOUT_SECONDS
-                    # of latency to every event (issue #648); the batch=1 path
-                    # returns the first message immediately. Do not "optimize"
-                    # this back to a batch without a pull API that returns
-                    # partial batches promptly.
-                    msgs = await psub.fetch(1, timeout=NATS_FETCH_TIMEOUT_SECONDS)
-                except asyncio.CancelledError:
-                    raise
-                except (nats.errors.TimeoutError, asyncio.TimeoutError):
-                    # No messages this cycle; the fetch also re-establishes
-                    # delivery after a broker reconnect.
-                    continue
-                except Exception:
-                    logger.warning(
-                        "NATS pull fetch failed for %s; will retry",
-                        NATS_SUBJECT_PATTERN,
-                        exc_info=True,
-                    )
-                    await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
-                    continue
-                for msg in msgs:
+            async def _consumer_loop():
+                while True:
                     try:
-                        await process_message(msg, js, handle_event, AsyncSessionLocal)
+                        # batch is deliberately 1: nats-py's multi-message fetch holds
+                        # already-received messages until the batch fills or the
+                        # deadline expires, which added up to NATS_FETCH_TIMEOUT_SECONDS
+                        # of latency to every event (issue #648); the batch=1 path
+                        # returns the first message immediately. Do not "optimize"
+                        # this back to a batch without a pull API that returns
+                        # partial batches promptly.
+                        msgs = await psub.fetch(1, timeout=NATS_FETCH_TIMEOUT_SECONDS)
+                    except asyncio.CancelledError:
+                        raise
+                    except (nats.errors.TimeoutError, asyncio.TimeoutError):
+                        # No messages this cycle; the fetch also re-establishes
+                        # delivery after a broker reconnect.
+                        continue
                     except Exception:
-                        logger.error(
-                            "Unexpected error in webhook consumer loop",
+                        logger.warning(
+                            "NATS pull fetch failed for %s; will retry",
+                            subject_pattern,
                             exc_info=True,
                         )
+                        await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
+                        continue
+                    for msg in msgs:
+                        try:
+                            await process_message(
+                                msg,
+                                js,
+                                handle_event,
+                                AsyncSessionLocal,
+                                dlq_subject=dlq_subject,
+                            )
+                        except Exception:
+                            logger.error(
+                                "Unexpected error in webhook consumer loop for %s",
+                                subject_pattern,
+                                exc_info=True,
+                            )
 
-        app.state.nats_consumer_task = asyncio.create_task(_consumer_loop())
-        logger.info("Integration webhook NATS consumer started")
+            return asyncio.create_task(_consumer_loop())
+
+        app.state.nats_consumer_task = await _make_subscription(
+            NATS_STREAM, NATS_SUBJECT_PATTERN, NATS_DURABLE, NATS_DLQ_SUBJECT
+        )
+        app.state.nats_health_consumer_task = await _make_subscription(
+            HEALTH_STREAM, HEALTH_SUBJECT_PATTERN, HEALTH_DURABLE, HEALTH_DLQ_SUBJECT
+        )
+        logger.info("Integration webhook NATS consumers started (reservations + health)")
 
     except Exception:
         logger.warning(
@@ -223,13 +273,14 @@ async def start_nats_consumer(app) -> None:
 
 
 async def stop_nats_consumer(app) -> None:
-    task = getattr(app.state, "nats_consumer_task", None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for task_attr in ("nats_consumer_task", "nats_health_consumer_task"):
+        task = getattr(app.state, task_attr, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     nc = getattr(app.state, "nats", None)
     if nc:

@@ -6,6 +6,12 @@ DLQ-publish swallow-on-failure, and `handle_event`'s per-target exception
 isolation. All existing webhook delivery tests (`test_webhooks.py`) call
 `deliver_one` directly and bypass the consumer entirely; this file targets the
 consumer's own control flow with a stubbed `js` (JetStream) and fake message.
+
+The trailing "health consumer config" and "health event routing" sections
+(issue #831) pin the second HERD_HEALTH durable consumer's constants and prove
+`handle_event` fans a `device.health_transition` payload out to a subscription
+that lists it and not to one that lists only reservation events, and that a
+poison message on the health subject routes to the health DLQ subject.
 """
 
 import json
@@ -242,3 +248,153 @@ async def test_handle_event_calls_deliver_one_with_expected_args(monkeypatch):
     assert call["body"] == raw_body
     assert call["event_id"] == "dk-1"
     assert call["event_type"] == "reservation.created"
+
+
+# --- health consumer config (issue #831) ------------------------------------
+
+
+def test_health_consumer_config_pinned():
+    """Pins the HERD_HEALTH consumer's constants: its own stream, subject
+    filter, durable name, and DLQ subject, distinct from the reservations
+    consumer's, plus the batch == 1 rule (issue #648) which is enforced by the
+    single shared `_consumer_loop` closure calling `psub.fetch(1, ...)`
+    regardless of which subscription it belongs to (see
+    test_consumer_loop_fetches_one_message_at_a_time in
+    test_nats_consumer_lifecycle.py, which proves this for both
+    subscriptions)."""
+    assert nats_consumer.HEALTH_STREAM == "HERD_HEALTH"
+    assert nats_consumer.HEALTH_SUBJECT_PATTERN == "herd.health.*"
+    assert nats_consumer.HEALTH_DURABLE == "integration-webhooks-health-consumer"
+    # 4-token DLQ subject, deliberately outside the 3-token consumer filter.
+    assert nats_consumer.HEALTH_DLQ_SUBJECT == "herd.health.dlq.integration"
+    assert nats_consumer.HEALTH_DLQ_SUBJECT != nats_consumer.NATS_DLQ_SUBJECT
+    assert nats_consumer.HEALTH_DURABLE != nats_consumer.NATS_DURABLE
+    assert nats_consumer.HEALTH_STREAM != nats_consumer.NATS_STREAM
+
+
+async def test_process_message_poison_health_message_routes_to_health_dlq():
+    """A poison message processed with the health subscription's dlq_subject
+    routes to herd.health.dlq.integration, not the reservations DLQ."""
+    msg = _FakeMsg(b"not-json")
+    js = AsyncMock()
+
+    async def _handler(event_data, raw_body, session_factory, dedupe_key):
+        raise AssertionError("handler should not be called on a poison message")
+
+    result = await nats_consumer.process_message(
+        msg,
+        js,
+        _handler,
+        session_factory=object(),
+        dlq_subject=nats_consumer.HEALTH_DLQ_SUBJECT,
+    )
+
+    assert result == "dlq"
+    js.publish.assert_awaited_once_with(nats_consumer.HEALTH_DLQ_SUBJECT, msg.data)
+    msg.ack.assert_awaited_once()
+
+
+async def test_process_message_max_deliver_exhausted_health_routes_to_health_dlq():
+    """Same exhaustion path as the reservations DLQ test, but with the health
+    subscription's dlq_subject; the DLQ subject actually used is the one
+    passed in, not the module-level default."""
+    payload = _payload(event="device.health_transition", device_id=str(uuid.uuid4()))
+    msg = _FakeMsg(payload, num_delivered=nats_consumer.NATS_MAX_DELIVER)
+    js = AsyncMock()
+
+    async def _handler(event_data, raw_body, session_factory, dedupe_key):
+        raise RuntimeError("still failing")
+
+    result = await nats_consumer.process_message(
+        msg,
+        js,
+        _handler,
+        session_factory=object(),
+        dlq_subject=nats_consumer.HEALTH_DLQ_SUBJECT,
+    )
+
+    assert result == "dlq"
+    js.publish.assert_awaited_once_with(nats_consumer.HEALTH_DLQ_SUBJECT, payload)
+
+
+# --- health event routing through handle_event (issue #831) -----------------
+
+
+async def test_handle_event_routes_health_transition_to_matching_subscription(monkeypatch):
+    """A subscription whose event_types lists device.health_transition receives
+    the health payload; handle_event needs no health-specific branch since both
+    reservation and health payloads carry the event name under the same
+    `event` key."""
+    target = Target(id=uuid.uuid4(), target_url="https://ok.example", secret="s1")
+
+    async def _load(session_factory, event_name):
+        assert event_name == "device.health_transition"
+        return [target]
+
+    delivered_to = []
+
+    async def _deliver_one(session_factory, tgt, body, event_id, event_type, *, timeout, attempts):
+        delivered_to.append(tgt.id)
+        return "delivered"
+
+    monkeypatch.setattr(nats_consumer, "load_matching_targets", _load)
+    monkeypatch.setattr(nats_consumer, "deliver_one", _deliver_one)
+
+    device_id = str(uuid.uuid4())
+    raw_body = _payload(event="device.health_transition", device_id=device_id)
+    await nats_consumer.handle_event(
+        json.loads(raw_body), raw_body, session_factory=object(), dedupe_key="health-dk-1"
+    )
+
+    assert delivered_to == [target.id]
+
+
+async def test_handle_event_health_transition_not_delivered_to_reservation_only_subscription():
+    """A subscription registered for reservation events only (never having
+    matched device.health_transition in load_matching_targets, since matching
+    is a plain membership check against event_types) gets nothing for a health
+    event. This exercises load_matching_targets' real filtering, not a stub,
+    against an in-memory subscription set."""
+    from app.services.delivery import load_matching_targets
+
+    class _FakeSub:
+        def __init__(self, event_types):
+            self.id = uuid.uuid4()
+            self.target_url = "https://ok.example"
+            self.secret = "s1"
+            self.event_types = event_types
+            self.is_active = True
+
+    class _FakeScalars:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _FakeScalars(self._rows)
+
+    reservation_only = _FakeSub(["reservation.created", "reservation.failed"])
+    health_sub = _FakeSub(["device.health_transition"])
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, stmt):
+            return _FakeResult([reservation_only, health_sub])
+
+    def _session_factory():
+        return _FakeSession()
+
+    targets = await load_matching_targets(_session_factory, "device.health_transition")
+
+    assert [t.id for t in targets] == [health_sub.id]

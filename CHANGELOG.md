@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Outbound webhooks can now subscribe to `device.health_transition` (issue #831). The
+  integration service's NATS consumer previously bound only `herd.reservations.*`, so a
+  device health transition published by execution's health scheduler on `HERD_HEALTH`
+  (subject `herd.health.status_changed`) could never reach a registered webhook, even
+  though `WebhookSubscription.event_types` accepted any string. A second durable pull
+  consumer now binds `herd.health.*` (its own durable name and DLQ subject
+  `herd.health.dlq.integration`, batch size 1 per the #648 rule), started through the
+  same schema-readiness gate as the reservations consumer and dispatching to the same
+  handler, since both streams' payloads carry the event name under the same `event`
+  key. `device.health_transition` is now accepted by the registration validator and
+  documented in `docs/EXTERNAL_API.md`.
 - Removed the dead `HEALTH_POLL_MINIMUM_INTERVAL_SECONDS` setting from the execution
   service (issue #880). The variable was declared with a default and documented in
   `docs/ENV_VARS.md`, but it was never passed through by `docker-compose.yml` and

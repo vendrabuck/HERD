@@ -6,6 +6,14 @@ surrounding start/stop control flow, modeled on
 services/execution/tests/test_nats_consumer_full.py's pattern of
 patch.dict("sys.modules", ...) to satisfy the module-local `import nats` /
 `from nats.js.api import ConsumerConfig` without a real broker.
+
+Issue #831 added a second durable consumer (HERD_HEALTH / herd.health.*)
+started from the same `start_nats_consumer` call, so `_FakeJetStream` below
+routes `pull_subscribe` by subject pattern (mirroring
+services/notifications/tests/test_nats_consumer.py's `_FakeJetStream`) instead
+of returning one fixed stub for every call: with two real subscriptions now
+wired by every successful start, a single shared AsyncMock stub would have had
+both consumer loops racing to drain the same one-shot fake subscription.
 """
 
 import asyncio
@@ -14,6 +22,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.database import Base
+from app.services import nats_consumer
 from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -42,6 +51,43 @@ class _StubPullSub:
         raise _StubTimeoutError()
 
 
+class _FakeJetStream:
+    """Routes pull_subscribe by subject pattern so the reservations and health
+    subscriptions each get their own independent fake subscription instead of
+    racing over one shared stub. `subs_by_subject` maps a subject pattern to
+    the `_StubPullSub` (or equivalent) to return for it; an unlisted pattern
+    gets a fresh empty (idle) `_StubPullSub([])`."""
+
+    def __init__(self, subs_by_subject=None, add_stream_error=False):
+        self._subs = dict(subs_by_subject or {})
+        self.added_streams = []
+        self.subscribe_calls = []
+        self.published = []
+        self._add_stream_error = add_stream_error
+
+    async def add_stream(self, name, subjects):
+        if self._add_stream_error:
+            raise RuntimeError("stream exists / cannot update")
+        self.added_streams.append((name, tuple(subjects)))
+
+    async def pull_subscribe(self, subject_pattern, durable, config):
+        self.subscribe_calls.append(
+            {"subject": subject_pattern, "durable": durable, "config": config}
+        )
+        return self._subs.setdefault(subject_pattern, _StubPullSub([]))
+
+    async def publish(self, subject, payload):
+        self.published.append((subject, payload))
+
+
+async def _fake_ensure_stream_exists(js, *, name, subjects):
+    """Stand-in for herd_common.jetstream.ensure_stream_exists: calls straight
+    through to the fake JetStream's add_stream so existing assertions on
+    `_FakeJetStream.added_streams` keep exercising the same call site without
+    depending on the real helper's stream_info-first internals."""
+    await js.add_stream(name, subjects)
+
+
 def _patched_nats_modules(mock_nats):
     """Register `nats`, `nats.js`, and `nats.js.api` in sys.modules so the
     consumer's local imports (`import nats`, `from nats.js.api import
@@ -59,6 +105,21 @@ def _patched_nats_modules(mock_nats):
     }
 
 
+async def _cancel(task):
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _cancel_both(mock_app):
+    for attr in ("nats_consumer_task", "nats_health_consumer_task"):
+        task = getattr(mock_app.state, attr, None)
+        if task is not None:
+            await _cancel(task)
+
+
 # --- start_nats_consumer -----------------------------------------------------
 
 
@@ -74,22 +135,24 @@ async def test_start_nats_consumer_connection_failure_is_swallowed():
     with patch.dict("sys.modules", _patched_nats_modules(mock_nats)):
         await start_nats_consumer(mock_app)
 
-    # No task or connection was stashed since connect() never returned.
+    # Neither task was stashed since connect() never returned.
     assert not hasattr(mock_app.state, "nats_consumer_task") or not isinstance(
         mock_app.state.nats_consumer_task, asyncio.Task
     )
+    assert not hasattr(mock_app.state, "nats_health_consumer_task") or not isinstance(
+        mock_app.state.nats_health_consumer_task, asyncio.Task
+    )
 
 
-async def test_start_nats_consumer_stream_ensure_failure_still_starts_consumer():
-    """ensure_stream_exists failing (e.g. transient broker error while the
-    stream already exists) is logged but must not block the pull subscription
-    from being set up; the stream is owned by the producing service, not this
-    consumer."""
+async def test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers():
+    """ensure_stream_exists failing for a stream (e.g. transient broker error
+    while the stream already exists) is logged but must not block either pull
+    subscription from being set up; the streams are owned by their producing
+    services, not this consumer."""
     mock_app = MagicMock()
     mock_app.state = MagicMock()
 
-    mock_js = AsyncMock()
-    mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([]))
+    mock_js = _FakeJetStream(add_stream_error=True)
     mock_nc = AsyncMock()
     mock_nc.jetstream = MagicMock(return_value=mock_js)
 
@@ -103,21 +166,60 @@ async def test_start_nats_consumer_stream_ensure_failure_still_starts_consumer()
     ):
         await start_nats_consumer(mock_app)
 
-    ensure_stream_mock.assert_awaited_once()
-    mock_js.pull_subscribe.assert_called_once()
+    assert ensure_stream_mock.await_count == 2
+    assert len(mock_js.subscribe_calls) == 2
     assert isinstance(mock_app.state.nats_consumer_task, asyncio.Task)
+    assert isinstance(mock_app.state.nats_health_consumer_task, asyncio.Task)
 
-    mock_app.state.nats_consumer_task.cancel()
-    try:
-        await mock_app.state.nats_consumer_task
-    except asyncio.CancelledError:
-        pass
+    await _cancel_both(mock_app)
 
 
-async def test_start_nats_consumer_success_processes_fetched_message():
-    """A successful connect wires the stream, the pull subscription with the
-    documented ConsumerConfig knobs, and a background task that drains and
-    acks a fetched message end to end through the real process_message path."""
+async def test_start_nats_consumer_wires_both_subscriptions():
+    """A successful connect wires both streams and both durable pull
+    subscriptions with the documented knobs, one background task each."""
+    mock_app = MagicMock()
+    mock_app.state = MagicMock()
+
+    mock_js = _FakeJetStream()
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
+
+    mock_nats = MagicMock()
+    mock_nats.connect = AsyncMock(return_value=mock_nc)
+
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
+    ):
+        await start_nats_consumer(mock_app)
+
+        assert (nats_consumer.NATS_STREAM, (nats_consumer.NATS_SUBJECT_PATTERN,)) in (
+            mock_js.added_streams
+        )
+        assert (nats_consumer.HEALTH_STREAM, (nats_consumer.HEALTH_SUBJECT_PATTERN,)) in (
+            mock_js.added_streams
+        )
+
+        durables = {c["durable"] for c in mock_js.subscribe_calls}
+        assert durables == {nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE}
+        subjects = {c["subject"] for c in mock_js.subscribe_calls}
+        assert subjects == {
+            nats_consumer.NATS_SUBJECT_PATTERN,
+            nats_consumer.HEALTH_SUBJECT_PATTERN,
+        }
+
+        assert mock_app.state.nats is mock_nc
+        assert isinstance(mock_app.state.nats_consumer_task, asyncio.Task)
+        assert isinstance(mock_app.state.nats_health_consumer_task, asyncio.Task)
+        assert not mock_app.state.nats_consumer_task.done()
+        assert not mock_app.state.nats_health_consumer_task.done()
+
+        await _cancel_both(mock_app)
+
+
+async def test_start_nats_consumer_success_processes_fetched_reservation_message():
+    """The reservations subscription drains and acks a fetched message end to
+    end through the real process_message path."""
     # start_nats_consumer imports AsyncSessionLocal from app.database inline
     # and hands it straight to the real handle_event, so the consumer loop
     # needs a real (in-memory) webhook schema to query against, not a bare
@@ -134,10 +236,6 @@ async def test_start_nats_consumer_success_processes_fetched_message():
     mock_app = MagicMock()
     mock_app.state = MagicMock()
 
-    mock_js = AsyncMock()
-    mock_nc = AsyncMock()
-    mock_nc.jetstream = MagicMock(return_value=mock_js)
-
     mock_msg = MagicMock()
     mock_msg.data = json.dumps(
         {"event": "reservation.created", "reservation_id": str(uuid.uuid4())}
@@ -146,29 +244,21 @@ async def test_start_nats_consumer_success_processes_fetched_message():
     mock_msg.ack = AsyncMock()
     mock_msg.nak = AsyncMock()
 
-    mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([mock_msg]))
+    mock_js = _FakeJetStream(
+        subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: _StubPullSub([mock_msg])}
+    )
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
 
     mock_nats = MagicMock()
     mock_nats.connect = AsyncMock(return_value=mock_nc)
 
-    ensure_stream_mock = AsyncMock()
     with (
         patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
-        patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_mock),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
         patch("app.database.AsyncSessionLocal", test_session_factory),
     ):
         await start_nats_consumer(mock_app)
-
-        ensure_stream_mock.assert_awaited_once_with(
-            mock_js, name="HERD_RESERVATIONS", subjects=["herd.reservations.*"]
-        )
-        mock_js.pull_subscribe.assert_called_once()
-        call_kwargs = mock_js.pull_subscribe.call_args
-        assert call_kwargs.args[0] == "herd.reservations.*"
-        assert call_kwargs.kwargs["durable"] == "integration-webhooks-consumer"
-
-        assert mock_app.state.nats is mock_nc
-        assert isinstance(mock_app.state.nats_consumer_task, asyncio.Task)
 
         # Let the background loop drain the queued message. handle_event has
         # no matching subscriptions (none registered), so this exercises the
@@ -181,27 +271,15 @@ async def test_start_nats_consumer_success_processes_fetched_message():
         mock_msg.ack.assert_awaited_once()
         mock_msg.nak.assert_not_awaited()
 
-        mock_app.state.nats_consumer_task.cancel()
-        try:
-            await mock_app.state.nats_consumer_task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_both(mock_app)
 
     await engine.dispose()
 
 
-async def test_consumer_loop_fetches_one_message_at_a_time():
-    """Pins the issue #648 fix: the consumer loop must call fetch with batch == 1
-    on every call, never a larger batch.
-
-    nats-py's multi-message fetch (`_fetch_n`) holds already-received messages
-    until the batch fills or the fetch's deadline expires, so a batch of 10 with
-    fewer than 10 events in flight added up to NATS_FETCH_TIMEOUT_SECONDS of
-    latency to every event before it was processed (measured on CI: a 4.995s
-    hold stacked with a 4.74s outbox tick against a 10s test budget). The
-    batch=1 path (`_fetch_one`) drains the client's pending queue and returns
-    the first processable message immediately. If a future change reintroduces
-    a batch > 1 here, it must first confront why #648 moved off it."""
+async def test_start_nats_consumer_success_processes_fetched_health_message():
+    """Issue #831: the health subscription drains and acks a fetched
+    device.health_transition message through the same process_message path,
+    independently of the reservations subscription."""
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -214,30 +292,31 @@ async def test_consumer_loop_fetches_one_message_at_a_time():
     mock_app = MagicMock()
     mock_app.state = MagicMock()
 
-    mock_js = AsyncMock()
-    mock_nc = AsyncMock()
-    mock_nc.jetstream = MagicMock(return_value=mock_js)
-
     mock_msg = MagicMock()
     mock_msg.data = json.dumps(
-        {"event": "reservation.created", "reservation_id": str(uuid.uuid4())}
+        {
+            "event": "device.health_transition",
+            "event_id": str(uuid.uuid4()),
+            "device_id": str(uuid.uuid4()),
+        }
     ).encode()
     mock_msg.metadata = MagicMock(num_delivered=1)
     mock_msg.ack = AsyncMock()
     mock_msg.nak = AsyncMock()
 
-    stub_sub = _StubPullSub([mock_msg])
-    mock_js.pull_subscribe = AsyncMock(return_value=stub_sub)
+    mock_js = _FakeJetStream(
+        subs_by_subject={nats_consumer.HEALTH_SUBJECT_PATTERN: _StubPullSub([mock_msg])}
+    )
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
 
     mock_nats = MagicMock()
     mock_nats.connect = AsyncMock(return_value=mock_nc)
 
-    ensure_stream_mock = AsyncMock()
     with (
         patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
-        patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_mock),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
         patch("app.database.AsyncSessionLocal", test_session_factory),
-        patch("app.services.nats_consumer.NATS_FETCH_TIMEOUT_SECONDS", 0.01),
     ):
         await start_nats_consumer(mock_app)
 
@@ -245,26 +324,103 @@ async def test_consumer_loop_fetches_one_message_at_a_time():
             if mock_msg.ack.await_count:
                 break
             await asyncio.sleep(0.01)
-        mock_msg.ack.assert_awaited_once()
-        # A few more idle-fetch cycles so more than one call is recorded.
-        await asyncio.sleep(0.05)
 
-        mock_app.state.nats_consumer_task.cancel()
-        try:
-            await mock_app.state.nats_consumer_task
-        except asyncio.CancelledError:
-            pass
+        mock_msg.ack.assert_awaited_once()
+        mock_msg.nak.assert_not_awaited()
+
+        await _cancel_both(mock_app)
 
     await engine.dispose()
 
-    assert stub_sub.batch_calls, "fetch was never called"
-    assert all(batch == 1 for batch in stub_sub.batch_calls)
+
+async def test_consumer_loop_fetches_one_message_at_a_time_on_both_subscriptions():
+    """Pins the issue #648 fix on BOTH subscriptions: the consumer loop must
+    call fetch with batch == 1 on every call, never a larger batch, for the
+    reservations subscription and the health subscription alike (both run
+    the same shared `_consumer_loop` closure).
+
+    nats-py's multi-message fetch (`_fetch_n`) holds already-received messages
+    until the batch fills or the fetch's deadline expires, so a batch of 10 with
+    fewer than 10 events in flight added up to NATS_FETCH_TIMEOUT_SECONDS of
+    latency to every event before it was processed (issue #648). The batch=1
+    path (`_fetch_one`) drains the client's pending queue and returns the first
+    processable message immediately. If a future change reintroduces a batch >
+    1 here, it must first confront why #648 moved off it."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    test_session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    mock_app = MagicMock()
+    mock_app.state = MagicMock()
+
+    res_msg = MagicMock()
+    res_msg.data = json.dumps(
+        {"event": "reservation.created", "reservation_id": str(uuid.uuid4())}
+    ).encode()
+    res_msg.metadata = MagicMock(num_delivered=1)
+    res_msg.ack = AsyncMock()
+    res_msg.nak = AsyncMock()
+
+    health_msg = MagicMock()
+    health_msg.data = json.dumps(
+        {"event": "device.health_transition", "event_id": str(uuid.uuid4())}
+    ).encode()
+    health_msg.metadata = MagicMock(num_delivered=1)
+    health_msg.ack = AsyncMock()
+    health_msg.nak = AsyncMock()
+
+    res_sub = _StubPullSub([res_msg])
+    health_sub = _StubPullSub([health_msg])
+    mock_js = _FakeJetStream(
+        subs_by_subject={
+            nats_consumer.NATS_SUBJECT_PATTERN: res_sub,
+            nats_consumer.HEALTH_SUBJECT_PATTERN: health_sub,
+        }
+    )
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
+
+    mock_nats = MagicMock()
+    mock_nats.connect = AsyncMock(return_value=mock_nc)
+
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
+        patch("app.database.AsyncSessionLocal", test_session_factory),
+        patch("app.services.nats_consumer.NATS_FETCH_TIMEOUT_SECONDS", 0.01),
+    ):
+        await start_nats_consumer(mock_app)
+
+        for _ in range(50):
+            if res_msg.ack.await_count and health_msg.ack.await_count:
+                break
+            await asyncio.sleep(0.01)
+        res_msg.ack.assert_awaited_once()
+        health_msg.ack.assert_awaited_once()
+        # A few more idle-fetch cycles so more than one call is recorded on
+        # each subscription.
+        await asyncio.sleep(0.05)
+
+        await _cancel_both(mock_app)
+
+    await engine.dispose()
+
+    assert res_sub.batch_calls, "reservations fetch was never called"
+    assert health_sub.batch_calls, "health fetch was never called"
+    assert all(batch == 1 for batch in res_sub.batch_calls)
+    assert all(batch == 1 for batch in health_sub.batch_calls)
 
 
 async def test_consumer_loop_survives_fetch_exception_and_retries():
     """A non-timeout exception from fetch() (e.g. a transient broker error)
     must not kill the background loop; it sleeps and retries rather than
-    propagating out of the task."""
+    propagating out of the task. Exercised on the reservations subscription;
+    both subscriptions share the identical closure body."""
     mock_app = MagicMock()
     mock_app.state = MagicMock()
 
@@ -280,8 +436,7 @@ async def test_consumer_loop_survives_fetch_exception_and_retries():
             raise _StubTimeoutError()
 
     flaky = _FlakyPullSub()
-    mock_js = AsyncMock()
-    mock_js.pull_subscribe = AsyncMock(return_value=flaky)
+    mock_js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: flaky})
     mock_nc = AsyncMock()
     mock_nc.jetstream = MagicMock(return_value=mock_js)
 
@@ -290,7 +445,7 @@ async def test_consumer_loop_survives_fetch_exception_and_retries():
 
     with (
         patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
-        patch("app.services.nats_consumer.ensure_stream_exists", AsyncMock()),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
         patch("app.services.nats_consumer.NATS_FETCH_TIMEOUT_SECONDS", 0.01),
     ):
         await start_nats_consumer(mock_app)
@@ -304,21 +459,17 @@ async def test_consumer_loop_survives_fetch_exception_and_retries():
         assert flaky.calls >= 2  # the loop survived the first exception
         assert not task.done()  # and is still running, not crashed
 
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_both(mock_app)
 
 
 async def test_consumer_loop_continues_after_idle_timeout():
     """A plain nats.errors.TimeoutError (no messages this fetch cycle) must be
-    swallowed and the loop must keep polling, not exit or propagate."""
+    swallowed and the loop must keep polling, not exit or propagate. Both
+    subscriptions are idle here (no queued messages for either subject)."""
     mock_app = MagicMock()
     mock_app.state = MagicMock()
 
-    mock_js = AsyncMock()
-    mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([]))
+    mock_js = _FakeJetStream()
     mock_nc = AsyncMock()
     mock_nc.jetstream = MagicMock(return_value=mock_js)
 
@@ -327,22 +478,18 @@ async def test_consumer_loop_continues_after_idle_timeout():
 
     with (
         patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
-        patch("app.services.nats_consumer.ensure_stream_exists", AsyncMock()),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
         patch("app.services.nats_consumer.NATS_FETCH_TIMEOUT_SECONDS", 0.01),
     ):
         await start_nats_consumer(mock_app)
-        task = mock_app.state.nats_consumer_task
 
         # The stub raises the timeout error on every fetch; let several idle
-        # cycles pass to prove the loop's `continue` keeps it alive.
+        # cycles pass to prove the loop's `continue` keeps both tasks alive.
         await asyncio.sleep(0.1)
-        assert not task.done()
+        assert not mock_app.state.nats_consumer_task.done()
+        assert not mock_app.state.nats_health_consumer_task.done()
 
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_both(mock_app)
 
 
 async def test_consumer_loop_logs_and_continues_on_process_message_exception():
@@ -359,8 +506,9 @@ async def test_consumer_loop_logs_and_continues_on_process_message_exception():
     mock_msg.ack = AsyncMock()
     mock_msg.nak = AsyncMock()
 
-    mock_js = AsyncMock()
-    mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([mock_msg]))
+    mock_js = _FakeJetStream(
+        subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: _StubPullSub([mock_msg])}
+    )
     mock_nc = AsyncMock()
     mock_nc.jetstream = MagicMock(return_value=mock_js)
 
@@ -370,7 +518,7 @@ async def test_consumer_loop_logs_and_continues_on_process_message_exception():
     process_message_mock = AsyncMock(side_effect=RuntimeError("unexpected escape"))
     with (
         patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
-        patch("app.services.nats_consumer.ensure_stream_exists", AsyncMock()),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
         patch("app.services.nats_consumer.process_message", process_message_mock),
     ):
         await start_nats_consumer(mock_app)
@@ -386,11 +534,50 @@ async def test_consumer_loop_logs_and_continues_on_process_message_exception():
         await asyncio.sleep(0.02)
         assert not task.done()
 
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_both(mock_app)
+
+
+async def test_consumer_loop_passes_health_dlq_subject_for_health_subscription():
+    """The health subscription's consumer loop must call process_message with
+    dlq_subject=HEALTH_DLQ_SUBJECT, not the reservations DLQ subject, so a
+    poison health message routes to herd.health.dlq.integration."""
+    mock_app = MagicMock()
+    mock_app.state = MagicMock()
+
+    health_msg = MagicMock()
+    health_msg.data = b"not-json"
+    health_msg.metadata = MagicMock(num_delivered=1)
+    health_msg.ack = AsyncMock()
+    health_msg.nak = AsyncMock()
+
+    mock_js = _FakeJetStream(
+        subs_by_subject={nats_consumer.HEALTH_SUBJECT_PATTERN: _StubPullSub([health_msg])}
+    )
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
+
+    mock_nats = MagicMock()
+    mock_nats.connect = AsyncMock(return_value=mock_nc)
+
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
+    ):
+        await start_nats_consumer(mock_app)
+
+        for _ in range(50):
+            if mock_js.published:
+                break
+            await asyncio.sleep(0.01)
+
+        await _cancel_both(mock_app)
+
+    assert mock_js.published, "the poison health message was never DLQ'd"
+    dlq_subject, dlq_payload = mock_js.published[0]
+    assert dlq_subject == nats_consumer.HEALTH_DLQ_SUBJECT
+    assert dlq_payload == b"not-json"
+    health_msg.ack.assert_awaited_once()
+    health_msg.nak.assert_not_awaited()
 
 
 # --- stop_nats_consumer -------------------------------------------------------
@@ -400,20 +587,44 @@ async def test_stop_nats_consumer_no_task_or_connection_is_a_noop():
     """Stopping before a successful start (state has neither attribute) must
     not raise."""
     mock_app = MagicMock()
-    mock_app.state = MagicMock(spec=[])  # no nats_consumer_task, no nats
+    mock_app.state = MagicMock(spec=[])  # no consumer tasks, no nats
 
     await stop_nats_consumer(mock_app)
 
 
-async def test_stop_nats_consumer_cancels_task_and_closes_connection():
+async def test_stop_nats_consumer_cancels_both_tasks_and_closes_connection():
     mock_app = MagicMock()
+
+    async def _forever():
+        await asyncio.sleep(3600)
+
+    reservations_task = asyncio.create_task(_forever())
+    health_task = asyncio.create_task(_forever())
+    mock_nc = AsyncMock()
+
+    mock_app.state.nats_consumer_task = reservations_task
+    mock_app.state.nats_health_consumer_task = health_task
+    mock_app.state.nats = mock_nc
+
+    await stop_nats_consumer(mock_app)
+
+    assert reservations_task.cancelled()
+    assert health_task.cancelled()
+    mock_nc.close.assert_awaited_once()
+
+
+async def test_stop_nats_consumer_only_reservations_task_present_is_fine():
+    """A partial start (e.g. the health subscription's pull_subscribe raised
+    before its task was stashed) must still stop cleanly; stop_nats_consumer
+    does not assume both task attributes exist."""
+    mock_app = MagicMock()
+    mock_app.state = MagicMock(spec=["nats_consumer_task", "nats"])
 
     async def _forever():
         await asyncio.sleep(3600)
 
     task = asyncio.create_task(_forever())
     mock_nc = AsyncMock()
-
     mock_app.state.nats_consumer_task = task
     mock_app.state.nats = mock_nc
 
@@ -433,7 +644,7 @@ async def test_stop_nats_consumer_close_failure_is_swallowed():
     mock_nc.close = AsyncMock(side_effect=RuntimeError("close failed"))
     mock_app.state.nats = mock_nc
 
-    # No nats_consumer_task attribute on the spec'd Mock.
+    # No consumer task attributes on the spec'd Mock.
     await stop_nats_consumer(mock_app)
 
     mock_nc.close.assert_awaited_once()

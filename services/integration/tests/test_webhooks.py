@@ -437,7 +437,9 @@ async def test_deliveries_endpoint_clamps_limit(session_factory):
         assert len(huge.json()) == 3
 
 
-def test_known_event_types_are_the_documented_six():
+def test_known_event_types_are_the_documented_seven():
+    """Issue #831 added device.health_transition to the six reservation
+    lifecycle events, documented in docs/EXTERNAL_API.md's Event types list."""
     assert KNOWN_EVENT_TYPES == {
         "reservation.created",
         "reservation.updated",
@@ -445,6 +447,7 @@ def test_known_event_types_are_the_documented_six():
         "reservation.completed",
         "reservation.failed",
         "reservation.expiring_soon",
+        "device.health_transition",
     }
 
 
