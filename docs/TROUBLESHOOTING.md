@@ -184,7 +184,7 @@ The execution service consumes `herd.reservations.*` events from NATS JetStream.
 
 - Check execution service logs for consumer errors.
 - A poison message (invalid JSON) lands on the DLQ subject `herd.reservations.dlq.execution`; inspect with the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
-- A transient handler failure gets NAK'd and retried up to `max_deliver=5` with configured backoff. After that it also goes to DLQ.
+- A transient handler failure gets NAK'd with an explicit delay from the `NATS_NAK_BACKOFF_SECONDS` schedule (issue #895; `1,5,15,60,120` seconds by default) and retried up to `max_deliver=5`. After that it also goes to DLQ.
 
 ### Notifications container is stuck in a crash loop on a fresh stack
 

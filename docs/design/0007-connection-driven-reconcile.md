@@ -265,7 +265,10 @@ it inherits the issue #317 per-message `in_progress` ack heartbeat
 redelivery, and the DLQ posture of `process_reservation_message`
 (`nats_consumer.py:2516-2614`). The split that keeps DLQ semantics meaningful: a
 transient UPSTREAM error (cabling or inventory 5xx while resolving the desired set)
-raises `TransientUpstreamError` and NAKs the whole message for JetStream backoff; a
+raises `TransientUpstreamError` and NAKs the whole message with an explicit
+`delay=` drawn from the `NATS_NAK_BACKOFF_SECONDS` schedule (issue #895: JetStream
+never times a NAK on its own, and a `ConsumerConfig.backoff` list this originally
+relied on silently replaced the server-side `ack_wait` instead of doing that); a
 per-connection DRIVER failure does not NAK, it lands a FAILED row and acks, moving
 retry to the Decision 6 channel. This keeps one bad cable from poison-looping a
 message to the DLQ. A `wiring_changed` that does exhaust `max_deliver` is routed to
