@@ -58,8 +58,8 @@ HANDLED_RESERVATION_EVENTS = frozenset(
 # JetStream consumer policy (issue #895: `ConsumerConfig` no longer carries a
 # `backoff` list). max_deliver bounds total delivery attempts; ack_wait is now
 # a REAL 30s in-flight window, since a `backoff` list on ConsumerConfig used to
-# make JetStream silently replace the server-side ack_wait with backoff[0] (1s)
-# -- measured against nats-server 2.10.29, not assumed. Redelivery timing for a
+# make JetStream silently replace the server-side ack_wait with backoff[0] (1s,
+# measured against nats-server 2.10.29, not assumed). Redelivery timing for a
 # transient-error NAK is driven entirely by the explicit `nak(delay=...)` call
 # in the transient branch below (NATS_NAK_BACKOFF_SECONDS), not by this
 # ConsumerConfig; ack_wait/backoff only ever governed an UN-acked/nak'd
@@ -77,7 +77,7 @@ NATS_NAK_BACKOFF_SECONDS = parse_nak_backoff_schedule(settings.nats_nak_backoff_
 # Work-in-progress heartbeat cadence (issue #317). A provisioning handler runs
 # the driver sandbox for up to recipe_timeout_seconds (300s), far beyond
 # ack_wait (30s, genuinely 30s now that ConsumerConfig carries no `backoff` to
-# silently shrink it -- issue #895). While a message is being processed (or
+# silently shrink it, issue #895). While a message is being processed (or
 # waits its turn behind a slow one in the same fetch batch), the loop resets
 # its ack timer on this interval so JetStream does not redeliver a message
 # that is still in flight and double-execute its provisioning, possibly on a
@@ -4464,7 +4464,7 @@ async def start_nats_consumer(app) -> None:
     """Start the NATS consumer as a background task during app lifespan.
 
     Subscribes to "herd.reservations.*" events with a durable consumer, configures
-    bounded retry policy (max_deliver, a real ack_wait, no backoff -- issue #895),
+    bounded retry policy (max_deliver, a real ack_wait, no backoff, issue #895),
     and spins the message loop. Failed messages that exhaust retries or are poison
     (undecodable JSON) are routed to the DLQ stream for inspection and manual
     replay. The consumer survives pod restarts; restarting the service resumes

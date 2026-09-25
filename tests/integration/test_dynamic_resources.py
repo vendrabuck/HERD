@@ -503,7 +503,7 @@ async def test_broken_recipe_package_dead_letters_on_first_delivery(
     >= 81s to exhaust) a transient path could not finish that fast either, but
     this suite actually runs against docker-compose.override.yml's short
     dev/test schedule, under which a transient exhaustion would ALSO land
-    FAILED well inside 60s -- so the absence of create_instance/login runs is
+    FAILED well inside 60s, so the absence of create_instance/login runs is
     the real, timing-independent proof of the first-delivery path, not the
     elapsed time."""
     nats_error = await probe_nats()

@@ -65,7 +65,7 @@ NATS_FETCH_TIMEOUT_SECONDS = 5
 
 # Issue #831: second durable consumer for device.health_transition events on
 # HERD_HEALTH. Own stream, subject filter, durable name, and DLQ subject; same
-# max_deliver/ack_wait/fetch-timeout knobs (no backoff -- issue #895) and the
+# max_deliver/ack_wait/fetch-timeout knobs (no backoff, issue #895) and the
 # same batch == 1 rule (issue #648) as the reservations consumer.
 HEALTH_STREAM = "HERD_HEALTH"
 HEALTH_SUBJECT_PATTERN = "herd.health.*"

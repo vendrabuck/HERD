@@ -184,25 +184,21 @@ def nak_delay(num_delivered: int | None, schedule: Sequence[float]) -> float:
     return schedule[index]
 
 
-def parse_nak_backoff_schedule(value: str | Sequence[object]) -> list[int]:
-    """Parse a NATS NAK-delay schedule (issue #895) from either a
-    comma-separated string (an env var's raw form, e.g. "1,5,15,60,120") or
-    an already-split sequence (a Settings field's stored `list[str]`, or any
-    list of int-like values).
+def parse_nak_backoff_schedule(value: str) -> list[int]:
+    """Parse a NATS NAK-delay schedule (issue #895) from a comma-separated
+    string (an env var's raw form, e.g. "1,5,15,60,120").
 
     Used twice per service: once inside each service's
     `NATS_NAK_BACKOFF_SECONDS` Settings field validator, purely to VALIDATE
     and normalize (empty entries, non-integers, and negative values all
-    raise ValueError with a message naming the offending entry), and again
-    at consumer-module import time to turn that field's validated
-    `list[str]` into the `list[int]` `nak_delay` needs. One shared function
-    so all three consumers (execution, notifications, integration) validate
-    and parse identically instead of carrying three copies.
+    raise ValueError with a message naming the offending entry) before
+    re-joining into the field's stored, normalized string, and again at
+    consumer-module import time to turn that field's validated string into
+    the `list[int]` `nak_delay` needs. One shared function so all three
+    consumers (execution, notifications, integration) validate and parse
+    identically instead of carrying three copies.
     """
-    if isinstance(value, str):
-        parts = [p.strip() for p in value.split(",")]
-    else:
-        parts = [str(p).strip() for p in value]
+    parts = [p.strip() for p in value.split(",")]
     if not parts or any(p == "" for p in parts):
         raise ValueError(
             "NATS NAK backoff schedule must be a non-empty comma-separated list "

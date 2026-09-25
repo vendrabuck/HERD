@@ -223,19 +223,9 @@ def test_parse_nak_backoff_schedule_strips_whitespace():
     assert parse_nak_backoff_schedule(" 1 , 5 ,15") == [1, 5, 15]
 
 
-def test_parse_nak_backoff_schedule_from_list():
-    assert parse_nak_backoff_schedule(["1", "5", "15"]) == [1, 5, 15]
-    assert parse_nak_backoff_schedule([1, 5, 15]) == [1, 5, 15]
-
-
 def test_parse_nak_backoff_schedule_rejects_empty_string():
     with pytest.raises(ValueError, match="non-empty"):
         parse_nak_backoff_schedule("")
-
-
-def test_parse_nak_backoff_schedule_rejects_empty_list():
-    with pytest.raises(ValueError, match="non-empty"):
-        parse_nak_backoff_schedule([])
 
 
 def test_parse_nak_backoff_schedule_rejects_empty_entry():
