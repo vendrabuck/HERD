@@ -545,6 +545,7 @@ Four jobs run on push/PR to main, plus a scheduled nightly workflow:
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): Common failure modes and how to diagnose them.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md): Day-2 runbook: config service, upgrades, NATS DLQ inspection, TLS rotation, backup and restore, log recipes.
 - [docs/ENV_VARS.md](docs/ENV_VARS.md): Every environment variable with defaults, purpose, and which service reads it.
+- [docs/SIMULATED_LAB_GUIDE.md](docs/SIMULATED_LAB_GUIDE.md): Task-oriented guide to the three simulated-hardware tiers (hardware-free mock drivers, the checked-in NOS lab, the unbuilt external network-simulator), with a full quick start for booting the NOS lab and driving a real device through the UI.
 
 ### For driver authors and contributors
 
