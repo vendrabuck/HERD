@@ -25,6 +25,7 @@ import pytest
 from app.services.nats_consumer import (
     NATS_DLQ_SUBJECT,
     NATS_MAX_DELIVER,
+    NATS_NAK_BACKOFF_SECONDS,
     PermanentEventError,
     TransientUpstreamError,
     _fetch_device,
@@ -329,9 +330,42 @@ async def test_process_message_transient_error_naks_below_max_deliver():
     )
 
     assert result == "nak"
-    msg.nak.assert_awaited_once()
+    # issue #895: the NAK must carry an explicit delay (schedule[num_delivered - 1]),
+    # never a bare msg.nak(), which JetStream redelivers immediately.
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[1])
     msg.ack.assert_not_awaited()
     js.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_message_transient_error_first_delivery_uses_first_schedule_entry():
+    """delivery 1 (num_delivered=1, e.g. missing/None metadata falling back to 1)
+    maps to schedule[0], not schedule[1] (issue #895's off-by-one is the whole
+    point of the delay mapping, so pin it at both ends)."""
+    js = _make_js()
+    msg = _make_msg(json.dumps({"event": "reservation.created"}).encode(), num_delivered=1)
+    handler = AsyncMock(side_effect=RuntimeError("transient db blip"))
+
+    result = await process_reservation_message(
+        msg, js, handler, session_factory=lambda: None, max_deliver=5
+    )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
+
+
+@pytest.mark.asyncio
+async def test_process_message_transient_error_third_delivery_uses_third_schedule_entry():
+    js = _make_js()
+    msg = _make_msg(json.dumps({"event": "reservation.created"}).encode(), num_delivered=3)
+    handler = AsyncMock(side_effect=RuntimeError("transient db blip"))
+
+    result = await process_reservation_message(
+        msg, js, handler, session_factory=lambda: None, max_deliver=5
+    )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[2])
 
 
 @pytest.mark.asyncio

@@ -177,9 +177,10 @@ async def test_start_nats_consumer_success():
     mock_nats_module = MagicMock()
     mock_nats_module.connect = AsyncMock(return_value=mock_nc)
 
+    patched_modules = _patched_nats_modules(mock_nats_module)
     ensure_stream_exists_mock = AsyncMock()
     with (
-        patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
+        patch.dict("sys.modules", patched_modules),
         patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_exists_mock),
     ):
         await start_nats_consumer(mock_app)
@@ -189,6 +190,15 @@ async def test_start_nats_consumer_success():
     ensure_stream_exists_mock.assert_awaited_once_with(
         mock_js, name="HERD_RESERVATIONS", subjects=["herd.reservations.*"]
     )
+    # issue #895: the ConsumerConfig built for this durable carries no `backoff`,
+    # and the durable is created-or-updated via add_consumer BEFORE pull_subscribe
+    # binds to it (herd_common.jetstream.ensure_consumer), not left to
+    # pull_subscribe's own create-if-missing-else-bind path.
+    consumer_config_kwargs = patched_modules["nats.js.api"].ConsumerConfig.call_args.kwargs
+    assert "backoff" not in consumer_config_kwargs
+    assert consumer_config_kwargs["ack_wait"] == 30
+    mock_js.add_consumer.assert_awaited_once()
+    assert mock_js.add_consumer.await_args.args[0] == "HERD_RESERVATIONS"
     # Verify subscription was created
     mock_js.pull_subscribe.assert_called_once()
     # Verify consumer task was stored

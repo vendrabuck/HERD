@@ -18,10 +18,13 @@ Failure injection rides the template field DEFAULTS: a dynamic instance has no
 device row when the recipe runs, so nats_consumer._build_recipe_context feeds
 the recipe the template defaults as HERD_<field> keys; a template whose
 mock_fail_actions field defaults to "create_instance" makes every instance of
-it fail to create. A driver-reported create failure NAKs through the consumer
-backoff schedule ([1, 5, 15, 60, 120]s, max_deliver 5), so the FAILED path
-takes roughly 90 seconds of wall clock before the DLQ exhaustion posts the
-failure callback; the failure test's timeouts are sized for that.
+it fail to create. A driver-reported create failure NAKs through max_deliver=5
+redeliveries, each delayed by the consumer's NATS_NAK_BACKOFF_SECONDS schedule
+(issue #895): the PRODUCTION default is [1, 5, 15, 60, 120]s, needing roughly
+90 seconds of wall clock before the DLQ exhaustion posts the failure callback,
+but docker-compose.override.yml (the dev/test stack this suite actually runs
+against) pins a short override schedule so this finishes in a few seconds; the
+failure test's timeouts are sized generously enough to cover either.
 
 The redelivery test reaches NATS directly from the host (NATS_URL_HOST) and
 skips when unreachable, mirroring test_dlq_and_idempotency.py.
@@ -424,12 +427,14 @@ async def test_cancel_tears_down_the_dynamic_instance(admin_client, dynamic_temp
 async def test_create_failure_lands_failed_with_no_orphans(
     admin_client, failing_dynamic_template, fresh_device
 ):
-    """Failure path: a driver-reported create_instance failure NAKs through the
-    backoff schedule, exhausts max_deliver (roughly 90s), dead-letters the
-    event, and the failure callback lands the reservation in FAILED. No
-    materialized device may remain and the physical exclusive device returns
-    to AVAILABLE. When the host can reach NATS, also asserts the exhausted
-    provision_requested event was retained on the execution DLQ subject."""
+    """Failure path: a driver-reported create_instance failure NAKs through
+    max_deliver=5 redeliveries (production: roughly 90s of NATS_NAK_BACKOFF_SECONDS
+    delay; the dev/test stack's short override schedule finishes far faster),
+    dead-letters the event, and the failure callback lands the reservation in
+    FAILED. No materialized device may remain and the physical exclusive
+    device returns to AVAILABLE. When the host can reach NATS, also asserts
+    the exhausted provision_requested event was retained on the execution DLQ
+    subject."""
     nats_error = await probe_nats()
 
     reservation = await _reserve_dynamic(
@@ -483,17 +488,24 @@ async def test_broken_recipe_package_dead_letters_on_first_delivery(
 ):
     """Permanent-package path (issue #279): a structurally broken recipe (no
     Driver class) can never load, so the consumer dead-letters the
-    provision_requested event on the FIRST delivery rather than NAK'ing through
-    the backoff ladder. The reservation lands in FAILED fast, no recipe method
-    ever runs (no ExecutionRun rows), no device is materialized, and the
-    physical DUT is released, matching the existing permanent-failure outcome.
+    provision_requested event on the FIRST delivery rather than NAK'ing
+    through the redelivery ladder. The reservation lands in FAILED fast, no
+    recipe method ever runs (no ExecutionRun rows), no device is
+    materialized, and the physical DUT is released, matching the existing
+    permanent-failure outcome.
 
-    First-delivery proof is twofold: (1) NO create_instance/login runs exist,
-    since load_driver fails before any sandbox step (contrast
+    First-delivery proof: NO create_instance/login runs exist, since
+    load_driver fails before any sandbox step (contrast
     test_create_failure_lands_failed_with_no_orphans, which records five
-    create_instance attempts across the ladder); and (2) FAILED arrives inside a
-    60s window, which is reachable for the immediate DLQ but impossible for the
-    retry ladder ([1, 5, 15, 60, 120]s needs >= 81s of backoff to exhaust)."""
+    create_instance attempts across the ladder). The 60s window this test
+    polls under is generous, not discriminating (issue #895): under the
+    PRODUCTION NATS_NAK_BACKOFF_SECONDS default ([1, 5, 15, 60, 120]s, needing
+    >= 81s to exhaust) a transient path could not finish that fast either, but
+    this suite actually runs against docker-compose.override.yml's short
+    dev/test schedule, under which a transient exhaustion would ALSO land
+    FAILED well inside 60s -- so the absence of create_instance/login runs is
+    the real, timing-independent proof of the first-delivery path, not the
+    elapsed time."""
     nats_error = await probe_nats()
 
     reservation = await _reserve_dynamic(
@@ -501,8 +513,10 @@ async def test_broken_recipe_package_dead_letters_on_first_delivery(
     )
     assert reservation["status"] == "PENDING_PROVISION", reservation
 
-    # 60s is below the >= 81s the ladder needs to exhaust, so reaching FAILED
-    # here can only be the first-delivery DLQ, not a retried transient failure.
+    # 60s is generous, not a discriminator against a transient retry under the
+    # dev/test stack's short override schedule (see the docstring above); the
+    # real proof that this is the first-delivery DLQ, not a retried transient
+    # failure, is the absence of create_instance/login runs asserted below.
     failed = await _poll_reservation_status(
         admin_client, reservation["id"], "FAILED", timeout=60.0, interval=1.0
     )

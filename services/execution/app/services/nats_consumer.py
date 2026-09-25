@@ -8,7 +8,12 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 import httpx
-from herd_common.jetstream import ensure_stream_exists
+from herd_common.jetstream import (
+    ensure_consumer,
+    ensure_stream_exists,
+    nak_delay,
+    parse_nak_backoff_schedule,
+)
 from herd_common.l3_route_identity import route_identity_key
 from herd_common.l3_validation import (
     usable_interface_attachments,
@@ -50,18 +55,35 @@ HANDLED_RESERVATION_EVENTS = frozenset(
     }
 )
 
-# JetStream consumer policy. Redelivery backoff tracks max_deliver length.
+# JetStream consumer policy (issue #895: `ConsumerConfig` no longer carries a
+# `backoff` list). max_deliver bounds total delivery attempts; ack_wait is now
+# a REAL 30s in-flight window, since a `backoff` list on ConsumerConfig used to
+# make JetStream silently replace the server-side ack_wait with backoff[0] (1s)
+# -- measured against nats-server 2.10.29, not assumed. Redelivery timing for a
+# transient-error NAK is driven entirely by the explicit `nak(delay=...)` call
+# in the transient branch below (NATS_NAK_BACKOFF_SECONDS), not by this
+# ConsumerConfig; ack_wait/backoff only ever governed an UN-acked/nak'd
+# message's timeout redelivery, which the #317 heartbeat below exists to avoid.
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
-NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
+# NAK-delay schedule (issue #895), from Settings so it is a knob
+# (NATS_NAK_BACKOFF_SECONDS): production defaults to [1, 5, 15, 60, 120],
+# matching the values this consumer's ConsumerConfig used to (ineffectively)
+# pass as `backoff`; docker-compose.override.yml pins a short dev/test
+# schedule so tests/integration/test_dynamic_resources.py's transient-failure
+# exhaustion finishes quickly. Parsed once at import time; nak_delay() maps a
+# message's num_delivered to the entry to pass as msg.nak(delay=...).
+NATS_NAK_BACKOFF_SECONDS = parse_nak_backoff_schedule(settings.nats_nak_backoff_seconds)
 # Work-in-progress heartbeat cadence (issue #317). A provisioning handler runs
 # the driver sandbox for up to recipe_timeout_seconds (300s), far beyond
-# ack_wait (30s). While a message is being processed (or waits its turn behind a
-# slow one in the same fetch batch), the loop resets its ack timer on this
-# interval so JetStream does not redeliver a message that is still in flight and
-# double-execute its provisioning, possibly on a peer replica. Half of ack_wait
-# leaves margin for a late heartbeat. A crashed consumer stops heartbeating, so
-# ack_wait still expires and the message correctly redelivers.
+# ack_wait (30s, genuinely 30s now that ConsumerConfig carries no `backoff` to
+# silently shrink it -- issue #895). While a message is being processed (or
+# waits its turn behind a slow one in the same fetch batch), the loop resets
+# its ack timer on this interval so JetStream does not redeliver a message
+# that is still in flight and double-execute its provisioning, possibly on a
+# peer replica. Half of ack_wait leaves margin for a late heartbeat. A crashed
+# consumer stops heartbeating, so ack_wait still expires and the message
+# correctly redelivers.
 NATS_HEARTBEAT_SECONDS = NATS_ACK_WAIT_SECONDS // 2
 # Pull-consumer fetch tuning. A pull consumer re-establishes on the next fetch
 # after a broker reconnect, which a push subscription does not do reliably, so it
@@ -4328,13 +4350,17 @@ async def process_reservation_message(
 
     Returns 'ack', 'nak', or 'dlq'. Poison messages (undecodable JSON) are
     routed to the DLQ immediately so a single malformed event does not wedge
-    the consumer. Transient handler failures (TransientUpstreamError) NAK so
-    JetStream reapplies the configured backoff and redelivers; the handler
-    is expected to raise TransientUpstreamError on 5xx or transport errors,
-    and swallow 404s as "not found". Once num_delivered reaches max_deliver
-    the message is moved to the DLQ (herd.reservations.dlq.execution) for
-    inspection and replay. All ack/nak/dlq actions are explicit; the loop
-    does not rely on ack_wait timeout to drive failure handling.
+    the consumer. Transient handler failures (TransientUpstreamError) NAK
+    with an explicit `delay=` (issue #895: a bare `msg.nak()` redelivers
+    immediately, and JetStream's ConsumerConfig.backoff only ever timed
+    ack-timeout redeliveries, never a NAK) so the redelivery actually waits
+    NATS_NAK_BACKOFF_SECONDS[min(num_delivered - 1, ...)] seconds; the
+    handler is expected to raise TransientUpstreamError on 5xx or transport
+    errors, and swallow 404s as "not found". Once num_delivered reaches
+    max_deliver the message is moved to the DLQ
+    (herd.reservations.dlq.execution) for inspection and replay. All
+    ack/nak/dlq actions are explicit; the loop does not rely on ack_wait
+    timeout to drive failure handling.
     """
     try:
         event_data = json.loads(msg.data.decode())
@@ -4411,19 +4437,23 @@ async def process_reservation_message(
             )
             await msg.ack()
             return "dlq"
-        # Transient error: NAK so JetStream applies the backoff delay and redelivers.
-        # This signals the handler that resource contention or a service outage might
-        # clear soon, so do not give up yet.
+        # Transient error: NAK with an explicit delay (issue #895) so the
+        # redelivery actually waits instead of coming back immediately (a bare
+        # msg.nak() carries no delay and JetStream requeues it right away).
+        # This signals the handler that resource contention or a service outage
+        # might clear soon, so do not give up yet.
+        delay = nak_delay(num_delivered, NATS_NAK_BACKOFF_SECONDS)
         logger.warning(
             "Transient error processing NATS message; NAK for retry",
             extra={
                 "action": "nats_message_nak",
                 "delivered": num_delivered,
+                "delay_seconds": delay,
                 "event": event_data.get("event"),
             },
             exc_info=exc,
         )
-        await msg.nak()
+        await msg.nak(delay=delay)
         return "nak"
 
     await msg.ack()
@@ -4434,10 +4464,16 @@ async def start_nats_consumer(app) -> None:
     """Start the NATS consumer as a background task during app lifespan.
 
     Subscribes to "herd.reservations.*" events with a durable consumer, configures
-    bounded retry policy (max_deliver + exponential backoff), and spins the message
-    loop. Failed messages that exhaust retries or are poison (undecodable JSON) are
-    routed to the DLQ stream for inspection and manual replay. The consumer survives
-    pod restarts; restarting the service resumes consuming from the last ACK'd offset.
+    bounded retry policy (max_deliver, a real ack_wait, no backoff -- issue #895),
+    and spins the message loop. Failed messages that exhaust retries or are poison
+    (undecodable JSON) are routed to the DLQ stream for inspection and manual
+    replay. The consumer survives pod restarts; restarting the service resumes
+    consuming from the last ACK'd offset. `ensure_consumer` (issue #895) creates
+    OR UPDATES the durable to match this config before `pull_subscribe` binds to
+    it: `pull_subscribe` alone only creates a missing durable and otherwise binds
+    to whatever config the server already has, so on a persistent NATS volume
+    (`make prod`) a durable provisioned before this fix would silently keep its
+    old `backoff` forever without the explicit update.
     """
     import nats
     from nats.js.api import ConsumerConfig
@@ -4466,20 +4502,35 @@ async def start_nats_consumer(app) -> None:
         except Exception:
             logger.warning("Could not create/update NATS stream", exc_info=True)
 
-        # Durable consumer with explicit retry policy: bounded redelivery + backoff.
+        # Durable consumer with explicit retry policy: bounded redelivery, a real
+        # 30s ack_wait, no `backoff` (issue #895: `backoff` on ConsumerConfig
+        # silently replaced ack_wait with backoff[0]; redelivery delay for a
+        # transient error now comes from the explicit `nak(delay=...)` call in
+        # process_reservation_message's transient branch, not from this config).
         # Durability persists the consumer state across restarts, so unprocessed messages
         # are not lost if the execution pod goes down. The consumer name is scoped to
         # this service so other consumers (e.g., notifications) have their own durable
         # offset. The DLQ subject (NATS_DLQ_SUBJECT) is intentionally outside this filter
         # so DLQ'd messages are not redelivered to this consumer; see NATS_DLQ_SUBJECT.
+        consumer_config = ConsumerConfig(
+            max_deliver=NATS_MAX_DELIVER,
+            ack_wait=NATS_ACK_WAIT_SECONDS,
+        )
+        # Create-or-update the durable to match consumer_config BEFORE
+        # pull_subscribe binds to it (issue #895; see ensure_consumer's
+        # docstring for why pull_subscribe alone cannot be trusted to apply a
+        # config change to an already-existing durable).
+        await ensure_consumer(
+            js,
+            stream="HERD_RESERVATIONS",
+            subject="herd.reservations.*",
+            durable="execution-consumer",
+            config=consumer_config,
+        )
         psub = await js.pull_subscribe(
             "herd.reservations.*",
             durable="execution-consumer",
-            config=ConsumerConfig(
-                max_deliver=NATS_MAX_DELIVER,
-                ack_wait=NATS_ACK_WAIT_SECONDS,
-                backoff=NATS_BACKOFF_SECONDS,
-            ),
+            config=consumer_config,
         )
 
         from app.database import AsyncSessionLocal

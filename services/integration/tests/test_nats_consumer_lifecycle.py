@@ -62,6 +62,7 @@ class _FakeJetStream:
         self._subs = dict(subs_by_subject or {})
         self.added_streams = []
         self.subscribe_calls = []
+        self.add_consumer_calls = []
         self.published = []
         self._add_stream_error = add_stream_error
 
@@ -69,6 +70,11 @@ class _FakeJetStream:
         if self._add_stream_error:
             raise RuntimeError("stream exists / cannot update")
         self.added_streams.append((name, tuple(subjects)))
+
+    async def add_consumer(self, stream, config):
+        # issue #895: herd_common.jetstream.ensure_consumer calls this to
+        # create-or-update the durable BEFORE pull_subscribe binds to it.
+        self.add_consumer_calls.append({"stream": stream, "config": config})
 
     async def pull_subscribe(self, subject_pattern, durable, config):
         self.subscribe_calls.append(
@@ -187,8 +193,9 @@ async def test_start_nats_consumer_wires_both_subscriptions():
     mock_nats = MagicMock()
     mock_nats.connect = AsyncMock(return_value=mock_nc)
 
+    patched_modules = _patched_nats_modules(mock_nats)
     with (
-        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch.dict("sys.modules", patched_modules),
         patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
     ):
         await start_nats_consumer(mock_app)
@@ -207,6 +214,16 @@ async def test_start_nats_consumer_wires_both_subscriptions():
             nats_consumer.NATS_SUBJECT_PATTERN,
             nats_consumer.HEALTH_SUBJECT_PATTERN,
         }
+
+        # issue #895: both durables are created-or-updated via add_consumer
+        # BEFORE pull_subscribe binds to them, with no `backoff` kwarg.
+        assert len(mock_js.add_consumer_calls) == 2
+        for call in mock_js.add_consumer_calls:
+            assert call["stream"] in {nats_consumer.NATS_STREAM, nats_consumer.HEALTH_STREAM}
+        consumer_config_calls = patched_modules["nats.js.api"].ConsumerConfig.call_args_list
+        for call in consumer_config_calls:
+            assert "backoff" not in call.kwargs
+            assert call.kwargs.get("ack_wait") == nats_consumer.NATS_ACK_WAIT_SECONDS
 
         assert mock_app.state.nats is mock_nc
         assert isinstance(mock_app.state.nats_consumer_task, asyncio.Task)
