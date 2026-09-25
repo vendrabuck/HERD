@@ -17,6 +17,8 @@ import type {
   Reservation,
   ReservationCreate,
   ReservationFork,
+  ReservationSortDir,
+  ReservationSortField,
   ReservationUpdate,
   TopologyRoutingIntentInvalidDetail,
   WiringRetryResponse,
@@ -27,15 +29,29 @@ import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
 import { errorDetail, structuredDetail } from "@/lib/errors";
 
+export interface ReservationSort {
+  sortBy: ReservationSortField;
+  sortDir: ReservationSortDir;
+}
+
 async function fetchPaginatedReservations(
   skip = 0,
   limit = 50,
   all = false,
+  sort?: ReservationSort,
 ): Promise<PaginatedResponse<Reservation>> {
   // `all=true` is admin-only (the backend returns 403 for non-admins); it lists
   // every user's reservations instead of just the caller's own (issue #340).
+  // sort_by/sort_dir are omitted entirely when no sort is chosen, so the
+  // backend's own default (today's ordering) applies rather than this client
+  // re-stating it (issue #844).
   const resp = await apiClient.get<PaginatedResponse<Reservation>>("/reservations/", {
-    params: all ? { skip, limit, all: true } : { skip, limit },
+    params: {
+      skip,
+      limit,
+      ...(all ? { all: true } : {}),
+      ...(sort ? { sort_by: sort.sortBy, sort_dir: sort.sortDir } : {}),
+    },
   });
   return resp.data;
 }
@@ -89,10 +105,15 @@ export function useReservations() {
   });
 }
 
-export function usePaginatedReservations(skip = 0, limit = 50, all = false) {
+export function usePaginatedReservations(
+  skip = 0,
+  limit = 50,
+  all = false,
+  sort?: ReservationSort,
+) {
   return useQuery({
-    queryKey: ["reservations", "paginated", skip, limit, all],
-    queryFn: () => fetchPaginatedReservations(skip, limit, all),
+    queryKey: ["reservations", "paginated", skip, limit, all, sort?.sortBy, sort?.sortDir],
+    queryFn: () => fetchPaginatedReservations(skip, limit, all, sort),
     placeholderData: keepPreviousData,
   });
 }

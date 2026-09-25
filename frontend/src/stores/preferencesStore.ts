@@ -2,6 +2,27 @@ import { create } from "zustand";
 import { getPreferences, patchPreferences } from "@/api/userProfile";
 import type { PreferencesPatch } from "@/api/userProfile";
 
+// A page's persisted column sort: which field, which direction. Stored under
+// the generic `extras` bucket (issue #844), keyed `sort:<page>` so it sits
+// alongside `page_sizes`'s per-page keying (the getPageSize/setPageSize
+// precedent, issue #599) without needing its own top-level Preferences field.
+export interface SortState {
+  sortBy: string;
+  sortDir: "asc" | "desc";
+}
+
+function sortExtraKey(page: string): string {
+  return `sort:${page}`;
+}
+
+function isSortState(value: unknown): value is SortState {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.sortBy === "string" && (v.sortDir === "asc" || v.sortDir === "desc")
+  );
+}
+
 interface PreferencesState {
   savedFilters: Record<string, unknown>;
   pageSizes: Record<string, number>;
@@ -11,6 +32,8 @@ interface PreferencesState {
   setSavedFilter: (page: string, filter: unknown) => void;
   getPageSize: (page: string, fallback: number) => number;
   setPageSize: (page: string, size: number) => void;
+  getSortState: (page: string) => SortState | null;
+  setSortState: (page: string, sort: SortState | null) => void;
   clear: () => void;
 }
 
@@ -79,6 +102,21 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     const next = { ...get().pageSizes, [page]: size };
     set({ pageSizes: next });
     queuePatch({ page_sizes: { [page]: size } });
+  },
+
+  getSortState: (page) => {
+    const stored = get().extras[sortExtraKey(page)];
+    return isSortState(stored) ? stored : null;
+  },
+
+  setSortState: (page, sort) => {
+    const key = sortExtraKey(page);
+    const next = { ...get().extras, [key]: sort };
+    set({ extras: next });
+    // extras merges per key server-side (no delete verb), so clearing back to
+    // the default sort still sends the key, just with a null value; getSortState
+    // treats a non-SortState value (including null) the same as absent.
+    queuePatch({ extras: { [key]: sort } });
   },
 
   clear: () => {

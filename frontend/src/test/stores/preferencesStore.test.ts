@@ -88,4 +88,57 @@ describe("preferencesStore", () => {
     expect(usePreferencesStore.getState().pageSizes).toEqual({});
     expect(usePreferencesStore.getState().loaded).toBe(false);
   });
+
+  // Sort state (issue #844): stored under the generic `extras` bucket, keyed
+  // per page, the same shape savedFilters/pageSizes use.
+  it("getSortState returns null when nothing is stored for the page", () => {
+    expect(usePreferencesStore.getState().getSortState("reservations")).toBeNull();
+  });
+
+  it("setSortState updates state, round-trips through getSortState, and queues a debounced patch", () => {
+    usePreferencesStore.getState().setSortState("reservations", {
+      sortBy: "start_time",
+      sortDir: "asc",
+    });
+    expect(usePreferencesStore.getState().getSortState("reservations")).toEqual({
+      sortBy: "start_time",
+      sortDir: "asc",
+    });
+    expect(mockedPatch).not.toHaveBeenCalled();
+    _flushPendingPatchForTest();
+    expect(mockedPatch).toHaveBeenCalledTimes(1);
+    expect(mockedPatch.mock.calls[0][0].extras).toEqual({
+      "sort:reservations": { sortBy: "start_time", sortDir: "asc" },
+    });
+  });
+
+  it("setSortState(page, null) clears the stored sort but still patches the key", () => {
+    usePreferencesStore.getState().setSortState("reservations", {
+      sortBy: "status",
+      sortDir: "desc",
+    });
+    usePreferencesStore.getState().setSortState("reservations", null);
+    expect(usePreferencesStore.getState().getSortState("reservations")).toBeNull();
+    _flushPendingPatchForTest();
+    // The last queued write for this key wins (coalesced, same as the
+    // savedFilters/pageSizes rapid-update behavior above).
+    expect(mockedPatch.mock.calls[0][0].extras).toEqual({
+      "sort:reservations": null,
+    });
+  });
+
+  it("sort state is keyed per page, independent of other pages' extras", () => {
+    usePreferencesStore.getState().setSortState("reservations", {
+      sortBy: "status",
+      sortDir: "asc",
+    });
+    expect(usePreferencesStore.getState().getSortState("other-page")).toBeNull();
+  });
+
+  it("getSortState ignores a malformed stored value (a foreign or stale extras entry)", () => {
+    usePreferencesStore.setState({ extras: { "sort:reservations": { sortBy: "start_time" } } });
+    expect(usePreferencesStore.getState().getSortState("reservations")).toBeNull();
+    usePreferencesStore.setState({ extras: { "sort:reservations": "not-an-object" } });
+    expect(usePreferencesStore.getState().getSortState("reservations")).toBeNull();
+  });
 });
