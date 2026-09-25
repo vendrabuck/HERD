@@ -118,6 +118,15 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      # Matches the npm Dependabot's npm_and_yarn updater runs (issue #885):
+      # frontend/package.json now declares engines.npm >= 11.11.0 and
+      # frontend/.npmrc sets engine-strict=true, so setup-node's bundled npm
+      # (whatever ships with Node 22 on the runner image) would otherwise
+      # refuse every step below. cache: npm above keys off the lockfile hash
+      # and is unaffected by which npm binary runs it.
+      - name: Install npm 11.17.0
+        run: npm install -g npm@11.17.0
+
       - name: Install dependencies
         run: cd frontend && npm ci
 
@@ -129,6 +138,15 @@ jobs:
 
       - name: Build
         run: cd frontend && npm run build
+
+      # Frontend twin of the backend job's "Check uv.lock is in sync" step:
+      # regenerate the lockfile with npm install (not npm ci, which never
+      # touches it) and fail if that rewrites anything. Runs last so it
+      # cannot affect the npm ci install the build and test steps above
+      # exercised. See issue #885: an older npm silently drops the `libc`
+      # array from optional-platform lockfile entries on a plain install.
+      - name: Check package-lock.json is in sync
+        run: cd frontend && npm install && git diff --exit-code -- package-lock.json
 
   # Stack-backed gate: builds the compose images, boots the full stack, and
   # runs the contract + integration suites that local `make master` covers but

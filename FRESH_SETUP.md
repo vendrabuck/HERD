@@ -6,7 +6,7 @@ Complete guide for building HERD from scratch on a new machine.
 
 - Docker and Docker Compose (v2+)
 - Git
-- Node.js 22+ and npm (for local frontend dev/testing)
+- Node.js 22+ and npm 11.11.0+ (for local frontend dev/testing; `frontend/package.json` enforces this floor via `engines` plus `engine-strict` in `frontend/.npmrc`, issue #885)
 - Python 3.12+ and uv (for local backend dev/testing)
 - openssl (only if regenerating TLS certs)
 
