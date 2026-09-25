@@ -1,4 +1,9 @@
+from typing import Annotated
+
 from herd_common.base_settings import HerdBaseSettings
+from herd_common.jetstream import parse_nak_backoff_schedule
+from pydantic import Field, field_validator
+from pydantic_settings import NoDecode
 
 
 class Settings(HerdBaseSettings):
@@ -23,6 +28,31 @@ class Settings(HerdBaseSettings):
     # prod, the nats-data volume); the dev/test override starts every stream
     # empty on each recreate regardless of this setting.
     nats_stream_max_age_seconds: int = 7 * 24 * 3600
+    # NAK-delay schedule for the reservations consumer's transient-error branch
+    # (issue #895): comma-separated seconds passed to msg.nak(delay=...) on
+    # each redelivery attempt (delivery 1 gets schedule[0], delivery 2
+    # schedule[1], ...), so JetStream actually waits between retries instead
+    # of redelivering an unadorned msg.nak() immediately. Shared env name
+    # NATS_NAK_BACKOFF_SECONDS across execution/notifications/integration;
+    # docker-compose.yml wires the same production default for all three,
+    # docker-compose.override.yml pins a short schedule for dev/test so the
+    # affected integration tests (tests/integration/test_dynamic_resources.py)
+    # finish quickly. Stored as list[str], not list[int]: the compose-parity
+    # test (tests/unit/test_compose_settings_wiring.py) compares the
+    # ${VAR:-default} string against this field's raw default by splitting on
+    # commas into strings, so a list[int] default could never match. The
+    # validator below still requires every entry to parse as a non-negative
+    # int; herd_common.jetstream.parse_nak_backoff_schedule does that
+    # validation once and is called again at consumer-module import time to
+    # get the list[int] nak_delay() actually uses.
+    nats_nak_backoff_seconds: Annotated[list[str], NoDecode] = Field(
+        default=["1", "5", "15", "60", "120"], validate_default=True
+    )
+
+    @field_validator("nats_nak_backoff_seconds", mode="before")
+    @classmethod
+    def _validate_nak_backoff_schedule(cls, v: object) -> list[str]:
+        return [str(n) for n in parse_nak_backoff_schedule(v)]
 
     # Execution settings
     driver_cache_path: str = "/data/driver-cache"
