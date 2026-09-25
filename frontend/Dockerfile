@@ -3,6 +3,17 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 
+# Deliberately package.json and package-lock.json* only, not the whole
+# context (that is the later `COPY . .`): frontend/.npmrc sets
+# engine-strict=true (issue #885) so that a local `npm ci`/`npm install`
+# refuses on an npm older than package.json's engines.npm floor. This
+# image's base, node:22-alpine, ships whatever npm was bundled with that
+# tag, which is not guaranteed to meet that floor. Keeping .npmrc out of
+# the build context until after the install step means engine-strict is
+# never in effect here, so the bundled npm only WARNS on an engines
+# mismatch (npm's default, non-strict behavior) instead of failing the
+# image build. Do not fold .npmrc into this COPY line or move `COPY . .`
+# ahead of the install without also pinning a compliant npm here first.
 COPY package.json package-lock.json* ./
 
 # Install dependencies (use npm ci if lock file exists, otherwise npm install)

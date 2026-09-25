@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- Pinned the npm version the frontend expects (issue #885). A plain `npm install` in
+  `frontend/` on an npm older than 11.11.0 silently strips the `libc` array that a newer
+  npm (including Dependabot's) writes into optional-platform lockfile entries, rewriting
+  `package-lock.json` by 18 lines with no `package.json` change: a diff every contributor
+  or agent had to notice and hand-discard before committing real work. `frontend/package.json`
+  now declares `engines.node`/`engines.npm`, and `frontend/.npmrc` sets `engine-strict=true`
+  so an incompatible npm refuses instead of silently drifting the lockfile. CI's frontend
+  job installs npm 11.17.0 (matching Dependabot's npm_and_yarn updater) before `npm ci`,
+  and a new gate step reruns `npm install` and fails on any `package-lock.json` diff,
+  mirroring the backend job's `uv lock --check`. The frontend Docker image is unaffected:
+  its build stage copies only `package.json`/`package-lock.json` before installing, so
+  `.npmrc` is not present yet and engine-strict never applies there.
 - Outbound webhooks can now subscribe to `device.health_transition` (issue #831). The
   integration service's NATS consumer previously bound only `herd.reservations.*`, so a
   device health transition published by execution's health scheduler on `HERD_HEALTH`
