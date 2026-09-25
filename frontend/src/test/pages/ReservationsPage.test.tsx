@@ -17,6 +17,17 @@ beforeAll(() => {
   });
 });
 
+// The sort controls (issue #844) persist through usePreferencesStore, which
+// best-effort PATCHes the backend on every change. Mock that transport (the
+// InventoryPage.test.tsx pattern) so sort-control tests assert on the queued
+// payload directly instead of racing a real network call.
+const { patchPreferencesMock } = vi.hoisted(() => ({ patchPreferencesMock: vi.fn() }));
+vi.mock("@/api/userProfile", () => ({
+  getPreferences: vi.fn(),
+  patchPreferences: patchPreferencesMock,
+  resetPreferences: vi.fn(),
+}));
+
 // The reservation detail modal pulls in heavy nested UI (AI tab, inventory tab,
 // etc.) that is exercised elsewhere. Stub it to keep this test page-focused.
 // The close button is wired to the real onClose prop so the page's own
@@ -40,6 +51,7 @@ vi.mock("@/components/reservations/ReservationDetailModal", () => ({
 import { server } from "../mocks/server";
 import { ReservationsPage } from "@/pages/ReservationsPage";
 import { useAuthStore } from "@/stores/authStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 
 function setRole(role: string | null) {
   useAuthStore.setState({
@@ -95,6 +107,15 @@ beforeEach(() => {
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
     ),
   );
+  patchPreferencesMock.mockReset();
+  patchPreferencesMock.mockResolvedValue({
+    user_id: "u",
+    saved_filters: {},
+    page_sizes: {},
+    extras: {},
+    updated_at: "",
+  });
+  usePreferencesStore.getState().clear();
 });
 
 describe("ReservationsPage", () => {
@@ -417,5 +438,156 @@ describe("ReservationsPage", () => {
     // Closing via Cancel returns the dialog to its closed state.
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(dialog?.open).toBe(false);
+  });
+
+  describe("column sort controls (issue #844)", () => {
+    interface SeenRequest {
+      skip: string | null;
+      sortBy: string | null;
+      sortDir: string | null;
+    }
+
+    function captureRequests(): SeenRequest[] {
+      const seen: SeenRequest[] = [];
+      server.use(
+        http.get("/api/reservations/", ({ request }) => {
+          const params = new URL(request.url).searchParams;
+          seen.push({
+            skip: params.get("skip"),
+            sortBy: params.get("sort_by"),
+            sortDir: params.get("sort_dir"),
+          });
+          // total=100 with one item keeps the Pagination nav visible (it
+          // hides at total <= limit) without needing 100 seeded rows.
+          return HttpResponse.json({ items: [RESERVATION], total: 100, skip: 0, limit: 50 });
+        }),
+      );
+      return seen;
+    }
+
+    it("sends no sort params by default and marks every sortable heading aria-sort=none", async () => {
+      const seen = captureRequests();
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+      expect(seen[0].sortBy).toBeNull();
+      expect(seen[0].sortDir).toBeNull();
+
+      for (const name of ["Owner", "Status", "Period", "Purpose"]) {
+        expect(screen.getByRole("columnheader", { name })).toHaveAttribute(
+          "aria-sort",
+          "none",
+        );
+      }
+    });
+
+    it("clicking a heading sorts ascending, sends sort_by/sort_dir, and resets to page 1", async () => {
+      const seen = captureRequests();
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+
+      // Move off the first page first so the reset is actually observable.
+      fireEvent.click(screen.getByText("Next"));
+      await waitFor(() => expect(seen.some((r) => r.skip === "50")).toBe(true));
+
+      fireEvent.click(screen.getByRole("button", { name: "Owner" }));
+      await waitFor(() =>
+        expect(seen.some((r) => r.sortBy === "user_id" && r.sortDir === "asc")).toBe(true),
+      );
+      const lastAscending = seen[seen.length - 1];
+      expect(lastAscending.skip).toBe("0");
+      expect(screen.getByRole("columnheader", { name: "Owner" })).toHaveAttribute(
+        "aria-sort",
+        "ascending",
+      );
+    });
+
+    it("cycles a heading through ascending, descending, and back to the default on a third click", async () => {
+      const seen = captureRequests();
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+
+      const heading = () => screen.getByRole("button", { name: "Status" });
+      const cell = () => screen.getByRole("columnheader", { name: "Status" });
+
+      fireEvent.click(heading());
+      await waitFor(() =>
+        expect(seen.some((r) => r.sortBy === "status" && r.sortDir === "asc")).toBe(true),
+      );
+      expect(cell()).toHaveAttribute("aria-sort", "ascending");
+
+      fireEvent.click(heading());
+      await waitFor(() =>
+        expect(seen.some((r) => r.sortBy === "status" && r.sortDir === "desc")).toBe(true),
+      );
+      expect(cell()).toHaveAttribute("aria-sort", "descending");
+
+      fireEvent.click(heading());
+      await waitFor(() =>
+        expect(seen[seen.length - 1]).toEqual({ skip: "0", sortBy: null, sortDir: null }),
+      );
+      expect(cell()).toHaveAttribute("aria-sort", "none");
+    });
+
+    it("switching to a different heading replaces the previous sort", async () => {
+      const seen = captureRequests();
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+
+      fireEvent.click(screen.getByRole("button", { name: "Owner" }));
+      await waitFor(() => expect(seen.some((r) => r.sortBy === "user_id")).toBe(true));
+
+      fireEvent.click(screen.getByRole("button", { name: "Purpose" }));
+      await waitFor(() =>
+        expect(
+          seen.some((r) => r.sortBy === "purpose_category" && r.sortDir === "asc"),
+        ).toBe(true),
+      );
+      expect(screen.getByRole("columnheader", { name: "Owner" })).toHaveAttribute(
+        "aria-sort",
+        "none",
+      );
+      expect(screen.getByRole("columnheader", { name: "Purpose" })).toHaveAttribute(
+        "aria-sort",
+        "ascending",
+      );
+    });
+
+    it("persists the chosen sort through the preferences store", async () => {
+      const seen = captureRequests();
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+
+      fireEvent.click(screen.getByRole("button", { name: "Period" }));
+      await waitFor(() =>
+        expect(seen.some((r) => r.sortBy === "start_time" && r.sortDir === "asc")).toBe(true),
+      );
+
+      expect(usePreferencesStore.getState().getSortState("reservations")).toEqual({
+        sortBy: "start_time",
+        sortDir: "asc",
+      });
+      await waitFor(() => expect(patchPreferencesMock).toHaveBeenCalled());
+      const lastCall = patchPreferencesMock.mock.calls[patchPreferencesMock.mock.calls.length - 1];
+      expect(lastCall[0].extras).toEqual({
+        "sort:reservations": { sortBy: "start_time", sortDir: "asc" },
+      });
+    });
+
+    it("a previously persisted sort is applied on load", async () => {
+      usePreferencesStore.setState({
+        extras: { "sort:reservations": { sortBy: "purpose_category", sortDir: "desc" } },
+      });
+      const seen = captureRequests();
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() =>
+        expect(
+          seen.some((r) => r.sortBy === "purpose_category" && r.sortDir === "desc"),
+        ).toBe(true),
+      );
+      expect(screen.getByRole("columnheader", { name: "Purpose" })).toHaveAttribute(
+        "aria-sort",
+        "descending",
+      );
+    });
   });
 });

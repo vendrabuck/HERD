@@ -1,8 +1,12 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { ChevronUp, ChevronDown } from "lucide-react";
 import { useCancelReservation, useReleaseReservation, usePaginatedReservations } from "@/api/reservations";
+import type { ReservationSort } from "@/api/reservations";
 import { useAllDeviceNames } from "@/api/inventory";
 import { useAuthStore } from "@/stores/authStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import type { SortState } from "@/stores/preferencesStore";
 import { isAdminRole } from "@/lib/roles";
 import { canCancel, canRelease } from "@/lib/reservationStatus";
 import { Pagination } from "@/components/ui/Pagination";
@@ -12,7 +16,64 @@ import { CreateReservationModal } from "@/components/reservations/CreateReservat
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { EmptyState } from "@/components/ui/EmptyState";
-import type { Reservation } from "@/types/reservation.types";
+import type { Reservation, ReservationSortField } from "@/types/reservation.types";
+
+// The sortable columns on this page (issue #844): each maps a visible column
+// heading to one backend-allowlisted field. Period shows both start and end
+// time in one column; it sorts by start_time; there is no separate heading
+// for end_time so that field has no UI control here (still reachable through
+// the API directly). ID, Topo ID, Topology, and Devices are not in the
+// backend allowlist and stay plain headings.
+const SORTABLE_COLUMN_FIELDS: ReservationSortField[] = [
+  "user_id",
+  "status",
+  "start_time",
+  "purpose_category",
+];
+
+const SORT_PAGE_KEY = "reservations";
+
+// Today's default ordering (created_at desc, see reservation_service.py); used
+// both as the query sent when nothing is persisted and as what a third click
+// clears back to. created_at has no column on this page, so it is never shown
+// as "active" in a header, only applied silently.
+const DEFAULT_SORT: SortState = { sortBy: "created_at", sortDir: "desc" };
+
+function isSortableColumnField(value: string): value is ReservationSortField {
+  return (SORTABLE_COLUMN_FIELDS as string[]).includes(value);
+}
+
+interface SortableHeaderProps {
+  label: string;
+  field: ReservationSortField;
+  active: boolean;
+  direction: "asc" | "desc";
+  onSort: (field: ReservationSortField) => void;
+}
+
+function SortableHeader({ label, field, active, direction, onSort }: SortableHeaderProps) {
+  return (
+    <th
+      scope="col"
+      aria-sort={active ? (direction === "asc" ? "ascending" : "descending") : "none"}
+      className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"
+    >
+      <button
+        type="button"
+        onClick={() => onSort(field)}
+        className="flex items-center gap-1 hover:text-gray-900"
+      >
+        {label}
+        {active &&
+          (direction === "asc" ? (
+            <ChevronUp className="w-3 h-3" aria-hidden="true" />
+          ) : (
+            <ChevronDown className="w-3 h-3" aria-hidden="true" />
+          ))}
+      </button>
+    </th>
+  );
+}
 
 function ReservationRow({
   reservation,
@@ -108,7 +169,37 @@ export function ReservationsPage() {
   // `showAll` is admin-only; a non-admin never sets it, so the query stays
   // scoped to the caller's own reservations (issue #340).
   const allReservations = isAdmin && showAll;
-  const { data, isLoading, isError } = usePaginatedReservations(skip, limit, allReservations);
+
+  // Persisted sort choice (issue #844), keyed per page like getPageSize/
+  // setPageSize (#599). A stored sortBy is validated against this page's own
+  // column set before use: preferences are a generic bucket shared across
+  // pages, so a stale or foreign value (an older build, a field later
+  // dropped from the allowlist) falls back to the default rather than being
+  // sent to the API as-is. No explicit choice means no sort params at all
+  // (see fetchPaginatedReservations), so the backend's own default order
+  // applies instead of this page re-stating it.
+  const rawSortState = usePreferencesStore((s) => s.getSortState(SORT_PAGE_KEY));
+  const setSortState = usePreferencesStore((s) => s.setSortState);
+  const explicitSort: SortState | null =
+    rawSortState && isSortableColumnField(rawSortState.sortBy) ? rawSortState : null;
+  const sortState: SortState = explicitSort ?? DEFAULT_SORT;
+  const sort: ReservationSort | undefined = explicitSort
+    ? { sortBy: explicitSort.sortBy as ReservationSortField, sortDir: explicitSort.sortDir }
+    : undefined;
+
+  const handleSort = (field: ReservationSortField) => {
+    setSkip(0);
+    if (sortState.sortBy !== field) {
+      setSortState(SORT_PAGE_KEY, { sortBy: field, sortDir: "asc" });
+    } else if (sortState.sortDir === "asc") {
+      setSortState(SORT_PAGE_KEY, { sortBy: field, sortDir: "desc" });
+    } else {
+      // Third click on the same heading: clear back to the default order.
+      setSortState(SORT_PAGE_KEY, null);
+    }
+  };
+
+  const { data, isLoading, isError } = usePaginatedReservations(skip, limit, allReservations, sort);
   const { data: deviceNames } = useAllDeviceNames();
   const reservations = data?.items;
   const total = data?.total ?? 0;
@@ -170,13 +261,37 @@ export function ReservationsPage() {
               <thead>
                 <tr className="border-b border-gray-200">
                   <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Owner</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Status</th>
+                  <SortableHeader
+                    label="Owner"
+                    field="user_id"
+                    active={sortState.sortBy === "user_id"}
+                    direction={sortState.sortDir}
+                    onSort={handleSort}
+                  />
+                  <SortableHeader
+                    label="Status"
+                    field="status"
+                    active={sortState.sortBy === "status"}
+                    direction={sortState.sortDir}
+                    onSort={handleSort}
+                  />
                   <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topo ID</th>
                   <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topology</th>
                   <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Devices</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Period</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Purpose</th>
+                  <SortableHeader
+                    label="Period"
+                    field="start_time"
+                    active={sortState.sortBy === "start_time"}
+                    direction={sortState.sortDir}
+                    onSort={handleSort}
+                  />
+                  <SortableHeader
+                    label="Purpose"
+                    field="purpose_category"
+                    active={sortState.sortBy === "purpose_category"}
+                    direction={sortState.sortDir}
+                    onSort={handleSort}
+                  />
                   <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"></th>
                 </tr>
               </thead>
