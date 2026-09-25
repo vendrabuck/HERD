@@ -9,6 +9,21 @@ export type ReservationStatus =
   | "CANCELLED"
   | "FAILED";
 
+// The reservations list sort allowlist (issue #844): mirrors the backend's
+// ReservationSortField/ReservationSortDir Literal query params on GET /reservations/
+// (services/reservations/app/routers/reservations.py) exactly. An unlisted value is a
+// TypeScript error at the call site, matching the backend's 422 for an unlisted value
+// at runtime.
+export type ReservationSortField =
+  | "start_time"
+  | "end_time"
+  | "status"
+  | "purpose_category"
+  | "user_id"
+  | "created_at";
+
+export type ReservationSortDir = "asc" | "desc";
+
 // One requested dynamic (hypervisor-backed) instance; mirrors the backend
 // DynamicRequestSpec (ADR 0004, issue #274). Listing the same template_id N
 // times requests N instances of it; the backend deliberately does not dedupe.

@@ -337,6 +337,297 @@ async def test_non_admin_cannot_cancel_other_users_reservation(other_client):
         assert row.cancelled_by is None
 
 
+# --- List sorting (issue #844) ---
+# sort_by/sort_dir on GET /: an explicit allowlist (start_time, end_time, status,
+# purpose_category, user_id, created_at), each direction, a stable id tiebreak, an
+# unchanged default, and visibility (the owner filter / all-gate) resolved before
+# ordering. Every seed here inserts directly against the test session (bypassing
+# the create-reservation API and its side effects), mirroring
+# _seed_owned_reservation above, so each row's sort-relevant fields land exactly
+# where the test sets them.
+
+
+async def _seed_sortable_reservation(
+    owner_id: str,
+    *,
+    start_time: datetime,
+    end_time: datetime,
+    status: ReservationStatus = ReservationStatus.ACTIVE,
+    purpose_category: str | None = None,
+    created_at: datetime | None = None,
+) -> str:
+    async with TestSessionLocal() as db:
+        res = Reservation(
+            user_id=uuid.UUID(owner_id),
+            device_ids=[str(uuid.uuid4())],
+            topology_type=TopologyType.PHYSICAL,
+            purpose="seeded-for-sort",
+            purpose_category=purpose_category,
+            start_time=start_time,
+            end_time=end_time,
+            status=status,
+        )
+        if created_at is not None:
+            res.created_at = created_at
+        db.add(res)
+        await db.commit()
+        await db.refresh(res)
+        return str(res.id)
+
+
+@pytest.mark.asyncio
+async def test_sort_default_matches_todays_ordering(client):
+    """No sort_by/sort_dir given: newest created_at first, same as before #844."""
+    first_id = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        created_at=NOW - timedelta(hours=2),
+    )
+    second_id = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        created_at=NOW - timedelta(hours=1),
+    )
+    resp = await client.get("/")
+    assert resp.status_code == 200
+    ids = [item["id"] for item in resp.json()["items"]]
+    assert ids == [second_id, first_id]
+
+    # Explicit sort_by=created_at&sort_dir=desc reproduces the same order: the
+    # default is not just an accident of insertion order.
+    explicit = await client.get("/?sort_by=created_at&sort_dir=desc")
+    assert [item["id"] for item in explicit.json()["items"]] == ids
+
+
+@pytest.mark.asyncio
+async def test_sort_start_time_both_directions(client):
+    r1 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1)
+    )
+    r2 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW + timedelta(hours=2), end_time=NOW + timedelta(hours=3)
+    )
+    r3 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW + timedelta(hours=4), end_time=NOW + timedelta(hours=5)
+    )
+    r4 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW + timedelta(hours=6), end_time=NOW + timedelta(hours=7)
+    )
+    asc = await client.get("/?sort_by=start_time&sort_dir=asc")
+    assert [item["id"] for item in asc.json()["items"]] == [r1, r2, r3, r4]
+    desc = await client.get("/?sort_by=start_time&sort_dir=desc")
+    assert [item["id"] for item in desc.json()["items"]] == [r4, r3, r2, r1]
+
+
+@pytest.mark.asyncio
+async def test_sort_end_time_both_directions(client):
+    r1 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1)
+    )
+    r2 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=2)
+    )
+    r3 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=3)
+    )
+    r4 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=4)
+    )
+    asc = await client.get("/?sort_by=end_time&sort_dir=asc")
+    assert [item["id"] for item in asc.json()["items"]] == [r1, r2, r3, r4]
+    desc = await client.get("/?sort_by=end_time&sort_dir=desc")
+    assert [item["id"] for item in desc.json()["items"]] == [r4, r3, r2, r1]
+
+
+@pytest.mark.asyncio
+async def test_sort_status_both_directions(client):
+    # Alphabetical by the enum's stored name: ACTIVE < CANCELLED < COMPLETED < FAILED.
+    r_active = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1), status=ReservationStatus.ACTIVE
+    )
+    r_cancelled = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        status=ReservationStatus.CANCELLED,
+    )
+    r_completed = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        status=ReservationStatus.COMPLETED,
+    )
+    r_failed = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1), status=ReservationStatus.FAILED
+    )
+    asc = await client.get("/?sort_by=status&sort_dir=asc")
+    assert [item["id"] for item in asc.json()["items"]] == [
+        r_active,
+        r_cancelled,
+        r_completed,
+        r_failed,
+    ]
+    desc = await client.get("/?sort_by=status&sort_dir=desc")
+    assert [item["id"] for item in desc.json()["items"]] == [
+        r_failed,
+        r_completed,
+        r_cancelled,
+        r_active,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sort_purpose_category_both_directions(client):
+    r1 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1), purpose_category="alpha"
+    )
+    r2 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1), purpose_category="bravo"
+    )
+    r3 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1), purpose_category="charlie"
+    )
+    r4 = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1), purpose_category="delta"
+    )
+    asc = await client.get("/?sort_by=purpose_category&sort_dir=asc")
+    assert [item["id"] for item in asc.json()["items"]] == [r1, r2, r3, r4]
+    desc = await client.get("/?sort_by=purpose_category&sort_dir=desc")
+    assert [item["id"] for item in desc.json()["items"]] == [r4, r3, r2, r1]
+
+
+@pytest.mark.asyncio
+async def test_sort_user_id_both_directions_admin_all(admin_client):
+    # Four distinct owners; only visible together under all=true as an admin.
+    owners = sorted([str(uuid.uuid4()) for _ in range(4)])
+    ids = []
+    for owner in owners:
+        ids.append(
+            await _seed_sortable_reservation(
+                owner, start_time=NOW, end_time=NOW + timedelta(hours=1)
+            )
+        )
+    asc = await admin_client.get("/?all=true&sort_by=user_id&sort_dir=asc")
+    assert [item["id"] for item in asc.json()["items"]] == ids
+    desc = await admin_client.get("/?all=true&sort_by=user_id&sort_dir=desc")
+    assert [item["id"] for item in desc.json()["items"]] == list(reversed(ids))
+
+
+@pytest.mark.asyncio
+async def test_sort_created_at_both_directions(client):
+    r1 = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        created_at=NOW - timedelta(hours=4),
+    )
+    r2 = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        created_at=NOW - timedelta(hours=3),
+    )
+    r3 = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        created_at=NOW - timedelta(hours=2),
+    )
+    r4 = await _seed_sortable_reservation(
+        USER_ID,
+        start_time=NOW,
+        end_time=NOW + timedelta(hours=1),
+        created_at=NOW - timedelta(hours=1),
+    )
+    asc = await client.get("/?sort_by=created_at&sort_dir=asc")
+    assert [item["id"] for item in asc.json()["items"]] == [r1, r2, r3, r4]
+    desc = await client.get("/?sort_by=created_at&sort_dir=desc")
+    assert [item["id"] for item in desc.json()["items"]] == [r4, r3, r2, r1]
+
+
+@pytest.mark.asyncio
+async def test_sort_unknown_sort_by_is_422(client):
+    resp = await client.get("/?sort_by=not_a_field")
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_sort_unknown_sort_dir_is_422(client):
+    resp = await client.get("/?sort_dir=sideways")
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_sort_non_admin_user_id_desc_sees_only_own_rows(client):
+    """Sorting by a field the caller cannot see across must not leak other rows.
+
+    A non-admin sorting by user_id desc still only sees their own reservations
+    (the owner filter runs before ORDER BY), never another user's, even though
+    user_id is itself the sort key.
+    """
+    own_id = await _seed_sortable_reservation(
+        USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1)
+    )
+    await _seed_sortable_reservation(
+        OTHER_USER_ID, start_time=NOW, end_time=NOW + timedelta(hours=1)
+    )
+    resp = await client.get("/?sort_by=user_id&sort_dir=desc")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert [item["id"] for item in data["items"]] == [own_id]
+
+
+@pytest.mark.asyncio
+async def test_sort_tiebreak_keeps_pagination_stable(admin_client):
+    """Four rows tie on the sort field; pagination must still be gap-free and
+    duplicate-free across pages, which only a secondary key (id) guarantees.
+    """
+    ids = sorted(
+        [
+            await _seed_sortable_reservation(
+                ADMIN_ID,
+                start_time=NOW,
+                end_time=NOW + timedelta(hours=1),
+                status=ReservationStatus.ACTIVE,
+            )
+            for _ in range(4)
+        ]
+    )
+    page1 = await admin_client.get("/?sort_by=status&sort_dir=asc&skip=0&limit=2")
+    page2 = await admin_client.get("/?sort_by=status&sort_dir=asc&skip=2&limit=2")
+    page1_ids = [item["id"] for item in page1.json()["items"]]
+    page2_ids = [item["id"] for item in page2.json()["items"]]
+    assert len(page1_ids) == 2
+    assert len(page2_ids) == 2
+    assert set(page1_ids).isdisjoint(page2_ids)
+    assert page1_ids + page2_ids == ids
+
+
+@pytest.mark.asyncio
+async def test_sort_pagination_disjoint_and_ordered(client):
+    """Pagination with an explicit sort still yields disjoint, correctly ordered pages."""
+    ids = [
+        await _seed_sortable_reservation(
+            USER_ID, start_time=NOW + timedelta(hours=i), end_time=NOW + timedelta(hours=i + 1)
+        )
+        for i in range(5)
+    ]
+    page1 = await client.get("/?sort_by=start_time&sort_dir=asc&skip=0&limit=2")
+    page2 = await client.get("/?sort_by=start_time&sort_dir=asc&skip=2&limit=2")
+    page3 = await client.get("/?sort_by=start_time&sort_dir=asc&skip=4&limit=2")
+    page1_ids = [item["id"] for item in page1.json()["items"]]
+    page2_ids = [item["id"] for item in page2.json()["items"]]
+    page3_ids = [item["id"] for item in page3.json()["items"]]
+    assert page1_ids == ids[0:2]
+    assert page2_ids == ids[2:4]
+    assert page3_ids == ids[4:5]
+    all_ids = page1_ids + page2_ids + page3_ids
+    assert len(all_ids) == len(set(all_ids)) == 5
+
+
 # --- GET single reservation ---
 
 

@@ -19,8 +19,9 @@ import httpx
 from herd_common import advisory_lock
 from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
+from herd_common.pagination import paginate
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, exists, false, func, select, update
+from sqlalchemy import and_, exists, false, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -1887,39 +1888,79 @@ async def apply_provision_result(
     return reservation, True
 
 
+# Sortable fields for the reservations list (issue #844): an explicit allowlist,
+# enforced at the router boundary by a Literal query param (an out-of-list value
+# 422s before it ever reaches this module). The router also resolves the caller's
+# visibility (the `all` gate, and the owner filter below) before any of these
+# functions run, so a sort can never surface a row the caller could not already see.
+_SORTABLE_FIELDS = {
+    "start_time": Reservation.start_time,
+    "end_time": Reservation.end_time,
+    "status": Reservation.status,
+    "purpose_category": Reservation.purpose_category,
+    "user_id": Reservation.user_id,
+    "created_at": Reservation.created_at,
+}
+
+# Today's ordering, unchanged: newest created first. Kept as the default for
+# both sort_by and sort_dir so an existing caller that never sends either param
+# sees the exact same order it always has.
+DEFAULT_RESERVATION_SORT_BY = "created_at"
+DEFAULT_RESERVATION_SORT_DIR = "desc"
+
+
+def _reservation_order_by(sort_by: str, sort_dir: str):
+    """Build the ORDER BY clause for the reservations list.
+
+    Always tiebreaks on Reservation.id (bare column, i.e. ascending) after the
+    requested primary field, regardless of the primary field's own direction.
+    Without a tiebreak, rows that tie on the primary field (two reservations
+    created in the same instant, sharing a status, etc.) have no defined
+    relative order, so the same query re-run mid-pagination (or a second page
+    of the same request) can duplicate or skip a row. The id tiebreak is
+    arbitrary but stable, which is all pagination needs. This is a new
+    guarantee: the previous single-key `created_at.desc()` order had the same
+    tie-ordering gap, just narrower (only exact-timestamp ties), so the
+    default's *row order* is unchanged while previously-undefined ties are now
+    deterministic.
+    """
+    column = _SORTABLE_FIELDS[sort_by]
+    primary = column.asc() if sort_dir == "asc" else column.desc()
+    return primary, Reservation.id
+
+
 async def list_user_reservations(
-    db: AsyncSession, user_id: uuid.UUID, skip: int = 0, limit: int = 50
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    skip: int = 0,
+    limit: int = 50,
+    sort_by: str = DEFAULT_RESERVATION_SORT_BY,
+    sort_dir: str = DEFAULT_RESERVATION_SORT_DIR,
 ) -> tuple[list[Reservation], int]:
-    base = select(Reservation).where(Reservation.user_id == user_id)
-
-    count_query = select(func.count()).select_from(base.subquery())
-    total = (await db.execute(count_query)).scalar() or 0
-
-    result = await db.execute(
-        base.order_by(Reservation.created_at.desc()).offset(skip).limit(limit)
+    stmt = (
+        select(Reservation)
+        .where(Reservation.user_id == user_id)
+        .order_by(*_reservation_order_by(sort_by, sort_dir))
     )
-    return list(result.scalars().all()), total
+    return await paginate(db, stmt, skip=skip, limit=limit)
 
 
 async def list_all_reservations(
-    db: AsyncSession, skip: int = 0, limit: int = 50
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 50,
+    sort_by: str = DEFAULT_RESERVATION_SORT_BY,
+    sort_dir: str = DEFAULT_RESERVATION_SORT_DIR,
 ) -> tuple[list[Reservation], int]:
     """Return every reservation across all users, paginated (issue #340).
 
     Admin-only: the router gates the caller's role before invoking this, so the
     owner filter that list_user_reservations applies is deliberately absent here.
-    Ordering mirrors list_user_reservations (newest created first) so the admin
-    and self views paginate identically.
+    Ordering mirrors list_user_reservations (same default, same allowlist, same
+    id tiebreak) so the admin and self views paginate identically.
     """
-    base = select(Reservation)
-
-    count_query = select(func.count()).select_from(base.subquery())
-    total = (await db.execute(count_query)).scalar() or 0
-
-    result = await db.execute(
-        base.order_by(Reservation.created_at.desc()).offset(skip).limit(limit)
-    )
-    return list(result.scalars().all()), total
+    stmt = select(Reservation).order_by(*_reservation_order_by(sort_by, sort_dir))
+    return await paginate(db, stmt, skip=skip, limit=limit)
 
 
 async def list_calendar_reservations(
