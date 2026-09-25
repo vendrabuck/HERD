@@ -3,11 +3,14 @@ text on the ExecutionRun row (the driver-load follow-up to issue #840's
 class-name-only rule).
 
 run_driver_action's `except (DriverPackageError, ValueError, RuntimeError) as
-e:` branch (execution_service.py) stores `str(e)` on the run row verbatim; the
-sanitizing has to happen at driver_loader.py's raise sites (proven in
-isolation by test_driver_loader_load.py), but this file drives the REAL
-load_driver through the REAL run_driver_action so a regression at either layer
-shows up here as a leaked sentinel on the persisted row, not just on a raised
+e:` branch (execution_service.py) builds a fixed, HERD-authored string
+carrying only a class name (the underlying `__cause__`'s class, else e's own
+class) and stores that on the run row; driver_loader.py's own raise sites are
+already class-name-only too (issue #878, proven in isolation by
+test_driver_loader_load.py), so this is defense in depth at the boundary, not
+a substitute for that discipline. This file drives the REAL load_driver
+through the REAL run_driver_action so a regression at either layer shows up
+here as a leaked sentinel on the persisted row, not just on a raised
 exception's __str__.
 """
 
@@ -84,7 +87,7 @@ async def test_run_driver_action_download_failure_stores_class_name_only(db, cap
 
     assert run.status == "FAILED"
     assert SENTINEL not in (run.error or "")
-    assert run.error.endswith("Exception")
+    assert run.error == "driver load failed: Exception"
 
     from herd_common.logging import JSONFormatter
 
@@ -114,7 +117,7 @@ async def test_run_driver_action_extraction_failure_stores_class_name_only(db, c
 
     assert run.status == "FAILED"
     assert SENTINEL not in (run.error or "")
-    assert run.error.endswith("BadZipFile")
+    assert run.error == "driver load failed: BadZipFile"
 
     from herd_common.logging import JSONFormatter
 
@@ -143,7 +146,7 @@ async def test_run_driver_action_validate_import_failure_stores_class_name_only(
 
     assert run.status == "FAILED"
     assert SENTINEL not in (run.error or "")
-    assert run.error == "Driver validation failed: Failed to load driver.py: RuntimeError"
+    assert run.error == "driver load failed: DriverPackageError"
 
     from herd_common.logging import JSONFormatter
 

@@ -167,7 +167,10 @@ async def test_run_driver_action_driver_package_error_records_failed(db, monkeyp
         USER_ID,
     )
     assert run.status == "FAILED"
-    assert "Driver validation failed: no Driver class" in run.error
+    # The row stores only a fixed, HERD-authored class-name string (issue
+    # #840, extended to driver-load failures): the DriverPackageError's own
+    # message never reaches the row.
+    assert run.error == "driver load failed: DriverPackageError"
 
 
 # --- run_driver_action DryRunRefused (lines 368-380) ---

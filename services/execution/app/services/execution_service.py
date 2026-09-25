@@ -466,8 +466,26 @@ async def run_driver_action(
             db, driver_id, driver_sha256, driver_filename, connection_type
         )
     except (DriverPackageError, ValueError, RuntimeError) as e:
-        run = await update_execution_run(db, run, status="FAILED", error=str(e))
-        logger.error("Driver load failed", extra={"run_id": str(run.id), "error": str(e)})
+        # driver_loader.py's own raise sites are already class-name-only
+        # (issue #878), but this boundary must not depend on that discipline
+        # holding forever: str(e) is never stored on the row or returned by
+        # an API (issue #840's rule, extended here to driver LOAD failures,
+        # reachable by a non-admin with a manage grant). The stored error is
+        # a fixed, HERD-authored string carrying only a class name: the
+        # underlying cause's class when e wraps one via __cause__, else e's
+        # own class. The full text goes in the log MESSAGE only, since
+        # JSONFormatter drops extra keys that are not on its allowlist.
+        cause = e.__cause__
+        cause_class = type(cause).__name__ if cause is not None else type(e).__name__
+        sanitized_error = f"driver load failed: {cause_class}"
+        logger.error(
+            "Driver load failed on run %s (%s): %s",
+            run.id,
+            cause_class,
+            e,
+            extra={"run_id": str(run.id)},
+        )
+        run = await update_execution_run(db, run, status="FAILED", error=sanitized_error)
         return run
 
     # Method-kwargs allowlist: for `configure`, the kwargs ARE the device config

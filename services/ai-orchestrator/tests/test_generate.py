@@ -772,6 +772,43 @@ async def test_generate_bare_exception_never_leaks_text(async_client, monkeypatc
     assert str(logged[0].exc_info[1]) == secret
 
 
+async def test_generate_schema_violation_never_leaks_offending_input(
+    async_client, monkeypatch, caplog
+):
+    """Issue #887: a pydantic ValidationError's default str() AND its default
+    .errors() both embed each field's input_value, which is model output that
+    can carry anything, including a credential-shaped fragment. The pinned
+    502 detail never interpolates the exception (matching the AIError and
+    bare-Exception siblings above, issue #713), and the logged errors must
+    have the offending value stripped too.
+    """
+    _override_inventory({"EX3400": 1})
+    _override_resolver(monkeypatch)
+    secret = "S3cr3t-Do-Not-Leak-9c2"
+    # "purpose" must be a str; a dict fails validation and pydantic's default
+    # error carries this exact value as input_value.
+    _override_ai({"purpose": {"password": secret}, "devices": [], "edges": []})
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    with caplog.at_level("WARNING", logger="app.services.generator"):
+        async with async_client as client:
+            resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == generator_module.AI_SCHEMA_VIOLATION_DETAIL
+    assert secret not in resp.text
+    assert "password" not in resp.text
+
+    logged = [r for r in caplog.records if r.getMessage() == "ai_response_schema_violation"]
+    assert len(logged) == 1
+    assert secret not in str(logged[0].errors)
+    assert "password" not in str(logged[0].errors)
+
+    from herd_common.logging import JSONFormatter
+
+    formatted = JSONFormatter("ai-orchestrator").format(logged[0])
+    assert secret not in formatted
+    assert "password" not in formatted
+
+
 async def test_generate_rejects_empty_prompt(async_client, monkeypatch):
     _override_inventory({"EX3400": 1})
     _override_resolver(monkeypatch)

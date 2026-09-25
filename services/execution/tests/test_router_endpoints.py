@@ -246,7 +246,9 @@ async def test_run_driver_action_driver_load_failure(monkeypatch):
             uuid.UUID(USER_ID),
         )
     assert run.status == "FAILED"
-    assert "missing driver" in run.error
+    # Fixed, HERD-authored class-name string (issue #840, extended to
+    # driver-load failures): str(e) never reaches the row.
+    assert run.error == "driver load failed: ValueError"
 
 
 @pytest.mark.asyncio

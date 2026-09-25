@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # could be anything.
 AI_NO_USABLE_RESPONSE_DETAIL = "AI returned no usable response"
 AI_CALL_FAILED_DETAIL = "AI call failed"
+AI_SCHEMA_VIOLATION_DETAIL = "AI returned a response that did not match the expected schema"
 
 
 # Pinned 503 detail for a cabling outage during the feasibility check. The
@@ -159,10 +160,20 @@ async def generate_topology(
         try:
             candidate = GenerateResponse.model_validate(raw)
         except ValidationError as e:
-            logger.warning("ai_response_schema_violation", extra={"errors": e.errors()})
-            raise GeneratorError(
-                502, f"AI returned a response that did not match the expected schema: {e}"
-            ) from e
+            # Never log or return the offending input value (issue #887): a
+            # pydantic ValidationError's default str() AND its default
+            # .errors() both embed each field's input_value, which here is
+            # model output that can carry anything the model produced,
+            # including a credential-shaped fragment it echoed or
+            # hallucinated. include_input=False drops that from the logged
+            # errors; the pinned detail (same CWE-209 rule as the two
+            # sibling branches above, issue #713) never interpolates the
+            # exception at all, so str(e) never reaches the API response.
+            logger.warning(
+                "ai_response_schema_violation",
+                extra={"errors": e.errors(include_input=False, include_url=False)},
+            )
+            raise GeneratorError(502, AI_SCHEMA_VIOLATION_DETAIL) from e
 
         try:
             _validate_against_inventory(candidate, inventory)

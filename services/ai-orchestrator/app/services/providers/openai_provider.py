@@ -225,7 +225,7 @@ def _response_from_openai(resp: Any, model: str) -> ProviderResponse:
             ToolUseBlock(
                 id=tc.id,
                 name=tc.function.name,
-                input=_safe_json_loads(tc.function.arguments),
+                input=_safe_json_loads(tc.function.arguments, tool_name=tc.function.name),
             )
         )
 
@@ -254,16 +254,36 @@ def _stop_reason_from_openai(raw: str | None) -> StopReason:
     return _OPENAI_STOP_REASONS.get(raw, "other")
 
 
-def _safe_json_loads(raw: str | None) -> dict[str, Any]:
+def _safe_json_loads(raw: str | None, *, tool_name: str | None = None) -> dict[str, Any]:
     """Decode tool_call arguments. Returns {} on malformed JSON so the
     dispatcher's argument-validation path catches the empty-args case
     rather than the orchestrator swallowing the failure.
+
+    Never logs the raw argument text (issue #887): tool_call arguments are
+    model output, and a malformed fragment can carry a credential value the
+    model echoed back or hallucinated (e.g. a truncated {"password": "...").
+    Only the SHAPE of the failure is logged: the argument string's length,
+    the decoder's error position (JSONDecodeError only; other decode
+    failures have none), the exception class, and the tool name, which is
+    HERD-authored (the name of an advertised tool, never model text).
     """
     if not raw:
         return {}
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("openai_tool_arguments_malformed", extra={"raw_arguments": raw[:200]})
+    except (json.JSONDecodeError, TypeError) as exc:
+        # TypeError (a non-str/bytes argument, the SDK misbehaving) has no
+        # meaningful length; guard with getattr rather than assuming raw
+        # supports len().
+        raw_length = len(raw) if hasattr(raw, "__len__") else None
+        logger.warning(
+            "openai_tool_arguments_malformed",
+            extra={
+                "tool_name": tool_name,
+                "raw_length": raw_length,
+                "error_position": getattr(exc, "pos", None),
+                "error_kind": type(exc).__name__,
+            },
+        )
         return {}
     return parsed if isinstance(parsed, dict) else {}
