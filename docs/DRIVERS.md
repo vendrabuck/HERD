@@ -26,7 +26,7 @@ dynamic template's `driver_id` instead of a device's, and it is invoked by a ded
 create/teardown flow rather than the L1/L2/L3 reservation lifecycle. See the dedicated
 section below.
 
-### Apply versus config versions: which contract runs configure (issue #839)
+### Apply versus config versions: which contract runs configure (issues #839, #870)
 
 A device-config APPLY (`POST /devices/{id}/config-versions/{vid}/apply`, `.../schedule`,
 and the AI assistant's `schedule_config_apply` tool) only ever runs against a driver
@@ -36,6 +36,20 @@ not by whether the driver class happens to define a `configure` method: a Layer 
 Layer 3 Switch driver that implements `configure` (as the `mock_l3` test driver does) is
 still refused, with a structured 409 `driver_cannot_configure` detail naming the
 connection type and driver.
+
+This gate has two independent layers. Inventory's `_assert_driver_can_configure`
+(`services/manage_guard.py`) checks it first, before any call reaches execution or a job
+row is created. Execution carries its own copy of the same check (`_assert_action_permitted`
+in `services/execution/app/services/execution_service.py`, issue #870): both
+`POST /execute` and `POST /execute/internal` refuse a `configure` action against a
+connection type outside `herd_common.device_config.CONFIGURE_CONNECTION_TYPES` with the
+same 409 `driver_cannot_configure` shape, before any run row is created or the driver is
+loaded. This matters because the AI assistant's `schedule_config_apply` tool posts
+straight to `/execute` rather than going through inventory's apply endpoints, so
+execution's own gate is what actually stops it; inventory's gate alone would not have
+covered that path. Execution's gate also refuses ANY action, not only `configure`,
+against a device with no resolvable driver (`driver_id` missing or null), with a
+structured 409 `device_has_no_driver`, since there is nothing to load.
 
 Creating, listing, reading, and restoring config VERSIONS is unaffected on every
 connection type. On a Layer 2 or Layer 3 Switch, a config version is how VLAN and
@@ -1500,6 +1514,7 @@ Update `driver.py`, rebuild the archive, upload via **Drivers > Edit > Replace f
 - **`TIMEOUT`**: your method took longer than `EXECUTION_TIMEOUT_SECONDS` (default 30). Raise it if the device is legitimately slow, or speed up the driver.
 - **`FAILED` with `Driver class not found`**: the package root doesn't contain a `driver.py` with a `Driver` class, or the class is missing one of the required methods for its connection type.
 - **`FAILED` with `error` reading `driver raised <ExceptionClassName>`**: the driver method raised (issue #840). The run row and any API response only ever carry the class name; the raw exception text is logged server-side on the execution service (`docker compose logs execution`, or `make logs`), keyed by the run id, and never stored or returned since it can carry hosts, paths, or credential-adjacent text. Check that log line for the actual message; most common cause is a credentials or network issue inside `login()`.
+- **`FAILED` with `error` reading `driver load failed: <ExceptionClassName>`**: loading the driver package itself failed (bad archive, missing `Driver` class, an import error inside the package), not a method call. The class name is the wrapped cause's class when the load error chains one via `__cause__`, else the load error's own class. Same sanitizing rule as above: the full text is in the execution service log, keyed by the run id, never on the row or in an API response.
 - **`FAILED` with `error` reading `driver process exited with status N`**: the driver's child process failed without reporting a structured exception (for example it called `sys.exit`, or died before the runner's handler ran). The child's raw output is never stored either; it is in the same execution service log line, keyed by the run id.
 - **Debugging locally**: run `python -c "from driver import Driver; d = Driver({...}); print(d.status())"` from the package dir. The execution service uses the same import path; if it works locally it will work in the sandbox.
 

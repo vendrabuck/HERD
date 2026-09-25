@@ -24,6 +24,17 @@
   mirroring the backend job's `uv lock --check`. The frontend Docker image is unaffected:
   its build stage copies only `package.json`/`package-lock.json` before installing, so
   `.npmrc` is not present yet and engine-strict never applies there.
+- The reservations list can now be sorted (issue #844). `GET /api/reservations/` gains
+  `sort_by` (an explicit allowlist: `start_time`, `end_time`, `status`,
+  `purpose_category`, `user_id`, `created_at`; an unlisted value 422s) and `sort_dir`
+  query params; the default (`created_at` desc) reproduces the previous ordering
+  exactly, and every `ORDER BY` now tiebreaks on `id` for stable pagination across
+  ties. Visibility narrows the row set before the sort ever runs, so sorting by a
+  field like `user_id` cannot surface a row outside what the caller could already see.
+  The Owner, Status, Period, and Purpose column headings on the reservations table are
+  now sort controls (aria-sort plus a direction chevron; a third click clears back to
+  the default order), and the chosen sort persists per page alongside the existing
+  page-size preference.
 - Outbound webhooks can now subscribe to `device.health_transition` (issue #831). The
   integration service's NATS consumer previously bound only `herd.reservations.*`, so a
   device health transition published by execution's health scheduler on `HERD_HEALTH`
@@ -35,6 +46,24 @@
   handler, since both streams' payloads carry the event name under the same `event`
   key. `device.health_transition` is now accepted by the registration validator and
   documented in `docs/EXTERNAL_API.md`.
+- `JSONFormatter` now emits every `extra=` key on a log record instead of a fixed
+  eleven-key allowlist that silently dropped the rest (issue #872). The stdlib's
+  reserved `LogRecord` attributes are computed once at import time so anything else
+  passed through `extra=` reaches the container log; an extra whose name collides
+  with one of the formatter's own envelope keys (`timestamp`, `level`, `service`,
+  `logger`, `message`, `exception`) is renamed `extra_<name>` instead of overwriting
+  it. A key that looks credential-shaped (password, secret, token, api key,
+  authorization, cookie, kek, credential, jwt, bearer, private key, ssh key, SNMP
+  community) is redacted to `"[redacted]"`, recursively through nested dicts and
+  lists (depth-capped at 8), with narrow carve-outs for token-counting fields
+  (`input_tokens`, `output_tokens`, `token_id`, `token_count`) so those are not swept
+  up as false positives; a value that defeats `json.dumps(default=str)` is replaced
+  with a placeholder for that key alone rather than losing the whole log line. Two
+  follow-up fixes closed fail-open gaps found on review: execution's "Starting driver
+  execution" log line now passes only the method-kwargs' key names, never the values
+  (for a `configure` action the kwargs are the device config itself, which can carry
+  passwords in free text no key-name pattern can catch), and redaction now recurses
+  into nested structures rather than only the top level of an extra.
 - Removed the dead `HEALTH_POLL_MINIMUM_INTERVAL_SECONDS` setting from the execution
   service (issue #880). The variable was declared with a default and documented in
   `docs/ENV_VARS.md`, but it was never passed through by `docker-compose.yml` and
@@ -42,6 +71,38 @@
   otherwise. The real floor on `poll_interval_seconds` remains inventory's hardcoded
   `MIN_POLL_INTERVAL_SECONDS`. An operator who had set this variable loses nothing by
   its removal, since it never changed any behavior.
+- The admin About page now tells an unreachable service apart from one that answered
+  with a malformed body (issue #874): a `200` whose body fails the `ServiceVersion`
+  shape check (a proxy's HTML error page, a truncated JSON body) used to render as
+  "reachable" and compute a version-skew "differs" badge against garbage data. It now
+  gets its own "invalid response" state, with dashed version/build/build-date cells
+  and no skew badge. Version comparison also now recognizes release-candidate versions
+  in both the backend's PEP 440 spelling (`0.6.0rc1`) and the frontend's semver
+  spelling (`0.6.0-rc.1`), comparing rc numbers for equality while still treating rc,
+  dev, and final as distinct pre-release kinds. The dead `ReservationPanel` component
+  (nothing imported it) was also removed.
+- The reservation assistant no longer discards a turn's tool writes when the turn
+  fails after they already landed (issue #871): a timeout, an unreachable provider, or
+  any other `AIError` used to roll the whole turn back once a write tool had already
+  run, hiding the only record of what happened. The route now checks whether any tool
+  produced a side effect before rolling back; if one did, it persists what completed
+  and returns 200 with the real `tool_calls`, `pending_apply` when applicable, a fixed
+  fallback answer, and a new `incomplete` field naming the reason (`timeout`,
+  `provider_unavailable`, or `ai_error`). A turn with no tool run and no text still
+  returns 502 and rolls back as before.
+- Execution now refuses a driver action its driver's own contract does not support,
+  instead of only failing deep inside the sandbox (issue #870). `POST /execute` and
+  `POST /execute/internal` reject a `configure` action against a connection type
+  outside `CONFIGURE_CONNECTION_TYPES` with the same structured 409
+  `driver_cannot_configure` shape inventory's apply endpoints already used, and reject
+  ANY action against a device with no resolvable driver with a 409
+  `device_has_no_driver`, both before any run row is created. This closes the gap left
+  by inventory's own #839 gate, which the AI assistant's `schedule_config_apply` tool
+  bypasses by posting straight to `/execute`. Driver LOAD failures (a bad archive, a
+  missing `Driver` class, an import error) are now sanitized the same way method-raise
+  failures already were: the stored and returned error is the fixed string `driver
+  load failed: <ExceptionClassName>`, with the full text going only to the execution
+  service log.
 - Reservations can be cancelled from the UI before they are active (issue #841): the
   reservations table and the reservation detail modal gated BOTH Release and Cancel on
   `status === "ACTIVE"`, so a PENDING or PENDING_PROVISION reservation had no Cancel

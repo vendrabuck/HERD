@@ -6,7 +6,7 @@ Complete guide for building HERD from scratch on a new machine.
 
 - Docker and Docker Compose (v2+)
 - Git
-- Node.js 22+ and npm 11.11.0+ (for local frontend dev/testing; `frontend/package.json` enforces this floor via `engines` plus `engine-strict` in `frontend/.npmrc`, issue #885)
+- Node.js 22.22.2+ and npm 11.11.0+ (for local frontend dev/testing; `frontend/package.json` declares `engines.node: ">=22"`, but `engine-strict` in `frontend/.npmrc` binds every dependency's own engines floor too, and jsdom 30 declares `^22.22.2 || ^24.15.0 || >=26`, so a Node 22.x host below 22.22.2 is refused by `npm ci`/`npm install`, issue #885)
 - Python 3.12+ and uv (for local backend dev/testing)
 - openssl (only if regenerating TLS certs)
 

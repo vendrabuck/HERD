@@ -469,6 +469,14 @@ caller learns nothing about the device's driver. Config-version create/list/read
 are unaffected by this gate on every connection type; see `docs/DRIVERS.md` for the
 full rule.
 
+Execution carries an independent copy of the same contract check (issue #870):
+`POST /execute` and `POST /execute/internal` refuse a `configure` action against a
+connection type outside the same allowlist with the identical 409 `driver_cannot_configure`
+shape, and refuse ANY action against a device with no resolvable driver with a 409
+`device_has_no_driver`, both before any run row is created. This is the gate that
+actually stops the AI assistant's `schedule_config_apply` tool, which posts straight to
+`/execute` rather than going through either of inventory's apply endpoints above.
+
 Read paths (list config versions, get version detail, diff) are not gated by this
 manage-or-reservation-ownership widening. As of issue #718, they instead carry the
 same plain group-visibility gate as `GET /devices/{id}` and `GET /devices/{id}/ports`:

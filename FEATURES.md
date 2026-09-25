@@ -401,7 +401,8 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   and the facade forwards the caller's identity so RBAC, device-group visibility,
   and ACL grants apply exactly as for interactive users. Admins register outbound
   webhooks for reservation lifecycle events (`reservation.created`, `.updated`,
-  `.cancelled`, `.completed`, `.failed`, `.expiring_soon`); each delivery is
+  `.cancelled`, `.completed`, `.failed`, `.expiring_soon`) and, since issue #831,
+  `device.health_transition`; each delivery is
   HMAC-SHA256 signed via `X-HERD-Signature`, at-least-once with retry and backoff,
   idempotent on the payload `event_id`, dead-lettered on exhaustion, and recorded
   in an inspectable delivery ledger. See
