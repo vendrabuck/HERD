@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- Added `docs/SIMULATED_LAB_GUIDE.md`, a task-oriented guide to HERD's three
+  simulated-hardware tiers (the hardware-free mock drivers, the checked-in NOS lab,
+  and the unbuilt external network-simulator): a table of what each can and cannot
+  do and when to reach for it, a numbered NOS lab quick start covering both the
+  Makefile commands and the UI steps to build a topology, add a Layer 3 route on
+  the real FRR node, reserve it, watch it go ACTIVE, verify on the box, cancel, and
+  detach, a mock-driver field_data knob reference, a test-tier comparison, and
+  troubleshooting for the known lab traps (the `[FACTORY]` prompt issue, the VRF
+  kernel-module dependency, the credential-export gotcha). `docs/NOS_LAB.md` now
+  points readers who want the how-to at the new guide instead of its own build log.
 - Pinned the npm version the frontend expects (issue #885). A plain `npm install` in
   `frontend/` on an npm older than 11.11.0 silently strips the `libc` array that a newer
   npm (including Dependabot's) writes into optional-platform lockfile entries, rewriting

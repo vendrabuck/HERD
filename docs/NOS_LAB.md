@@ -1,5 +1,9 @@
 # Emulated-gear test lab (phase 0)
 
+Looking for a how-to instead of this build log: see `docs/SIMULATED_LAB_GUIDE.md`
+for a task-oriented walkthrough of when to use each simulated-gear tier and how to
+drive a real device through HERD's own UI.
+
 This is a checked-in, license-free lab of two real network operating systems,
 run as Docker containers on the local host: no external Proxmox host, no
 paid license, no separate lab reservation. It is phase 0 of the
