@@ -1,10 +1,11 @@
 """Outbound webhook subscriptions and the delivery ledger (issue #33, phase 4).
 
-An admin registers a WebhookSubscription (target URL, subscribed reservation
-event types, shared HMAC secret). The NATS consumer fans reservation lifecycle
-events out to every matching active subscription and records each attempt in
-WebhookDelivery, which doubles as the at-least-once dedup ledger and the
-dead-letter record on retry exhaustion.
+An admin registers a WebhookSubscription (target URL, subscribed event types,
+shared HMAC secret). The NATS consumer fans reservation lifecycle events
+(HERD_RESERVATIONS) and, since issue #831, device health transition events
+(HERD_HEALTH) out to every matching active subscription and records each
+attempt in WebhookDelivery, which doubles as the at-least-once dedup ledger
+and the dead-letter record on retry exhaustion.
 """
 
 import uuid

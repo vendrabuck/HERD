@@ -266,14 +266,15 @@ A subscription may subscribe to any of:
 - `reservation.completed`
 - `reservation.failed`
 - `reservation.expiring_soon`
+- `device.health_transition`
 
 An unknown event type in `event_types` is rejected at registration.
 
 ### Delivery payload
 
-The body is the reservation lifecycle event as JSON. Every payload carries an
-`event` discriminator and an `event_id` (the stable per-event id used for
-idempotency), plus event-specific fields.
+The body is the reservation lifecycle or device health event as JSON. Every
+payload carries an `event` discriminator and an `event_id` (the stable
+per-event id used for idempotency), plus event-specific fields.
 
 Example `reservation.created`:
 
@@ -307,6 +308,23 @@ Example `reservation.failed`:
 }
 ```
 
+Example `device.health_transition` (issue #831):
+
+```json
+{
+  "event": "device.health_transition",
+  "event_id": "c9d8e7f6-5a4b-4c3d-9e2f-1a0b9c8d7e6f",
+  "device_id": "22222222-2222-2222-2222-222222222222",
+  "device_name": "switch-lab-01",
+  "old_status": "HEALTHY",
+  "new_status": "UNREACHABLE",
+  "transition_kind": "bad_news",
+  "consecutive_failures": 3,
+  "last_run_id": "55555555-5555-5555-5555-555555555555",
+  "timestamp": "2026-07-01T09:05:00+00:00"
+}
+```
+
 Field sets vary by event. For example `reservation.updated` adds
 `added_device_ids` and `removed_device_ids`, and `reservation.expiring_soon`
 carries `reservation_id`, `user_id`, `device_ids`, and `end_time`. Every
@@ -315,8 +333,10 @@ carries `reservation_id`, `user_id`, `device_ids`, and `end_time`. Every
 event was staged, or `null` when unclassified. There is no dedicated event for
 a purpose_category edit made through the interactive UI (the PATCH endpoint is
 not part of this v1 API); an edit rides the next lifecycle event for that
-reservation instead. Treat the payload as additive: read the fields you need
-by name and ignore any you do not recognize.
+reservation instead. `device.health_transition` carries no `purpose_category`;
+it is a device-level event, not a reservation lifecycle event. Treat the
+payload as additive: read the fields you need by name and ignore any you do
+not recognize.
 
 ### Verifying the signature
 

@@ -5,9 +5,11 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
-# The reservation lifecycle event names a subscription may subscribe to. These
-# mirror the `event` field on HERD_RESERVATIONS payloads (subjects
-# herd.reservations.{created,updated,cancelled,completed,failed,expiring_soon}).
+# The event names a subscription may subscribe to. These mirror the `event`
+# field on HERD_RESERVATIONS payloads (subjects
+# herd.reservations.{created,updated,cancelled,completed,failed,expiring_soon})
+# plus, since issue #831, the `event` field on HERD_HEALTH payloads (subject
+# herd.health.status_changed, published by execution's health scheduler).
 KNOWN_EVENT_TYPES = {
     "reservation.created",
     "reservation.updated",
@@ -15,6 +17,7 @@ KNOWN_EVENT_TYPES = {
     "reservation.completed",
     "reservation.failed",
     "reservation.expiring_soon",
+    "device.health_transition",
 }
 
 
