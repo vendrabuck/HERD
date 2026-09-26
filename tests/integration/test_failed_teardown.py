@@ -1,20 +1,33 @@
-"""Integration tests for reservation.failed provisioning teardown (issue #244).
+"""Integration tests for terminal-event provisioning teardown (issue #244).
 
-The invariant under test: reservation.failed tears down exactly the provisioning
-that landed before the failure, and nothing else. As of ADR 0009 phase 6 the
-teardown is ledger-driven (an ACTIVE ledger row IS an applied op), and as of
-phase 7 the provisioning that writes those ledgers is fork-driven: each scenario
-books a reservation against a WIRED parent topology, so the activation-staged
-reservation.wiring_changed reconcile provisions the initial wiring and records
-the ledger rows the teardown then releases.
+The invariant under test: a terminal reservation event tears down exactly the
+provisioning that landed before the reservation ended, and nothing else. As of
+ADR 0009 phase 6 the teardown is ledger-driven (an ACTIVE ledger row IS an
+applied op), and as of phase 7 the provisioning that writes those ledgers is
+fork-driven: each scenario books a reservation against a WIRED parent
+topology, so the activation-staged reservation.wiring_changed reconcile
+provisions the initial wiring and records the ledger rows the teardown then
+releases. reservation.cancelled and reservation.failed drive the identical
+teardown code (both are members of nats_consumer.DYNAMIC_TEARDOWN_EVENTS and
+share _teardown_from_ledgers), so these scenarios exercise that shared path
+regardless of which of the two names the row's real transition.
 
-The failed events themselves are still published synthetically onto the
-reservations stream: the consumer acts on its own ledgers and validates nothing
-against the reservations service, which is exactly the contract issue #244
-hardens (the teardown invariant must hold for any producer ordering, current or
-future). Observability is GET /execution/runs (there is no REST endpoint for
-vlan/route assignment rows; a SUCCESS remove_* run driven by the stored state is
-the end-to-end proof the stored state existed and was used).
+Hardening: execution's consumer now corroborates every terminal event against
+reservations' own record of the row before running any handler (see
+nats_consumer._verify_reservation_event); a forged terminal event for a row
+reservations still reports ACTIVE is acked without running the teardown. These
+tests therefore end the provisioned reservation for REAL, through
+`DELETE /reservations/{id}` (_cancel_for_real below), which both flips the row
+to CANCELLED and stages a genuine reservation.cancelled event via the outbox in
+the same transaction, so the corroboration check sees a reservation that has
+actually ended. Once a scenario's reservation is genuinely terminal, a forged
+republish for that SAME reservation (used below to test that a redelivery, or
+a duplicate event for a row with nothing left to release, tears down nothing
+further) is itself corroborated and is not a case of "trust a bare claim":
+the row really is terminal by then. Observability is GET /execution/runs
+(there is no REST endpoint for vlan/route assignment rows; a SUCCESS remove_*
+run driven by the stored state is the end-to-end proof the stored state
+existed and was used).
 
 Ordering anchor pattern: the execution consumer processes the reservations
 stream sequentially, so publishing a later event and waiting for its runs
@@ -70,6 +83,14 @@ async def _publish_event(event: str, reservation_id: str, device_ids: list[str])
     Stamps a fresh event_id (as the outbox relay does); publishing the SAME
     returned payload again simulates a JetStream redelivery / relay republish of
     one logical event.
+
+    Since the corroboration gate (nats_consumer._verify_reservation_event) now
+    checks every terminal/created/updated/wiring_changed event's claim against
+    reservations' own record, a forged event only reaches the handler here when
+    the reservation is ALREADY genuinely terminal (via _cancel_for_real below)
+    or does not exist at all (a 404 is its own, equally safe, unverified path).
+    Never use this to claim a status change for a reservation that is still
+    ACTIVE; that is exactly the forged-event attack the gate closes.
     """
     payload = {
         "event": event,
@@ -80,6 +101,20 @@ async def _publish_event(event: str, reservation_id: str, device_ids: list[str])
     }
     await _publish_raw(f"herd.reservations.{event.split('.')[1]}", json.dumps(payload).encode())
     return payload
+
+
+async def _cancel_for_real(client, reservation_id: str) -> None:
+    """End a reservation through the real API instead of forging its terminal
+    event. DELETE /reservations/{id} (reservation_service.cancel_reservation)
+    flips the row to CANCELLED and stages a genuine reservation.cancelled event
+    via the outbox in the same transaction, so by the time execution's consumer
+    processes it, the corroboration gate sees a reservation that has actually
+    ended. cancelled and failed drive the identical ledger-driven teardown code
+    (nats_consumer.DYNAMIC_TEARDOWN_EVENTS / _teardown_from_ledgers), so this
+    exercises the same invariant issue #244 is about.
+    """
+    resp = await client.delete(f"/reservations/{reservation_id}")
+    resp.raise_for_status()
 
 
 async def _publish_raw(subject: str, payload: bytes) -> None:
@@ -296,8 +331,9 @@ async def _reserve(client, device_ids: list[str], topology_id: str) -> dict:
 async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempotent(
     admin_client, teardown_templates, fresh_devices
 ):
-    """reservation.failed after full L3 provisioning removes exactly the pinned
-    routes; a redelivered failed event (same event_id) tears down nothing more."""
+    """Ending a fully-L3-provisioned reservation removes exactly the pinned
+    routes; a redelivered terminal event for the now-terminal row tears down
+    nothing more."""
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_switch(
         admin_client, teardown_templates["mock_l3"]["id"], f"failed-l3-sw-{suffix}"
@@ -323,22 +359,26 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
             await _poll_runs(admin_client, res_id, "configure_route", count=len(ROUTES))
         ) == len(ROUTES), "provisioning never completed, cannot test failed teardown"
 
-        failed_payload = await _publish_event("reservation.failed", res_id, [dut_a["id"]])
+        # End the reservation for real (DELETE) rather than forging its terminal
+        # event: the corroboration gate acks an unverified event without running
+        # the handler, so a forged reservation.failed for a row reservations
+        # still reports ACTIVE would no longer tear anything down.
+        await _cancel_for_real(admin_client, res_id)
         remove_runs = await _poll_runs(admin_client, res_id, "remove_route", count=len(ROUTES))
-        assert len(remove_runs) == len(ROUTES), (
-            "reservation.failed did not remove the pinned routes"
-        )
+        assert len(remove_runs) == len(ROUTES), "cancelling did not remove the pinned routes"
         removed = {
             (k["destination"], k.get("next_hop"), k["interface"])
             for k in (_method_kwargs(r) for r in remove_runs)
         }
         assert removed == {(r["destination"], r.get("next_hop"), r["interface"]) for r in ROUTES}
 
-        # Redelivery: the same logical event again (same event_id). The pinned
-        # set is RELEASED, so the ledger teardown finds nothing applied and no
-        # further teardown may run. Anchor on a later provisioning event (a second
-        # wired reservation on the same switch) to avoid a sleep.
-        await _publish_raw("herd.reservations.failed", json.dumps(failed_payload).encode())
+        # Redelivery: a duplicate terminal event for the SAME reservation. The row
+        # is genuinely CANCELLED now, so the gate corroborates it (any terminal
+        # status satisfies any terminal event), and the pinned set is already
+        # RELEASED, so the ledger teardown finds nothing applied and no further
+        # teardown may run. Anchor on a later provisioning event (a second wired
+        # reservation on the same switch) to avoid a sleep.
+        await _publish_event("reservation.failed", res_id, [dut_a["id"]])
         connections.append(
             await _connect(admin_client, dut_b["id"], "eth0", switch["id"], "ge-0/0/2")
         )
@@ -350,7 +390,7 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
             "anchor reservation was never provisioned"
         )
         assert len(await _runs(admin_client, res_id, "remove_route", "SUCCESS")) == len(ROUTES), (
-            "a redelivered reservation.failed re-ran teardown"
+            "a redelivered terminal event re-ran teardown"
         )
     finally:
         for res in reservations:
@@ -409,9 +449,12 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
         assert failed_connects, "the broken switch was supposed to raise on connect_ports"
         assert {str(r["device_id"]) for r in failed_connects} == {sw_broken["id"]}
 
-        await _publish_event("reservation.failed", res_id, device_ids)
+        # End the reservation for real: a forged reservation.failed for this
+        # still-ACTIVE row would now be acked, unverified, by the corroboration
+        # gate rather than driving any teardown.
+        await _cancel_for_real(admin_client, res_id)
         disconnects = await _poll_runs(admin_client, res_id, "disconnect_ports")
-        assert disconnects, "reservation.failed did not disconnect the applied pair"
+        assert disconnects, "cancelling did not disconnect the applied pair"
         assert {str(r["device_id"]) for r in disconnects} == {sw_ok["id"]}, (
             "teardown must only touch the switch whose connect_ports succeeded"
         )
@@ -439,9 +482,12 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
 async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_teardown_works(
     admin_client, teardown_templates, fresh_device
 ):
-    """Phase 1: a reservation.failed with NO prior provisioning drives zero
-    driver runs (in particular no derived-VLAN fallback teardown). Phase 2: the
-    same topology provisioned then failed removes the STORED VLAN membership.
+    """Phase 1: a terminal event for a reservation that was never created drives
+    zero driver runs (in particular no derived-VLAN fallback teardown); this is
+    now also the corroboration gate's own 404 path (the row does not exist, so
+    it cannot be verified either), which is exactly the outcome this phase
+    wants. Phase 2: the same topology provisioned then genuinely ended removes
+    the STORED VLAN membership.
 
     The teardown is ledger-driven (ADR 0009 phase 6): it reads the
     l2_port_assignments membership rows (written by the fork-driven reconcile,
@@ -463,15 +509,14 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
             admin_client, fresh_device["id"], "eth0", switch["id"], "ge-0/0/1"
         )
 
-        # Phase 1: failed with nothing applied; the provisioning of the next (real,
-        # wired) reservation is the ordering anchor proving it was fully processed.
+        # Phase 1: failed for a reservation id that was never created; the
+        # provisioning of the next (real, wired) reservation is the ordering
+        # anchor proving it was fully processed.
         await _publish_event("reservation.failed", unprovisioned_res_id, [fresh_device["id"]])
         topology_id = await _create_topology(
             admin_client, _canvas([(fresh_device["id"], switch["id"])])
         )
-        reservation = await _reserve(
-            admin_client, [fresh_device["id"], switch["id"]], topology_id
-        )
+        reservation = await _reserve(admin_client, [fresh_device["id"], switch["id"]], topology_id)
         provisioned_res_id = reservation["id"]
         add_runs = await _poll_runs(admin_client, provisioned_res_id, "add_to_vlan")
         assert add_runs, "anchor provisioning never completed"
@@ -479,12 +524,14 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
             "a never-provisioned FAILED reservation must not produce any driver run"
         )
 
-        # Phase 2: fail the provisioned reservation; the ledger-driven teardown removes the
-        # stored membership (remove_from_vlan with the stored VLAN id), frees the
+        # Phase 2: end the provisioned reservation for real (a forged failed event
+        # for this still-ACTIVE row would now be acked, unverified, without
+        # driving any teardown); the ledger-driven teardown removes the stored
+        # membership (remove_from_vlan with the stored VLAN id), frees the
         # allocation in the DB, and undefines the VLAN via delete_vlan (issue #442).
-        await _publish_event("reservation.failed", provisioned_res_id, [fresh_device["id"]])
+        await _cancel_for_real(admin_client, provisioned_res_id)
         remove_runs = await _poll_runs(admin_client, provisioned_res_id, "remove_from_vlan")
-        assert remove_runs, "reservation.failed did not remove the stored VLAN membership"
+        assert remove_runs, "cancelling did not remove the stored VLAN membership"
         provisioned_vlan = _method_kwargs(add_runs[0])["vlan_id"]
         torn_down_vlans = {_method_kwargs(r)["vlan_id"] for r in remove_runs}
         assert torn_down_vlans == {provisioned_vlan}, (
