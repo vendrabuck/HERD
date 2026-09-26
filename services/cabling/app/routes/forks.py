@@ -339,13 +339,16 @@ async def get_fork_internal(
         .all()
     )
 
+    # Read-side strip (belt and braces, see routes/topologies.py's
+    # get_topology): never mutates fork.canvas_data itself, only the value
+    # handed to the response.
     return ForkDetailResponse(
         id=fork.id,
         reservation_id=fork.reservation_id,
         parent_topology_id=fork.parent_topology_id,
         parent_version_id=fork.parent_version_id,
         status=fork.status,
-        canvas_data=fork.canvas_data,
+        canvas_data=strip_device_nodes(fork.canvas_data),
         draft_restored_from_id=fork.draft_restored_from_id,
         created_at=fork.created_at,
         updated_at=fork.updated_at,
@@ -378,13 +381,14 @@ async def get_fork_version_internal(
     fork = await _load_fork(db, reservation_id)
     version = await _load_fork_version(db, fork.id, version_id)
 
+    # Read-side strip (belt and braces, see get_fork_internal above).
     return ForkVersionDetailResponse(
         id=version.id,
         fork_id=version.fork_id,
         version_number=version.version_number,
         restored_from_id=version.restored_from_id,
         created_at=version.created_at,
-        canvas_data=version.canvas_data,
+        canvas_data=strip_device_nodes(version.canvas_data),
     )
 
 

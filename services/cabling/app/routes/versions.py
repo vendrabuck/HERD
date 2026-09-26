@@ -95,7 +95,15 @@ async def diff_versions(
     await _load_topology(db, topology_id)
     version_a = await _load_version(db, topology_id, a)
     version_b = await _load_version(db, topology_id, b)
-    diff = diff_canvas(version_a.canvas_data, version_b.canvas_data)
+    # Read-side strip (belt and braces, see get_topology): diff_canvas echoes
+    # whole node dicts verbatim into nodes_added/nodes_removed/nodes_modified,
+    # so a pre-fix row's device node would otherwise leak field_data straight
+    # into this diff. Strip both sides before diffing, never after: stripping
+    # post-diff would still leave nodes_modified's stale "before"/"after"
+    # values dirty since diff_collection copies the dicts it indexes.
+    diff = diff_canvas(
+        strip_device_nodes(version_a.canvas_data), strip_device_nodes(version_b.canvas_data)
+    )
     return TopologyVersionDiff(version_a=a, version_b=b, **diff)
 
 
@@ -107,7 +115,13 @@ async def get_version(
     db: AsyncSession = Depends(get_db),
 ):
     await _load_topology(db, topology_id)
-    return await _load_version(db, topology_id, version_id)
+    version = await _load_version(db, topology_id, version_id)
+    # Read-side strip (belt and braces, see get_topology): build the response
+    # model explicitly and overwrite its canvas_data rather than mutate the
+    # ORM object, so this read never persists what it strips.
+    detail = TopologyVersionDetail.model_validate(version)
+    detail.canvas_data = strip_device_nodes(detail.canvas_data)
+    return detail
 
 
 @router.post(

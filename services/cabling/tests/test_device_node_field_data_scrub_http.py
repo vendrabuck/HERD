@@ -19,8 +19,9 @@ from app.config import settings
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload
 from app.main import app
-from app.models.fork import ReservationFork
-from app.models.topology import Topology
+from app.models.fork import ForkStatus_ACTIVE, ForkVersion, ReservationFork
+from app.models.template import TopologyTemplate
+from app.models.topology import Topology, TopologyVersion
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -225,8 +226,6 @@ async def test_topology_restore_version_scrubs_field_data():
     """Belt and braces: a version row seeded directly (bypassing the API, as a
     pre-migration legacy row would look) still comes out clean once restored,
     since restore is its own write boundary."""
-    from app.models.topology import TopologyVersion
-
     tid = uuid.uuid4()
     dev = str(uuid.uuid4())
     dirty = _dirty_canvas(dev)
@@ -367,3 +366,230 @@ async def test_template_create_and_instantiate_scrub_field_data(client):
 
     get_resp = await client.get(f"/templates/{create_resp.json()['id']}")
     _assert_clean(get_resp.text)
+
+
+# --- Read-side strip: a dirty row seeded directly, bypassing every write ----
+# boundary, simulates a stack that upgraded images without running
+# `make migrate` (a missed cabling migration is a logged warning, not a boot
+# failure). Each of these proves the READ itself strips field_data, and that
+# doing so never rewrites the stored row: "reads stay reads".
+
+
+@pytest.mark.asyncio
+async def test_topology_get_strips_a_dirty_row_without_rewriting_it(client):
+    tid = uuid.uuid4()
+    dev = str(uuid.uuid4())
+    dirty = _dirty_canvas(dev)
+    async with TestSessionLocal() as db:
+        db.add(Topology(id=tid, name="Legacy", created_by=uuid.uuid4(), canvas_data=dirty))
+        await db.commit()
+
+    get_resp = await client.get(f"/topologies/{tid}")
+    assert get_resp.status_code == 200
+    _assert_clean(get_resp.text)
+
+    async with TestSessionLocal() as db:
+        stored = (await db.execute(select(Topology).where(Topology.id == tid))).scalar_one()
+        assert "field_data" in json.dumps(stored.canvas_data), (
+            "the read must not rewrite the stored row"
+        )
+
+
+@pytest.mark.asyncio
+async def test_topology_version_get_strips_a_dirty_row_without_rewriting_it(client):
+    tid = uuid.uuid4()
+    vid = uuid.uuid4()
+    dev = str(uuid.uuid4())
+    dirty = _dirty_canvas(dev)
+    async with TestSessionLocal() as db:
+        topo = Topology(id=tid, name="Legacy", created_by=uuid.uuid4(), canvas_data=None)
+        db.add(topo)
+        await db.flush()
+        db.add(
+            TopologyVersion(
+                id=vid,
+                topology_id=tid,
+                version_number=1,
+                canvas_data=dirty,
+                name="Legacy",
+                created_by=topo.created_by,
+            )
+        )
+        await db.commit()
+
+    get_resp = await client.get(f"/topologies/{tid}/versions/{vid}")
+    assert get_resp.status_code == 200
+    _assert_clean(get_resp.text)
+
+    async with TestSessionLocal() as db:
+        stored = (
+            await db.execute(select(TopologyVersion).where(TopologyVersion.id == vid))
+        ).scalar_one()
+        assert "field_data" in json.dumps(stored.canvas_data), (
+            "the read must not rewrite the stored row"
+        )
+
+
+@pytest.mark.asyncio
+async def test_topology_version_diff_strips_dirty_rows_on_both_sides(client):
+    """diff_canvas echoes whole node dicts into nodes_added/removed/modified;
+    both a node present only on one side (added/removed) and a node present on
+    both sides with a change (modified) must come out clean."""
+    tid = uuid.uuid4()
+    dev_a, dev_b = str(uuid.uuid4()), str(uuid.uuid4())
+    va_id, vb_id = uuid.uuid4(), uuid.uuid4()
+
+    # Version A: one dirty device node (dev_a), present in both -> "modified"
+    # (its name differs) plus a node present only here -> "removed".
+    canvas_a = {
+        "nodes": [
+            {
+                "id": "n1",
+                "type": "deviceNode",
+                "data": {"device": _dirty_device(dev_a, "sw-a-old")},
+            },
+            {"id": "n2", "type": "deviceNode", "data": {"device": _dirty_device(dev_b, "sw-b")}},
+        ],
+        "edges": [],
+    }
+    # Version B: dev_a renamed (modified), dev_b gone, a new dirty node added.
+    dev_c = str(uuid.uuid4())
+    canvas_b = {
+        "nodes": [
+            {
+                "id": "n1",
+                "type": "deviceNode",
+                "data": {"device": _dirty_device(dev_a, "sw-a-new")},
+            },
+            {"id": "n3", "type": "deviceNode", "data": {"device": _dirty_device(dev_c, "sw-c")}},
+        ],
+        "edges": [],
+    }
+
+    async with TestSessionLocal() as db:
+        topo = Topology(id=tid, name="Legacy", created_by=uuid.uuid4(), canvas_data=None)
+        db.add(topo)
+        await db.flush()
+        db.add(
+            TopologyVersion(
+                id=va_id,
+                topology_id=tid,
+                version_number=1,
+                canvas_data=canvas_a,
+                name="Legacy",
+                created_by=topo.created_by,
+            )
+        )
+        db.add(
+            TopologyVersion(
+                id=vb_id,
+                topology_id=tid,
+                version_number=2,
+                canvas_data=canvas_b,
+                name="Legacy",
+                created_by=topo.created_by,
+            )
+        )
+        await db.commit()
+
+    diff_resp = await client.get(
+        f"/topologies/{tid}/versions/diff", params={"a": str(va_id), "b": str(vb_id)}
+    )
+    assert diff_resp.status_code == 200, diff_resp.text
+    _assert_clean(diff_resp.text)
+    body = diff_resp.json()
+    assert len(body["nodes_added"]) == 1  # n3 (dev_c)
+    assert len(body["nodes_removed"]) == 1  # n2 (dev_b)
+    assert len(body["nodes_modified"]) == 1  # n1 (dev_a renamed)
+
+    # The read must not rewrite either stored version.
+    async with TestSessionLocal() as db:
+        stored_a = (
+            await db.execute(select(TopologyVersion).where(TopologyVersion.id == va_id))
+        ).scalar_one()
+        stored_b = (
+            await db.execute(select(TopologyVersion).where(TopologyVersion.id == vb_id))
+        ).scalar_one()
+        assert "field_data" in json.dumps(stored_a.canvas_data)
+        assert "field_data" in json.dumps(stored_b.canvas_data)
+
+
+@pytest.mark.asyncio
+async def test_fork_get_strips_a_dirty_row_without_rewriting_it(client):
+    rid = uuid.uuid4()
+    dev = str(uuid.uuid4())
+    dirty = _dirty_canvas(dev)
+    async with TestSessionLocal() as db:
+        db.add(
+            ReservationFork(
+                reservation_id=rid,
+                canvas_data=dirty,
+                status=ForkStatus_ACTIVE,
+            )
+        )
+        await db.commit()
+
+    get_resp = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    assert get_resp.status_code == 200
+    _assert_clean(get_resp.text)
+
+    async with TestSessionLocal() as db:
+        stored = (
+            await db.execute(select(ReservationFork).where(ReservationFork.reservation_id == rid))
+        ).scalar_one()
+        assert "field_data" in json.dumps(stored.canvas_data), (
+            "the read must not rewrite the stored row"
+        )
+
+
+@pytest.mark.asyncio
+async def test_fork_version_get_strips_a_dirty_row_without_rewriting_it(client):
+    rid = uuid.uuid4()
+    dev = str(uuid.uuid4())
+    dirty = _dirty_canvas(dev)
+    async with TestSessionLocal() as db:
+        fork = ReservationFork(reservation_id=rid, canvas_data=None, status=ForkStatus_ACTIVE)
+        db.add(fork)
+        await db.flush()
+        version = ForkVersion(fork_id=fork.id, version_number=1, canvas_data=dirty)
+        db.add(version)
+        await db.commit()
+        version_id = version.id
+
+    get_resp = await client.get(f"/internal/forks/{rid}/versions/{version_id}", headers=_hdr())
+    assert get_resp.status_code == 200
+    _assert_clean(get_resp.text)
+
+    async with TestSessionLocal() as db:
+        stored = (
+            await db.execute(select(ForkVersion).where(ForkVersion.id == version_id))
+        ).scalar_one()
+        assert "field_data" in json.dumps(stored.canvas_data), (
+            "the read must not rewrite the stored row"
+        )
+
+
+@pytest.mark.asyncio
+async def test_template_get_strips_a_dirty_row_without_rewriting_it(client):
+    tpl_id = uuid.uuid4()
+    dev = str(uuid.uuid4())
+    dirty = _dirty_canvas(dev)
+    async with TestSessionLocal() as db:
+        db.add(
+            TopologyTemplate(
+                id=tpl_id, name="Legacy Template", created_by=uuid.uuid4(), canvas_data=dirty
+            )
+        )
+        await db.commit()
+
+    get_resp = await client.get(f"/templates/{tpl_id}")
+    assert get_resp.status_code == 200
+    _assert_clean(get_resp.text)
+
+    async with TestSessionLocal() as db:
+        stored = (
+            await db.execute(select(TopologyTemplate).where(TopologyTemplate.id == tpl_id))
+        ).scalar_one()
+        assert "field_data" in json.dumps(stored.canvas_data), (
+            "the read must not rewrite the stored row"
+        )

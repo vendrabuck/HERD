@@ -10,10 +10,10 @@ the marker never reaches a GET, a version GET, or an export (JSON or CSV).
 Requires a running stack (`make test-integration`). This test proves the fix
 against whatever cabling code the stack is running: on a plain dev stack
 booted from the main checkout mount, that is still pre-fix code, so this test
-is EXPECTED TO FAIL there until the fix lands on main. CI's advisory
-integration job (which builds and runs the branch under review) is the first
-real proof; see the fix's own commit history for the unit- and HTTP-level
-tests that already pass against this branch's code directly.
+is EXPECTED TO FAIL there until the fix lands on main. The non-required
+integration job in CI (which builds and runs the branch under review) is the
+first real proof; see the fix's own commit history for the unit- and
+HTTP-level tests that already pass against this branch's code directly.
 """
 
 import uuid

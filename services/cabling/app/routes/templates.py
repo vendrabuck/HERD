@@ -185,7 +185,11 @@ async def get_template(
     template = await db.get(TopologyTemplate, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
-    return template
+    # Read-side strip (belt and braces, see routes/topologies.py's
+    # get_topology): never mutates the ORM object, only the response value.
+    detail = TemplateDetail.model_validate(template)
+    detail.canvas_data = strip_device_nodes(detail.canvas_data)
+    return detail
 
 
 @router.put("/{template_id}", response_model=TemplateDetail)

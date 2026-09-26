@@ -76,7 +76,16 @@ async def get_topology(
     topology = await db.get(Topology, topology_id)
     if not topology:
         raise HTTPException(status_code=404, detail="Topology not found")
-    return topology
+    # Read-side strip (belt and braces): the write side already reduces a
+    # device node's data.device to the allowlist before a row is stored, but a
+    # stack that upgraded images without running `make migrate` (the missed
+    # migration is a logged warning, not a boot failure, per the migration
+    # lifecycle notes) could still be serving a pre-fix row. Build the
+    # response model explicitly and overwrite its canvas_data rather than
+    # mutate the ORM object: this must never re-persist what it strips.
+    detail = TopologyDetail.model_validate(topology)
+    detail.canvas_data = strip_device_nodes(detail.canvas_data)
+    return detail
 
 
 @router.put("/{topology_id}", response_model=TopologyDetail)
