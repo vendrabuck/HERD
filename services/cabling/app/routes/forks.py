@@ -47,6 +47,7 @@ from app.schemas.fork import (
     ForkVersionDetailResponse,
     ForkVersionSummary,
 )
+from app.services.canvas_nodes import strip_device_nodes
 from app.services.fork_save_service import (
     WireSpec,
     assert_endpoints_are_members,
@@ -433,7 +434,10 @@ async def restore_fork_version_internal(
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
     version = await _load_fork_version(db, fork.id, version_id)
 
-    restored_canvas = version.canvas_data
+    # version.canvas_data was already stripped when that version was written;
+    # strip again anyway (cheap, idempotent) since this copies it onto the
+    # fork's own draft, a write boundary in its own right.
+    restored_canvas = strip_device_nodes(version.canvas_data)
     fork.canvas_data = restored_canvas
     fork.draft_restored_from_id = version.id
     # Same validation the loose canvas PUT runs, on the same terms: reported, not
@@ -486,8 +490,9 @@ async def update_fork_canvas_internal(
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
-    fork.canvas_data = body.canvas_data
-    edge_validation = await validate_canvas_edges(body.canvas_data, db)
+    stripped_canvas = strip_device_nodes(body.canvas_data)
+    fork.canvas_data = stripped_canvas
+    edge_validation = await validate_canvas_edges(stripped_canvas, db)
     fork_id = fork.id
     await db.commit()
 
@@ -571,10 +576,15 @@ async def save_fork_internal(
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
 
-    member_device_ids = set(body.member_device_ids)
-    assert_endpoints_are_members(body.canvas_data, member_device_ids)
+    # Reduce every device node's `data.device` to the allowlist before anything
+    # downstream (membership check, L3 parse, wiring resolve, the eventual
+    # write) ever sees the submitted canvas.
+    stripped_canvas = strip_device_nodes(body.canvas_data)
 
-    candidates, malformed = walk_l3_nodes(body.canvas_data)
+    member_device_ids = set(body.member_device_ids)
+    assert_endpoints_are_members(stripped_canvas, member_device_ids)
+
+    candidates, malformed = walk_l3_nodes(stripped_canvas)
     if malformed:
         _node_id, _device_id, exc = malformed[0]
         raise HTTPException(
@@ -587,7 +597,7 @@ async def save_fork_internal(
         )
     intended_routes = merge_candidates_by_device(candidates)
 
-    wiring_resolution = await resolve_canvas_wiring(db, body.canvas_data)
+    wiring_resolution = await resolve_canvas_wiring(db, stripped_canvas)
 
     validated_config_version_ids: dict[uuid.UUID, uuid.UUID | None] = {}
     if intended_routes:
@@ -611,7 +621,7 @@ async def save_fork_internal(
     result = await save_fork(
         db,
         fork,
-        canvas_data=body.canvas_data,
+        canvas_data=stripped_canvas,
         member_device_ids=member_device_ids,
         wiring_resolution=wiring_resolution,
         intended_routes=intended_routes,

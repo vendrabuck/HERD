@@ -14,6 +14,7 @@ from app.schemas.topology import (
     TopologyVersionDetail,
     TopologyVersionDiff,
 )
+from app.services.canvas_nodes import strip_device_nodes
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_diff import diff_canvas
 from app.services.version_service import commit_with_new_version
@@ -146,7 +147,12 @@ async def restore_version(
                 },
             )
 
-    topology.canvas_data = version.canvas_data
+    # version.canvas_data was already stripped when that version was written;
+    # strip again anyway (cheap, idempotent) since restoring is a write
+    # boundary of its own, copying the version's canvas back onto the live
+    # topology and into a fresh version snapshot.
+    restored_canvas = strip_device_nodes(version.canvas_data)
+    topology.canvas_data = restored_canvas
     if body.restore_name:
         topology.name = version.name
     topology.modified_by = uuid.UUID(payload["sub"])
@@ -157,7 +163,7 @@ async def restore_version(
     # raw IntegrityError 500 (see commit_with_new_version).
     snapshot = TopologyVersion(
         topology_id=topology.id,
-        canvas_data=version.canvas_data,
+        canvas_data=restored_canvas,
         name=topology.name,
         description=description,
         created_by=uuid.UUID(payload["sub"]),
