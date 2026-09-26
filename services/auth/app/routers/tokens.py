@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.dependencies.auth import require_role
+from app.dependencies.auth import get_effective_role, require_role
 from app.models.user import Role, User
 from app.schemas.api_token import (
     ApiTokenCreatedResponse,
@@ -36,6 +36,7 @@ async def create_token(
     body: CreateApiTokenRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = _admin_or_superadmin,
+    caller_role: Role = Depends(get_effective_role),
 ):
     """Create an API token for a machine principal. Admin or superadmin.
 
@@ -57,9 +58,14 @@ async def create_token(
     # mint an admin-role token for another admin machine account); only a
     # strictly higher rank is refused. The service still enforces the
     # token-cannot-exceed-its-principal invariant below.
-    if _role_exceeds(body.role, current_user.role) or _role_exceeds(
-        principal.role, current_user.role
-    ):
+    #
+    # Both checks use the caller's EFFECTIVE role (get_effective_role), not
+    # current_user.role: an API-token JWT whose role claim was clamped below
+    # the principal's database role at exchange time (see
+    # api_token_service.exchange_api_token) must be held to that clamp here
+    # too, or the clamp is cosmetic and this endpoint is the escalation path
+    # back to the principal's full database role.
+    if _role_exceeds(body.role, caller_role) or _role_exceeds(principal.role, caller_role):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Cannot mint a token whose role or principal exceeds your own role",

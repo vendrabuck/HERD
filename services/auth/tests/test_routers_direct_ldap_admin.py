@@ -591,7 +591,7 @@ async def test_create_token_direct_success_returns_raw_token_once():
     async with TestSessionLocal() as db:
         principal = await _make_principal(db, Role.USER, username="principal1")
         body = CreateApiTokenRequest(name="ci-bot", principal_id=principal.id, role=Role.USER)
-        result = await create_token(body, db=db, current_user=admin)
+        result = await create_token(body, db=db, current_user=admin, caller_role=admin.role)
         assert result.name == "ci-bot"
         assert result.principal_id == principal.id
         assert result.token  # the raw token, shown exactly once
@@ -606,7 +606,7 @@ async def test_create_token_direct_unknown_principal_404():
     async with TestSessionLocal() as db:
         body = CreateApiTokenRequest(name="x", principal_id=uuid.uuid4(), role=Role.USER)
         with pytest.raises(HTTPException) as exc:
-            await create_token(body, db=db, current_user=admin)
+            await create_token(body, db=db, current_user=admin, caller_role=admin.role)
         assert exc.value.status_code == 404
         assert exc.value.detail == "Principal user not found"
 
@@ -621,7 +621,7 @@ async def test_create_token_direct_role_exceeds_caller_403():
         principal = await _make_principal(db, Role.USER, username="principal2")
         body = CreateApiTokenRequest(name="x", principal_id=principal.id, role=Role.SUPERADMIN)
         with pytest.raises(HTTPException) as exc:
-            await create_token(body, db=db, current_user=admin)
+            await create_token(body, db=db, current_user=admin, caller_role=admin.role)
         assert exc.value.status_code == 403
         assert "exceeds your own role" in exc.value.detail
 
@@ -639,7 +639,7 @@ async def test_create_token_direct_principal_role_exceeds_caller_403():
         superadmin_principal = await _make_principal(db, Role.SUPERADMIN, username="sa-principal")
         body = CreateApiTokenRequest(name="x", principal_id=superadmin_principal.id, role=Role.USER)
         with pytest.raises(HTTPException) as exc:
-            await create_token(body, db=db, current_user=admin)
+            await create_token(body, db=db, current_user=admin, caller_role=admin.role)
         assert exc.value.status_code == 403
 
 
@@ -660,7 +660,7 @@ async def test_create_token_direct_service_backstop_maps_to_400(monkeypatch):
         principal = await _make_principal(db, Role.USER, username="principal-backstop")
         body = CreateApiTokenRequest(name="x", principal_id=principal.id, role=Role.SUPERADMIN)
         with pytest.raises(HTTPException) as exc:
-            await create_token(body, db=db, current_user=admin)
+            await create_token(body, db=db, current_user=admin, caller_role=admin.role)
         assert exc.value.status_code == 400
         assert "cannot exceed the principal's role" in exc.value.detail
 
@@ -674,7 +674,7 @@ async def test_list_tokens_direct_returns_metadata():
     async with TestSessionLocal() as db:
         principal = await _make_principal(db, Role.USER, username="principal3")
         body = CreateApiTokenRequest(name="ci-bot", principal_id=principal.id, role=Role.USER)
-        await create_token(body, db=db, current_user=admin)
+        await create_token(body, db=db, current_user=admin, caller_role=admin.role)
 
         result = await list_tokens(db=db, _=admin)
         assert len(result) == 1
@@ -691,7 +691,7 @@ async def test_delete_token_direct_is_idempotent():
     async with TestSessionLocal() as db:
         principal = await _make_principal(db, Role.USER, username="principal4")
         body = CreateApiTokenRequest(name="ci-bot", principal_id=principal.id, role=Role.USER)
-        created = await create_token(body, db=db, current_user=admin)
+        created = await create_token(body, db=db, current_user=admin, caller_role=admin.role)
 
         # First revoke succeeds; a second revoke of the same (or an unknown)
         # id must not raise, matching the docstring's "idempotent" contract.
@@ -712,7 +712,7 @@ async def test_exchange_token_direct_success():
     async with TestSessionLocal() as db:
         principal = await _make_principal(db, Role.USER, username="principal5")
         body = CreateApiTokenRequest(name="ci-bot", principal_id=principal.id, role=Role.USER)
-        created = await create_token(body, db=db, current_user=admin)
+        created = await create_token(body, db=db, current_user=admin, caller_role=admin.role)
 
         result = await exchange_token(ExchangeTokenRequest(token=created.token), db=db)
         assert result.token_type == "bearer"
