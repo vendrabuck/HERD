@@ -73,6 +73,10 @@ Alembic migrations are per-service (one migration chain per database schema). On
 
 If a migration fails mid-flight, the service stays down. Fix the cause, re-run `make migrate-<service>` for just that one.
 
+## Remote access to NATS and Postgres
+
+`docker-compose.yml` publishes NATS (4222, 8222) and Postgres (`POSTGRES_PORT`, default 5433) on loopback only, matching the Traefik dashboard's loopback bind (issue #708): NATS carries no broker authentication at all, and a wide bind on either would be reachable from the LAN or the open internet on a host with no firewall in front of it. The recipes below already reach NATS through `docker compose exec nats nats ...`, which needs no host port at all. From a remote host, either run the same `docker compose exec` commands over SSH, or forward the port first (`ssh -L 4222:localhost:4222 <host>` or `-L 5433:localhost:5433`) and point a local client (the `nats` CLI, `psql`) at `localhost`. Never widen the compose binding to reach either service remotely.
+
 ## Inspecting the NATS DLQ
 
 Five durable consumers feed off two source streams (`HERD_RESERVATIONS` for `herd.reservations.*`, `HERD_HEALTH` for `herd.health.*`). Each consumer routes its failures to its own 4-token DLQ subject so one consumer's failures do not mask another's. All DLQ subjects are captured by a single dedicated `HERD_DLQ` stream (`herd.*.dlq.>` subjects), created by the execution service at startup. The DLQ subjects are deliberately one token longer than any consumer's 3-token filter, so a DLQ'd message is never redelivered to the consumer that failed it:
