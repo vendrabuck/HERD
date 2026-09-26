@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- Hardened execution's NATS consumer against a forged reservation lifecycle event.
+  It used to treat any event on `herd.reservations.*` as authoritative: a message
+  claiming `reservation.cancelled`, `.completed`, or `.failed` froze a reservation's
+  wiring and tore down its ledgers and dynamic instances, a `reservation.updated`
+  destroyed dynamic instances for whatever `removed_device_ids` it named, and a
+  `reservation.created` or `.wiring_changed` acted on whatever it claimed, all
+  without asking reservations whether any of it was true. `process_reservation_message`
+  now corroborates each of these six events against reservations' own record of the
+  row (`GET /internal/{id}`) before running any handler: a terminal event needs any
+  terminal status, `reservation.created` needs PENDING_PROVISION or ACTIVE,
+  `reservation.updated` needs any non-terminal status (it is staged outside the
+  ACTIVE-only branch of the device-set PATCH), and `reservation.wiring_changed`
+  needs ACTIVE specifically. A mismatch, or a reservation
+  that does not exist, acks the message without running the handler; an unanswerable
+  check (a reservations outage) NAKs for retry rather than proceeding on missing
+  information. `reservation.provision_requested` is unaffected: it already enforces
+  its own preconditions server-side.
+- Hardened `docker-compose.yml`: the NATS (4222, 8222) and Postgres (`POSTGRES_PORT`,
+  default 5433) host port bindings now listen on loopback only, matching the
+  Traefik dashboard's existing loopback bind (issue #708). NATS runs with no broker
+  authentication, so both were reachable from the LAN or the open internet on a host
+  with no firewall in front of it. Traefik's plain HTTP/HTTPS listeners are unchanged.
 - Fixed the auth service authorizing against a caller's database role instead of
   their JWT's role claim. The API-token exchange (`POST /tokens/exchange`) already
   clamped an issued JWT's role claim to the lesser of the token's role and the

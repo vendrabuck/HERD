@@ -119,7 +119,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"  # password-protected, but loopback only, not open to the LAN
     networks:
       - herd-net
     restart: unless-stopped
@@ -140,8 +140,8 @@ services:
     image: nats:2.10-alpine
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"  # NATS monitoring
+      - "127.0.0.1:4222:4222"  # no broker authentication: loopback only
+      - "127.0.0.1:8222:8222"  # NATS monitoring, also unauthenticated: loopback only
     volumes:
       - nats-data:/data
     networks:

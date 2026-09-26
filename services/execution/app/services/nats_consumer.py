@@ -5,7 +5,7 @@ import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
 from herd_common.jetstream import (
@@ -213,6 +213,145 @@ async def _get_internal(client, url, *, what, **kwargs):
     if resp.status_code >= 500:
         raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
     return resp
+
+
+# --- Reservation-event corroboration gate ------------------------------------
+#
+# NATS carries no authentication (hardening tracked separately), and both it and
+# Postgres used to be published on every host interface. Anyone who could open a
+# TCP connection to the broker could therefore publish a `herd.reservations.*`
+# message and drive this consumer's handlers directly: a forged
+# reservation.cancelled froze wiring and tore down a live reservation's ledgers
+# and dynamic instances, a forged reservation.updated destroyed dynamic instances
+# for made-up removed_device_ids, and a forged reservation.created or
+# reservation.wiring_changed acted on a made-up device/wiring claim. The gate
+# below closes that: before any handler mutates hardware, a ledger row, or a
+# dynamic instance, the event's claim about the reservation is corroborated
+# against reservations' own record of the row (GET /internal/{id}, the same
+# X-Internal-Token call every other cross-service check in this file uses).
+#
+# Each entry maps an event name to a predicate over the reservation's reported
+# ReservationStatus (a plain str, e.g. "ACTIVE") and the event payload. A
+# predicate returning False means the event is NOT corroborated: the caller
+# acks the message without running the handler, rather than acting on an
+# unverifiable claim. An event with no entry here (reservation.provision_requested,
+# or anything unrecognized) is not subject to this gate; provision_requested
+# already enforces its own PENDING_PROVISION + dynamic-request preconditions
+# server-side and is left untouched.
+def _terminal_event_corroborated(status: str, event_data: dict) -> bool:
+    """Any terminal status corroborates a terminal event, not only the matching one.
+
+    A forged (or merely late-arriving) reservation.cancelled for a row
+    reservations now reports COMPLETED or FAILED still names a reservation that
+    has genuinely ended: refusing it on a name mismatch would only teach an
+    attacker to guess the exact terminal event name, and would also refuse a
+    legitimate stale-in-flight event for no security benefit. The one thing
+    that must never corroborate is a NON-terminal status: that is exactly the
+    forged-event case (an ACTIVE row that never ended).
+    """
+    return status in ("COMPLETED", "CANCELLED", "FAILED")
+
+
+def _created_event_corroborated(status: str, event_data: dict) -> bool:
+    """reservation.created is staged atomically with ACTIVE for a physical-only
+    reservation and with PENDING_PROVISION for a dynamic-carrying one (see the
+    reservation state machine); either is a legitimate reported status.
+    """
+    return status in ("PENDING_PROVISION", "ACTIVE")
+
+
+def _updated_event_corroborated(status: str, event_data: dict) -> bool:
+    """reservation.updated is staged by the device-set PATCH
+    (reservation_service.update_reservation_devices, the `enqueue_event(...,
+    "herd.reservations.updated", ...)` call around line 2238) at FUNCTION
+    level, not inside the `if removed_ids and reservation.status ==
+    ReservationStatus.ACTIVE:` prune-marker branch a few lines above it. That
+    branch only decides whether to record a pending-prune marker; the event
+    itself is staged regardless, and `update_reservation` accepts either
+    ACTIVE or PENDING (its own status guard: "Cannot update a {status}
+    reservation" otherwise). So a metadata-only or device-set edit on a
+    PENDING (or, defensively, PENDING_PROVISION) booking legitimately emits
+    this event too; only a terminal status (the reservation has already
+    ended) fails to corroborate it.
+    """
+    return status not in ("COMPLETED", "CANCELLED", "FAILED")
+
+
+def _wiring_changed_event_corroborated(status: str, event_data: dict) -> bool:
+    """reservation.wiring_changed is staged only for an ACTIVE reservation:
+    every stage_wiring_changed call site (activation's initial-fork staging,
+    the fork-save route, the provision-result callback, and the expiration
+    sweep's wiring-heal reconciler, which iterates only its own `active_ids`)
+    gates on `reservation.status == ReservationStatus.ACTIVE` before staging,
+    because cabling only has a fork to read wiring intent from once a
+    reservation is ACTIVE.
+    """
+    return status == "ACTIVE"
+
+
+# ReservationInternalStatus deliberately carries no device list ("No PII; no
+# device list" in its own docstring), so a payload's device_ids or
+# removed_device_ids claim cannot be cross-checked against reservations' record
+# here; extending that schema to add one would change the contract snapshot and
+# is left as a follow-up. Status is the only corroborable field today.
+_EVENT_CORROBORATION_RULES: dict[str, Callable[[str, dict], bool]] = {
+    "reservation.cancelled": _terminal_event_corroborated,
+    "reservation.completed": _terminal_event_corroborated,
+    "reservation.failed": _terminal_event_corroborated,
+    "reservation.created": _created_event_corroborated,
+    "reservation.updated": _updated_event_corroborated,
+    WIRING_CHANGED_EVENT: _wiring_changed_event_corroborated,
+}
+
+
+class ReservationEventVerification(NamedTuple):
+    verified: bool
+    reported_status: str | None
+    reason: str
+
+
+async def _verify_reservation_event(
+    event_data: dict, client
+) -> ReservationEventVerification | None:
+    """Corroborate one event's claim against reservations' own record of the row.
+
+    Returns None when the event carries no entry in `_EVENT_CORROBORATION_RULES`
+    (not subject to this gate; proceed as before). Otherwise returns a
+    ReservationEventVerification: `verified=True` means the reported status
+    corroborates the event and the caller should proceed; `verified=False`
+    means it does not (including a 404, "reservation not found", and any other
+    non-200 the underlying GET did not already turn into a raised error) and
+    the caller must ack without running the handler. Raises
+    TransientUpstreamError (via `_get_internal`) on a 5xx or transport error,
+    so the message NAKs and retries instead of proceeding on an unanswerable
+    check: fail closed, never assume corroboration.
+    """
+    event_type = event_data.get("event", "")
+    rule = _EVENT_CORROBORATION_RULES.get(event_type)
+    if rule is None:
+        return None
+    reservation_id = event_data.get("reservation_id")
+    if not reservation_id:
+        # Every handler already guards a missing reservation_id itself (issue
+        # #455); let that existing, already-tested guard handle it rather than
+        # duplicating it here with nothing to verify against.
+        return None
+    url = f"{settings.reservations_service_url}/internal/{reservation_id}"
+    resp = await _get_internal(
+        client,
+        url,
+        what="verify reservation event",
+        headers={"X-Internal-Token": settings.internal_api_token},
+        timeout=10.0,
+    )
+    if resp.status_code == 404:
+        return ReservationEventVerification(False, None, "reservation not found")
+    if resp.status_code != 200:
+        return ReservationEventVerification(False, None, f"unexpected status {resp.status_code}")
+    reported_status = resp.json().get("status")
+    if reported_status is not None and rule(reported_status, event_data):
+        return ReservationEventVerification(True, reported_status, "")
+    return ReservationEventVerification(False, reported_status, "status does not corroborate event")
 
 
 class _AsyncNullCtx:
@@ -4375,6 +4514,28 @@ async def process_reservation_message(
         return "dlq"
 
     try:
+        # Corroborate the event against reservations' own record BEFORE any
+        # handler runs (see the gate's docstring above _verify_reservation_event).
+        # A TransientUpstreamError raised here (5xx or transport error) is caught
+        # by the generic except-Exception branch below, same as a handler-raised
+        # one, so an unanswerable check NAKs and retries rather than proceeding.
+        async with httpx.AsyncClient() as verify_client:
+            verification = await _verify_reservation_event(event_data, verify_client)
+        if verification is not None and not verification.verified:
+            logger.warning(
+                "Reservation event not corroborated by reservations service; "
+                "acking without running the handler",
+                extra={
+                    "action": "nats_event_unverified",
+                    "event": event_data.get("event"),
+                    "reservation_id": event_data.get("reservation_id"),
+                    "reported_status": verification.reported_status,
+                    "reason": verification.reason,
+                },
+            )
+            await msg.ack()
+            return "ack"
+
         # Key idempotency on the stable producer-stamped event_id when present
         # (issue #21), so a relay republish under a new stream sequence still
         # dedupes; fall back to "<stream>:<sequence>" for pre-outbox events.

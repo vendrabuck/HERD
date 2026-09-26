@@ -185,6 +185,7 @@ The execution service consumes `herd.reservations.*` events from NATS JetStream.
 - Check execution service logs for consumer errors.
 - A poison message (invalid JSON) lands on the DLQ subject `herd.reservations.dlq.execution`; inspect with the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
 - A transient handler failure gets NAK'd with an explicit delay from the `NATS_NAK_BACKOFF_SECONDS` schedule (issue #895; `1,5,15,60,120` seconds by default) and retried up to `max_deliver=5`. After that it also goes to DLQ.
+- A log line with `"action": "nats_event_unverified"` means the event was acked WITHOUT running the handler: execution's consumer corroborates `reservation.created`/`.updated`/`.cancelled`/`.completed`/`.failed`/`.wiring_changed` against reservations' own status for the row before acting on it (see ARCHITECTURE.md's Event-driven flows section), and this event's claim did not match. This is the expected, correct outcome for an event whose reservation moved on (or never existed) before the message was processed, not a bug; the log line's `reported_status` names what reservations actually had on file.
 
 ### Notifications container is stuck in a crash loop on a fresh stack
 
