@@ -11,8 +11,10 @@
   without asking reservations whether any of it was true. `process_reservation_message`
   now corroborates each of these six events against reservations' own record of the
   row (`GET /internal/{id}`) before running any handler: a terminal event needs any
-  terminal status, `reservation.created` needs PENDING_PROVISION or ACTIVE, and
-  `reservation.updated`/`.wiring_changed` need ACTIVE. A mismatch, or a reservation
+  terminal status, `reservation.created` needs PENDING_PROVISION or ACTIVE,
+  `reservation.updated` needs any non-terminal status (it is staged outside the
+  ACTIVE-only branch of the device-set PATCH), and `reservation.wiring_changed`
+  needs ACTIVE specifically. A mismatch, or a reservation
   that does not exist, acks the message without running the handler; an unanswerable
   check (a reservations outage) NAKs for retry rather than proceeding on missing
   information. `reservation.provision_requested` is unaffected: it already enforces

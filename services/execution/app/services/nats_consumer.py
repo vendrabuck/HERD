@@ -260,9 +260,31 @@ def _created_event_corroborated(status: str, event_data: dict) -> bool:
     return status in ("PENDING_PROVISION", "ACTIVE")
 
 
-def _active_event_corroborated(status: str, event_data: dict) -> bool:
-    """reservation.updated (device add/remove) and reservation.wiring_changed
-    are only ever emitted for an ACTIVE reservation.
+def _updated_event_corroborated(status: str, event_data: dict) -> bool:
+    """reservation.updated is staged by the device-set PATCH
+    (reservation_service.update_reservation_devices, the `enqueue_event(...,
+    "herd.reservations.updated", ...)` call around line 2238) at FUNCTION
+    level, not inside the `if removed_ids and reservation.status ==
+    ReservationStatus.ACTIVE:` prune-marker branch a few lines above it. That
+    branch only decides whether to record a pending-prune marker; the event
+    itself is staged regardless, and `update_reservation` accepts either
+    ACTIVE or PENDING (its own status guard: "Cannot update a {status}
+    reservation" otherwise). So a metadata-only or device-set edit on a
+    PENDING (or, defensively, PENDING_PROVISION) booking legitimately emits
+    this event too; only a terminal status (the reservation has already
+    ended) fails to corroborate it.
+    """
+    return status not in ("COMPLETED", "CANCELLED", "FAILED")
+
+
+def _wiring_changed_event_corroborated(status: str, event_data: dict) -> bool:
+    """reservation.wiring_changed is staged only for an ACTIVE reservation:
+    every stage_wiring_changed call site (activation's initial-fork staging,
+    the fork-save route, the provision-result callback, and the expiration
+    sweep's wiring-heal reconciler, which iterates only its own `active_ids`)
+    gates on `reservation.status == ReservationStatus.ACTIVE` before staging,
+    because cabling only has a fork to read wiring intent from once a
+    reservation is ACTIVE.
     """
     return status == "ACTIVE"
 
@@ -272,13 +294,13 @@ def _active_event_corroborated(status: str, event_data: dict) -> bool:
 # removed_device_ids claim cannot be cross-checked against reservations' record
 # here; extending that schema to add one would change the contract snapshot and
 # is left as a follow-up. Status is the only corroborable field today.
-_EVENT_COROBORATION_RULES: dict[str, Callable[[str, dict], bool]] = {
+_EVENT_CORROBORATION_RULES: dict[str, Callable[[str, dict], bool]] = {
     "reservation.cancelled": _terminal_event_corroborated,
     "reservation.completed": _terminal_event_corroborated,
     "reservation.failed": _terminal_event_corroborated,
     "reservation.created": _created_event_corroborated,
-    "reservation.updated": _active_event_corroborated,
-    WIRING_CHANGED_EVENT: _active_event_corroborated,
+    "reservation.updated": _updated_event_corroborated,
+    WIRING_CHANGED_EVENT: _wiring_changed_event_corroborated,
 }
 
 
@@ -293,7 +315,7 @@ async def _verify_reservation_event(
 ) -> ReservationEventVerification | None:
     """Corroborate one event's claim against reservations' own record of the row.
 
-    Returns None when the event carries no entry in `_EVENT_COROBORATION_RULES`
+    Returns None when the event carries no entry in `_EVENT_CORROBORATION_RULES`
     (not subject to this gate; proceed as before). Otherwise returns a
     ReservationEventVerification: `verified=True` means the reported status
     corroborates the event and the caller should proceed; `verified=False`
@@ -305,7 +327,7 @@ async def _verify_reservation_event(
     check: fail closed, never assume corroboration.
     """
     event_type = event_data.get("event", "")
-    rule = _EVENT_COROBORATION_RULES.get(event_type)
+    rule = _EVENT_CORROBORATION_RULES.get(event_type)
     if rule is None:
         return None
     reservation_id = event_data.get("reservation_id")

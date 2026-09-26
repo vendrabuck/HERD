@@ -48,12 +48,22 @@ STATUSES = ("PENDING", "PENDING_PROVISION", "ACTIVE", "COMPLETED", "CANCELLED", 
 
 def _expected_verified(event: str, status: str) -> bool:
     """Independent oracle for the expected-state table (does not import the
-    module's rule functions, so this cannot pass by tautology)."""
+    module's rule functions, so this cannot pass by tautology).
+
+    reservation.updated is staged by the device-set PATCH at function level,
+    outside the ACTIVE-only prune-marker branch a few lines above it in
+    reservation_service.py, and update_reservation itself accepts ACTIVE or
+    PENDING; so it corroborates any NON-terminal status (PENDING,
+    PENDING_PROVISION, ACTIVE), unlike reservation.wiring_changed, which every
+    stage_wiring_changed call site gates on ACTIVE.
+    """
     if event in TERMINAL_EVENTS:
         return status in ("COMPLETED", "CANCELLED", "FAILED")
     if event == "reservation.created":
         return status in ("PENDING_PROVISION", "ACTIVE")
-    if event in ("reservation.updated", "reservation.wiring_changed"):
+    if event == "reservation.updated":
+        return status not in ("COMPLETED", "CANCELLED", "FAILED")
+    if event == "reservation.wiring_changed":
         return status == "ACTIVE"
     raise AssertionError(f"no oracle entry for event {event!r}")
 
@@ -307,11 +317,14 @@ async def test_gate_404_acks_without_running_the_handler(caplog):
 
 
 @pytest.mark.asyncio
-async def test_forged_removed_device_id_on_a_non_active_reservation_is_unverified():
+async def test_forged_removed_device_id_on_a_terminal_reservation_is_unverified():
     """Stand-in for 'removed id still in the set': ReservationInternalStatus
     carries no device list to check the id against (by design), so the only
-    corroborable claim for reservation.updated is the ACTIVE status itself. A
-    forged removal for a reservation reservations reports PENDING is unverified."""
+    corroborable claim for reservation.updated is that the reservation has not
+    already ended. reservation.updated corroborates any NON-terminal status
+    (PENDING, PENDING_PROVISION, ACTIVE: the device-set PATCH accepts either
+    of the first and third), so a forged removal only fails corroboration once
+    the reservation is genuinely terminal, as this one is reported here."""
     rid = str(uuid.uuid4())
     js = _make_js()
     payload = json.dumps(
@@ -324,7 +337,7 @@ async def test_forged_removed_device_id_on_a_non_active_reservation_is_unverifie
         "app.services.nats_consumer._verify_reservation_event",
         new=AsyncMock(
             return_value=ReservationEventVerification(
-                False, "PENDING", "status does not corroborate event"
+                False, "CANCELLED", "status does not corroborate event"
             )
         ),
     ):
@@ -332,6 +345,28 @@ async def test_forged_removed_device_id_on_a_non_active_reservation_is_unverifie
 
     assert result == "ack"
     handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_updated_for_a_pending_reservation_is_verified():
+    """The device-set PATCH stages reservation.updated at function level,
+    outside the ACTIVE-only prune-marker branch, and update_reservation itself
+    accepts a PENDING booking, so a PENDING-reported reservation corroborates
+    this event and the handler runs."""
+    rid = str(uuid.uuid4())
+    js = _make_js()
+    payload = json.dumps({"event": "reservation.updated", "reservation_id": rid}).encode()
+    msg = _make_msg(payload)
+    handler = AsyncMock()
+
+    with patch(
+        "app.services.nats_consumer._verify_reservation_event",
+        new=AsyncMock(return_value=ReservationEventVerification(True, "PENDING", "")),
+    ):
+        result = await process_reservation_message(msg, js, handler, session_factory=lambda: None)
+
+    assert result == "ack"
+    handler.assert_awaited_once()
 
 
 @pytest.mark.asyncio
