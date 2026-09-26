@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- Hardened the topology editor and cabling service against persisting device
+  credentials on a canvas. The editor used to store the whole inventory Device
+  record on each device node, including `field_data`, which can carry a
+  clear-text device password; cabling stored and returned whatever canvas a
+  caller sent, with no narrowing on what a device node could hold. Every
+  cabling write boundary (topology create/update/clone/import, every fork
+  write, template create/update/instantiate, and version restore) now reduces
+  a device node's `data.device` to a fixed allowlist (id, name, topology_type,
+  connection_type, status, template_name, template_icon, plus the
+  topology-template placeholder key `role`) before a row is written, and the
+  export route strips again on read as a second layer. The frontend narrows
+  the same way before a save is ever sent, though the server-side strip is
+  what actually enforces it. A one-time data migration scrubbed every
+  already-stored canvas.
 - Hardened execution's NATS consumer against a forged reservation lifecycle event.
   It used to treat any event on `herd.reservations.*` as authoritative: a message
   claiming `reservation.cancelled`, `.completed`, or `.failed` froze a reservation's

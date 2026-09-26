@@ -73,6 +73,16 @@ Alembic migrations are per-service (one migration chain per database schema). On
 
 If a migration fails mid-flight, the service stays down. Fix the cause, re-run `make migrate-<service>` for just that one.
 
+`make migrate-cabling` (part of a plain `make migrate`) includes a one-time data
+scrub (revision 0013, hardening): every stored canvas across `topologies`,
+`topology_versions`, `reservation_fork`, `fork_versions`, and
+`topology_templates` has each device node's `data.device` reduced to the fixed
+allowlist described in `docs/ARCHITECTURE.md`'s "Device node persistence"
+section, removing `field_data` and anything else outside it. It is batched and
+idempotent (a rerun, or a database this revision has already touched, is a
+no-op), and `downgrade` is a no-op by design: the stripped data is not
+recoverable.
+
 ## Remote access to NATS and Postgres
 
 `docker-compose.yml` publishes NATS (4222, 8222) and Postgres (`POSTGRES_PORT`, default 5433) on loopback only, matching the Traefik dashboard's loopback bind (issue #708): NATS carries no broker authentication at all, and a wide bind on either would be reachable from the LAN or the open internet on a host with no firewall in front of it. The recipes below already reach NATS through `docker compose exec nats nats ...`, which needs no host port at all. From a remote host, either run the same `docker compose exec` commands over SSH, or forward the port first (`ssh -L 4222:localhost:4222 <host>` or `-L 5433:localhost:5433`) and point a local client (the `nats` CLI, `psql`) at `localhost`. Never widen the compose binding to reach either service remotely.
