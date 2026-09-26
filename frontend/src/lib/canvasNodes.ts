@@ -1,4 +1,5 @@
 import type { Node } from "@xyflow/react";
+import type { Device } from "@/types/device.types";
 import type { CanvasNodeData, DeviceNodeData, L3RouteIntent } from "@/types/topology.types";
 
 // Canvas node type predicates, factored out of TopologyEditorPage.tsx (review
@@ -35,6 +36,53 @@ export function collectCanvasDeviceIds(nodes: Node<CanvasNodeData>[]): Set<strin
       .filter((n) => !(n.data as DeviceNodeData).isProposal)
       .map((n) => (n.data as DeviceNodeData).device.id)
   );
+}
+
+// The keys of a Device a device node actually needs to render itself, mirroring
+// app/services/canvas_nodes.py's DEVICE_NODE_ALLOWED_KEYS on the cabling
+// service (kept in sync by review, not by import: this is a browser bundle).
+// Hardening: the editor used to persist the WHOLE inventory Device record
+// (including `field_data`, which can carry clear-text device credentials)
+// onto every device node; this is what a save now actually SENDS. Cabling
+// strips again server-side regardless, so this is defense in depth, not the
+// only guard. "role" (the topology-template placeholder key) is deliberately
+// excluded: the editor never authors a template canvas, only real topology
+// and fork canvases, so a real Device is all this ever sees.
+const PERSISTABLE_DEVICE_KEYS = [
+  "id",
+  "name",
+  "topology_type",
+  "connection_type",
+  "status",
+  "template_name",
+  "template_icon",
+] as const satisfies readonly (keyof Device)[];
+
+// Reduce a hydrated Device down to what the editor is allowed to send. The
+// runtime canvas store may keep the full Device for display (hydrateCanvasNodes
+// refreshes it on load); only the payload a save builds is narrowed.
+export function persistableDevice(device: Device): Partial<Device> {
+  const out: Record<string, unknown> = {};
+  for (const key of PERSISTABLE_DEVICE_KEYS) {
+    if (key in device) {
+      out[key] = device[key];
+    }
+  }
+  return out as Partial<Device>;
+}
+
+// Map every device node's `data.device` through persistableDevice, leaving
+// every other node (network elements, dynamic placeholders, anything else)
+// untouched. The one place persistableCanvas (TopologyEditorPage.tsx) and any
+// other canvas-PUT site reduce a node list before it is sent to the server.
+export function persistableCanvasNodes(
+  nodes: Node<CanvasNodeData>[],
+): Node<CanvasNodeData>[] {
+  return nodes.map((node) => {
+    if (!isDeviceNode(node)) return node;
+    const data = node.data as DeviceNodeData;
+    return { ...node, data: { ...data, device: persistableDevice(data.device) as Device } };
+  });
 }
 
 // The shared fallback for l3RoutesOf below: a SINGLE stable reference, never
