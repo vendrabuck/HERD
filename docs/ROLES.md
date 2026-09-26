@@ -3,6 +3,19 @@
 HERD uses three roles. Every authenticated user holds exactly one role, which is encoded
 in their JWT access token and enforced independently by each service.
 
+Inside the auth service itself, every authorization decision uses the effective role:
+the lower of the JWT's role claim and the account's current database role, ranked
+user, admin, superadmin. This matters for the machine-token exchange
+(`POST /tokens/exchange`, see `docs/ARCHITECTURE.md`'s Machine-token exchange note),
+which can mint a JWT carrying a role lower than the owning account's database role; the
+auth service now holds that token to its lower claimed role for every gate it enforces
+(listing users, changing a role, group and directory-sync administration, minting
+further tokens), not to the account's own role. A missing, empty, or unrecognized role
+claim is treated as user. Demoting an account's database role takes effect immediately
+inside the auth service; every other service still trusts the claim in whatever JWT is
+presented, so a demotion there takes effect only once that token expires and a new one
+is issued with the lower role.
+
 ---
 
 ## Roles at a Glance
