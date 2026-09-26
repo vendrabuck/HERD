@@ -71,8 +71,9 @@ async def test_process_message_dlq_on_max_deliver_exhausted():
 
 
 async def test_process_message_nak_on_transient_error():
+    num_delivered = nats_consumer.NATS_MAX_DELIVER - 1
     payload = _payload()
-    msg = _FakeMsg(payload, num_delivered=nats_consumer.NATS_MAX_DELIVER - 1)
+    msg = _FakeMsg(payload, num_delivered=num_delivered)
     js = AsyncMock()
 
     async def _handler(event_data, raw_body, session_factory, dedupe_key):
@@ -81,9 +82,28 @@ async def test_process_message_nak_on_transient_error():
     result = await nats_consumer.process_message(msg, js, _handler, session_factory=object())
 
     assert result == "nak"
-    msg.nak.assert_awaited_once()
+    # issue #895: the NAK must carry an explicit delay (schedule[num_delivered - 1]),
+    # never a bare msg.nak(), which JetStream redelivers immediately.
+    expected_delay = nats_consumer.NATS_NAK_BACKOFF_SECONDS[
+        min(num_delivered - 1, len(nats_consumer.NATS_NAK_BACKOFF_SECONDS) - 1)
+    ]
+    msg.nak.assert_awaited_once_with(delay=expected_delay)
     msg.ack.assert_not_awaited()
     js.publish.assert_not_awaited()
+
+
+async def test_process_message_nak_on_transient_error_first_delivery():
+    payload = _payload()
+    msg = _FakeMsg(payload, num_delivered=1)
+    js = AsyncMock()
+
+    async def _handler(event_data, raw_body, session_factory, dedupe_key):
+        raise RuntimeError("transient")
+
+    result = await nats_consumer.process_message(msg, js, _handler, session_factory=object())
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=nats_consumer.NATS_NAK_BACKOFF_SECONDS[0])
 
 
 async def test_process_message_acks_on_success():

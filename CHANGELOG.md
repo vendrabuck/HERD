@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Fixed the three NATS consumers' (execution, notifications, integration) retry timing
+  (issue #895). Measured against nats-server 2.10.29, a `ConsumerConfig.backoff` list
+  silently made the server replace the configured `ack_wait` with `backoff[0]` (1
+  second instead of the intended 30), and `backoff` itself only ever timed
+  ack-timeout redeliveries, never a NAK, so a bare `msg.nak()` on a transient error
+  redelivered immediately: five NAKs landed within about a second and the #317
+  in-progress heartbeat protected nothing. `ConsumerConfig` no longer carries
+  `backoff`; a transient-error NAK now passes an explicit `delay=` from a new
+  `NATS_NAK_BACKOFF_SECONDS` setting (comma-separated seconds, default
+  `1,5,15,60,120`, shared across all three services; a short schedule is pinned in
+  the dev/test compose override), via the shared `herd_common.jetstream.nak_delay`
+  helper. Every durable is now also created OR UPDATED to match its `ConsumerConfig`
+  at boot (`herd_common.jetstream.ensure_consumer`), since `pull_subscribe` alone
+  only creates a durable that does not yet exist and otherwise binds to whatever
+  config the server already has, which would have silently kept a `make prod`
+  durable's stale `backoff` forever across this fix's rollout.
 - Added `docs/SIMULATED_LAB_GUIDE.md`, a task-oriented guide to HERD's three
   simulated-hardware tiers (the hardware-free mock drivers, the checked-in NOS lab,
   and the unbuilt external network-simulator): a table of what each can and cannot

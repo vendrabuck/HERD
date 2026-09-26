@@ -28,7 +28,12 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 
-from herd_common.jetstream import ensure_stream_exists
+from herd_common.jetstream import (
+    ensure_consumer,
+    ensure_stream_exists,
+    nak_delay,
+    parse_nak_backoff_schedule,
+)
 from herd_common.outbox import event_dedupe_key
 
 from app.config import settings
@@ -39,9 +44,20 @@ logger = logging.getLogger(__name__)
 NATS_STREAM = "HERD_RESERVATIONS"
 NATS_SUBJECT_PATTERN = "herd.reservations.*"
 NATS_DURABLE = "integration-webhooks-consumer"
+# JetStream consumer policy (issue #895: no `backoff` on ConsumerConfig; a
+# `backoff` list used to make JetStream silently replace the server-side
+# ack_wait with backoff[0], measured 1s against nats-server 2.10.29 instead of
+# the intended 30s). Redelivery timing for a transient error comes entirely
+# from the explicit `nak(delay=...)` call in process_message's transient
+# branch (NATS_NAK_BACKOFF_SECONDS below), not from this config.
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
-NATS_BACKOFF_SECONDS = [1, 5, 15, 60, 120]
+# NAK-delay schedule (issue #895), from Settings so it is a knob
+# (NATS_NAK_BACKOFF_SECONDS): production defaults to [1, 5, 15, 60, 120];
+# docker-compose.override.yml pins a short dev/test schedule. Parsed once at
+# import time; nak_delay() maps a message's num_delivered to the entry to
+# pass as msg.nak(delay=...).
+NATS_NAK_BACKOFF_SECONDS = parse_nak_backoff_schedule(settings.nats_nak_backoff_seconds)
 # 4-token DLQ subject, deliberately outside the 3-token consumer filter so a
 # dead-lettered message is not re-consumed in a poison loop.
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.integration"
@@ -49,8 +65,8 @@ NATS_FETCH_TIMEOUT_SECONDS = 5
 
 # Issue #831: second durable consumer for device.health_transition events on
 # HERD_HEALTH. Own stream, subject filter, durable name, and DLQ subject; same
-# max_deliver/ack_wait/backoff/fetch-timeout knobs and the same batch == 1
-# rule (issue #648) as the reservations consumer.
+# max_deliver/ack_wait/fetch-timeout knobs (no backoff, issue #895) and the
+# same batch == 1 rule (issue #648) as the reservations consumer.
 HEALTH_STREAM = "HERD_HEALTH"
 HEALTH_SUBJECT_PATTERN = "herd.health.*"
 HEALTH_DURABLE = "integration-webhooks-health-consumer"
@@ -120,7 +136,14 @@ async def process_message(
     max_deliver: int = NATS_MAX_DELIVER,
     dlq_subject: str = NATS_DLQ_SUBJECT,
 ) -> str:
-    """Process one NATS message. Returns 'ack', 'nak', or 'dlq'."""
+    """Process one NATS message. Returns 'ack', 'nak', or 'dlq'.
+
+    A transient failure NAKs with an explicit `delay=` (issue #895: a bare
+    `msg.nak()` redelivers immediately regardless of any ConsumerConfig
+    `backoff`, which itself only ever timed ack-timeout redeliveries, never a
+    NAK), so the redelivery actually waits
+    NATS_NAK_BACKOFF_SECONDS[min(num_delivered - 1, ...)] seconds.
+    """
     try:
         event_data = json.loads(msg.data.decode())
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -155,16 +178,18 @@ async def process_message(
             await _publish_to_dlq(js, msg.data, subject=dlq_subject)
             await msg.ack()
             return "dlq"
+        delay = nak_delay(num_delivered, NATS_NAK_BACKOFF_SECONDS)
         logger.warning(
             "Transient error processing NATS message; NAK for retry",
             extra={
                 "action": "nats_message_nak",
                 "delivered": num_delivered,
+                "delay_seconds": delay,
                 "event": event_data.get("event"),
             },
             exc_info=exc,
         )
-        await msg.nak()
+        await msg.nak(delay=delay)
         return "nak"
 
     await msg.ack()
@@ -204,14 +229,28 @@ async def start_nats_consumer(app) -> None:
             except Exception:
                 logger.warning("Could not create/update NATS stream %s", stream, exc_info=True)
 
+            consumer_config = ConsumerConfig(
+                max_deliver=NATS_MAX_DELIVER,
+                ack_wait=NATS_ACK_WAIT_SECONDS,
+            )
+            # Create-or-update the durable to match consumer_config BEFORE
+            # pull_subscribe binds to it (issue #895): pull_subscribe alone
+            # only creates a durable that is missing, and otherwise binds to
+            # whatever config the server already has, so a durable created
+            # under the old `backoff`-carrying config would silently keep it
+            # forever on a persistent NATS volume (`make prod`) without this
+            # explicit update. See herd_common.jetstream.ensure_consumer.
+            await ensure_consumer(
+                js,
+                stream=stream,
+                subject=subject_pattern,
+                durable=durable,
+                config=consumer_config,
+            )
             psub = await js.pull_subscribe(
                 subject_pattern,
                 durable=durable,
-                config=ConsumerConfig(
-                    max_deliver=NATS_MAX_DELIVER,
-                    ack_wait=NATS_ACK_WAIT_SECONDS,
-                    backoff=NATS_BACKOFF_SECONDS,
-                ),
+                config=consumer_config,
             )
 
             async def _consumer_loop():

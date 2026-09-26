@@ -63,9 +63,22 @@ services:
       # Test-only webhook delivery sink, dev/test stack only (never in make prod,
       # which excludes this override). Mirrors the HERD_FAULT_INJECTION seam.
       WEBHOOK_TEST_SINK_ENABLED: "true"
+      # Dev/test-only short NAK-delay schedule (issue #895; production default
+      # is 1,5,15,60,120). Keeps tests/integration/test_dynamic_resources.py's
+      # transient-failure exhaustion fast while still exercising a real
+      # nak(delay=...) > 0 call on every redelivery past the first.
+      NATS_NAK_BACKOFF_SECONDS: "0,1,1,1,1"
     volumes:
       - ./services/integration/app:/app/app
       - ./services/common/herd_common:/app/common/herd_common
+
+  # notifications has no dev-mode command/volume override here (a code change
+  # needs `docker compose up -d --build notifications`, not a restart): this
+  # env-only block exists solely to pin the same dev/test NAK-delay schedule
+  # (issue #895) as `integration` above.
+  notifications:
+    environment:
+      NATS_NAK_BACKOFF_SECONDS: "0,1,1,1,1"
 
   secrets:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -86,6 +99,12 @@ services:
 
   execution:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      # Dev/test-only short NAK-delay schedule (issue #895; production default
+      # is 1,5,15,60,120). Keeps tests/integration/test_dynamic_resources.py's
+      # transient-failure exhaustion fast while still exercising a real
+      # nak(delay=...) > 0 call on every redelivery past the first.
+      NATS_NAK_BACKOFF_SECONDS: "0,1,1,1,1"
     volumes:
       - ./services/execution/app:/app/app
       - ./services/common/herd_common:/app/common/herd_common

@@ -99,3 +99,13 @@ async def test_heartbeat_interval_is_below_ack_wait():
     break it."""
     assert nats_consumer.NATS_HEARTBEAT_SECONDS < nats_consumer.NATS_ACK_WAIT_SECONDS
     assert nats_consumer.NATS_HEARTBEAT_SECONDS >= 1
+
+
+def test_ack_wait_is_the_real_effective_window_no_backoff_shrinks_it():
+    """Issue #895: a ConsumerConfig.backoff list used to make JetStream silently
+    replace the server-side ack_wait with backoff[0] (measured 1s against
+    nats-server 2.10.29), so the heartbeat assertion above protected nothing
+    against the EFFECTIVE window. ack_wait must still be a real 30s, and this
+    module must not reintroduce a NATS_BACKOFF_SECONDS-style constant."""
+    assert nats_consumer.NATS_ACK_WAIT_SECONDS == 30
+    assert not hasattr(nats_consumer, "NATS_BACKOFF_SECONDS")

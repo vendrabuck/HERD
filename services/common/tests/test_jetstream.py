@@ -16,10 +16,18 @@ given name/subjects and no max_age; any other stream_info exception
 propagates; an add_stream failure on the create path propagates too.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from herd_common.jetstream import JS_STREAM_NAME_IN_USE, ensure_stream, ensure_stream_exists
+from herd_common.jetstream import (
+    JS_STREAM_NAME_IN_USE,
+    ensure_consumer,
+    ensure_stream,
+    ensure_stream_exists,
+    nak_delay,
+    parse_nak_backoff_schedule,
+)
 from nats.js.errors import BadRequestError, NotFoundError
 
 
@@ -170,3 +178,128 @@ async def test_ensure_stream_exists_add_stream_failure_propagates():
 
     with pytest.raises(RuntimeError):
         await ensure_stream_exists(js, name="HERD_RESERVATIONS", subjects=["herd.reservations.*"])
+
+
+# --- nak_delay / parse_nak_backoff_schedule / ensure_consumer (issue #895) ---
+
+
+@pytest.mark.parametrize(
+    "num_delivered,expected",
+    [
+        (1, 1),
+        (2, 5),
+        (3, 15),
+        (4, 60),
+        (5, 120),
+    ],
+)
+def test_nak_delay_maps_each_delivery_to_its_schedule_entry(num_delivered, expected):
+    schedule = [1, 5, 15, 60, 120]
+    assert nak_delay(num_delivered, schedule) == expected
+
+
+def test_nak_delay_clamps_num_delivered_past_schedule_length():
+    schedule = [1, 5, 15, 60, 120]
+    assert nak_delay(6, schedule) == 120
+    assert nak_delay(1000, schedule) == 120
+
+
+@pytest.mark.parametrize("num_delivered", [0, -1, None])
+def test_nak_delay_falls_back_to_first_entry_for_non_positive_or_missing(num_delivered):
+    schedule = [1, 5, 15, 60, 120]
+    assert nak_delay(num_delivered, schedule) == 1
+
+
+def test_nak_delay_empty_schedule_raises():
+    with pytest.raises(ValueError, match="must not be empty"):
+        nak_delay(1, [])
+
+
+def test_parse_nak_backoff_schedule_from_comma_string():
+    assert parse_nak_backoff_schedule("1,5,15,60,120") == [1, 5, 15, 60, 120]
+
+
+def test_parse_nak_backoff_schedule_strips_whitespace():
+    assert parse_nak_backoff_schedule(" 1 , 5 ,15") == [1, 5, 15]
+
+
+def test_parse_nak_backoff_schedule_rejects_empty_string():
+    with pytest.raises(ValueError, match="non-empty"):
+        parse_nak_backoff_schedule("")
+
+
+def test_parse_nak_backoff_schedule_rejects_empty_entry():
+    with pytest.raises(ValueError, match="non-empty"):
+        parse_nak_backoff_schedule("1,,5")
+
+
+def test_parse_nak_backoff_schedule_rejects_non_integer_entry():
+    with pytest.raises(ValueError, match="not an integer"):
+        parse_nak_backoff_schedule("1,x,5")
+
+
+def test_parse_nak_backoff_schedule_rejects_negative_entry():
+    with pytest.raises(ValueError, match="non-negative"):
+        parse_nak_backoff_schedule("1,-5,15")
+
+
+@pytest.mark.asyncio
+async def test_ensure_consumer_sets_name_durable_name_filter_subject_and_calls_add_consumer():
+    js = AsyncMock()
+    config = SimpleNamespace(filter_subject=None, filter_subjects=None)
+
+    await ensure_consumer(
+        js,
+        stream="HERD_RESERVATIONS",
+        subject="herd.reservations.*",
+        durable="my-durable",
+        config=config,
+    )
+
+    assert config.name == "my-durable"
+    assert config.durable_name == "my-durable"
+    assert config.filter_subject == "herd.reservations.*"
+    js.add_consumer.assert_awaited_once_with("HERD_RESERVATIONS", config=config)
+
+
+@pytest.mark.asyncio
+async def test_ensure_consumer_does_not_overwrite_an_already_set_filter_subject():
+    js = AsyncMock()
+    config = SimpleNamespace(filter_subject="herd.reservations.created", filter_subjects=None)
+
+    await ensure_consumer(
+        js,
+        stream="HERD_RESERVATIONS",
+        subject="herd.reservations.*",
+        durable="my-durable",
+        config=config,
+    )
+
+    assert config.filter_subject == "herd.reservations.created"
+
+
+@pytest.mark.asyncio
+async def test_ensure_consumer_tolerates_a_config_double_missing_filter_subject_attrs():
+    """A minimal test double (e.g. a fake ConsumerConfig storing only **kwargs)
+    need not predefine filter_subject/filter_subjects; ensure_consumer must
+    read them with a default rather than raising AttributeError."""
+
+    class _MinimalConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    js = AsyncMock()
+    config = _MinimalConfig(max_deliver=5, ack_wait=30)
+
+    await ensure_consumer(
+        js,
+        stream="HERD_RESERVATIONS",
+        subject="herd.reservations.*",
+        durable="my-durable",
+        config=config,
+    )
+
+    assert config.name == "my-durable"
+    assert config.durable_name == "my-durable"
+    assert config.filter_subject == "herd.reservations.*"
+    js.add_consumer.assert_awaited_once_with("HERD_RESERVATIONS", config=config)

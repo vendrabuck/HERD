@@ -1,4 +1,6 @@
 from herd_common.base_settings import HerdBaseSettings
+from herd_common.jetstream import parse_nak_backoff_schedule
+from pydantic import field_validator
 
 
 class Settings(HerdBaseSettings):
@@ -23,6 +25,23 @@ class Settings(HerdBaseSettings):
     # prod, the nats-data volume); the dev/test override starts every stream
     # empty on each recreate regardless of this setting.
     nats_stream_max_age_seconds: int = 7 * 24 * 3600
+    # NAK-delay schedule for the reservations consumer's transient-error branch
+    # (issue #895): comma-separated seconds passed to msg.nak(delay=...) on
+    # each redelivery attempt (delivery 1 gets schedule[0], delivery 2
+    # schedule[1], ...), so JetStream actually waits between retries instead
+    # of redelivering an unadorned msg.nak() immediately. Shared env name
+    # NATS_NAK_BACKOFF_SECONDS across execution/notifications/integration;
+    # docker-compose.yml wires the same production default, and
+    # docker-compose.override.yml pins a short dev/test schedule. The
+    # validator below normalizes and re-validates via
+    # herd_common.jetstream.parse_nak_backoff_schedule, which consumer modules
+    # call again at import time to get the list[int] nak_delay() uses.
+    nats_nak_backoff_seconds: str = "1,5,15,60,120"
+
+    @field_validator("nats_nak_backoff_seconds", mode="before")
+    @classmethod
+    def _validate_nak_backoff_schedule(cls, v: object) -> str:
+        return ",".join(str(n) for n in parse_nak_backoff_schedule(v))
 
     # Execution settings
     driver_cache_path: str = "/data/driver-cache"

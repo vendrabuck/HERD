@@ -192,7 +192,31 @@ async def test_process_message_nak_on_transient_error():
 
     result = await nats_consumer.process_message(msg, js, _handler, _session_factory)
     assert result == "nak"
-    msg.nak.assert_awaited_once()
+    # issue #895: the NAK must carry an explicit delay (schedule[num_delivered - 1]),
+    # never a bare msg.nak(), which JetStream redelivers immediately.
+    msg.nak.assert_awaited_once_with(delay=nats_consumer.NATS_NAK_BACKOFF_SECONDS[0])
+    msg.ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_message_nak_on_transient_error_third_delivery():
+    payload = json.dumps(
+        {
+            "event": "reservation.created",
+            "user_id": str(uuid.uuid4()),
+            "device_ids": [],
+            "end_time": None,
+        }
+    ).encode()
+    msg = _FakeMsg(payload, num_delivered=3)
+    js = AsyncMock()
+
+    async def _handler(event, sf, dedupe_key=None):
+        raise RuntimeError("transient")
+
+    result = await nats_consumer.process_message(msg, js, _handler, _session_factory)
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=nats_consumer.NATS_NAK_BACKOFF_SECONDS[2])
     msg.ack.assert_not_awaited()
 
 
@@ -320,7 +344,7 @@ async def test_process_message_naks_when_prefs_client_fails():
 
     result = await nats_consumer.process_message(msg, js, _handler, _session_factory)
     assert result == "nak"
-    msg.nak.assert_awaited_once()
+    msg.nak.assert_awaited_once_with(delay=nats_consumer.NATS_NAK_BACKOFF_SECONDS[0])
     js.publish.assert_not_awaited()
 
 
@@ -534,6 +558,7 @@ class _FakeJetStream:
         self._subs = subs_by_subject or {}
         self.added_streams = []
         self.subscribe_calls = []
+        self.add_consumer_calls = []
         self.published = []
         self._add_stream_error = add_stream_error
 
@@ -541,6 +566,11 @@ class _FakeJetStream:
         if self._add_stream_error:
             raise RuntimeError("stream exists / cannot update")
         self.added_streams.append((name, tuple(subjects)))
+
+    async def add_consumer(self, stream, config):
+        # issue #895: herd_common.jetstream.ensure_consumer calls this to
+        # create-or-update the durable BEFORE pull_subscribe binds to it.
+        self.add_consumer_calls.append({"stream": stream, "config": config})
 
     async def pull_subscribe(self, subject_pattern, durable, config):
         self.subscribe_calls.append(
@@ -610,6 +640,17 @@ async def test_start_nats_consumer_wires_both_subscriptions(monkeypatch):
         )
         durables = {c["durable"] for c in js.subscribe_calls}
         assert durables == {nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE}
+        # issue #895: both durables are created-or-updated via add_consumer
+        # BEFORE pull_subscribe binds to them, and neither config carries a
+        # `backoff` (a real object attribute here, not just a kwargs entry, so
+        # accessing it directly proves ensure_consumer built it that way).
+        assert len(js.add_consumer_calls) == 2
+        add_consumer_durables = {c["config"].durable_name for c in js.add_consumer_calls}
+        assert add_consumer_durables == {nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE}
+        for call in js.add_consumer_calls:
+            assert not getattr(call["config"], "backoff", None)
+            assert call["config"].kwargs.get("ack_wait") == nats_consumer.NATS_ACK_WAIT_SECONDS
+            assert "backoff" not in call["config"].kwargs
         # Both background loop tasks are running.
         assert not app.state.nats_consumer_task.done()
         assert not app.state.nats_health_consumer_task.done()
