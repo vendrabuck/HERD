@@ -1,3 +1,4 @@
+import enum
 import uuid
 
 from fastapi import Depends, HTTPException, Request, status
@@ -16,14 +17,37 @@ bearer_scheme = HTTPBearer()
 # Rank order for the three roles: user is least privileged, superadmin most.
 _ROLE_RANK = {Role.USER: 0, Role.ADMIN: 1, Role.SUPERADMIN: 2}
 
-# Sentinel returned by _decode_role_claim when the raw request carries no
-# bearer token at all. On a real request this cannot happen for a route that
-# reaches this far: get_current_user's own bearer_scheme dependency (below)
-# already requires one and 401s first. The only way to reach get_effective_role
-# without a token present is a test that has replaced get_current_user with a
-# double, in which case there is no claim to compare against and the caller's
-# current database role is used as-is (see get_effective_role).
-_NO_CREDENTIALS = object()
+
+class _ClaimAvailability(enum.Enum):
+    """The two ways _decode_role_claim can come back with no claim string.
+
+    These are NOT interchangeable, on purpose: only NO_HEADER is safe to
+    treat as "no signal, trust the database role". Collapsing the two into
+    one fallback would be fail-open by construction, silently reopening the
+    bypass this whole mechanism exists to close the moment get_current_user
+    is ever changed to accept credentials from somewhere other than a bearer
+    Authorization header (a cookie, a query parameter): a request could then
+    satisfy get_current_user while still reading as "no credentials" here.
+
+    NO_HEADER: the request carries no Authorization header at all. On a real
+    request this cannot happen for a route that reaches this far, since
+    get_current_user's own bearer_scheme dependency already requires one and
+    401s first; the only way to reach get_effective_role with no header
+    present is a test that has replaced get_current_user with a double, and
+    in that case there is no claim to compare against, so the caller's
+    current database role is used as-is (see get_effective_role).
+
+    UNDECODABLE: an Authorization header IS present but is not a decodable
+    bearer token (wrong scheme, an empty token, or a token that fails to
+    decode). On a real request this means get_current_user was satisfied by
+    something other than this same header, which should be impossible
+    today; unlike NO_HEADER, this is not a state a legitimate test double
+    needs to pass through, so it fails CLOSED to user rather than trusting
+    the database role.
+    """
+
+    NO_HEADER = "no_header"
+    UNDECODABLE = "undecodable"
 
 
 def effective_role(claim_role: str | None, db_role: Role) -> Role:
@@ -69,7 +93,7 @@ async def get_current_user(
     return user
 
 
-async def _decode_role_claim(request: Request) -> str | None:
+async def _decode_role_claim(request: Request) -> str | None | _ClaimAvailability:
     """Best-effort read of the `role` claim straight off the request's own
     bearer token.
 
@@ -81,33 +105,46 @@ async def _decode_role_claim(request: Request) -> str | None:
     bare User and every existing caller of it (the /me endpoint, the
     any-authenticated-user group routes) is untouched.
 
-    Returns the sentinel _NO_CREDENTIALS when the request carries no bearer
-    token, or one that fails to decode, so get_effective_role can tell that
-    apart from a token that decoded but has no `role` key.
+    Returns a plain string (or None, meaning the token decoded but has no
+    `role` key) when a bearer token was present and decoded, or one of
+    _ClaimAvailability's two members otherwise; see that enum for why they
+    are kept distinct rather than folded into one fallback.
     """
+    if not request.headers.get("Authorization"):
+        return _ClaimAvailability.NO_HEADER
+    # Same parsing HTTPBearer itself uses: get_authorization_scheme_param plus
+    # a lowercase "bearer" comparison. Kept identical so this independent
+    # decode can never disagree with get_current_user's own bearer_scheme
+    # about what counts as a bearer token.
     scheme, token = get_authorization_scheme_param(request.headers.get("Authorization"))
     if scheme.lower() != "bearer" or not token:
-        return _NO_CREDENTIALS
+        return _ClaimAvailability.UNDECODABLE
     try:
         payload = verify_access_token(token)
     except JWTError:
-        return _NO_CREDENTIALS
+        return _ClaimAvailability.UNDECODABLE
     return payload.get("role")
 
 
 async def get_effective_role(
     current_user: User = Depends(get_current_user),
-    role_claim: str | None = Depends(_decode_role_claim),
+    role_claim: str | None | _ClaimAvailability = Depends(_decode_role_claim),
 ) -> Role:
     """The effective role to use for every authorization decision in this service.
 
-    See effective_role() for the rule. When the request carries no bearer
-    token at all (only possible when get_current_user has been replaced by a
-    test double; see _decode_role_claim), there is no claim to compare
-    against, so the account's current database role is used as-is.
+    See effective_role() for the rule applied to a decoded claim.
+    _ClaimAvailability.NO_HEADER means there is no claim to compare against
+    (only possible when get_current_user has been replaced by a test
+    double), so the account's current database role is used as-is.
+    _ClaimAvailability.UNDECODABLE means a header was present but could not
+    be read as a bearer token at all; that should be unreachable on a real
+    request (get_current_user could not have been satisfied either), so it
+    fails CLOSED to user rather than trusting the database role.
     """
-    if role_claim is _NO_CREDENTIALS:
+    if role_claim is _ClaimAvailability.NO_HEADER:
         return current_user.role
+    if role_claim is _ClaimAvailability.UNDECODABLE:
+        return Role.USER
     return effective_role(role_claim, current_user.role)
 
 

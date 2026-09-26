@@ -204,6 +204,23 @@ async def test_no_role_claim_on_admin_row_is_treated_as_user(real_client):
 
 
 @pytest.mark.asyncio
+async def test_bearer_scheme_casing_does_not_change_the_outcome(real_client):
+    """_decode_role_claim parses the Authorization header independently of
+    get_current_user's own bearer_scheme; a lowercase "bearer" and a
+    titlecase "Bearer" must agree on the same token, or the two parsers
+    could disagree about whether a claim is even present."""
+    sa = await _make_user(Role.SUPERADMIN, username="sa-case-scheme")
+    token = _mint(sa, Role.SUPERADMIN)
+
+    lower_resp = await real_client.get("/users", headers={"Authorization": f"bearer {token}"})
+    title_resp = await real_client.get("/users", headers={"Authorization": f"Bearer {token}"})
+
+    assert lower_resp.status_code == 200
+    assert title_resp.status_code == 200
+    assert lower_resp.json() == title_resp.json()
+
+
+@pytest.mark.asyncio
 async def test_inactive_account_is_refused_regardless_of_claim(real_client):
     """(e) An inactive account is refused before any role decision, even
     carrying a superadmin claim."""
