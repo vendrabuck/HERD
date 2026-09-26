@@ -276,7 +276,16 @@ async def test_forged_cancelled_event_for_an_active_reservation_is_ignored(
         cancel_resp = await admin_client.delete(f"/reservations/{res_id}")
         cancel_resp.raise_for_status()
 
-        wiring_final = await _poll(_get_wiring, lambda w: w["frozen"] is True)
+        # Terminal teardown freezes the wiring FIRST and only then drives the
+        # release, so a poll that stops at frozen=True can observe rows still
+        # ACTIVE for a moment (that is what CI saw on the first run). Poll for
+        # the end state, freeze plus release, and assert both together.
+        wiring_final = await _poll(
+            _get_wiring,
+            lambda w: (
+                w["frozen"] is True and all(c["status"] != "ACTIVE" for c in w["connections"])
+            ),
+        )
         assert wiring_final["frozen"] is True, "a real cancel never froze the wiring"
         assert all(c["status"] != "ACTIVE" for c in wiring_final["connections"]), (
             "a real cancel did not release the applied L1 connection"
