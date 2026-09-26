@@ -126,7 +126,9 @@ async def test_owner_can_edit_canvas_of_reserved_topology(admin_client, fresh_de
 
         # Owner re-edits the canvas while the reservation is live: allowed.
         edited = _canvas_with_edge(a_id, b_id)
-        edited["nodes"][0]["data"]["device"]["label"] = "owner-edited"
+        # Edit a node-level field, not a device field: cabling reduces data.device
+        # to its allowlist before comparing, so a device-only tweak is a no-op.
+        edited["nodes"][0]["data"]["label"] = "owner-edited"
         resp = await _set_canvas(admin_client, topology_id, edited)
         assert resp.status_code == 200, (
             f"owner carve-out must allow the edit, got {resp.status_code}: {resp.text}"
@@ -167,7 +169,8 @@ async def test_non_owner_canvas_edit_of_reserved_topology_is_blocked_409(
         # The topology creator (intuser), who does NOT own the reservation, tries
         # to change the wiring: blocked by the reservation lock.
         edited = _canvas_with_edge(a_id, b_id)
-        edited["nodes"][1]["data"]["device"]["label"] = "creator-edited"
+        # Node-level edit for the same reason as the owner test above.
+        edited["nodes"][1]["data"]["label"] = "creator-edited"
         resp = await _set_canvas(user_client, topology_id, edited)
         assert resp.status_code == 409, (
             f"canvas edit by a non-reservation-owner must 409, got {resp.status_code}: {resp.text}"

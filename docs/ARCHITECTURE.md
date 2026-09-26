@@ -236,6 +236,23 @@ topology editor's Routing panel) and execution-side consumption of it (this
 file's `reservation.wiring_changed` paragraph above) are phases 2 and 3 of
 ADR 0014, both shipped. See [docs/design/0014-first-class-layer-3-routing.md](design/0014-first-class-layer-3-routing.md).
 
+### Device node persistence (hardening)
+
+A device node's `data.device` in `canvas_data` is reduced to a fixed allowlist
+(`DEVICE_NODE_ALLOWED_KEYS` in `services/cabling/app/services/canvas_nodes.py`:
+`id`, `name`, `topology_type`, `connection_type`, `status`, `template_name`,
+`template_icon`, plus `role`, the topology-template placeholder key) before it is
+stored, on every cabling write boundary: topology create/update/clone/import,
+every fork write (create, canvas PUT, save, restore), template create/update/
+instantiate, and topology-version restore. `field_data` (which can carry
+clear-text device credentials such as passwords) and every other key an
+inventory `Device` record carries is never persisted into a canvas, regardless
+of what a caller submits. The frontend narrows the same way before a save is
+ever sent (`persistableDevice`/`persistableCanvasNodes` in
+`frontend/src/lib/canvasNodes.ts`); cabling's own strip is the enforcing layer,
+not a courtesy to a well-behaved client. Existing rows were scrubbed once by
+cabling migration 0013.
+
 ## Device visibility
 
 - **Admins** see every device.

@@ -18,7 +18,7 @@ from app.schemas.topology import (
     TopologyUpdate,
     TopologyValidationResponse,
 )
-from app.services.canvas_nodes import redact_invisible_device_nodes
+from app.services.canvas_nodes import redact_invisible_device_nodes, strip_device_nodes
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.topology_validation import run_full_topology_validation
 from app.services.version_service import commit_with_new_version
@@ -76,7 +76,16 @@ async def get_topology(
     topology = await db.get(Topology, topology_id)
     if not topology:
         raise HTTPException(status_code=404, detail="Topology not found")
-    return topology
+    # Read-side strip (belt and braces): the write side already reduces a
+    # device node's data.device to the allowlist before a row is stored, but a
+    # stack that upgraded images without running `make migrate` (the missed
+    # migration is a logged warning, not a boot failure, per the migration
+    # lifecycle notes) could still be serving a pre-fix row. Build the
+    # response model explicitly and overwrite its canvas_data rather than
+    # mutate the ORM object: this must never re-persist what it strips.
+    detail = TopologyDetail.model_validate(topology)
+    detail.canvas_data = strip_device_nodes(detail.canvas_data)
+    return detail
 
 
 @router.put("/{topology_id}", response_model=TopologyDetail)
@@ -97,7 +106,16 @@ async def update_topology(
     if str(topology.created_by) != payload["sub"] and not is_admin:
         raise HTTPException(status_code=403, detail="Not authorized to update this topology")
 
-    canvas_changed = body.canvas_data is not None and body.canvas_data != topology.canvas_data
+    # Reduce a device node's `data.device` to the allowlist before it ever
+    # reaches a comparison or a write: canvas_changed must judge the stripped
+    # shape against the already-stripped stored canvas, and the stripped value
+    # is what gets persisted below and into the version snapshot.
+    stripped_canvas_data = (
+        None if body.canvas_data is None else strip_device_nodes(body.canvas_data)
+    )
+    canvas_changed = (
+        stripped_canvas_data is not None and stripped_canvas_data != topology.canvas_data
+    )
 
     # Reservation-scoped lock: a topology with a live reservation may only have
     # its wiring changed by the reservation owner (or an admin). This is what
@@ -134,8 +152,8 @@ async def update_topology(
 
     if body.name is not None:
         topology.name = body.name
-    if body.canvas_data is not None:
-        topology.canvas_data = body.canvas_data
+    if stripped_canvas_data is not None:
+        topology.canvas_data = stripped_canvas_data
     topology.modified_by = uuid.UUID(payload["sub"])
 
     if canvas_changed:
@@ -144,7 +162,7 @@ async def update_topology(
         # raw IntegrityError 500 (see commit_with_new_version).
         snapshot = TopologyVersion(
             topology_id=topology.id,
-            canvas_data=body.canvas_data,
+            canvas_data=stripped_canvas_data,
             name=topology.name,
             description=body.description,
             created_by=uuid.UUID(payload["sub"]),
@@ -172,7 +190,14 @@ async def clone_topology(
     if not source:
         raise HTTPException(status_code=404, detail="Topology not found")
 
-    cloned_canvas = None if source.canvas_data is None else copy.deepcopy(source.canvas_data)
+    # source.canvas_data was already stripped when it was written; strip again
+    # here anyway (cheap and idempotent) rather than trust that invariant across
+    # a clone, which is a fresh write boundary of its own.
+    cloned_canvas = (
+        None
+        if source.canvas_data is None
+        else strip_device_nodes(copy.deepcopy(source.canvas_data))
+    )
 
     clone = Topology(
         name=body.name,

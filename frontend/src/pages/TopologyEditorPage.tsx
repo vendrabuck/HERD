@@ -40,6 +40,7 @@ import {
   isDeviceNode,
   collectCanvasDeviceIds,
   canvasHasL3Intent,
+  persistableCanvasNodes,
 } from "@/lib/canvasNodes";
 import {
   isBlockingRouteProblem,
@@ -272,8 +273,14 @@ function TopologyEditorInner() {
   // restored when a history view exits.
   const persistableCanvas = useMemo<CanvasData>(() => {
     const placeholderIds = new Set(nodes.filter(isDynamicPlaceholder).map((n) => n.id));
+    const keptNodes = placeholderIds.size === 0 ? nodes : nodes.filter((n) => !placeholderIds.has(n.id));
     return {
-      nodes: placeholderIds.size === 0 ? nodes : nodes.filter((n) => !placeholderIds.has(n.id)),
+      // Hardening: reduce every device node's `data.device` to what a device
+      // node actually needs (persistableCanvasNodes/persistableDevice in
+      // lib/canvasNodes.ts) before it is ever sent to the server. The
+      // runtime store keeps the full Device for display; only what gets
+      // persisted here is narrowed.
+      nodes: persistableCanvasNodes(keptNodes),
       edges:
         placeholderIds.size === 0
           ? strippedEdges

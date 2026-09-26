@@ -20,6 +20,7 @@ from app.schemas.template import (
     TemplateUpdate,
 )
 from app.schemas.topology import TopologyDetail
+from app.services.canvas_nodes import strip_device_nodes
 
 router = APIRouter(prefix="/templates", tags=["topology-templates"])
 
@@ -126,7 +127,9 @@ async def create_template(
     template = TopologyTemplate(
         name=body.name,
         description=body.description,
-        canvas_data=body.canvas_data,
+        # A caller-authored template canvas is raw input like any other write
+        # boundary: strip before it is ever stored.
+        canvas_data=None if body.canvas_data is None else strip_device_nodes(body.canvas_data),
         created_by=uuid.UUID(payload["sub"]),
         owner_name=payload.get("username", ""),
     )
@@ -155,7 +158,11 @@ async def create_template_from_topology(
     if not topology:
         raise HTTPException(status_code=404, detail="Topology not found")
 
-    role_canvas = _extract_role_template(topology.canvas_data or {})
+    # _extract_role_template already reduces every device dict to {"role": ...},
+    # a minimal shape with nothing outside the allowlist by construction; strip
+    # again anyway (cheap, idempotent) since this canvas becomes its own stored
+    # row.
+    role_canvas = strip_device_nodes(_extract_role_template(topology.canvas_data or {}))
     template = TopologyTemplate(
         name=body.name,
         description=body.description,
@@ -178,7 +185,11 @@ async def get_template(
     template = await db.get(TopologyTemplate, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
-    return template
+    # Read-side strip (belt and braces, see routes/topologies.py's
+    # get_topology): never mutates the ORM object, only the response value.
+    detail = TemplateDetail.model_validate(template)
+    detail.canvas_data = strip_device_nodes(detail.canvas_data)
+    return detail
 
 
 @router.put("/{template_id}", response_model=TemplateDetail)
@@ -199,7 +210,7 @@ async def update_template(
     if body.description is not None:
         template.description = body.description
     if body.canvas_data is not None:
-        template.canvas_data = body.canvas_data
+        template.canvas_data = strip_device_nodes(body.canvas_data)
     try:
         await db.commit()
     except IntegrityError:
@@ -240,7 +251,11 @@ async def instantiate_template(
         raise HTTPException(status_code=404, detail="Template not found")
 
     role_assignments = body.role_assignments or {}
-    new_canvas = _instantiate_canvas(template.canvas_data or {}, role_assignments)
+    # This creates a real Topology/TopologyVersion row directly, bypassing
+    # routes/topologies.py's own create path, so it is its own write boundary.
+    new_canvas = strip_device_nodes(
+        _instantiate_canvas(template.canvas_data or {}, role_assignments)
+    )
 
     topology = Topology(
         name=body.name,

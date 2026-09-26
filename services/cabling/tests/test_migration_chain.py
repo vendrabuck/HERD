@@ -59,12 +59,12 @@ def test_chain_is_linear_and_walks_to_base():
     )
 
 
-def test_head_is_0012_fork_l3_routes_key_text():
-    """The current head is 0012 (issue #758's route_key String(400) to Text widen),
-    which follows 0011 (ADR 0014 phase 1's fork_l3_routes table)."""
+def test_head_is_0013_scrub_device_node_field_data():
+    """The current head is 0013 (the device-node-allowlist scrub, a hardening
+    pass), which follows 0012 (issue #758's route_key String(400) to Text widen)."""
     script = _script_directory()
-    assert script.get_heads() == ["0012"]
-    head = script.get_revision("0012")
-    assert head.down_revision == "0011"
-    prior = script.get_revision("0011")
-    assert prior.down_revision == "0010"
+    assert script.get_heads() == ["0013"]
+    head = script.get_revision("0013")
+    assert head.down_revision == "0012"
+    prior = script.get_revision("0012")
+    assert prior.down_revision == "0011"

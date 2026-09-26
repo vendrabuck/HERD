@@ -9,9 +9,115 @@ their function-local "avoid a cycle" imports: there is no cycle left to avoid.
 
 ``fork_save_service`` re-exports ``node_to_device_map``, ``node_to_element_map``, and
 ``classify_element_edge`` for existing importers of that module.
+
+``strip_device_nodes`` (with its ``DEVICE_NODE_ALLOWED_KEYS`` allowlist) is the one
+place every cabling write boundary reduces a device node's ``data.device`` to what the
+codebase actually reads off it, so a device's ``field_data`` (which can carry
+clear-text credentials) never enters a stored canvas.
 """
 
 import uuid
+
+# The only keys of a device node's `data.device` that cabling may persist and
+# return, derived from every read site across the frontend and backend (a
+# hardening pass, not a new feature): an inventory device record is fetched
+# fresh by id wherever real detail is needed (there are no cross-schema
+# FK/JOINs in HERD), so a canvas node only ever needs enough of the device to
+# render itself and to let the few callers below key off it.
+#
+# - "id": the one key the backend itself reads off a device node
+#   (node_to_device_map above, fork_save_service's removed-id check, and
+#   routes/templates.py's instantiate flow, which writes it onto a role
+#   placeholder).
+# - "name": frontend/src/lib/canvasNodes.ts canvasNodeLabel,
+#   components/topology-editor/RoutingPanel.tsx, nodes/DeviceNode.tsx.
+# - "topology_type": nodes/DeviceNode.tsx's color class, and
+#   pages/TopologyEditorPage.tsx's cross-type (PHYSICAL/CLOUD) edge guard.
+# - "connection_type": lib/l3.ts's isLayer3Switch, which gates whether the
+#   Routing panel and the route-count badge apply to this node at all.
+# - "status": nodes/DeviceNode.tsx's non-AVAILABLE badge.
+# - "template_name": nodes/DeviceNode.tsx's caption, and
+#   routes/templates.py's _extract_role_template, which reads it to name a
+#   template role.
+# - "template_icon": nodes/DeviceNode.tsx's icon image.
+# - "role": never a real inventory device field; the placeholder key
+#   routes/templates.py writes in place of a device (_extract_role_template)
+#   and reads back at instantiation (_instantiate_canvas) for a
+#   topology-template's canvas, which reuses this same device-node shape.
+#
+# Deliberately excluded for lack of any read site: template_id,
+# template_vendor, template_model, template_part_number, driver_id,
+# driver_name, driver_sha256, driver_filename, exclusive, created_at,
+# created_by, created_by_name, modified_by, modified_by_name,
+# poll_interval_seconds, resolved_poll_interval_seconds, and, above all,
+# field_data (which can carry clear-text device credentials) and anything
+# else credential-shaped. A device node never carries a "ports" key either
+# (Device has none; ports are fetched separately by device id), so there is
+# nothing to allow there.
+DEVICE_NODE_ALLOWED_KEYS = frozenset(
+    {
+        "id",
+        "name",
+        "topology_type",
+        "connection_type",
+        "status",
+        "template_name",
+        "template_icon",
+        "role",
+    }
+)
+
+
+def strip_device_nodes(canvas: dict) -> dict:
+    """Return a copy of ``canvas`` with every device node's ``data.device``
+    reduced to ``DEVICE_NODE_ALLOWED_KEYS``.
+
+    Applied at every cabling write boundary (topology create/update/clone,
+    bulk import, template create/update/instantiate, and every fork write) so
+    a device node's ``field_data`` and any other non-allowlisted key never
+    reaches a stored canvas, regardless of what a caller (editor, import
+    file, or a raw API request) sent.
+
+    Never mutates ``canvas``. A node is treated as a device node purely by
+    the shape of its own data (an object under ``data.device``), the same
+    test the rest of this module uses, not by its ``type`` tag: this also
+    catches a legacy thin node saved before the seed fix that set the
+    ``deviceNode`` type discriminator. Every other node (network elements,
+    dynamic placeholders), every edge, and every other top-level canvas key
+    (e.g. ``viewport``) pass through untouched, by reference. A node that is
+    not a dict, or whose ``data``/``data.device`` is not a dict, is returned
+    unchanged: narrowing a device dict is this function's only job, not
+    validating canvas shape. Returns ``canvas`` itself, unchanged, when
+    nothing needed stripping (idempotent: a second pass over already-stripped
+    data is always a no-op).
+    """
+    if not isinstance(canvas, dict):
+        return canvas
+    nodes = canvas.get("nodes")
+    if not isinstance(nodes, list):
+        return canvas
+
+    new_nodes = []
+    changed = False
+    for node in nodes:
+        if not isinstance(node, dict):
+            new_nodes.append(node)
+            continue
+        data = node.get("data")
+        device = data.get("device") if isinstance(data, dict) else None
+        if not isinstance(device, dict):
+            new_nodes.append(node)
+            continue
+        stripped_device = {k: v for k, v in device.items() if k in DEVICE_NODE_ALLOWED_KEYS}
+        if stripped_device.keys() == device.keys():
+            new_nodes.append(node)
+            continue
+        changed = True
+        new_nodes.append({**node, "data": {**data, "device": stripped_device}})
+
+    if not changed:
+        return canvas
+    return {**canvas, "nodes": new_nodes}
 
 
 def node_to_device_map(canvas: dict) -> dict[str, uuid.UUID]:
@@ -153,7 +259,9 @@ def redact_invisible_device_nodes(
 
 __all__ = [
     "classify_element_edge",
+    "DEVICE_NODE_ALLOWED_KEYS",
     "node_to_device_map",
     "node_to_element_map",
     "redact_invisible_device_nodes",
+    "strip_device_nodes",
 ]

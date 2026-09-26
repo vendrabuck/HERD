@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.topology import Topology, TopologyVersion
 from app.schemas.bulk import BulkImportReport, RowResult
+from app.services.canvas_nodes import strip_device_nodes
 from app.services.device_resolver import resolve_device_names
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
@@ -114,9 +115,14 @@ def canvas_ids_to_names(canvas: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def topology_to_record(topology: Topology) -> dict[str, Any]:
+    # Belt and braces (defense in depth): the stored canvas_data was already
+    # reduced to the allowlist when it was written, but export is the one
+    # surface that reassembles a response straight from storage for an
+    # external file, so it strips again rather than trust that invariant
+    # silently.
     return {
         "name": topology.name,
-        "canvas": canvas_ids_to_names(topology.canvas_data),
+        "canvas": strip_device_nodes(canvas_ids_to_names(topology.canvas_data)),
     }
 
 
@@ -313,6 +319,10 @@ async def import_topologies(
 
             canvas = rec.get("canvas") or {"nodes": [], "edges": []}
             rewritten, unresolved = rewrite_canvas_names_to_ids(canvas, name_to_id)
+            # An imported file is caller-supplied input like any other: reduce
+            # every device node's `data.device` to the allowlist before it is
+            # validated or written.
+            rewritten = strip_device_nodes(rewritten)
             if unresolved:
                 report.rows.append(
                     RowResult(

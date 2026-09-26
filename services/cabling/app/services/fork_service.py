@@ -50,6 +50,7 @@ from app.models.fork import (
     ReservationFork,
 )
 from app.models.topology import Topology, TopologyVersion
+from app.services.canvas_nodes import strip_device_nodes
 from app.services.fork_save_service import (
     WireSpec,
     assert_endpoints_are_members,
@@ -191,7 +192,12 @@ async def create_fork(
     parent_canvas, pinned_version_id = await _resolve_parent_canvas(
         db, parent_topology_id, parent_version_id
     )
-    forked_canvas = None if parent_canvas is None else copy.deepcopy(parent_canvas)
+    # The parent topology's canvas_data was already stripped when it was written;
+    # strip again here anyway (cheap, idempotent) since forking is its own write
+    # boundary into fork_connections/canvas_data and fork_versions below.
+    forked_canvas = (
+        None if parent_canvas is None else strip_device_nodes(copy.deepcopy(parent_canvas))
+    )
     assert_endpoints_are_members(forked_canvas, member_device_ids)
 
     # ADR 0014 phase 1 (issue #34), R4: tolerant parse, no gate, no inventory call.

@@ -962,6 +962,13 @@ filtered (below), a bare device id sitting in someone's canvas answers nothing
 on its own: it cannot be turned into reachability, interface names, or subnets
 without a route that now refuses to answer for gear the caller cannot see.
 
+This is also safe with respect to device credentials (a later hardening pass):
+a canvas device node's `data.device` is reduced to a fixed allowlist (id, name,
+topology_type, connection_type, status, template_name, template_icon) on every
+write, so the device's `field_data` (which can carry a clear-text password)
+never enters a stored canvas in the first place, regardless of who reads this
+route back.
+
 ### Validate a topology
 
 ```
