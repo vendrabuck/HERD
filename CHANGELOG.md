@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- Fixed the auth service authorizing against a caller's database role instead of
+  their JWT's role claim. The API-token exchange (`POST /tokens/exchange`) already
+  clamped an issued JWT's role claim to the lesser of the token's role and the
+  owning principal's current database role, but every authorization check inside
+  the auth service itself (`require_role`, the token-minting rank checks in
+  `POST /tokens`) read `current_user.role`, the database row, and ignored that
+  clamp entirely. A user-role API token minted for a superadmin account therefore
+  passed every admin and superadmin gate in the auth service, including minting a
+  full superadmin token from it, undoing the exchange's demotion. Every service
+  other than auth already authorized against the claim (`herd_common.auth`), so
+  only the auth service itself was affected. Authorization inside the auth service
+  now uses the effective role, the lower of the claim and the database role
+  (`app.dependencies.auth.effective_role`); a missing, empty, or unrecognized role
+  claim is treated as `user`. A login or refresh JWT still carries the account's
+  role at issue time and behaves exactly as before; the only change in outcome is
+  that a token whose claim is lower than the account's current database role, or an
+  account demoted after a token was issued, is now held to the lower role until
+  that token expires, as intended. See `docs/ROLES.md` for the updated rule.
 - Fixed the three NATS consumers' (execution, notifications, integration) retry timing
   (issue #895). Measured against nats-server 2.10.29, a `ConsumerConfig.backoff` list
   silently made the server replace the configured `ack_wait` with `backoff[0]` (1
