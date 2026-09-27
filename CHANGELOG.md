@@ -41,6 +41,29 @@
   row that references a hidden device is rejected and stores nothing. CSV
   import parses into the same canvas shape before this gate runs, so it is
   covered identically.
+- Hardened every CSV writer against spreadsheet formula injection (issue #910).
+  A CSV cell whose text began with `=`, `+`, `-`, `@`, a tab, or a carriage
+  return was written as given and evaluated as a formula, not literal text,
+  when the file was opened in a spreadsheet: the most exposed writer was
+  cabling's topology export, whose topology, device, and port names are
+  free text any authenticated user controls (they come from the stored
+  canvas, not inventory), so a regular user could plant a formula that ran
+  when an admin opened the export. A new shared helper,
+  `herd_common.csv_safety.csv_safe_cell`, prefixes a single quote onto a
+  text cell whose first character (ignoring leading spaces) is one of those
+  triggers, the OWASP-recommended neutralization; it is applied to every
+  free-text column of the topology CSV export, the inventory device and
+  template CSV exports, and the reservations utilization CSV export
+  (owner_name and fleet device name), while a fixed enumeration, a
+  formatted number or boolean, and a JSON-encoded blob column are left
+  untouched. The topology, device, and template CSV importers apply the
+  inverse, `csv_safe_cell`'s exact opposite `csv_unsafe_cell`, which strips
+  exactly one leading quote and only when a trigger character still follows
+  it, so an exported value round-trips through import byte-for-byte and a
+  name that legitimately begins with an apostrophe is never mangled. The
+  Reporting page's browser-built "by template" CSV export gained the same
+  neutralization via its own `csvSafeCell`, applied before its existing
+  RFC 4180 quoting.
 - Hardened the topology editor and cabling service against persisting device
   credentials on a canvas. The editor used to store the whole inventory Device
   record on each device node, including `field_data`, which can carry a
