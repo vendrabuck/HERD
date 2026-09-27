@@ -28,7 +28,7 @@ from app.schemas.device_config import (
     PaginatedDeviceConfigVersions,
 )
 from app.services.config_diff import render_unified_diff
-from app.services.device_visibility import _resolve_visible_device_ids
+from app.services.device_visibility import check_device_read_visibility
 from app.services.manage_guard import (
     _assert_driver_can_configure,
     _is_admin,
@@ -47,33 +47,6 @@ async def _load_device(db: AsyncSession, device_id: uuid.UUID) -> Device:
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     return device
-
-
-async def _check_read_visibility(
-    db: AsyncSession,
-    device_id: uuid.UUID,
-    payload: dict,
-    authorization: str | None,
-) -> None:
-    """Gate config-version reads behind the same group visibility as the
-    device and port reads (issue #718): a non-admin caller outside the
-    device's groups gets 404, identical status and detail to `GET
-    /devices/{id}`, so this endpoint cannot be used to tell "hidden" from
-    "absent". Admins are unfiltered, matching the device read.
-
-    Deliberately plain visibility, not manage_guard's reservation-widened
-    check: a user can only book devices they can already see, so visibility
-    is the right boundary for a read.
-    """
-    if _is_admin(payload):
-        return
-    try:
-        user_id = uuid.UUID(payload["sub"])
-    except (KeyError, ValueError):
-        raise HTTPException(status_code=404, detail="Device not found") from None
-    visible_ids = await _resolve_visible_device_ids(db, user_id, authorization)
-    if device_id not in visible_ids:
-        raise HTTPException(status_code=404, detail="Device not found")
 
 
 def _connection_type_for(device: Device) -> str:
@@ -144,7 +117,7 @@ async def list_config_versions(
     db: AsyncSession = Depends(get_db),
 ):
     await _load_device(db, device_id)
-    await _check_read_visibility(db, device_id, payload, authorization)
+    await check_device_read_visibility(db, device_id, payload, authorization)
 
     count = (
         await db.execute(
@@ -189,7 +162,7 @@ async def diff_config_versions(
     db: AsyncSession = Depends(get_db),
 ):
     await _load_device(db, device_id)
-    await _check_read_visibility(db, device_id, payload, authorization)
+    await check_device_read_visibility(db, device_id, payload, authorization)
     va = await _load_version(db, device_id, a)
     vb = await _load_version(db, device_id, b)
     diff = render_unified_diff(
@@ -246,7 +219,7 @@ async def get_config_version(
     db: AsyncSession = Depends(get_db),
 ):
     await _load_device(db, device_id)
-    await _check_read_visibility(db, device_id, payload, authorization)
+    await check_device_read_visibility(db, device_id, payload, authorization)
     version = await _load_version(db, device_id, version_id)
     return DeviceConfigVersionDetail.model_validate(version)
 

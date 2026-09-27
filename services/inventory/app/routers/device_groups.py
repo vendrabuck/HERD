@@ -38,6 +38,7 @@ from app.services.device_group_service import (
     list_device_groups,
     update_device_group,
 )
+from app.services.device_visibility import check_device_read_visibility
 
 logger = logging.getLogger(__name__)
 
@@ -180,15 +181,27 @@ async def get_device_groups_for_device_endpoint(
     device_id: uuid.UUID,
     authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
-    _: dict = Depends(get_current_user_payload),
+    payload: dict = Depends(get_current_user_payload),
 ):
     """Get all device groups a device belongs to, with user group names resolved.
 
     404s when the device itself does not exist, so callers can distinguish
     "exists but ungrouped" (200 []) from "no such device" (404). See issue #392.
+
+    Non-admin callers are also gated behind the same group-visibility check as
+    `GET /devices/{id}` (issue #909): a real device outside the caller's
+    groups 404s with the identical detail as an unknown device id, so this
+    endpoint (which otherwise leaks group names, descriptions, and user-group
+    names for a hidden device) cannot be used to confirm a hidden device
+    exists. Admins are unfiltered, matching every other read this endpoint's
+    contract is tested against (see test_device_groups.py's #392 tests).
     """
+    not_found_detail = f"Device {device_id} not found"
     if await db.get(Device, device_id) is None:
-        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+        raise HTTPException(status_code=404, detail=not_found_detail)
+    await check_device_read_visibility(
+        db, device_id, payload, authorization, not_found_detail=not_found_detail
+    )
     groups = await get_device_groups_for_device(db, device_id)
     # Collect all unique user_group_ids to resolve names in a single call
     all_ug_ids: set[uuid.UUID] = set()
