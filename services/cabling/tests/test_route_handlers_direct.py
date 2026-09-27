@@ -48,6 +48,22 @@ async def setup_db():
         await conn.run_sync(Base.metadata.drop_all)
 
 
+@pytest.fixture(autouse=True)
+def _unfiltered_bulk_import_visibility():
+    """None of the bulk-import tests in this file are about device
+    visibility (issue #908; see test_visibility_oracle.py for that). Pin
+    `resolve_caller_visibility` to always return None (the admin, no-filter
+    outcome) so this file's existing USER_ID-role, no-Authorization-header
+    calls keep exercising exactly what they exercised before the #908 gate
+    was added. Harmless to every non-bulk-import test in this file: the
+    patch target is a module these other tests never touch."""
+    with patch(
+        "app.services.bulk_service.resolve_caller_visibility",
+        new=AsyncMock(return_value=None),
+    ):
+        yield
+
+
 def _mock_httpx_client(*, status_code=200, json_data=None, raise_exc=None):
     """Build a patch target for httpx.AsyncClient used as an async context manager.
 
