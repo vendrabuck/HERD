@@ -21,6 +21,21 @@ never targets a same-named topology someone else created.
 Per-row error handling means one bad topology is rejected with a reason without
 aborting the batch. A dry_run import runs full parsing, name resolution, and
 validation and returns the per-row report without committing.
+
+Visibility (issue #908): the internal resolve-by-name call to inventory stays
+unfiltered (it still answers "does this name exist anywhere", the contract
+POST /devices/resolve-by-name has always had); the filtering for a non-admin
+caller happens here, in cabling, once per request, via `resolve_caller_visibility`
+(issue #763's shared helper: admin means no filter, an unanswerable lookup fails
+closed with a 503). A name that resolves to a device outside the caller's
+visible set is folded into that row's "unresolved device names" list, the exact
+reason and outcome an unresolvable name already produces, so a hidden device and
+a nonexistent one are indistinguishable. As a second, independent layer,
+`redact_invisible_device_nodes` runs on the rewritten canvas before validation, so
+a device reference that bypassed name resolution entirely (a raw `id` carried in
+`data.device` with no `name`) still cannot reach the L3 pass or the edge pass as
+anything but the existing `missing_device` reason. CSV import shares this same
+path: it parses into the identical canvas shape before `import_topologies` runs.
 """
 
 import copy
@@ -36,10 +51,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.topology import Topology, TopologyVersion
 from app.schemas.bulk import BulkImportReport, RowResult
-from app.services.canvas_nodes import strip_device_nodes
+from app.services.canvas_nodes import redact_invisible_device_nodes, strip_device_nodes
 from app.services.device_resolver import resolve_device_names
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
+from app.services.visible_devices import resolve_caller_visibility
 
 # Pinned reject reason when an import row would rewire a topology currently held
 # by another user's active reservation. Mirrors the reservation-scoped lock on
@@ -245,6 +261,33 @@ def _collect_device_names(canvas: dict[str, Any] | None) -> set[str]:
     return names
 
 
+def _hidden_names_in_canvas(
+    canvas: dict[str, Any] | None,
+    name_to_id: dict[str, str],
+    visible_ids: set[uuid.UUID],
+) -> set[str]:
+    """Names in ``canvas`` that resolved to a real device id outside ``visible_ids``.
+
+    Issue #908: a non-admin caller must not learn, via the per-row reject
+    reason, that a device name exists but is outside their device-group
+    visibility. Every such name is returned here so the caller can fold it
+    into the row's "unresolved device names" set, making a hidden name and a
+    nonexistent one produce an identical per-row report.
+    """
+    hidden: set[str] = set()
+    for name in _collect_device_names(canvas):
+        local_id = name_to_id.get(name)
+        if local_id is None:
+            continue
+        try:
+            device_uuid = uuid.UUID(local_id)
+        except (ValueError, TypeError):
+            continue
+        if device_uuid not in visible_ids:
+            hidden.add(name)
+    return hidden
+
+
 def rewrite_canvas_names_to_ids(
     canvas: dict[str, Any], name_to_id: dict[str, str]
 ) -> tuple[dict[str, Any], list[str]]:
@@ -279,6 +322,7 @@ async def import_topologies(
     actor_id: uuid.UUID,
     actor_name: str,
     actor_role: str = "user",
+    authorization: str | None = None,
 ) -> BulkImportReport:
     if fmt == "json":
         records = parse_json_topologies(raw)
@@ -289,9 +333,26 @@ async def import_topologies(
 
     report = _empty_report(dry_run)
 
+    # Issue #908: resolve the caller's device visibility ONCE per request,
+    # before any name is resolved or any row is judged, mirroring the #763
+    # pattern on POST /topologies/{id}/validate. None for an admin (no
+    # filter, no inventory call); a non-admin's own visible-device set
+    # otherwise. An unanswerable lookup fails CLOSED with a 503, never an
+    # unfiltered pass.
+    visible_ids = await resolve_caller_visibility(
+        {"sub": str(actor_id), "role": actor_role},
+        authorization,
+        unavailable_detail=(
+            "Could not verify device visibility; the import was not processed. Retry the request."
+        ),
+    )
+
     # Resolve every device name across the whole batch in one inventory call,
     # then rewrite per topology. Keeps import O(1) HTTP calls regardless of row
-    # count.
+    # count. This lookup stays unfiltered by design (issue #908): it answers
+    # whether a name exists anywhere, exactly the internal resolve-by-name
+    # contract already had; the visibility filter above is applied per row,
+    # below, so a hidden device produces the same outcome as a nonexistent one.
     all_names: set[str] = set()
     for rec in records:
         all_names |= _collect_device_names(rec.get("canvas"))
@@ -319,6 +380,14 @@ async def import_topologies(
 
             canvas = rec.get("canvas") or {"nodes": [], "edges": []}
             rewritten, unresolved = rewrite_canvas_names_to_ids(canvas, name_to_id)
+            if visible_ids is not None:
+                # Issue #908: a name that DID resolve, but to a device outside
+                # this non-admin caller's visibility, is folded into the same
+                # unresolved set, so the reject reason below is byte-identical
+                # to a genuinely nonexistent name.
+                unresolved = sorted(
+                    set(unresolved) | _hidden_names_in_canvas(canvas, name_to_id, visible_ids)
+                )
             # An imported file is caller-supplied input like any other: reduce
             # every device node's `data.device` to the allowlist before it is
             # validated or written.
@@ -333,6 +402,15 @@ async def import_topologies(
                     )
                 )
                 continue
+
+            if visible_ids is not None:
+                # Issue #908, second layer (defense in depth): a device node
+                # can carry a raw `data.device.id` with no `name` at all,
+                # bypassing name resolution (and the fold above) entirely.
+                # Redact any such node exactly as the user-facing validate
+                # route does (issue #763), so it reports the existing
+                # `missing_device` reason and never reaches the L3 pass.
+                rewritten = redact_invisible_device_nodes(rewritten, visible_ids)
 
             # Run the existing full validator (edges + L3) against the rewritten
             # canvas before any write; it is read-only, reading connections (and,
