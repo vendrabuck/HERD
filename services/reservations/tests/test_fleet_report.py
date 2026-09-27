@@ -381,6 +381,31 @@ def test_report_to_csv_fleet_requires_populated_section():
         report_to_csv(_report_with_fleet(None), "fleet")
 
 
+def test_report_to_csv_fleet_section_neutralizes_formula_trigger_in_device_name():
+    """issue #910: name is the admin-written device name (free text); status
+    is a fixed enumeration and stays unquoted."""
+    fleet = FleetSection(
+        device_count=1,
+        idle_device_count=0,
+        window_hours=24.0,
+        total_reserved_hours=6.0,
+        utilization_pct=25.0,
+        devices=[
+            FleetDeviceBucket(
+                device_id=DEVICE_X,
+                name='=HYPERLINK("http://evil")',
+                status="AVAILABLE",
+                reservation_count=1,
+                hours=6.0,
+                utilization_pct=25.0,
+            ),
+        ],
+    )
+    body = report_to_csv(_report_with_fleet(fleet), "fleet")
+    lines = body.splitlines()
+    assert lines[1] == f'{DEVICE_X},"\'=HYPERLINK(""http://evil"")",AVAILABLE,6.0000,25.00,1'
+
+
 # --- routes ---
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
