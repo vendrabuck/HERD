@@ -185,6 +185,63 @@ async def test_export_devices_csv(client):
 
 
 @pytest.mark.asyncio
+async def test_export_devices_csv_neutralizes_formula_trigger_cells(client):
+    """issue #910: a device name or template_name beginning with a formula
+    trigger (=, +, -, @, tab, CR) must be neutralized in the CSV export, not
+    passed through for a spreadsheet to evaluate as a formula. topology_type
+    and status are fixed enumerations and stay unquoted."""
+    template = await _create_template(client, name="=cmd|' /c calc'!A0")
+    await _create_device(client, template["id"], name="=1+1")
+    resp = await client.get("/devices/export", params={"format": "csv"})
+    assert resp.status_code == 200
+    import csv as csv_module
+
+    rows = list(csv_module.DictReader(io.StringIO(resp.text)))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["name"] == "'=1+1"
+    assert row["template_name"] == "'=cmd|' /c calc'!A0"
+    assert row["topology_type"] == "PHYSICAL"
+    assert row["status"] == "AVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_export_templates_csv_neutralizes_formula_trigger_cells(client):
+    """issue #910: the free-text template columns (name, driver_name, icon,
+    description, vendor, model, part_number) are neutralized; template_type
+    and exclusive are a fixed enumeration and a bool, unquoted; sections is a
+    JSON blob whose first character is always "[" and needs no quoting."""
+    driver_id = await _create_driver(client)
+    payload = {
+        **TEMPLATE_PAYLOAD,
+        "name": "=1+1",
+        "driver_id": driver_id,
+        "vendor": "-vendor",
+        "model": "@model",
+        "part_number": "+partnum",
+        "description": "\tdescription",
+        "icon": "data:image/png;base64,iVBOR",
+    }
+    resp = await client.post("/templates", json=payload)
+    assert resp.status_code == 201, resp.text
+    resp = await client.get("/templates/export", params={"format": "csv"})
+    assert resp.status_code == 200
+    import csv as csv_module
+
+    rows = list(csv_module.DictReader(io.StringIO(resp.text)))
+    row = rows[0]
+    assert row["name"] == "'=1+1"
+    assert row["vendor"] == "'-vendor"
+    assert row["model"] == "'@model"
+    assert row["part_number"] == "'+partnum"
+    assert row["description"] == "'\tdescription"
+    # icon is a data: URI, no trigger character leads it, so untouched.
+    assert row["icon"] == "data:image/png;base64,iVBOR"
+    assert row["template_type"] == "device"
+    assert row["sections"].startswith("[")
+
+
+@pytest.mark.asyncio
 async def test_export_templates_json_carries_driver_name(client):
     await _create_template(client, name="Firewall")
     resp = await client.get("/templates/export", params={"format": "json"})
@@ -319,6 +376,60 @@ async def test_device_csv_roundtrip(client):
 
 
 # Update path ----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_device_csv_roundtrip_with_formula_trigger_name(client):
+    """issue #910 round trip: exporting a device named "=1+1" and importing
+    that CSV back in must restore the exact original name, never a name
+    still carrying the export's neutralizing quote."""
+    template = await _create_template(client, name="Firewall")
+    await _create_device(client, template["id"], name="=1+1")
+    csv_body = (await client.get("/devices/export", params={"format": "csv"})).text
+    # Sanity: the export really did neutralize the name.
+    assert "'=1+1" in csv_body
+
+    devs = (await client.get("/devices")).json()["items"]
+    await client.delete(f"/devices/{devs[0]['id']}")
+
+    resp = await client.post(
+        "/devices/import",
+        params={"format": "csv"},
+        files={"file": ("d.csv", io.BytesIO(csv_body.encode()), "text/csv")},
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["created"] == 1
+    assert report["rejected"] == 0
+    devices = (await client.get("/devices")).json()["items"]
+    assert any(d["name"] == "=1+1" for d in devices)
+    assert not any(d["name"] == "'=1+1" for d in devices)
+
+
+@pytest.mark.asyncio
+async def test_template_csv_roundtrip_with_formula_trigger_name(client):
+    """issue #910 round trip: exporting a template named "=1+1" and
+    importing that CSV back in (matched by name, so this is an update in
+    place) must keep the exact original name, never rename it to a
+    quote-carrying variant."""
+    await _create_template(client, name="=1+1")
+    csv_body = (await client.get("/templates/export", params={"format": "csv"})).text
+    # Sanity: the export really did neutralize the name.
+    assert "'=1+1" in csv_body
+
+    resp = await client.post(
+        "/templates/import",
+        params={"format": "csv"},
+        files={"file": ("t.csv", io.BytesIO(csv_body.encode()), "text/csv")},
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["updated"] == 1
+    assert report["created"] == 0
+    assert report["rejected"] == 0
+    templates = (await client.get("/templates")).json()["items"]
+    assert any(t["name"] == "=1+1" for t in templates)
+    assert not any(t["name"] == "'=1+1" for t in templates)
 
 
 @pytest.mark.asyncio

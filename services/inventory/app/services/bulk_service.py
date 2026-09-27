@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
+from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +58,23 @@ TEMPLATE_CSV_COLUMNS = [
     "sections",
     "poll_interval_seconds",
 ]
+
+# issue #910: the columns above that carry free text and must be run through
+# csv_safe_cell on export and csv_unsafe_cell on import. Excluded deliberately:
+# topology_type, status, template_type (fixed enumerations), exclusive and
+# poll_interval_seconds (formatted bool/number), and field_data/sections
+# (JSON-encoded blobs whose first character is always "{" or "[", never a
+# trigger, and which prefixing a quote onto would break json.loads on import).
+DEVICE_CSV_TEXT_COLUMNS = {"name", "template_name"}
+TEMPLATE_CSV_TEXT_COLUMNS = {
+    "name",
+    "driver_name",
+    "icon",
+    "description",
+    "vendor",
+    "model",
+    "part_number",
+}
 
 
 def _empty_report(dry_run: bool) -> BulkImportReport:
@@ -122,7 +140,16 @@ def template_to_record(template: DeviceTemplate) -> dict[str, Any]:
     }
 
 
-def records_to_csv(records: list[dict[str, Any]], columns: list[str]) -> str:
+def records_to_csv(
+    records: list[dict[str, Any]], columns: list[str], text_columns: set[str] | None = None
+) -> str:
+    """Render records as CSV. `text_columns` (issue #910) names the columns to
+    run through `csv_safe_cell`: free text that a caller other than the
+    exporting admin may have written (a device name, a template's
+    driver_name/description/vendor/model/...), never a JSON blob, a fixed
+    enumeration, or a formatted number/bool.
+    """
+    text_columns = text_columns or set()
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
@@ -134,6 +161,8 @@ def records_to_csv(records: list[dict[str, Any]], columns: list[str]) -> str:
                 row[col] = json.dumps(value)
             elif value is None:
                 row[col] = ""
+            elif col in text_columns:
+                row[col] = csv_safe_cell(value)
             else:
                 row[col] = value
         writer.writerow(row)
@@ -147,12 +176,20 @@ def records_to_json(records: list[dict[str, Any]], resource: str) -> str:
 # Import parsing -------------------------------------------------------------
 
 
-def _parse_csv(raw: str, columns: list[str]) -> list[dict[str, Any]]:
+def _parse_csv(
+    raw: str, columns: list[str], text_columns: set[str] | None = None
+) -> list[dict[str, Any]]:
+    text_columns = text_columns or set()
     reader = csv.DictReader(io.StringIO(raw))
     rows: list[dict[str, Any]] = []
     for row in reader:
         # Strip the columns we do not recognize; keep the recognized ones.
-        rows.append({k: row.get(k) for k in columns})
+        # A text_columns cell gets csv_unsafe_cell (issue #910), the inverse
+        # of the csv_safe_cell neutralization records_to_csv applies, so an
+        # exported name like "=1+1" round-trips through import unchanged.
+        rows.append(
+            {k: (csv_unsafe_cell(row.get(k)) if k in text_columns else row.get(k)) for k in columns}
+        )
     return rows
 
 
@@ -175,10 +212,14 @@ def _parse_json(raw: str) -> list[dict[str, Any]]:
     return items
 
 
-def parse_import(raw: bytes, fmt: str, columns: list[str]) -> list[dict[str, Any]]:
+def parse_import(
+    raw: bytes, fmt: str, columns: list[str], text_columns: set[str] | None = None
+) -> list[dict[str, Any]]:
     text = raw.decode("utf-8-sig")
     if fmt == "csv":
-        return _parse_csv(text, columns)
+        # text_columns applies only to CSV: a JSON import was never run
+        # through csv_safe_cell on export, so it carries no quote to strip.
+        return _parse_csv(text, columns, text_columns)
     if fmt == "json":
         return _parse_json(text)
     raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
@@ -222,7 +263,7 @@ async def import_devices(
     actor_id: uuid.UUID | None,
     actor_name: str | None,
 ) -> BulkImportReport:
-    rows = parse_import(raw, fmt, DEVICE_CSV_COLUMNS)
+    rows = parse_import(raw, fmt, DEVICE_CSV_COLUMNS, DEVICE_CSV_TEXT_COLUMNS)
     report = _empty_report(dry_run)
 
     # Build a name -> template-id map once so reference resolution is O(1) per
@@ -324,7 +365,7 @@ async def import_templates(
     dry_run: bool,
     actor_id: uuid.UUID | None,
 ) -> BulkImportReport:
-    rows = parse_import(raw, fmt, TEMPLATE_CSV_COLUMNS)
+    rows = parse_import(raw, fmt, TEMPLATE_CSV_COLUMNS, TEMPLATE_CSV_TEXT_COLUMNS)
     report = _empty_report(dry_run)
 
     # Store the plain driver id, not the ORM instance: a per-row rollback below
