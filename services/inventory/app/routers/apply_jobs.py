@@ -31,6 +31,7 @@ from app.schemas.device_config import (
     ApplyJobsInternalSummary,
     PaginatedApplyJobs,
 )
+from app.services.device_visibility import check_device_read_visibility
 from app.services.manage_guard import (
     _assert_driver_can_configure,
     _is_admin,
@@ -259,11 +260,19 @@ async def list_apply_jobs(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
     payload: dict = Depends(get_current_user_payload),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
     device = await db.get(Device, device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+
+    # Group-visibility gate (issue #909): a non-admin caller outside the
+    # device's groups gets the same 404 an unknown device id gets, so this
+    # endpoint cannot be used to confirm a hidden device exists or to read
+    # its config-apply history (author names, driver-returned error text).
+    # Mirrors device_configs.py's config-version reads (issue #718).
+    await check_device_read_visibility(db, device_id, payload, authorization)
 
     total = (
         await db.execute(
@@ -302,6 +311,7 @@ async def list_apply_jobs(
 async def get_apply_job(
     job_id: uuid.UUID,
     payload: dict = Depends(get_current_user_payload),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Fetch a single apply job by id. Used by the frontend confirmation
@@ -309,10 +319,19 @@ async def get_apply_job(
     user only; visibility through this endpoint matches list_apply_jobs
     (no per-job ACL gate, since the existence of a job_id implies the
     caller already had visibility into it via the listing).
+
+    Group-visibility gate (issue #909): gated on the job's OWN device_id
+    rather than a device_id path param, since this route only takes a job
+    id. A non-admin whose groups do not cover the job's device gets the same
+    404 a nonexistent job_id gets ("Apply job not found"), so this route
+    cannot be used to confirm a hidden device's job exists.
     """
     job = await db.get(DeviceConfigApplyJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Apply job not found")
+    await check_device_read_visibility(
+        db, job.device_id, payload, authorization, not_found_detail="Apply job not found"
+    )
     return ApplyJobResponse.model_validate(job)
 
 

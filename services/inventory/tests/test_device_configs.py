@@ -983,7 +983,7 @@ async def test_list_config_versions_non_admin_denied_when_not_visible():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._resolve_visible_device_ids",
+            "app.services.device_visibility._resolve_visible_device_ids",
             new=AsyncMock(return_value=set()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -1004,7 +1004,7 @@ async def test_list_config_versions_non_admin_allowed_when_visible():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._resolve_visible_device_ids",
+            "app.services.device_visibility._resolve_visible_device_ids",
             new=AsyncMock(return_value={uuid.UUID(device_id)}),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -1022,7 +1022,7 @@ async def test_list_config_versions_admin_unfiltered(client):
     # Admin never consults visibility at all; patch it to blow up to prove
     # the admin path never calls it.
     with patch(
-        "app.routers.device_configs._resolve_visible_device_ids",
+        "app.services.device_visibility._resolve_visible_device_ids",
         new=AsyncMock(side_effect=AssertionError("admin must not check visibility")),
     ):
         resp = await client.get(f"/devices/{device_id}/config-versions")
@@ -1040,7 +1040,7 @@ async def test_diff_config_versions_non_admin_denied_when_not_visible():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._resolve_visible_device_ids",
+            "app.services.device_visibility._resolve_visible_device_ids",
             new=AsyncMock(return_value=set()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -1061,7 +1061,7 @@ async def test_diff_config_versions_non_admin_allowed_when_visible():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._resolve_visible_device_ids",
+            "app.services.device_visibility._resolve_visible_device_ids",
             new=AsyncMock(return_value={uuid.UUID(device_id)}),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -1076,7 +1076,7 @@ async def test_diff_config_versions_admin_unfiltered(client):
     device_id, v1, v2 = await _seed_device_with_two_versions(client)
 
     with patch(
-        "app.routers.device_configs._resolve_visible_device_ids",
+        "app.services.device_visibility._resolve_visible_device_ids",
         new=AsyncMock(side_effect=AssertionError("admin must not check visibility")),
     ):
         resp = await client.get(f"/devices/{device_id}/config-versions/diff?from={v1}&to={v2}")
@@ -1093,7 +1093,7 @@ async def test_get_config_version_non_admin_denied_when_not_visible():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._resolve_visible_device_ids",
+            "app.services.device_visibility._resolve_visible_device_ids",
             new=AsyncMock(return_value=set()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -1114,7 +1114,7 @@ async def test_get_config_version_non_admin_allowed_when_visible():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._resolve_visible_device_ids",
+            "app.services.device_visibility._resolve_visible_device_ids",
             new=AsyncMock(return_value={uuid.UUID(device_id)}),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -1130,7 +1130,7 @@ async def test_get_config_version_admin_unfiltered(client):
     device_id, v1, _ = await _seed_device_with_two_versions(client)
 
     with patch(
-        "app.routers.device_configs._resolve_visible_device_ids",
+        "app.services.device_visibility._resolve_visible_device_ids",
         new=AsyncMock(side_effect=AssertionError("admin must not check visibility")),
     ):
         resp = await client.get(f"/devices/{device_id}/config-versions/{v1}")
@@ -1151,7 +1151,7 @@ async def test_config_version_reads_404_detail_matches_device_read():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._resolve_visible_device_ids",
+            "app.services.device_visibility._resolve_visible_device_ids",
             new=AsyncMock(return_value=set()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:

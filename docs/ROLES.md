@@ -501,6 +501,21 @@ boundary than the write widening above by design: a user can only book (and ther
 usefully read the configuration of) a device they can already see, so reservation
 ownership adds nothing a read needs beyond visibility.
 
+Three more reads originally shipped without this gate and were closed by issue #909:
+`GET /device-groups/device/{id}` (device-group and user-group membership for a
+device), `GET /devices/{id}/apply-jobs` (a device's config-apply job history), and
+`GET /apply-jobs/{id}` (a single apply job, including driver-returned error text).
+All three now call the same shared `check_device_read_visibility` helper
+(`app/services/device_visibility.py`) the config-version reads use: a non-admin
+caller outside the device's groups 404s, and the detail is each route's OWN existing
+unknown-id phrasing, never a new one. `device-groups/device/{id}` keeps its
+id-bearing detail (`Device {id} not found`, issue #392) for both the "does not exist"
+and "exists but hidden" cases; the two apply-job routes keep their plain `Device not
+found` / `Apply job not found`. `GET /apply-jobs/{id}` gates on the JOB's own
+`device_id` (it takes no device_id path param), so a job whose device is hidden 404s
+exactly like a job id that does not exist. Admins are unfiltered on all three, matching
+every other read in this section.
+
 A scheduled (`POST .../schedule`) apply job's authorization is not evaluated once and
 forgotten: issue #704 re-checks the creator's authority at fire time, using the same
 two grounds (explicit `manage` grant, or reservation-owner of an active reservation

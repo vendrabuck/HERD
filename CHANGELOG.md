@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Hardened three inventory reads that skipped the issue #718 device-group
+  visibility gate (issue #909): `GET /device-groups/device/{id}`,
+  `GET /devices/{id}/apply-jobs`, and `GET /apply-jobs/{id}`. Any
+  authenticated user could confirm a hidden device exists, read its
+  device-group and user-group membership, and read its config-apply
+  history, including driver-returned error text. All three now apply the
+  same non-admin group-visibility gate as `GET /devices/{id}` and
+  device_configs.py's config-version reads: a device outside the caller's
+  groups 404s with the identical detail its own unknown-id 404 already
+  used (`device-groups/device/{id}`'s existing id-bearing detail is reused
+  rather than replaced with a second phrasing), and `GET /apply-jobs/{id}`
+  gates on the job's own device_id, answering a hidden device's job with
+  the same 404 a missing job gets. Admins stay unfiltered. The gate itself
+  moved out of device_configs.py into a shared `check_device_read_visibility`
+  helper in `app/services/device_visibility.py` so all three call sites,
+  plus device_configs.py's own three reads, share one implementation.
 - Hardened the topology editor and cabling service against persisting device
   credentials on a canvas. The editor used to store the whole inventory Device
   record on each device node, including `field_data`, which can carry a
