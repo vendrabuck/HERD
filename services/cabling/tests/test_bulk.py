@@ -15,6 +15,7 @@ Authorization header, which a real non-admin request always would; the mock
 stands in for that header's absence.
 """
 
+import csv
 import io
 import json
 import uuid
@@ -209,6 +210,94 @@ async def test_export_csv_flattens_edges(admin_client):
     assert "switch-a" in body
     assert "switch-b" in body
     assert "L1" in body
+
+
+@pytest.mark.asyncio
+async def test_export_csv_neutralizes_formula_trigger_cells(admin_client):
+    """issue #910: a topology name, or a device/port name from the stored
+    canvas, beginning with a formula trigger (=, +, -, @, tab, CR) must be
+    neutralized in the CSV export (a leading single quote), not passed
+    through for a spreadsheet to evaluate as a formula. Device and port
+    names come from the canvas, not inventory, so any authenticated user who
+    can name a device on their own topology controls this cell."""
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": DEV_A, "name": "=formula-device"}}},
+            {"id": "n2", "data": {"device": {"id": DEV_B, "name": "switch-b"}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "n1",
+                "target": "n2",
+                "data": {"layer": "L1", "sourcePort": "+1+1", "targetPort": "eth0"},
+            }
+        ],
+    }
+    create = await admin_client.post("/topologies", json={"name": "=1+1"})
+    tid = create.json()["id"]
+    await admin_client.put(f"/topologies/{tid}", json={"canvas_data": canvas})
+
+    resp = await admin_client.get("/topologies/export", params={"format": "csv"})
+    assert resp.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["topology_name"] == "'=1+1"
+    assert row["source_device"] == "'=formula-device"
+    assert row["source_port"] == "'+1+1"
+    # target_device and target_port carry no trigger and are untouched.
+    assert row["target_device"] == "switch-b"
+    assert row["target_port"] == "eth0"
+
+
+@pytest.mark.asyncio
+async def test_export_then_import_csv_roundtrips_formula_name(admin_client):
+    """issue #910 round trip: exporting a topology named "=1+1" and
+    immediately importing that CSV back in must restore the exact original
+    name, never a name still carrying the export's neutralizing quote."""
+    await _seed_connection()
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": DEV_A, "name": "switch-a"}}},
+            {"id": "n2", "data": {"device": {"id": DEV_B, "name": "switch-b"}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "n1",
+                "target": "n2",
+                "data": {"layer": "L1", "sourcePort": "eth0", "targetPort": "eth0"},
+            }
+        ],
+    }
+    create = await admin_client.post("/topologies", json={"name": "=1+1"})
+    tid = create.json()["id"]
+    await admin_client.put(f"/topologies/{tid}", json={"canvas_data": canvas})
+
+    export_resp = await admin_client.get("/topologies/export", params={"format": "csv"})
+    csv_body = export_resp.text
+    # Sanity: the export really did neutralize the name; otherwise this test
+    # would prove nothing about the round trip.
+    assert "'=1+1" in csv_body
+
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        import_resp = await admin_client.post(
+            "/topologies/import",
+            params={"format": "csv"},
+            files={"file": ("t.csv", io.BytesIO(csv_body.encode()), "text/csv")},
+        )
+    assert import_resp.status_code == 200, import_resp.text
+    report = import_resp.json()
+    # The existing topology named "=1+1" is matched by name (bulk_service's
+    # re-import-updates-in-place rule) and updated, never duplicated under a
+    # still-quoted name.
+    assert report["created"] + report["updated"] == 1
+    assert report["rejected"] == 0
+
+    listing = (await admin_client.get("/topologies")).json()["items"]
+    assert any(t["name"] == "=1+1" for t in listing)
+    assert not any(t["name"] == "'=1+1" for t in listing)
 
 
 # Import ----------------------------------------------------------------------
