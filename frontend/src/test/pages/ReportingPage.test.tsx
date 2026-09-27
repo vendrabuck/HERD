@@ -460,6 +460,48 @@ describe("ReportingPage", () => {
     expect(capturedBody.indexOf(fwLine!)).toBeLessThan(capturedBody.indexOf(commaLine!));
   });
 
+  it("neutralizes a by-template CSV row whose template name opens as a formula (issue #910)", async () => {
+    // A template named "=1+1" is exactly the CSV-formula-injection payload
+    // issue #910 describes: unneutralized, a spreadsheet evaluates it as a
+    // formula rather than showing the literal text.
+    const DEVICE_FORMULA = { id: "dev-formula", name: "sw-formula", template_name: "=1+1" };
+    mockDevices([DEVICE_FW1, DEVICE_FW2, DEVICE_FORMULA]);
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json({
+          ...REPORT,
+          by_device: [
+            ...REPORT.by_device,
+            { device_id: "dev-formula", reservation_count: 1, hours: 5.0 },
+          ],
+        }),
+      ),
+    );
+
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:mock-url");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const createObjectURL = URL.createObjectURL as unknown as ReturnType<typeof vi.fn>;
+
+    renderWithProviders(<ReportingPage />);
+
+    const templateHeading = await screen.findByText("By Template");
+    const templateCard = templateHeading.closest("div")?.parentElement as HTMLElement;
+    await within(templateCard).findByText("=1+1");
+    const downloadButton = within(templateCard).getByRole("button", { name: "Download CSV" });
+    await waitFor(() => expect(downloadButton).toBeEnabled());
+    fireEvent.click(downloadButton);
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+    const blobArg = createObjectURL.mock.calls[0][0] as Blob;
+    const capturedBody = await blobArg.text();
+    const formulaLine = capturedBody.split("\n").find((l) => l.includes("1+1"));
+    // The neutralizing quote is prefixed before escapeCsvCell's own
+    // quoting is considered; "'=1+1" contains no comma/quote/newline, so
+    // escapeCsvCell leaves it unquoted and the row reads exactly this way.
+    expect(formulaLine).toBe("'=1+1,5.0000,1");
+  });
+
   it("switches to the 7-day and 30-day presets, requesting a fresh window each time", async () => {
     const requestedRanges: string[] = [];
     server.use(

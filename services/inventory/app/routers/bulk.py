@@ -23,7 +23,9 @@ from app.models.template import DeviceTemplate
 from app.schemas.bulk import BulkImportReport
 from app.services.bulk_service import (
     DEVICE_CSV_COLUMNS,
+    DEVICE_CSV_TEXT_COLUMNS,
     TEMPLATE_CSV_COLUMNS,
+    TEMPLATE_CSV_TEXT_COLUMNS,
     device_to_record,
     import_devices,
     import_templates,
@@ -38,13 +40,13 @@ _CSV_MEDIA = "text/csv"
 _JSON_MEDIA = "application/json"
 
 
-def _export_response(records, columns, resource, fmt):
+def _export_response(records, columns, resource, fmt, text_columns=None):
     if fmt == "json":
         body = records_to_json(records, resource)
         media = _JSON_MEDIA
         ext = "json"
     else:
-        body = records_to_csv(records, columns)
+        body = records_to_csv(records, columns, text_columns)
         media = _CSV_MEDIA
         ext = "csv"
     return Response(
@@ -63,7 +65,7 @@ async def export_devices(
     """Export every device to CSV or JSON. Admin or superadmin only."""
     devices = (await db.execute(select(Device).order_by(Device.name))).unique().scalars().all()
     records = [device_to_record(d) for d in devices]
-    return _export_response(records, DEVICE_CSV_COLUMNS, "devices", format)
+    return _export_response(records, DEVICE_CSV_COLUMNS, "devices", format, DEVICE_CSV_TEXT_COLUMNS)
 
 
 @router.post("/devices/import", response_model=BulkImportReport)
@@ -97,7 +99,9 @@ async def export_templates(
         (await db.execute(select(DeviceTemplate).order_by(DeviceTemplate.name))).scalars().all()
     )
     records = [template_to_record(t) for t in templates]
-    return _export_response(records, TEMPLATE_CSV_COLUMNS, "templates", format)
+    return _export_response(
+        records, TEMPLATE_CSV_COLUMNS, "templates", format, TEMPLATE_CSV_TEXT_COLUMNS
+    )
 
 
 @router.post("/templates/import", response_model=BulkImportReport)

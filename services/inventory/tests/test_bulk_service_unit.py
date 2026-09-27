@@ -5,6 +5,8 @@ exercise the rejection and format-error branches deterministically without a
 session or HTTP transport.
 """
 
+import csv
+import io
 import json
 import uuid
 
@@ -21,6 +23,7 @@ from app.services.bulk_service import (
     import_devices,
     import_templates,
     parse_import,
+    records_to_csv,
 )
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -96,6 +99,65 @@ def test_parse_import_strips_utf8_bom_for_csv():
 def test_parse_csv_keeps_only_known_columns():
     rows = _parse_csv("name,extra\nA,drop", ["name"])
     assert rows == [{"name": "A"}]
+
+
+# --- issue #910: CSV formula-injection neutralization -----------------------
+
+
+def test_records_to_csv_neutralizes_only_the_named_text_columns():
+    records = [{"name": "=1+1", "template_name": "safe-name", "poll_interval_seconds": 30}]
+    body = records_to_csv(
+        records,
+        ["name", "template_name", "poll_interval_seconds"],
+        {"name", "template_name"},
+    )
+    row = list(csv.DictReader(io.StringIO(body)))[0]
+    assert row["name"] == "'=1+1"
+    # template_name carries no trigger, so it is untouched even though it is
+    # a text column.
+    assert row["template_name"] == "safe-name"
+    # poll_interval_seconds is not in text_columns (a formatted number), so a
+    # value that happens to look like a trigger there would still pass
+    # through untouched; this column never carries one in practice.
+    assert row["poll_interval_seconds"] == "30"
+
+
+def test_records_to_csv_with_no_text_columns_is_a_no_op():
+    records = [{"name": "=1+1"}]
+    body = records_to_csv(records, ["name"])
+    row = list(csv.DictReader(io.StringIO(body)))[0]
+    assert row["name"] == "=1+1"
+
+
+def test_records_to_csv_json_blob_column_never_quoted_even_if_named_a_text_column():
+    # field_data/sections are JSON-encoded before the text_columns check ever
+    # sees them (isinstance(value, (dict, list)) short-circuits first), so
+    # naming a JSON column as a text_column by mistake could not corrupt it.
+    records = [{"name": "=1+1", "field_data": {"a": 1}}]
+    body = records_to_csv(records, ["name", "field_data"], {"name", "field_data"})
+    row = list(csv.DictReader(io.StringIO(body)))[0]
+    assert row["field_data"] == '{"a": 1}'
+
+
+def test_parse_csv_strips_neutralizing_quote_from_named_text_columns():
+    rows = _parse_csv(
+        "name,template_name\n'=1+1,safe-name",
+        ["name", "template_name"],
+        {"name", "template_name"},
+    )
+    assert rows == [{"name": "=1+1", "template_name": "safe-name"}]
+
+
+def test_parse_csv_leaves_apostrophe_led_value_alone():
+    # A legitimately apostrophe-led name (no trigger after the quote) must
+    # not be mangled by import.
+    rows = _parse_csv("name\n'quoted", ["name"], {"name"})
+    assert rows == [{"name": "'quoted"}]
+
+
+def test_parse_csv_without_text_columns_does_not_strip_quotes():
+    rows = _parse_csv("name\n'=1+1", ["name"])
+    assert rows == [{"name": "'=1+1"}]
 
 
 # --- _coerce_json_cell ------------------------------------------------------

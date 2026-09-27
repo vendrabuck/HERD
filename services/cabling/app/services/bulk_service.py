@@ -46,6 +46,7 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
+from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -162,12 +163,24 @@ def topology_to_csv_rows(topology: Topology) -> list[dict[str, Any]]:
         edge_data = edge.get("data") or {}
         rows.append(
             {
-                "topology_name": topology.name,
-                "source_device": node_to_name.get(edge.get("source"), ""),
-                "source_port": edge_data.get("sourcePort") or edge.get("sourceHandle") or "",
-                "target_device": node_to_name.get(edge.get("target"), ""),
-                "target_port": edge_data.get("targetPort") or edge.get("targetHandle") or "",
-                "layer": edge_data.get("layer") or "",
+                # Every column here is free text: topology_name is
+                # user-writable by any authenticated user (issue #910's most
+                # exposed writer), and source/target device and port names
+                # come from the stored canvas, not inventory, so they carry
+                # no server-side allowlist either. layer is a canvas
+                # annotation only (ADR 0009 option C), never validated
+                # against a fixed enum, so it is neutralized too rather than
+                # treated as a safe enumeration.
+                "topology_name": csv_safe_cell(topology.name),
+                "source_device": csv_safe_cell(node_to_name.get(edge.get("source"), "")),
+                "source_port": csv_safe_cell(
+                    edge_data.get("sourcePort") or edge.get("sourceHandle") or ""
+                ),
+                "target_device": csv_safe_cell(node_to_name.get(edge.get("target"), "")),
+                "target_port": csv_safe_cell(
+                    edge_data.get("targetPort") or edge.get("targetHandle") or ""
+                ),
+                "layer": csv_safe_cell(edge_data.get("layer") or ""),
             }
         )
     return rows
@@ -215,12 +228,17 @@ def parse_csv_topologies(raw: bytes) -> list[dict[str, Any]]:
     reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
     by_topology: dict[str, dict[str, Any]] = {}
     for row in reader:
-        topo_name = (row.get("topology_name") or "").strip()
+        # Every cell here may carry a csv_safe_cell neutralization quote
+        # added by records_to_csv (issue #910); csv_unsafe_cell strips it
+        # back off before the value is stripped/used, so an exported name
+        # like "=1+1" round-trips through import to the exact original
+        # rather than staying quoted forever.
+        topo_name = (csv_unsafe_cell(row.get("topology_name")) or "").strip()
         if not topo_name:
             continue
         bucket = by_topology.setdefault(topo_name, {"nodes": {}, "edges": []})
-        src = (row.get("source_device") or "").strip()
-        tgt = (row.get("target_device") or "").strip()
+        src = (csv_unsafe_cell(row.get("source_device")) or "").strip()
+        tgt = (csv_unsafe_cell(row.get("target_device")) or "").strip()
         for dev in (src, tgt):
             if dev and dev not in bucket["nodes"]:
                 node_id = f"node-{dev}"
@@ -235,9 +253,11 @@ def parse_csv_topologies(raw: bytes) -> list[dict[str, Any]]:
                     "source": f"node-{src}",
                     "target": f"node-{tgt}",
                     "data": {
-                        "layer": (row.get("layer") or "").strip() or None,
-                        "sourcePort": (row.get("source_port") or "").strip() or None,
-                        "targetPort": (row.get("target_port") or "").strip() or None,
+                        "layer": (csv_unsafe_cell(row.get("layer")) or "").strip() or None,
+                        "sourcePort": (csv_unsafe_cell(row.get("source_port")) or "").strip()
+                        or None,
+                        "targetPort": (csv_unsafe_cell(row.get("target_port")) or "").strip()
+                        or None,
                     },
                 }
             )

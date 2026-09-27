@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from herd_common.csv_safety import csv_safe_cell
 from herd_common.enums import TopologyType
 from herd_common.internal_client import InternalTokenAuth, call_service
 from sqlalchemy import select
@@ -746,7 +747,13 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
     if section == "user":
         writer.writerow(["user_id", "owner_name", "hours", "reservation_count"])
         for b in report.by_user:
-            writer.writerow([str(b.user_id), b.owner_name, f"{b.hours:.4f}", b.reservation_count])
+            # issue #910: owner_name is free text (a local username or an
+            # LDAP username, neither checked against a formula-safe
+            # character set); hours/reservation_count are formatted
+            # numbers, never quoted.
+            writer.writerow(
+                [str(b.user_id), csv_safe_cell(b.owner_name), f"{b.hours:.4f}", b.reservation_count]
+            )
     elif section == "device":
         writer.writerow(
             [
@@ -774,10 +781,12 @@ def report_to_csv(report: UtilizationReport, section: str) -> str:
             ["device_id", "name", "status", "hours", "utilization_pct", "reservation_count"]
         )
         for b in report.fleet.devices:
+            # issue #910: name is the admin-written device name (free text);
+            # status is a fixed enumeration, never quoted.
             writer.writerow(
                 [
                     str(b.device_id),
-                    b.name,
+                    csv_safe_cell(b.name),
                     b.status,
                     f"{b.hours:.4f}",
                     f"{b.utilization_pct:.2f}",

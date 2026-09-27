@@ -12,6 +12,7 @@ import { EmptyRow } from "@/components/ui/EmptyState";
 import { SkeletonRows } from "@/components/ui/Skeleton";
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { isUnclassifiedCategory, purposeCategoryLabel } from "@/lib/purposeCategories";
+import { csvSafeCell } from "@/lib/csvSafety";
 
 function triggerCsvDownload(filename: string, body: string): void {
   const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
@@ -145,7 +146,7 @@ export function ReportingPage() {
   const handleTemplateCsv = () => {
     const header = "template_name,hours,reservation_count";
     const rows = byTemplate.map((t) =>
-      [escapeCsvCell(t.template_name), t.hours.toFixed(4), t.count].join(","),
+      [escapeCsvCell(csvSafeCell(t.template_name)), t.hours.toFixed(4), t.count].join(","),
     );
     const body = [header, ...rows].join("\n") + "\n";
     const startDate = toDateInputValue(window.start);

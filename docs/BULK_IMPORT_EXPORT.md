@@ -212,6 +212,51 @@ CSV is the intentionally lossy interchange format, and JSON round-trips a
 topology's element nodes and attachments byte-for-byte, same as it does for
 every other canvas node kind.
 
+## CSV formula-injection neutralization (issue #910)
+
+Every free-text CSV cell HERD writes (topology names, device and port names on
+the topology export, device and template names and their free-text columns on
+the inventory exports, and the utilization report's owner_name and fleet
+device name) is passed through `herd_common.csv_safety.csv_safe_cell` before
+it is written. A cell whose text begins with a spreadsheet formula trigger
+(`=`, `+`, `-`, `@`, a tab, or a carriage return), ignoring any leading ASCII
+spaces, gets a single quote prefixed. That is the OWASP-recommended
+neutralization: every common spreadsheet application treats a leading `'` as
+a marker that the cell is literal text and never evaluates what follows, and
+the quote itself is not shown to the user. This exists because topology
+names, and the device and port names carried in a topology's canvas, are
+free text any authenticated user controls (they are not validated against
+inventory), so an unneutralized cell would let one user plant a formula that
+runs when another user, including an admin, opens the export in a
+spreadsheet.
+
+A column that is already a fixed enumeration (`topology_type`, `status`,
+`template_type`, a purpose category) or a formatted number or boolean is
+never passed through the helper, so it is never quoted. A column that carries
+a JSON blob (`field_data`, `sections`) is JSON-encoded first and is never
+inspected for a trigger character either: its first character is always `{`
+or `[`.
+
+The topology, device, and template CSV **importers** are the exact inverse: a
+leading single quote is stripped from a text cell, via
+`herd_common.csv_safety.csv_unsafe_cell`, but only when the character after
+it (ignoring leading spaces) is itself a trigger, i.e. only when the quote is
+one `csv_safe_cell` could have added on export. A value that legitimately
+begins with an apostrophe for its own reason (a name like `'quoted`) carries
+no trigger after that quote and is left completely alone, so it is never
+mangled by an import. This is what makes the round trip exact: exporting a
+topology, device, or template named `=1+1` and importing that CSV straight
+back in restores the literal name `=1+1`, not `'=1+1`. The utilization
+report has no CSV importer at all, so it needs only the export-side
+neutralization.
+
+The frontend's client-built "by template" CSV export (Reporting page) carries
+its own copy of the same neutralization, `csvSafeCell` in
+`frontend/src/lib/csvSafety.ts` (imported by `ReportingPage.tsx`), applied to
+the template name before
+`escapeCsvCell`'s RFC 4180 comma/quote/newline quoting, so the neutralizing
+quote rides inside that quoting rather than in front of it.
+
 ## Validation on import
 
 A topology import runs the existing `build_adjacency_graph` and validate path

@@ -754,3 +754,26 @@ def test_report_to_csv_handles_commas_in_owner_name():
     )
     csv_text = report_to_csv(report, "user")
     assert '"Doe, Jane"' in csv_text
+
+
+def test_report_to_csv_user_section_neutralizes_formula_trigger_in_owner_name():
+    """issue #910: owner_name is free text (a local username restricted only
+    to ``^[a-zA-Z0-9_-]+$``, which allows a leading "-", or an unchecked LDAP
+    username), so a value beginning with a formula trigger must be
+    neutralized. hours/reservation_count are formatted numbers, never
+    quoted."""
+    uid = uuid.uuid4()
+    did = uuid.uuid4()
+    report = UtilizationReport(
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        total_hours=1.0,
+        total_reservations=1,
+        by_user=[
+            UserBucket(user_id=uid, owner_name="-1+1", reservation_count=1, hours=1.0),
+        ],
+        by_device=[DeviceBucket(device_id=did, reservation_count=1, hours=1.0)],
+    )
+    csv_text = report_to_csv(report, "user")
+    lines = csv_text.strip().splitlines()
+    assert lines[1] == f"{uid},'-1+1,1.0000,1"
