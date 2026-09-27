@@ -1011,6 +1011,18 @@ A consequence worth stating: a non-admin who somehow has a hidden device on
 their canvas gets no routing-intent feedback for it. That is the intended
 trade; authoring L3 intent on gear you cannot see is not a supported workflow.
 
+`POST /api/cabling/topologies/import` (issue #908) applies the same
+device-visibility filter for the same reason: import is open to any
+authenticated user and, before this fix, resolved every device name and ran
+this validator against the unredacted canvas regardless of caller, reopening
+this route's own oracle through a batched side door (with `dry_run=true`
+making it free of side effects). A non-admin's imported canvas name that
+resolves to a device outside their visibility is now rejected with the same
+`unresolved device names` reason a nonexistent name gets, and a raw device id
+smuggled into the canvas with no name is redacted the same way this route
+redacts one, so it can only ever surface as `missing_device`. See
+[BULK_IMPORT_EXPORT.md](BULK_IMPORT_EXPORT.md#device-visibility-on-topology-import).
+
 ### Create a topology
 
 ```
@@ -1664,7 +1676,7 @@ Authorization: Bearer <admin-token>
 | `/api/cabling/topologies/{id}` | PUT | creator | yes | yes |
 | `/api/cabling/topologies/{id}` | DELETE | creator | yes | yes |
 | `/api/cabling/topologies/export` | GET | yes | yes | yes |
-| `/api/cabling/topologies/import` | POST | create yes; update creator, per row | yes | yes |
+| `/api/cabling/topologies/import` | POST | create yes; update creator, per row; filtered to visible devices | yes | yes |
 | `/api/cabling/internal/forks` | POST | internal | internal | internal |
 | `/api/acl/grants` | GET | | yes | yes |
 | `/api/acl/grants/{id}` | GET | | yes | yes |

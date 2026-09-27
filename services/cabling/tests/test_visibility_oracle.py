@@ -24,6 +24,7 @@ consumers, for the same reason: they exercise the shared helper, not a route
 that duplicates its logic.
 """
 
+import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -37,8 +38,10 @@ from app.routes.pathfind import pathfind_batch_endpoint, pathfind_endpoint
 from app.routes.topologies import validate_topology
 from app.schemas.pathfind import PathfindBatchRequest, PathfindRequest
 from app.services import l3_validation, visible_devices
+from app.services.bulk_service import import_topologies, parse_csv_topologies
 from app.services.visible_devices import VisibleDevicesUnavailableError
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
@@ -494,3 +497,231 @@ async def test_list_connections_non_admin_fails_closed_when_visibility_unavailab
                 )
     assert exc.value.status_code == 503
     assert "device visibility" in exc.value.detail
+
+
+# --- import: the #908 visibility gate on POST /topologies/import -----------
+
+
+def _import_canvas_names(a_name: str, b_name: str) -> dict:
+    """Two device nodes referenced by NAME, the import wire format."""
+    return {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"name": a_name}, "label": a_name}},
+            {"id": "n2", "data": {"device": {"name": b_name}, "label": b_name}},
+        ],
+        "edges": [{"id": "e1", "source": "n1", "target": "n2", "data": {"layer": "L1"}}],
+    }
+
+
+def _import_canvas_smuggled_hidden_switch() -> dict:
+    """DUT_A and DUT_B by name; HIDDEN_SWITCH carried as a raw `data.device.id`
+    with NO `name` at all, the bypass that skips name resolution (and the
+    name-based hidden-device check that rides on it) entirely."""
+    return {
+        "nodes": [
+            {"id": "a", "data": {"device": {"name": "dut-a"}, "label": "dut-a"}},
+            {"id": "b", "data": {"device": {"name": "dut-b"}, "label": "dut-b"}},
+            {
+                "id": "sw",
+                "data": {
+                    "device": {"id": str(HIDDEN_SWITCH)},
+                    "l3": {
+                        "routes": [
+                            {
+                                "destination": "10.20.0.0/24",
+                                "next_hop": "10.0.0.2",
+                                "interface": "eth1",
+                            }
+                        ]
+                    },
+                },
+            },
+        ],
+        "edges": [
+            {"id": "a-sw", "source": "a", "target": "sw", "data": {"layer": "L1"}},
+            {"id": "sw-b", "source": "sw", "target": "b", "data": {"layer": "L1"}},
+            {"id": "a-b", "source": "a", "target": "b", "data": {"layer": "L2"}},
+        ],
+    }
+
+
+async def _run_import(items, *, role="user", authorization=AUTH, actor_id=USER_ID, dry_run=True):
+    raw = json.dumps(items).encode()
+    async with TestSession() as db:
+        return await import_topologies(
+            db, raw, "json", dry_run, actor_id, "viewer", role, authorization=authorization
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_non_admin_hidden_device_matches_nonexistent_device_report():
+    """A row naming a device that exists but is hidden produces the exact
+    same per-row report as a row naming a device that does not exist at all
+    (issue #908): same action, same reason text, byte for byte."""
+    canvas = _import_canvas_names("phantom-dev", "phantom-dev")
+    items = [{"name": "PhantomRow", "canvas": canvas}]
+
+    with patch.object(visible_devices, "fetch_visible_device_ids", _visible_mock()):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={"phantom-dev": str(HIDDEN_SWITCH)}),
+        ):
+            hidden_report = await _run_import(items)
+
+    with patch.object(visible_devices, "fetch_visible_device_ids", _visible_mock()):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={}),
+        ):
+            ghost_report = await _run_import(items)
+
+    assert hidden_report.rows == ghost_report.rows
+    assert hidden_report.rows[0].action == "reject"
+    assert hidden_report.rows[0].reason == "unresolved device names: phantom-dev"
+
+
+@pytest.mark.asyncio
+async def test_import_non_admin_hidden_l3_switch_via_smuggled_id_is_redacted():
+    """A device node carrying a raw id with no name (bypassing name
+    resolution, and the name-based hidden check with it) is still caught by
+    `redact_invisible_device_nodes` before validation runs: the hidden L3
+    switch's routing intent never reaches the L3 pass, and neither edge
+    touching it reports anything beyond the existing `missing_device` reason
+    (issue #908, defense in depth)."""
+    inventory, calls = _mock_inventory()
+    items = [{"name": "SmuggledSwitch", "canvas": _import_canvas_smuggled_hidden_switch()}]
+    async with TestSession() as db:
+        await _seed_chain(db)
+
+    with patch.object(visible_devices, "fetch_visible_device_ids", _visible_mock()):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={"dut-a": str(DUT_A), "dut-b": str(DUT_B)}),
+        ):
+            with patch.object(l3_validation, "call_service", inventory):
+                report = await _run_import(items)
+
+    row = report.rows[0]
+    assert row.action == "reject"
+    assert row.reason.startswith("topology validation failed: ")
+    assert "missing_device(a-sw)" in row.reason
+    assert "missing_device(sw-b)" in row.reason
+    # DUT_A to DUT_B is physically reachable THROUGH the hidden switch (the
+    # same connections _seed_chain wires up); redaction removes the node, not
+    # the cabling, so that edge is not in the reject reason at all.
+    assert "a-b" not in row.reason
+    # The hidden switch's routing intent never reached the L3 pass: no
+    # inventory call, and no l3_* reason of any kind in the report.
+    assert calls == []
+    assert "l3_" not in row.reason
+
+
+@pytest.mark.asyncio
+async def test_import_non_admin_non_dry_run_hidden_device_creates_nothing():
+    """A non-dry-run row naming a hidden device is rejected and the topology
+    is never created (issue #908): the write path must not run for a
+    hidden-device reference any more than for a nonexistent one."""
+    items = [{"name": "NeverCreated", "canvas": _import_canvas_names("hidden-dev", "hidden-dev")}]
+
+    with patch.object(visible_devices, "fetch_visible_device_ids", _visible_mock()):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={"hidden-dev": str(HIDDEN_SWITCH)}),
+        ):
+            report = await _run_import(items, dry_run=False)
+
+    assert report.rows[0].action == "reject"
+    assert report.created == 0
+    async with TestSession() as db:
+        result = await db.execute(select(Topology).where(Topology.name == "NeverCreated"))
+        assert result.scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_import_non_admin_fails_closed_when_visibility_unavailable():
+    """An unanswerable visibility lookup is a 503 with NO partial result and
+    no row processed: the 503 fires before name resolution even starts, and
+    nothing is written."""
+    fetch = AsyncMock(side_effect=VisibleDevicesUnavailableError("inventory down"))
+    items = [{"name": "NeverWritten", "canvas": _import_canvas_names("dut-a", "dut-b")}]
+
+    with patch.object(visible_devices, "fetch_visible_device_ids", fetch):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={"dut-a": str(DUT_A), "dut-b": str(DUT_B)}),
+        ) as resolver:
+            with pytest.raises(HTTPException) as exc:
+                await _run_import(items, dry_run=False)
+
+    assert exc.value.status_code == 503
+    resolver.assert_not_awaited()
+    async with TestSession() as db:
+        result = await db.execute(select(Topology).where(Topology.name == "NeverWritten"))
+        assert result.scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_import_admin_never_calls_the_visibility_lookup():
+    """The same canvas as the smuggled-hidden-switch test above, admin
+    caller: the switch is judged for real (the L3 pass runs and reports the
+    actual reason), and the visibility lookup is never invoked at all."""
+    fetch = AsyncMock(return_value=set())
+    inventory, calls = _mock_inventory(interfaces=[{"name": "eth9", "ip": "10.0.0.1/24"}])
+    items = [{"name": "AdminRow", "canvas": _import_canvas_smuggled_hidden_switch()}]
+    async with TestSession() as db:
+        await _seed_chain(db)
+
+    with patch.object(visible_devices, "fetch_visible_device_ids", fetch):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={"dut-a": str(DUT_A), "dut-b": str(DUT_B)}),
+        ):
+            with patch.object(l3_validation, "call_service", inventory):
+                report = await _run_import(items, role="admin")
+
+    fetch.assert_not_awaited()
+    assert calls  # admins are not filtered, so inventory IS consulted
+    assert "l3_unknown_interface" in report.rows[0].reason
+
+
+@pytest.mark.asyncio
+async def test_import_csv_hidden_device_matches_json_report():
+    """CSV import parses into the same canvas shape (parse_csv_topologies)
+    before import_topologies runs, so it is covered by the same gate: a
+    hidden-device row behaves identically to the JSON form (issue #908)."""
+    csv_raw = (
+        "topology_name,source_device,source_port,target_device,target_port,layer\n"
+        "CsvHidden,phantom-dev,eth0,phantom-dev,eth1,L1\n"
+    ).encode()
+    # Confirm the CSV row really does parse into a name-only canvas, the same
+    # shape the JSON path gates.
+    records = parse_csv_topologies(csv_raw)
+    assert records[0]["name"] == "CsvHidden"
+    assert {n["data"]["device"]["name"] for n in records[0]["canvas"]["nodes"]} == {"phantom-dev"}
+
+    with patch.object(visible_devices, "fetch_visible_device_ids", _visible_mock()):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={"phantom-dev": str(HIDDEN_SWITCH)}),
+        ):
+            async with TestSession() as db:
+                csv_report = await import_topologies(
+                    db, csv_raw, "csv", True, USER_ID, "viewer", "user", authorization=AUTH
+                )
+
+    json_items = [
+        {"name": "CsvHidden", "canvas": _import_canvas_names("phantom-dev", "phantom-dev")}
+    ]
+    with patch.object(visible_devices, "fetch_visible_device_ids", _visible_mock()):
+        with patch(
+            "app.services.bulk_service.resolve_device_names",
+            new=AsyncMock(return_value={"phantom-dev": str(HIDDEN_SWITCH)}),
+        ):
+            json_report = await _run_import(json_items)
+
+    assert csv_report.rows[0].action == json_report.rows[0].action == "reject"
+    assert (
+        csv_report.rows[0].reason
+        == json_report.rows[0].reason
+        == "unresolved device names: phantom-dev"
+    )

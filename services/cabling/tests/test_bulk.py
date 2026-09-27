@@ -4,6 +4,15 @@ Covers: JSON and CSV export with device ids rewritten to names, JSON/CSV import
 round-trip, cross-instance device-name resolution (mocked inventory call),
 dry-run writing nothing, per-row error handling, unresolved device rejection,
 and the existing validator rejecting an unreachable edge on import.
+
+None of these tests are about device visibility (issue #908; see
+test_visibility_oracle.py for that). The autouse `_unfiltered_visibility`
+fixture below pins `resolve_caller_visibility` to always return None (the
+admin, no-filter outcome), which is exactly this suite's pre-#908 behavior and
+keeps every existing assertion here about ownership, reservation locks, and
+validation unaffected by the new gate. The ASGI test client below sends no
+Authorization header, which a real non-admin request always would; the mock
+stands in for that header's absence.
 """
 
 import io
@@ -60,6 +69,18 @@ async def setup_db():
     yield
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.fixture(autouse=True)
+def _unfiltered_visibility():
+    """Every test in this file predates issue #908 and is not about
+    visibility; pin the new per-request lookup to the no-filter outcome so
+    this suite keeps testing what it always tested. See module docstring."""
+    with patch(
+        "app.services.bulk_service.resolve_caller_visibility",
+        new=AsyncMock(return_value=None),
+    ):
+        yield
 
 
 async def _override_get_db() -> AsyncSession:

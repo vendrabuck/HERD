@@ -221,6 +221,24 @@ two devices have no physical path through the cabling graph is rejected with a
 node whose device name does not exist in the target instance's inventory is
 rejected with an `unresolved device names` reason.
 
+## Device visibility on topology import
+
+Topology import is open to any authenticated user, so a non-admin caller must
+not learn anything about a device outside their device-group visibility that
+`POST /topologies/{id}/validate` would not already tell them (issue #763's
+visibility oracle). The import route resolves the caller's visibility once per
+request the same way validate does: admins are unfiltered and never trigger
+the lookup, and an unanswerable inventory lookup fails closed with a 503 and
+writes nothing. A canvas device name that resolves to a real device outside
+the caller's visible set is folded into that row's `unresolved device names`
+reason, so a hidden device and a nonexistent one produce an identical
+rejection. A device reference that carries a raw id with no name at all
+(bypassing name resolution) is redacted from the canvas before validation
+runs, so it can only ever surface as the existing `missing_device` reason and
+never reaches the L3 pass. A non-dry-run row that references a hidden device
+is rejected and stores nothing. CSV import parses into the same canvas shape
+before this gate runs, so it is covered identically.
+
 ## Out of scope
 
 Reservations, ACL grants, users, and notification preferences are not part of

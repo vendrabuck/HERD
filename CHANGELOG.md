@@ -18,6 +18,29 @@
   moved out of device_configs.py into a shared `check_device_read_visibility`
   helper in `app/services/device_visibility.py` so all three call sites,
   plus device_configs.py's own three reads, share one implementation.
+- Hardened `POST /api/cabling/topologies/import` against reopening the #763
+  visibility oracle through a batched side door. Topology import is open to
+  any authenticated user, and it used to resolve every device name through
+  the unfiltered internal inventory lookup and run the full topology
+  validator against the unredacted canvas regardless of caller, so a
+  non-admin could confirm a hidden device's name, learn whether two hidden
+  devices are physically connected, and probe a hidden Layer 3 switch's
+  interface and VRF configuration through the per-row reject reason, with
+  `dry_run=true` making it free of side effects. The import route now
+  resolves the caller's device visibility once per request the same way
+  `POST /topologies/{id}/validate` does (issue #763's shared
+  `resolve_caller_visibility`): admins are unfiltered and never trigger the
+  lookup, and an unanswerable inventory lookup fails closed with a 503 and
+  writes nothing. For a non-admin, a canvas device name that resolves to a
+  device outside their visibility is folded into the row's existing
+  `unresolved device names` reason, so a hidden device and a nonexistent one
+  produce an identical rejection; a device reference that carries a raw id
+  with no name at all (bypassing name resolution) is redacted from the canvas
+  before validation runs, so it can only ever surface as the existing
+  `missing_device` reason and never reaches the Layer 3 pass. A non-dry-run
+  row that references a hidden device is rejected and stores nothing. CSV
+  import parses into the same canvas shape before this gate runs, so it is
+  covered identically.
 - Hardened the topology editor and cabling service against persisting device
   credentials on a canvas. The editor used to store the whole inventory Device
   record on each device node, including `field_data`, which can carry a
