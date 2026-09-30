@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Fixed `sort_by=status` on the reservations list ordering by the Postgres enum's
+  storage order instead of alphabetically (issue #902). The ORDER BY now casts
+  the status column to a string, so every dialect sorts by status name, matching
+  the SQLite unit test and the UI. A new live Postgres suite,
+  `test_reservation_sort_live_pg.py`, pins both directions and is part of
+  `_gate-pg-live-tests`.
 - Made every reservation status transition a compare-and-swap (issue #899).
   The immediate create path wrote ACTIVE (or FAILED) with an UPDATE keyed by
   id alone after seconds of inventory calls, so a cancel committed in that
