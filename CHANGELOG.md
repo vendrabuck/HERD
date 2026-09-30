@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- Fixed back-to-back bookings leaving a shared exclusive device AVAILABLE under
+  an ACTIVE reservation (issue #898). In one expiration tick the successor's
+  activation ran before the predecessor's release, and both are absolute
+  inventory writes. The sweep now releases completed rows' devices before
+  activating claimed rows, and every release (cancel, release, provision
+  failure, timeout, auto-complete) skips a device another PENDING_PROVISION or
+  ACTIVE reservation still holds, logging `release_skipped_device_held`. The
+  activation claim also requires `end_time > now`: a PENDING row whose window
+  already elapsed is moved to FAILED (`reservation_window_elapsed`), stages
+  `reservation.failed`, and makes no inventory or fork call.
 - Stopped PENDING reservations from writing inventory status (issue #897).
   Since #132 a future booking touches no inventory status until activation,
   but cancelling a PENDING booking, or PATCH-removing a device from one,

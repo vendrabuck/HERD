@@ -165,3 +165,44 @@ async def test_patch_add_still_refuses_a_device_that_is_not_available_on_pending
                 db, res.id, USER_ID, ReservationUpdate(device_ids=[HELD, OTHER]), token="t"
             )
     assert _calls(spy) == []
+
+
+# --- holder-aware release (issue #898): cancel and release share one helper ---
+
+
+@pytest.mark.parametrize("holder_status", [ACTIVE, PROVISION])
+async def test_cancel_skips_a_device_another_live_row_holds(spy, holder_status):
+    other_dev = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        res = await _insert(db, ACTIVE, [HELD, other_dev])
+        await _insert(db, holder_status, [HELD])
+        await cancel_reservation(db, res.id, USER_ID, "token")
+    assert _calls(spy) == [([str(other_dev)], "AVAILABLE")]
+
+
+async def test_cancel_release_ignores_a_pending_row_as_holder(spy):
+    async with TestSessionLocal() as db:
+        res = await _insert(db, ACTIVE, [HELD])
+        await _insert(db, PENDING, [HELD])
+        await cancel_reservation(db, res.id, USER_ID, "token")
+    assert _calls(spy) == [([str(HELD)], "AVAILABLE")]
+
+
+async def test_release_skips_a_device_another_live_row_holds(spy):
+    from app.services.reservation_service import release_reservation
+
+    other_dev = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        res = await _insert(db, ACTIVE, [HELD, other_dev])
+        await _insert(db, ACTIVE, [other_dev])
+        out = await release_reservation(db, res.id, USER_ID, "token")
+    assert out.status == ReservationStatus.COMPLETED
+    assert _calls(spy) == [([str(HELD)], "AVAILABLE")]
+
+
+async def test_holder_lookup_failure_falls_back_to_releasing(spy):
+    async with TestSessionLocal() as db:
+        res = await _insert(db, ACTIVE, [HELD])
+        with patch(f"{SVC}._devices_held_by_others", new=AsyncMock(side_effect=RuntimeError("x"))):
+            await cancel_reservation(db, res.id, USER_ID, "token")
+    assert _calls(spy) == [([str(HELD)], "AVAILABLE")]
