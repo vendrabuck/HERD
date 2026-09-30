@@ -641,3 +641,47 @@ async def test_configure_validation_runs_after_load_driver(db, monkeypatch):
         method_kwargs={"commands": ["ip route 192.0.2.0/24 blackhole"]},
     )
     assert calls.index("load") < calls.index("schema")
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_start_log_emits_context_keys_not_values(db, monkeypatch, caplog):
+    """Issue #905: the start log used to pass the whole redacted context as an
+    extra. Redaction masks only template fields typed password, so a text-typed
+    secret under a neutral key (an enable password stored as "notes") reached
+    the JSON log. Only the sorted key names may be logged."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_metadata", AsyncMock(return_value={}))
+    monkeypatch.setattr(ex_service, "execute_driver_method", MagicMock(side_effect=_ok_method))
+
+    secret_value = "Enable-Pw-Do-Not-Leak-93bc"
+    device = _device_data()
+    device["field_data"] = {"notes": secret_value, "tacacs_key": secret_value}
+    template = {
+        "sections": [
+            {
+                "name": "General",
+                "fields": [
+                    {"key": "notes", "type": "string"},
+                    {"key": "tacacs_key", "type": "string"},
+                ],
+            }
+        ]
+    }
+
+    with caplog.at_level("INFO"):
+        run = await run_driver_action(db, device, template, "status", USER_ID)
+    assert run.status == "SUCCESS"
+
+    matching = [r for r in caplog.records if r.getMessage() == "Starting driver execution"]
+    assert len(matching) == 1
+
+    from herd_common.logging import JSONFormatter
+
+    line = JSONFormatter("execution").format(matching[0])
+    assert secret_value not in line
+    output = json.loads(line)
+    assert "context" not in output
+    keys = output["context_keys"]
+    assert keys == sorted(keys)
+    assert "HERD_notes" in keys
+    assert "HERD_tacacs_key" in keys

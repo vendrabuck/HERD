@@ -160,7 +160,8 @@ A `dynamic_instances` table: id, reservation_id, template_id,
 hypervisor_id, device_id (nullable until materialized), instance_ref,
 status (CREATING, ACTIVE, DESTROYED), error, timestamps. This is the
 applied-state ledger teardown drives from, the direct peer of
-`VlanAssignment` and `RouteAssignment`.
+`VlanAssignment` and `RouteAssignment`. The ledger moves only forward: a DESTROYED row is never
+re-activated, and create updates are compare-and-swap (issue #896).
 
 ### Secrets delivery and sandbox limits
 

@@ -429,7 +429,12 @@ async def run_driver_action(
             "device_id": str(device_id),
             "driver_id": str(driver_id),
             "action": action,
-            "context": redacted,
+            # Not the context dict (issue #905): build_context copies every
+            # field_data key as HERD_<key> and redaction masks only template
+            # fields typed password, so a text-typed secret under a neutral key
+            # (an enable password stored as "notes") would reach the log, where
+            # key-name redaction cannot see inside a value. Key names only.
+            "context_keys": sorted(redacted),
             "port_a": port_a,
             "port_b": port_b,
             # Not the raw method_kwargs dict: for "configure" this carries
@@ -595,8 +600,10 @@ async def run_driver_action(
         if not exception_class and result.get("stderr"):
             # The child failed without a structured line (issue #840): 'error'
             # is a pinned string, and the unstructured output is logged here
-            # and goes no further. In the MESSAGE, since JSONFormatter drops
-            # extra keys that are not on its allowlist.
+            # and goes no further. Logged in the MESSAGE, not `extra`: raw
+            # driver output can carry a secret inside a VALUE, which the
+            # formatter's key-name redaction cannot see, and a message line is
+            # the one place this deliberately-raw text is kept (issue #872).
             logger.error(
                 "Driver process failed on run %s (%s): %s", run.id, error_msg, result["stderr"]
             )
