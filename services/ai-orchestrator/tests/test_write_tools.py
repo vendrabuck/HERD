@@ -637,3 +637,111 @@ async def test_read_only_tool_dispatches_when_flag_on(monkeypatch):
     assert result["is_error"] is False
     body = json.loads(result["content"])
     assert body["id"] == str(DEVICE_ID)
+
+
+# --- Issue #903: side effects for propose_config_change ---
+
+
+def _propose_routes(post_response):
+    return [
+        (
+            lambda r: r.method == "GET" and r.url.path.endswith(f"/devices/{DEVICE_ID}"),
+            httpx.Response(200, json=_device()),
+        ),
+        (
+            lambda r: r.method == "GET" and r.url.path.endswith(f"/templates/{TEMPLATE_ID}"),
+            httpx.Response(200, json=_template_with_password_fields()),
+        ),
+        (
+            lambda r: (
+                r.method == "POST" and r.url.path.endswith(f"/devices/{DEVICE_ID}/config-versions")
+            ),
+            post_response,
+        ),
+    ]
+
+
+_PROPOSE_ARGS = {"device_id": str(DEVICE_ID), "config_payload": {"vlan": 200}, "description": "x"}
+
+
+@pytest.mark.asyncio
+async def test_propose_config_change_success_records_one_config_version_side_effect():
+    routes = _propose_routes(
+        httpx.Response(201, json={"id": VERSION_ID, "version_number": 7, "config": {}})
+    )
+    async with _dispatcher_with(routes) as dispatcher:
+        result = await dispatcher.dispatch("propose_config_change", _PROPOSE_ARGS)
+    assert result["is_error"] is False
+    assert dispatcher.side_effects == [
+        {
+            "kind": "config_version_created",
+            "tool": "propose_config_change",
+            "device_id": str(DEVICE_ID),
+            "version_id": VERSION_ID,
+            "version_number": 7,
+        }
+    ]
+
+
+def _raise_connect_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("inventory down", request=request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "post_response",
+    [
+        pytest.param(httpx.Response(403, json={"detail": "no manage"}), id="403"),
+        pytest.param(httpx.Response(422, json={"detail": "bad"}), id="422"),
+        pytest.param(httpx.Response(500, json={"detail": "boom"}), id="500"),
+        pytest.param(_raise_connect_error, id="transport_error"),
+    ],
+)
+async def test_propose_config_change_failure_records_no_side_effect(post_response):
+    async with _dispatcher_with(_propose_routes(post_response)) as dispatcher:
+        await dispatcher.dispatch("propose_config_change", _PROPOSE_ARGS)
+    assert dispatcher.side_effects == []
+
+
+def _schedule_ok(req: httpx.Request) -> httpx.Response:
+    body = json.loads(req.content)
+    return httpx.Response(
+        201,
+        json={
+            "id": JOB_ID,
+            "dry_run": body["dry_run"],
+            "status": "pending",
+            "scheduled_for": body["scheduled_for"],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_write_tool_records_a_side_effect_on_success():
+    """Invariant (issue #903): each write tool that lands a durable change
+    records a side effect. The case table is checked against WRITE_TOOL_NAMES so
+    a new write tool cannot be added without extending this test."""
+    cases = {
+        "propose_config_change": (
+            _propose_routes(
+                httpx.Response(201, json={"id": VERSION_ID, "version_number": 1, "config": {}})
+            ),
+            _PROPOSE_ARGS,
+        ),
+        "schedule_config_apply": (
+            [
+                (
+                    lambda r: r.method == "POST" and r.url.path.endswith("/schedule"),
+                    _schedule_ok,
+                )
+            ],
+            {"device_id": str(DEVICE_ID), "version_id": VERSION_ID},
+        ),
+    }
+    assert set(cases) == set(WRITE_TOOL_NAMES)
+    for tool, (routes, args) in cases.items():
+        async with _dispatcher_with(routes) as dispatcher:
+            result = await dispatcher.dispatch(tool, args)
+        assert result["is_error"] is False, tool
+        assert len(dispatcher.side_effects) == 1, tool
+        assert dispatcher.side_effects[0]["tool"] == tool

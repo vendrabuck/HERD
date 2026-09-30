@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- Fixed the reservation assistant losing the record of a write (issues #903,
+  #904, #906). `propose_config_change` now records a `config_version_created`
+  side effect, so a later timeout or provider failure persists the turn
+  instead of rolling back a config version that exists (it does not set
+  `pending_apply`). Both transports now persist a completed turn outside the
+  overall deadline, so the deadline can no longer interrupt the commit or
+  append the same segments twice. The closing text of an incomplete turn now
+  ignores errored tool calls when deciding which landed actions were
+  recorded, and `ai_assistant_incomplete_after_tools` carries `reason` as its
+  own log field.
 - Fixed `sort_by=status` on the reservations list ordering by the Postgres enum's
   storage order instead of alphabetically (issue #902). The ORDER BY now casts
   the status column to a string, so every dialect sorts by status name, matching

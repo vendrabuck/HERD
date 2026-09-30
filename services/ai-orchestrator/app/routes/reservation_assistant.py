@@ -45,7 +45,7 @@ from app.services.ai_client import (
     ai_is_configured,
     get_ai_client,
 )
-from app.services.llm_provider import TextBlock, ToolUseBlock, Usage
+from app.services.llm_provider import TextBlock, ToolResultBlock, ToolUseBlock, Usage
 from app.services.reservation_context import (
     ContextDeadlineExceededError,
     ReservationNotFoundError,
@@ -73,7 +73,10 @@ INCOMPLETE_LANDED_ACTIONS_HEADER = "Actions that landed before the failure:"
 # Fallback tool name per dispatcher.side_effects `kind`, used only when an
 # entry has no `tool` key of its own (every entry ToolDispatcher records
 # today does; this only guards a hand-built entry, e.g. in a test double).
-_SIDE_EFFECT_KIND_TOOL_NAMES = {"scheduled_apply": "schedule_config_apply"}
+_SIDE_EFFECT_KIND_TOOL_NAMES = {
+    "scheduled_apply": "schedule_config_apply",
+    "config_version_created": "propose_config_change",
+}
 
 get_current_user, _require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -230,15 +233,26 @@ def _closing_incomplete_text(*, segments: list[TurnSegment], dispatcher: ToolDis
     write that genuinely happened. Detect that gap by matching each
     dispatcher.side_effects entry against a tool_use block of the same name
     recorded in `segments` (a plain per-name count match, since side_effects
-    carries no iteration index to compare against); any side effect left
+    carries no iteration index to compare against, skipping tool_use blocks whose
+    tool_result is an error); any side effect left
     unmatched is named explicitly in an appended, deterministic list, so the
     closing message is never a dangling reference to nothing.
     """
+    # Only a tool_use whose paired tool_result succeeded can have recorded a
+    # side effect; an errored call (refused, 403/409/422) landed nothing, so
+    # counting it would make a later landed call of the same tool look
+    # recorded (issue #906).
+    errored_ids = {
+        block.tool_use_id
+        for segment in segments
+        for block in segment.tool_result_blocks
+        if isinstance(block, ToolResultBlock) and block.is_error
+    }
     recorded_names: Counter[str] = Counter(
         block.name
         for segment in segments
         for block in segment.assistant_blocks
-        if isinstance(block, ToolUseBlock)
+        if isinstance(block, ToolUseBlock) and block.id not in errored_ids
     )
     unrecorded: list[str] = []
     for entry in dispatcher.side_effects:
@@ -347,11 +361,10 @@ async def _finalize_incomplete_turn(
 
     await usage_repo.record_usage(db, user_id, usage, fallback_text=question + closing_text)
 
-    # Reason lives in the message string, not `extra`: herd_common's
-    # JSONFormatter only forwards a fixed allowlist of `extra` keys into the
-    # container log (see issue #840, which hit the same gotcha), so a reason
-    # passed only via extra would never reach it.
-    logger.warning("ai_assistant_incomplete_after_tools: reason=%s", reason)
+    logger.warning(
+        "ai_assistant_incomplete_after_tools",
+        extra={"reason": reason},
+    )
 
     return AssistantResponse(
         answer=closing_text,
@@ -396,7 +409,6 @@ async def reservation_assistant(
         seed_gatherer=seed_gatherer,
     )
 
-    pending_apply: PendingApply | None = None
     dispatcher: ToolDispatcher | None = None
     # Issue #871: shared-mutable output params (see AIClient's docstring).
     # partial_segments/partial_usage are mutated in place by the loop below,
@@ -419,14 +431,6 @@ async def reservation_assistant(
                     per_call_timeout_s=settings.assistant_per_call_timeout_s,
                     segments=partial_segments,
                     usage=partial_usage,
-                )
-                pending_apply = await _persist_turn(
-                    db=db,
-                    conversation=conversation,
-                    turn=turn,
-                    user_id=user_id,
-                    question=body.question,
-                    dispatcher=dispatcher,
                 )
                 call_log = list(dispatcher.call_log)
     except asyncio.TimeoutError as exc:
@@ -496,6 +500,21 @@ async def reservation_assistant(
             status.HTTP_502_BAD_GATEWAY,
             "Assistant call failed",
         ) from exc
+
+    # Issue #904: the overall deadline bounds only the model-and-tool loop
+    # above. Persisting a completed turn runs outside it, so a deadline can
+    # never interrupt the commit or re-enter _finalize_incomplete_turn with
+    # the same segments (persistence happens at most once per turn).
+    # dispatcher.call_log and side_effects stay readable after its async-with
+    # exits (__aexit__ only closes the HTTP client).
+    pending_apply = await _persist_turn(
+        db=db,
+        conversation=conversation,
+        turn=turn,
+        user_id=user_id,
+        question=body.question,
+        dispatcher=dispatcher,
+    )
 
     tool_calls = _tool_call_summaries(call_log)
 
@@ -574,6 +593,7 @@ async def reservation_assistant_stream(
         # buffered endpoint; see the comment there and AIClient's docstring.
         partial_segments: list[TurnSegment] = []
         partial_usage = Usage()
+        turn = None
         try:
             async with asyncio.timeout(settings.assistant_overall_deadline_s):
                 async with ToolDispatcher(
@@ -581,7 +601,6 @@ async def reservation_assistant_stream(
                     reservation_id=reservation_id,
                     char_cap=settings.assistant_tool_result_char_cap,
                 ) as dispatcher:
-                    turn = None
                     async for ev in ai.answer_reservation_question_streaming(
                         messages=messages,
                         dispatcher=dispatcher,
@@ -608,34 +627,6 @@ async def reservation_assistant_stream(
                         await db.rollback()
                         yield _sse("error", {"message": "Assistant produced no answer"})
                         return
-
-                    # Persist inside the generator: this is the only scope where
-                    # the assembled turn (from the done event), the open
-                    # ToolDispatcher, and the db session all coexist. The
-                    # async-with blocks (timeout and ToolDispatcher) close once the
-                    # generator returns, and _persist_turn needs the dispatcher's
-                    # tool-call results, so the write must happen here, before the
-                    # final done frame.
-                    pending_apply = await _persist_turn(
-                        db=db,
-                        conversation=conversation,
-                        turn=turn,
-                        user_id=user_id,
-                        question=body.question,
-                        dispatcher=dispatcher,
-                    )
-                    payload = AssistantResponse(
-                        answer=turn.answer,
-                        model=settings.ai_model,
-                        input_tokens=turn.usage.input_tokens,
-                        output_tokens=turn.usage.output_tokens,
-                        stop_reason=turn.stop_reason,
-                        tool_calls=_tool_call_summaries(dispatcher.call_log),
-                        tool_iterations=turn.iteration,
-                        conversation_id=str(conversation.id),
-                        pending_apply=pending_apply,
-                    )
-                    yield _sse("done", payload.model_dump(mode="json"))
         except asyncio.TimeoutError:
             incomplete_response = await _finalize_incomplete_turn(
                 db=db,
@@ -705,6 +696,32 @@ async def reservation_assistant_stream(
             await db.rollback()
             logger.exception("ai_assistant_stream_failed")
             yield _sse("error", {"message": "Assistant call failed"})
+        else:
+            # Issue #904: persist AFTER the deadline-bounded loop, never inside
+            # it, so the overall deadline cannot interrupt the commit or make
+            # a timeout handler persist the same segments a second time. The
+            # `done` frame follows persistence. dispatcher.call_log and
+            # side_effects remain readable after its async-with exits.
+            pending_apply = await _persist_turn(
+                db=db,
+                conversation=conversation,
+                turn=turn,
+                user_id=user_id,
+                question=body.question,
+                dispatcher=dispatcher,
+            )
+            payload = AssistantResponse(
+                answer=turn.answer,
+                model=settings.ai_model,
+                input_tokens=turn.usage.input_tokens,
+                output_tokens=turn.usage.output_tokens,
+                stop_reason=turn.stop_reason,
+                tool_calls=_tool_call_summaries(dispatcher.call_log),
+                tool_iterations=turn.iteration,
+                conversation_id=str(conversation.id),
+                pending_apply=pending_apply,
+            )
+            yield _sse("done", payload.model_dump(mode="json"))
 
     return StreamingResponse(
         _event_stream(),
