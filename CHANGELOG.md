@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- Made every reservation status transition a compare-and-swap (issue #899).
+  The immediate create path wrote ACTIVE (or FAILED) with an UPDATE keyed by
+  id alone after seconds of inventory calls, so a cancel committed in that
+  window was overwritten, leaving a zombie ACTIVE reservation that never
+  wires and has both a cancelled and a created event. Create, scheduled
+  activation, cancel, release, and the sweep's auto-complete now go through
+  one `_claim_status_transition` (a conditional `UPDATE ... WHERE status IN
+  (...)`; `_claim_provision_transition` is a thin wrapper) and stage events,
+  flip inventory, and call cabling only when the rowcount is 1. A create or
+  scheduled activation that loses reverts exactly the devices it flipped
+  (skipping any a newer booking holds) and returns the row as the winner left
+  it. No HTTP status code or error message changed. A new live Postgres suite,
+  `test_reservation_status_cas_live_pg.py`, races create against cancel and
+  auto-complete against release, and is part of `_gate-pg-live-tests`.
 - Fixed back-to-back bookings leaving a shared exclusive device AVAILABLE under
   an ACTIVE reservation (issue #898). In one expiration tick the successor's
   activation ran before the predecessor's release, and both are absolute
