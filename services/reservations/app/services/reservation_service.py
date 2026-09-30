@@ -1544,7 +1544,11 @@ async def _revert_flipped_devices_best_effort(
     *,
     db: AsyncSession | None = None,
 ) -> None:
-    """Best-effort revert of exactly the devices a LOSING activation flipped (issue #899).
+    """Best-effort revert of devices an activation flipped but no longer holds (issue #899).
+
+    Also used by the scheduled path's flip-failure revert (issue #898), which passes
+    ALL of the row's exclusive devices: a same-tick predecessor's release skipped them
+    because the row held them as PENDING_PROVISION.
 
     A create or scheduled activation that lost its status CAS (a cancel committed
     during the inventory flip window) has already written RESERVED for `device_ids`.
@@ -2576,6 +2580,17 @@ async def cancel_reservation(
         if reservation.status in _TERMINAL_STATUSES:
             return reservation
     else:
+        # Three lost CASes on a row that stayed non-terminal: leave it as is, but
+        # never silently.
+        logger.warning(
+            "Reservation %s: cancel gave up after repeated lost status CAS attempts",
+            reservation.id,
+            extra={
+                "action": "reservation_cancel_cas_exhausted",
+                "reservation_id": str(reservation.id),
+                "status": reservation.status.value,
+            },
+        )
         return reservation
     await db.refresh(reservation)
     reservation.modified_by = user_id

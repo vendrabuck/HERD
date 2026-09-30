@@ -26,6 +26,9 @@
   activation claim also requires `end_time > now`: a PENDING row whose window
   already elapsed is moved to FAILED (`reservation_window_elapsed`), stages
   `reservation.failed`, and makes no inventory or fork call.
+  A scheduled activation whose inventory flip fails reverts to PENDING and
+  also releases the row's exclusive devices (holder-aware), since a same-tick
+  predecessor's release had skipped them while the row held them.
 - Stopped PENDING reservations from writing inventory status (issue #897).
   Since #132 a future booking touches no inventory status until activation,
   but cancelling a PENDING booking, or PATCH-removing a device from one,

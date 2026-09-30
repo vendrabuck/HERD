@@ -335,3 +335,25 @@ async def test_claim_provision_transition_is_the_pending_provision_wrapper():
         assert not await svc._claim_provision_transition(db, b, CANCELLED)
         await db.commit()
     assert (await _row(b)).status == ACTIVE
+
+
+async def test_cancel_cas_exhaustion_warns_with_fixed_action_and_stages_nothing(seams, caplog):
+    """Three lost CASes on a row that stays non-terminal: no silent give-up."""
+    rid = await _insert(ACTIVE)
+    inv = Inventory()
+    with (
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        patch(f"{SVC}._claim_status_transition", new=AsyncMock(return_value=False)),
+        caplog.at_level("WARNING"),
+    ):
+        async with TestSessionLocal() as db:
+            out = await cancel_reservation(db, rid, USER_ID, "tok")
+    assert out.status == ACTIVE
+    warned = [
+        r for r in caplog.records if getattr(r, "action", "") == "reservation_cancel_cas_exhausted"
+    ]
+    assert len(warned) == 1
+    assert warned[0].reservation_id == str(rid)
+    assert warned[0].status == "ACTIVE"
+    assert await _subjects() == []
+    assert inv.calls == []

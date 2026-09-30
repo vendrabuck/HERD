@@ -166,12 +166,20 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
                 max_delay=5.0,
             )
         except Exception:
-            # Revert the claim so a later tick retries (retry-next-tick policy).
+            # Revert the claim so a later tick retries (retry-next-tick policy),
+            # as a compare-and-swap (issue #899): a cancel that won meanwhile keeps
+            # its CANCELLED and this is a no-op write.
             async with AsyncSessionLocal() as db:
-                res = await db.get(Reservation, reservation_id)
-                if res is not None and res.status == ReservationStatus.PENDING_PROVISION:
-                    res.status = ReservationStatus.PENDING
-                    await db.commit()
+                await _claim_provision_transition(db, reservation_id, ReservationStatus.PENDING)
+                await db.commit()
+            # PENDING holds nothing (issue #897), so release ALL of the row's
+            # exclusive devices, holder-aware (issue #898): this call may have
+            # flipped only some, and a same-tick predecessor's release skipped the
+            # rest BECAUSE this row held them as PENDING_PROVISION. Whether or not
+            # the CAS won, these devices belong to nobody now. Best-effort: the
+            # retry-next-tick claim re-flips them, so a failed release self-heals
+            # unless the row is cancelled first.
+            await _revert_flipped_devices_best_effort(reservation_id, exclusive_ids)
             logger.warning(
                 "Scheduled activation deferred for %s: inventory flip failed; retry next tick",
                 reservation_id,

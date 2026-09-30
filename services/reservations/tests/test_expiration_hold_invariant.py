@@ -200,3 +200,91 @@ async def test_pending_row_still_inside_its_window_is_still_activated(spy):
     await _run_expiration_cycle()
     assert await _status(rid) == ReservationStatus.ACTIVE
     assert spy.calls == [([str(dev)], "RESERVED")]
+
+
+class _FailingReserve(_Spy):
+    """Records every write, then raises on RESERVED (the flip fails through retries)."""
+
+    async def __call__(self, ids, status, **kw):
+        await super().__call__(ids, status, **kw)
+        if status == "RESERVED":
+            raise RuntimeError("inventory down")
+        return list(ids)
+
+
+@pytest.fixture
+def failing_spy(spy):
+    s = _FailingReserve()
+
+    async def once(fn, **_):
+        return await fn()
+
+    with (
+        patch(f"{EXP}._update_device_statuses", new=s),
+        patch(f"{SVC}._update_device_statuses", new=s),
+        patch(f"{EXP}.retry_with_backoff", new=once),
+    ):
+        yield s
+
+
+async def test_failed_successor_flip_releases_the_device_its_predecessor_skipped(failing_spy):
+    """R2 (claimed same tick) holds D as PENDING_PROVISION so R1's release skips D; when
+    R2's flip fails and it reverts to PENDING (which holds nothing), D must be released."""
+    dev = uuid.uuid4()
+    boundary = NOW - timedelta(seconds=40)
+    r1 = await _insert(ReservationStatus.ACTIVE, boundary - timedelta(hours=1), boundary, [dev])
+    r2 = await _insert(ReservationStatus.PENDING, boundary, NOW + timedelta(hours=1), [dev])
+    await _run_expiration_cycle()
+    assert await _status(r1) == ReservationStatus.COMPLETED
+    assert await _status(r2) == ReservationStatus.PENDING
+    writes = failing_spy.writes_for(dev)
+    assert writes == ["RESERVED", "AVAILABLE"]
+    assert "herd.reservations.created" not in await _subjects()
+
+
+async def test_failed_successor_flip_does_not_release_a_device_a_third_row_holds(failing_spy):
+    dev = uuid.uuid4()
+    boundary = NOW - timedelta(seconds=40)
+    await _insert(ReservationStatus.ACTIVE, boundary - timedelta(hours=1), boundary, [dev])
+    r2 = await _insert(ReservationStatus.PENDING, boundary, NOW + timedelta(hours=1), [dev])
+    await _insert(
+        ReservationStatus.ACTIVE, NOW - timedelta(hours=1), NOW + timedelta(hours=1), [dev]
+    )
+    await _run_expiration_cycle()
+    assert await _status(r2) == ReservationStatus.PENDING
+    assert "AVAILABLE" not in failing_spy.writes_for(dev)
+
+
+async def test_failed_flip_revert_still_releases_when_a_cancel_won_meanwhile(failing_spy):
+    """The revert CAS loses to a cancel: the devices still belong to nobody."""
+    dev = uuid.uuid4()
+    rid = await _insert(
+        ReservationStatus.PENDING_PROVISION,
+        NOW - timedelta(minutes=1),
+        NOW + timedelta(hours=1),
+        [dev],
+    )
+    orig = failing_spy.__call__
+
+    async def cancel_then_fail(ids, status, **kw):
+        if status == "RESERVED":
+            async with TestSessionLocal() as s:
+                from sqlalchemy import update
+
+                await s.execute(
+                    update(Reservation)
+                    .where(Reservation.id == rid)
+                    .values(status=ReservationStatus.CANCELLED)
+                )
+                await s.commit()
+        return await orig(ids, status, **kw)
+
+    from app.tasks.expiration import _activate_pending_reservation
+
+    with (
+        patch(f"{EXP}._update_device_statuses", new=cancel_then_fail),
+        patch(f"{SVC}._update_device_statuses", new=cancel_then_fail),
+    ):
+        assert await _activate_pending_reservation(rid) is False
+    assert await _status(rid) == ReservationStatus.CANCELLED
+    assert failing_spy.writes_for(dev) == ["RESERVED", "AVAILABLE"]
