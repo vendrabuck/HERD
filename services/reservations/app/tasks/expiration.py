@@ -3,11 +3,13 @@
 import asyncio
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
 from sqlalchemy import and_, exists, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import AsyncSessionLocal
@@ -22,6 +24,7 @@ from app.services.purpose_service import classify_purpose_one, stamp_purpose_cla
 from app.services.reservation_service import (
     _archive_reservation_fork_best_effort,
     _claim_provision_transition,
+    _claim_status_transition,
     _clear_pending_fork_prune,
     _create_reservation_fork_best_effort,
     _fetch_active_forks,
@@ -31,9 +34,11 @@ from app.services.reservation_service import (
     _release_exclusive_devices_best_effort,
     _reservation_created_event,
     _reservation_failed_event,
+    _revert_flipped_devices_best_effort,
     _update_device_statuses,
     is_fork_membership_refused,
     prune_fork_membership_refused,
+    release_devices_not_held_by_others,
     stage_wiring_changed,
 )
 
@@ -161,12 +166,20 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
                 max_delay=5.0,
             )
         except Exception:
-            # Revert the claim so a later tick retries (retry-next-tick policy).
+            # Revert the claim so a later tick retries (retry-next-tick policy),
+            # as a compare-and-swap (issue #899): a cancel that won meanwhile keeps
+            # its CANCELLED and this is a no-op write.
             async with AsyncSessionLocal() as db:
-                res = await db.get(Reservation, reservation_id)
-                if res is not None and res.status == ReservationStatus.PENDING_PROVISION:
-                    res.status = ReservationStatus.PENDING
-                    await db.commit()
+                await _claim_provision_transition(db, reservation_id, ReservationStatus.PENDING)
+                await db.commit()
+            # PENDING holds nothing (issue #897), so release ALL of the row's
+            # exclusive devices, holder-aware (issue #898): this call may have
+            # flipped only some, and a same-tick predecessor's release skipped the
+            # rest BECAUSE this row held them as PENDING_PROVISION. Whether or not
+            # the CAS won, these devices belong to nobody now. Best-effort: the
+            # retry-next-tick claim re-flips them, so a failed release self-heals
+            # unless the row is cancelled first.
+            await _revert_flipped_devices_best_effort(reservation_id, exclusive_ids)
             logger.warning(
                 "Scheduled activation deferred for %s: inventory flip failed; retry next tick",
                 reservation_id,
@@ -184,6 +197,9 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
     async with AsyncSessionLocal() as db:
         res = await db.get(Reservation, reservation_id)
         if res is None or res.status != ReservationStatus.PENDING_PROVISION:
+            # A cancel won the flip window (issue #899); the devices this call
+            # just flipped belong to nobody, so put them back.
+            await _revert_flipped_devices_best_effort(reservation_id, exclusive_ids, db=db)
             return False
         if res.dynamic_requests:
             # Gated activation (ADR 0004): a dynamic-carrying reservation stays
@@ -193,6 +209,13 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
             # reservation.created follow in the callback path. Publishing after
             # the flip (not at the claim) keeps the retry-next-tick revert
             # above from orphaning instances against a PENDING reservation.
+            # Self-transition CAS guard (issue #899): only stage while the row is
+            # still PENDING_PROVISION.
+            if not await _claim_provision_transition(
+                db, reservation_id, ReservationStatus.PENDING_PROVISION
+            ):
+                await _revert_flipped_devices_best_effort(reservation_id, exclusive_ids, db=db)
+                return False
             await enqueue_event(
                 db, OutboxEvent, PROVISION_REQUESTED_SUBJECT, _provision_requested_event(res)
             )
@@ -206,7 +229,13 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
                 },
             )
             return True
-        res.status = ReservationStatus.ACTIVE
+        # Compare-and-swap into ACTIVE (issue #899), replacing the db.get re-read
+        # whose milliseconds gap a cancel could still land in. The loser stages
+        # no event, creates no fork, and reverts the devices it flipped.
+        if not await _claim_provision_transition(db, reservation_id, ReservationStatus.ACTIVE):
+            await _revert_flipped_devices_best_effort(reservation_id, exclusive_ids, db=db)
+            return False
+        await db.refresh(res)
         await enqueue_event(db, OutboxEvent, CREATED_SUBJECT, _reservation_created_event(res))
         await db.commit()
 
@@ -222,6 +251,53 @@ async def _activate_pending_reservation(reservation_id: uuid.UUID) -> bool:
         extra={"action": "scheduled_activation", "reservation_id": str(reservation_id)},
     )
     return True
+
+
+async def _complete_expired_rows(
+    db: AsyncSession, expired: Sequence[Reservation]
+) -> list[Reservation]:
+    """Auto-complete `expired` ACTIVE rows, staging one reservation.completed each.
+
+    Extracted from _run_expiration_cycle so the ACTIVE-to-COMPLETED
+    compare-and-swap can be raced against release_reservation in isolation
+    (test_reservation_status_cas_live_pg.py). Returns only the rows THIS call
+    completed; the caller commits and releases devices for exactly those.
+    """
+    completed: list[Reservation] = []
+    for res in expired:
+        # Compare-and-swap out of ACTIVE (issue #899): a manual release or a
+        # cancel that committed since the SELECT wins the row; skip it, so
+        # no second terminal event is staged and its devices are not
+        # released twice. Only rows this call completed join `completed`.
+        if not await _claim_status_transition(
+            db, res.id, (ReservationStatus.ACTIVE,), ReservationStatus.COMPLETED
+        ):
+            continue
+        completed.append(res)
+        # One of the five terminal-transition sites (issue #646 phase 2,
+        # ADR 0013 point 8): marks the row eligible for background purpose
+        # classification.
+        stamp_purpose_classify_requested(res)
+        await enqueue_event(
+            db,
+            OutboxEvent,
+            COMPLETED_SUBJECT,
+            {
+                "event": "reservation.completed",
+                "reservation_id": str(res.id),
+                "user_id": str(res.user_id),
+                "device_ids": [str(d) for d in res.device_ids],
+                "topology_id": str(res.topology_id) if res.topology_id else None,
+                "topology_type": res.topology_type.value,
+                "purpose_category": res.purpose_category,
+            },
+        )
+        logger.info(
+            "Auto-completed reservation %s",
+            res.id,
+            extra={"action": "auto_complete", "reservation_id": str(res.id)},
+        )
+    return completed
 
 
 async def _run_expiration_cycle() -> None:
@@ -255,6 +331,11 @@ async def _run_expiration_cycle() -> None:
                 and_(
                     Reservation.status == ReservationStatus.PENDING,
                     Reservation.start_time <= now,
+                    # A window that already elapsed is never activated (issue
+                    # #898): it would emit reservation.created, hold ACTIVE for a
+                    # tick, then complete and release, clobbering a successor's
+                    # RESERVED. The elapsed rows are failed just below instead.
+                    Reservation.end_time > now,
                 )
             )
             .with_for_update(skip_locked=True)
@@ -268,6 +349,34 @@ async def _run_expiration_cycle() -> None:
                 extra={"action": "scheduled_activation_claim", "reservation_id": str(res.id)},
             )
         activate_ids = [res.id for res in claimed]
+
+        # Fail PENDING rows whose whole window elapsed before activation (issue
+        # #898): a deferred activation (inventory outage) or a long sweep outage.
+        # A PENDING row holds nothing in inventory (issue #897), so this makes NO
+        # inventory call and NO fork call. Compare-and-swap on PENDING: a cancel
+        # that committed since the SELECT wins and this is skipped.
+        result = await db.execute(
+            select(Reservation)
+            .where(
+                and_(
+                    Reservation.status == ReservationStatus.PENDING,
+                    Reservation.end_time <= now,
+                )
+            )
+            .with_for_update(skip_locked=True)
+        )
+        for res in result.scalars().all():
+            if not await _claim_status_transition(
+                db, res.id, (ReservationStatus.PENDING,), ReservationStatus.FAILED
+            ):
+                continue
+            stamp_purpose_classify_requested(res)
+            await enqueue_event(db, OutboxEvent, FAILED_SUBJECT, _reservation_failed_event(res))
+            logger.warning(
+                "Reservation %s: window elapsed before activation; failing it",
+                res.id,
+                extra={"action": "reservation_window_elapsed", "reservation_id": str(res.id)},
+            )
 
         # Complete ACTIVE reservations whose end_time has passed
         result = await db.execute(
@@ -286,31 +395,7 @@ async def _run_expiration_cycle() -> None:
         # reservation's full set (every device in the topology), not just the
         # exclusive subset released in inventory below. The eager-loaded
         # device_ids is read here while the row is attached, before the commit.
-        for res in expired:
-            res.status = ReservationStatus.COMPLETED
-            # One of the five terminal-transition sites (issue #646 phase 2,
-            # ADR 0013 point 8): marks the row eligible for background purpose
-            # classification.
-            stamp_purpose_classify_requested(res)
-            await enqueue_event(
-                db,
-                OutboxEvent,
-                COMPLETED_SUBJECT,
-                {
-                    "event": "reservation.completed",
-                    "reservation_id": str(res.id),
-                    "user_id": str(res.user_id),
-                    "device_ids": [str(d) for d in res.device_ids],
-                    "topology_id": str(res.topology_id) if res.topology_id else None,
-                    "topology_type": res.topology_type.value,
-                    "purpose_category": res.purpose_category,
-                },
-            )
-            logger.info(
-                "Auto-completed reservation %s",
-                res.id,
-                extra={"action": "auto_complete", "reservation_id": str(res.id)},
-            )
+        completed = await _complete_expired_rows(db, expired)
 
         # Timeout backstop (ADR 0004): fail dynamic-carrying reservations stuck
         # in PENDING_PROVISION past provision_timeout_seconds, so a lost
@@ -406,17 +491,13 @@ async def _run_expiration_cycle() -> None:
 
         await db.commit()
 
-    # Provision each claimed reservation now that the claim is committed and the
-    # row lock is released: flip inventory, mark ACTIVE, fork, emit
-    # reservation.created (issue #132). Each is independent and best-effort; a
-    # deferred one stays PENDING for a later tick.
-    for reservation_id in activate_ids:
-        await _activate_pending_reservation(reservation_id)
-
-    # Release only exclusive devices for completed reservations. Uses the same
+    # Release the completed reservations' devices BEFORE activating the claimed
+    # rows (issue #898): inventory status writes are absolute, so a release that
+    # ran after a same-tick successor activation would leave the successor's
+    # device AVAILABLE. Only exclusive devices are released. Uses the same
     # best-effort fetch + internal-token status update as the cancel/release
     # paths.
-    for res in expired:
+    for res in completed:
         device_ids = list(res.device_ids)
         fetch_results = await _fetch_devices_best_effort(device_ids)
         exclusive_ids: list[uuid.UUID] = []
@@ -430,11 +511,22 @@ async def _run_expiration_cycle() -> None:
                 exclusive_ids.append(did)
             elif result.get("exclusive", True):
                 exclusive_ids.append(did)
+        # Holder-aware (issue #898): a successor claimed above (R2.start == R1.end)
+        # is PENDING_PROVISION and holds the device, so it is skipped here rather
+        # than flipped to AVAILABLE under the successor's activation.
+        exclusive_ids = await release_devices_not_held_by_others(res.id, exclusive_ids)
         if exclusive_ids:
             await _update_device_statuses(exclusive_ids, "AVAILABLE")
         # Freeze the fork as the as-built record now the reservation is COMPLETED
         # (ADR 0006 Decision 5). Best-effort, mirroring the manual release path.
         await _archive_reservation_fork_best_effort(res.id)
+
+    # Provision each claimed reservation now that the claim is committed and the
+    # row lock is released: flip inventory, mark ACTIVE, fork, emit
+    # reservation.created (issue #132). Each is independent and best-effort; a
+    # deferred one stays PENDING for a later tick.
+    for reservation_id in activate_ids:
+        await _activate_pending_reservation(reservation_id)
 
     # Release the timed-out reservations' exclusive devices back to AVAILABLE
     # (the create path's orphaned-RESERVED discipline: FAILED is outside the

@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+- Made every reservation status transition a compare-and-swap (issue #899).
+  The immediate create path wrote ACTIVE (or FAILED) with an UPDATE keyed by
+  id alone after seconds of inventory calls, so a cancel committed in that
+  window was overwritten, leaving a zombie ACTIVE reservation that never
+  wires and has both a cancelled and a created event. Create, scheduled
+  activation, cancel, release, and the sweep's auto-complete now go through
+  one `_claim_status_transition` (a conditional `UPDATE ... WHERE status IN
+  (...)`; `_claim_provision_transition` is a thin wrapper) and stage events,
+  flip inventory, and call cabling only when the rowcount is 1. A create or
+  scheduled activation that loses reverts exactly the devices it flipped
+  (skipping any a newer booking holds) and returns the row as the winner left
+  it. No HTTP status code or error message changed. A new live Postgres suite,
+  `test_reservation_status_cas_live_pg.py`, races create against cancel and
+  auto-complete against release, and is part of `_gate-pg-live-tests`.
+- Fixed back-to-back bookings leaving a shared exclusive device AVAILABLE under
+  an ACTIVE reservation (issue #898). In one expiration tick the successor's
+  activation ran before the predecessor's release, and both are absolute
+  inventory writes. The sweep now releases completed rows' devices before
+  activating claimed rows, and every release (cancel, release, provision
+  failure, timeout, auto-complete) skips a device another PENDING_PROVISION or
+  ACTIVE reservation still holds, logging `release_skipped_device_held`. The
+  activation claim also requires `end_time > now`: a PENDING row whose window
+  already elapsed is moved to FAILED (`reservation_window_elapsed`), stages
+  `reservation.failed`, and makes no inventory or fork call.
+  A scheduled activation whose inventory flip fails reverts to PENDING and
+  also releases the row's exclusive devices (holder-aware), since a same-tick
+  predecessor's release had skipped them while the row held them.
+- Stopped PENDING reservations from writing inventory status (issue #897).
+  Since #132 a future booking touches no inventory status until activation,
+  but cancelling a PENDING booking, or PATCH-removing a device from one,
+  still released every exclusive device to AVAILABLE (flipping a device that
+  another ACTIVE reservation held), and PATCH-adding a free device marked it
+  RESERVED for a booking that starts later. An exclusive device is now
+  RESERVED in inventory if and only if a reservation in PENDING_PROVISION or
+  ACTIVE holds it, so `cancel_reservation` and `update_reservation` write
+  inventory status only when the row's status before the transition holds
+  devices. Conflict checks and the "device must be AVAILABLE to add" refusal
+  are unchanged.
+
 - Hardened three inventory reads that skipped the issue #718 device-group
   visibility gate (issue #909): `GET /device-groups/device/{id}`,
   `GET /devices/{id}/apply-jobs`, and `GET /apply-jobs/{id}`. Any

@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -1365,6 +1366,98 @@ def _reservation_failed_event(reservation: Reservation) -> dict:
     }
 
 
+_TERMINAL_STATUSES = (
+    ReservationStatus.COMPLETED,
+    ReservationStatus.CANCELLED,
+    ReservationStatus.FAILED,
+)
+
+# Invariant (issues #897, #898, #899): an exclusive device is RESERVED in inventory
+# if and only if some reservation in {PENDING_PROVISION, ACTIVE} holds it. A PENDING
+# reservation holds nothing (since #132 a future booking touches no inventory status
+# until activation), so no transition of a PENDING row may write inventory status.
+_DEVICE_HOLDING_STATUSES = (ReservationStatus.PENDING_PROVISION, ReservationStatus.ACTIVE)
+
+
+async def _devices_held_by_others(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    device_ids: list[uuid.UUID],
+) -> set[uuid.UUID]:
+    """Return the subset of `device_ids` another live reservation still holds (issue #898).
+
+    A device is held by any reservation OTHER than `reservation_id` in
+    {PENDING_PROVISION, ACTIVE}. Inventory status writes are absolute sets, so a
+    release that flips such a device to AVAILABLE would clobber the holder's
+    RESERVED. Reads only reservations' own reservation_devices relation (never a
+    cross-schema read).
+    """
+    if not device_ids:
+        return set()
+    result = await db.execute(
+        select(ReservationDevice.device_id)
+        .join(Reservation, Reservation.id == ReservationDevice.reservation_id)
+        .where(
+            ReservationDevice.device_id.in_(device_ids),
+            Reservation.id != reservation_id,
+            Reservation.status.in_(_DEVICE_HOLDING_STATUSES),
+        )
+        .distinct()
+    )
+    return {uuid.UUID(str(d)) for d in result.scalars().all()}
+
+
+async def release_devices_not_held_by_others(
+    reservation_id: uuid.UUID,
+    device_ids: list[uuid.UUID],
+    *,
+    db: AsyncSession | None = None,
+) -> list[uuid.UUID]:
+    """Filter `device_ids` down to those safe to flip to AVAILABLE (issue #898).
+
+    Drops every device another PENDING_PROVISION or ACTIVE reservation holds and
+    logs each skip with the fixed action `release_skipped_device_held`. This is the
+    ONE holder-aware filter shared by cancel, release, the provision-failure and
+    timeout releases, and the expiration sweep's auto-complete release. Uses `db`
+    when the caller has a session, else a short-lived one. If the holder lookup
+    itself fails it is logged and the full list is returned (the pre-#898
+    behavior): the row's own transition has already committed, and leaving a
+    device RESERVED with no holder would make it unbookable.
+    """
+    if not device_ids:
+        return []
+    try:
+        if db is not None:
+            held = await _devices_held_by_others(db, reservation_id, device_ids)
+        else:
+            async with AsyncSessionLocal() as own:
+                held = await _devices_held_by_others(own, reservation_id, device_ids)
+    except Exception:
+        logger.warning(
+            "Reservation %s: holder lookup failed; releasing without the holder check",
+            reservation_id,
+            extra={
+                "action": "release_holder_lookup_failed",
+                "reservation_id": str(reservation_id),
+            },
+            exc_info=True,
+        )
+        return list(device_ids)
+    for did in device_ids:
+        if did in held:
+            logger.info(
+                "Reservation %s: not releasing device %s, another reservation holds it",
+                reservation_id,
+                did,
+                extra={
+                    "action": "release_skipped_device_held",
+                    "reservation_id": str(reservation_id),
+                    "device_id": str(did),
+                },
+            )
+    return [d for d in device_ids if d not in held]
+
+
 async def _release_exclusive_devices_best_effort(
     reservation_id: uuid.UUID,
     device_ids: list[uuid.UUID],
@@ -1372,6 +1465,7 @@ async def _release_exclusive_devices_best_effort(
     *,
     context_label: str = "provision failure",
     user_id: uuid.UUID | None = None,
+    db: AsyncSession | None = None,
 ) -> None:
     """Release a FAILED reservation's exclusive devices back to AVAILABLE.
 
@@ -1414,6 +1508,9 @@ async def _release_exclusive_devices_best_effort(
             exclusive_ids.append(did)
         elif result.get("exclusive", True):
             exclusive_ids.append(did)
+    # Holder-aware (issue #898): never flip a device another PENDING_PROVISION or
+    # ACTIVE reservation still holds; the write is an absolute set.
+    exclusive_ids = await release_devices_not_held_by_others(reservation_id, exclusive_ids, db=db)
     if not exclusive_ids:
         return
     try:
@@ -1439,6 +1536,63 @@ async def _release_exclusive_devices_best_effort(
             extra=extra,
             exc_info=exc,
         )
+
+
+async def _revert_flipped_devices_best_effort(
+    reservation_id: uuid.UUID,
+    device_ids: list[uuid.UUID],
+    *,
+    db: AsyncSession | None = None,
+) -> None:
+    """Best-effort revert of devices an activation flipped but no longer holds (issue #899).
+
+    Also used by the scheduled path's flip-failure revert (issue #898), which passes
+    ALL of the row's exclusive devices: a same-tick predecessor's release skipped them
+    because the row held them as PENDING_PROVISION.
+
+    A create or scheduled activation that lost its status CAS (a cancel committed
+    during the inventory flip window) has already written RESERVED for `device_ids`.
+    Those devices belong to nobody now, so put them back to AVAILABLE, holder-aware:
+    the winning cancel already released them, so another booking may have taken
+    them since, and a duplicate AVAILABLE is otherwise idempotent. Errors are
+    logged, never raised.
+    """
+    releasable = await release_devices_not_held_by_others(reservation_id, device_ids, db=db)
+    if not releasable:
+        return
+    try:
+        await _update_device_statuses(releasable, "AVAILABLE")
+    except Exception:
+        logger.error(
+            "Failed to revert RESERVED devices after a lost activation: %s",
+            reservation_id,
+            extra={
+                "action": "reservation_lost_activation_revert_failed",
+                "reservation_id": str(reservation_id),
+                "device_ids": [str(d) for d in releasable],
+            },
+            exc_info=True,
+        )
+
+
+async def _lost_activation_race(
+    db: AsyncSession,
+    reservation: Reservation,
+    flipped: list[uuid.UUID],
+) -> Reservation:
+    """Clean loser path for create_reservation's status CAS (issue #899).
+
+    No event, no fork. Revert exactly the devices this call flipped, then return
+    the row as the winner left it.
+    """
+    logger.warning(
+        "Reservation %s left PENDING_PROVISION during the inventory flip; not activating",
+        reservation.id,
+        extra={"action": "reservation_create_lost_race", "reservation_id": str(reservation.id)},
+    )
+    await db.refresh(reservation)
+    await _revert_flipped_devices_best_effort(reservation.id, flipped, db=db)
+    return reservation
 
 
 async def create_reservation(
@@ -1651,7 +1805,12 @@ async def create_reservation(
                 max_delay=5.0,
             )
         except Exception as exc:
-            reservation.status = ReservationStatus.FAILED
+            # Compare-and-swap out of PENDING_PROVISION (issue #899): the flip
+            # window is seconds long, and a cancel committed inside it owns the
+            # row. Losing means stage nothing and return the row as it now is.
+            if not await _claim_provision_transition(db, reservation.id, ReservationStatus.FAILED):
+                return await _lost_activation_race(db, reservation, sorted(reserved_ok))
+            await db.refresh(reservation)
             # Stage reservation.failed in the same transaction that lands the row
             # in FAILED (issue #21), so the event exists iff the failure committed.
             # This is the webhook/notification signal that provisioning gave up
@@ -1702,7 +1861,14 @@ async def create_reservation(
             # but the reservation stays PENDING_PROVISION until the execution
             # service posts the provision result. Stage provision_requested now
             # that the flip committed cleanly; the callback (or the timeout
-            # backstop) owns the next transition.
+            # backstop) owns the next transition. The self-transition is a
+            # compare-and-swap guard (issue #899): it matches only while the row
+            # is still PENDING_PROVISION, so a cancel that won the flip window
+            # never gets instances requested for it.
+            if not await _claim_provision_transition(
+                db, reservation.id, ReservationStatus.PENDING_PROVISION
+            ):
+                return await _lost_activation_race(db, reservation, sorted(reserved_ok))
             await enqueue_event(
                 db,
                 OutboxEvent,
@@ -1710,7 +1876,13 @@ async def create_reservation(
                 _provision_requested_event(reservation),
             )
         else:
-            reservation.status = ReservationStatus.ACTIVE
+            # Compare-and-swap into ACTIVE (issue #899): a cancel that committed
+            # during the flip window wins and this call stages no event, creates
+            # no fork, and reverts the devices it flipped.
+            if not await _claim_provision_transition(db, reservation.id, ReservationStatus.ACTIVE):
+                return await _lost_activation_race(db, reservation, sorted(reserved_ok))
+            # Re-read so the payload reflects the committed row (issue #899).
+            await db.refresh(reservation)
             # Stage reservation.created in the same transaction that lands the row
             # in ACTIVE (issue #21), so the event exists iff provisioning
             # committed. The old fire-and-forget post-commit publish could drop it
@@ -1741,23 +1913,28 @@ async def create_reservation(
     return reservation
 
 
-async def _claim_provision_transition(
+async def _claim_status_transition(
     db: AsyncSession,
     reservation_id: uuid.UUID,
+    expected: Iterable[ReservationStatus],
     new_status: ReservationStatus,
 ) -> bool:
-    """Atomically move a reservation out of PENDING_PROVISION (issue #276).
+    """Compare-and-swap a reservation's status (issues #276, #897, #898, #899).
 
-    A conditional UPDATE ... WHERE status = PENDING_PROVISION is a compare-and-
-    swap: of the two writers that can leave this state (the provision-result
-    callback here and the expiration task's timeout backstop), exactly one finds
-    the row still PENDING_PROVISION and performs the transition. Both paths read
-    the status and then write it, so without this CAS a success callback landing
-    between the backstop's SELECT and its COMMIT could be overwritten to FAILED
-    (or the reverse), after which teardown would destroy instances the user
-    believes are active. Returns True iff this call performed the transition; a
-    False return is the loser and must be a clean no-op (no event, no device
-    flip, no teardown).
+    Every reservation status transition is a compare-and-swap on the status it
+    expects to leave: a conditional UPDATE ... WHERE id = :id AND status IN
+    (:expected) whose rowcount decides which writer performs the side effects
+    (event staging, inventory flips, fork calls). Returns True iff this call
+    performed the transition; a False return is the loser and MUST be a clean
+    no-op (no event, no inventory flip, no fork call, no teardown).
+
+    Why it is needed: the paths that move a row read its status, do slow work
+    (inventory HTTP calls take seconds), and then write. An ORM attribute set
+    writes an UPDATE keyed by id alone, so a writer that lost the race to a
+    concurrent cancel, release, callback, or backstop would overwrite the
+    winner's terminal status and stage a second, contradictory event. Under
+    READ COMMITTED a concurrent second UPDATE blocks on the winner's row lock
+    and then re-evaluates the predicate, so exactly one writer sees rowcount 1.
 
     synchronize_session is off, so a lost CAS never mutates the caller's
     in-memory object; a winner re-reads via db.refresh where it needs the new
@@ -1769,12 +1946,30 @@ async def _claim_provision_transition(
         update(Reservation)
         .where(
             Reservation.id == reservation_id,
-            Reservation.status == ReservationStatus.PENDING_PROVISION,
+            Reservation.status.in_(list(expected)),
         )
         .values(status=new_status)
         .execution_options(synchronize_session=False)
     )
     return result.rowcount == 1
+
+
+async def _claim_provision_transition(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    new_status: ReservationStatus,
+) -> bool:
+    """Atomically move a reservation out of PENDING_PROVISION (issue #276).
+
+    A thin wrapper over _claim_status_transition with the expected set fixed to
+    {PENDING_PROVISION}: of the writers that can leave this state (the
+    provision-result callback, the expiration task's timeout backstops, and the
+    create and scheduled activation paths), exactly one finds the row still
+    PENDING_PROVISION and performs the transition.
+    """
+    return await _claim_status_transition(
+        db, reservation_id, (ReservationStatus.PENDING_PROVISION,), new_status
+    )
 
 
 async def apply_provision_result(
@@ -1878,7 +2073,10 @@ async def apply_provision_result(
         },
     )
     await _release_exclusive_devices_best_effort(
-        reservation.id, list(reservation.device_ids), "reservation_provision_failed_release"
+        reservation.id,
+        list(reservation.device_ids),
+        "reservation_provision_failed_release",
+        db=db,
     )
     # Archive the fork as the as-built record even on failure (ADR 0006 Decision 5):
     # the fork captures intended wiring regardless of the provisioning outcome. The
@@ -2200,11 +2398,17 @@ async def update_reservation(
 
                 # Mark added exclusive devices as RESERVED
                 added_exclusive_uuids = [d for d in added_ids if str(d) in added_exclusive]
-                if added_exclusive_uuids:
+                # Inventory status describes a HOLD (issue #897): only a row in
+                # {PENDING_PROVISION, ACTIVE} holds its devices, and a PENDING row
+                # (a future booking since #132) holds nothing, so a PATCH on it
+                # writes no inventory status. PENDING_PROVISION is refused above.
+                if added_exclusive_uuids and reservation.status in _DEVICE_HOLDING_STATUSES:
                     await _update_device_statuses(added_exclusive_uuids, "RESERVED")
 
             # Release removed exclusive devices
-            if removed_ids:
+            # Same hold rule as the add half: a PENDING row never flipped these, so
+            # releasing them would clobber another holder's RESERVED (issue #897).
+            if removed_ids and reservation.status in _DEVICE_HOLDING_STATUSES:
                 try:
                     removed_devices = await _fetch_devices(removed_ids, token)
                     removed_exclusive = [
@@ -2357,7 +2561,38 @@ async def cancel_reservation(
         ReservationStatus.FAILED,
     ):
         return reservation
-    reservation.status = ReservationStatus.CANCELLED
+    # Compare-and-swap out of the status the row is LEAVING (issue #899). That
+    # status also decides the inventory release: only a PENDING_PROVISION or ACTIVE
+    # row holds its exclusive devices (issue #897), a PENDING row holds nothing.
+    # The expected status is exact so the pre-status is known precisely; if the row
+    # moved since it was loaded (e.g. PENDING to PENDING_PROVISION) re-read it and
+    # try again, and if it went terminal a concurrent writer already ended it: a
+    # clean no-op with no event and no release, like the early return above.
+    held_devices = False
+    for _ in range(3):
+        leaving = reservation.status
+        if await _claim_status_transition(
+            db, reservation.id, (leaving,), ReservationStatus.CANCELLED
+        ):
+            held_devices = leaving in _DEVICE_HOLDING_STATUSES
+            break
+        await db.refresh(reservation)
+        if reservation.status in _TERMINAL_STATUSES:
+            return reservation
+    else:
+        # Three lost CASes on a row that stayed non-terminal: leave it as is, but
+        # never silently.
+        logger.warning(
+            "Reservation %s: cancel gave up after repeated lost status CAS attempts",
+            reservation.id,
+            extra={
+                "action": "reservation_cancel_cas_exhausted",
+                "reservation_id": str(reservation.id),
+                "status": reservation.status.value,
+            },
+        )
+        return reservation
+    await db.refresh(reservation)
     reservation.modified_by = user_id
     # Record the acting admin only when this is a cross-owner override; an owner
     # self-cancel leaves cancelled_by NULL (issue #340 audit invariant).
@@ -2404,13 +2639,15 @@ async def cancel_reservation(
     # booking is already CANCELLED at this point; if the inventory release
     # fails after retries we log it structured but do NOT revert the cancel
     # (a future reconciliation sweeper handles orphaned RESERVED rows).
-    await _release_exclusive_devices_best_effort(
-        reservation.id,
-        list(reservation.device_ids),
-        "reservation_cancel_release_failed",
-        context_label="cancel",
-        user_id=user_id,
-    )
+    if held_devices:
+        await _release_exclusive_devices_best_effort(
+            reservation.id,
+            list(reservation.device_ids),
+            "reservation_cancel_release_failed",
+            context_label="cancel",
+            user_id=user_id,
+            db=db,
+        )
 
     # Freeze the fork as the as-built record now that the reservation is CANCELLED
     # (ADR 0006 Decision 5). Best-effort: the cancel already committed and its
@@ -2431,7 +2668,15 @@ async def release_reservation(
         return None
     if reservation.status != ReservationStatus.ACTIVE:
         return reservation
-    reservation.status = ReservationStatus.COMPLETED
+    # Compare-and-swap out of ACTIVE (issue #899): the auto-complete sweep or a
+    # cancel may have ended the row since it was loaded; the loser stages no
+    # event and releases nothing.
+    if not await _claim_status_transition(
+        db, reservation.id, (ReservationStatus.ACTIVE,), ReservationStatus.COMPLETED
+    ):
+        await db.refresh(reservation)
+        return reservation
+    await db.refresh(reservation)
     reservation.modified_by = user_id
     # One of the five terminal-transition sites (issue #646 phase 2, ADR 0013
     # point 8): marks the row eligible for background purpose classification.
@@ -2475,6 +2720,7 @@ async def release_reservation(
         "reservation_release_inventory_failed",
         context_label="release",
         user_id=user_id,
+        db=db,
     )
 
     # Freeze the fork as the as-built record now that the reservation is COMPLETED
