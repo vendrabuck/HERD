@@ -961,6 +961,113 @@ async def _fetch_recipe_deps(
     return template, hypervisor, secret
 
 
+async def _destroy_orphaned_instance(
+    db,
+    hypervisor_uuid: uuid.UUID,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    user_uuid: uuid.UUID,
+    redacted: dict,
+    res_uuid: uuid.UUID,
+    driver_path: str,
+    context: dict,
+    password_keys: set[str],
+    request_id,
+    instance_ref: str | None,
+) -> None:
+    """Compensating destroy for an instance the ledger no longer tracks (issue #896).
+
+    Called when a create lost its ledger CAS because teardown retired the row to
+    DESTROYED while create_instance was in flight. The instance exists on the
+    hypervisor but no teardown candidate will ever point at it, so destroy it
+    here. A missing instance_ref leaves nothing addressable to destroy; that
+    case is logged and left to the driver contract. A failed destroy is logged
+    with its own fixed action and not raised: a redelivery would only hit the
+    DESTROYED refusal, so a NAK would loop without helping.
+    """
+    if not instance_ref:
+        logger.error(
+            "Dynamic instance for request %s lost its ledger row with no instance_ref; "
+            "nothing addressable to destroy",
+            request_id,
+            extra={"action": "dynamic_instance_compensation_failed"},
+        )
+        return
+    login = await _run_recipe_step(
+        db,
+        hypervisor_uuid,
+        driver_id,
+        driver_sha256,
+        "login",
+        user_uuid,
+        redacted,
+        res_uuid,
+        driver_path,
+        context,
+        password_keys,
+    )
+    destroy = None
+    if login["success"]:
+        destroy = await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "destroy_instance",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+            method_kwargs={"instance_ref": instance_ref},
+        )
+        await _run_recipe_step(
+            db,
+            hypervisor_uuid,
+            driver_id,
+            driver_sha256,
+            "logout",
+            user_uuid,
+            redacted,
+            res_uuid,
+            driver_path,
+            context,
+            password_keys,
+        )
+    if destroy is not None and _recipe_reported_success(destroy):
+        logger.warning(
+            "Destroyed instance %s created for request %s after teardown won the ledger row",
+            instance_ref,
+            request_id,
+            extra={"action": "dynamic_instance_compensated"},
+        )
+    else:
+        logger.error(
+            "Compensating destroy of instance %s for request %s did not succeed; "
+            "the instance may still exist",
+            instance_ref,
+            request_id,
+            extra={"action": "dynamic_instance_compensation_failed"},
+        )
+
+
+def _refuse_resurrection(request_id) -> None:
+    logger.warning(
+        "Refusing provision for request %s: its ledger row is DESTROYED",
+        request_id,
+        extra={"action": "dynamic_instance_resurrection_refused"},
+    )
+
+
+def _log_lost_to_teardown(request_id) -> None:
+    logger.warning(
+        "Create for request %s lost its ledger row to teardown; undid the create",
+        request_id,
+        extra={"action": "dynamic_instance_create_lost_to_teardown"},
+    )
+
+
 async def _provision_one_instance(
     req: dict,
     reservation_id: str,
@@ -968,11 +1075,16 @@ async def _provision_one_instance(
     get_db_session,
     dedupe_key: str | None,
     client,
-) -> str:
+) -> str | None:
     """Create one dynamic instance and return its materialized device id.
 
     Idempotent on the ledger: a redelivery that finds the row already ACTIVE with
-    a device skips the whole create. A missing template/hypervisor/secret (404),
+    a device skips the whole create. The ledger only moves forward (issue #896):
+    a DESTROYED row is REFUSED (returns None, nothing created, log action
+    ``dynamic_instance_resurrection_refused``), and if teardown retires the row
+    while create_instance is in flight the ledger CAS loses, the instance just
+    created is destroyed again and any device removed (returns None, log action
+    ``dynamic_instance_create_lost_to_teardown``). A missing template/hypervisor/secret (404),
     or a structurally broken recipe package that can never load, is a
     PermanentEventError (retry cannot heal); a driver-result failure or sandbox
     error raises so the message NAKs with the row left CREATING for an idempotent
@@ -1002,6 +1114,8 @@ async def _provision_one_instance(
                 existing.device_id,
             )
             return str(existing.device_id)
+        if existing is not None and existing.status == "DESTROYED":
+            return _refuse_resurrection(request_id)
 
     template, hypervisor, secret = await _fetch_recipe_deps(template_id, None, client)
     if template is None:
@@ -1023,6 +1137,8 @@ async def _provision_one_instance(
         )
         if row.status == "ACTIVE" and row.device_id is not None:
             return str(row.device_id)
+        if row.status == "DESTROYED":
+            return _refuse_resurrection(request_id)
 
     context, secret_keys = _build_recipe_context(
         template, hypervisor, secret, request_id, reservation_id, user_id
@@ -1121,7 +1237,25 @@ async def _provision_one_instance(
 
         # Persist the hypervisor-side handle immediately: if the device create
         # below fails and NAKs, teardown can still destroy the instance.
-        await set_instance_ref(db, request_id, instance_ref)
+        if not await set_instance_ref(db, request_id, instance_ref):
+            # Teardown retired the row while create_instance ran: the instance
+            # is untracked, destroy it and create no device (issue #896).
+            await _destroy_orphaned_instance(
+                db,
+                hypervisor_uuid,
+                driver_id,
+                driver_sha256,
+                user_uuid,
+                redacted,
+                res_uuid,
+                driver_path,
+                context,
+                password_keys,
+                request_id,
+                instance_ref,
+            )
+            _log_lost_to_teardown(request_id)
+            return None
 
     device = await _create_dynamic_device(
         client, template_id, reservation_id, field_data, request_id
@@ -1133,7 +1267,27 @@ async def _provision_one_instance(
     device_id = device["id"]
 
     async with get_db_session() as db:
-        await mark_active(db, request_id, device_id, instance_ref)
+        won = await mark_active(db, request_id, device_id, instance_ref)
+        if not won:
+            # Teardown ran between create_instance and this flip. Undo both the
+            # device and the hypervisor instance so nothing is orphaned.
+            await _delete_dynamic_device(client, str(device_id))
+            await _destroy_orphaned_instance(
+                db,
+                hypervisor_uuid,
+                driver_id,
+                driver_sha256,
+                user_uuid,
+                redacted,
+                res_uuid,
+                driver_path,
+                context,
+                password_keys,
+                request_id,
+                instance_ref,
+            )
+            _log_lost_to_teardown(request_id)
+            return None
 
     logger.info(
         "Materialized dynamic instance for request %s as device %s",
@@ -1173,6 +1327,16 @@ async def _handle_provision_requested(
             device_id = await _provision_one_instance(
                 req, reservation_id, user_id, get_db_session, dedupe_key, client
             )
+            if device_id is None:
+                # Refused or undone (issue #896): the reservation is being torn
+                # down, so there is no success to report. Reservations ignores a
+                # provision-result for a non-PENDING_PROVISION row anyway.
+                logger.warning(
+                    "provision_requested for reservation %s abandoned; no success reported",
+                    reservation_id,
+                    extra={"action": "dynamic_provision_abandoned"},
+                )
+                return
             device_ids.append(device_id)
 
     # Reached only when every request is ACTIVE.
@@ -4564,8 +4728,9 @@ async def process_reservation_message(
         # "driver raised <ClassName>" convention): str(exc) can carry foreign
         # exception text, and this reason rides all the way into reservations'
         # stored failure detail. The full text is already in this log record's
-        # "exception" field via exc_info above (JSONFormatter emits exc_info,
-        # unlike `extra`, whose keys off its allowlist are dropped).
+        # "exception" field via exc_info above (JSONFormatter emits exc_info;
+        # the raw text stays out of `extra` because key-name redaction cannot see
+        # a secret inside a string value).
         await _maybe_post_provision_failure(
             event_data, f"provisioning failed: {type(exc).__name__}"
         )

@@ -9,12 +9,14 @@ the same idiom as vlan_service and route_service).
 Status lifecycle: CREATING to ACTIVE (create_instance succeeded, device
 materialized) to DESTROYED (destroy_instance plus device delete done). A row
 stuck in CREATING is retried idempotently; the unique request_id makes a
-concurrent insert lose to IntegrityError and re-read the winner.
+concurrent insert lose to IntegrityError and re-read the winner. The lifecycle
+only moves forward: set_instance_ref and mark_active are compare-and-swap
+updates that never touch a DESTROYED row (issue #896).
 """
 
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +24,9 @@ from app.models.dynamic_instance import DynamicInstance
 from app.services._uuid_utils import as_uuid as _as_uuid
 
 logger = logging.getLogger(__name__)
+
+# Statuses from which a row may still move forward. DESTROYED is terminal.
+LIVE_STATUSES = ("CREATING", "ACTIVE")
 
 
 async def get_by_request_id(db: AsyncSession, request_id) -> DynamicInstance | None:
@@ -72,29 +77,52 @@ async def insert_or_get_creating(
     return row
 
 
-async def set_instance_ref(db: AsyncSession, request_id, instance_ref: str | None) -> None:
-    """Record the hypervisor-side instance_ref while the row is still CREATING.
+async def set_instance_ref(db: AsyncSession, request_id, instance_ref: str | None) -> bool:
+    """Record the hypervisor-side instance_ref while the row is still live.
 
     Persisted before the inventory device-create so teardown can still destroy
     the hypervisor-side instance if the device-create call fails and NAKs.
+
+    A compare-and-swap (issue #896): the UPDATE applies only while the row is
+    CREATING or ACTIVE, so a row a concurrent teardown already retired to
+    DESTROYED is never touched. Returns True when this call won the row; False
+    means the row is DESTROYED or absent and the caller owns a hypervisor
+    instance no ledger row tracks (it must destroy it).
     """
-    row = await get_by_request_id(db, request_id)
-    if row is None:
-        return
-    row.instance_ref = instance_ref
+    result = await db.execute(
+        update(DynamicInstance)
+        .where(
+            DynamicInstance.request_id == _as_uuid(request_id),
+            DynamicInstance.status.in_(LIVE_STATUSES),
+        )
+        .values(instance_ref=instance_ref)
+    )
     await db.commit()
+    return result.rowcount == 1
 
 
-async def mark_active(db: AsyncSession, request_id, device_id, instance_ref: str | None) -> None:
-    """Flip a row to ACTIVE once the instance is materialized as a device."""
-    row = await get_by_request_id(db, request_id)
-    if row is None:
-        return
-    row.device_id = _as_uuid(device_id)
-    row.instance_ref = instance_ref
-    row.status = "ACTIVE"
-    row.error = None
+async def mark_active(db: AsyncSession, request_id, device_id, instance_ref: str | None) -> bool:
+    """Flip a row to ACTIVE once the instance is materialized as a device.
+
+    Same compare-and-swap as set_instance_ref (issue #896): a DESTROYED row
+    never comes back to life. Returns True when this call won the row, False
+    when teardown retired it first (the caller must undo what it created).
+    """
+    result = await db.execute(
+        update(DynamicInstance)
+        .where(
+            DynamicInstance.request_id == _as_uuid(request_id),
+            DynamicInstance.status.in_(LIVE_STATUSES),
+        )
+        .values(
+            device_id=_as_uuid(device_id),
+            instance_ref=instance_ref,
+            status="ACTIVE",
+            error=None,
+        )
+    )
     await db.commit()
+    return result.rowcount == 1
 
 
 async def mark_destroyed(db: AsyncSession, request_id) -> None:

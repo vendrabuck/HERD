@@ -1320,3 +1320,228 @@ async def test_fetch_secret_value_5xx_raises_transient():
 
     with pytest.raises(TransientUpstreamError):
         await _fetch_secret_value("sec-1", _StubClient(500))
+
+
+# --- forward-only ledger (issue #896) ----------------------------------------
+#
+# Invariant: a dynamic-instance ledger row moves only CREATING to ACTIVE to
+# DESTROYED and never leaves DESTROYED; a hypervisor instance exists only while
+# its row is CREATING or ACTIVE.
+
+
+def _actions(caplog):
+    return [
+        rec.action
+        for rec in caplog.records
+        if getattr(rec, "action", None) and str(rec.action).startswith("dynamic_")
+    ]
+
+
+async def _seed_status(status):
+    """Seed the ledger row for REQUEST_ID in the named scenario state."""
+    if status == "absent":
+        return
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+    if status == "CREATING":
+        return
+    async with TestSessionLocal() as db:
+        if status == "ACTIVE with device":
+            await set_instance_ref(db, REQUEST_ID, "vm-100")
+            await mark_active(db, REQUEST_ID, DEVICE_ID, "vm-100")
+        elif status == "ACTIVE without device":
+            row = await get_by_request_id(db, REQUEST_ID)
+            row.status = "ACTIVE"
+            await db.commit()
+        elif status == "DESTROYED":
+            await mark_destroyed(db, REQUEST_ID)
+
+
+@pytest.mark.parametrize(
+    "seed, expected_calls, expected_status, expected_device, expected_actions, expect_callback",
+    [
+        ("absent", ["login", "create_instance", "logout"], "ACTIVE", DEVICE_ID, [], True),
+        ("CREATING", ["login", "create_instance", "logout"], "ACTIVE", DEVICE_ID, [], True),
+        ("ACTIVE with device", [], "ACTIVE", DEVICE_ID, [], True),
+        (
+            "ACTIVE without device",
+            ["login", "create_instance", "logout"],
+            "ACTIVE",
+            DEVICE_ID,
+            [],
+            True,
+        ),
+        (
+            "DESTROYED",
+            [],
+            "DESTROYED",
+            None,
+            ["dynamic_instance_resurrection_refused"],
+            False,
+        ),
+    ],
+)
+async def test_provision_over_every_ledger_state(
+    seed,
+    expected_calls,
+    expected_status,
+    expected_device,
+    expected_actions,
+    expect_callback,
+    caplog,
+):
+    await _seed_status(seed)
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    callback = AsyncMock()
+    patches = _create_patches(execute)
+    patches.append(
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback)
+    )
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    assert [c[0] for c in calls] == expected_calls
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == expected_status
+    assert (str(rows[0].device_id) if rows[0].device_id else None) == expected_device
+    actions = _actions(caplog)
+    if expected_actions:
+        assert actions == expected_actions + ["dynamic_provision_abandoned"]
+    else:
+        assert actions == []
+    assert (callback.await_count == 1) is expect_callback
+
+
+async def test_ledger_cas_refuses_destroyed_row():
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+        await mark_destroyed(db, REQUEST_ID)
+    async with TestSessionLocal() as db:
+        assert await set_instance_ref(db, REQUEST_ID, "vm-1") is False
+        assert await mark_active(db, REQUEST_ID, DEVICE_ID, "vm-1") is False
+    row = (await _rows())[0]
+    assert row.status == "DESTROYED"
+    assert row.instance_ref is None
+    assert row.device_id is None
+
+
+async def test_ledger_cas_wins_on_creating_row():
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+        assert await set_instance_ref(db, REQUEST_ID, "vm-1") is True
+        assert await mark_active(db, REQUEST_ID, DEVICE_ID, "vm-1") is True
+    row = (await _rows())[0]
+    assert (row.status, row.instance_ref, str(row.device_id)) == ("ACTIVE", "vm-1", DEVICE_ID)
+
+
+async def test_teardown_between_create_and_instance_ref_destroys_created_instance(caplog):
+    """Teardown retires the CREATING row (no instance_ref yet) while
+    create_instance is in flight: the set_instance_ref CAS loses, the instance
+    just created is destroyed again, and no device is ever created."""
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK, "destroy_instance": DESTROY_OK})
+    create_dev = AsyncMock(return_value={"id": DEVICE_ID})
+    callback = AsyncMock()
+    real_set_ref = dynamic_instance_service_module.set_instance_ref
+
+    async def _teardown_first(db, request_id, instance_ref):
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+        return await real_set_ref(db, request_id, instance_ref)
+
+    patches = _create_patches(execute)
+    patches[-1] = patch("app.services.nats_consumer._create_dynamic_device", new=create_dev)
+    patches.append(
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback)
+    )
+    patches.append(
+        patch.object(dynamic_instance_service_module, "set_instance_ref", new=_teardown_first)
+    )
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    destroys = [c for c in calls if c[0] == "destroy_instance"]
+    assert [c[1] for c in destroys] == [{"instance_ref": "vm-100"}]
+    create_dev.assert_not_awaited()
+    callback.assert_not_awaited()
+    assert (await _rows())[0].status == "DESTROYED"
+    assert _actions(caplog) == [
+        "dynamic_instance_compensated",
+        "dynamic_instance_create_lost_to_teardown",
+        "dynamic_provision_abandoned",
+    ]
+
+
+async def test_teardown_between_instance_ref_and_active_flip_leaves_no_orphan(caplog):
+    """Teardown destroys the instance after set_instance_ref but before
+    mark_active: the ACTIVE flip loses, the device just created is deleted, the
+    instance is destroyed through the driver with its instance_ref, and the row
+    stays DESTROYED."""
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK, "destroy_instance": DESTROY_OK})
+    delete = AsyncMock(return_value=True)
+    callback = AsyncMock()
+
+    async def _create_device_then_teardown(client, *args, **kwargs):
+        # Stands in for the window in which the other replica's teardown runs.
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+        return {"id": DEVICE_ID}
+
+    patches = _create_patches(execute)
+    patches[-1] = patch(
+        "app.services.nats_consumer._create_dynamic_device",
+        new=_create_device_then_teardown,
+    )
+    patches.append(patch("app.services.nats_consumer._delete_dynamic_device", new=delete))
+    patches.append(
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback)
+    )
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    # One destroy from teardown, one compensating destroy; both with vm-100.
+    destroys = [c[1] for c in calls if c[0] == "destroy_instance"]
+    assert destroys == [{"instance_ref": "vm-100"}, {"instance_ref": "vm-100"}]
+    delete.assert_awaited_once()
+    assert delete.await_args.args[1] == DEVICE_ID
+    callback.assert_not_awaited()
+    row = (await _rows())[0]
+    assert row.status == "DESTROYED"
+    assert row.device_id is None
+    assert _actions(caplog) == [
+        "dynamic_instance_compensated",
+        "dynamic_instance_create_lost_to_teardown",
+        "dynamic_provision_abandoned",
+    ]
+
+
+async def test_failed_compensating_destroy_is_logged_not_raised(caplog):
+    calls, execute = _recipe_execute(
+        {"create_instance": CREATE_OK, "destroy_instance": DESTROY_DRIVER_FAIL}
+    )
+    real_set_ref = dynamic_instance_service_module.set_instance_ref
+
+    async def _retire_row_first(db, request_id, instance_ref):
+        await mark_destroyed(db, request_id)
+        return await real_set_ref(db, request_id, instance_ref)
+
+    patches = _create_patches(execute)
+    patches.append(
+        patch.object(dynamic_instance_service_module, "set_instance_ref", new=_retire_row_first)
+    )
+    patches.append(patch("app.services.nats_consumer._post_provision_result_best_effort"))
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    assert _actions(caplog) == [
+        "dynamic_instance_compensation_failed",
+        "dynamic_instance_create_lost_to_teardown",
+        "dynamic_provision_abandoned",
+    ]
+    assert (await _rows())[0].status == "DESTROYED"
