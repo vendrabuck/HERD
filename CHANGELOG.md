@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Made the dynamic-instance ledger forward-only (issue #896). `set_instance_ref`
+  and `mark_active` are now compare-and-swap updates that never touch a
+  DESTROYED row, and `provision_requested` refuses a DESTROYED row
+  (`dynamic_instance_resurrection_refused`). If teardown retires the row while
+  `create_instance` is in flight, the instance just created is destroyed again
+  and its device deleted, so nothing is orphaned.
+- The execution "Starting driver execution" log now emits `context_keys` (the
+  sorted key names) instead of the whole redacted device context (issue #905),
+  so a text-typed secret under a neutral key no longer reaches the JSON log.
+- Corrected stale comments in execution that claimed JSONFormatter drops
+  unlisted extras (issue #906).
 - Fixed the reservation assistant losing the record of a write (issues #903,
   #904, #906). `propose_config_change` now records a `config_version_created`
   side effect, so a later timeout or provider failure persists the turn

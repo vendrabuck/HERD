@@ -142,7 +142,8 @@ def validate_driver(driver_dir: Path, connection_type: str) -> list[str]:
         # (e.g. a SyntaxError's filename), so only the class name is kept in the
         # errors list, which load_driver folds into a DriverPackageError that
         # is stored on the run row (issue #840/#870). The full text goes in the
-        # log MESSAGE, not `extra`, since JSONFormatter drops unlisted extra keys.
+        # log MESSAGE, not `extra`: the text is foreign and may carry a secret or
+        # path inside a value, which JSONFormatter's key-name redaction cannot see.
         logger.error("Failed to load driver.py at %s: %s", driver_py, e)
         errors.append(f"Failed to load driver.py: {type(e).__name__}")
         return errors
@@ -305,8 +306,9 @@ async def load_driver(
         # e is a foreign (httpx) exception and can carry the inventory service's
         # internal URL; only the class name is kept in the raised message, which
         # run_driver_action stores verbatim on the run row (issue #870). The full
-        # text goes in the log MESSAGE, not `extra`, since JSONFormatter drops
-        # unlisted extra keys.
+        # text goes in the log MESSAGE, not `extra`: the text is foreign and may carry a secret or
+        # internal URL inside a value, which JSONFormatter's key-name redaction
+        # cannot see.
         logger.error("Failed to download driver %s: %s", driver_id, e)
         raise RuntimeError(f"Failed to download driver {driver_id}: {type(e).__name__}") from e
 
