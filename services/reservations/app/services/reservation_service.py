@@ -22,7 +22,7 @@ from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.pagination import paginate
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, exists, false, select, update
+from sqlalchemy import String, and_, cast, exists, false, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -2123,6 +2123,12 @@ def _reservation_order_by(sort_by: str, sort_dir: str):
     deterministic.
     """
     column = _SORTABLE_FIELDS[sort_by]
+    if sort_by == "status":
+        # Issue #902: on Postgres the column is a native enum, which sorts in
+        # storage order (declaration order, or a different order on a stack
+        # migrated in place by ADD VALUE). Cast so every dialect sorts
+        # alphabetically by the status name, as the SQLite VARCHAR column does.
+        column = cast(column, String)
     primary = column.asc() if sort_dir == "asc" else column.desc()
     return primary, Reservation.id
 
