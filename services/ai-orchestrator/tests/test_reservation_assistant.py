@@ -1746,3 +1746,263 @@ async def test_stream_mid_dispatch_gap_names_landed_tool_in_closing_message(
     rows = await _load_db_messages(conv_id)
     _assert_no_orphan_trailing_user(rows)
     assert [r for r, _ in rows] == ["USER", "ASSISTANT", "USER", "ASSISTANT"]
+
+
+# --- Issues #903, #904, #906 ---
+
+
+def _propose_side_effect_state(version_id: uuid.UUID, device_id: uuid.UUID):
+    """Like _pre_raise_write_tool_state but for propose_config_change: a
+    config_version_created side effect (issue #903) with its completed segment."""
+    tool_calls = [
+        ToolCallRecord(
+            name="propose_config_change",
+            arguments_summary=f"device_id={device_id}",
+            duration_ms=9,
+            error=None,
+        )
+    ]
+    side_effects = [
+        {
+            "kind": "config_version_created",
+            "tool": "propose_config_change",
+            "device_id": str(device_id),
+            "version_id": str(version_id),
+            "version_number": 3,
+        }
+    ]
+    segments = [
+        TurnSegment(
+            assistant_blocks=[ToolUseBlock(id="toolu_p", name="propose_config_change", input={})],
+            tool_result_blocks=[
+                ToolResultBlock(tool_use_id="toolu_p", content='{"validation": "ok"}')
+            ],
+        )
+    ]
+    return tool_calls, side_effects, segments
+
+
+async def test_buffered_timeout_after_propose_persists_turn_without_pending_apply(async_client):
+    tool_calls, side_effects, segments = _propose_side_effect_state(uuid.uuid4(), uuid.uuid4())
+    _override_seed()
+    _override_ai(
+        raises=TimeoutError("overall deadline"),
+        pre_raise_tool_calls=tool_calls,
+        pre_raise_side_effects=side_effects,
+        pre_raise_segments=segments,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "propose"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["incomplete"] == "timeout"
+    assert body["answer"] == INCOMPLETE_AFTER_TOOLS_ANSWER
+    assert body["pending_apply"] is None
+    assert [t["name"] for t in body["tool_calls"]] == ["propose_config_change"]
+    rows = await _load_db_messages(body["conversation_id"])
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "TOOL", "ASSISTANT"]
+
+
+async def test_stream_timeout_after_propose_emits_done_without_pending_apply(async_client):
+    tool_calls, side_effects, segments = _propose_side_effect_state(uuid.uuid4(), uuid.uuid4())
+    _override_seed()
+    _override_streaming_ai(
+        [],
+        raises=TimeoutError("overall deadline"),
+        pre_raise_tool_calls=tool_calls,
+        pre_raise_side_effects=side_effects,
+        pre_raise_segments=segments,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "propose"}, headers=headers)
+    events = _parse_sse(resp.text)
+    assert [e for e, _ in events] == ["done"]
+    data = events[-1][1]
+    assert data["incomplete"] == "timeout"
+    assert data["pending_apply"] is None
+    rows = await _load_db_messages(data["conversation_id"])
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "TOOL", "ASSISTANT"]
+
+
+def _slow_persist(monkeypatch, delay_s: float = 0.3):
+    """Wrap the real _persist_turn so it outlasts the overall deadline (#904)."""
+    from app.routes import reservation_assistant as route_module
+
+    real = route_module._persist_turn
+    calls = {"n": 0}
+
+    async def slow(**kwargs):
+        calls["n"] += 1
+        await asyncio.sleep(delay_s)
+        return await real(**kwargs)
+
+    monkeypatch.setattr(route_module, "_persist_turn", slow)
+    return calls
+
+
+async def test_buffered_deadline_during_persist_does_not_interrupt_or_duplicate(
+    async_client, monkeypatch
+):
+    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.1)
+    calls = _slow_persist(monkeypatch)
+    _override_seed()
+    _override_ai(answer="done fine")
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "hi"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["answer"] == "done fine"
+    assert body["incomplete"] is None
+    assert calls["n"] == 1
+    rows = await _load_db_messages(body["conversation_id"])
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+
+
+async def test_buffered_deadline_during_persist_with_side_effect_persists_once(
+    async_client, monkeypatch
+):
+    """The double-append shape from issue #904: a side-effect turn whose
+    persistence outlasts the deadline must store each row exactly once."""
+    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.1)
+    _slow_persist(monkeypatch)
+    _override_seed()
+    tool_calls, side_effects, segments = _pre_raise_write_tool_state(
+        uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    )
+
+    class OkAI:
+        async def answer_reservation_question_with_tools(self, *, dispatcher, segments, **kw):
+            dispatcher.call_log.extend(tool_calls)
+            dispatcher.side_effects.extend(side_effects)
+            done = TurnSegment(assistant_blocks=[TextBlock(text="all set")])
+            segments.extend(_pre_raise_write_tool_state(*[uuid.uuid4()] * 3)[2])
+            segments.append(done)
+            return AssistantTurnResult(
+                answer="all set",
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                stop_reason="end_turn",
+                iteration=2,
+                segments=list(segments),
+            )
+
+    app.dependency_overrides[get_ai_client] = lambda: OkAI()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_url(), json={"question": "apply"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["incomplete"] is None
+    assert body["pending_apply"] is not None
+    rows = await _load_db_messages(body["conversation_id"])
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "TOOL", "ASSISTANT"]
+
+
+async def test_stream_deadline_during_persist_emits_done_not_error(async_client, monkeypatch):
+    from app.services.ai_client import AssistantDone
+
+    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.1)
+    calls = _slow_persist(monkeypatch)
+    _override_seed()
+    _override_streaming_ai(
+        [
+            AssistantDone(
+                result=AssistantTurnResult(
+                    answer="streamed ok",
+                    usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                    stop_reason="end_turn",
+                    iteration=1,
+                    segments=[TurnSegment(assistant_blocks=[TextBlock(text="streamed ok")])],
+                )
+            )
+        ]
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post(_stream_url(), json={"question": "hi"}, headers=headers)
+    events = _parse_sse(resp.text)
+    assert [e for e, _ in events] == ["done"]
+    assert events[0][1]["answer"] == "streamed ok"
+    assert events[0][1]["incomplete"] is None
+    assert calls["n"] == 1
+    rows = await _load_db_messages(events[0][1]["conversation_id"])
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+
+
+def test_closing_text_names_landed_call_when_earlier_same_tool_call_errored():
+    """Issue #906.1: a refused first schedule_config_apply (error result, no
+    side effect) must not make the landed second call look recorded."""
+    from app.routes.reservation_assistant import (
+        INCOMPLETE_AFTER_TOOLS_ANSWER,
+        INCOMPLETE_LANDED_ACTIONS_HEADER,
+        _closing_incomplete_text,
+    )
+
+    segments = [
+        TurnSegment(
+            assistant_blocks=[ToolUseBlock(id="toolu_a", name="schedule_config_apply", input={})],
+            tool_result_blocks=[
+                ToolResultBlock(tool_use_id="toolu_a", content="refused", is_error=True)
+            ],
+        )
+    ]
+    dispatcher = SimpleNamespace(
+        side_effects=[{"kind": "scheduled_apply", "tool": "schedule_config_apply"}]
+    )
+    text = _closing_incomplete_text(segments=segments, dispatcher=dispatcher)
+    assert text == (
+        f"{INCOMPLETE_AFTER_TOOLS_ANSWER}\n\n{INCOMPLETE_LANDED_ACTIONS_HEADER}\n"
+        "- schedule_config_apply"
+    )
+
+
+def test_closing_text_omits_call_recorded_by_successful_tool_use():
+    from app.routes.reservation_assistant import (
+        INCOMPLETE_AFTER_TOOLS_ANSWER,
+        _closing_incomplete_text,
+    )
+
+    segments = [
+        TurnSegment(
+            assistant_blocks=[ToolUseBlock(id="toolu_a", name="schedule_config_apply", input={})],
+            tool_result_blocks=[ToolResultBlock(tool_use_id="toolu_a", content="{}")],
+        )
+    ]
+    dispatcher = SimpleNamespace(
+        side_effects=[{"kind": "scheduled_apply", "tool": "schedule_config_apply"}]
+    )
+    assert _closing_incomplete_text(segments=segments, dispatcher=dispatcher) == (
+        INCOMPLETE_AFTER_TOOLS_ANSWER
+    )
+
+
+def test_closing_text_uses_kind_fallback_name_for_config_version_created():
+    from app.routes.reservation_assistant import _closing_incomplete_text
+
+    dispatcher = SimpleNamespace(side_effects=[{"kind": "config_version_created"}])
+    assert "- propose_config_change" in _closing_incomplete_text(segments=[], dispatcher=dispatcher)
+
+
+async def test_incomplete_log_carries_reason_as_its_own_key(async_client, caplog):
+    """Issue #906.2: `reason` is a queryable field, not text in the message."""
+    from herd_common.logging import JSONFormatter
+
+    tool_calls, side_effects, segments = _propose_side_effect_state(uuid.uuid4(), uuid.uuid4())
+    _override_seed()
+    _override_ai(
+        raises=TimeoutError("overall deadline"),
+        pre_raise_tool_calls=tool_calls,
+        pre_raise_side_effects=side_effects,
+        pre_raise_segments=segments,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    with caplog.at_level(logging.WARNING):
+        async with async_client as client:
+            await client.post(_url(), json={"question": "x"}, headers=headers)
+    records = [r for r in caplog.records if r.getMessage() == "ai_assistant_incomplete_after_tools"]
+    assert len(records) == 1
+    formatted = json.loads(JSONFormatter("ai-orchestrator").format(records[0]))
+    assert formatted["message"] == "ai_assistant_incomplete_after_tools"
+    assert formatted["reason"] == "timeout"

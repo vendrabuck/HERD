@@ -857,6 +857,20 @@ class ToolDispatcher:
             return {"validation": "errors", "detail": detail}
         resp.raise_for_status()
         body = resp.json()
+        # Record the durable write before returning (issue #903) so a later
+        # timeout or provider failure in the same turn persists the turn
+        # (issue #871) instead of rolling back a config version that exists.
+        # Kind is deliberately not "scheduled_apply": it must not set
+        # pending_apply.
+        self.side_effects.append(
+            {
+                "kind": "config_version_created",
+                "tool": "propose_config_change",
+                "device_id": str(device_id),
+                "version_id": str(body["id"]),
+                "version_number": body["version_number"],
+            }
+        )
         return {
             "validation": "ok",
             "version_id": body["id"],
