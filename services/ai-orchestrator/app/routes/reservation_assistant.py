@@ -233,10 +233,11 @@ def _closing_incomplete_text(*, segments: list[TurnSegment], dispatcher: ToolDis
     write that genuinely happened. Detect that gap by matching each
     dispatcher.side_effects entry against a tool_use block of the same name
     recorded in `segments` (a plain per-name count match, since side_effects
-    carries no iteration index to compare against, skipping tool_use blocks whose
-    tool_result is an error); any side effect left
-    unmatched is named explicitly in an appended, deterministic list, so the
-    closing message is never a dangling reference to nothing.
+    carries no iteration index to compare against; a tool_use block whose
+    tool_result is an error landed nothing and is not counted, issue #906);
+    any side effect left unmatched is named explicitly in an appended,
+    deterministic list, so the closing message is never a dangling reference
+    to nothing.
     """
     # Only a tool_use whose paired tool_result succeeded can have recorded a
     # side effect; an errored call (refused, 403/409/422) landed nothing, so
