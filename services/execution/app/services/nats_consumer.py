@@ -1270,7 +1270,13 @@ async def _provision_one_instance(
         won = await mark_active(db, request_id, device_id, instance_ref)
         if not won:
             # Teardown ran between create_instance and this flip. Undo both the
-            # device and the hypervisor instance so nothing is orphaned.
+            # device and the hypervisor instance so nothing is orphaned. Teardown
+            # saw the instance_ref set_instance_ref recorded, so it has usually
+            # destroyed the instance already and this destroy is a repeat; that
+            # is safe because destroy_instance is idempotent by driver contract
+            # (docs/DRIVERS.md, the same rule a redelivered teardown relies on),
+            # and it covers the case where teardown retired the row without
+            # driving the driver.
             await _delete_dynamic_device(client, str(device_id))
             await _destroy_orphaned_instance(
                 db,
