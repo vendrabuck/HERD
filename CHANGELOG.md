@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- Stopped PENDING reservations from writing inventory status (issue #897).
+  Since #132 a future booking touches no inventory status until activation,
+  but cancelling a PENDING booking, or PATCH-removing a device from one,
+  still released every exclusive device to AVAILABLE (flipping a device that
+  another ACTIVE reservation held), and PATCH-adding a free device marked it
+  RESERVED for a booking that starts later. An exclusive device is now
+  RESERVED in inventory if and only if a reservation in PENDING_PROVISION or
+  ACTIVE holds it, so `cancel_reservation` and `update_reservation` write
+  inventory status only when the row's status before the transition holds
+  devices. Conflict checks and the "device must be AVAILABLE to add" refusal
+  are unchanged.
+
 - Hardened three inventory reads that skipped the issue #718 device-group
   visibility gate (issue #909): `GET /device-groups/device/{id}`,
   `GET /devices/{id}/apply-jobs`, and `GET /apply-jobs/{id}`. Any

@@ -1365,6 +1365,13 @@ def _reservation_failed_event(reservation: Reservation) -> dict:
     }
 
 
+# Invariant (issues #897, #898, #899): an exclusive device is RESERVED in inventory
+# if and only if some reservation in {PENDING_PROVISION, ACTIVE} holds it. A PENDING
+# reservation holds nothing (since #132 a future booking touches no inventory status
+# until activation), so no transition of a PENDING row may write inventory status.
+_DEVICE_HOLDING_STATUSES = (ReservationStatus.PENDING_PROVISION, ReservationStatus.ACTIVE)
+
+
 async def _release_exclusive_devices_best_effort(
     reservation_id: uuid.UUID,
     device_ids: list[uuid.UUID],
@@ -2200,11 +2207,17 @@ async def update_reservation(
 
                 # Mark added exclusive devices as RESERVED
                 added_exclusive_uuids = [d for d in added_ids if str(d) in added_exclusive]
-                if added_exclusive_uuids:
+                # Inventory status describes a HOLD (issue #897): only a row in
+                # {PENDING_PROVISION, ACTIVE} holds its devices, and a PENDING row
+                # (a future booking since #132) holds nothing, so a PATCH on it
+                # writes no inventory status. PENDING_PROVISION is refused above.
+                if added_exclusive_uuids and reservation.status in _DEVICE_HOLDING_STATUSES:
                     await _update_device_statuses(added_exclusive_uuids, "RESERVED")
 
             # Release removed exclusive devices
-            if removed_ids:
+            # Same hold rule as the add half: a PENDING row never flipped these, so
+            # releasing them would clobber another holder's RESERVED (issue #897).
+            if removed_ids and reservation.status in _DEVICE_HOLDING_STATUSES:
                 try:
                     removed_devices = await _fetch_devices(removed_ids, token)
                     removed_exclusive = [
@@ -2357,6 +2370,10 @@ async def cancel_reservation(
         ReservationStatus.FAILED,
     ):
         return reservation
+    # Capture the status the row is LEAVING: only a PENDING_PROVISION or ACTIVE row
+    # holds its exclusive devices in inventory (issue #897); a PENDING row holds
+    # nothing, so cancelling it must not write inventory status.
+    held_devices = reservation.status in _DEVICE_HOLDING_STATUSES
     reservation.status = ReservationStatus.CANCELLED
     reservation.modified_by = user_id
     # Record the acting admin only when this is a cross-owner override; an owner
@@ -2404,13 +2421,14 @@ async def cancel_reservation(
     # booking is already CANCELLED at this point; if the inventory release
     # fails after retries we log it structured but do NOT revert the cancel
     # (a future reconciliation sweeper handles orphaned RESERVED rows).
-    await _release_exclusive_devices_best_effort(
-        reservation.id,
-        list(reservation.device_ids),
-        "reservation_cancel_release_failed",
-        context_label="cancel",
-        user_id=user_id,
-    )
+    if held_devices:
+        await _release_exclusive_devices_best_effort(
+            reservation.id,
+            list(reservation.device_ids),
+            "reservation_cancel_release_failed",
+            context_label="cancel",
+            user_id=user_id,
+        )
 
     # Freeze the fork as the as-built record now that the reservation is CANCELLED
     # (ADR 0006 Decision 5). Best-effort: the cancel already committed and its
