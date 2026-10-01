@@ -12,6 +12,11 @@ to B, reserve A and B with an edge A to B) must also refuse the delete, since
 once the inventory row is gone there is no driver left to release the hops.
 Inventory asks cabling's GET /internal/forks/by-device/{id}; the 409 carries
 `transit_reservation_ids` beside `reservation_ids`.
+
+Issue #940 adds the plain-cable axis: a device that cabling still names on a
+`Connection` row, with no reservation at all, refuses the delete with 409
+`device_cabled` (`connection_count`, `connection_ids`) until its cables are
+removed. Same cabling response, checked after `device_in_use`.
 """
 
 import asyncio
@@ -288,3 +293,60 @@ async def test_transit_switch_on_live_fork_blocks_delete_until_cancel(
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         if not switch_deleted:
             await _delete_when_released(admin_client, switch["id"])
+
+
+# --- Issue #940: cabled, unreserved device ---------------------------------------
+
+
+def _cable_body(a_id: str, b_id: str, port: str) -> dict:
+    return {
+        "device_a_id": a_id,
+        "port_a": port,
+        "device_b_id": b_id,
+        "port_b": port,
+        "connection_type": "L1",
+    }
+
+
+async def test_cabled_unreserved_device_blocks_delete_until_cables_removed(
+    admin_client, fresh_devices
+):
+    """Two fresh devices cabled to each other, no reservation. Deleting either end
+    is refused with device_cabled naming the true count and the (sorted) ids; the
+    device still resolves; once the cables are gone the delete succeeds.
+
+    The cable cleanup sits in a finally so a failed assertion (including an old
+    stack answering 204 here) never leaves a Connection row behind."""
+    dev_a, dev_b = await fresh_devices(2)
+    connection_ids: list[str] = []
+    try:
+        for port in ("eth0", "eth1"):
+            resp = await admin_client.post(
+                "/cabling/connections", json=_cable_body(dev_a["id"], dev_b["id"], port)
+            )
+            assert resp.status_code == 201, resp.text
+            connection_ids.append(resp.json()["id"])
+
+        for device in (dev_a, dev_b):
+            blocked = await admin_client.delete(f"/inventory/devices/{device['id']}")
+            assert blocked.status_code == 409, blocked.text
+            assert blocked.json()["detail"] == {
+                "error": "device_cabled",
+                "connection_count": 2,
+                "connection_ids": sorted(connection_ids),
+            }
+            still = await admin_client.get(f"/inventory/devices/{device['id']}")
+            assert still.status_code == 200
+
+        while connection_ids:
+            gone_conn = await admin_client.delete(f"/cabling/connections/{connection_ids[-1]}")
+            assert gone_conn.status_code in (200, 204), gone_conn.text
+            connection_ids.pop()
+
+        deleted = await admin_client.delete(f"/inventory/devices/{dev_a['id']}")
+        assert deleted.status_code == 204, deleted.text
+        gone = await admin_client.get(f"/inventory/devices/{dev_a['id']}")
+        assert gone.status_code == 404
+    finally:
+        for connection_id in connection_ids:
+            await admin_client.delete(f"/cabling/connections/{connection_id}")
