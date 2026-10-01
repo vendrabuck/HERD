@@ -864,3 +864,47 @@ async def test_stop_nats_consumer_swallows_close_failure():
     app.state.nats = _BadConn()
     # Close failure is logged, not raised.
     await nats_consumer.stop_nats_consumer(app)
+
+
+@pytest.mark.asyncio
+async def test_started_consumer_loop_heartbeats_a_slow_handler(monkeypatch):
+    """Issue #911, wired end to end: a message fetched by the real
+    `_consumer_loop` whose handler outlasts several heartbeat intervals gets
+    `in_progress` before it is acked. Fails if a loop is ever wired straight
+    to `process_message` without the heartbeat."""
+    msg = _FakeMsg(
+        json.dumps({"event": "reservation.created", "user_id": str(uuid.uuid4())}).encode(),
+        stream_seq=7,
+    )
+    msg.in_progress = AsyncMock()
+
+    async def _slow_handler(event_data, session_factory, dedupe_key):
+        await asyncio.sleep(0.1)
+
+    sub = _FakeSubscription([msg])
+    js = _FakeJetStream(subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: sub})
+    conn = _FakeNatsConn(js)
+
+    async def _connect(url, **kwargs):
+        return conn
+
+    _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
+    monkeypatch.setattr(nats_consumer, "handle_event", _slow_handler)
+    monkeypatch.setattr(nats_consumer, "NATS_HEARTBEAT_SECONDS", 0.01)
+
+    import app.database as app_db
+
+    monkeypatch.setattr(app_db, "AsyncSessionLocal", _SessionLocal)
+
+    app = _FakeApp()
+    await nats_consumer.start_nats_consumer(app)
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if msg.ack.await_count:
+                break
+        msg.ack.assert_awaited_once()
+        assert msg.in_progress.await_count >= 3
+    finally:
+        await nats_consumer.stop_nats_consumer(app)

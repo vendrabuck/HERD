@@ -380,7 +380,10 @@ def receive():
 ### Delivery semantics
 
 - At-least-once. A delivery can arrive more than once (for example after a
-  message redelivery), so your receiver must be idempotent.
+  message redelivery), so your receiver must be idempotent. A slow receiver
+  alone does not cause a duplicate: the consumer keeps its message alive while
+  a delivery is in flight. A crash of HERD during a POST still can, which is why
+  deduping on `event_id` stays your job.
 - Idempotent on `event_id`. HERD itself dedupes per `(subscription, event_id)`:
   once an event is `delivered` to a subscription, a redelivery of that event is
   skipped. Use the payload `event_id` as your own idempotency key too.

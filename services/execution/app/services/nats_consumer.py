@@ -11,6 +11,7 @@ import httpx
 from herd_common.jetstream import (
     ensure_consumer,
     ensure_stream_exists,
+    keep_messages_alive,
     nak_delay,
     parse_nak_backoff_schedule,
 )
@@ -158,24 +159,9 @@ async def _run_sandbox(*args, **kwargs):
     return await asyncio.to_thread(execute_driver_method, *args, **kwargs)
 
 
-async def _keep_messages_alive(messages: list, interval: float) -> None:
-    """Reset ack_wait on every still-in-flight message until it is settled.
-
-    Runs concurrently with the sequential batch processing (issue #317). Each
-    cycle sends work-in-progress to every message still in `messages`; the loop
-    removes a message as soon as it is acked/naked, so heartbeating stops for
-    settled messages. in_progress failures are swallowed: a heartbeat is
-    best-effort and must never wedge the consumer. Requires the driver calls to
-    run off-loop (see _run_sandbox), or this task could never get scheduled while
-    a provisioning handler holds the loop.
-    """
-    while True:
-        await asyncio.sleep(interval)
-        for msg in list(messages):
-            try:
-                await msg.in_progress()
-            except Exception:
-                logger.debug("in_progress heartbeat failed; continuing", exc_info=True)
+# The heartbeat lives in herd_common.jetstream now (issue #911); the private
+# name stays importable here for execution's tests and the loop below.
+_keep_messages_alive = keep_messages_alive
 
 
 class TransientUpstreamError(RuntimeError):

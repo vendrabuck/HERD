@@ -665,3 +665,50 @@ async def test_stop_nats_consumer_close_failure_is_swallowed():
     await stop_nats_consumer(mock_app)
 
     mock_nc.close.assert_awaited_once()
+
+
+async def test_started_consumer_loop_heartbeats_a_slow_handler():
+    """Issue #911, wired end to end: a message fetched by the real
+    `_consumer_loop` whose handler outlasts several heartbeat intervals gets
+    `in_progress` before it is acked. Fails if a loop is ever wired straight
+    to `process_message` without the heartbeat."""
+    mock_app = MagicMock()
+    mock_app.state = MagicMock()
+
+    msg = MagicMock()
+    msg.data = json.dumps(
+        {"event": "reservation.created", "reservation_id": str(uuid.uuid4())}
+    ).encode()
+    msg.metadata = MagicMock(num_delivered=1)
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
+    msg.in_progress = AsyncMock()
+
+    async def _slow_handler(event_data, raw_body, session_factory, dedupe_key):
+        await asyncio.sleep(0.1)
+
+    mock_js = _FakeJetStream(
+        subs_by_subject={nats_consumer.NATS_SUBJECT_PATTERN: _StubPullSub([msg])}
+    )
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
+    mock_nats = MagicMock()
+    mock_nats.connect = AsyncMock(return_value=mock_nc)
+
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
+        patch("app.services.nats_consumer.handle_event", _slow_handler),
+        patch("app.services.nats_consumer.NATS_HEARTBEAT_SECONDS", 0.01),
+        patch("app.database.AsyncSessionLocal", MagicMock()),
+    ):
+        await start_nats_consumer(mock_app)
+        for _ in range(100):
+            if msg.ack.await_count:
+                break
+            await asyncio.sleep(0.01)
+
+        msg.ack.assert_awaited_once()
+        assert msg.in_progress.await_count >= 3
+
+        await _cancel_both(mock_app)
