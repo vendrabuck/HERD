@@ -544,8 +544,9 @@ async def delete_device_by_id(
     `device_in_use` (with `reservation_ids` and `transit_reservation_ids`) or a
     fail-closed 503. Issue #940: after that, a device any cabling connection
     still names is refused with 409 `device_cabled` (`connection_count`,
-    `connection_ids`); remove the cables first; see app/services/device_delete_guard.py for the exact
-    shapes and the known post-cancel teardown window. Unlike the restore guard
+    `connection_ids`); remove the cables first; see
+    app/services/device_delete_guard.py for the exact shapes and the known
+    post-cancel teardown window. Unlike the restore guard
     there is no caller-owned exemption, and no force flag.
     """
     device = await get_device(db, device_id)
