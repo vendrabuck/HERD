@@ -39,6 +39,7 @@ vi.mock("@/api/reservations", () => ({
   useReleaseReservation: () => ({ mutate: vi.fn(), isPending: false }),
   usePurposeCategories: () => ({ data: { categories: [] } }),
   useSetPurposeCategory: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useClassifyPurpose: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 vi.mock("@/api/ai", () => ({
   useAIStatus: () => ({ data: { enabled: false } }),

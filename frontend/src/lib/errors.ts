@@ -112,3 +112,28 @@ export function formatUnconnectableDetail(detail: TopologyUnconnectableDetail): 
   const message = detail.message || "The proposed topology cannot be wired in this lab.";
   return lines.length > 0 ? `${message}\n${lines.join("\n")}` : message;
 }
+
+/**
+ * The three refusals of the on-demand purpose classifier trigger that are
+ * errors rather than outcomes (issue #822): 503 `purpose_classification_
+ * disabled`, and the two 409s `already_suggested` and `not_eligible`.
+ * Returns null for anything else (404, a 5xx without that body, a transport
+ * failure) so the caller falls back to `errorDetail`.
+ */
+export type PurposeClassifyRefusal =
+  | "purpose_classification_disabled"
+  | "already_suggested"
+  | "not_eligible";
+
+export function purposeClassifyRefusal(err: unknown): PurposeClassifyRefusal | null {
+  if (structuredDetail(err, 503, (d) => d.error === "purpose_classification_disabled")) {
+    return "purpose_classification_disabled";
+  }
+  if (structuredDetail(err, 409, (d) => d.error === "already_suggested")) {
+    return "already_suggested";
+  }
+  if (structuredDetail(err, 409, (d) => d.error === "not_eligible")) {
+    return "not_eligible";
+  }
+  return null;
+}

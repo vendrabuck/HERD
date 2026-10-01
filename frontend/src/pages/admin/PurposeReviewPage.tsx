@@ -118,6 +118,11 @@ export function PurposeReviewPage() {
           </button>
         </div>
 
+        <p className="text-sm text-gray-600">
+          A finished reservation with no suggestion can be classified from its detail view on the
+          Reservations page.
+        </p>
+
         <div className="flex items-center gap-2">
           <label htmlFor="purpose-review-category" className="text-sm text-gray-600">
             Category

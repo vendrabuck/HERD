@@ -437,3 +437,15 @@ export interface WiringRetryResponse {
   reservation_id: string;
   results: WiringRetryOutcome[];
 }
+
+// POST /reservations/admin/purpose-review/{id}/classify response (issue #808,
+// UI in issue #822). The endpoint answers 200 for every classifier outcome;
+// `outcome` says whether the attempt produced a suggestion. The disabled
+// feature (503) and the two 409 refusals arrive as errors, not as outcomes.
+export type PurposeClassifyOutcome = "ok" | "timeout" | "transient" | "failed" | "forbidden";
+
+export interface PurposeClassifyResponse {
+  reservation_id: string;
+  outcome: PurposeClassifyOutcome;
+  purpose_suggestion: PurposeClassification | null;
+}

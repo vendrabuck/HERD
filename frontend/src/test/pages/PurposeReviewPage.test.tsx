@@ -227,6 +227,16 @@ describe("PurposeReviewPage", () => {
     expect(await screen.findByText("Nothing to review")).toBeInTheDocument();
   });
 
+  it("tells the admin where to classify a reservation that has no suggestion (issue #822)", async () => {
+    mockReview([]);
+    renderWithProviders(<PurposeReviewPage />);
+    expect(
+      await screen.findByText(
+        "A finished reservation with no suggestion can be classified from its detail view on the Reservations page.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("accepts the top category: removes the row optimistically and posts purpose_category null", async () => {
     mockReview();
     let acceptedBody: unknown = null;

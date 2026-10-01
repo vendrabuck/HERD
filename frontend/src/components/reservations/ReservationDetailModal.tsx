@@ -5,6 +5,7 @@ import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import {
   useCancelReservation,
+  useClassifyPurpose,
   usePurposeCategories,
   useReleaseReservation,
   useSetPurposeCategory,
@@ -12,9 +13,16 @@ import {
 import { useTemplates } from "@/api/templates";
 import { useAIStatus } from "@/api/ai";
 import { useAuthStore } from "@/stores/authStore";
-import { errorDetail } from "@/lib/errors";
+import { errorDetail, purposeClassifyRefusal } from "@/lib/errors";
 import { isAdminRole } from "@/lib/roles";
-import { canCancel, canRelease } from "@/lib/reservationStatus";
+import { canCancel, canClassifyPurpose, canRelease } from "@/lib/reservationStatus";
+import {
+  PURPOSE_CLASSIFY_ALREADY_SUGGESTED_MESSAGE,
+  PURPOSE_CLASSIFY_DISABLED_MESSAGE,
+  PURPOSE_CLASSIFY_NOT_ELIGIBLE_MESSAGE,
+  PURPOSE_CLASSIFY_OUTCOME_MESSAGES,
+  purposeClassifySuccessMessage,
+} from "@/lib/purposeClassify";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import { ReservationInventoryTab } from "./ReservationInventoryTab";
 import { ReservationRoutesTab } from "./ReservationRoutesTab";
@@ -94,6 +102,12 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
     setPurposeCategoryState((s) => ({ ...s, value }));
   const { data: purposeCategoriesData } = usePurposeCategories();
   const setPurposeCategory = useSetPurposeCategory();
+  // On-demand purpose classification (issue #822). The `reservation` prop is
+  // a snapshot the parent does not refresh, so a reservation that was just
+  // classified (or refused as already suggested or not eligible) is remembered
+  // here to hide the button instead of waiting for a prop that never changes.
+  const classify = useClassifyPurpose();
+  const [classifyDoneIds, setClassifyDoneIds] = useState<ReadonlySet<string>>(() => new Set());
 
   if (!reservation) return null;
 
@@ -110,6 +124,36 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
     } catch (err) {
       setLocalPurposeCategory(previous);
       toast.error(errorDetail(err, "Failed to update purpose category"));
+    }
+  };
+  const canClassifyAct =
+    isAdminRole(user?.role) &&
+    canClassifyPurpose(reservation) &&
+    !classifyDoneIds.has(reservation.id);
+  const markClassifyDone = (id: string) => setClassifyDoneIds((prev) => new Set(prev).add(id));
+  const handleClassify = async () => {
+    const id = reservation.id;
+    try {
+      const result = await classify.mutateAsync(id);
+      if (result.outcome === "ok") {
+        markClassifyDone(id);
+        toast.success(purposeClassifySuccessMessage(result.purpose_suggestion));
+      } else {
+        toast(PURPOSE_CLASSIFY_OUTCOME_MESSAGES[result.outcome]);
+      }
+    } catch (err) {
+      const refusal = purposeClassifyRefusal(err);
+      if (refusal === "purpose_classification_disabled") {
+        toast.error(PURPOSE_CLASSIFY_DISABLED_MESSAGE);
+      } else if (refusal === "already_suggested") {
+        markClassifyDone(id);
+        toast.error(PURPOSE_CLASSIFY_ALREADY_SUGGESTED_MESSAGE);
+      } else if (refusal === "not_eligible") {
+        markClassifyDone(id);
+        toast.error(PURPOSE_CLASSIFY_NOT_ELIGIBLE_MESSAGE);
+      } else {
+        toast.error(errorDetail(err, "Failed to classify purpose"));
+      }
     }
   };
   const canReleaseAct = isOwner && canRelease(reservation.status);
@@ -251,6 +295,18 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
                   {Math.round((reservation.purpose_suggestion.distribution[0]?.probability ?? 0) * 100)}%
                   {reservation.purpose_suggestion_dismissed_at ? " (dismissed)" : ""}
                 </span>
+              </div>
+            )}
+            {canClassifyAct && (
+              <div className="flex justify-end -mt-2">
+                <button
+                  type="button"
+                  onClick={handleClassify}
+                  disabled={classify.isPending}
+                  className="text-xs px-2.5 py-1 rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                >
+                  {classify.isPending ? "Classifying..." : "Classify now"}
+                </button>
               </div>
             )}
             <div className="flex justify-between">
