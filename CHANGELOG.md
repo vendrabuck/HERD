@@ -14,7 +14,11 @@
   heartbeat derived as half of it by `herd_common.jetstream.heartbeat_interval`.
   The dev/test stack pins integration to 4 s, and the test webhook sink gains a
   bounded `delay_ms` and a per-event hit counter, so a live test holds a fan-out
-  open past ack_wait and asserts the receiver got exactly one POST.
+  open past ack_wait and asserts that the receiver got one POST and that a second
+  consumer waiting on the durable was handed no redelivery. The second consumer
+  is what makes the test able to fail: JetStream hands a timed-out message only
+  to a pull request that is waiting, so a lone consumer never receives its own
+  redelivery and the duplicate the heartbeat prevents needs a peer replica.
 - Added a **Classify now** action to the reservation detail modal (issue #822),
   the UI for the on-demand purpose classification trigger from issue #808. An
   admin sees it on a COMPLETED, CANCELLED, or FAILED reservation with no

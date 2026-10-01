@@ -34,8 +34,9 @@ import socket
 
 import nats
 import pytest
-from _nats_helpers import fetch_reservation_event
-from test_webhooks_flow import _poll_for_status, _register_webhook, _reservation_body
+
+from ._nats_helpers import fetch_reservation_event
+from .test_webhooks_flow import _poll_for_status, _register_webhook, _reservation_body
 
 pytestmark = pytest.mark.asyncio
 
@@ -170,6 +171,9 @@ async def test_slow_receiver_gets_the_event_exactly_once(admin_client, fresh_dev
             f"(ack_wait={ack_wait}s, sink delay {SINK_DELAY_MS}ms)"
         )
     finally:
+        # Webhook first: while it exists, every reservation.created on the stack
+        # is held SINK_DELAY_MS by the slow sink, which would lag the consumer
+        # for whatever test runs next.
+        await admin_client.delete(f"/v1/webhooks/{webhook_id}")
         if reservation_id:
             await admin_client.delete(f"/v1/reservations/{reservation_id}")
-        await admin_client.delete(f"/v1/webhooks/{webhook_id}")
