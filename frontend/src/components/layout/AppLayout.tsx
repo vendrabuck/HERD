@@ -7,6 +7,7 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
 import { APP_VERSION } from "@/lib/appVersion";
+import { MANUAL_URL } from "@/lib/links";
 
 const NAV_ITEMS = [
   { to: "/inventory", label: "Inventory" },
@@ -233,7 +234,7 @@ export function AppLayout() {
         </div>
         <div className="flex items-center gap-3">
           <a
-            href="https://github.com/vendrabuck/HERD/blob/main/docs/USER_GUIDE.md"
+            href={MANUAL_URL}
             target="_blank"
             rel="noopener noreferrer"
             aria-label="Help"
