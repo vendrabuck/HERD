@@ -33,6 +33,7 @@ from herd_common.jetstream import (
     ensure_stream_exists,
     nak_delay,
     parse_nak_backoff_schedule,
+    process_batch_with_heartbeat,
 )
 from herd_common.outbox import event_dedupe_key
 
@@ -52,6 +53,14 @@ NATS_DURABLE = "integration-webhooks-consumer"
 # branch (NATS_NAK_BACKOFF_SECONDS below), not from this config.
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
+# Work-in-progress heartbeat cadence (issue #911, the shared
+# herd_common.jetstream.keep_messages_alive; execution's issue #317 twin).
+# A webhook fan-out can run past ack_wait (up to WEBHOOK_DELIVERY_ATTEMPTS
+# POSTs of WEBHOOK_DELIVERY_TIMEOUT_SECONDS each plus backoff), and a
+# redelivery mid-flight would POST the same event to the receiver again.
+# Half of ack_wait leaves margin for a late heartbeat; a crashed consumer stops
+# heartbeating, so ack_wait still expires and the message correctly redelivers.
+NATS_HEARTBEAT_SECONDS = NATS_ACK_WAIT_SECONDS // 2
 # NAK-delay schedule (issue #895), from Settings so it is a knob
 # (NATS_NAK_BACKOFF_SECONDS): production defaults to [1, 5, 15, 60, 120];
 # docker-compose.override.yml pins a short dev/test schedule. Parsed once at
@@ -196,6 +205,29 @@ async def process_message(
     return "ack"
 
 
+async def process_batch(
+    msgs: list,
+    js,
+    session_factory: Callable,
+    *,
+    dlq_subject: str = NATS_DLQ_SUBJECT,
+    handler: Callable[[dict, bytes, Callable, str | None], Awaitable[None]] | None = None,
+) -> None:
+    """Process one fetched batch with the in-progress heartbeat running (issue
+    #911): every message not yet settled, the running one and any queued
+    behind it, gets `in_progress` every NATS_HEARTBEAT_SECONDS, so a slow
+    handler never reaches ack_wait. Every durable's consumer loop goes through
+    here, so no loop can skip the heartbeat."""
+
+    # Resolved at call time so a test patching `handle_event` still takes effect.
+    handler_fn = handler or handle_event
+
+    async def _one(msg) -> None:
+        await process_message(msg, js, handler_fn, session_factory, dlq_subject=dlq_subject)
+
+    await process_batch_with_heartbeat(msgs, _one, NATS_HEARTBEAT_SECONDS)
+
+
 async def start_nats_consumer(app) -> None:
     """Start both webhook delivery consumers as background tasks during lifespan.
 
@@ -278,21 +310,12 @@ async def start_nats_consumer(app) -> None:
                         )
                         await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
                         continue
-                    for msg in msgs:
-                        try:
-                            await process_message(
-                                msg,
-                                js,
-                                handle_event,
-                                AsyncSessionLocal,
-                                dlq_subject=dlq_subject,
-                            )
-                        except Exception:
-                            logger.error(
-                                "Unexpected error in webhook consumer loop for %s",
-                                subject_pattern,
-                                exc_info=True,
-                            )
+                    await process_batch(
+                        msgs,
+                        js,
+                        AsyncSessionLocal,
+                        dlq_subject=dlq_subject,
+                    )
 
             return asyncio.create_task(_consumer_loop())
 

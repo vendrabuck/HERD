@@ -37,8 +37,9 @@ longer redelivers immediately (see each function's docstring).
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 from nats.js.api import ConsumerConfig, StreamConfig
 from nats.js.errors import BadRequestError, NotFoundError
@@ -218,7 +219,69 @@ def parse_nak_backoff_schedule(value: str) -> list[int]:
     return schedule
 
 
+async def keep_messages_alive(messages: list, interval: float) -> None:
+    """Reset ack_wait on every still-in-flight message until it is settled.
+
+    The ONE heartbeat implementation every durable consumer shares (issue #317
+    for execution, issue #911 for integration and notifications). Runs
+    concurrently with the sequential processing of a fetched batch. Each cycle
+    sends work-in-progress to every message still in `messages`; the caller
+    removes a message as soon as it is acked/naked, so heartbeating stops for
+    settled messages. in_progress failures are swallowed: a heartbeat is
+    best-effort and must never wedge the consumer. The task never ends on its
+    own; the caller cancels it. `interval` must stay strictly below the
+    consumer's ack_wait.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        for msg in list(messages):
+            try:
+                await msg.in_progress()
+            except Exception:
+                logger.debug("in_progress heartbeat failed; continuing", exc_info=True)
+
+
+async def process_batch_with_heartbeat(
+    msgs: list,
+    process_one: Callable[[object], Awaitable[object]],
+    interval: float,
+) -> None:
+    """Run `process_one(msg)` for each fetched message in order while
+    `keep_messages_alive` heartbeats every message that is not yet settled
+    (the one running AND any queued behind it).
+
+    A message leaves the in-flight list as soon as its `process_one` returns
+    or raises, so its heartbeat stops. `process_one` is expected to ack or nak
+    (or dead-letter) the message itself; an exception it raises is logged and
+    the batch continues. The heartbeat task is always cancelled and awaited on
+    the way out, including when the caller is cancelled mid-message, so no
+    task leaks.
+    """
+    in_flight = list(msgs)
+    heartbeat = asyncio.create_task(keep_messages_alive(in_flight, interval))
+    try:
+        for msg in msgs:
+            try:
+                await process_one(msg)
+            except Exception:
+                logger.error("Unexpected error processing NATS message", exc_info=True)
+            finally:
+                try:
+                    in_flight.remove(msg)
+                except ValueError:
+                    pass
+    finally:
+        heartbeat.cancel()
+        # gather (not a bare await inside try/except CancelledError): a cancel
+        # aimed at THIS task while it waits here must still propagate, whereas
+        # catching CancelledError would swallow it and leave the consumer loop
+        # running after stop_nats_consumer cancelled it.
+        await asyncio.gather(heartbeat, return_exceptions=True)
+
+
 __all__ = [
+    "keep_messages_alive",
+    "process_batch_with_heartbeat",
     "ensure_stream",
     "ensure_stream_exists",
     "ensure_consumer",

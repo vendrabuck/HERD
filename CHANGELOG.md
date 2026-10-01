@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- Fixed integration and notifications redelivering a message whose handler was
+  still running (issue #911). Only execution sent `in_progress`, so a webhook
+  fan-out outlasting the 30 s `ack_wait` (several slow POSTs plus backoff) was
+  redelivered and the receiver got the same event twice. The heartbeat is now
+  one shared implementation, `herd_common.jetstream.keep_messages_alive`, with
+  `process_batch_with_heartbeat` wrapping each fetched batch; both integration
+  durables and notifications' two durables use it, and each service pins its
+  `NATS_HEARTBEAT_SECONDS` below its `ack_wait`. Execution's behavior is
+  unchanged. Delivery stays at-least-once: a crash during a POST can still
+  redeliver (`docs/EXTERNAL_API.md` says so).
 - Fixed an expanded inventory row collapsing when the list changes under it
   (issue #938). Typing a search and expanding a row before the debounced
   filtered list arrived used to close the row, because every list change
