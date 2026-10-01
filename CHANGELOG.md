@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- Fixed the header help icon (the `?` beside the notification bell) to open the
+  published user manual at <https://vendrabuck.github.io/HERD/manual/> (issue
+  #960). It used to open a repository document. The address lives once as
+  `MANUAL_URL` in `frontend/src/lib/links.ts`; the link still opens in a new tab
+  with `rel="noopener noreferrer"`.
 - Added multi-select Cancel and Release to the Reservations page (issue #843).
   Each row has a checkbox and the header has a select-all for the current page;
   a selection bar offers Cancel selected and Release selected. There is no bulk
