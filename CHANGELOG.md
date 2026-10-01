@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- Fixed the assistant stream losing its terminal frame when the overall
+  deadline fired while a frame was being handed to a slow client (issue #946).
+  The route yielded SSE frames from inside `asyncio.timeout`, so the
+  cancellation landed in the consumer, the timeout handler never ran, and the
+  stream ended with neither `done` nor `error` and no incomplete-turn save. The
+  route now keeps one absolute deadline and bounds only the wait for the next
+  event, yielding each frame after that scope closes, and closes the inner
+  generator on every exit. A structural unit test fails on any `yield` inside
+  `asyncio.timeout`, `asyncio.timeout_at`, or `asyncio.TaskGroup` under
+  `services/*/app`.
 - Fixed integration and notifications redelivering a message whose handler was
   still running (issue #911). Only execution sent `in_progress`, so a webhook
   fan-out outlasting the 30 s `ack_wait` (several slow POSTs plus backoff) was

@@ -184,6 +184,8 @@ Event types (each frame is `event: <type>` then `data: <json>`):
 - `done`: the fully-assembled turn, carrying the same JSON object the buffered endpoint returns (`answer`, `model`, token counts, `stop_reason`, `tool_calls`, `tool_iterations`, `conversation_id`, `pending_apply`, `incomplete`).
 - `error`: `{ "message": "..." }` for a failure after the stream opened (timeout or LLM failure) that struck before any write tool produced a side effect. Once a write tool has produced one, the same failure instead rides the ordinary `done` event with `incomplete` set (see the Errors section above); the stream never emits both for one turn.
 
+The overall deadline is one absolute instant that bounds only the wait for the next event, so it also applies while the server is waiting on a slow client to take a frame (that time counts against it). Whichever way the turn ends, the stream carries exactly one terminal frame, `done` or `error`.
+
 The conversation is persisted after the stream completes, so a `conversation_id` from a streamed `done` event can be passed to either endpoint to continue the thread. The buffered endpoint remains available; streaming is opt-in per request by calling the `/stream` path.
 
 ## Privacy and safety

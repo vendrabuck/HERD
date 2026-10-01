@@ -1707,7 +1707,13 @@ async def test_buffered_mid_dispatch_gap_names_landed_tool_in_closing_message(
 async def test_stream_mid_dispatch_gap_names_landed_tool_in_closing_message(
     async_client, monkeypatch
 ):
-    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.05)
+    # 0.5 s, not the 0.05 s the buffered twin uses: this stub yields a `status`
+    # frame BEFORE it dispatches, and time spent handing that frame to the client
+    # counts against the deadline (issue #946). A 50 ms deadline could already be
+    # spent by a slow handoff on a loaded runner, so the tool never landed and the
+    # turn ended in `error`; that is what failed in CI. The deadline only has to
+    # fire while `slow_tool` hangs, so a wider one costs nothing but wall time.
+    monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.5)
     monkeypatch.setattr("app.routes.reservation_assistant.ToolDispatcher", _GatherGapFakeDispatcher)
     _override_seed()
     app.dependency_overrides[get_ai_client] = lambda: _GatherGapStreamStubAI()

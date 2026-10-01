@@ -57,6 +57,9 @@ from app.services.tools import ToolDispatcher
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for `anext(agen, _STREAM_END)` in the streaming loop (issue #946).
+_STREAM_END = object()
+
 # Issue #871: reason codes for AssistantResponse.incomplete, one per except
 # branch below that now checks dispatcher.side_effects before rolling back.
 # Pinned strings (not the exception's own text) so the client and tests match
@@ -596,20 +599,34 @@ async def reservation_assistant_stream(
         partial_usage = Usage()
         turn = None
         try:
-            async with asyncio.timeout(settings.assistant_overall_deadline_s):
-                async with ToolDispatcher(
-                    token=token,
-                    reservation_id=reservation_id,
-                    char_cap=settings.assistant_tool_result_char_cap,
-                ) as dispatcher:
-                    async for ev in ai.answer_reservation_question_streaming(
-                        messages=messages,
-                        dispatcher=dispatcher,
-                        max_iterations=settings.assistant_max_tool_iterations,
-                        per_call_timeout_s=settings.assistant_per_call_timeout_s,
-                        segments=partial_segments,
-                        usage=partial_usage,
-                    ):
+            # Issue #946: no yield may sit inside a timeout scope. A deadline
+            # that fires while this generator is suspended at a yield cancels
+            # the CONSUMER, so the handlers below never run and the stream ends
+            # with no terminal frame. So the deadline is ONE absolute instant
+            # and only the wait for the NEXT event is bounded by it; each frame
+            # is yielded after that scope has closed. Time spent suspended at a
+            # yield still counts against the deadline: the next wait then
+            # raises at once.
+            deadline = asyncio.get_running_loop().time() + settings.assistant_overall_deadline_s
+            async with ToolDispatcher(
+                token=token,
+                reservation_id=reservation_id,
+                char_cap=settings.assistant_tool_result_char_cap,
+            ) as dispatcher:
+                agen = ai.answer_reservation_question_streaming(
+                    messages=messages,
+                    dispatcher=dispatcher,
+                    max_iterations=settings.assistant_max_tool_iterations,
+                    per_call_timeout_s=settings.assistant_per_call_timeout_s,
+                    segments=partial_segments,
+                    usage=partial_usage,
+                )
+                try:
+                    while True:
+                        async with asyncio.timeout_at(deadline):
+                            ev = await anext(agen, _STREAM_END)
+                        if ev is _STREAM_END:
+                            break
                         if ev.type == "status":
                             yield _sse(
                                 "status",
@@ -628,6 +645,10 @@ async def reservation_assistant_stream(
                         await db.rollback()
                         yield _sse("error", {"message": "Assistant produced no answer"})
                         return
+                finally:
+                    # Close the inner generator on every exit (timeout, error,
+                    # consumer disconnect): a no-op once it has finished.
+                    await agen.aclose()
         except asyncio.TimeoutError:
             incomplete_response = await _finalize_incomplete_turn(
                 db=db,
