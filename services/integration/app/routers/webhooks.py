@@ -5,8 +5,11 @@ are app-relative /webhooks. Only admins manage subscriptions; the NATS consumer
 (app.services.nats_consumer) is what actually delivers events.
 """
 
+import asyncio
+import json
 import secrets
 import uuid
+from collections import OrderedDict
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from herd_common.auth import make_auth_dependencies
@@ -123,11 +126,49 @@ async def delete_webhook(
 test_sink_router = APIRouter(prefix="/webhooks", tags=["v1-webhooks-test-sink"])
 
 
+# Longest the sink will sleep before answering (issue #944), so a stray
+# delay_ms can never be used to hang the service.
+SINK_MAX_DELAY_MS = 10_000
+# Arrivals per payload event_id, bounded so a long-lived dev stack cannot grow
+# it without limit. Counts POSTs as they ARRIVE (before any delay), which the
+# delivery ledger cannot show: its unique (subscription, event) row hides a
+# redelivered fan-out's second POST.
+_SINK_HITS_MAX_KEYS = 1000
+_sink_hits: "OrderedDict[str, int]" = OrderedDict()
+
+
+def _record_sink_hit(body: bytes) -> None:
+    try:
+        event_id = json.loads(body).get("event_id")
+    except (ValueError, AttributeError):
+        return
+    if not isinstance(event_id, str):
+        return
+    _sink_hits[event_id] = _sink_hits.pop(event_id, 0) + 1
+    while len(_sink_hits) > _SINK_HITS_MAX_KEYS:
+        _sink_hits.popitem(last=False)
+
+
 @test_sink_router.post("/echo", include_in_schema=False)
-async def echo_receiver(request: Request):
-    """Unauthenticated 200 sink for end-to-end delivery verification (test stack only)."""
+async def echo_receiver(request: Request, delay_ms: int = 0):
+    """Unauthenticated 200 sink for end-to-end delivery verification (test stack only).
+
+    `delay_ms` (query parameter on the registered target URL, clamped to
+    0..SINK_MAX_DELAY_MS) makes the sink answer slowly, so a live test can hold
+    a webhook fan-out open past the consumer's ack_wait (issue #944).
+    """
     body = await request.body()
+    _record_sink_hit(body)
+    delay = max(0, min(delay_ms, SINK_MAX_DELAY_MS))
+    if delay:
+        await asyncio.sleep(delay / 1000)
     return {"ok": True, "received_bytes": len(body)}
+
+
+@test_sink_router.get("/echo/hits", include_in_schema=False)
+async def echo_hits(event_id: str):
+    """How many POSTs the sink has received whose JSON body carried `event_id`."""
+    return {"event_id": event_id, "count": _sink_hits.get(event_id, 0)}
 
 
 @router.get("/{webhook_id}/deliveries", response_model=list[WebhookDeliveryResponse])

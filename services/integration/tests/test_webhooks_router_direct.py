@@ -12,6 +12,7 @@ attribution for the branches ASGI tests already exercise, plus covers
 coverage at all (it is registered only when webhook_test_sink_enabled=True).
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -309,3 +310,82 @@ async def test_list_deliveries_direct_clamps_limit_above_500(session_factory):
         result = await webhooks_mod.list_deliveries(sub.id, 999999, _payload(), db)
 
     assert len(result) == 3
+
+
+# --- echo sink delay and hit counter (issue #944) ------------------------------
+
+
+def _sink_request(body: bytes):
+    from starlette.requests import Request
+
+    sent = False
+
+    async def _receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(
+        {"type": "http", "method": "POST", "path": "/webhooks/echo", "headers": []},
+        receive=_receive,
+    )
+
+
+async def test_echo_receiver_counts_arrivals_per_event_id():
+    webhooks_mod._sink_hits.clear()
+    body = json.dumps({"event_id": "evt-1"}).encode()
+
+    await webhooks_mod.echo_receiver(_sink_request(body))
+    await webhooks_mod.echo_receiver(_sink_request(body))
+    await webhooks_mod.echo_receiver(_sink_request(b'{"event_id": "evt-2"}'))
+
+    assert (await webhooks_mod.echo_hits("evt-1")) == {"event_id": "evt-1", "count": 2}
+    assert (await webhooks_mod.echo_hits("evt-2"))["count"] == 1
+    assert (await webhooks_mod.echo_hits("never-sent"))["count"] == 0
+
+
+async def test_echo_receiver_ignores_bodies_without_a_string_event_id():
+    webhooks_mod._sink_hits.clear()
+
+    for body in (b"not json", b"[]", b'{"event_id": 5}', b"{}"):
+        await webhooks_mod.echo_receiver(_sink_request(body))
+
+    assert not webhooks_mod._sink_hits
+
+
+async def test_echo_receiver_hit_table_is_bounded():
+    webhooks_mod._sink_hits.clear()
+    for i in range(webhooks_mod._SINK_HITS_MAX_KEYS + 5):
+        await webhooks_mod.echo_receiver(_sink_request(json.dumps({"event_id": str(i)}).encode()))
+
+    assert len(webhooks_mod._sink_hits) == webhooks_mod._SINK_HITS_MAX_KEYS
+    assert "0" not in webhooks_mod._sink_hits
+
+
+async def test_echo_receiver_delay_ms_sleeps_and_is_clamped(monkeypatch):
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(webhooks_mod.asyncio, "sleep", fake_sleep)
+
+    await webhooks_mod.echo_receiver(_sink_request(b"{}"), delay_ms=0)
+    await webhooks_mod.echo_receiver(_sink_request(b"{}"), delay_ms=6000)
+    await webhooks_mod.echo_receiver(_sink_request(b"{}"), delay_ms=10**9)
+    await webhooks_mod.echo_receiver(_sink_request(b"{}"), delay_ms=-5)
+
+    assert slept == [6.0, webhooks_mod.SINK_MAX_DELAY_MS / 1000]
+
+
+def test_sink_routes_stay_out_of_the_published_schema():
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(webhooks_mod.test_sink_router)
+
+    assert "/webhooks/echo" in {r.path for r in app.routes}
+    assert "/webhooks/echo/hits" in {r.path for r in app.routes}
+    assert not [p for p in app.openapi()["paths"] if p.startswith("/webhooks/echo")]

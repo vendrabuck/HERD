@@ -426,3 +426,39 @@ async def test_process_batch_cancel_while_stopping_heartbeat_still_propagates():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# --- heartbeat_interval / validate_ack_wait_seconds (issue #944) -------------
+
+
+@pytest.mark.parametrize(
+    "ack_wait, expected",
+    [(30, 15.0), (4, 2.0), (3, 1.5), (2, 1.0)],
+)
+def test_heartbeat_interval_is_exactly_half_of_ack_wait(ack_wait, expected):
+    from herd_common.jetstream import heartbeat_interval
+
+    assert heartbeat_interval(ack_wait) == expected
+
+
+def test_heartbeat_interval_never_floors_to_zero_at_the_minimum_ack_wait():
+    from herd_common.jetstream import MIN_ACK_WAIT_SECONDS, heartbeat_interval
+
+    assert 0 < heartbeat_interval(MIN_ACK_WAIT_SECONDS) < MIN_ACK_WAIT_SECONDS
+
+
+def test_validate_ack_wait_accepts_the_minimum_and_above():
+    from herd_common.jetstream import MIN_ACK_WAIT_SECONDS, validate_ack_wait_seconds
+
+    assert validate_ack_wait_seconds(MIN_ACK_WAIT_SECONDS) == MIN_ACK_WAIT_SECONDS
+    assert validate_ack_wait_seconds(30) == 30
+
+
+@pytest.mark.parametrize("bad", [1, 0, -1])
+def test_validate_ack_wait_refuses_below_the_minimum_with_pinned_wording(bad):
+    from herd_common.jetstream import validate_ack_wait_seconds
+
+    with pytest.raises(ValueError) as exc:
+        validate_ack_wait_seconds(bad)
+
+    assert str(exc.value) == f"NATS_ACK_WAIT_SECONDS must be at least 2 seconds, got {bad}"
