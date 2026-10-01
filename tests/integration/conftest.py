@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import time
 import uuid
 from pathlib import Path
 
@@ -20,7 +21,11 @@ import pytest
 # from the repo root, which is not in sys.path for this directory.
 sys.path.insert(0, str(Path(__file__).parent))
 
-from _device_teardown import DeviceTeardownError, delete_device_checked  # noqa: E402
+from _device_teardown import (  # noqa: E402
+    IN_USE_WAIT_SECONDS,
+    DeviceTeardownError,
+    delete_device_checked,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -377,12 +382,19 @@ async def fresh_devices(admin_client, dut_template):
 
     yield _make
     # Every device gets its delete attempt before any failure is raised, so one
-    # stuck device does not leak the rest (issue #940).
+    # stuck device does not leak the rest (issue #940). The in-use wait is ONE
+    # budget shared by the whole batch: a test that leaves a live reservation on
+    # N devices must not add N waits to its teardown under the 30 s test cap.
     failures: list[str] = []
+    deadline = time.monotonic() + IN_USE_WAIT_SECONDS
     for device in created:
         try:
-            await delete_device_checked(admin_client, device["id"])
-        except DeviceTeardownError as exc:
-            failures.append(str(exc))
+            await delete_device_checked(
+                admin_client,
+                device["id"],
+                in_use_wait_seconds=max(0.0, deadline - time.monotonic()),
+            )
+        except Exception as exc:
+            failures.append(f"{device['id']}: {exc}")
     if failures:
         raise DeviceTeardownError("; ".join(failures))
