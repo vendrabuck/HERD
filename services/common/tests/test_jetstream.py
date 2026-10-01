@@ -303,3 +303,126 @@ async def test_ensure_consumer_tolerates_a_config_double_missing_filter_subject_
     assert config.durable_name == "my-durable"
     assert config.filter_subject == "herd.reservations.*"
     js.add_consumer.assert_awaited_once_with("HERD_RESERVATIONS", config=config)
+
+
+# --- keep_messages_alive / process_batch_with_heartbeat (issue #911) --------
+
+
+class _BeatMsg:
+    def __init__(self, fail=False):
+        self.beats = 0
+        self._fail = fail
+
+    async def in_progress(self):
+        self.beats += 1
+        if self._fail:
+            raise RuntimeError("broker hiccup")
+
+
+@pytest.mark.asyncio
+async def test_keep_messages_alive_heartbeats_until_settled_or_cancelled():
+    import asyncio
+
+    from herd_common.jetstream import keep_messages_alive
+
+    m1, m2 = _BeatMsg(), _BeatMsg()
+    in_flight = [m1, m2]
+    task = asyncio.create_task(keep_messages_alive(in_flight, 0.01))
+    await asyncio.sleep(0.06)
+    assert m1.beats >= 1 and m2.beats >= 1
+
+    in_flight.remove(m1)
+    frozen, before = m1.beats, m2.beats
+    await asyncio.sleep(0.06)
+    assert m1.beats == frozen
+    assert m2.beats > before
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    after = m2.beats
+    await asyncio.sleep(0.05)
+    assert m2.beats == after
+
+
+@pytest.mark.asyncio
+async def test_keep_messages_alive_swallows_in_progress_errors():
+    import asyncio
+
+    from herd_common.jetstream import keep_messages_alive
+
+    good = _BeatMsg()
+    task = asyncio.create_task(keep_messages_alive([_BeatMsg(fail=True), good], 0.01))
+    await asyncio.sleep(0.06)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert good.beats >= 1
+
+
+@pytest.mark.asyncio
+async def test_process_batch_settles_in_order_and_survives_a_raising_message():
+    import asyncio
+
+    from herd_common.jetstream import process_batch_with_heartbeat
+
+    seen = []
+    msgs = [_BeatMsg(), _BeatMsg(), _BeatMsg()]
+
+    async def process_one(msg):
+        seen.append(msg)
+        if msg is msgs[0]:
+            raise RuntimeError("boom")
+        await asyncio.sleep(0.03)
+
+    before = asyncio.all_tasks()
+    await process_batch_with_heartbeat(msgs, process_one, 0.01)
+
+    assert seen == msgs
+    assert msgs[2].beats >= 1
+    assert not (asyncio.all_tasks() - before - {asyncio.current_task()})
+
+
+@pytest.mark.asyncio
+async def test_process_batch_cancelled_mid_message_leaks_no_task():
+    import asyncio
+
+    from herd_common.jetstream import process_batch_with_heartbeat
+
+    msg = _BeatMsg()
+    started = asyncio.Event()
+
+    async def process_one(_msg):
+        started.set()
+        await asyncio.sleep(10)
+
+    before = asyncio.all_tasks()
+    task = asyncio.create_task(process_batch_with_heartbeat([msg], process_one, 0.01))
+    await started.wait()
+    await asyncio.sleep(0.04)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert msg.beats >= 1
+    assert not (asyncio.all_tasks() - before - {asyncio.current_task()})
+
+
+@pytest.mark.asyncio
+async def test_process_batch_cancel_while_stopping_heartbeat_still_propagates():
+    """A cancel that lands while the batch helper awaits its heartbeat's
+    shutdown must not be swallowed (it would leave a consumer loop running
+    after stop_nats_consumer cancelled it, hanging shutdown)."""
+    import asyncio
+
+    from herd_common.jetstream import process_batch_with_heartbeat
+
+    async def process_one(_msg):
+        raise AssertionError("empty batch")
+
+    task = asyncio.create_task(process_batch_with_heartbeat([], process_one, 0.01))
+    await asyncio.sleep(0)  # task is now parked in the heartbeat shutdown
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
