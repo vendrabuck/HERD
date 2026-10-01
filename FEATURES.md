@@ -205,7 +205,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   suggested category, until an admin accepts (the top category or a chosen
   override), dismisses, or overrules an owner's pick; a **Classify history**
   action backfills suggestions for terminal reservations that predate the
-  feature. Suggested-but-unconfirmed rows report in their own
+  feature; a finished reservation with no suggestion can also be classified
+  on demand from an admin-only **Classify now** button in its detail modal.
+  Suggested-but-unconfirmed rows report in their own
   `by_purpose_suggested` bucket, shown as a distinct hatched bar in the
   reporting page's chart, never mixed into the confirmed totals; the
   `unclassified` bucket now means genuinely untouched, not merely unconfirmed.

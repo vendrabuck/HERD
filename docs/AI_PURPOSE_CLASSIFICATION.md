@@ -204,6 +204,27 @@ null (the reservation has not reached a terminal state), and
 `{"error": "already_suggested"}` when `purpose_suggestion` is already set
 (dismiss or override it through the accept/dismiss endpoints first).
 
+The admin UI path (issue #822): the reservation detail modal on the
+Reservations page shows a **Classify now** button to an admin on a COMPLETED,
+CANCELLED, or FAILED reservation that has no suggestion. The Purpose Review
+page lists only rows that already have a suggestion, so it carries a sentence
+pointing at this button instead of a list of its own. The gate is
+`canClassifyPurpose` in `frontend/src/lib/reservationStatus.ts`. It mirrors the
+route's two 409s: the API does not expose `purpose_classify_requested_at`, so
+terminal status stands in for it, and a reservation that went terminal before
+the stamp existed and was never backfilled still shows the button and answers
+409 `not_eligible`. The button is disabled while the request is in flight, and
+the response is rendered as follows (wording in
+`frontend/src/lib/purposeClassify.ts`):
+
+| Response | What the admin sees |
+|---|---|
+| 200 `ok` | Success toast naming the suggested category; the button leaves and the reservation and Purpose Review queries refetch |
+| 200 `timeout`, `transient`, `failed`, `forbidden` | A neutral toast with a plain sentence for that outcome and a hint to check the AI orchestrator; the button stays for a retry |
+| 503 `purpose_classification_disabled` | The toast "Purpose classification is disabled."; the button stays |
+| 409 `already_suggested` or `not_eligible` | A plain toast; the button leaves and the queries refetch |
+| 404 or anything else | The response's string detail, else "Failed to classify purpose" |
+
 Concurrency with the sweep is accepted, not locked: the sweep may be
 classifying the same row in the same window the trigger is called for it
 (both become eligible the moment `purpose_classify_requested_at` is set).

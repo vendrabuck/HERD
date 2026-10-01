@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Added a **Classify now** action to the reservation detail modal (issue #822),
+  the UI for the on-demand purpose classification trigger from issue #808. An
+  admin sees it on a COMPLETED, CANCELLED, or FAILED reservation with no
+  suggestion; it calls `POST /admin/purpose-review/{id}/classify` and renders
+  the outcome: a toast naming the suggested category on `ok`, a plain sentence
+  for each other outcome, the disabled message on 503, and a refetch that
+  removes the stale button on either 409. The gate is one predicate,
+  `canClassifyPurpose`, beside `canCancel` and `canRelease`. The Purpose Review
+  page, which lists only rows that already have a suggestion, gained a sentence
+  pointing at the new button. Covered by vitest and a Playwright test that
+  asserts the UI against the real backend answer and an API read-back.
 - Fixed the assistant stream losing its terminal frame when the overall
   deadline fired while a frame was being handed to a slow client (issue #946).
   The route yielded SSE frames from inside `asyncio.timeout`, so the
