@@ -119,22 +119,23 @@ async def test_in_use_is_retried_until_the_reservation_teardown_finishes():
 
 
 @pytest.mark.asyncio
-async def test_in_use_outlasting_the_window_is_reported_not_raised_by_default(capsys):
-    stack = FakeStack([(409, IN_USE)])
-    async with stack.client() as client:
-        await td.delete_device_checked(client, DEVICE, in_use_wait_seconds=0.0)
-    assert "device_in_use" in capsys.readouterr().err
-
-
-@pytest.mark.asyncio
-async def test_in_use_outlasting_the_window_raises_when_strict():
+async def test_in_use_outlasting_the_window_raises_by_default():
+    """The default is strict: a device a live reservation still holds at
+    teardown fails the test with the refusal body."""
+    assert td.STRICT_IN_USE is True
     stack = FakeStack([(409, IN_USE)])
     async with stack.client() as client:
         with pytest.raises(td.DeviceTeardownError) as ei:
-            await td.delete_device_checked(
-                client, DEVICE, in_use_wait_seconds=0.0, strict_in_use=True
-            )
+            await td.delete_device_checked(client, DEVICE, in_use_wait_seconds=0.0)
     assert "device_in_use" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_in_use_outlasting_the_window_is_reported_not_raised_when_not_strict(capsys):
+    stack = FakeStack([(409, IN_USE)])
+    async with stack.client() as client:
+        await td.delete_device_checked(client, DEVICE, in_use_wait_seconds=0.0, strict_in_use=False)
+    assert "device_in_use" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
