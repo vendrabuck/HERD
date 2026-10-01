@@ -171,3 +171,131 @@ def test_inventory_expanded_shows_device_info_panel(pw_page):
             json={"saved_filters": {"inventory": baseline_inventory_filter}},
             allow_errors=True,
         )
+
+
+def test_inventory_expansion_survives_delayed_search_refetch(pw_page):
+    """An expanded row stays open when the debounced search refetch lands (issue #938).
+
+    The list refetch is held with a Playwright route so the race is deterministic:
+    the row is expanded while the filtered response is still in flight, then the
+    response is released. Two devices share a name token so the second search
+    returns a DIFFERENT id list that still contains the expanded row (the exact
+    shape that used to wipe `expandedIds`); the row stays on screen during the
+    hold because the page keeps the previous list as placeholder data.
+    """
+    pw_login(pw_page)
+
+    tmpl_resp = _api(
+        pw_page,
+        "GET",
+        "/inventory/templates",
+        params={"template_type": "device", "limit": 20},
+        allow_errors=True,
+    )
+    if tmpl_resp.status_code != 200:
+        pytest.skip(f"could not list device templates: {tmpl_resp.status_code}")
+    templates = tmpl_resp.json().get("items") or []
+    if not templates:
+        pytest.skip("no device templates available to provision a test device")
+
+    token = uuid.uuid4().hex[:10]
+    name_a = f"e2e-pw-inv-race-{token}-a"
+    name_b = f"e2e-pw-inv-race-{token}-b"
+    created_ids: list[str] = []
+    baseline_inventory_filter: dict = {}
+    try:
+        for name in (name_a, name_b):
+            for template in templates:
+                create = _api(
+                    pw_page,
+                    "POST",
+                    "/inventory/devices",
+                    json={
+                        "name": name,
+                        "template_id": template["id"],
+                        "topology_type": "PHYSICAL",
+                        "status": "AVAILABLE",
+                        "field_data": _required_field_data(template),
+                    },
+                    allow_errors=True,
+                )
+                if create.status_code == 201:
+                    created_ids.append(create.json()["id"])
+                    break
+            else:
+                pytest.skip("could not provision a test device against any device template")
+
+        prefs_before = _api(pw_page, "GET", "/user-profile/preferences", allow_errors=True)
+        if prefs_before.status_code == 200:
+            baseline_inventory_filter = (
+                prefs_before.json().get("saved_filters", {}).get("inventory") or {}
+            )
+
+        pw_page.goto(f"{HOST_BASE_URL}/inventory")
+        search_box = pw_page.get_by_placeholder("Search devices by name...")
+
+        # Step 1: settle on a list holding only device A.
+        search_box.fill(name_a)
+        row_a = pw_page.locator("tbody tr", has_text=name_a)
+        expect(row_a).to_have_count(1)
+        expect(pw_page.locator("tbody tr", has_text=name_b)).to_have_count(0)
+
+        # Step 2: hold the response to the shared-token search. Only a request
+        # whose search term is the shared token is held, so the all-names walker
+        # and every other devices call pass straight through.
+        shared = f"e2e-pw-inv-race-{token}-"
+        held: list = []
+
+        def hold_shared_search(route):
+            if f"search={shared}" in route.request.url:
+                held.append(route)
+            else:
+                route.continue_()
+
+        # The page saves the search as a debounced preference PATCH. Wait for the
+        # one carrying the shared token before the cleanup below restores the
+        # baseline, or that late PATCH lands after the restore and poisons the
+        # saved filter for the next run (the search box would start prefilled).
+        def is_shared_prefs_patch(response):
+            request = response.request
+            return (
+                request.method == "PATCH"
+                and "/user-profile/preferences" in response.url
+                and shared in (request.post_data or "")
+            )
+
+        pw_page.route("**/api/inventory/devices?*", hold_shared_search)
+        try:
+            with (
+                pw_page.expect_response(is_shared_prefs_patch),
+                pw_page.expect_request(lambda r: f"search={shared}" in r.url),
+            ):
+                search_box.fill(shared)
+            # Row A is still on screen from the previous list; expand it before
+            # the filtered response is allowed to land.
+            row_a.locator("button[aria-label*='Expand']").click()
+            panel_row = row_a.locator("xpath=following-sibling::tr[1]")
+            expect(panel_row.get_by_text("Modified by:", exact=True)).to_be_visible()
+            assert held, "the shared-token search response was not held"
+            assert pw_page.locator("tbody tr", has_text=name_b).count() == 0
+
+            # Release the response: the list now holds both devices.
+            for route in held:
+                route.continue_()
+        finally:
+            pw_page.unroute("**/api/inventory/devices?*", hold_shared_search)
+
+        expect(pw_page.locator("tbody tr", has_text=name_b)).to_have_count(1)
+        expect(row_a).to_have_count(1)
+        # The refetch kept device A, so its panel must still be open.
+        expect(panel_row.get_by_text("Modified by:", exact=True)).to_be_visible()
+    finally:
+        for device_id in created_ids:
+            _api(pw_page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
+        _api(
+            pw_page,
+            "PATCH",
+            "/user-profile/preferences",
+            json={"saved_filters": {"inventory": baseline_inventory_filter}},
+            allow_errors=True,
+        )

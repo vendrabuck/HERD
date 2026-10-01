@@ -261,7 +261,16 @@ export function InventoryPage() {
   if (deviceIds !== prevDeviceIdsRef.current) {
     prevDeviceIdsRef.current = deviceIds;
     if (selected.size > 0) setSelected(new Set());
-    if (expandedIds.size > 0) setExpandedIds(new Set());
+    // Expanded rows are pruned, not cleared: a row still on the page keeps its
+    // panel open (the debounced search refetch lands while a user may already
+    // have expanded a row), only ids that left the list are dropped. The set
+    // is replaced only when something was actually dropped, so this render-time
+    // update cannot loop.
+    if (expandedIds.size > 0) {
+      const listed = new Set(devices?.map((d) => d.id));
+      const kept = new Set([...expandedIds].filter((id) => listed.has(id)));
+      if (kept.size !== expandedIds.size) setExpandedIds(kept);
+    }
   }
 
   const toggleOne = (id: string) => {

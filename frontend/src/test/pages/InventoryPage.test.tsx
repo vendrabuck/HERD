@@ -432,6 +432,97 @@ describe("InventoryPage", () => {
     });
   });
 
+  describe("list changes and row state (issue #938)", () => {
+    const idA = "aaaaaaaa-1111-2222-3333-444444444444";
+    const idB = "bbbbbbbb-1111-2222-3333-444444444444";
+    const idC = "cccccccc-1111-2222-3333-444444444444";
+
+    // The list the server returns for each search term; the empty term is the
+    // unfiltered first page.
+    function listBySearch(table: Record<string, string[]>) {
+      const devices: Record<string, ReturnType<typeof makeDevice>> = {
+        [idA]: makeDevice({ id: idA, name: "dev-a" }),
+        [idB]: makeDevice({ id: idB, name: "dev-b" }),
+        [idC]: makeDevice({ id: idC, name: "dev-c" }),
+      };
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          const search = new URL(request.url).searchParams.get("search") ?? "";
+          const ids = table[search] ?? [];
+          return HttpResponse.json({
+            items: ids.map((id) => devices[id]),
+            total: ids.length,
+            skip: 0,
+            limit: 50,
+          });
+        }),
+        http.get("/api/inventory/devices/:id/ports", () => HttpResponse.json([])),
+        http.get("/api/cabling/connections", () =>
+          HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
+        ),
+      );
+    }
+
+    function search(term: string) {
+      fireEvent.change(screen.getByPlaceholderText("Search devices by name..."), {
+        target: { value: term },
+      });
+    }
+
+    it("keeps an expanded row open when a list change still contains it", async () => {
+      listBySearch({ "": [idA, idB], keep: [idA, idC] });
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      const rowA = screen.getByText("dev-a").closest("tr") as HTMLElement;
+      fireEvent.click(within(rowA).getByLabelText("Expand ports"));
+      await waitFor(() => expect(screen.getByText("No ports configured")).toBeInTheDocument());
+
+      search("keep");
+      await waitFor(() => expect(screen.getByText("dev-c")).toBeInTheDocument());
+
+      // dev-a survived the list change and is still expanded; dev-c is not.
+      expect(screen.queryByText("dev-b")).not.toBeInTheDocument();
+      expect(screen.getByText("No ports configured")).toBeInTheDocument();
+      expect(screen.getAllByLabelText("Collapse ports")).toHaveLength(1);
+      expect(screen.getAllByLabelText("Expand ports")).toHaveLength(1);
+    });
+
+    it("drops an expanded row whose id left the list and does not resurrect it", async () => {
+      listBySearch({ "": [idA, idB], only_b: [idB] });
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      const rowA = screen.getByText("dev-a").closest("tr") as HTMLElement;
+      fireEvent.click(within(rowA).getByLabelText("Expand ports"));
+      await waitFor(() => expect(screen.getByText("No ports configured")).toBeInTheDocument());
+
+      search("only_b");
+      await waitFor(() => expect(screen.queryByText("dev-a")).not.toBeInTheDocument());
+      expect(screen.queryByText("No ports configured")).not.toBeInTheDocument();
+
+      // dev-a returns with the unfiltered list: its old expansion is gone.
+      search("");
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      expect(screen.queryByLabelText("Collapse ports")).not.toBeInTheDocument();
+      expect(screen.getAllByLabelText("Expand ports")).toHaveLength(2);
+    });
+
+    it("still clears the bulk selection on a list change while keeping the expansion", async () => {
+      listBySearch({ "": [idA, idB], keep: [idA, idC] });
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      const rowA = screen.getByText("dev-a").closest("tr") as HTMLElement;
+      fireEvent.click(within(rowA).getByLabelText("Expand ports"));
+      fireEvent.click(within(rowA).getByRole("checkbox"));
+      expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+      search("keep");
+      await waitFor(() => expect(screen.getByText("dev-c")).toBeInTheDocument());
+
+      expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
+      expect(screen.getAllByLabelText("Collapse ports")).toHaveLength(1);
+    });
+  });
+
   describe("select-all checkbox", () => {
     function twoDevicesHandler() {
       return http.get("/api/inventory/devices", () =>
