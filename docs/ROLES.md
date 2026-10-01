@@ -1435,7 +1435,16 @@ cabling's internal `GET /internal/forks/by-device/{device_id}` (non-archived for
 `fork_connections` name the device on either end of any hop) and fails CLOSED: either
 service unreachable or erroring returns HTTP 503 ("Could not verify device is not in
 use") rather than silently letting the delete through. There is no force flag; cancel or
-let the blocking reservation end first. Known limit: a fork is archived when its
+let the blocking reservation end first. Issue #940 adds a second refusal, checked AFTER
+the one above (so `device_in_use` wins when both apply): a device that any cabling
+connection still names, on either end, is refused with HTTP 409
+`{"error": "device_cabled", "connection_count": N, "connection_ids": [...]}`.
+`connection_count` is the true total and `connection_ids` a sorted sample capped at 10.
+It comes from the same cabling response as the fork check (the route also answers
+`connection_count` and `connection_ids`), so there is still one cabling call; a cabling
+build that does not return those keys reads as the same 503, never as "not cabled".
+Remove the device's connections (Administration, Connections) first; there is no cascade
+and no force flag. Known limit: a fork is archived when its
 reservation goes terminal, while execution's hardware teardown runs asynchronously
 afterwards, so a delete in the short window just after a cancel can still precede the
 release of the device's cross-connects. The internal dynamic-instance delete

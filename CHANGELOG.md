@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- Fixed the admin device DELETE leaving stale cabling connections behind (issue
+  #940, the plain-cable half split out of #900). A cabled device with no live
+  reservation deleted with 204 and every `Connection` row that named it kept a
+  dead device UUID that pathfinding still routed through. Cabling's internal
+  `GET /internal/forks/by-device/{device_id}` now also returns
+  `connection_count` (true total, a loopback counts once) and `connection_ids`
+  (sorted sample, capped at 10), and `assert_device_deletable` refuses with
+  `409 {"error": "device_cabled", "connection_count", "connection_ids"}` after
+  the `device_in_use` decision, which wins when both apply. A cabling build
+  without the new keys reads as the existing 503, fail closed; there is no
+  force flag. The device page keeps the refusal on screen with the count and a
+  link to Connections, and a bulk delete on the inventory page says remove the
+  cables first. Integration fixtures now route device teardown through a strict
+  helper that removes leftover cables and fails with the refusal body instead of
+  leaking the device.
 - Fixed execution's consumer loop swallowing a shutdown cancel, and added a live
   exactly-once test for a slow webhook receiver (issue #944). Execution kept an
   inline copy of the heartbeat whose `try: await heartbeat / except
