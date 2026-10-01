@@ -46,9 +46,7 @@ def _find_available_dut(page):
     """One seeded, AVAILABLE, exclusive DUT device with at least one port
     (mirrors conftest.py's pw_two_devices_with_ports filter, single-device
     since only one DUT is needed here)."""
-    resp = pw_api(
-        page, "GET", "/inventory/devices?limit=100&dut_only=true", allow_errors=True
-    )
+    resp = pw_api(page, "GET", "/inventory/devices?limit=100&dut_only=true", allow_errors=True)
     if resp.status_code != 200:
         return None
     payload = resp.json()
@@ -115,8 +113,7 @@ def l3_switch_setup(pw_page):
     if driver_resp.status_code not in (200, 201):
         run_cleanup()
         pytest.skip(
-            f"could not upload the mock L3 driver: "
-            f"{driver_resp.status_code} {driver_resp.text}"
+            f"could not upload the mock L3 driver: {driver_resp.status_code} {driver_resp.text}"
         )
     driver = driver_resp.json()
     cleanup.append(
@@ -145,8 +142,7 @@ def l3_switch_setup(pw_page):
     if template_resp.status_code not in (200, 201):
         run_cleanup()
         pytest.skip(
-            f"could not create the L3 template: "
-            f"{template_resp.status_code} {template_resp.text}"
+            f"could not create the L3 template: {template_resp.status_code} {template_resp.text}"
         )
     template = template_resp.json()
     cleanup.append(
@@ -169,8 +165,7 @@ def l3_switch_setup(pw_page):
     if device_resp.status_code not in (200, 201):
         run_cleanup()
         pytest.skip(
-            f"could not create the L3 switch device: "
-            f"{device_resp.status_code} {device_resp.text}"
+            f"could not create the L3 switch device: {device_resp.status_code} {device_resp.text}"
         )
     switch = device_resp.json()
     cleanup.append(
@@ -182,9 +177,7 @@ def l3_switch_setup(pw_page):
         "POST",
         f"/inventory/devices/{switch['id']}/config-versions",
         json={
-            "config": {
-                "interfaces": [{"name": "eth0", "ip": "10.20.0.1/24", "zone": "trust"}]
-            },
+            "config": {"interfaces": [{"name": "eth0", "ip": "10.20.0.1/24", "zone": "trust"}]},
             "description": "e2e routing panel test config",
         },
         allow_errors=True,
@@ -251,6 +244,27 @@ def l3_switch_setup(pw_page):
     }
 
     run_cleanup()
+
+
+# A point well clear of the top-right toaster (react-hot-toast, `App.tsx`).
+_OFF_TOASTER = (640, 600)
+
+
+def _click_save(page) -> None:
+    """Click the topology editor's Save without a lingering toast in the way.
+
+    react-hot-toast pauses a toast's dismissal timer while the pointer is over
+    it, and the top-right toast stack sits over the toolbar's Save button
+    (issue #938). A click leaves the pointer on Save, the next toast appears
+    under it and then never expires, so the following Save click is
+    intercepted for the full 30 s timeout. So: move the pointer off the toaster
+    and wait for every earlier toast to be gone before clicking, then move the
+    pointer away again so this click's own toast can expire.
+    """
+    page.mouse.move(*_OFF_TOASTER)
+    expect(page.locator("[data-rht-toaster] [role='status']")).to_have_count(0, timeout=10_000)
+    page.get_by_role("button", name="Save", exact=True).click()
+    page.mouse.move(*_OFF_TOASTER)
 
 
 def _canvas_with_switch_and_dut(dut_id: str, switch_id: str) -> dict:
@@ -326,7 +340,7 @@ def test_add_route_saves_then_edit_to_bad_destination_shows_red_badge_and_toast(
         expect(add_button).to_be_enabled()
         add_button.click()
 
-        page.get_by_role("button", name="Save", exact=True).click()
+        _click_save(page)
         expect(page.get_by_text("Topology saved")).to_be_visible(timeout=15_000)
 
         # Backend effect via API read-back (the standing e2e rule): the saved
@@ -348,11 +362,11 @@ def test_add_route_saves_then_edit_to_bad_destination_shows_red_badge_and_toast(
         # substring match against "New destination" (the Add-route staging
         # form) too.
         page.get_by_label("Destination", exact=True).fill("not-an-ip")
-        page.get_by_role("button", name="Save", exact=True).click()
+        _click_save(page)
 
-        expect(
-            page.get_by_text("Routing intent has 1 problem", exact=False)
-        ).to_be_visible(timeout=15_000)
+        expect(page.get_by_text("Routing intent has 1 problem", exact=False)).to_be_visible(
+            timeout=15_000
+        )
         # exact=True: the toast text above also contains "l3_bad_destination"
         # as a substring, so this disambiguates to the Routing panel's own
         # reason line.
@@ -370,14 +384,14 @@ def test_add_route_saves_then_edit_to_bad_destination_shows_red_badge_and_toast(
         # remaining problem is the VRF one.
         page.get_by_label("Destination", exact=True).fill("10.20.1.0/24")
         page.get_by_label("Virtual router", exact=True).fill("no-such-vrf")
-        page.get_by_role("button", name="Save", exact=True).click()
+        _click_save(page)
 
-        expect(
-            page.get_by_text("Routing intent has 1 problem", exact=False)
-        ).to_be_visible(timeout=15_000)
-        expect(
-            page.get_by_text("l3_unknown_virtual_router", exact=True)
-        ).to_be_visible(timeout=10_000)
+        expect(page.get_by_text("Routing intent has 1 problem", exact=False)).to_be_visible(
+            timeout=15_000
+        )
+        expect(page.get_by_text("l3_unknown_virtual_router", exact=True)).to_be_visible(
+            timeout=10_000
+        )
         vrf_input = page.get_by_label("Virtual router", exact=True)
         vrf_class = vrf_input.get_attribute("class") or ""
         assert "border-red-400" in vrf_class, vrf_class

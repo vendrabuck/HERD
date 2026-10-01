@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- Fixed an expanded inventory row collapsing when the list changes under it
+  (issue #938). Typing a search and expanding a row before the debounced
+  filtered list arrived used to close the row, because every list change
+  cleared the expanded set. The page now drops only the rows that left the
+  list; rows still listed stay open. The bulk selection is still cleared on a
+  list change. The seeded e2e pass gains a deterministic regression test, and
+  the topology editor's L3 routing e2e test now moves the pointer off the toast
+  stack before each Save (react-hot-toast pauses a toast while hovered).
 - Fixed the admin device DELETE guard ignoring cabling (issue #900, live-wiring
   half). A switch that was only a transit hop on a saved fork sat in no
   `reservation_devices` row, so it deleted with 204 and its cross-connects were
