@@ -419,15 +419,16 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
         # holds the row's claim at that instant, so poll instead of asserting on one call.
         reconnected = await _poll_retry_l1(admin_client, reservation_id, "reconnected")
 
-        # wiring-status now shows the pair ACTIVE with no lingering FAILED row. Accept
-        # convergence by either channel: the manual-retry helper saw "reconnected"
-        # directly, or the tick got there first and wiring-status already shows ACTIVE.
+        # wiring-status must show the pair ACTIVE, whichever channel (manual retry or the
+        # background tick) did the flip. The read-back is mandatory: a reported
+        # "reconnected" means the compare-and-swap already ran, so it cannot stand in for
+        # the row being there (a row that left FAILED without reaching ACTIVE).
         active = await _poll_wiring_conn(
             admin_client, reservation_id, lambda c: c["status"] == "ACTIVE"
         )
-        assert active is not None or (
-            reconnected is not None and reconnected["outcome"] == "reconnected"
-        ), f"the retried connection never reached ACTIVE (last retry row: {reconnected})"
+        assert active is not None, (
+            f"the retried connection never read back ACTIVE (last retry row: {reconnected})"
+        )
         remaining = [
             c
             for c in (await _wiring_status(admin_client, reservation_id))["connections"]
@@ -514,14 +515,15 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
         # holds the row's claim at that instant, so poll instead of asserting on one call.
         row_released = await _poll_retry_l1(admin_client, reservation_id, "released")
 
-        # Accept convergence by either channel: the manual-retry helper saw "released"
-        # directly, or the tick got there first and wiring-status already shows RELEASED.
+        # The read-back is mandatory, whichever channel (manual retry or the background
+        # tick) did the flip: a reported "released" means the compare-and-swap already
+        # ran, so it cannot stand in for the row reading back RELEASED.
         released = await _poll_wiring_conn(
             admin_client, reservation_id, lambda c: c["status"] == "RELEASED"
         )
-        assert released is not None or (
-            row_released is not None and row_released["outcome"] == "released"
-        ), f"the retried connection never reached RELEASED (last retry row: {row_released})"
+        assert released is not None, (
+            f"the retried connection never read back RELEASED (last retry row: {row_released})"
+        )
         remaining = [
             c
             for c in (await _wiring_status(admin_client, reservation_id))["connections"]
