@@ -268,6 +268,12 @@ async def test_transit_switch_on_live_fork_blocks_delete_until_cancel(
         cancel = await admin_client.delete(f"/reservations/{reservation_id}")
         assert cancel.status_code == 204
         reservation_id = None
+        # Remove the cables before the switch, so no Connection row is left naming a
+        # deleted device (the guard under test is about fork hops, not plain cables).
+        while connections:
+            conn = connections.pop()
+            gone_conn = await admin_client.delete(f"/cabling/connections/{conn['id']}")
+            assert gone_conn.status_code in (200, 204), gone_conn.text
         deleted = await _delete_when_released(admin_client, switch["id"])
         assert deleted.status_code == 204, deleted.text
         switch_deleted = True
