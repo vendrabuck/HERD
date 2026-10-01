@@ -11,6 +11,7 @@ class Settings(HerdBaseSettings):
     auth_service_url: str = "http://auth:8000"
     execution_service_url: str = "http://execution:8000"
     reservations_service_url: str = "http://reservations:8000"
+    cabling_service_url: str = "http://cabling:8000"
     acl_service_url: str = "http://acl:8000"
     secrets_service_url: str = "http://secrets:8000"
     apply_scheduler_interval_seconds: int = 30
