@@ -51,6 +51,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Driver packages** (Shipped): standalone driver entities classified by connection
   type (Management, Layer 1/2/3 Switch). Stored on local filesystem by default;
   MinIO/S3-compatible storage supported when configured.
+- **Inventory page filters** (Shipped, issue #842): Status, Template (labelled with
+  vendor and model), and Topology filters beside the name search, each with an All
+  option, composing with the search and pagination, saved per user and restored on the
+  next visit, with a Clear filters control and a filtered-empty state.
 - **Exclusive vs non-exclusive flag** (Shipped): exclusive devices get conflict
   detection; shared infrastructure (such as switches) can take concurrent
   reservations.

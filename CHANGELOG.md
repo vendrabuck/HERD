@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- Added column filters to the Inventory page (issue #842). Status, Template, and
+  Topology selects sit beside the name search and use the device list's existing
+  `status`, `template_id`, and `topology_type` parameters, so there is no backend
+  change. Each has an All option that sends no parameter. The Template options show
+  the template name with its vendor and model, which is how vendor and model are
+  filterable. Filters compose with the search and pagination (any change returns to
+  page one, and the total is the filtered total), a Clear filters control resets all
+  of them, and a filtered-empty result says so instead of showing the no-devices
+  state. The choices persist in `savedFilters.inventory` as
+  `{search, status, template_id, topology_type}` with a filter at All omitted, so an
+  old `{search}` object still works; an unknown saved status or topology, or a
+  template id that no longer exists, falls back to All and is never sent.
 - Fixed the admin device DELETE leaving stale cabling connections behind (issue
   #940, the plain-cable half split out of #900). A cabled device with no live
   reservation deleted with 204 and every `Connection` row that named it kept a

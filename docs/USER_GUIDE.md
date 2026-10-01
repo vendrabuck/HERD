@@ -144,9 +144,18 @@ Expand a row to see device audit info (who created/modified, when), device-group
 
 Click a row to open the device detail page. A left-hand sidebar on that page shows the same audit and group information (created / modified dates, created-by and modified-by names, device groups, and the user groups that have access through each device group), so you do not need to navigate back to the table to see it.
 
-The Inventory page's only filter is a name search box (a case-insensitive substring
-match). The template dropdown, topology-type dropdown, and "Show reserved" toggle live
-in the topology editor's equipment palette (Equipment Browser), not on this page; see
+Above the table, the Inventory page has a name search box (a case-insensitive substring
+match) and three filters: **Status** (`AVAILABLE`, `RESERVED`, `OFFLINE`, `MAINTENANCE`),
+**Template**, and **Topology** (`PHYSICAL`, `CLOUD`). Each filter has an **All** option that
+applies no restriction. The Template list shows each device template with its vendor and
+model, so choosing a template is also how you filter by vendor or model. Filters combine
+with each other and with the search; changing any of them returns the table to page one,
+and the count next to "All Devices" is the number of matching devices. **Clear filters**
+appears whenever a filter or the search is active and resets all of them. When nothing
+matches, the table says so and offers the same control. Your choices are saved and restored
+the next time you open the page; a saved status, topology, or template that no longer
+exists falls back to **All**. The "Show reserved" toggle lives in the topology editor's
+equipment palette (Equipment Browser), not on this page; see
 [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#the-equipment-palette).
 
 A **Rows per page** selector on the pagination bar (25, 50, 100, or 200) sets how many
