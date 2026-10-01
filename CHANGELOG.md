@@ -13,6 +13,9 @@
   so a text-typed secret under a neutral key no longer reaches the JSON log.
 - Corrected stale comments in execution that claimed JSONFormatter drops
   unlisted extras (issue #906).
+- Made the L1 manual-retry integration tests read the row back again (issue #906):
+  a reported `reconnected` or `released` outcome no longer substitutes for
+  wiring-status showing the row ACTIVE or RELEASED.
 - Fixed the reservation assistant losing the record of a write (issues #903,
   #904, #906). `propose_config_change` now records a `config_version_created`
   side effect, so a later timeout or provider failure persists the turn
