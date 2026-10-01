@@ -11,7 +11,8 @@ stacks have the classifier off (the endpoint answers 503), a stack with an AI
 provider and AI_PURPOSE_CLASSIFICATION_ENABLED may answer 200 with any outcome.
 So the test captures the REAL response with expect_response and asserts the UI
 and an API read-back against whatever the backend actually said. It passes on
-either kind of stack and never skips on a seeded one.
+either kind of stack and never skips on a seeded one (on an unseeded stack there is no device
+to book, so every test here skips, like the other device-gated e2e tests).
 
 The intercepted-response tests below fulfill the classify call in the browser
 with page.route, so the stack cannot be asked to produce a 200 ok. They assert
@@ -69,6 +70,25 @@ def _category_label(category: str) -> str:
     return CATEGORY_LABELS.get(category) or " ".join(w.capitalize() for w in category.split("_"))
 
 
+def _available_device(page) -> dict:
+    """One AVAILABLE exclusive DUT device to book, or skip.
+
+    The first e2e pass of the nightly and of make everything runs BEFORE the
+    seed, so there is nothing to book and the test skips there by design; the
+    seeded pass (HERD_E2E_REQUIRE_NO_SKIP=1) has devices, so a skip there fails
+    the run and this never hides a real gap.
+    """
+    resp = pw_api(page, "GET", "/inventory/devices?limit=100&dut_only=true", allow_errors=True)
+    if resp.status_code != 200:
+        pytest.fail(f"cannot list devices: {resp.status_code}")
+    payload = resp.json()
+    items = payload.get("items", payload) if isinstance(payload, dict) else payload
+    available = [d for d in items if d.get("status") == "AVAILABLE" and d.get("exclusive", True)]
+    if not available:
+        pytest.skip("no AVAILABLE exclusive DUT device to reserve (unseeded stack)")
+    return available[0]
+
+
 @pytest.fixture
 def pw_cancelled_reservation(pw_page):
     """A reservation booked then cancelled through the real API, as admin.
@@ -79,19 +99,11 @@ def pw_cancelled_reservation(pw_page):
     """
     pw_login(pw_page)
 
-    devices_resp = pw_api(
-        pw_page, "GET", "/inventory/devices?limit=100&dut_only=true", allow_errors=True
-    )
-    if devices_resp.status_code != 200:
-        pytest.fail(f"cannot list devices: {devices_resp.status_code}")
-    payload = devices_resp.json()
-    items = payload.get("items", payload) if isinstance(payload, dict) else payload
-    available = [d for d in items if d.get("status") == "AVAILABLE" and d.get("exclusive", True)]
-    assert available, "the seeded stack should have an available exclusive device"
+    device = _available_device(pw_page)
 
     now = datetime.now(timezone.utc)
     body = {
-        "device_ids": [available[0]["id"]],
+        "device_ids": [device["id"]],
         "purpose": f"e2e classify now {uuid.uuid4().hex[:8]}",
         "start_time": now.isoformat(),
         "end_time": (now + timedelta(minutes=30)).isoformat(),
@@ -192,10 +204,7 @@ def test_classify_now_matches_the_real_backend_answer(pw_page, pw_cancelled_rese
 
 def test_classify_now_is_absent_on_a_reservation_that_is_not_terminal(pw_page):
     pw_login(pw_page)
-    devices = pw_api(pw_page, "GET", "/inventory/devices?limit=100&dut_only=true").json()
-    items = devices.get("items", devices) if isinstance(devices, dict) else devices
-    available = [d for d in items if d.get("status") == "AVAILABLE" and d.get("exclusive", True)]
-    assert available, "the seeded stack should have an available exclusive device"
+    device = _available_device(pw_page)
     now = datetime.now(timezone.utc)
     purpose = f"e2e classify live {uuid.uuid4().hex[:8]}"
     create = pw_api(
@@ -203,7 +212,7 @@ def test_classify_now_is_absent_on_a_reservation_that_is_not_terminal(pw_page):
         "POST",
         "/reservations/",
         json={
-            "device_ids": [available[0]["id"]],
+            "device_ids": [device["id"]],
             "purpose": purpose,
             "start_time": now.isoformat(),
             "end_time": (now + timedelta(minutes=30)).isoformat(),
