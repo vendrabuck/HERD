@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-01
+
+- Reservation status writes are race-safe. Every status transition is a compare-and-swap
+  through one helper, so only the writer that wins the row stages the event, flips
+  inventory, or calls cabling (#899). A PENDING reservation holds no device and writes no
+  inventory status (#897), back-to-back bookings no longer leave a shared exclusive device
+  AVAILABLE under a live booking (#898), and the dynamic-instance ledger is forward-only,
+  so a row retired by teardown is never brought back by a late create (#896).
+- Security hardening. The auth service authorizes on the lower of the JWT role claim and
+  the account's current database role; the compose file binds the NATS and Postgres host
+  ports to loopback (#708); a device node on a canvas is reduced to a fixed allowlist at
+  every write and read, so `field_data` is never stored or returned; execution
+  corroborates each reservation lifecycle event with the reservations service before
+  acting on it; every device-scoped inventory read and the topology import go through the
+  device-group visibility check (#909, and the #763 follow-up); and every CSV writer
+  neutralizes spreadsheet formulas (#910).
+- NATS consumers behave as configured. Retry timing comes from an explicit NAK delay
+  schedule instead of a `backoff` list that silently shortened `ack_wait` (#895), all
+  three consumers heartbeat a message while its handler runs so a slow webhook receiver
+  is not handed the same event twice (#911, #944), and `ack_wait` is the setting
+  `NATS_ACK_WAIT_SECONDS`.
+- Deleting a device is refused while wiring depends on it: as a transit hop on a live
+  reservation's fork (#900, `device_in_use`) or while any cable still names it (#940,
+  `device_cabled`). There is no force flag, and an unreachable upstream refuses too.
+- AI topology generation picks devices that can be wired. Resolution asks cabling which
+  candidate pairs are reachable and searches for an assignment that satisfies every
+  proposed edge (#828), commit checks wireability before the reservation is created
+  (#827), and an opt-in evaluation harness scores how often a proposal resolves (#826).
+- The reservation assistant keeps the record of what it did. A turn whose tools already
+  ran is persisted when the model returns no text, times out, or the provider fails
+  (#848, #871, #903), and a streamed turn always ends in one `done` or `error` frame
+  (#946).
+- Config apply is gated on the driver contract in inventory and again in execution
+  (#839, #870), raw driver exception text no longer reaches a row or a response (#840),
+  and the JSON log formatter emits every `extra=` key with key-name redaction (#872).
+- Version and build visibility (#846): every service answers `GET /version`, images are
+  stamped with the git build identifier, `make version` prints it, and the admin About
+  page lists all twelve services and flags version skew (#874).
+- Reservations and inventory pages: the reservations list sorts (#844, #902), a booking
+  can be cancelled before it is active (#841), rows can be selected for a bulk Cancel or
+  Release (#843), the inventory page filters by status, template, and topology (#842)
+  and keeps an expanded row open across a refetch (#938), an admin can classify one
+  reservation's purpose from its detail modal (#822), and the header help icon opens the
+  published manual (#960).
+- Outbound webhooks can subscribe to `device.health_transition` (#831).
+- Added `docs/SIMULATED_LAB_GUIDE.md`, pinned the npm floor the frontend lockfile needs
+  (#885), and removed the dead `HEALTH_POLL_MINIMUM_INTERVAL_SECONDS` setting (#880).
+
+### Delivery detail
+
 - Fixed the header help icon (the `?` beside the notification bell) to open the
   published user manual at <https://vendrabuck.github.io/HERD/manual/> (issue
   #960). It used to open a repository document. The address lives once as
