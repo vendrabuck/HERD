@@ -23,7 +23,8 @@ UI action being exercised is the connection create/delete.
 Effect-assertion discipline (issue #388): every UI mutation is verified by an
 API read-back, never by the UI's own toast alone. Each finally block restores
 its mutations in dependency order (connection before devices; a device delete
-while a connection references it is the wrong order), so a mid-test failure
+while a connection references it is refused with 409 device_cabled since
+issue #940, so the wrong order strands the device), so a mid-test failure
 never strands resources on the shared dev stack.
 
 Sibling coverage under issue #388: test_templates_playwright.py (item 5,
@@ -297,7 +298,8 @@ def test_connection_create_and_delete_own_devices(pw_page):
         connection_id = None
     finally:
         # Connection first (a device delete while a connection references it
-        # can 409), then the tracked resources in reverse creation order
+        # 409s with device_cabled since issue #940 and the best-effort cleanup
+        # below would then leave the device behind), then the tracked resources in reverse creation order
         # (devices, then templates, then driver).
         if connection_id:
             _api(pw_page, "DELETE", f"/cabling/connections/{connection_id}", allow_errors=True)

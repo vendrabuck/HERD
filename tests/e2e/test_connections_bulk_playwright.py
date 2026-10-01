@@ -170,6 +170,25 @@ def bulk_fixture_devices(pw_page):
         # device template references the driver, so deleting in creation
         # order would 409 against still-referenced rows.
         for device_id in device_ids:
+            # Belt and braces (issue #940): the tests' own finally blocks remove the
+            # cables by notes marker, but a device delete is refused with 409
+            # device_cabled while any Connection still names it, so sweep any cable
+            # a failed test left behind before the delete.
+            leftover = pw_api(
+                pw_page,
+                "GET",
+                "/cabling/connections",
+                params={"device_id": device_id, "limit": 500},
+                allow_errors=True,
+            )
+            if leftover.status_code == 200:
+                for conn in leftover.json().get("items", []):
+                    pw_api(
+                        pw_page,
+                        "DELETE",
+                        f"/cabling/connections/{conn['id']}",
+                        allow_errors=True,
+                    )
             resp = pw_api(pw_page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
             log_cleanup_failure("device", device_id, resp)
         if device_template_id:
