@@ -1421,15 +1421,25 @@ DELETE /api/inventory/devices/{device_id}
 Authorization: Bearer <admin-token>
 ```
 
-Returns HTTP 204 on success. Issue #391: refused with HTTP 409
-(`{"error": "device_in_use", "reservation_ids": [...]}`) when the device is held by
-a reservation in a non-terminal status (`PENDING`, `PENDING_PROVISION`, `ACTIVE`), so
+Returns HTTP 204 on success. Issue #391: refused with HTTP 409 when the device is held
+by a reservation in a non-terminal status (`PENDING`, `PENDING_PROVISION`, `ACTIVE`), so
 the delete cannot orphan the device UUID in reservations, cabling, and execution (no
-cross-schema foreign keys by design). The check calls reservations' internal
-`/internal/by-device/{device_id}` lookup and fails CLOSED: an unreachable or erroring
-reservations service returns HTTP 503 ("Could not verify device is not in use")
-rather than silently letting the delete through. There is no force flag; cancel or
-let the blocking reservation end first.
+cross-schema foreign keys by design). Issue #900 extends the refusal to a device that is
+only a transit hop on a live reservation's saved fork wiring (for example a switch
+between two booked devices), which no reservation books as a member. The 409 detail is
+`{"error": "device_in_use", "reservation_ids": [...], "transit_reservation_ids": [...]}`:
+`reservation_ids` is the sorted union of both causes, and `transit_reservation_ids` is
+the sorted subset that holds the device only as a transit hop (always present, empty when
+none). The check calls reservations' internal `/internal/by-device/{device_id}` lookup and
+cabling's internal `GET /internal/forks/by-device/{device_id}` (non-archived forks whose
+`fork_connections` name the device on either end of any hop) and fails CLOSED: either
+service unreachable or erroring returns HTTP 503 ("Could not verify device is not in
+use") rather than silently letting the delete through. There is no force flag; cancel or
+let the blocking reservation end first. Known limit: a fork is archived when its
+reservation goes terminal, while execution's hardware teardown runs asynchronously
+afterwards, so a delete in the short window just after a cancel can still precede the
+release of the device's cross-connects. The internal dynamic-instance delete
+(`DELETE /devices/{id}/internal`) is exempt, as before.
 
 ### Batch device identity and type (internal, ADR 0014)
 
@@ -1678,6 +1688,7 @@ Authorization: Bearer <admin-token>
 | `/api/cabling/topologies/export` | GET | yes | yes | yes |
 | `/api/cabling/topologies/import` | POST | create yes; update creator, per row; filtered to visible devices | yes | yes |
 | `/api/cabling/internal/forks` | POST | internal | internal | internal |
+| `/api/cabling/internal/forks/by-device/{device_id}` | GET | internal | internal | internal |
 | `/api/acl/grants` | GET | | yes | yes |
 | `/api/acl/grants/{id}` | GET | | yes | yes |
 | `/api/acl/grants` | POST | | yes | yes |
