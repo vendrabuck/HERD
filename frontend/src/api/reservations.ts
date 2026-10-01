@@ -76,6 +76,25 @@ async function releaseReservation(id: string): Promise<Reservation> {
   return resp.data;
 }
 
+/**
+ * Fan a bulk Cancel or Release over the per-id endpoints (issue #843). Unlike
+ * `useCancelReservation`/`useReleaseReservation` it neither toasts nor
+ * invalidates per row: the caller reports one summary from the settled results,
+ * and the reservation queries are invalidated ONCE when every call has settled.
+ * Each status transition is a compare-and-swap server-side, so the parallel
+ * calls are safe.
+ */
+export function useBulkReservationAction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ action, ids }: { action: "cancel" | "release"; ids: string[] }) =>
+      Promise.allSettled(
+        ids.map((id) => (action === "cancel" ? cancelReservation(id) : releaseReservation(id))),
+      ),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["reservations"] }),
+  });
+}
+
 async function fetchCalendarReservations(params: CalendarQueryParams): Promise<Reservation[]> {
   const search = new URLSearchParams();
   search.set("range_start", params.range_start);

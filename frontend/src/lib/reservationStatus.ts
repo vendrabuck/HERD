@@ -50,3 +50,26 @@ export function canClassifyPurpose(
     reservation.status === "FAILED";
   return terminal && !reservation.purpose_suggestion;
 }
+
+/**
+ * Who may cancel or release, in one place (issue #843). The detail modal and
+ * the Reservations page's bulk actions both ask here, so a row is offered the
+ * action by exactly the same rule everywhere: the caller must own the
+ * reservation AND the status gate above must pass. The backend is looser for
+ * an admin cancel (issue #340); the UI keeps the owner-only rule the detail
+ * modal always had, by decision, and an admin's cross-owner cancel stays on
+ * the API.
+ */
+export function canCancelAs(
+  reservation: Pick<Reservation, "status" | "user_id">,
+  userId: string | undefined | null,
+): boolean {
+  return !!userId && userId === reservation.user_id && canCancel(reservation.status);
+}
+
+export function canReleaseAs(
+  reservation: Pick<Reservation, "status" | "user_id">,
+  userId: string | undefined | null,
+): boolean {
+  return !!userId && userId === reservation.user_id && canRelease(reservation.status);
+}
