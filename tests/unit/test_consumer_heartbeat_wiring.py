@@ -2,9 +2,10 @@
 heartbeat, so no in-flight message reaches ack_wait while its handler runs.
 
 Structural, deliberately coarse: any service module that calls
-`pull_subscribe(` must also use `keep_messages_alive` (execution) or
-`process_batch_with_heartbeat` (integration, notifications) from
-herd_common.jetstream and define a `NATS_HEARTBEAT_SECONDS` below its
+`pull_subscribe(` must also run its batches through `process_batch_with_heartbeat`
+from herd_common.jetstream (execution since issue #944; no module keeps an inline
+heartbeat loop, whose hand-rolled cancel handling once swallowed a shutdown cancel)
+and define a `NATS_HEARTBEAT_SECONDS` below its
 `NATS_ACK_WAIT_SECONDS`. A new consumer module that skips the heartbeat fails
 here. The behavioral proof lives in each service's own tests.
 """
@@ -23,11 +24,24 @@ def test_consumer_modules_are_discovered():
     assert {"execution", "integration", "notifications"} <= names
 
 
+def test_no_pull_consumer_module_keeps_an_inline_heartbeat():
+    """Issue #944: the inline `try: await heartbeat / except CancelledError: pass`
+    shape cannot tell a cancel aimed at the consumer from the heartbeat's own."""
+    inline = [
+        str(p.relative_to(REPO))
+        for p in CONSUMER_MODULES
+        if re.search(
+            r"\bkeep_messages_alive\(|create_task\(\s*_?keep_messages_alive", p.read_text()
+        )
+    ]
+    assert not inline, f"pull consumer with its own heartbeat task: {inline}"
+
+
 def test_every_pull_consumer_module_uses_the_shared_heartbeat():
     missing = [
         str(p.relative_to(REPO))
         for p in CONSUMER_MODULES
-        if not re.search(r"\b(keep_messages_alive|process_batch_with_heartbeat)\b", p.read_text())
+        if "process_batch_with_heartbeat" not in p.read_text()
     ]
     assert not missing, f"pull consumer without the #911 heartbeat: {missing}"
 

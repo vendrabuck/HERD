@@ -34,7 +34,8 @@ NATS_DURABLE = "notifications-consumer"
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
 # Work-in-progress heartbeat cadence (issue #911, the shared
-# herd_common.jetstream.keep_messages_alive; execution's issue #317 twin).
+# herd_common.jetstream.keep_messages_alive, which execution's loop shares too,
+# issue #944).
 # The loop resets the ack timer on this interval so a slow dispatcher (email,
 # outbound channels) cannot trigger an ack-timeout redelivery of a message
 # still in flight.

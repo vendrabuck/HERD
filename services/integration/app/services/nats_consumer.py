@@ -54,7 +54,8 @@ NATS_DURABLE = "integration-webhooks-consumer"
 NATS_MAX_DELIVER = 5
 NATS_ACK_WAIT_SECONDS = 30
 # Work-in-progress heartbeat cadence (issue #911, the shared
-# herd_common.jetstream.keep_messages_alive; execution's issue #317 twin).
+# herd_common.jetstream.keep_messages_alive, which execution's loop shares too,
+# issue #944).
 # A webhook fan-out can run past ack_wait (up to WEBHOOK_DELIVERY_ATTEMPTS
 # POSTs of WEBHOOK_DELIVERY_TIMEOUT_SECONDS each plus backoff), and a
 # redelivery mid-flight would POST the same event to the receiver again.

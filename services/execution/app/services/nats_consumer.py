@@ -11,9 +11,9 @@ import httpx
 from herd_common.jetstream import (
     ensure_consumer,
     ensure_stream_exists,
-    keep_messages_alive,
     nak_delay,
     parse_nak_backoff_schedule,
+    process_batch_with_heartbeat,
 )
 from herd_common.l3_route_identity import route_identity_key
 from herd_common.l3_validation import (
@@ -157,11 +157,6 @@ async def _run_sandbox(*args, **kwargs):
     from app.services.driver_sandbox import execute_driver_method
 
     return await asyncio.to_thread(execute_driver_method, *args, **kwargs)
-
-
-# The heartbeat lives in herd_common.jetstream now (issue #911); the private
-# name stays importable here for execution's tests and the loop below.
-_keep_messages_alive = keep_messages_alive
 
 
 class TransientUpstreamError(RuntimeError):
@@ -4778,6 +4773,26 @@ async def process_reservation_message(
     return "ack"
 
 
+async def process_batch(msgs: list, js, session_factory: Callable) -> None:
+    """Process one fetched batch with the in-progress heartbeat running (issues
+    #317 and #944): every message not yet settled, the running one and any
+    queued behind it, gets `in_progress` every NATS_HEARTBEAT_SECONDS, so a slow
+    provisioning handler never lets JetStream redeliver a message still in
+    flight here (and double-execute it, possibly on a peer replica). Settled
+    messages drop out of the heartbeat. Driver calls run off-loop
+    (_run_sandbox) so the heartbeat task is actually scheduled while
+    provisioning runs. The consumer loop goes through here, and the shared
+    helper owns the cancel handling (a cancel aimed at the loop task must never
+    be swallowed while it waits for the cancelled heartbeat)."""
+
+    async def _one(msg) -> None:
+        # process_reservation_message never raises on its own; the helper logs
+        # whatever ack/nak/publish failure escapes so the loop keeps draining.
+        await process_reservation_message(msg, js, handle_reservation_event, session_factory)
+
+    await process_batch_with_heartbeat(msgs, _one, NATS_HEARTBEAT_SECONDS)
+
+
 async def start_nats_consumer(app) -> None:
     """Start the NATS consumer as a background task during app lifespan.
 
@@ -4889,39 +4904,7 @@ async def start_nats_consumer(app) -> None:
                     logger.warning("NATS pull fetch failed; will retry", exc_info=True)
                     await asyncio.sleep(NATS_FETCH_TIMEOUT_SECONDS)
                     continue
-                # Heartbeat every fetched message while the batch is processed
-                # sequentially (issue #317): a slow provisioning handler must not
-                # let JetStream redeliver a message still in flight here, whether
-                # it is the one executing or one still queued behind it in this
-                # batch. Settled messages drop out of in_flight so their heartbeat
-                # stops. Driver calls run off-loop (_run_sandbox) so this task is
-                # actually scheduled while provisioning runs.
-                in_flight = list(msgs)
-                heartbeat = asyncio.create_task(
-                    _keep_messages_alive(in_flight, NATS_HEARTBEAT_SECONDS)
-                )
-                try:
-                    for msg in msgs:
-                        try:
-                            await process_reservation_message(
-                                msg, js, handle_reservation_event, _get_db_session
-                            )
-                        except Exception:
-                            # process_reservation_message never raises on its own; this
-                            # catches ack/nak/publish failures so the loop keeps draining.
-                            logger.error("Unexpected error in NATS consumer loop", exc_info=True)
-                        finally:
-                            # Stop heartbeating this message once it is settled.
-                            try:
-                                in_flight.remove(msg)
-                            except ValueError:
-                                pass
-                finally:
-                    heartbeat.cancel()
-                    try:
-                        await heartbeat
-                    except asyncio.CancelledError:
-                        pass
+                await process_batch(msgs, js, _get_db_session)
 
         app.state.nats_consumer_task = asyncio.create_task(_consumer_loop())
         logger.info("NATS consumer started")
