@@ -13,6 +13,7 @@ import type {
   ForkVersionRestoreResult,
   PurposeBackfillResponse,
   PurposeCategoriesResponse,
+  PurposeClassifyResponse,
   PurposeReviewResponse,
   Reservation,
   ReservationCreate,
@@ -614,4 +615,25 @@ export function forkL3ConfigUnavailableDetail(err: unknown): ForkL3ConfigUnavail
     503,
     (d) => d.error === "l3_config_unavailable",
   );
+}
+
+// On-demand classify for one reservation (issue #808 endpoint, UI in issue
+// #822). A 200 carries the classifier's outcome; the disabled feature (503)
+// and the two 409s reject, and the caller narrows them with
+// `purposeClassifyRefusal`. Settling always invalidates the reservation
+// queries (the Purpose Review list shares the "reservations" key prefix) so a
+// new suggestion appears and a stale button disappears without a reload.
+export async function classifyPurposeNow(id: string): Promise<PurposeClassifyResponse> {
+  const resp = await apiClient.post<PurposeClassifyResponse>(
+    `/reservations/admin/purpose-review/${id}/classify`,
+  );
+  return resp.data;
+}
+
+export function useClassifyPurpose() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => classifyPurposeNow(id),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["reservations"] }),
+  });
 }
