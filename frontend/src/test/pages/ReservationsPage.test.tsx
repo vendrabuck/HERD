@@ -48,16 +48,23 @@ vi.mock("@/components/reservations/ReservationDetailModal", () => ({
     ) : null,
 }));
 
+// Bulk Cancel and Release (issue #843) report through toast; capture the calls.
+const { toastSuccess, toastError } = vi.hoisted(() => ({
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
+}));
+vi.mock("react-hot-toast", () => ({ default: { success: toastSuccess, error: toastError } }));
+
 import { server } from "../mocks/server";
 import { ReservationsPage } from "@/pages/ReservationsPage";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 
-function setRole(role: string | null) {
+function setRole(role: string | null, id = "1") {
   useAuthStore.setState({
     user: role
       ? {
-          id: "1",
+          id,
           email: "a@b.c",
           username: "u",
           is_active: true,
@@ -68,10 +75,12 @@ function setRole(role: string | null) {
   });
 }
 
-function renderWithProviders(node: ReactNode) {
-  const client = new QueryClient({
+function renderWithProviders(
+  node: ReactNode,
+  client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+  }),
+) {
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter>{node}</MemoryRouter>
@@ -97,7 +106,8 @@ function reservationWithStatus(status: string) {
 }
 
 beforeEach(() => {
-  setRole(null);
+  // The caller owns RESERVATION (user_id "user-1"), so the row actions show.
+  setRole("user", "user-1");
   server.use(
     http.get("/api/inventory/devices", () =>
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
@@ -107,6 +117,8 @@ beforeEach(() => {
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
     ),
   );
+  toastSuccess.mockReset();
+  toastError.mockReset();
   patchPreferencesMock.mockReset();
   patchPreferencesMock.mockResolvedValue({
     user_id: "u",
@@ -588,6 +600,294 @@ describe("ReservationsPage", () => {
         "aria-sort",
         "descending",
       );
+    });
+  });
+  describe("who sees Cancel and Release on a row (issue #843)", () => {
+    const cancelBtn = { name: `Cancel reservation ${RESERVATION.id.slice(0, 8)}` };
+    const releaseBtn = { name: `Release reservation ${RESERVATION.id.slice(0, 8)}` };
+
+    function serveOne() {
+      server.use(
+        http.get("/api/reservations/", () =>
+          HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 50 }),
+        ),
+      );
+    }
+
+    it("an admin sees Cancel but not Release on another user's row", async () => {
+      serveOne();
+      setRole("admin", "admin-id");
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByRole("button", cancelBtn);
+      expect(screen.queryByRole("button", releaseBtn)).not.toBeInTheDocument();
+    });
+
+    it("a non-admin non-owner sees neither", async () => {
+      serveOne();
+      setRole("user", "stranger-id");
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+      expect(screen.queryByRole("button", cancelBtn)).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", releaseBtn)).not.toBeInTheDocument();
+    });
+
+    it("an admin owner sees both", async () => {
+      serveOne();
+      setRole("admin", "user-1");
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByRole("button", releaseBtn);
+      expect(screen.getByRole("button", cancelBtn)).toBeInTheDocument();
+    });
+
+    it("bulk: an admin's cross-owner rows are eligible for Cancel and skipped for Release", async () => {
+      serveOne();
+      setRole("admin", "admin-id");
+      renderWithProviders(<ReservationsPage />);
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+
+      expect(screen.getByRole("button", { name: "Cancel selected" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Release selected" })).toBeDisabled();
+      expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent(
+        "None of the selected reservations can be released: 1 not yours.",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Cancel selected" }));
+      expect(await screen.findByText(/^Cancel 1 reservation\?/)).toBeInTheDocument();
+    });
+
+    it("bulk: a non-admin non-owner can neither cancel nor release the row", async () => {
+      serveOne();
+      setRole("user", "stranger-id");
+      renderWithProviders(<ReservationsPage />);
+      // No row buttons and a checkbox is still offered; both actions are disabled.
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+      expect(screen.getByRole("button", { name: "Cancel selected" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Release selected" })).toBeDisabled();
+    });
+  });
+
+  describe("bulk cancel and release (issue #843)", () => {
+    const ME = "me-id";
+    const uuid = (n: number) => `0000000${n}-2222-3333-4444-555555555555`;
+    const row = (n: number, status: string, userId = ME) => ({
+      ...RESERVATION,
+      id: uuid(n),
+      status,
+      user_id: userId,
+      owner_name: `owner${n}`,
+      purpose: `purpose ${n}`,
+    });
+    const rowBox = (n: number) =>
+      screen.getByRole("checkbox", { name: `Select reservation ${uuid(n).slice(0, 8)}` });
+    const selectAllBox = () =>
+      screen.getByRole("checkbox", { name: "Select all reservations on this page" });
+
+    function serveList(items: ReturnType<typeof row>[], total = items.length) {
+      const seen: URLSearchParams[] = [];
+      server.use(
+        http.get("/api/reservations/", ({ request }) => {
+          seen.push(new URL(request.url).searchParams);
+          return HttpResponse.json({ items, total, skip: 0, limit: 50 });
+        }),
+      );
+      return seen;
+    }
+
+    beforeEach(() => setRole("user", ME));
+
+    it("a row checkbox selects without opening the detail modal", async () => {
+      serveList([row(1, "ACTIVE")]);
+      renderWithProviders(<ReservationsPage />);
+      const box = await screen.findByRole("checkbox", { name: /Select reservation/ });
+      fireEvent.click(box);
+      expect(box).toBeChecked();
+      expect(screen.queryByTestId("reservation-detail-modal")).not.toBeInTheDocument();
+      expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent("1 selected");
+    });
+
+    it("select-all takes the current page only and goes indeterminate on a partial selection", async () => {
+      // total 100 with two rows: the page holds two, the list holds more.
+      serveList([row(1, "ACTIVE"), row(2, "PENDING")], 100);
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByText("purpose 1");
+
+      fireEvent.click(selectAllBox());
+      expect(rowBox(1)).toBeChecked();
+      expect(rowBox(2)).toBeChecked();
+      expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent("2 selected");
+      expect((selectAllBox() as HTMLInputElement).indeterminate).toBe(false);
+
+      fireEvent.click(rowBox(2));
+      expect((selectAllBox() as HTMLInputElement).indeterminate).toBe(true);
+      expect(selectAllBox()).not.toBeChecked();
+
+      fireEvent.click(selectAllBox());
+      expect(rowBox(2)).toBeChecked();
+      fireEvent.click(selectAllBox());
+      expect(rowBox(1)).not.toBeChecked();
+      expect(screen.getByRole("status", { name: "Selection" })).not.toHaveTextContent("selected");
+    });
+
+    it("clears the selection when the page changes", async () => {
+      const seen = serveList([row(1, "ACTIVE")], 100);
+      renderWithProviders(<ReservationsPage />);
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+      expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent("1 selected");
+
+      fireEvent.click(screen.getByText("Next"));
+      await waitFor(() => expect(seen.some((p) => p.get("skip") === "50")).toBe(true));
+      await waitFor(() =>
+        expect(screen.getByRole("status", { name: "Selection" })).not.toHaveTextContent("selected"),
+      );
+      fireEvent.click(screen.getByText("Prev"));
+      await waitFor(() => expect(seen.filter((p) => p.get("skip") === "0").length).toBeGreaterThan(0));
+      expect(rowBox(1)).not.toBeChecked();
+    });
+
+    it("clears the selection when the sort changes", async () => {
+      serveList([row(1, "ACTIVE")]);
+      renderWithProviders(<ReservationsPage />);
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Status" }));
+      await waitFor(() => expect(rowBox(1)).not.toBeChecked());
+      expect(screen.getByRole("status", { name: "Selection" })).not.toHaveTextContent("selected");
+    });
+
+    it("clears the selection when the all-reservations toggle changes", async () => {
+      serveList([row(1, "ACTIVE")]);
+      setRole("admin", ME);
+      renderWithProviders(<ReservationsPage />);
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+      fireEvent.click(screen.getByLabelText("All reservations"));
+      await waitFor(() => expect(rowBox(1)).not.toBeChecked());
+      expect(screen.getByRole("status", { name: "Selection" })).not.toHaveTextContent("selected");
+    });
+
+    it("the confirmation counts what will run and what will be skipped, and why", async () => {
+      const calls: string[] = [];
+      serveList([
+        row(1, "ACTIVE"),
+        row(2, "PENDING"),
+        row(3, "CANCELLED"),
+        row(4, "ACTIVE", "another-user"),
+      ]);
+      server.use(
+        http.delete("/api/reservations/:id", ({ params }) => {
+          calls.push(params.id as string);
+          return new HttpResponse(null, { status: 204 });
+        }),
+      );
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByText("purpose 1");
+      fireEvent.click(selectAllBox());
+      fireEvent.click(screen.getByRole("button", { name: "Cancel selected" }));
+
+      const desc = await screen.findByText(/Cancel 2 of the 4 selected reservations\?/);
+      expect(desc).toHaveTextContent("This releases their devices and cannot be undone.");
+      expect(desc).toHaveTextContent("2 will be skipped: 1 already finished, 1 not yours.");
+
+      // Keeping aborts: nothing is sent.
+      fireEvent.click(screen.getByRole("button", { name: "Keep reservations" }));
+      expect(calls).toEqual([]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel selected" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel 2 reservations" }));
+      await waitFor(() => expect(calls.sort()).toEqual([uuid(1), uuid(2)]));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Cancelled 2 reservations"));
+      // The two cancelled rows leave the selection; the two skipped rows stay.
+      await waitFor(() =>
+        expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent("2 selected"),
+      );
+    });
+
+    it("disables an action with an explanation when no selected row is eligible", async () => {
+      serveList([row(1, "PENDING"), row(2, "COMPLETED")]);
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByText("purpose 1");
+      fireEvent.click(selectAllBox());
+
+      const release = screen.getByRole("button", { name: "Release selected" });
+      expect(release).toBeDisabled();
+      expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent(
+        "None of the selected reservations can be released: 1 already finished, 1 not active.",
+      );
+      fireEvent.click(release);
+      expect(screen.queryByRole("button", { name: /^Release \d+ reservation/ })).not.toBeInTheDocument();
+      // Cancel is still available for the PENDING row.
+      expect(screen.getByRole("button", { name: "Cancel selected" })).toBeEnabled();
+    });
+
+    it("disables the action buttons while the fan-out is in flight", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      serveList([row(1, "ACTIVE")]);
+      server.use(
+        http.delete("/api/reservations/:id", async () => {
+          await gate;
+          return new HttpResponse(null, { status: 204 });
+        }),
+      );
+      renderWithProviders(<ReservationsPage />);
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Cancel selected" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel 1 reservation" }));
+
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel selected" })).toBeDisabled());
+      expect(screen.getByRole("button", { name: "Release selected" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Clear selection" })).toBeDisabled();
+
+      release();
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Cancelled 1 reservation"));
+    });
+
+    it("keeps failed rows selected, reports the counts and reason, and invalidates once", async () => {
+      serveList([row(1, "ACTIVE"), row(2, "ACTIVE"), row(3, "ACTIVE")]);
+      server.use(
+        http.delete("/api/reservations/:id", ({ params }) =>
+          params.id === uuid(2)
+            ? HttpResponse.json({ detail: "Reservation not found" }, { status: 404 })
+            : new HttpResponse(null, { status: 204 }),
+        ),
+      );
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      renderWithProviders(<ReservationsPage />, client);
+      await screen.findByText("purpose 1");
+      fireEvent.click(selectAllBox());
+      fireEvent.click(screen.getByRole("button", { name: "Cancel selected" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel 3 reservations" }));
+
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith("Cancelled 2, failed 1: Reservation not found"),
+      );
+      expect(toastSuccess).not.toHaveBeenCalled();
+      expect(rowBox(2)).toBeChecked();
+      expect(rowBox(1)).not.toBeChecked();
+      expect(rowBox(3)).not.toBeChecked();
+      expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent("1 selected");
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["reservations"] });
+    });
+
+    it("gives only the counts when the failures have different reasons", async () => {
+      serveList([row(1, "ACTIVE"), row(2, "ACTIVE")]);
+      server.use(
+        http.put("/api/reservations/:id/release", ({ params }) =>
+          HttpResponse.json(
+            { detail: params.id === uuid(1) ? "one reason" : "another reason" },
+            { status: 409 },
+          ),
+        ),
+      );
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByText("purpose 1");
+      fireEvent.click(selectAllBox());
+      fireEvent.click(screen.getByRole("button", { name: "Release selected" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Release 2 reservations" }));
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith("Released 0, failed 2"));
+      expect(rowBox(1)).toBeChecked();
+      expect(rowBox(2)).toBeChecked();
     });
   });
 });

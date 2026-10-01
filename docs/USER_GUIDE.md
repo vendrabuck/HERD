@@ -59,6 +59,8 @@ Transitions you can trigger:
 - **Cancel** (`CANCELLED`): stops a reservation and releases its devices. Available on `PENDING`, `PENDING_PROVISION`, and `ACTIVE` reservations. (The Release action appears in the UI only for `ACTIVE` reservations.)
 - **Release** (`COMPLETED`): ends an `ACTIVE` reservation early. Frees the devices immediately.
 
+The same rule applies to the buttons on a row, the detail modal, and the bulk actions below: the owner or an admin may cancel a reservation, and only the owner may release one. To cancel or release several reservations at once, tick the checkbox on each row of the Reservations list (the box in the header selects every row on the current page) and use **Cancel selected** or **Release selected** in the bar that appears. Changing the page, the sort order, or the "All reservations" view clears the selection. Each action asks for one confirmation that says how many selected reservations it will act on and how many it will skip and why: a reservation that has already finished, one that is not `ACTIVE` (Release only), or one you may not act on (for Release, any you do not own, even as an admin; for Cancel, any you neither own nor can cancel as an admin) is skipped, never acted on. If none of the selected reservations qualifies, the action is disabled and says why. Cancelling cannot be undone. The page then reports the result, for example "Cancelled 2, failed 1: <reason>" when every failure has the same reason, or just the counts when they differ. Reservations that succeeded leave the selection; reservations that failed stay selected so you can see which ones to retry.
+
 Transitions the system runs automatically:
 
 - **Activate** (`PENDING -> ACTIVE`): at your reservation's start time.

@@ -15,7 +15,7 @@ import { useAIStatus } from "@/api/ai";
 import { useAuthStore } from "@/stores/authStore";
 import { errorDetail, purposeClassifyRefusal } from "@/lib/errors";
 import { isAdminRole } from "@/lib/roles";
-import { canCancel, canClassifyPurpose, canRelease } from "@/lib/reservationStatus";
+import { canCancelAs, canClassifyPurpose, canReleaseAs } from "@/lib/reservationStatus";
 import {
   PURPOSE_CLASSIFY_ALREADY_SUGGESTED_MESSAGE,
   PURPOSE_CLASSIFY_DISABLED_MESSAGE,
@@ -156,8 +156,8 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
       }
     }
   };
-  const canReleaseAct = isOwner && canRelease(reservation.status);
-  const canCancelAct = isOwner && canCancel(reservation.status);
+  const canReleaseAct = canReleaseAs(reservation, user);
+  const canCancelAct = canCancelAs(reservation, user);
   const canEdit = isOwner && (reservation.status === "ACTIVE" || reservation.status === "PENDING");
   // The fork is editable only while the reservation is ACTIVE (ADR 0006); after
   // it ends the fork is the frozen, read-only as-built record. A fork exists only

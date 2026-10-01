@@ -9,8 +9,9 @@ beforeAll(() => {
   HTMLDialogElement.prototype.close = vi.fn();
 });
 
-// The current user owns the reservation under test (user_id matches), so the
-// owner-only Release/Cancel and Edit Resources affordances are reachable.
+// The current user owns the reservation under test (user_id matches) and is an
+// admin, so Release, Cancel and Edit Resources are reachable; a test that needs
+// another caller kind changes the role through setCallerRole.
 // useAuthStore is used two ways: as a selector hook in components and via
 // .getState() in the axios client interceptor. The mock must satisfy both, or
 // the interceptor throws and mutation requests never reach MSW. Everything is
@@ -63,7 +64,12 @@ vi.mock("@/components/reservations/EditDevicesModal", () => ({
 
 import { server } from "../mocks/server";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
+import { useAuthStore } from "@/stores/authStore";
 import type { Reservation } from "@/types/reservation.types";
+
+function setCallerRole(role: string) {
+  (useAuthStore.getState() as unknown as { user: { role: string } }).user.role = role;
+}
 
 const RESERVATION: Reservation = {
   id: "res-1",
@@ -104,6 +110,7 @@ function renderModal(overrides: Partial<Reservation> = {}) {
 }
 
 beforeEach(() => {
+  setCallerRole("admin");
   aiStatusMock.mockReturnValue({ data: { enabled: false } });
 });
 
@@ -161,10 +168,26 @@ describe("ReservationDetailModal", () => {
     expect(screen.getByTestId("edit-devices-modal")).toBeInTheDocument();
   });
 
-  it("hides Release and Cancel for a non-owner", () => {
+  // Cancel follows the backend's cancel rule (owner or admin, issue #340);
+  // Release follows its release rule (owner only). Issue #843.
+  it("offers an admin Cancel but not Release on another user's reservation", () => {
+    renderModal({ user_id: "someone-else" });
+    expect(screen.queryByRole("button", { name: "Release", hidden: true })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel", hidden: true })).toBeInTheDocument();
+  });
+
+  it("hides Release and Cancel for a non-admin non-owner", () => {
+    setCallerRole("user");
     renderModal({ user_id: "someone-else" });
     expect(screen.queryByRole("button", { name: "Release", hidden: true })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel", hidden: true })).not.toBeInTheDocument();
+  });
+
+  it("offers a non-admin owner both Release and Cancel", () => {
+    setCallerRole("user");
+    renderModal();
+    expect(screen.getByRole("button", { name: "Release", hidden: true })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel", hidden: true })).toBeInTheDocument();
   });
 
   it("shows Cancel but hides Release for a PENDING reservation (issue #841)", () => {

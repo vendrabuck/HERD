@@ -1,14 +1,32 @@
 import { useState } from "react";
+import toast from "react-hot-toast";
 import { Link } from "react-router-dom";
 import { ChevronUp, ChevronDown } from "lucide-react";
-import { useCancelReservation, useReleaseReservation, usePaginatedReservations } from "@/api/reservations";
+import {
+  useBulkReservationAction,
+  useCancelReservation,
+  useReleaseReservation,
+  usePaginatedReservations,
+} from "@/api/reservations";
 import type { ReservationSort } from "@/api/reservations";
 import { useAllDeviceNames } from "@/api/inventory";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import type { SortState } from "@/stores/preferencesStore";
 import { isAdminRole } from "@/lib/roles";
-import { canCancel, canRelease } from "@/lib/reservationStatus";
+import { canCancelAs, canReleaseAs } from "@/lib/reservationStatus";
+import { errorDetail } from "@/lib/errors";
+import {
+  applySettled,
+  confirmDescription,
+  confirmLabel,
+  confirmTitle,
+  keepLabel,
+  noneEligibleMessage,
+  partitionSelection,
+  summarizeOutcome,
+} from "@/lib/reservationBulk";
+import type { BulkAction } from "@/lib/reservationBulk";
 import { Pagination } from "@/components/ui/Pagination";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
@@ -75,15 +93,24 @@ function SortableHeader({ label, field, active, direction, onSort }: SortableHea
   );
 }
 
+const NO_SELECTION: ReadonlySet<string> = new Set();
+
 function ReservationRow({
   reservation,
+  selected,
+  onToggleSelected,
   onClick,
 }: {
   reservation: Reservation;
+  selected: boolean;
+  onToggleSelected: () => void;
   onClick: () => void;
 }) {
   const cancel = useCancelReservation();
   const release = useReleaseReservation();
+  const user = useAuthStore((s) => s.user);
+  const mayRelease = canReleaseAs(reservation, user);
+  const mayCancel = canCancelAs(reservation, user);
   const [confirmCancelOpen, setConfirmCancelOpen] = useState(false);
   const shortId = reservation.id.slice(0, 8);
 
@@ -91,7 +118,19 @@ function ReservationRow({
   const end = new Date(reservation.end_time).toLocaleDateString();
 
   return (
-    <tr className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={onClick}>
+    <tr
+      className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${selected ? "bg-blue-50" : ""}`}
+      onClick={onClick}
+    >
+      <td className="px-4 py-3 w-8" onClick={(e) => e.stopPropagation()}>
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggleSelected}
+          aria-label={`Select reservation ${shortId}`}
+          className="h-4 w-4 rounded border-gray-300"
+        />
+      </td>
       <td className="px-4 py-3 text-sm font-mono text-gray-500">{shortId}</td>
       <td className="px-4 py-3 text-sm text-gray-500">{reservation.owner_name || reservation.user_id.slice(0, 8)}</td>
       <td className="px-4 py-3 text-sm">
@@ -116,9 +155,9 @@ function ReservationRow({
         </div>
       </td>
       <td className="px-4 py-3 text-sm" onClick={(e) => e.stopPropagation()}>
-        {(canRelease(reservation.status) || canCancel(reservation.status)) && (
+        {(mayRelease || mayCancel) && (
           <div className="flex gap-1">
-            {canRelease(reservation.status) && (
+            {mayRelease && (
               <button
                 onClick={() => release.mutate(reservation.id)}
                 disabled={release.isPending}
@@ -128,7 +167,7 @@ function ReservationRow({
                 Release
               </button>
             )}
-            {canCancel(reservation.status) && (
+            {mayCancel && (
               <button
                 onClick={() => setConfirmCancelOpen(true)}
                 disabled={cancel.isPending}
@@ -163,6 +202,8 @@ export function ReservationsPage() {
   const [selectedReservation, setSelectedReservation] = useState<Reservation | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<BulkAction | null>(null);
+  const bulk = useBulkReservationAction();
   const user = useAuthStore((s) => s.user);
   const isAdmin = isAdminRole(user?.role);
   const limit = 50;
@@ -204,6 +245,56 @@ export function ReservationsPage() {
   const reservations = data?.items;
   const total = data?.total ?? 0;
 
+  // Multi-select (issue #843). The selection is tagged with the view it was
+  // made in (page, sort, and the all-reservations toggle) and is dropped under
+  // any other view, so it can never hold a row the user cannot see, even when
+  // the sort changes from a late-loading preference rather than a click.
+  const viewKey = `${skip}|${allReservations}|${sort?.sortBy ?? ""}|${sort?.sortDir ?? ""}`;
+  const [selection, setSelection] = useState<{ key: string; ids: ReadonlySet<string> }>({
+    key: viewKey,
+    ids: NO_SELECTION,
+  });
+  // Adjust during render (not in an effect) so the stale ids are dropped for
+  // good: merely reading them as empty would bring them back if the user
+  // returned to the same page, sort, and toggle state.
+  if (selection.key !== viewKey) setSelection({ key: viewKey, ids: NO_SELECTION });
+  const selectedIds = selection.key === viewKey ? selection.ids : NO_SELECTION;
+  const selectedRows = (reservations ?? []).filter((r) => selectedIds.has(r.id));
+  const pageCount = reservations?.length ?? 0;
+  const allSelected = pageCount > 0 && selectedRows.length === pageCount;
+  const setSelectedIds = (ids: ReadonlySet<string>) => setSelection({ key: viewKey, ids });
+
+  const toggleRow = (id: string) => {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedIds(next);
+  };
+  const toggleAll = () =>
+    setSelectedIds(allSelected ? NO_SELECTION : new Set((reservations ?? []).map((r) => r.id)));
+
+  const partitions = {
+    cancel: partitionSelection("cancel", selectedRows, user),
+    release: partitionSelection("release", selectedRows, user),
+  };
+
+  const runBulk = async (action: BulkAction) => {
+    setConfirmAction(null);
+    const ids = partitions[action].eligible.map((r) => r.id);
+    if (ids.length === 0) return;
+    let results: PromiseSettledResult<unknown>[];
+    try {
+      results = await bulk.mutateAsync({ action, ids });
+    } catch {
+      results = [];
+    }
+    const outcome = applySettled(selectedIds, ids, results, (err) => errorDetail(err, "") || null);
+    setSelectedIds(outcome.remaining);
+    const message = summarizeOutcome(action, outcome);
+    if (outcome.failures.length === 0) toast.success(message);
+    else toast.error(message);
+  };
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="px-6 xl:px-12 2xl:px-16 py-6">
@@ -243,6 +334,48 @@ export function ReservationsPage() {
           </button>
         </div>
 
+        <div role="status" aria-label="Selection" aria-live="polite">
+          {selectedRows.length > 0 && (
+            <div className="mb-3 flex flex-wrap items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-sm">
+              <span className="font-medium text-gray-900">{selectedRows.length} selected</span>
+              {(["cancel", "release"] as const).map((action) => {
+                const none = partitions[action].eligible.length === 0;
+                const noteId = `bulk-${action}-note`;
+                return (
+                  <span key={action} className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmAction(action)}
+                      disabled={bulk.isPending || none}
+                      aria-describedby={none ? noteId : undefined}
+                      className={`text-xs px-2.5 py-1.5 rounded border disabled:opacity-50 ${
+                        action === "cancel"
+                          ? "border-red-300 text-red-700 hover:bg-red-50"
+                          : "border-green-300 text-green-700 hover:bg-green-50"
+                      }`}
+                    >
+                      {action === "cancel" ? "Cancel selected" : "Release selected"}
+                    </button>
+                    {none && (
+                      <span id={noteId} className="text-xs text-gray-500">
+                        {noneEligibleMessage(action, partitions[action].skipped)}
+                      </span>
+                    )}
+                  </span>
+                );
+              })}
+              <button
+                type="button"
+                onClick={() => setSelectedIds(NO_SELECTION)}
+                disabled={bulk.isPending}
+                className="ml-auto text-xs text-gray-600 hover:text-gray-900 disabled:opacity-50"
+              >
+                Clear selection
+              </button>
+            </div>
+          )}
+        </div>
+
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
           {isLoading && (
             <p role="status" aria-live="polite" className="text-sm text-gray-400 text-center py-8">
@@ -257,9 +390,21 @@ export function ReservationsPage() {
           )}
           {reservations && reservations.length > 0 && (
             <div className="overflow-x-auto">
-            <table className="w-full min-w-[900px]">
+            <table className="w-full min-w-[940px]">
               <thead>
                 <tr className="border-b border-gray-200">
+                  <th scope="col" className="sticky top-0 z-10 bg-gray-50 px-4 py-2 w-8">
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      ref={(el) => {
+                        if (el) el.indeterminate = selectedRows.length > 0 && !allSelected;
+                      }}
+                      onChange={toggleAll}
+                      aria-label="Select all reservations on this page"
+                      className="h-4 w-4 rounded border-gray-300"
+                    />
+                  </th>
                   <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
                   <SortableHeader
                     label="Owner"
@@ -300,6 +445,8 @@ export function ReservationsPage() {
                   <ReservationRow
                     key={res.id}
                     reservation={res}
+                    selected={selectedIds.has(res.id)}
+                    onToggleSelected={() => toggleRow(res.id)}
                     onClick={() => setSelectedReservation(res)}
                   />
                 ))}
@@ -320,6 +467,17 @@ export function ReservationsPage() {
           open={createOpen}
           deviceIds={[]}
           onClose={() => setCreateOpen(false)}
+        />
+
+        <ConfirmDialog
+          open={confirmAction !== null}
+          title={confirmAction ? confirmTitle(confirmAction) : ""}
+          description={confirmAction ? confirmDescription(confirmAction, partitions[confirmAction]) : ""}
+          confirmLabel={confirmAction ? confirmLabel(confirmAction, partitions[confirmAction]) : "Confirm"}
+          cancelLabel={confirmAction ? keepLabel(confirmAction) : "Cancel"}
+          destructive={confirmAction === "cancel"}
+          onConfirm={() => confirmAction && runBulk(confirmAction)}
+          onCancel={() => setConfirmAction(null)}
         />
       </div>
     </div>

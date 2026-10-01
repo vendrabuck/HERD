@@ -171,6 +171,14 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Conflict detection** (Shipped): time-window conflict checks for exclusive devices.
 - **Automatic expiration** (Shipped): pending reservations activate and active
   reservations complete on schedule.
+- **Bulk cancel and release** (Shipped, issue #843): the Reservations list has a
+  checkbox per row and a select-all for the current page. Cancel selected and
+  Release selected fan out over the per-id endpoints behind one confirmation that
+  counts what will run and what will be skipped (finished, not active, not yours).
+  Eligibility is per row and uses one rule shared with the single-row buttons and
+  the detail modal, matching the backend: the owner or an admin may cancel, only
+  the owner may release. A partial failure keeps the failed rows selected and
+  reports the counts.
 - **Automatic infrastructure provisioning** (Shipped): the reservation's topology
   fork drives the connected infrastructure through drivers, initial provisioning
   included (activation stages the fork's wiring for the same connection-driven

@@ -10,8 +10,13 @@ descending in the UI, the first RENDERED row must match the first item a
 direct API call with the identical query params returns.
 
 Two reservations are created on the same available device, a year or more
-out and clearly ordered in start_time, so the sort has something
-unambiguous to prove regardless of whatever else is on the shared stack.
+out and clearly ordered in start_time, so the sort has something to prove
+that does not depend on the stack's other rows. Other far-future rows (a
+cancelled row stays in the list, and any other test or user may have booked
+later than these) can sort ahead of the pair, so the test never assumes its
+own reservation is first: it asserts that the first rendered row is the first
+item the API returns for the identical query, and that the API orders the
+pair later-before-earlier.
 
 Rerunnable on a reused stack (issue #951). Two things make that true. The
 reservations are cleaned up by cancelling, and a cancelled row stays in the
@@ -46,9 +51,9 @@ def pw_two_future_reservations(pw_page):
     matters here, not ports or cabling, so no fresh-device creation is
     needed the way test_connections_bulk_playwright.py's bulk_fixture_devices
     does for port-level isolation. Both reservations sit more than a year
-    out, far past anything else on the shared stack (transient_reservation
-    and its Playwright analogues all book at "now"), so no other reservation
-    should plausibly sort ahead of them by start_time.
+    out and clearly ordered against each other. Other rows may still sort
+    ahead of the pair on a reused stack, so the test asserts only their
+    relative order and the first-row match, never that either is first.
     """
     pw_login(pw_page)
 
@@ -116,8 +121,8 @@ def _is_sort_desc_patch(response) -> bool:
 
 
 def test_sort_by_start_time_desc_matches_api_readback(pw_page, pw_two_future_reservations):
-    """Sorting the Period column descending puts the API's own first row on top."""
-    later, _earlier = pw_two_future_reservations
+    """Sorting the Period column descending renders the API's own order."""
+    later, earlier = pw_two_future_reservations
 
     # The sort choice is a saved preference: remember the admin's, then reset it
     # to the default so the two-click path below starts from a known state.
@@ -141,26 +146,31 @@ def test_sort_by_start_time_desc_matches_api_readback(pw_page, pw_two_future_res
         period_header_cell = pw_page.get_by_role("columnheader", name="Period")
         expect(period_header_cell).to_have_attribute("aria-sort", "descending", timeout=WAIT_MS)
 
-        # Wait for the fixture's later reservation to actually be rendered,
-        # proving the sorted request has round-tripped, before reading the
-        # table's first data row.
-        expect(pw_page.get_by_text(later["purpose"], exact=True)).to_be_visible(timeout=WAIT_MS)
-
-        first_row = pw_page.locator("table tbody tr").first
-        expect(first_row).to_contain_text(later["id"][:8])
-
         # Effect assertion: read the identical query back through the API
         # directly, rather than trusting the UI's own claim that it applied the
         # sort. Same params the page itself sends (no `all`: this admin's own
-        # reservations, matching the default "My Reservations" view).
+        # reservations, matching the default "My Reservations" view), at the
+        # endpoint's maximum limit so a crowded stack cannot hide the pair.
         readback = pw_api(
             pw_page,
             "GET",
             "/reservations/",
-            params={"sort_by": "start_time", "sort_dir": "desc", "limit": 50},
+            params={"sort_by": "start_time", "sort_dir": "desc", "limit": 500},
         ).json()
-        assert readback["items"], "expected at least the two fixture reservations back"
-        assert readback["items"][0]["id"] == later["id"]
+        items = readback["items"]
+        assert items, "expected at least the two fixture reservations back"
+        order = [r["id"] for r in items]
+        assert later["id"] in order and earlier["id"] in order, (
+            "both fixture reservations must be in the read-back "
+            f"(total={readback.get('total')}, returned={len(order)})"
+        )
+        assert order.index(later["id"]) < order.index(earlier["id"])
+
+        # The first rendered row is the API's first item, whichever reservation
+        # that is. Wait for the sorted request to land first: the table shows
+        # the API's first row once it does.
+        first_row = pw_page.locator("table tbody tr").first
+        expect(first_row).to_contain_text(items[0]["id"][:8], timeout=WAIT_MS)
 
         # The choice really was saved, which is why it has to be restored.
         saved = pw_api(pw_page, "GET", "/user-profile/preferences").json()
