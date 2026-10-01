@@ -5,9 +5,10 @@ Structural, deliberately coarse: any service module that calls
 `pull_subscribe(` must also run its batches through `process_batch_with_heartbeat`
 from herd_common.jetstream (execution since issue #944; no module keeps an inline
 heartbeat loop, whose hand-rolled cancel handling once swallowed a shutdown cancel)
-and define a `NATS_HEARTBEAT_SECONDS` below its
-`NATS_ACK_WAIT_SECONDS`. A new consumer module that skips the heartbeat fails
-here. The behavioral proof lives in each service's own tests.
+and (issue #944) take `NATS_ACK_WAIT_SECONDS` from settings and
+`NATS_HEARTBEAT_SECONDS` from `herd_common.jetstream.heartbeat_interval`, never a
+hardcoded value. A new consumer module that skips the heartbeat fails here. The
+behavioral proof lives in each service's own tests.
 """
 
 import re
@@ -46,10 +47,18 @@ def test_every_pull_consumer_module_uses_the_shared_heartbeat():
     assert not missing, f"pull consumer without the #911 heartbeat: {missing}"
 
 
-def test_every_pull_consumer_module_pins_heartbeat_below_ack_wait():
+def test_every_pull_consumer_module_takes_ack_wait_and_heartbeat_from_one_source():
+    """Issue #944: ack_wait comes from settings and the heartbeat cadence from the
+    shared `heartbeat_interval` helper (half of ack_wait, derived once). A module
+    that hardcodes either, or computes its own fraction, fails here."""
     for p in CONSUMER_MODULES:
         text = p.read_text()
-        ack = re.search(r"^NATS_ACK_WAIT_SECONDS = (\d+)$", text, re.M)
-        hb = re.search(r"^NATS_HEARTBEAT_SECONDS = NATS_ACK_WAIT_SECONDS // (\d+)$", text, re.M)
-        assert ack and hb, f"{p} must define NATS_ACK_WAIT_SECONDS and NATS_HEARTBEAT_SECONDS"
-        assert int(hb.group(1)) >= 2, f"{p}: heartbeat must be below ack_wait"
+        assert re.search(
+            r"^NATS_ACK_WAIT_SECONDS = settings\.nats_ack_wait_seconds$", text, re.M
+        ), f"{p}: NATS_ACK_WAIT_SECONDS must come from settings.nats_ack_wait_seconds"
+        assert re.search(
+            r"^NATS_HEARTBEAT_SECONDS = heartbeat_interval\(NATS_ACK_WAIT_SECONDS\)$",
+            text,
+            re.M,
+        ), f"{p}: NATS_HEARTBEAT_SECONDS must be heartbeat_interval(NATS_ACK_WAIT_SECONDS)"
+        assert not re.search(r"ack_wait\s*=\s*\d", text), f"{p}: hardcoded ack_wait"

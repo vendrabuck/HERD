@@ -11,6 +11,7 @@ import httpx
 from herd_common.jetstream import (
     ensure_consumer,
     ensure_stream_exists,
+    heartbeat_interval,
     nak_delay,
     parse_nak_backoff_schedule,
     process_batch_with_heartbeat,
@@ -66,7 +67,9 @@ HANDLED_RESERVATION_EVENTS = frozenset(
 # ConsumerConfig; ack_wait/backoff only ever governed an UN-acked/nak'd
 # message's timeout redelivery, which the #317 heartbeat below exists to avoid.
 NATS_MAX_DELIVER = 5
-NATS_ACK_WAIT_SECONDS = 30
+# Read from settings (NATS_ACK_WAIT_SECONDS, issue #944; production 30, validated
+# at least 2 at load). Never hardcode it here.
+NATS_ACK_WAIT_SECONDS = settings.nats_ack_wait_seconds
 # NAK-delay schedule (issue #895), from Settings so it is a knob
 # (NATS_NAK_BACKOFF_SECONDS): production defaults to [1, 5, 15, 60, 120],
 # matching the values this consumer's ConsumerConfig used to (ineffectively)
@@ -85,7 +88,7 @@ NATS_NAK_BACKOFF_SECONDS = parse_nak_backoff_schedule(settings.nats_nak_backoff_
 # peer replica. Half of ack_wait leaves margin for a late heartbeat. A crashed
 # consumer stops heartbeating, so ack_wait still expires and the message
 # correctly redelivers.
-NATS_HEARTBEAT_SECONDS = NATS_ACK_WAIT_SECONDS // 2
+NATS_HEARTBEAT_SECONDS = heartbeat_interval(NATS_ACK_WAIT_SECONDS)
 # Pull-consumer fetch tuning. A pull consumer re-establishes on the next fetch
 # after a broker reconnect, which a push subscription does not do reliably, so it
 # survives a NATS restart (issue #21).

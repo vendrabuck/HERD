@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- Fixed execution's consumer loop swallowing a shutdown cancel, and added a live
+  exactly-once test for a slow webhook receiver (issue #944). Execution kept an
+  inline copy of the heartbeat whose `try: await heartbeat / except
+  CancelledError: pass` could not tell a cancel aimed at the consumer from the
+  heartbeat's own, so a shutdown landing just after a batch settled left the loop
+  running and `stop_nats_consumer` waiting forever. Execution now runs its
+  batches through the shared `process_batch_with_heartbeat`, with a regression
+  test through the real loop. `NATS_ACK_WAIT_SECONDS` is now a setting (default
+  30, minimum 2) in execution, notifications, and integration, with the
+  heartbeat derived as half of it by `herd_common.jetstream.heartbeat_interval`.
+  The dev/test stack pins integration to 4 s, and the test webhook sink gains a
+  bounded `delay_ms` and a per-event hit counter, so a live test holds a fan-out
+  open past ack_wait and asserts the receiver got exactly one POST.
 - Added a **Classify now** action to the reservation detail modal (issue #822),
   the UI for the on-demand purpose classification trigger from issue #808. An
   admin sees it on a COMPLETED, CANCELLED, or FAILED reservation with no

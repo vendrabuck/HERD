@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable
 from herd_common.jetstream import (
     ensure_consumer,
     ensure_stream_exists,
+    heartbeat_interval,
     nak_delay,
     parse_nak_backoff_schedule,
     process_batch_with_heartbeat,
@@ -52,7 +53,9 @@ NATS_DURABLE = "integration-webhooks-consumer"
 # from the explicit `nak(delay=...)` call in process_message's transient
 # branch (NATS_NAK_BACKOFF_SECONDS below), not from this config.
 NATS_MAX_DELIVER = 5
-NATS_ACK_WAIT_SECONDS = 30
+# Read from settings (NATS_ACK_WAIT_SECONDS, issue #944; production 30, validated
+# at least 2 at load). Never hardcode it here.
+NATS_ACK_WAIT_SECONDS = settings.nats_ack_wait_seconds
 # Work-in-progress heartbeat cadence (issue #911, the shared
 # herd_common.jetstream.keep_messages_alive, which execution's loop shares too,
 # issue #944).
@@ -61,7 +64,7 @@ NATS_ACK_WAIT_SECONDS = 30
 # redelivery mid-flight would POST the same event to the receiver again.
 # Half of ack_wait leaves margin for a late heartbeat; a crashed consumer stops
 # heartbeating, so ack_wait still expires and the message correctly redelivers.
-NATS_HEARTBEAT_SECONDS = NATS_ACK_WAIT_SECONDS // 2
+NATS_HEARTBEAT_SECONDS = heartbeat_interval(NATS_ACK_WAIT_SECONDS)
 # NAK-delay schedule (issue #895), from Settings so it is a knob
 # (NATS_NAK_BACKOFF_SECONDS): production defaults to [1, 5, 15, 60, 120];
 # docker-compose.override.yml pins a short dev/test schedule. Parsed once at

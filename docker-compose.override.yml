@@ -68,6 +68,15 @@ services:
       # transient-failure exhaustion fast while still exercising a real
       # nak(delay=...) > 0 call on every redelivery past the first.
       NATS_NAK_BACKOFF_SECONDS: "0,1,1,1,1"
+      # Dev/test-only short ack_wait for integration's durables ONLY (issue #944;
+      # production keeps 30, and execution and notifications keep 30 here too).
+      # It exists so tests/integration/test_webhook_slow_receiver_live.py can hold
+      # a webhook fan-out open past ack_wait inside the suite's --timeout=30 cap
+      # and prove the broker honors the in-progress heartbeat. The heartbeat runs
+      # at half of it (2s here), the test sink sleeps 6s (1.5x ack_wait, under the
+      # 10s webhook delivery timeout), and test_nats_consumer_configs_live.py pins
+      # the server-side value.
+      NATS_ACK_WAIT_SECONDS: "4"
     volumes:
       - ./services/integration/app:/app/app
       - ./services/common/herd_common:/app/common/herd_common

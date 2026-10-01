@@ -1,5 +1,7 @@
 """Live-NATS proof for issue #895: every durable consumer's server-side
-config actually carries a 30s ack_wait and no backoff.
+config actually carries its real ack_wait and no backoff. Since issue #944 the
+ack_wait is per service: integration's durables carry the dev/test pin from
+docker-compose.override.yml (4s), execution's and notifications' keep 30.
 
 Connects directly to NATS_URL_HOST (mirroring test_dlq_and_idempotency.py and
 _nats_helpers.py) and reads `consumer_info` for each durable this issue
@@ -28,6 +30,11 @@ pytestmark = pytest.mark.asyncio
 
 NATS_URL_HOST = os.getenv("NATS_URL_HOST", "nats://localhost:4222")
 
+# Server-side ack_wait per service on the dev/test stack. Integration is pinned
+# short by docker-compose.override.yml (NATS_ACK_WAIT_SECONDS) for
+# test_webhook_slow_receiver_live.py; the others run the production 30.
+_EXPECTED_ACK_WAIT = {"execution": 30, "notifications": 30, "integration": 4}
+
 # (stream, service, durable name); see each service's
 # app/services/nats_consumer.py. Execution has no HERD_HEALTH durable (it
 # only produces to that stream, via the health scheduler).
@@ -50,8 +57,8 @@ async def _probe_nats() -> str | None:
 
 
 async def test_consumers_have_real_ack_wait_and_no_backoff():
-    """Every durable consuming HERD_RESERVATIONS or HERD_HEALTH reports
-    ack_wait == 30 and an empty/None backoff (issue #895)."""
+    """Every durable consuming HERD_RESERVATIONS or HERD_HEALTH reports its
+    service's expected ack_wait and an empty/None backoff (issue #895, #944)."""
     nats_error = await _probe_nats()
     if nats_error is not None:
         pytest.skip(f"NATS unreachable from test host: {nats_error}")
@@ -66,10 +73,11 @@ async def test_consumers_have_real_ack_wait_and_no_backoff():
             except nats.js.errors.NotFoundError:
                 failures.append(f"{service}'s durable {durable!r} does not exist on {stream}")
                 continue
-            if info.config.ack_wait != 30:
+            expected = _EXPECTED_ACK_WAIT[service]
+            if info.config.ack_wait != expected:
                 failures.append(
                     f"{service}'s durable {durable!r} on {stream}: "
-                    f"ack_wait={info.config.ack_wait!r}, expected 30 (issue #895: a "
+                    f"ack_wait={info.config.ack_wait!r}, expected {expected} (issue #895: a "
                     "lingering `backoff` would report 1.0 here, since JetStream "
                     "substitutes backoff[0] for ack_wait)"
                 )

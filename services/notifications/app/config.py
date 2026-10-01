@@ -1,5 +1,5 @@
 from herd_common.base_settings import HerdBaseSettings
-from herd_common.jetstream import parse_nak_backoff_schedule
+from herd_common.jetstream import parse_nak_backoff_schedule, validate_ack_wait_seconds
 from pydantic import field_validator
 
 
@@ -22,6 +22,19 @@ class Settings(HerdBaseSettings):
     @classmethod
     def _validate_nak_backoff_schedule(cls, v: object) -> str:
         return ",".join(str(n) for n in parse_nak_backoff_schedule(v))
+
+    # Durable consumers' ack_wait in seconds (issue #944), shared env name
+    # NATS_ACK_WAIT_SECONDS across execution/notifications/integration. The
+    # in-progress heartbeat runs at half of it (herd_common.jetstream
+    # .heartbeat_interval). Production keeps 30; docker-compose.override.yml
+    # pins a short value for integration only, so a live test can outlast it.
+    # Refuses to boot below herd_common.jetstream.MIN_ACK_WAIT_SECONDS.
+    nats_ack_wait_seconds: int = 30
+
+    @field_validator("nats_ack_wait_seconds")
+    @classmethod
+    def _validate_ack_wait(cls, v: int) -> int:
+        return validate_ack_wait_seconds(v)
 
     user_profile_service_url: str = "http://user-profile:8000"
     auth_service_url: str = "http://auth:8000"

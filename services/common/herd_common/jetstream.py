@@ -219,6 +219,34 @@ def parse_nak_backoff_schedule(value: str) -> list[int]:
     return schedule
 
 
+# Smallest ack_wait a consumer may be configured with (issue #944). The
+# heartbeat runs at half of it, and a sub-second heartbeat interval would be
+# noise, not a safety margin; each service's NATS_ACK_WAIT_SECONDS Settings
+# field refuses anything lower at load.
+MIN_ACK_WAIT_SECONDS = 2
+
+
+def validate_ack_wait_seconds(value: int) -> int:
+    """Settings-time check for a consumer's `nats_ack_wait_seconds` (issue
+    #944): returns `value` unchanged, or raises ValueError naming the minimum.
+    Shared so execution, notifications, and integration refuse the same way."""
+    if value < MIN_ACK_WAIT_SECONDS:
+        raise ValueError(
+            f"NATS_ACK_WAIT_SECONDS must be at least {MIN_ACK_WAIT_SECONDS} seconds, got {value}"
+        )
+    return value
+
+
+def heartbeat_interval(ack_wait_seconds: float) -> float:
+    """The in-progress heartbeat cadence for a consumer whose ack_wait is
+    `ack_wait_seconds`: always HALF of it (issue #944), derived here and
+    nowhere else so no consumer can drift from the rule. Half leaves margin for
+    a late heartbeat while still resetting the ack timer well before it
+    expires. True division on purpose: a 3 s ack_wait gives 1.5 s, never an
+    integer floor that could reach 0 and spin."""
+    return ack_wait_seconds / 2
+
+
 async def keep_messages_alive(messages: list, interval: float) -> None:
     """Reset ack_wait on every still-in-flight message until it is settled.
 
@@ -230,7 +258,7 @@ async def keep_messages_alive(messages: list, interval: float) -> None:
     settled messages. in_progress failures are swallowed: a heartbeat is
     best-effort and must never wedge the consumer. The task never ends on its
     own; the caller cancels it. `interval` must stay strictly below the
-    consumer's ack_wait.
+    consumer's ack_wait (use `heartbeat_interval`).
     """
     while True:
         await asyncio.sleep(interval)
@@ -280,6 +308,9 @@ async def process_batch_with_heartbeat(
 
 
 __all__ = [
+    "MIN_ACK_WAIT_SECONDS",
+    "heartbeat_interval",
+    "validate_ack_wait_seconds",
     "keep_messages_alive",
     "process_batch_with_heartbeat",
     "ensure_stream",
