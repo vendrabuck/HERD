@@ -11,7 +11,9 @@ import pytest
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
+from app.models.connection import Connection
 from app.models.fork import ForkConnection, ForkStatus_ACTIVE, ForkStatus_ARCHIVED, ReservationFork
+from app.routes.forks import CONNECTION_ID_SAMPLE_LIMIT
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -100,7 +102,7 @@ async def test_missing_token_is_422(client):
 async def test_no_forks_is_empty(client):
     resp = await _by_device(client, uuid.uuid4())
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"reservation_ids": []}
+    assert resp.json()["reservation_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -108,7 +110,7 @@ async def test_unknown_device_with_other_forks_present_is_empty(client):
     await _mk_fork([(uuid.uuid4(), uuid.uuid4())])
     resp = await _by_device(client, uuid.uuid4())
     assert resp.status_code == 200
-    assert resp.json() == {"reservation_ids": []}
+    assert resp.json()["reservation_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -116,7 +118,7 @@ async def test_device_as_source(client):
     dev = uuid.uuid4()
     rid = await _mk_fork([(dev, uuid.uuid4())])
     resp = await _by_device(client, dev)
-    assert resp.json() == {"reservation_ids": [str(rid)]}
+    assert resp.json()["reservation_ids"] == [str(rid)]
 
 
 @pytest.mark.asyncio
@@ -124,7 +126,7 @@ async def test_device_as_target(client):
     dev = uuid.uuid4()
     rid = await _mk_fork([(uuid.uuid4(), dev)])
     resp = await _by_device(client, dev)
-    assert resp.json() == {"reservation_ids": [str(rid)]}
+    assert resp.json()["reservation_ids"] == [str(rid)]
 
 
 @pytest.mark.asyncio
@@ -132,7 +134,7 @@ async def test_device_as_middle_hop_only(client):
     a, s, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     rid = await _mk_fork([(a, s), (s, b)])
     resp = await _by_device(client, s)
-    assert resp.json() == {"reservation_ids": [str(rid)]}
+    assert resp.json()["reservation_ids"] == [str(rid)]
 
 
 @pytest.mark.asyncio
@@ -140,7 +142,7 @@ async def test_many_hops_in_one_fork_yield_one_id(client):
     s = uuid.uuid4()
     rid = await _mk_fork([(uuid.uuid4(), s), (s, uuid.uuid4()), (s, uuid.uuid4())])
     resp = await _by_device(client, s)
-    assert resp.json() == {"reservation_ids": [str(rid)]}
+    assert resp.json()["reservation_ids"] == [str(rid)]
 
 
 @pytest.mark.asyncio
@@ -148,7 +150,7 @@ async def test_archived_fork_does_not_count(client):
     s = uuid.uuid4()
     await _mk_fork([(uuid.uuid4(), s), (s, uuid.uuid4())], status=ForkStatus_ARCHIVED)
     resp = await _by_device(client, s)
-    assert resp.json() == {"reservation_ids": []}
+    assert resp.json()["reservation_ids"] == []
 
 
 @pytest.mark.asyncio
@@ -159,4 +161,73 @@ async def test_two_active_forks_sorted_and_archived_excluded(client):
     await _mk_fork([(s, uuid.uuid4())], status=ForkStatus_ARCHIVED)
     resp = await _by_device(client, s)
     assert resp.status_code == 200
-    assert resp.json() == {"reservation_ids": sorted([str(r1), str(r2)])}
+    assert resp.json()["reservation_ids"] == sorted([str(r1), str(r2)])
+
+
+async def _mk_connections(rows: list[tuple]) -> list[str]:
+    """Insert plain Connection rows (device_a_id, device_b_id); returns their ids."""
+    ids = []
+    async with TestSessionLocal() as db:
+        for i, (a, b) in enumerate(rows):
+            conn = Connection(
+                device_a_id=a,
+                port_a=f"a{i}",
+                device_b_id=b,
+                port_b=f"b{i}",
+                created_by="system",
+            )
+            db.add(conn)
+            await db.flush()
+            ids.append(str(conn.id))
+        await db.commit()
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_connections_named_at_either_end_are_reported(client):
+    d, other = uuid.uuid4(), uuid.uuid4()
+    ids = await _mk_connections([(d, other), (other, d), (other, uuid.uuid4())])
+    body = (await _by_device(client, d)).json()
+    assert body["connection_count"] == 2
+    assert body["connection_ids"] == sorted(ids[:2])
+    assert body["reservation_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_loopback_connection_counts_once(client):
+    d = uuid.uuid4()
+    ids = await _mk_connections([(d, d)])
+    body = (await _by_device(client, d)).json()
+    assert body["connection_count"] == 1
+    assert body["connection_ids"] == ids
+
+
+@pytest.mark.asyncio
+async def test_connection_id_sample_is_capped_but_count_is_true_total(client):
+    d = uuid.uuid4()
+    ids = await _mk_connections([(d, uuid.uuid4()) for _ in range(CONNECTION_ID_SAMPLE_LIMIT + 5)])
+    body = (await _by_device(client, d)).json()
+    assert CONNECTION_ID_SAMPLE_LIMIT == 10
+    assert body["connection_count"] == CONNECTION_ID_SAMPLE_LIMIT + 5
+    assert len(body["connection_ids"]) == CONNECTION_ID_SAMPLE_LIMIT
+    assert body["connection_ids"] == sorted(ids)[:CONNECTION_ID_SAMPLE_LIMIT]
+
+
+@pytest.mark.asyncio
+async def test_uncabled_or_unknown_device_has_zero_connections(client):
+    await _mk_connections([(uuid.uuid4(), uuid.uuid4())])
+    body = (await _by_device(client, uuid.uuid4())).json()
+    assert body == {"reservation_ids": [], "connection_count": 0, "connection_ids": []}
+
+
+@pytest.mark.asyncio
+async def test_forks_and_connections_are_reported_independently(client):
+    s = uuid.uuid4()
+    rid = await _mk_fork([(uuid.uuid4(), s)])
+    ids = await _mk_connections([(s, uuid.uuid4())])
+    body = (await _by_device(client, s)).json()
+    assert body == {
+        "reservation_ids": [str(rid)],
+        "connection_count": 1,
+        "connection_ids": ids,
+    }

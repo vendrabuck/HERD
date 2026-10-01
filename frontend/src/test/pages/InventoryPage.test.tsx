@@ -646,6 +646,35 @@ describe("InventoryPage", () => {
       );
     });
 
+    it("says remove the cables first when a bulk delete is refused as cabled (issue #940)", async () => {
+      const toastModule = await import("react-hot-toast");
+      server.use(
+        twoDevicesHandler(),
+        http.delete("/api/inventory/devices/aaaaaaaa-0000-0000-0000-000000000001", () =>
+          HttpResponse.json(
+            { detail: { error: "device_cabled", connection_count: 2, connection_ids: ["c1"] } },
+            { status: 409 },
+          ),
+        ),
+        http.delete("/api/inventory/devices/aaaaaaaa-0000-0000-0000-000000000002", () =>
+          new HttpResponse(null, { status: 204 }),
+        ),
+      );
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-1")).toBeInTheDocument());
+
+      fireEvent.click(screen.getAllByRole("checkbox")[0]);
+      fireEvent.click(screen.getByText("Delete Selected"));
+      const dialog = findDialogByHeading("Delete devices");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Delete", hidden: true }));
+
+      await waitFor(() =>
+        expect(toastModule.default.error).toHaveBeenCalledWith(
+          "Deleted 1, failed 1. 1 still cabled: remove their cables first",
+        ),
+      );
+    });
+
     it("cancelling the confirm dialog issues no delete calls", async () => {
       let deleteCalled = false;
       server.use(

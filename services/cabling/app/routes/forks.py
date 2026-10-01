@@ -12,11 +12,12 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from herd_common.internal_auth import internal_token_matches
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
+from app.models.connection import Connection
 from app.models.fork import (
     ForkConnection,
     ForkL3Route,
@@ -65,6 +66,10 @@ from app.services.l3_intent import merge_candidates_by_device, walk_l3_nodes
 from app.services.topology_validation import validate_canvas_edges
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
+
+# Cap on the connection id sample the by-device lookup returns (issue #940); the
+# count beside it is always the true total.
+CONNECTION_ID_SAMPLE_LIMIT = 10
 
 
 def _check_internal_token(token: str) -> None:
@@ -250,9 +255,17 @@ async def list_forks_by_device_internal(
     x_internal_token: str = Header(..., alias="X-Internal-Token"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Reservations whose live fork wiring references a device (issue #900).
+    """What in cabling still names a device (issues #900 and #940).
 
-    Feeds inventory's admin device DELETE guard. A switch that is only a transit
+    The path says "forks" for historical reasons (it shipped in #900 as the fork
+    lookup); it now answers the whole question inventory's admin device DELETE
+    guard asks, in ONE call: `reservation_ids` (live fork wiring, below) plus
+    `connection_count` and `connection_ids` (plain `Connection` rows naming the
+    device as device_a_id or device_b_id; a loopback row counts once, the id
+    sample is sorted by string form and capped at CONNECTION_ID_SAMPLE_LIMIT while
+    the count stays the true total). Unknown or uncabled device: zero and empty.
+
+    Fork part: feeds the guard. A switch that is only a transit
     hop on a saved fork is in no reservations `reservation_devices` row, so the
     reservations-side membership lookup cannot see it; this reads the wiring
     itself: the distinct reservation_ids of every non-ARCHIVED fork with a
@@ -281,7 +294,25 @@ async def list_forks_by_device_internal(
             .distinct()
         )
     ).all()
-    return ForkByDeviceResponse(reservation_ids=sorted({r for (r,) in rows}, key=str))
+
+    conn_where = or_(Connection.device_a_id == device_id, Connection.device_b_id == device_id)
+    connection_count = (
+        await db.execute(select(func.count()).select_from(Connection).where(conn_where))
+    ).scalar_one()
+    sample = (
+        await db.execute(
+            select(Connection.id)
+            .where(conn_where)
+            .order_by(cast(Connection.id, String))
+            .limit(CONNECTION_ID_SAMPLE_LIMIT)
+        )
+    ).all()
+    connection_ids = [c for (c,) in sample]
+    return ForkByDeviceResponse(
+        reservation_ids=sorted({r for (r,) in rows}, key=str),
+        connection_count=connection_count,
+        connection_ids=connection_ids,
+    )
 
 
 @router.post("/devices/batch", response_model=ForkDevicesBatchResponse)

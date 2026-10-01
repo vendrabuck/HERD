@@ -6,6 +6,7 @@ import pytest
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
+from app.services.device_delete_guard import CablingDependents
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -389,8 +390,8 @@ async def test_delete_device_blocked_by_active_reservation(client, real_delete_g
             ),
         ),
         patch(
-            "app.services.device_delete_guard.find_fork_reservation_ids_for_device",
-            new=AsyncMock(return_value=[]),
+            "app.services.device_delete_guard.find_cabling_dependents_for_device",
+            new=AsyncMock(return_value=CablingDependents([], 0, [])),
         ),
     ):
         resp = await client.delete(f"/devices/{device_id}")
@@ -419,8 +420,8 @@ async def test_delete_device_blocked_as_transit_hop_only(client, real_delete_gua
             new=AsyncMock(return_value=[]),
         ),
         patch(
-            "app.services.device_delete_guard.find_fork_reservation_ids_for_device",
-            new=AsyncMock(return_value=["r9"]),
+            "app.services.device_delete_guard.find_cabling_dependents_for_device",
+            new=AsyncMock(return_value=CablingDependents(["r9"], 0, [])),
         ),
     ):
         resp = await client.delete(f"/devices/{device_id}")
@@ -429,6 +430,34 @@ async def test_delete_device_blocked_as_transit_hop_only(client, real_delete_gua
         "error": "device_in_use",
         "reservation_ids": ["r9"],
         "transit_reservation_ids": ["r9"],
+    }
+    get_resp = await client.get(f"/devices/{device_id}")
+    assert get_resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_delete_device_blocked_while_cabled(client, real_delete_guard):
+    """Issue #940: an unreserved device that cabling still names is refused with
+    the pinned device_cabled shape, and the row survives."""
+    tid = await _create_template(client)
+    create_resp = await client.post("/devices", json=_device_payload(tid))
+    device_id = create_resp.json()["id"]
+    with (
+        patch(
+            "app.services.device_delete_guard.find_blocking_reservations_for_device",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "app.services.device_delete_guard.find_cabling_dependents_for_device",
+            new=AsyncMock(return_value=CablingDependents([], 12, ["c1", "c2"])),
+        ),
+    ):
+        resp = await client.delete(f"/devices/{device_id}")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "device_cabled",
+        "connection_count": 12,
+        "connection_ids": ["c1", "c2"],
     }
     get_resp = await client.get(f"/devices/{device_id}")
     assert get_resp.status_code == 200

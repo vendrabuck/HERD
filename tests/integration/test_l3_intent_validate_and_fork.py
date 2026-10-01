@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._l3_helpers import create_connection as _create_connection
 from ._l3_helpers import create_device as _create_device
 from ._l3_helpers import create_l3_driver, create_l3_template
@@ -145,7 +146,7 @@ async def l3_switch(admin_client, l3_template):
     )
     await _create_config_version(admin_client, switch["id"], INTERFACES)
     yield switch
-    await admin_client.delete(f"/inventory/devices/{switch['id']}")
+    await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_validate_valid_l3_intent(admin_client, l3_switch, fresh_device):

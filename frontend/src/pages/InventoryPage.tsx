@@ -2,7 +2,13 @@ import { useState, useRef, useEffect, useMemo, Fragment } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
-import { usePaginatedDevices, useCreateDevice, useDeleteDevice, useAllDeviceNames } from "@/api/inventory";
+import {
+  usePaginatedDevices,
+  useCreateDevice,
+  useDeleteDevice,
+  useAllDeviceNames,
+  deviceCabledCount,
+} from "@/api/inventory";
 import { BulkImportExport } from "@/components/ui/BulkImportExport";
 import { exportDevices, importDevices } from "@/api/bulk";
 import { fetchPorts, useCreatePort, usePorts } from "@/api/ports";
@@ -309,8 +315,17 @@ export function InventoryPage() {
     );
     const failed = results.filter((r) => r.status === "rejected").length;
     const succeeded = results.length - failed;
+    // Issue #940: a device that cabling still names is refused with device_cabled;
+    // say so, since "failed 2" gives the admin nothing to act on.
+    const cabled = results.filter(
+      (r) => r.status === "rejected" && deviceCabledCount(r.reason) !== null,
+    ).length;
     if (failed === 0) {
       toast.success(`Deleted ${succeeded} device(s)`);
+    } else if (cabled > 0) {
+      toast.error(
+        `Deleted ${succeeded}, failed ${failed}. ${cabled} still cabled: remove their cables first`,
+      );
     } else {
       toast.error(`Deleted ${succeeded}, failed ${failed}`);
     }

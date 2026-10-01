@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._l3_helpers import create_connection as _create_connection
 from ._l3_helpers import create_device as _create_device
 from ._l3_helpers import create_l3_driver, create_l3_template
@@ -113,7 +114,7 @@ async def l3_switch(admin_client, l3_template):
     )
     assert resp.status_code == 201, f"config-version create failed: {resp.status_code} {resp.text}"
     yield switch
-    await admin_client.delete(f"/inventory/devices/{switch['id']}")
+    await delete_device_checked(admin_client, switch["id"])
 
 
 def _canvas_with_l3(dut_id: str, switch_id: str, routes: list[dict] | None) -> dict:
@@ -650,7 +651,7 @@ async def vrf_switch(admin_client, l3_template):
     )
     assert resp.status_code == 201, f"config-version create failed: {resp.status_code} {resp.text}"
     yield switch
-    await admin_client.delete(f"/inventory/devices/{switch['id']}")
+    await delete_device_checked(admin_client, switch["id"])
 
 
 @pytest.fixture(scope="session")
@@ -705,7 +706,7 @@ async def no_vrf_switch(admin_client, no_vrf_l3_template):
     )
     assert resp.status_code == 201, resp.text
     yield switch
-    await admin_client.delete(f"/inventory/devices/{switch['id']}")
+    await delete_device_checked(admin_client, switch["id"])
 
 
 VRF_ROUTE = {

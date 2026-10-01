@@ -1,7 +1,7 @@
-"""Unit tests for the admin device DELETE guard helper (issues #391 and #900).
+"""Unit tests for the admin device DELETE guard helper (issues #391, #900, and #940).
 
 The matrix: {member blocking yes or no} x {transit blocking yes or no} x
-{reservations up or down} x {cabling up or down}, pinning the exact 409 and 503
+{reservations up or down} x {cabling up or down} x {cabled yes or no}, pinning the exact 409 and 503
 details. The reservations side is patched at `find_blocking_reservations_for_device`;
 the cabling side is exercised through `call_service` with fake responses so the
 transport, status, and body failure modes are all covered.
@@ -18,7 +18,7 @@ from app.services import device_delete_guard as guard
 from app.services.device_delete_guard import (
     UNVERIFIABLE_DETAIL,
     assert_device_deletable,
-    find_fork_reservation_ids_for_device,
+    find_cabling_dependents_for_device,
 )
 from fastapi import HTTPException
 
@@ -46,11 +46,21 @@ def _reservations_patch(*, member: bool, up: bool):
     )
 
 
-def _cabling_response(ids):
-    return httpx.Response(200, json={"reservation_ids": ids})
+CONNECTION_IDS = ["33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444"]
 
 
-def _cabling_patch(*, transit: bool, up: bool, member: bool = False):
+def _cabling_response(ids, *, cabled: bool = False):
+    return httpx.Response(
+        200,
+        json={
+            "reservation_ids": ids,
+            "connection_count": 12 if cabled else 0,
+            "connection_ids": CONNECTION_IDS if cabled else [],
+        },
+    )
+
+
+def _cabling_patch(*, transit: bool, up: bool, member: bool = False, cabled: bool = False):
     if not up:
         return patch.object(
             guard, "call_service", new=AsyncMock(side_effect=httpx.ConnectError("down"))
@@ -61,17 +71,19 @@ def _cabling_patch(*, transit: bool, up: bool, member: bool = False):
     if member:
         # A member whose fork also touches the device: still a member, not transit-only.
         ids.append(MEMBER_RID)
-    return patch.object(guard, "call_service", new=AsyncMock(return_value=_cabling_response(ids)))
+    return patch.object(
+        guard, "call_service", new=AsyncMock(return_value=_cabling_response(ids, cabled=cabled))
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "member,transit,res_up,cab_up", list(itertools.product([False, True], repeat=4))
+    "member,transit,res_up,cab_up,cabled", list(itertools.product([False, True], repeat=5))
 )
-async def test_matrix(member, transit, res_up, cab_up):
+async def test_matrix(member, transit, res_up, cab_up, cabled):
     with (
         _reservations_patch(member=member, up=res_up),
-        _cabling_patch(transit=transit, up=cab_up),
+        _cabling_patch(transit=transit, up=cab_up, cabled=cabled),
     ):
         if not res_up or not cab_up:
             with pytest.raises(HTTPException) as ei:
@@ -79,12 +91,21 @@ async def test_matrix(member, transit, res_up, cab_up):
             assert ei.value.status_code == 503
             assert ei.value.detail == "Could not verify device is not in use"
             return
-        if not member and not transit:
+        if not member and not transit and not cabled:
             assert await assert_device_deletable(DEVICE) is None
             return
         with pytest.raises(HTTPException) as ei:
             await assert_device_deletable(DEVICE)
     assert ei.value.status_code == 409
+    if not member and not transit:
+        # Only the cabled axis applies.
+        assert ei.value.detail == {
+            "error": "device_cabled",
+            "connection_count": 12,
+            "connection_ids": CONNECTION_IDS,
+        }
+        return
+    # device_in_use wins over device_cabled when both apply.
     expected_ids = sorted(([MEMBER_RID] if member else []) + ([TRANSIT_RID] if transit else []))
     assert ei.value.detail == {
         "error": "device_in_use",
@@ -124,7 +145,8 @@ async def test_non_503_reservation_error_propagates():
 async def test_cabling_call_shape():
     mock = AsyncMock(return_value=_cabling_response([]))
     with patch.object(guard, "call_service", new=mock):
-        assert await find_fork_reservation_ids_for_device(DEVICE) == []
+        result = await find_cabling_dependents_for_device(DEVICE)
+    assert result == ([], 0, [])
     args = mock.await_args
     assert args.args[1] == "GET"
     assert args.args[2] == f"/internal/forks/by-device/{DEVICE}"
@@ -138,7 +160,7 @@ async def test_cabling_non_200_is_503(status):
         guard, "call_service", new=AsyncMock(return_value=httpx.Response(status, json={}))
     ):
         with pytest.raises(HTTPException) as ei:
-            await find_fork_reservation_ids_for_device(DEVICE)
+            await find_cabling_dependents_for_device(DEVICE)
     assert ei.value.status_code == 503
     assert ei.value.detail == UNVERIFIABLE_DETAIL
 
@@ -151,12 +173,28 @@ async def test_cabling_non_200_is_503(status):
         httpx.Response(200, json={}),
         httpx.Response(200, json={"reservation_ids": 5}),
         httpx.Response(200, json=[]),
+        # A cabling build that predates #940 lacks the new keys: unverifiable, never "not cabled".
+        httpx.Response(200, json={"reservation_ids": []}),
+        httpx.Response(200, json={"reservation_ids": [], "connection_count": 0}),
+        httpx.Response(200, json={"reservation_ids": [], "connection_ids": []}),
+        httpx.Response(
+            200, json={"reservation_ids": [], "connection_count": "2", "connection_ids": []}
+        ),
+        httpx.Response(
+            200, json={"reservation_ids": [], "connection_count": True, "connection_ids": []}
+        ),
+        httpx.Response(
+            200, json={"reservation_ids": [], "connection_count": -1, "connection_ids": []}
+        ),
+        httpx.Response(
+            200, json={"reservation_ids": [], "connection_count": 1, "connection_ids": "c"}
+        ),
     ],
 )
 async def test_cabling_unparseable_body_is_503(response):
     with patch.object(guard, "call_service", new=AsyncMock(return_value=response)):
         with pytest.raises(HTTPException) as ei:
-            await find_fork_reservation_ids_for_device(DEVICE)
+            await find_cabling_dependents_for_device(DEVICE)
     assert ei.value.status_code == 503
     assert ei.value.detail == UNVERIFIABLE_DETAIL
 
@@ -165,6 +203,43 @@ async def test_cabling_unparseable_body_is_503(response):
 async def test_missing_internal_token_is_503(monkeypatch):
     monkeypatch.setattr(settings, "internal_api_token", "")
     with pytest.raises(HTTPException) as ei:
-        await find_fork_reservation_ids_for_device(DEVICE)
+        await find_cabling_dependents_for_device(DEVICE)
     assert ei.value.status_code == 503
     assert ei.value.detail == UNVERIFIABLE_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_old_cabling_build_without_new_keys_blocks_delete_with_503():
+    old = httpx.Response(200, json={"reservation_ids": []})
+    with (
+        _reservations_patch(member=False, up=True),
+        patch.object(guard, "call_service", new=AsyncMock(return_value=old)),
+    ):
+        with pytest.raises(HTTPException) as ei:
+            await assert_device_deletable(DEVICE)
+    assert ei.value.status_code == 503
+    assert ei.value.detail == UNVERIFIABLE_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_cabled_detail_ids_are_sorted_and_count_is_the_true_total():
+    resp = httpx.Response(
+        200,
+        json={
+            "reservation_ids": [],
+            "connection_count": 57,
+            "connection_ids": list(reversed(CONNECTION_IDS)),
+        },
+    )
+    with (
+        _reservations_patch(member=False, up=True),
+        patch.object(guard, "call_service", new=AsyncMock(return_value=resp)),
+    ):
+        with pytest.raises(HTTPException) as ei:
+            await assert_device_deletable(DEVICE)
+    assert ei.value.status_code == 409
+    assert ei.value.detail == {
+        "error": "device_cabled",
+        "connection_count": 57,
+        "connection_ids": CONNECTION_IDS,
+    }

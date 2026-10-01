@@ -1,7 +1,13 @@
 import { useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import toast from "react-hot-toast";
-import { useDevice, useUpdateDevice, useDeleteDevice, deleteDeviceErrorMessage } from "@/api/inventory";
+import {
+  useDevice,
+  useUpdateDevice,
+  useDeleteDevice,
+  deleteDeviceErrorMessage,
+  deviceCabledCount,
+} from "@/api/inventory";
 import { useTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { isAdminRole } from "@/lib/roles";
@@ -36,6 +42,10 @@ export function DevicePage() {
 
   const [editing, setEditing] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  // Set when the delete is refused with device_cabled (issue #940): a toast alone
+  // is gone before the admin can act, so the refusal stays on the page with a link
+  // to where the cables are removed.
+  const [cabledRefusal, setCabledRefusal] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [topologyType, setTopologyType] = useState<TopologyType>("PHYSICAL");
   const [status, setStatus] = useState<DeviceStatus>("AVAILABLE");
@@ -76,12 +86,15 @@ export function DevicePage() {
   };
 
   const handleDelete = async () => {
+    setCabledRefusal(null);
     try {
       await deleteDevice.mutateAsync(id!);
       toast.success("Device deleted");
       navigate("/inventory");
     } catch (err: unknown) {
-      toast.error(deleteDeviceErrorMessage(err));
+      const msg = deleteDeviceErrorMessage(err);
+      if (deviceCabledCount(err) !== null) setCabledRefusal(msg);
+      toast.error(msg);
     }
     setShowDeleteConfirm(false);
   };
@@ -168,6 +181,18 @@ export function DevicePage() {
             )}
           </div>
         </div>
+
+        {cabledRefusal && (
+          <div
+            role="alert"
+            className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+          >
+            <p>{cabledRefusal}</p>
+            <Link to="/admin/connections" className="font-medium text-blue-700 hover:underline">
+              Open Connections
+            </Link>
+          </div>
+        )}
 
         <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-4">
           {editing ? (
