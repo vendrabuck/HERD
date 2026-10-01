@@ -328,6 +328,8 @@
     },
     "ForkByDeviceResponse": {
       "properties": {
+        "connection_count": "integer",
+        "connection_ids": "array",
         "reservation_ids": "array"
       },
       "required": [],

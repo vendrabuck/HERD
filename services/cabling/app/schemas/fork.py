@@ -295,9 +295,16 @@ class ForkByDeviceResponse(BaseModel):
     Sorted distinct reservation ids of every non-archived fork whose
     fork_connections reference the device on either end of any hop. Empty when
     none do (also for a device id cabling has never seen).
+
+    Since issue #940 the same answer also says whether plain `Connection` rows
+    still name the device: `connection_count` is the true total (a loopback row
+    counts once) and `connection_ids` a sorted sample capped at
+    `CONNECTION_ID_SAMPLE_LIMIT`, so the count can exceed the list length.
     """
 
     reservation_ids: UUIDStrList = Field(default_factory=list)
+    connection_count: int = 0
+    connection_ids: UUIDStrList = Field(default_factory=list)
 
 
 class ForkDevicesBatchResponse(BaseModel):
