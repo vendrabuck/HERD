@@ -11,10 +11,10 @@ their deletes through `delete_device_checked`:
   cleaned up, not hidden.
 - `device_in_use`: retry for a short bounded window, because a delete just
   after a cancel can precede execution's asynchronous teardown (#900 known
-  limit). A refusal that outlasts the window is reported on stderr, or raised
-  when `STRICT_IN_USE` is True. It is False because a static survey could not
-  prove that no existing test leaves a live reservation on a fresh device at
-  teardown; flip it once a nightly shows the suite is clean.
+  limit). A refusal that outlasts the window is raised, because `STRICT_IN_USE`
+  is True: a full integration run on merged code left no device held at
+  teardown, so a lingering reservation is now a test bug that must fail
+  loudly. Passing `strict_in_use=False` reports it on stderr instead.
 - anything else (including a persistent `device_cabled` and a 503), after the
   window: raise `DeviceTeardownError` carrying the refusal body, so a leak can
   never hide.
@@ -24,9 +24,9 @@ import asyncio
 import sys
 import time
 
-# See the module docstring: loud-by-default for cables, report-only for
-# lingering reservations until a nightly proves the suite clean.
-STRICT_IN_USE = False
+# See the module docstring: loud by default for cables and for lingering
+# reservations alike.
+STRICT_IN_USE = True
 
 IN_USE_WAIT_SECONDS = 6.0
 IN_USE_POLL_SECONDS = 0.5
