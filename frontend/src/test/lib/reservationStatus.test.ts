@@ -1,5 +1,5 @@
 import { canCancel, canClassifyPurpose, canRelease } from "@/lib/reservationStatus";
-import type { ReservationStatus } from "@/types/reservation.types";
+import type { PurposeClassification, ReservationStatus } from "@/types/reservation.types";
 
 // Table-driven against every ReservationStatus value (issue #841): the UI
 // gate must match the backend's cancel_reservation/release_reservation rule
@@ -30,7 +30,7 @@ describe("canRelease", () => {
 // routers/purpose_review.py). Eligible means terminal (the proxy for the
 // unexposed purpose_classify_requested_at stamp) and no suggestion yet; a
 // dismissed or accepted suggestion stays set, so it refuses like any other.
-const SUGGESTION = {
+const SUGGESTION: PurposeClassification = {
   distribution: [{ category: "qa_regression", probability: 0.9 }],
   top_category: "qa_regression",
   pass: "end",
