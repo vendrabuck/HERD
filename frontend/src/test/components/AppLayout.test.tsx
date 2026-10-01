@@ -268,17 +268,17 @@ describe("AppLayout", () => {
     expect(screen.queryByText("alice")).not.toBeInTheDocument();
   });
 
-  it("renders a Settings link and a help link to the user guide", async () => {
+  it("renders a Settings link and a help link to the published manual", async () => {
     server.use(http.get("/api/auth/me", () => HttpResponse.json(user())));
     renderLayout("/inventory");
 
     await screen.findByText("alice");
     expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
     const help = screen.getByRole("link", { name: "Help" });
-    expect(help).toHaveAttribute(
-      "href",
-      "https://github.com/vendrabuck/HERD/blob/main/docs/USER_GUIDE.md",
-    );
+    // The literal on purpose (issue #960): the help icon must open the published
+    // manual, not a raw markdown file on GitHub.
+    expect(help).toHaveAttribute("href", "https://vendrabuck.github.io/HERD/manual/");
+    expect(help).toHaveAttribute("rel", "noopener noreferrer");
     expect(help).toHaveAttribute("target", "_blank");
   });
 
