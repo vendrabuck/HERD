@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- Added multi-select Cancel and Release to the Reservations page (issue #843).
+  Each row has a checkbox and the header has a select-all for the current page;
+  a selection bar offers Cancel selected and Release selected. There is no bulk
+  endpoint: the page fans out over the existing per-id cancel and release calls,
+  and the backend's status compare-and-swap decides each row. Eligibility is per
+  row through `canCancelAs` and `canReleaseAs` in `lib/reservationStatus.ts`
+  (the status gates plus the detail modal's owner rule, now shared by both),
+  and one confirmation per action states how many reservations will be acted on
+  and how many will be skipped and why. Succeeded rows leave the selection,
+  failed rows stay selected and the toast reports "Cancelled N, failed M" with
+  the server's reason when every failure shares one. The selection is dropped
+  when the page, sort, or all-reservations view changes. Pure logic lives in
+  `lib/reservationBulk.ts`; `tests/e2e/test_reservations_bulk_playwright.py`
+  proves the effect through API read-back.
 - Added column filters to the Inventory page (issue #842). Status, Template, and
   Topology selects sit beside the name search and use the device list's existing
   `status`, `template_id`, and `topology_type` parameters, so there is no backend
