@@ -68,7 +68,7 @@ def _mock_reservation_guard():
     directly override this with their own nested patch.
     """
     with patch(
-        "app.routers.devices.find_blocking_reservations_for_device",
+        "app.routers.devices.assert_device_deletable",
         new=AsyncMock(return_value=[]),
     ):
         yield
@@ -352,7 +352,7 @@ async def test_delete_device(client):
     create_resp = await client.post("/devices", json=_device_payload(tid))
     device_id = create_resp.json()["id"]
     with patch(
-        "app.routers.devices.find_blocking_reservations_for_device",
+        "app.routers.devices.assert_device_deletable",
         new=AsyncMock(return_value=[]),
     ):
         resp = await client.delete(f"/devices/{device_id}")
@@ -361,27 +361,75 @@ async def test_delete_device(client):
     assert get_resp.status_code == 404
 
 
+@pytest.fixture
+def real_delete_guard():
+    """Undo the autouse router-level stub so the real guard helper runs."""
+    from app.services.device_delete_guard import assert_device_deletable
+
+    with patch("app.routers.devices.assert_device_deletable", new=assert_device_deletable):
+        yield
+
+
 @pytest.mark.asyncio
-async def test_delete_device_blocked_by_active_reservation(client):
-    """Issue #391: a device held by a non-terminal reservation refuses the
-    delete with a pinned 409 shape naming the blocking reservation ids."""
+async def test_delete_device_blocked_by_active_reservation(client, real_delete_guard):
+    """Issue #391 and #900: a device held by a non-terminal reservation refuses
+    the delete with a pinned 409 shape naming the blocking reservation ids, and
+    the additive transit list is present (empty: no transit-only holder)."""
     tid = await _create_template(client)
     create_resp = await client.post("/devices", json=_device_payload(tid))
     device_id = create_resp.json()["id"]
-    with patch(
-        "app.routers.devices.find_blocking_reservations_for_device",
-        new=AsyncMock(
-            return_value=[
-                {"id": "r1", "user_id": "u1", "status": "ACTIVE", "end_time": "t"},
-                {"id": "r2", "user_id": "u2", "status": "PENDING", "end_time": "t"},
-            ]
+    with (
+        patch(
+            "app.services.device_delete_guard.find_blocking_reservations_for_device",
+            new=AsyncMock(
+                return_value=[
+                    {"id": "r1", "user_id": "u1", "status": "ACTIVE", "end_time": "t"},
+                    {"id": "r2", "user_id": "u2", "status": "PENDING", "end_time": "t"},
+                ]
+            ),
+        ),
+        patch(
+            "app.services.device_delete_guard.find_fork_reservation_ids_for_device",
+            new=AsyncMock(return_value=[]),
         ),
     ):
         resp = await client.delete(f"/devices/{device_id}")
     assert resp.status_code == 409
     detail = resp.json()["detail"]
-    assert detail == {"error": "device_in_use", "reservation_ids": ["r1", "r2"]}
+    assert detail == {
+        "error": "device_in_use",
+        "reservation_ids": ["r1", "r2"],
+        "transit_reservation_ids": [],
+    }
     # The device must still exist: the delete never ran.
+    get_resp = await client.get(f"/devices/{device_id}")
+    assert get_resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_delete_device_blocked_as_transit_hop_only(client, real_delete_guard):
+    """Issue #900: a device in no reservation's booked set but on a live fork's
+    wiring is refused, and the reservation is named as a transit holder."""
+    tid = await _create_template(client)
+    create_resp = await client.post("/devices", json=_device_payload(tid))
+    device_id = create_resp.json()["id"]
+    with (
+        patch(
+            "app.services.device_delete_guard.find_blocking_reservations_for_device",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "app.services.device_delete_guard.find_fork_reservation_ids_for_device",
+            new=AsyncMock(return_value=["r9"]),
+        ),
+    ):
+        resp = await client.delete(f"/devices/{device_id}")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "device_in_use",
+        "reservation_ids": ["r9"],
+        "transit_reservation_ids": ["r9"],
+    }
     get_resp = await client.get(f"/devices/{device_id}")
     assert get_resp.status_code == 200
 
@@ -393,8 +441,8 @@ async def test_delete_device_proceeds_when_no_blocking_reservations(client):
     create_resp = await client.post("/devices", json=_device_payload(tid))
     device_id = create_resp.json()["id"]
     with patch(
-        "app.routers.devices.find_blocking_reservations_for_device",
-        new=AsyncMock(return_value=[]),
+        "app.routers.devices.assert_device_deletable",
+        new=AsyncMock(return_value=None),
     ) as mock_guard:
         resp = await client.delete(f"/devices/{device_id}")
     assert resp.status_code == 204
@@ -403,7 +451,9 @@ async def test_delete_device_proceeds_when_no_blocking_reservations(client):
 
 
 @pytest.mark.asyncio
-async def test_delete_device_blocked_by_reservation_upstream_unreachable_503(client):
+async def test_delete_device_blocked_by_reservation_upstream_unreachable_503(
+    client, real_delete_guard
+):
     """A transport error talking to reservations must not silently let the
     delete through; it fails CLOSED with the pinned wording (issue #391), since
     a delete is destructive and rare, unlike the caller-owned-exempt restore guard."""
@@ -411,7 +461,7 @@ async def test_delete_device_blocked_by_reservation_upstream_unreachable_503(cli
     create_resp = await client.post("/devices", json=_device_payload(tid))
     device_id = create_resp.json()["id"]
     with patch(
-        "app.routers.devices.find_blocking_reservations_for_device",
+        "app.services.device_delete_guard.find_blocking_reservations_for_device",
         new=AsyncMock(
             side_effect=HTTPException(
                 status_code=503,

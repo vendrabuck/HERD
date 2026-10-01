@@ -78,7 +78,7 @@ def _mock_reservation_guard():
     """Default the issue #391 delete guard to "no blocking reservations" so a
     device delete in this suite never reaches a real reservations service."""
     with patch(
-        "app.routers.devices.find_blocking_reservations_for_device",
+        "app.routers.devices.assert_device_deletable",
         new=AsyncMock(return_value=[]),
     ):
         yield

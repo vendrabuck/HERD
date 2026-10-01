@@ -322,6 +322,7 @@ _EXEMPTIONS: dict[str, dict[str, str]] = {
         "auth_service_url": _SERVICE_URL_REASON,
         "execution_service_url": _SERVICE_URL_REASON,
         "reservations_service_url": _SERVICE_URL_REASON,
+        "cabling_service_url": _SERVICE_URL_REASON,
         "acl_service_url": _SERVICE_URL_REASON,
         "secrets_service_url": _SERVICE_URL_REASON,
     },

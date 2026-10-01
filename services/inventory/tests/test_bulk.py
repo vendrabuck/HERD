@@ -73,7 +73,7 @@ def _mock_reservation_guard():
     from unittest.mock import AsyncMock, patch
 
     with patch(
-        "app.routers.devices.find_blocking_reservations_for_device",
+        "app.routers.devices.assert_device_deletable",
         new=AsyncMock(return_value=[]),
     ):
         yield

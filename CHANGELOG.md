@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- Fixed the admin device DELETE guard ignoring cabling (issue #900, live-wiring
+  half). A switch that was only a transit hop on a saved fork sat in no
+  `reservation_devices` row, so it deleted with 204 and its cross-connects were
+  stranded with no driver left to release them. Cabling gains the internal
+  `GET /internal/forks/by-device/{device_id}` (reservation ids of non-archived
+  forks whose hops touch the device), and inventory's single helper
+  `assert_device_deletable` asks it beside reservations. The 409 `device_in_use`
+  detail keeps `reservation_ids` (now the sorted union) and adds
+  `transit_reservation_ids`; either upstream failing returns 503, fail closed.
+  The device page names transit holders in its toast. A delete right after a
+  cancel can still precede execution's asynchronous teardown. Refusing a delete
+  while plain cabling connections reference the device (`device_cabled`) is
+  deferred to its own issue.
 - Made the dynamic-instance ledger forward-only (issue #896). `set_instance_ref`
   and `mark_active` are now compare-and-swap updates that never touch a
   DESTROYED row, and `provision_requested` refuses a DESTROYED row

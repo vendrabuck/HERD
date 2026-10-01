@@ -20,6 +20,7 @@ from app.schemas.device import (
     InternalDeviceCreate,
     PaginatedDeviceResponse,
 )
+from app.services.device_delete_guard import assert_device_deletable
 from app.services.device_visibility import _resolve_visible_device_ids
 from app.services.inventory_service import (
     create_device,
@@ -32,7 +33,6 @@ from app.services.inventory_service import (
     set_device_status,
     update_device,
 )
-from app.services.reservation_guard import find_blocking_reservations_for_device
 
 logger = logging.getLogger(__name__)
 
@@ -537,36 +537,20 @@ async def delete_device_by_id(
 
     Issue #391: an unconditional delete orphans the device UUID in
     reservations, cabling, and execution (no cross-schema FKs by design), so
-    this reuses the same cross-service guard config-version restore already
-    established (find_blocking_reservations_for_device, issue #337's
-    /internal/by-device call) to refuse deleting a device held by a
-    non-terminal (PENDING/PENDING_PROVISION/ACTIVE) reservation. Unlike the
-    restore guard there is no caller-owned exemption: a delete is
-    irreversible for every holder, not just a surprise for someone else.
-    Fails CLOSED on an unreachable/erroring reservations service (a delete is
-    destructive and rare, so an unverifiable in-use check must block, not
-    silently let the delete through). No force flag: deliberately deferred.
+    it is refused while a live reservation depends on the device. Issue #900:
+    "depends on" includes a device that is only a transit hop on a saved fork,
+    not just a booked member. One helper, `assert_device_deletable`, asks both
+    reservations (members) and cabling (fork hops) and raises the 409
+    `device_in_use` (with `reservation_ids` and `transit_reservation_ids`) or a
+    fail-closed 503; see app/services/device_delete_guard.py for the exact
+    shapes and the known post-cancel teardown window. Unlike the restore guard
+    there is no caller-owned exemption, and no force flag.
     """
     device = await get_device(db, device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    try:
-        blocking = await find_blocking_reservations_for_device(device_id)
-    except HTTPException as exc:
-        if exc.status_code == 503:
-            raise HTTPException(
-                status_code=503, detail="Could not verify device is not in use"
-            ) from exc
-        raise
-    if blocking:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "device_in_use",
-                "reservation_ids": [str(b.get("id")) for b in blocking],
-            },
-        )
+    await assert_device_deletable(device_id)
 
     deleted = await delete_device(db, device_id)
     if not deleted:
