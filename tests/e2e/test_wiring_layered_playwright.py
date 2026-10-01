@@ -22,12 +22,16 @@ surface as layer "l2" wiring-status rows.
 The default auto-retry channel (WIRING_RETRY_INTERVAL_SECONDS=60,
 WIRING_RETRY_MAX_ATTEMPTS=10, docs/ENV_VARS.md) is not overridden in the dev
 stack. The background sweep CAN fire mid-test (its 60s tick is wall-clock from
-service start, not from row creation), but every interleaving converges: a
-sweep while the fail knob is armed only increments attempts (asserted below
-the cap before the manual retry click), and a sweep after the knob clears
-flips the rows ACTIVE server-side, in which case the manual retry is a no-op
-that still passes the ACTIVE read-back. Do not weaken the attempts-cap guard
-on the strength of the happy-path timing.
+service start, not from row creation). A sweep while the fail knob is armed
+only increments attempts (asserted below the cap before the manual retry
+click), and a sweep after the knob clears flips the rows ACTIVE server-side,
+in which case the manual retry is a no-op that still passes the ACTIVE
+read-back. ONE interleaving does not converge on a single click (issue #953):
+a sweep already driving the rows when the knob clears fails them, and the
+click that lands in that window loses the row claim (#817) and is told
+`in_progress`. `_retry_until_active` clicks again for that case, as an
+operator would. Do not weaken the attempts-cap guard on the strength of the
+happy-path timing.
 """
 
 import io
@@ -125,6 +129,34 @@ def _poll(fn, predicate, *, timeout: float = 20.0, interval: float = 0.5):
         if predicate(result):
             return result
         time.sleep(interval)
+    return None
+
+
+# A manual retry can lose the row claim to execution's background retry tick
+# (issue #953): the two channels never drive the same row (#817), so a tick
+# that is already driving the rows when the fail knob clears fails them, the
+# click that lands in that window is told `in_progress`, and the rows stay
+# FAILED until the next retry. A retry issued after the tick has recorded its
+# result holds no stale claim, so clicking again converges. Bounded, and each
+# pass waits this long for the read-back before clicking again.
+_MANUAL_RETRY_CLICKS = 3
+_RETRY_CONVERGE_SECONDS = 6.0
+
+
+def _retry_until_active(page, retry_button, fetch, is_active):
+    """Click Retry failed (again) until `is_active(fetch())` holds.
+
+    The FIRST click and its toast are the caller's; this polls the read-back
+    and, when a pass times out with the button still offered, clicks again.
+    Returns the satisfying snapshot, or None when every pass timed out.
+    """
+    for attempt in range(_MANUAL_RETRY_CLICKS):
+        if attempt:
+            expect(retry_button).to_be_enabled(timeout=5000)
+            retry_button.click()
+        snapshot = _poll(fetch, is_active, timeout=_RETRY_CONVERGE_SECONDS)
+        if snapshot is not None:
+            return snapshot
     return None
 
 
@@ -400,10 +432,11 @@ def test_wiring_tab_layered_l2_membership_retry_and_release(pw_page):
         retry_button.click()
         expect(pw_page.get_by_text("Retry complete:")).to_be_visible(timeout=10000)
 
-        active_wiring = _poll(
+        active_wiring = _retry_until_active(
+            pw_page,
+            retry_button,
             lambda: _api(pw_page, "GET", f"/reservations/{reservation_id}/wiring-status").json(),
             lambda w: len(_l2_rows(w)) == 2 and all(c["status"] == "ACTIVE" for c in _l2_rows(w)),
-            timeout=15.0,
         )
         assert active_wiring is not None, (
             "the retried memberships never reached ACTIVE via read-back"
