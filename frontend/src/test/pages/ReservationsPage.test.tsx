@@ -106,7 +106,8 @@ function reservationWithStatus(status: string) {
 }
 
 beforeEach(() => {
-  setRole(null);
+  // The caller owns RESERVATION (user_id "user-1"), so the row actions show.
+  setRole("user", "user-1");
   server.use(
     http.get("/api/inventory/devices", () =>
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
@@ -601,6 +602,69 @@ describe("ReservationsPage", () => {
       );
     });
   });
+  describe("who sees Cancel and Release on a row (issue #843)", () => {
+    const cancelBtn = { name: `Cancel reservation ${RESERVATION.id.slice(0, 8)}` };
+    const releaseBtn = { name: `Release reservation ${RESERVATION.id.slice(0, 8)}` };
+
+    function serveOne() {
+      server.use(
+        http.get("/api/reservations/", () =>
+          HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 50 }),
+        ),
+      );
+    }
+
+    it("an admin sees Cancel but not Release on another user's row", async () => {
+      serveOne();
+      setRole("admin", "admin-id");
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByRole("button", cancelBtn);
+      expect(screen.queryByRole("button", releaseBtn)).not.toBeInTheDocument();
+    });
+
+    it("a non-admin non-owner sees neither", async () => {
+      serveOne();
+      setRole("user", "stranger-id");
+      renderWithProviders(<ReservationsPage />);
+      await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+      expect(screen.queryByRole("button", cancelBtn)).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", releaseBtn)).not.toBeInTheDocument();
+    });
+
+    it("an admin owner sees both", async () => {
+      serveOne();
+      setRole("admin", "user-1");
+      renderWithProviders(<ReservationsPage />);
+      await screen.findByRole("button", releaseBtn);
+      expect(screen.getByRole("button", cancelBtn)).toBeInTheDocument();
+    });
+
+    it("bulk: an admin's cross-owner rows are eligible for Cancel and skipped for Release", async () => {
+      serveOne();
+      setRole("admin", "admin-id");
+      renderWithProviders(<ReservationsPage />);
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+
+      expect(screen.getByRole("button", { name: "Cancel selected" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Release selected" })).toBeDisabled();
+      expect(screen.getByRole("status", { name: "Selection" })).toHaveTextContent(
+        "None of the selected reservations can be released: 1 not yours.",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Cancel selected" }));
+      expect(await screen.findByText(/^Cancel 1 reservation\?/)).toBeInTheDocument();
+    });
+
+    it("bulk: a non-admin non-owner can neither cancel nor release the row", async () => {
+      serveOne();
+      setRole("user", "stranger-id");
+      renderWithProviders(<ReservationsPage />);
+      // No row buttons and a checkbox is still offered; both actions are disabled.
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
+      expect(screen.getByRole("button", { name: "Cancel selected" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Release selected" })).toBeDisabled();
+    });
+  });
+
   describe("bulk cancel and release (issue #843)", () => {
     const ME = "me-id";
     const uuid = (n: number) => `0000000${n}-2222-3333-4444-555555555555`;

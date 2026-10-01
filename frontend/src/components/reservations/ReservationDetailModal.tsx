@@ -156,8 +156,8 @@ export function ReservationDetailModal({ reservation, deviceNames, onClose }: Pr
       }
     }
   };
-  const canReleaseAct = canReleaseAs(reservation, user?.id);
-  const canCancelAct = canCancelAs(reservation, user?.id);
+  const canReleaseAct = canReleaseAs(reservation, user);
+  const canCancelAct = canCancelAs(reservation, user);
   const canEdit = isOwner && (reservation.status === "ACTIVE" || reservation.status === "PENDING");
   // The fork is editable only while the reservation is ACTIVE (ADR 0006); after
   // it ends the fork is the frozen, read-only as-built record. A fork exists only

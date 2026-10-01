@@ -14,7 +14,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import type { SortState } from "@/stores/preferencesStore";
 import { isAdminRole } from "@/lib/roles";
-import { canCancel, canRelease } from "@/lib/reservationStatus";
+import { canCancelAs, canReleaseAs } from "@/lib/reservationStatus";
 import { errorDetail } from "@/lib/errors";
 import {
   applySettled,
@@ -108,6 +108,9 @@ function ReservationRow({
 }) {
   const cancel = useCancelReservation();
   const release = useReleaseReservation();
+  const user = useAuthStore((s) => s.user);
+  const mayRelease = canReleaseAs(reservation, user);
+  const mayCancel = canCancelAs(reservation, user);
   const [confirmCancelOpen, setConfirmCancelOpen] = useState(false);
   const shortId = reservation.id.slice(0, 8);
 
@@ -152,9 +155,9 @@ function ReservationRow({
         </div>
       </td>
       <td className="px-4 py-3 text-sm" onClick={(e) => e.stopPropagation()}>
-        {(canRelease(reservation.status) || canCancel(reservation.status)) && (
+        {(mayRelease || mayCancel) && (
           <div className="flex gap-1">
-            {canRelease(reservation.status) && (
+            {mayRelease && (
               <button
                 onClick={() => release.mutate(reservation.id)}
                 disabled={release.isPending}
@@ -164,7 +167,7 @@ function ReservationRow({
                 Release
               </button>
             )}
-            {canCancel(reservation.status) && (
+            {mayCancel && (
               <button
                 onClick={() => setConfirmCancelOpen(true)}
                 disabled={cancel.isPending}
@@ -271,8 +274,8 @@ export function ReservationsPage() {
     setSelectedIds(allSelected ? NO_SELECTION : new Set((reservations ?? []).map((r) => r.id)));
 
   const partitions = {
-    cancel: partitionSelection("cancel", selectedRows, user?.id),
-    release: partitionSelection("release", selectedRows, user?.id),
+    cancel: partitionSelection("cancel", selectedRows, user),
+    release: partitionSelection("release", selectedRows, user),
   };
 
   const runBulk = async (action: BulkAction) => {

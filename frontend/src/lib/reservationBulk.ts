@@ -1,3 +1,4 @@
+import { isAdminRole } from "@/lib/roles";
 import { canCancelAs, canReleaseAs } from "@/lib/reservationStatus";
 import type { Reservation } from "@/types/reservation.types";
 
@@ -7,6 +8,8 @@ import type { Reservation } from "@/types/reservation.types";
  * test needs to pin lives here: who is eligible, why the rest are not, how a
  * settled fan-out changes the selection, and the sentences shown to the user.
  */
+
+type Caller = { id: string; role?: string | null } | null | undefined;
 
 export type BulkAction = "cancel" | "release";
 
@@ -27,15 +30,19 @@ export interface SelectionPartition {
 
 const FINISHED_STATUSES = ["COMPLETED", "CANCELLED", "FAILED"];
 
-function skipReason(action: BulkAction, reservation: Reservation, userId: string | null | undefined) {
+function skipReason(action: BulkAction, reservation: Reservation, user: Caller) {
   const allowed =
     action === "cancel"
-      ? canCancelAs(reservation, userId)
-      : canReleaseAs(reservation, userId);
+      ? canCancelAs(reservation, user)
+      : canReleaseAs(reservation, user);
   if (allowed) return null;
-  // Ownership first: a row the caller may not touch is "not yours" whatever
-  // its status, so the reason never hints at another user's reservation state.
-  if (!userId || userId !== reservation.user_id) return "not_yours" as const;
+  // The caller rule first: a row the caller may not touch is "not yours"
+  // whatever its status, so the reason never hints at another user's
+  // reservation state. Cancel is open to the owner or an admin, Release to the
+  // owner alone (see canCancelAs and canReleaseAs).
+  const mayAct =
+    !!user && (user.id === reservation.user_id || (action === "cancel" && isAdminRole(user.role)));
+  if (!mayAct) return "not_yours" as const;
   return FINISHED_STATUSES.includes(reservation.status)
     ? ("finished" as const)
     : ("not_active" as const);
@@ -49,12 +56,12 @@ function skipReason(action: BulkAction, reservation: Reservation, userId: string
 export function partitionSelection(
   action: BulkAction,
   selected: readonly Reservation[],
-  userId: string | null | undefined,
+  user: Caller,
 ): SelectionPartition {
   const eligible: Reservation[] = [];
   const skipped: SkippedReservation[] = [];
   for (const reservation of selected) {
-    const reason = skipReason(action, reservation, userId);
+    const reason = skipReason(action, reservation, user);
     if (reason === null) eligible.push(reservation);
     else skipped.push({ reservation, reason });
   }

@@ -1,3 +1,4 @@
+import { isAdminRole } from "@/lib/roles";
 import type { Reservation, ReservationStatus } from "@/types/reservation.types";
 
 /**
@@ -52,24 +53,31 @@ export function canClassifyPurpose(
 }
 
 /**
- * Who may cancel or release, in one place (issue #843). The detail modal and
- * the Reservations page's bulk actions both ask here, so a row is offered the
- * action by exactly the same rule everywhere: the caller must own the
- * reservation AND the status gate above must pass. The backend is looser for
- * an admin cancel (issue #340); the UI keeps the owner-only rule the detail
- * modal always had, by decision, and an admin's cross-owner cancel stays on
- * the API.
+ * Who may cancel or release, in one place (issue #843): the detail modal, the
+ * per-row buttons on the Reservations page, and the bulk Cancel and Release all
+ * ask here, and each rule matches the backend exactly, never stricter and never
+ * looser. Both combine the status gate above with the backend's caller rule:
+ *
+ * Cancel: `cancel_reservation_by_id` (services/reservations/app/routers/
+ * reservations.py) passes `is_admin=role in ("admin", "superadmin")`, so the
+ * owner OR an admin may cancel any reservation (issue #340).
+ *
+ * Release: `release_reservation_early` (same file) passes only the caller's id,
+ * so the OWNER alone may release; an admin who does not own it gets a 404.
  */
+type Caller = { id: string; role?: string | null } | null | undefined;
+
 export function canCancelAs(
   reservation: Pick<Reservation, "status" | "user_id">,
-  userId: string | undefined | null,
+  user: Caller,
 ): boolean {
-  return !!userId && userId === reservation.user_id && canCancel(reservation.status);
+  if (!user || !canCancel(reservation.status)) return false;
+  return user.id === reservation.user_id || isAdminRole(user.role);
 }
 
 export function canReleaseAs(
   reservation: Pick<Reservation, "status" | "user_id">,
-  userId: string | undefined | null,
+  user: Caller,
 ): boolean {
-  return !!userId && userId === reservation.user_id && canRelease(reservation.status);
+  return !!user && user.id === reservation.user_id && canRelease(reservation.status);
 }

@@ -14,6 +14,9 @@ import type { Reservation, ReservationStatus } from "@/types/reservation.types";
 
 const ME = "me";
 const OTHER = "someone-else";
+const OWNER = { id: ME, role: "user" };
+const ADMIN = { id: "admin-id", role: "admin" };
+const STRANGER = { id: "stranger", role: "user" };
 
 function res(id: string, status: ReservationStatus, userId = ME): Reservation {
   return { id, user_id: userId, status } as Reservation;
@@ -28,9 +31,16 @@ const STATUSES: ReservationStatus[] = [
   "FAILED",
 ];
 
-// Every status for the owner and for a non-owner. The page's rule is
-// owner-only whatever the caller's role (the detail modal's rule), so an admin
-// looking at another user's row lands in the "not yours" column too.
+// Reservations here are owned by ME. Three caller kinds by every status: the
+// owner, an admin who does not own it, and a non-admin who does not own it.
+// Cancel follows the backend rule (owner or admin), Release is owner only.
+const NOT_YOURS_FOR_CALLER: Record<string, { cancel: boolean; release: boolean }> = {
+  owner: { cancel: false, release: false },
+  admin: { cancel: false, release: true },
+  stranger: { cancel: true, release: true },
+};
+const CALLERS = { owner: OWNER, admin: ADMIN, stranger: STRANGER };
+
 const EXPECT: Record<BulkAction, Record<ReservationStatus, SkipReason | null>> = {
   cancel: {
     PENDING: null,
@@ -52,23 +62,20 @@ const EXPECT: Record<BulkAction, Record<ReservationStatus, SkipReason | null>> =
 
 describe("partitionSelection eligibility matrix", () => {
   for (const action of ["cancel", "release"] as const) {
-    it.each(STATUSES)(`${action}: owner, status %s`, (status) => {
-      const { eligible, skipped } = partitionSelection(action, [res("a", status)], ME);
-      const want = EXPECT[action][status];
-      if (want === null) {
-        expect(eligible.map((r) => r.id)).toEqual(["a"]);
-        expect(skipped).toEqual([]);
-      } else {
-        expect(eligible).toEqual([]);
-        expect(skipped.map((s) => s.reason)).toEqual([want]);
-      }
-    });
-
-    it.each(STATUSES)(`${action}: not the owner, status %s`, (status) => {
-      const { eligible, skipped } = partitionSelection(action, [res("a", status, OTHER)], ME);
-      expect(eligible).toEqual([]);
-      expect(skipped.map((s) => s.reason)).toEqual(["not_yours"]);
-    });
+    for (const [kind, caller] of Object.entries(CALLERS)) {
+      it.each(STATUSES)(`${action}: ${kind}, status %s`, (status) => {
+        const { eligible, skipped } = partitionSelection(action, [res("a", status)], caller);
+        const notYours = NOT_YOURS_FOR_CALLER[kind][action];
+        const want = notYours ? "not_yours" : EXPECT[action][status];
+        if (want === null) {
+          expect(eligible.map((r) => r.id)).toEqual(["a"]);
+          expect(skipped).toEqual([]);
+        } else {
+          expect(eligible).toEqual([]);
+          expect(skipped.map((s) => s.reason)).toEqual([want]);
+        }
+      });
+    }
 
     it(`${action}: no signed-in user means nothing is eligible`, () => {
       const { eligible, skipped } = partitionSelection(action, [res("a", "ACTIVE")], undefined);
@@ -77,31 +84,41 @@ describe("partitionSelection eligibility matrix", () => {
     });
   }
 
-  it("agrees with the single-row gates for every status and owner", () => {
+  it("agrees with the single-row gates for every status, owner and caller kind", () => {
     for (const status of STATUSES) {
       for (const owner of [ME, OTHER]) {
-        const r = res("a", status, owner);
-        expect(partitionSelection("cancel", [r], ME).eligible.length === 1).toBe(
-          canCancelAs(r, ME),
-        );
-        expect(partitionSelection("release", [r], ME).eligible.length === 1).toBe(
-          canReleaseAs(r, ME),
-        );
+        for (const caller of Object.values(CALLERS)) {
+          const r = res("a", status, owner);
+          expect(partitionSelection("cancel", [r], caller).eligible.length === 1).toBe(
+            canCancelAs(r, caller),
+          );
+          expect(partitionSelection("release", [r], caller).eligible.length === 1).toBe(
+            canReleaseAs(r, caller),
+          );
+        }
       }
     }
   });
 
   it("partitions a mixed selection per row, keeping order", () => {
     const rows = [res("1", "ACTIVE"), res("2", "CANCELLED"), res("3", "PENDING"), res("4", "ACTIVE", OTHER)];
-    const cancel = partitionSelection("cancel", rows, ME);
+    const cancel = partitionSelection("cancel", rows, OWNER);
     expect(cancel.eligible.map((r) => r.id)).toEqual(["1", "3"]);
     expect(cancel.skipped.map((s) => [s.reservation.id, s.reason])).toEqual([
       ["2", "finished"],
       ["4", "not_yours"],
     ]);
-    const release = partitionSelection("release", rows, ME);
+    const release = partitionSelection("release", rows, OWNER);
     expect(release.eligible.map((r) => r.id)).toEqual(["1"]);
     expect(release.skipped.map((s) => s.reason)).toEqual(["finished", "not_active", "not_yours"]);
+  });
+
+  it("lets an admin cancel across owners but release only their own", () => {
+    const rows = [res("1", "ACTIVE", OTHER), res("2", "ACTIVE", ADMIN.id)];
+    expect(partitionSelection("cancel", rows, ADMIN).eligible.map((r) => r.id)).toEqual(["1", "2"]);
+    const release = partitionSelection("release", rows, ADMIN);
+    expect(release.eligible.map((r) => r.id)).toEqual(["2"]);
+    expect(release.skipped.map((s) => s.reason)).toEqual(["not_yours"]);
   });
 });
 
@@ -172,12 +189,12 @@ describe("summaries", () => {
 
 describe("confirmation text", () => {
   it("states the consequence with no skipped rows (singular and plural)", () => {
-    const one = partitionSelection("cancel", [res("1", "ACTIVE")], ME);
+    const one = partitionSelection("cancel", [res("1", "ACTIVE")], OWNER);
     expect(confirmDescription("cancel", one)).toBe(
       "Cancel 1 reservation? This releases their devices and cannot be undone.",
     );
     expect(confirmLabel("cancel", one)).toBe("Cancel 1 reservation");
-    const two = partitionSelection("release", [res("1", "ACTIVE"), res("2", "ACTIVE")], ME);
+    const two = partitionSelection("release", [res("1", "ACTIVE"), res("2", "ACTIVE")], OWNER);
     expect(confirmDescription("release", two)).toBe(
       "Release 2 reservations? This ends them early and frees their devices.",
     );
@@ -185,7 +202,7 @@ describe("confirmation text", () => {
 
   it("reports how many will be acted on and how many skipped, with reasons", () => {
     const rows = [res("1", "ACTIVE"), res("2", "CANCELLED"), res("3", "COMPLETED"), res("4", "ACTIVE", OTHER)];
-    const p = partitionSelection("cancel", rows, ME);
+    const p = partitionSelection("cancel", rows, OWNER);
     expect(confirmDescription("cancel", p)).toBe(
       "Cancel 1 of the 4 selected reservations? This releases their devices and cannot be undone. " +
         "3 will be skipped: 2 already finished, 1 not yours.",
@@ -196,17 +213,17 @@ describe("confirmation text", () => {
     const p = partitionSelection(
       "release",
       [res("1", "ACTIVE", OTHER), res("2", "PENDING"), res("3", "FAILED")],
-      ME,
+      OWNER,
     );
     expect(describeSkipped(p.skipped)).toBe("1 already finished, 1 not active, 1 not yours");
   });
 
   it("explains a disabled action in plain words", () => {
-    const p = partitionSelection("release", [res("1", "PENDING"), res("2", "CANCELLED")], ME);
+    const p = partitionSelection("release", [res("1", "PENDING"), res("2", "CANCELLED")], OWNER);
     expect(noneEligibleMessage("release", p.skipped)).toBe(
       "None of the selected reservations can be released: 1 already finished, 1 not active.",
     );
-    const c = partitionSelection("cancel", [res("1", "CANCELLED")], ME);
+    const c = partitionSelection("cancel", [res("1", "CANCELLED")], OWNER);
     expect(noneEligibleMessage("cancel", c.skipped)).toBe(
       "None of the selected reservations can be cancelled: 1 already finished.",
     );

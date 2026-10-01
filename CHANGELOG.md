@@ -7,9 +7,12 @@
   a selection bar offers Cancel selected and Release selected. There is no bulk
   endpoint: the page fans out over the existing per-id cancel and release calls,
   and the backend's status compare-and-swap decides each row. Eligibility is per
-  row through `canCancelAs` and `canReleaseAs` in `lib/reservationStatus.ts`
-  (the status gates plus the detail modal's owner rule, now shared by both),
-  and one confirmation per action states how many reservations will be acted on
+  row through `canCancelAs` and `canReleaseAs` in `lib/reservationStatus.ts`,
+  the one rule now behind the detail modal, the per-row buttons, and the bulk
+  actions, matching the backend: the owner or an admin may cancel (issue #340),
+  only the owner may release. An admin now sees Cancel on another user's
+  reservation, and Release no longer shows on a row the caller does not own.
+  One confirmation per action states how many reservations will be acted on
   and how many will be skipped and why. Succeeded rows leave the selection,
   failed rows stay selected and the toast reports "Cancelled N, failed M" with
   the server's reason when every failure shares one. The selection is dropped
