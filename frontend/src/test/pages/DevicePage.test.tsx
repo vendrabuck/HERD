@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
@@ -262,6 +262,57 @@ describe("DevicePage", () => {
       ),
     );
     expect(navigate).not.toHaveBeenCalledWith("/inventory");
+  });
+
+  it("keeps the cabled refusal on the page with the count and a link to Connections (issue #940)", async () => {
+    server.use(
+      http.delete(`/api/inventory/devices/${DEVICE_ID}`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "device_cabled",
+              connection_count: 2,
+              connection_ids: ["c1", "c2"],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage();
+    await screen.findByText("Device Details");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    const confirmButtons = screen.getAllByRole("button", { name: "Delete" });
+    fireEvent.click(confirmButtons[confirmButtons.length - 1]);
+    const expected =
+      "Device is still cabled (2 connections) and cannot be deleted. Remove its cables first.";
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(expected));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(expected);
+    expect(within(alert).getByRole("link", { name: "Open Connections" })).toHaveAttribute(
+      "href",
+      "/admin/connections",
+    );
+    expect(navigate).not.toHaveBeenCalledWith("/inventory");
+  });
+
+  it("shows no cabled banner for a reservation refusal", async () => {
+    server.use(
+      http.delete(`/api/inventory/devices/${DEVICE_ID}`, () =>
+        HttpResponse.json(
+          { detail: { error: "device_in_use", reservation_ids: ["r1"] } },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderPage();
+    await screen.findByText("Device Details");
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    const confirmButtons = screen.getAllByRole("button", { name: "Delete" });
+    fireEvent.click(confirmButtons[confirmButtons.length - 1]);
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("surfaces the server detail message when an update fails", async () => {

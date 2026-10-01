@@ -255,8 +255,21 @@ export function usePaginatedDevices(filters?: DeviceFilters, skip = 0, limit = 5
 // extraction elsewhere would toast an unreadable object. Issue #900 adds the
 // always-present `transit_reservation_ids`: the subset of reservation_ids that
 // hold the device only as a transit hop on live wiring, not as a booked member.
+// Issue #940 adds `device_cabled` ({connection_count, connection_ids}): a
+// cabling Connection still names the device, checked after device_in_use. The
+// admin has to remove the cables first, so the message says so with the count.
 // Callers pass the caught error's response detail through this to get a plain
 // string instead.
+
+/** The connection count of a `device_cabled` delete refusal, or null for any other error. */
+export function deviceCabledCount(err: unknown): number | null {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  if (!detail || typeof detail !== "object") return null;
+  const { error, connection_count } = detail as { error?: unknown; connection_count?: unknown };
+  if (error !== "device_cabled") return null;
+  return typeof connection_count === "number" && connection_count >= 0 ? connection_count : 0;
+}
+
 export function deleteDeviceErrorMessage(err: unknown): string {
   const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
   if (typeof detail === "string") return detail;
@@ -278,6 +291,12 @@ export function deleteDeviceErrorMessage(err: unknown): string {
       return "Device is held by an active reservation and carries " + transitText + ", so it cannot be deleted";
     }
     return "Device carries " + transitText + " and cannot be deleted";
+  }
+  const cabled = deviceCabledCount(err);
+  if (cabled !== null) {
+    if (cabled === 0) return "Device is still cabled and cannot be deleted. Remove its cables first.";
+    const noun = cabled === 1 ? "1 connection" : cabled + " connections";
+    return "Device is still cabled (" + noun + ") and cannot be deleted. Remove its cables first.";
   }
   return "Failed to delete device";
 }

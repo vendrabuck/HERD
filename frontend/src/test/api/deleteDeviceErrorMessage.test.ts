@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deleteDeviceErrorMessage } from "@/api/inventory";
+import { deleteDeviceErrorMessage, deviceCabledCount } from "@/api/inventory";
 
 function err(detail: unknown) {
   return { response: { data: { detail } } };
@@ -59,5 +59,48 @@ describe("deleteDeviceErrorMessage", () => {
   it("falls back to the generic message for an unknown shape", () => {
     expect(deleteDeviceErrorMessage(err({ error: "other" }))).toBe("Failed to delete device");
     expect(deleteDeviceErrorMessage(new Error("x"))).toBe("Failed to delete device");
+  });
+
+  it("tells the admin to remove the cables first, with the connection count (issue #940)", () => {
+    expect(
+      deleteDeviceErrorMessage(
+        err({ error: "device_cabled", connection_count: 3, connection_ids: ["a", "b", "c"] }),
+      ),
+    ).toBe("Device is still cabled (3 connections) and cannot be deleted. Remove its cables first.");
+  });
+
+  it("uses the singular for one connection", () => {
+    expect(
+      deleteDeviceErrorMessage(
+        err({ error: "device_cabled", connection_count: 1, connection_ids: ["a"] }),
+      ),
+    ).toBe("Device is still cabled (1 connection) and cannot be deleted. Remove its cables first.");
+  });
+
+  it("reports the true total, not the capped id sample", () => {
+    expect(
+      deleteDeviceErrorMessage(
+        err({ error: "device_cabled", connection_count: 57, connection_ids: ["a", "b"] }),
+      ),
+    ).toContain("57 connections");
+  });
+
+  it("still gives a cabled message when the count is missing", () => {
+    expect(deleteDeviceErrorMessage(err({ error: "device_cabled" }))).toBe(
+      "Device is still cabled and cannot be deleted. Remove its cables first.",
+    );
+  });
+});
+
+describe("deviceCabledCount", () => {
+  it("returns the count for device_cabled", () => {
+    expect(deviceCabledCount(err({ error: "device_cabled", connection_count: 2 }))).toBe(2);
+  });
+
+  it("returns null for any other refusal or shape", () => {
+    expect(deviceCabledCount(err({ error: "device_in_use", reservation_ids: [] }))).toBeNull();
+    expect(deviceCabledCount(err("Device not found"))).toBeNull();
+    expect(deviceCabledCount(new Error("network"))).toBeNull();
+    expect(deviceCabledCount(undefined)).toBeNull();
   });
 });
