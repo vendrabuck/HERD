@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, Fragment } from "react";
+import { useState, useRef, useEffect, useMemo, useId, Fragment } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
@@ -226,17 +226,23 @@ function FilterSelect({
   onChange: (value: string) => void;
   children: React.ReactNode;
 }) {
+  // An explicit htmlFor/id pair, not a wrapping label: a wrapping label's
+  // accessible name would include the selected option's text.
+  const id = useId();
   return (
-    <label className="flex flex-col gap-1 text-xs font-medium text-gray-500">
-      {label}
+    <div className="flex flex-col gap-1">
+      <label htmlFor={id} className="text-xs font-medium text-gray-500">
+        {label}
+      </label>
       <select
+        id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className="max-w-[16rem] text-sm font-normal text-gray-900 border border-gray-300 rounded-lg px-2 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
       >
         {children}
       </select>
-    </label>
+    </div>
   );
 }
 
