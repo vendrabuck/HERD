@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, Fragment } from "react";
+import { useState, useRef, useEffect, useMemo, useId, Fragment } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
@@ -13,8 +13,16 @@ import { BulkImportExport } from "@/components/ui/BulkImportExport";
 import { exportDevices, importDevices } from "@/api/bulk";
 import { fetchPorts, useCreatePort, usePorts } from "@/api/ports";
 import { useDeviceConnections } from "@/api/connections";
+import { useTemplates } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { isAdminRole } from "@/lib/roles";
+import {
+  DEVICE_STATUSES,
+  TOPOLOGY_TYPES,
+  parseSavedInventoryFilter,
+  serializeInventoryFilter,
+  type InventoryFilterState,
+} from "@/lib/inventoryFilters";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
@@ -23,7 +31,7 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { TopoBadge } from "@/components/ui/TopoBadge";
 import { EmptyRow } from "@/components/ui/EmptyState";
 import { SkeletonRows } from "@/components/ui/Skeleton";
-import type { Device } from "@/types/device.types";
+import type { Device, DeviceFilters, DeviceStatus, TopologyType } from "@/types/device.types";
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
 
@@ -202,6 +210,42 @@ function DeviceRow({ device, isAdmin, onCopy, onClick, selected, onToggle, showC
   );
 }
 
+function templateOptionLabel(t: { name: string; vendor?: string | null; model?: string | null }) {
+  const detail = [t.vendor, t.model].filter(Boolean).join(" ");
+  return detail ? `${t.name} (${detail})` : t.name;
+}
+
+function FilterSelect({
+  label,
+  value,
+  onChange,
+  children,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  children: React.ReactNode;
+}) {
+  // An explicit htmlFor/id pair, not a wrapping label: a wrapping label's
+  // accessible name would include the selected option's text.
+  const id = useId();
+  return (
+    <div className="flex flex-col gap-1">
+      <label htmlFor={id} className="text-xs font-medium text-gray-500">
+        {label}
+      </label>
+      <select
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="max-w-[16rem] text-sm font-normal text-gray-900 border border-gray-300 rounded-lg px-2 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+      >
+        {children}
+      </select>
+    </div>
+  );
+}
+
 export function InventoryPage() {
   const navigate = useNavigate();
   const createDevice = useCreateDevice();
@@ -211,9 +255,9 @@ export function InventoryPage() {
   const isAdmin = isAdminRole(user?.role);
   const queryClient = useQueryClient();
 
-  const storedSearch = usePreferencesStore((s) =>
-    (s.savedFilters.inventory as { search?: string } | undefined)?.search ?? "",
-  );
+  const savedRaw = usePreferencesStore((s) => s.savedFilters.inventory);
+  const stored = useMemo(() => parseSavedInventoryFilter(savedRaw), [savedRaw]);
+  const storedSearch = stored.search;
   const limit = usePreferencesStore((s) => s.getPageSize("inventory", 50));
   const setSavedFilter = usePreferencesStore((s) => s.setSavedFilter);
   const setPageSize = usePreferencesStore((s) => s.setPageSize);
@@ -222,6 +266,43 @@ export function InventoryPage() {
   const [userSearch, setUserSearch] = useState<string | null>(null);
   const searchInput = userSearch ?? storedSearch;
   const [debouncedSearch, setDebouncedSearch] = useState(storedSearch);
+
+  // Column filters: null means the user has not touched the control, so the
+  // saved value shows; "" is an explicit All. Saved values are validated on read
+  // (parseSavedInventoryFilter drops an unknown status or topology; a template id
+  // is checked against the loaded template list below), so a stale preference
+  // never reaches the API.
+  const [userStatus, setUserStatus] = useState<DeviceStatus | "" | null>(null);
+  const [userTemplate, setUserTemplate] = useState<string | null>(null);
+  const [userTopology, setUserTopology] = useState<TopologyType | "" | null>(null);
+  const status = userStatus ?? stored.status;
+  const topologyType = userTopology ?? stored.topologyType;
+  const rawTemplate = userTemplate ?? stored.templateId;
+
+  // Device templates only: vendor and model are template fields, so filtering by
+  // template covers them. The list is the server's first page of up to 500.
+  const { data: templates, isLoading: templatesLoading } = useTemplates("device");
+  const templateId = templates?.some((t) => t.id === rawTemplate) ? rawTemplate : "";
+  // Hold the device query while a saved template id awaits validation, so a
+  // stale id is never sent and a valid one does not flash an unfiltered page.
+  const templatePending = rawTemplate !== "" && templatesLoading;
+
+  // The last value of every persisted field. Both the search debounce and the
+  // filter handlers write the WHOLE object through persistFilters, so whichever
+  // write lands last carries all fields.
+  const latestRef = useRef<InventoryFilterState>({
+    search: debouncedSearch,
+    status,
+    templateId,
+    topologyType,
+  });
+  useEffect(() => {
+    latestRef.current = { search: debouncedSearch, status, templateId, topologyType };
+  }, [debouncedSearch, status, templateId, topologyType]);
+  const persistFilters = (patch: Partial<InventoryFilterState>) => {
+    latestRef.current = { ...latestRef.current, ...patch };
+    setSavedFilter("inventory", serializeInventoryFilter(latestRef.current));
+  };
 
   const handlePageSizeChange = (size: number) => {
     setPageSize("inventory", size);
@@ -242,7 +323,7 @@ export function InventoryPage() {
       setDebouncedSearch(searchInput);
       setSkip(0);
       if (userSearch !== null) {
-        setSavedFilter("inventory", { search: userSearch });
+        persistFilters({ search: userSearch });
       }
     }, 300);
     return () => clearTimeout(timer);
@@ -252,8 +333,45 @@ export function InventoryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchInput, userSearch, setSavedFilter]);
 
-  const filters = debouncedSearch ? { search: debouncedSearch } : undefined;
-  const { data, isLoading, isError } = usePaginatedDevices(filters, skip, limit);
+  const activeFilters: DeviceFilters = {};
+  if (debouncedSearch) activeFilters.search = debouncedSearch;
+  if (status) activeFilters.status = status;
+  if (templateId) activeFilters.template_id = templateId;
+  if (topologyType) activeFilters.topology_type = topologyType;
+  const filtersApplied = Object.keys(activeFilters).length > 0;
+  const filters = filtersApplied ? activeFilters : undefined;
+  const { data, isLoading, isError } = usePaginatedDevices(filters, skip, limit, {
+    enabled: !templatePending,
+  });
+
+  const changeStatus = (value: string) => {
+    const next = DEVICE_STATUSES.find((v) => v === value) ?? "";
+    setUserStatus(next);
+    setSkip(0);
+    persistFilters({ status: next });
+  };
+  const changeTemplate = (value: string) => {
+    setUserTemplate(value);
+    setSkip(0);
+    persistFilters({ templateId: value });
+  };
+  const changeTopology = (value: string) => {
+    const next = TOPOLOGY_TYPES.find((v) => v === value) ?? "";
+    setUserTopology(next);
+    setSkip(0);
+    persistFilters({ topologyType: next });
+  };
+  const clearFilters = () => {
+    setUserSearch("");
+    setDebouncedSearch("");
+    setUserStatus("");
+    setUserTemplate("");
+    setUserTopology("");
+    setSkip(0);
+    persistFilters({ search: "", status: "", templateId: "", topologyType: "" });
+  };
+  const showClear = filtersApplied || searchInput !== "";
+  const listLoading = isLoading || (templatePending && !data);
   const devices = data?.items;
   const total = data?.total ?? 0;
   const { data: deviceNameMap } = useAllDeviceNames();
@@ -390,14 +508,48 @@ export function InventoryPage() {
               />
             )}
           </div>
-          <div className="mb-3">
+          <div className="mb-3 flex flex-wrap items-end gap-3">
             <input
               type="text"
+              aria-label="Search devices"
               placeholder="Search devices by name..."
               value={searchInput}
               onChange={(e) => setUserSearch(e.target.value)}
               className="w-full max-w-sm px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
             />
+            <FilterSelect label="Status" value={status} onChange={changeStatus}>
+              <option value="">All</option>
+              {DEVICE_STATUSES.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </FilterSelect>
+            <FilterSelect label="Template" value={templateId} onChange={changeTemplate}>
+              <option value="">All</option>
+              {templates?.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {templateOptionLabel(t)}
+                </option>
+              ))}
+            </FilterSelect>
+            <FilterSelect label="Topology" value={topologyType} onChange={changeTopology}>
+              <option value="">All</option>
+              {TOPOLOGY_TYPES.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </FilterSelect>
+            {showClear && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="px-3 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+              >
+                Clear filters
+              </button>
+            )}
           </div>
           {isAdmin && selected.size > 0 && (
             <div className="flex items-center gap-3 mb-3 px-1">
@@ -417,7 +569,7 @@ export function InventoryPage() {
             </div>
           )}
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-            {isLoading && (
+            {listLoading && (
               <div role="status" aria-live="polite">
                 <SkeletonRows rows={5} />
               </div>
@@ -454,7 +606,22 @@ export function InventoryPage() {
                 </thead>
                 <tbody>
                   {devices.length === 0 ? (
-                    <EmptyRow colSpan={isAdmin ? 8 : 6}>No devices found</EmptyRow>
+                    <EmptyRow colSpan={isAdmin ? 8 : 6}>
+                      {filtersApplied ? (
+                        <span>
+                          No devices match the current filters.{" "}
+                          <button
+                            type="button"
+                            onClick={clearFilters}
+                            className="text-blue-600 hover:underline"
+                          >
+                            Clear filters
+                          </button>
+                        </span>
+                      ) : (
+                        "No devices found"
+                      )}
+                    </EmptyRow>
                   ) : (
                     devices.map((device) => {
                       const expanded = expandedIds.has(device.id);

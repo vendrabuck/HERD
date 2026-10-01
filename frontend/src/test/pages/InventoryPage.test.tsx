@@ -163,8 +163,10 @@ describe("InventoryPage", () => {
     await waitFor(() =>
       expect(screen.getByText("fw-edge-01")).toBeInTheDocument(),
     );
-    expect(screen.getByText("FW-3600")).toBeInTheDocument();
-    expect(screen.getByText("AVAILABLE")).toBeInTheDocument();
+    // Scoped to the row: the Status filter also lists AVAILABLE as an option.
+    const row = screen.getByText("fw-edge-01").closest("tr") as HTMLElement;
+    expect(within(row).getByText("FW-3600")).toBeInTheDocument();
+    expect(within(row).getByText("AVAILABLE")).toBeInTheDocument();
     // The count badge next to the "All Devices" heading.
     expect(screen.getByText("(1)")).toBeInTheDocument();
   });
@@ -845,6 +847,296 @@ describe("InventoryPage", () => {
       await waitFor(() =>
         expect(toastModule.default.error).toHaveBeenCalledWith("Failed to duplicate device"),
       );
+    });
+  });
+
+  describe("column filters (issue #842)", () => {
+    const tmplA = "11111111-aaaa-bbbb-cccc-000000000001";
+    const tmplB = "11111111-aaaa-bbbb-cccc-000000000002";
+    const idA = "aaaaaaaa-1111-2222-3333-444444444444";
+    const idB = "bbbbbbbb-1111-2222-3333-444444444444";
+
+    function makeTemplate(id: string, name: string, vendor = "", model = "") {
+      return { id, name, template_type: "device", vendor, model };
+    }
+
+    // Records the query string of every list request (the all-names walker also
+    // hits this route, with limit=500, so tests filter on limit=50).
+    function setup(opts: { total?: number; items?: unknown[] } = {}) {
+      const requests: URLSearchParams[] = [];
+      server.use(
+        http.get("/api/inventory/templates", () =>
+          HttpResponse.json({
+            items: [makeTemplate(tmplA, "Switch-A", "Acme", "S1"), makeTemplate(tmplB, "Router-B")],
+            total: 2,
+            skip: 0,
+            limit: 500,
+          }),
+        ),
+        http.get("/api/inventory/devices", ({ request }) => {
+          const params = new URL(request.url).searchParams;
+          if (params.get("limit") === "50") requests.push(params);
+          return HttpResponse.json({
+            items: opts.items ?? [makeDevice({ id: idA, name: "dev-a" })],
+            total: opts.total ?? 1,
+            skip: Number(params.get("skip") ?? 0),
+            limit: 50,
+          });
+        }),
+        http.get("/api/inventory/devices/:id/ports", () => HttpResponse.json([])),
+        http.get("/api/cabling/connections", () =>
+          HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
+        ),
+      );
+      return requests;
+    }
+
+    const last = (r: URLSearchParams[]) => r[r.length - 1];
+
+    async function ready() {
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByRole("option", { name: "Switch-A (Acme S1)" })).toBeInTheDocument());
+    }
+
+    const pick = (label: string, value: string) =>
+      fireEvent.change(screen.getByLabelText(label), { target: { value } });
+
+    it("sends no filter parameter at All, and labels templates with vendor and model", async () => {
+      const requests = setup();
+      await ready();
+      const p = requests[0];
+      expect(p.has("status")).toBe(false);
+      expect(p.has("template_id")).toBe(false);
+      expect(p.has("topology_type")).toBe(false);
+      expect(p.has("search")).toBe(false);
+      expect(screen.getByRole("option", { name: "Router-B" })).toBeInTheDocument();
+      expect(screen.queryByText("Clear filters")).not.toBeInTheDocument();
+    });
+
+    it("each filter sends its own parameter, and All removes it again", async () => {
+      const requests = setup();
+      await ready();
+
+      pick("Status", "RESERVED");
+      await waitFor(() => expect(last(requests).get("status")).toBe("RESERVED"));
+      pick("Template", tmplA);
+      await waitFor(() => expect(last(requests).get("template_id")).toBe(tmplA));
+      pick("Topology", "CLOUD");
+      await waitFor(() => expect(last(requests).get("topology_type")).toBe("CLOUD"));
+      expect(last(requests).get("status")).toBe("RESERVED");
+
+      pick("Status", "");
+      await waitFor(() => expect(last(requests).has("status")).toBe(false));
+      expect(last(requests).get("template_id")).toBe(tmplA);
+      expect(last(requests).get("topology_type")).toBe("CLOUD");
+    });
+
+    it("composes the filters with the search in one request", async () => {
+      const requests = setup();
+      await ready();
+      pick("Status", "AVAILABLE");
+      pick("Template", tmplB);
+      fireEvent.change(screen.getByPlaceholderText("Search devices by name..."), {
+        target: { value: "edge" },
+      });
+      await waitFor(() => expect(last(requests).get("search")).toBe("edge"));
+      expect(last(requests).get("status")).toBe("AVAILABLE");
+      expect(last(requests).get("template_id")).toBe(tmplB);
+    });
+
+    it("resets to the first page on a filter change and shows the filtered total", async () => {
+      const requests = setup({ total: 150 });
+      await ready();
+      fireEvent.click(screen.getByText("Next"));
+      await waitFor(() => expect(last(requests).get("skip")).toBe("50"));
+
+      pick("Status", "OFFLINE");
+      await waitFor(() => expect(last(requests).get("status")).toBe("OFFLINE"));
+      expect(last(requests).get("skip")).toBe("0");
+      expect(screen.getByText("(150)")).toBeInTheDocument();
+    });
+
+    it("persists every field, merges the search write with the filters, and round-trips", async () => {
+      setup();
+      await ready();
+      pick("Status", "MAINTENANCE");
+      pick("Template", tmplA);
+      pick("Topology", "PHYSICAL");
+      fireEvent.change(screen.getByPlaceholderText("Search devices by name..."), {
+        target: { value: "abc" },
+      });
+      await waitFor(() =>
+        expect(usePreferencesStore.getState().savedFilters.inventory).toEqual({
+          search: "abc",
+          status: "MAINTENANCE",
+          template_id: tmplA,
+          topology_type: "PHYSICAL",
+        }),
+      );
+    });
+
+    it("a filter change made while a search is pending still ends with all fields saved", async () => {
+      setup();
+      await ready();
+      fireEvent.change(screen.getByPlaceholderText("Search devices by name..."), {
+        target: { value: "abc" },
+      });
+      pick("Status", "OFFLINE");
+      await waitFor(() =>
+        expect(usePreferencesStore.getState().savedFilters.inventory).toEqual({
+          search: "abc",
+          status: "OFFLINE",
+        }),
+      );
+    });
+
+    it("restores saved filters into the controls and the first request", async () => {
+      usePreferencesStore.setState({
+        savedFilters: {
+          inventory: { search: "dev", status: "RESERVED", template_id: tmplB, topology_type: "CLOUD" },
+        },
+      });
+      const requests = setup();
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      expect(requests).toHaveLength(1);
+      expect(Object.fromEntries(requests[0])).toMatchObject({
+        search: "dev",
+        status: "RESERVED",
+        template_id: tmplB,
+        topology_type: "CLOUD",
+      });
+      expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("RESERVED");
+      expect((screen.getByLabelText("Template") as HTMLSelectElement).value).toBe(tmplB);
+      expect((screen.getByLabelText("Topology") as HTMLSelectElement).value).toBe("CLOUD");
+    });
+
+    it("an old saved { search } object keeps working", async () => {
+      usePreferencesStore.setState({ savedFilters: { inventory: { search: "old" } } });
+      const requests = setup();
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      expect(requests[0].get("search")).toBe("old");
+      expect(requests[0].has("status")).toBe(false);
+    });
+
+    it("falls back to All for a stale saved status, topology, or template and never sends them", async () => {
+      usePreferencesStore.setState({
+        savedFilters: {
+          inventory: {
+            status: "DECOMMISSIONED",
+            template_id: "99999999-0000-0000-0000-000000000000",
+            topology_type: "HYBRID",
+          },
+        },
+      });
+      const requests = setup();
+      await ready();
+      for (const p of requests) {
+        expect(p.has("status")).toBe(false);
+        expect(p.has("template_id")).toBe(false);
+        expect(p.has("topology_type")).toBe(false);
+      }
+      expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("");
+      expect((screen.getByLabelText("Template") as HTMLSelectElement).value).toBe("");
+      expect((screen.getByLabelText("Topology") as HTMLSelectElement).value).toBe("");
+    });
+
+    it("a stale saved template is dropped from the next write while other fields persist", async () => {
+      usePreferencesStore.setState({
+        savedFilters: { inventory: { template_id: "99999999-0000-0000-0000-000000000000" } },
+      });
+      setup();
+      await ready();
+      pick("Status", "AVAILABLE");
+      await waitFor(() =>
+        expect(usePreferencesStore.getState().savedFilters.inventory).toEqual({
+          search: "",
+          status: "AVAILABLE",
+        }),
+      );
+    });
+
+    it("Clear filters resets every control, the request, and the saved state", async () => {
+      const requests = setup();
+      await ready();
+      pick("Status", "RESERVED");
+      pick("Template", tmplA);
+      fireEvent.change(screen.getByPlaceholderText("Search devices by name..."), {
+        target: { value: "abc" },
+      });
+      await waitFor(() => expect(last(requests).get("search")).toBe("abc"));
+
+      fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+      await waitFor(() => expect(last(requests).has("search")).toBe(false));
+      expect(last(requests).has("status")).toBe(false);
+      expect(last(requests).has("template_id")).toBe(false);
+      expect((screen.getByPlaceholderText("Search devices by name...") as HTMLInputElement).value).toBe("");
+      expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("");
+      expect(usePreferencesStore.getState().savedFilters.inventory).toEqual({ search: "" });
+      expect(screen.queryByRole("button", { name: "Clear filters" })).not.toBeInTheDocument();
+    });
+
+    it("shows a filtered-empty state with a working Clear control, not the no-devices state", async () => {
+      server.use(
+        http.get("/api/inventory/templates", () =>
+          HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
+        ),
+        http.get("/api/inventory/devices", ({ request }) => {
+          const filtered = new URL(request.url).searchParams.has("status");
+          return HttpResponse.json({
+            items: filtered ? [] : [makeDevice({ id: idA, name: "dev-a" })],
+            total: filtered ? 0 : 1,
+            skip: 0,
+            limit: 50,
+          });
+        }),
+      );
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      pick("Status", "OFFLINE");
+      await waitFor(() =>
+        expect(screen.getByText(/No devices match the current filters/)).toBeInTheDocument(),
+      );
+      expect(screen.queryByText("No devices found")).not.toBeInTheDocument();
+
+      const inRow = within(screen.getByText(/No devices match/).closest("td") as HTMLElement);
+      fireEvent.click(inRow.getByRole("button", { name: "Clear filters" }));
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+    });
+
+    it("prunes expansion and clears selection when a filter changes the list", async () => {
+      server.use(
+        http.get("/api/inventory/templates", () =>
+          HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
+        ),
+        http.get("/api/inventory/devices", ({ request }) => {
+          const onlyB = new URL(request.url).searchParams.get("status") === "OFFLINE";
+          const items = onlyB
+            ? [makeDevice({ id: idB, name: "dev-b" })]
+            : [makeDevice({ id: idA, name: "dev-a" }), makeDevice({ id: idB, name: "dev-b" })];
+          return HttpResponse.json({ items, total: items.length, skip: 0, limit: 50 });
+        }),
+        http.get("/api/inventory/devices/:id/ports", () => HttpResponse.json([])),
+        http.get("/api/cabling/connections", () =>
+          HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
+        ),
+      );
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+      const rowA = screen.getByText("dev-a").closest("tr") as HTMLElement;
+      const rowB = screen.getByText("dev-b").closest("tr") as HTMLElement;
+      fireEvent.click(within(rowA).getByLabelText("Expand ports"));
+      fireEvent.click(within(rowB).getByLabelText("Expand ports"));
+      fireEvent.click(within(rowB).getByRole("checkbox"));
+      expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+      pick("Status", "OFFLINE");
+      await waitFor(() => expect(screen.queryByText("dev-a")).not.toBeInTheDocument());
+      expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
+      // dev-b stayed listed, so its panel is still open; dev-a's is gone.
+      expect(screen.getAllByLabelText("Collapse ports")).toHaveLength(1);
     });
   });
 

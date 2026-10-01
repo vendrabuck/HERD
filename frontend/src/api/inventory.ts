@@ -241,11 +241,17 @@ export function useDevices(filters?: DeviceFilters) {
   });
 }
 
-export function usePaginatedDevices(filters?: DeviceFilters, skip = 0, limit = 50) {
+export function usePaginatedDevices(
+  filters?: DeviceFilters,
+  skip = 0,
+  limit = 50,
+  options?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: deviceKeys.paginated(filters, skip, limit),
     queryFn: () => fetchPaginatedDevices(filters, skip, limit),
     placeholderData: keepPreviousData,
+    enabled: options?.enabled ?? true,
   });
 }
 
