@@ -41,6 +41,10 @@
       "/internal/forks"
     ],
     [
+      "GET",
+      "/internal/forks/by-device/{device_id}"
+    ],
+    [
       "POST",
       "/internal/forks/devices/batch"
     ],
@@ -320,6 +324,13 @@
         "device_id",
         "fabric_id"
       ],
+      "type": "object"
+    },
+    "ForkByDeviceResponse": {
+      "properties": {
+        "reservation_ids": "array"
+      },
+      "required": [],
       "type": "object"
     },
     "ForkCanvasUpdate": {

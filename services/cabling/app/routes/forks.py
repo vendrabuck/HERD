@@ -12,7 +12,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from herd_common.internal_auth import internal_token_matches
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -29,6 +29,7 @@ from app.schemas.fork import (
     ActiveForkEntry,
     ActiveForkListResponse,
     ForkArchiveResponse,
+    ForkByDeviceResponse,
     ForkCanvasUpdate,
     ForkCanvasUpdateResponse,
     ForkConnectionDelta,
@@ -241,6 +242,46 @@ async def list_active_forks_internal(
         skip=skip,
         limit=limit,
     )
+
+
+@router.get("/by-device/{device_id}", response_model=ForkByDeviceResponse)
+async def list_forks_by_device_internal(
+    device_id: uuid.UUID,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reservations whose live fork wiring references a device (issue #900).
+
+    Feeds inventory's admin device DELETE guard. A switch that is only a transit
+    hop on a saved fork is in no reservations `reservation_devices` row, so the
+    reservations-side membership lookup cannot see it; this reads the wiring
+    itself: the distinct reservation_ids of every non-ARCHIVED fork with a
+    fork_connections row naming the device as device_a_id or device_b_id, at
+    either layer. ARCHIVED forks are frozen history and never count (a fork is
+    archived when its reservation goes terminal, while execution's hardware
+    teardown runs asynchronously afterwards, so a delete just after a cancel can
+    still precede the release; documented, not closed). An unknown device id is
+    an empty list, not a 404: absence is an answer here. Sorted by string form
+    for a stable response. Registered before the `/{reservation_id}` routes so
+    the literal prefix is never captured as an id.
+    """
+    _check_internal_token(x_internal_token)
+
+    rows = (
+        await db.execute(
+            select(ReservationFork.reservation_id)
+            .join(ForkConnection, ForkConnection.fork_id == ReservationFork.id)
+            .where(
+                ReservationFork.status != ForkStatus_ARCHIVED,
+                or_(
+                    ForkConnection.device_a_id == device_id,
+                    ForkConnection.device_b_id == device_id,
+                ),
+            )
+            .distinct()
+        )
+    ).all()
+    return ForkByDeviceResponse(reservation_ids=sorted({r for (r,) in rows}, key=str))
 
 
 @router.post("/devices/batch", response_model=ForkDevicesBatchResponse)

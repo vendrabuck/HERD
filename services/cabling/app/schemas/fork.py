@@ -289,6 +289,17 @@ class ForkDevicesBatchRequest(BaseModel):
     reservation_ids: UUIDStrList = Field(min_length=1, max_length=500)
 
 
+class ForkByDeviceResponse(BaseModel):
+    """GET /internal/forks/by-device/{device_id} result (issue #900).
+
+    Sorted distinct reservation ids of every non-archived fork whose
+    fork_connections reference the device on either end of any hop. Empty when
+    none do (also for a device id cabling has never seen).
+    """
+
+    reservation_ids: UUIDStrList = Field(default_factory=list)
+
+
 class ForkDevicesBatchResponse(BaseModel):
     """POST .../devices/batch result: sorted distinct device ids per reservation.
 
