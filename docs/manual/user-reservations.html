@@ -7,6 +7,13 @@
 <link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
 <link rel="stylesheet" href="assets/manual.css" />
 <link rel="stylesheet" href="assets/app.css" />
+<style>
+/* Ten-column list mockup: tighter cells so the actions column fits the card. */
+.hd-table.hd-compact thead th{padding:9px 7px;}
+.hd-table.hd-compact tbody td{padding:10px 7px;font-size:13px;}
+.hd-table.hd-compact .mono{font-size:12px;}
+.hd-table.hd-compact .hd-badge{font-size:11px;padding:2px 5px;}
+</style>
 </head>
 <body>
 
@@ -54,7 +61,7 @@
 
     <div class="lost">
       <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg> The one-sentence version</div>
-      <p>Go to <strong>Reservations &rarr; New reservation</strong>, fill in a purpose, a start and end time, tick the devices you want, and submit. Everything below is just detail on top of that.</p>
+      <p>Go to <strong>Reservations &rarr; New Reservation</strong>, fill in a purpose, a start and end time, tick the devices you want, and submit. Everything below is just detail on top of that.</p>
     </div>
 
     <h2 class="sec" id="list">Home base</h2>
@@ -72,29 +79,29 @@
                 <span class="hd-tab active" data-anno="2" data-anno-pin="t" data-anno-arrow>All Reservations</span>
                 <span class="hd-tab" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Calendar</span>
                 <span class="ct">(4)</span>
-                <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--gray-600);" data-anno="7" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;"></span>All reservations</span>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--gray-600);" data-anno="7" data-anno-pin="t" data-anno-arrow data-anno-color="blue"><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;"></span>All reservations</span>
                 <span class="grow" style="flex:1"></span>
-                <span class="hd-btn primary sm" data-anno="1" data-anno-pin="l" data-anno-arrow><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg> New reservation</span>
+                <span class="hd-btn primary sm" data-anno="1" data-anno-pin="l" data-anno-arrow><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg> New Reservation</span>
               </div>
-              <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px;padding:8px 14px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:var(--radius-lg);font-size:13px;" data-anno="6" data-anno-pin="r" data-anno-arrow data-anno-color="blue">
+              <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px;padding:8px 14px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:var(--radius-lg);font-size:13px;" data-anno="6" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
                 <span style="font-weight:500;color:var(--gray-900);">2 selected</span>
                 <span style="font-size:12px;padding:5px 10px;border-radius:4px;border:1px solid #fca5a5;color:#b91c1c;">Cancel selected</span>
                 <span style="font-size:12px;padding:5px 10px;border-radius:4px;border:1px solid #86efac;color:#15803d;opacity:.5;">Release selected</span>
-                <span style="font-size:12px;color:var(--gray-500);">None of the selected reservations can be released: 2 not active.</span>
+                <span style="font-size:12px;color:var(--gray-500);">None of the selected reservations can be released: 2 not yours.</span>
                 <span style="margin-left:auto;font-size:12px;color:var(--gray-600);">Clear selection</span>
               </div>
               <div class="hd-card"><div style="overflow-x:auto;">
-                <table class="hd-table" style="min-width:900px;">
+                <table class="hd-table hd-compact">
                   <thead><tr>
                     <th style="width:32px;" data-anno="5" data-anno-pin="l" data-anno-arrow><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></th>
                     <th>ID</th><th>Owner</th><th>Status</th><th>Topo ID</th><th>Topology</th><th>Devices</th>
-                    <th data-anno="8" data-anno-pin="t" data-anno-arrow data-anno-color="blue"><span style="display:inline-flex;align-items:center;gap:4px;color:var(--gray-900);">Period <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:11px;height:11px;"><path d="m6 9 6 6 6-6"/></svg></span></th>
+                    <th data-anno="8" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><span style="display:inline-flex;align-items:center;gap:4px;color:var(--gray-900);">Period <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:11px;height:11px;"><path d="m6 9 6 6 6-6"/></svg></span></th>
                     <th>Purpose</th><th></th>
                   </tr></thead>
                   <tbody>
                     <tr style="background:#eff6ff;"><td><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span></td><td class="mono">a9b8c7d6</td><td>sara.k</td><td><span class="hd-badge pending">PENDING</span></td><td class="mono">c0ffee12</td><td><span class="hd-badge cloud">CLOUD</span></td><td style="white-space:nowrap;">2 devices</td><td style="white-space:nowrap;">5/30/2026 to 5/31/2026</td><td>VPC peering smoke test</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
                     <tr style="background:#eff6ff;"><td><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span></td><td class="mono">1234abcd</td><td>sara.k</td><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">6 devices</td><td style="white-space:nowrap;">5/30/2026 to 6/2/2026</td><td>Spine-leaf burn-in</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
-                    <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">f1a2b3c4</td><td>jordan</td><td data-anno="4" data-anno-pin="l" data-anno-arrow><span class="hd-badge active">ACTIVE</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">4 devices</td><td style="white-space:nowrap;">5/28/2026 to 6/4/2026</td><td>HA failover regression</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
+                    <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">f1a2b3c4</td><td>jordan</td><td><span class="hd-badge active" data-anno="4" data-anno-pin="b" data-anno-arrow>ACTIVE</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">4 devices</td><td style="white-space:nowrap;">5/28/2026 to 6/4/2026</td><td>HA failover regression</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
                     <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">deadbeef</td><td>admin</td><td><span class="hd-badge completed">COMPLETED</span></td><td class="mono">4b2d7e10</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">3 devices</td><td style="white-space:nowrap;">5/18/2026 to 5/25/2026</td><td>Driver cert run</td><td></td></tr>
                   </tbody>
                 </table>
@@ -107,7 +114,7 @@
     </figure>
 
     <ol class="legend">
-      <li><b>New reservation.</b> The button that starts everything. Opens the form in step <a href="#create">Create a reservation</a>.</li>
+      <li><b>New Reservation.</b> The button that starts everything. Opens the form in step <a href="#create">Create a reservation</a>.</li>
       <li><b>My Reservations.</b> Just yours. This is the default view; the label reads All Reservations once an admin ticks the checkbox in item 7.</li>
       <li><b>Calendar.</b> Everyone's bookings on a timeline &mdash; use it to <a href="#calendar">find a free window</a> before you book.</li>
       <li><b>Status badge.</b> The colour tells you what's happening. Full key is <a href="#status">just below</a>.</li>
@@ -121,14 +128,14 @@
 
     <h2 class="sec" id="create">The main event</h2>
     <p class="sectitle">Create a reservation</p>
-    <p>Click <b>New reservation</b>. You get this form. Nothing is reserved until you submit.</p>
+    <p>Click <b>New Reservation</b>. You get this form. Nothing is reserved until you submit.</p>
 
     <figure class="shot">
       <div class="shot-frame">
         <div class="shot-stage">
           <div class="hd"><div class="hd-modal-bg">
             <div class="hd-modal">
-              <div class="mhead"><h2>New reservation</h2><span class="x">&times;</span></div>
+              <div class="mhead"><h2>Create Reservation</h2><span class="x">&times;</span></div>
               <div class="mbody">
                 <div class="hd-field"><label class="hd-label">Purpose</label><div class="hd-input" data-anno="1" data-anno-pin="r" data-anno-arrow>HA failover regression</div></div>
                 <div class="hd-field"><label class="hd-label">Purpose category (optional)</label><div class="hd-select" data-anno="6" data-anno-pin="r" data-anno-arrow>Unclassified</div></div>
