@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -59,45 +59,65 @@
 
     <h2 class="sec" id="list">Home base</h2>
     <p class="sectitle">Your reservations list</p>
-    <p>When you land on <b>Reservations</b>, you see your own bookings. Each row is one reservation, colour-coded by where it is in its life.</p>
+    <p>When you land on <b>Reservations</b>, you see your own bookings. Each row is one reservation, colour-coded by where it is in its life. Four of the column headings sort the list, every row has a checkbox so you can act on several at once, and an admin can switch the list to everyone's bookings.</p>
 
     <figure class="shot">
       <div class="shot-frame">
         <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/reservations</span></div>
         <div class="shot-stage">
           <div class="hd">
-            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a class="active">Reservations</a></span><span class="grow"></span><span class="right"><span class="bell"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span><span class="u">sara.k</span><a>Logout</a></span></div>
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a class="active">Reservations</a></span><span class="grow"></span><span class="right"><span class="bell"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span><span class="u">admin</span><a>Logout</a></span></div>
             <div class="hd-body">
-              <div class="hd-tabs">
-                <span class="hd-tab active" data-anno="2" data-anno-pin="t" data-anno-arrow>My Reservations</span>
+              <div class="hd-tabs" style="flex-wrap:wrap;">
+                <span class="hd-tab active" data-anno="2" data-anno-pin="t" data-anno-arrow>All Reservations</span>
                 <span class="hd-tab" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Calendar</span>
+                <span class="ct">(4)</span>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--gray-600);" data-anno="7" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;"></span>All reservations</span>
                 <span class="grow" style="flex:1"></span>
                 <span class="hd-btn primary sm" data-anno="1" data-anno-pin="l" data-anno-arrow><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg> New reservation</span>
               </div>
-              <div class="hd-card">
-                <table class="hd-table">
-                  <thead><tr><th>ID</th><th>Status</th><th>Topology</th><th>Devices</th><th>Period</th><th>Purpose</th><th></th></tr></thead>
+              <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px;padding:8px 14px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:var(--radius-lg);font-size:13px;" data-anno="6" data-anno-pin="r" data-anno-arrow data-anno-color="blue">
+                <span style="font-weight:500;color:var(--gray-900);">2 selected</span>
+                <span style="font-size:12px;padding:5px 10px;border-radius:4px;border:1px solid #fca5a5;color:#b91c1c;">Cancel selected</span>
+                <span style="font-size:12px;padding:5px 10px;border-radius:4px;border:1px solid #86efac;color:#15803d;opacity:.5;">Release selected</span>
+                <span style="font-size:12px;color:var(--gray-500);">None of the selected reservations can be released: 2 not active.</span>
+                <span style="margin-left:auto;font-size:12px;color:var(--gray-600);">Clear selection</span>
+              </div>
+              <div class="hd-card"><div style="overflow-x:auto;">
+                <table class="hd-table" style="min-width:900px;">
+                  <thead><tr>
+                    <th style="width:32px;" data-anno="5" data-anno-pin="l" data-anno-arrow><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></th>
+                    <th>ID</th><th>Owner</th><th>Status</th><th>Topo ID</th><th>Topology</th><th>Devices</th>
+                    <th data-anno="8" data-anno-pin="t" data-anno-arrow data-anno-color="blue"><span style="display:inline-flex;align-items:center;gap:4px;color:var(--gray-900);">Period <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:11px;height:11px;"><path d="m6 9 6 6 6-6"/></svg></span></th>
+                    <th>Purpose</th><th></th>
+                  </tr></thead>
                   <tbody>
-                    <tr><td class="mono">f1a2b3c4</td><td data-anno="4" data-anno-pin="l" data-anno-arrow><span class="hd-badge active">ACTIVE</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td>4 devices</td><td>May 28 &ndash; Jun 04</td><td>HA failover regression</td><td><span style="color:#16a34a;font-weight:500;margin-right:10px;">Release</span><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
-                    <tr><td class="mono">a9b8c7d6</td><td><span class="hd-badge pending">PENDING</span></td><td><span class="hd-badge cloud">CLOUD</span></td><td>2 devices</td><td>May 30 &ndash; May 31</td><td>VPC peering smoke test</td><td></td></tr>
-                    <tr><td class="mono">1234abcd</td><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td>6 devices</td><td>May 30 &ndash; Jun 02</td><td>Spine-leaf burn-in</td><td></td></tr>
-                    <tr><td class="mono">deadbeef</td><td><span class="hd-badge completed">COMPLETED</span></td><td><span class="hd-badge physical">PHYSICAL</span></td><td>3 devices</td><td>May 18 &ndash; May 25</td><td>Driver cert run</td><td></td></tr>
+                    <tr style="background:#eff6ff;"><td><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span></td><td class="mono">a9b8c7d6</td><td>sara.k</td><td><span class="hd-badge pending">PENDING</span></td><td class="mono">c0ffee12</td><td><span class="hd-badge cloud">CLOUD</span></td><td style="white-space:nowrap;">2 devices</td><td style="white-space:nowrap;">5/30/2026 to 5/31/2026</td><td>VPC peering smoke test</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
+                    <tr style="background:#eff6ff;"><td><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span></td><td class="mono">1234abcd</td><td>sara.k</td><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">6 devices</td><td style="white-space:nowrap;">5/30/2026 to 6/2/2026</td><td>Spine-leaf burn-in</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
+                    <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">f1a2b3c4</td><td>jordan</td><td data-anno="4" data-anno-pin="l" data-anno-arrow><span class="hd-badge active">ACTIVE</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">4 devices</td><td style="white-space:nowrap;">5/28/2026 to 6/4/2026</td><td>HA failover regression</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
+                    <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">deadbeef</td><td>admin</td><td><span class="hd-badge completed">COMPLETED</span></td><td class="mono">4b2d7e10</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">3 devices</td><td style="white-space:nowrap;">5/18/2026 to 5/25/2026</td><td>Driver cert run</td><td></td></tr>
                   </tbody>
                 </table>
-              </div>
+              </div></div>
             </div>
           </div>
         </div>
       </div>
-      <p class="shotcap"><b>The reservations list.</b> Your bookings, newest behaviour on top.</p>
+      <p class="shotcap"><b>The reservations list.</b> Your bookings, newest on top; a click on a sortable heading changes the order. Here an admin has ticked All reservations: two of sara.k's future bookings are selected, the list is sorted by Period with the latest start first, and jordan's ACTIVE row offers the admin Cancel but not Release.</p>
     </figure>
 
     <ol class="legend">
       <li><b>New reservation.</b> The button that starts everything. Opens the form in step <a href="#create">Create a reservation</a>.</li>
-      <li><b>My Reservations.</b> Just yours. This is the default view.</li>
+      <li><b>My Reservations.</b> Just yours. This is the default view; the label reads All Reservations once an admin ticks the checkbox in item 7.</li>
       <li><b>Calendar.</b> Everyone's bookings on a timeline &mdash; use it to <a href="#calendar">find a free window</a> before you book.</li>
       <li><b>Status badge.</b> The colour tells you what's happening. Full key is <a href="#status">just below</a>.</li>
+      <li><b>The checkbox column.</b> Tick rows to act on several at once; the header checkbox selects every row on the current page (its accessible name is "Select all reservations on this page"). Ticked rows turn pale blue. The selection is dropped when you change page, change the sort, or switch the All reservations view.</li>
+      <li><b>The selection bar.</b> Appears as soon as one row is ticked: "N selected", then <b>Cancel selected</b> and <b>Release selected</b>, then <b>Clear selection</b>. Each action is checked row by row with the same rule as the per-row buttons. When no ticked row qualifies, that button is disabled and a note beside it says why, for example "None of the selected reservations can be cancelled: 1 already finished, 2 not yours." Clicking an action opens one confirmation, titled <b>Cancel Reservations</b> or <b>Release Reservations</b>, whose text counts what will run and what will be skipped: "Cancel 3 reservations? This releases their devices and cannot be undone.", or "Cancel 2 of the 3 selected reservations? This releases their devices and cannot be undone. 1 will be skipped: 1 already finished." Release says "This ends them early and frees their devices." The skip reasons are "already finished", "not active" (Release only), and "not yours". The confirm button reads "Cancel 3 reservations" or "Release 1 reservation"; the dismiss button reads "Keep reservations" or "Do not release". HERD then runs the ordinary cancel or release for each row, one at a time; there is no bulk endpoint. A success toast says "Cancelled 3 reservations"; with failures you get an error toast such as "Cancelled 2, failed 1", followed by the server's reason when every failure shares one. Rows that succeeded leave the selection; rows that failed stay ticked so you can retry or inspect them.</li>
+      <li><b>All reservations</b> <span class="badge admin-only">admin only</span>. A checkbox beside the tabs and the count. Tick it to switch the list from your own bookings to everyone's; the list returns to page one. This is what the <b>Owner</b> column is for. Admins can Cancel another user's reservation from here, but Release is only ever offered to the owner.</li>
+      <li><b>Sortable headings.</b> <b>Owner</b>, <b>Status</b>, <b>Period</b>, and <b>Purpose</b> are buttons. The first click sorts ascending, the second descending, and the third clears back to the default order, newest created first. The active heading shows an up or down chevron. Period sorts by start time; Status sorts alphabetically by status name. Changing the sort returns you to page one, and the choice is remembered with your other saved preferences. <b>ID</b>, <b>Topo ID</b>, <b>Topology</b>, and <b>Devices</b> do not sort.</li>
     </ol>
+
+    <p>The last column holds a green <b>Release</b> and a red <b>Cancel</b> text button, shown by the same rule as the bulk actions: Release on an ACTIVE reservation you own, Cancel on any PENDING, PENDING_PROVISION, or ACTIVE reservation you own or, as an admin, anyone's. Release acts at once. Cancel asks first, in a dialog titled <b>Cancel Reservation</b>: "Cancel this reservation? This releases its devices and cannot be undone.", with the buttons <b>Cancel reservation</b> and <b>Keep reservation</b>.</p>
 
     <h2 class="sec" id="create">The main event</h2>
     <p class="sectitle">Create a reservation</p>
@@ -162,9 +182,9 @@
       <table class="hd-table">
         <thead><tr><th>Badge</th><th>What it means</th><th>Who moves it</th></tr></thead>
         <tbody>
-          <tr><td><span class="hd-badge pending">PENDING</span></td><td>Booked for the future, not live yet.</td><td>Auto &rarr; ACTIVE at start time</td></tr>
-          <tr><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td>Row exists; HERD is confirming the devices. Usually seconds.</td><td>Auto, on create</td></tr>
-          <tr><td><span class="hd-badge active">ACTIVE</span></td><td>Live now. Exclusive devices are flipped to RESERVED and provisioning has fired.</td><td>You can <b>Release</b> early</td></tr>
+          <tr><td><span class="hd-badge pending">PENDING</span></td><td>Booked for the future, not live yet. A PENDING booking holds no device: an exclusive device is RESERVED only while a reservation in PENDING_PROVISION or ACTIVE holds it, the conflict check still stops an overlapping booking, and a device is released only when no other live reservation holds it.</td><td>Auto to ACTIVE at start time. You can <b>Cancel</b></td></tr>
+          <tr><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td>Row exists; HERD is confirming the devices. Usually seconds.</td><td>Auto, on create. You can <b>Cancel</b></td></tr>
+          <tr><td><span class="hd-badge active">ACTIVE</span></td><td>Live now. Exclusive devices are flipped to RESERVED and provisioning has fired.</td><td>You can <b>Release</b> early, or <b>Cancel</b></td></tr>
           <tr><td><span class="hd-badge completed">COMPLETED</span></td><td>End time passed; devices released back to the pool.</td><td>Auto, at end time</td></tr>
           <tr><td><span class="hd-badge cancelled">CANCELLED</span></td><td>You or an admin stopped it before the end.</td><td>You, via <b>Cancel</b></td></tr>
           <tr><td><span class="hd-badge failed">FAILED</span></td><td>Provisioning couldn't complete. <strong>No devices were actually reserved</strong> &mdash; the row is kept for audit.</td><td>Make a new one, or see Troubleshooting</td></tr>
@@ -174,7 +194,7 @@
 
     <div class="callout calm">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
-      <div><span class="ttl">Cancel vs Release</span><p><b>Cancel</b> stops a future or current reservation and frees its devices. <b>Release</b> ends an <span class="badge active">ACTIVE</span> reservation <em>early</em> &mdash; you're done before your end time and want to hand the gear back now. Both free the devices immediately.</p></div>
+      <div><span class="ttl">Cancel vs Release</span><p><b>Cancel</b> stops a future or current reservation and frees its devices. <b>Release</b> ends an <span class="badge active">ACTIVE</span> reservation <em>early</em>: you're done before your end time and want to hand the gear back now. Both free the devices immediately. Who may act differs: the owner or an admin may Cancel, so an admin sees Cancel on another user's reservation; only the owner may Release, so an admin who does not own the reservation sees no Release button.</p></div>
     </div>
 
     <h2 class="sec" id="exclusive">A distinction that bites people</h2>
@@ -183,7 +203,7 @@
       <div class="gcard" style="cursor:default;">
         <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
         <h3>Exclusive</h3>
-        <p>DUTs and individual test instruments. <strong>One reservation at a time.</strong> Booking it for an overlapping window fails with a conflict. Status flips to <span class="badge reserved">RESERVED</span> while held.</p>
+        <p>DUTs and individual test instruments. <strong>One reservation at a time.</strong> Booking it for an overlapping window fails with a conflict. Status flips to <span class="badge reserved">RESERVED</span> while a reservation that is being provisioned or is ACTIVE holds it; a future PENDING booking does not flip it.</p>
       </div>
       <div class="gcard" style="cursor:default;">
         <span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a3 3 0 1 0-2.8-4M6 8a3 3 0 1 1 2.8-4M12 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 20a5 5 0 0 1 9-3M21 20a5 5 0 0 0-9-3"/></svg></span>
@@ -210,6 +230,8 @@
                   <span class="hd-mtab" data-anno="3" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Routes</span>
                   <span class="hd-mtab" data-anno="4" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Wiring</span>
                   <span class="hd-mtab" data-anno="5" data-anno-pin="t" data-anno-arrow data-anno-color="blue">Schedule</span>
+                  <span style="flex:1"></span>
+                  <span style="display:inline-flex;gap:6px;align-items:center;padding-bottom:6px;"><span style="font-size:12px;padding:4px 9px;border-radius:4px;border:1px solid #93c5fd;color:var(--blue-700);">Edit topology</span><span style="font-size:12px;padding:4px 9px;border-radius:4px;border:1px solid var(--gray-300);color:var(--gray-600);">Edit Resources</span></span>
                 </div>
                 <dl class="hd-dl">
                   <dt>Status</dt><dd><span class="hd-badge active">ACTIVE</span></dd>
@@ -220,13 +242,13 @@
                   <dt>Devices</dt><dd>4</dd>
                   <dt>Dynamic instances</dt><dd data-anno="6" data-anno-pin="r" data-anno-arrow data-anno-pad="4">client-vm <span style="color:var(--gray-500);font-weight:400;">x3</span></dd>
                 </dl>
+                <div style="display:flex;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid var(--gray-200);"><span style="font-size:14px;padding:6px 12px;border-radius:4px;background:#16a34a;color:#fff;">Release</span><span style="font-size:14px;padding:6px 12px;border-radius:4px;background:#dc2626;color:#fff;">Cancel</span></div>
               </div>
-              <div class="mfoot"><span class="hd-btn secondary">Edit Resources</span><span class="hd-btn danger">Cancel reservation</span></div>
             </div>
           </div></div>
         </div>
       </div>
-      <p class="shotcap"><b>The detail modal, Details tab.</b></p>
+      <p class="shotcap"><b>The detail modal, Details tab.</b> Release and Cancel sit at the bottom of the tab; Edit topology and Edit Resources sit at the right end of the tab bar. On a finished reservation an admin also sees Classify now under the Purpose category row (legend item 8).</p>
     </figure>
 
     <ol class="legend">
@@ -237,6 +259,7 @@
       <li><b>Schedule</b> &mdash; inline-edit the end time and purpose without rebooking.</li>
       <li><b>Dynamic instances</b> &mdash; if the reservation carries dynamic requests, the Details tab lists them grouped by template with a count. The instances themselves appear once the reservation is <span class="badge active">ACTIVE</span>.</li>
       <li><b>Purpose category</b> &mdash; you (the owner) or an admin can set or change this from the same list of categories offered at creation, in any status including <span class="badge completed">COMPLETED</span>, <span class="badge cancelled">CANCELLED</span>, and <span class="badge failed">FAILED</span>, so past reservations can be classified retroactively. Anyone else sees it as a read-only tag. If the reservation carries an AI suggestion, a muted <b>AI suggested: &lt;category&gt; &lt;NN&gt;%</b> line sits under the category row (the model's reasoning shows as a tooltip on hover), with a "(dismissed)" marker once an admin has dismissed it. This line is read-only here: an admin accepts, overrides, or dismisses a suggestion from the <a href="admin-purpose-review.html">Purpose Review</a> page, not from this modal.</li>
+      <li><b>Classify now</b> <span class="badge admin-only">admin only</span>. A small button directly under the Purpose category row (and under the AI suggested line, when there is one), shown on a <span class="badge completed">COMPLETED</span>, <span class="badge cancelled">CANCELLED</span>, or <span class="badge failed">FAILED</span> reservation that has no suggestion yet. It asks the classifier for a suggestion for this one reservation, the same call <a href="admin-purpose-review.html#backfill">Classify history</a> runs over the whole backlog; while it runs the button reads "Classifying...". On success a toast says "Suggested category: &lt;category&gt;." and the button goes away. Any other outcome is a plain sentence: "Classification timed out. Check that the AI orchestrator is responding, then try again.", "The AI orchestrator could not take the request right now. Check its status, then try again.", "Classification failed. Check the AI orchestrator logs, then try again.", or "The AI orchestrator refused the request. Check that its internal token matches this service." Three refusals: "Purpose classification is disabled." when the feature is off; "This reservation already has a suggestion. Review it on the Purpose Review page."; and "This reservation is not ready to be classified." for a reservation that ended before classification existed and was never swept or backfilled (run Classify history first). On either of the last two the button goes away.</li>
     </ol>
 
     <div class="callout tip">
@@ -246,7 +269,7 @@
 
     <div class="callout tip">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
-      <div><span class="ttl">Re-wiring a live reservation</span><p>On an <span class="badge active">ACTIVE</span> reservation you own, the tab bar also shows <b>Edit topology</b>. It opens the reservation's private <strong>fork</strong> in the editor's live-edit mode &mdash; your changes never touch the shared master topology, and a <span class="badge pending">PENDING</span> reservation offers no topology editing at all (its fork doesn't exist until activation). After the reservation ends, the button becomes <b>View as-built</b>. The whole flow is <a href="user-live-editing.html">step 4, Live editing</a>.</p></div>
+      <div><span class="ttl">Re-wiring a live reservation</span><p>On an <span class="badge active">ACTIVE</span> reservation you own, the tab bar also shows <b>Edit topology</b>. It opens the reservation's private <strong>fork</strong> in the editor's live-edit mode &mdash; your changes never touch the shared master topology, and a <span class="badge pending">PENDING</span> reservation offers no topology editing at all (its fork doesn't exist until activation). After the reservation ends, the button becomes <b>View as-built</b>. The whole flow is <a href="user-live-editing.html">step 4, Live editing</a>. The green <b>Release</b> and red <b>Cancel</b> buttons at the bottom of the Details tab follow the same rules as the list: Release on your own ACTIVE reservation, Cancel on any PENDING, PENDING_PROVISION, or ACTIVE reservation you own or, as an admin, anyone's. Cancel asks first with the same "Cancel this reservation?" dialog.</p></div>
     </div>
 
     <h2 class="sec" id="calendar">Finding a free window</h2>
