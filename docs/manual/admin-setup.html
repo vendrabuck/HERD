@@ -20,7 +20,7 @@
     <a href="admin-setup.html" class="active">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -36,6 +36,7 @@
       <li><a href="#groups">4 · Device &amp; user groups</a></li>
       <li><a href="#perms">5 · Grant permissions</a></li>
       <li><a href="#dynamic">6 · Hypervisors (optional)</a></li>
+      <li><a href="#about">7 · Check versions</a></li>
     </ul>
     <p class="eyebrow">Admin track</p>
     <ul>
@@ -135,7 +136,7 @@
       <div><p>Drivers are reference-counted: you can't delete one while a template points at it. Remove or repoint the template first.</p></div>
     </div>
 
-    <p>Two driver packages for real network operating systems ship with HERD, under <code>drivers/</code> in the repository: <code>frr_l3</code> (FRRouting, connection type Layer 3 Switch) and <code>srl_l2</code> (Nokia SR Linux, connection type Layer 2 Switch). Upload either one exactly as it is. A driver must report a device's rejection of a command as a failure, so a refused change is never shown as applied; a driver that can place a route in a virtual router declares <code>supports_vrf</code> in its metadata, and HERD refuses a route that names a virtual router on any driver that does not. Both packages are exercised against a lab of the real operating systems in the project's own tests on every change (<a href="https://github.com/vendrabuck/HERD/blob/main/docs/NOS_LAB.md">docs/NOS_LAB.md</a>).</p>
+    <p>Two driver packages for real network operating systems ship with HERD, under <code>drivers/</code> in the repository: <code>frr_l3</code> (FRRouting, connection type Layer 3 Switch) and <code>srl_l2</code> (Nokia SR Linux, connection type Layer 2 Switch). Upload either one exactly as it is. A driver must report a device's rejection of a command as a failure, so a refused change is never shown as applied; a driver that can place a route in a virtual router declares <code>supports_vrf</code> in its metadata, and HERD refuses a route that names a virtual router on any driver that does not. Both packages are exercised against a lab of the real operating systems in the project's own tests on every change (<a href="https://github.com/vendrabuck/HERD/blob/main/docs/NOS_LAB.md">docs/NOS_LAB.md</a>). For the how-to, read <a href="https://github.com/vendrabuck/HERD/blob/main/docs/SIMULATED_LAB_GUIDE.md">docs/SIMULATED_LAB_GUIDE.md</a>: it compares the three simulated-hardware tiers (the mock drivers, the checked-in lab of real operating systems, and the unbuilt external simulator) and walks through building and reserving a topology on the lab in the UI.</p>
 
     <p class="sectitle" id="templates">Step 2 &middot; Create a template</p>
     <p>A template defines the fields a class of device carries and points at the driver that runs it. Go to <b>Templates &rarr; New template</b>.</p>
@@ -274,6 +275,54 @@
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
       <div><p>Dynamic templates skip the device step entirely: there is nothing to add to inventory. What users see and reserve is covered in <a href="user-topology.html#dynamic">Dynamic resources on the canvas</a>.</p></div>
     </div>
+
+    <p class="sectitle" id="about">Step 7 &middot; Check versions, after setup and after every upgrade</p>
+    <p>Open <b>Administration &rarr; About</b>, the last item in that menu. The page is admin only. It has a heading <b>About</b>, a <b>Refresh</b> button, a <b>Frontend</b> card with Version, Build, and Build date, and a <b>Services</b> table with the columns Service, Version, Build, Build date, and Status, one row per service: ACL, AI Orchestrator, Auth, Cabling, Config, Execution, Integration, Inventory, Notifications, Reservations, Secrets, User Profile.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/admin/about</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand" style="white-space:nowrap;">HERD <span style="font-size:11px;font-weight:400;color:var(--chrome-fg-muted);white-space:nowrap;">v0.6.0</span></span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a><a class="active">Administration</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
+            <div class="hd-body">
+              <div class="hd-h1" style="justify-content:space-between;">About <span class="hd-btn secondary sm" style="background:#fff;border-color:var(--gray-300);" data-anno="1" data-anno-pin="l" data-anno-arrow>Refresh</span></div>
+              <div class="hd-card" style="padding:14px 16px;margin-bottom:18px;">
+                <div style="font-size:14px;font-weight:600;color:var(--gray-900);margin-bottom:10px;">Frontend</div>
+                <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;font-size:13px;">
+                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Version</div><div style="font-weight:500;color:var(--gray-900);">0.6.0</div></div>
+                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Build</div><div class="mono" style="font-size:12px;color:var(--gray-900);">v0.6.0</div></div>
+                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Build date</div><div style="font-weight:500;color:var(--gray-900);">2026-10-01 14:05 UTC</div></div>
+                </div>
+              </div>
+              <div style="font-size:14px;font-weight:600;color:var(--gray-900);margin-bottom:10px;">Services</div>
+              <div class="hd-card"><div style="overflow-x:auto;">
+                <table class="hd-table" style="min-width:560px;">
+                  <thead><tr><th>Service</th><th>Version</th><th>Build</th><th>Build date</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td class="name">ACL</td><td>0.6.0</td><td class="mono">v0.6.0</td><td>2026-10-01 14:05 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr style="background:#fffbeb;" data-anno="2" data-anno-pin="l" data-anno-arrow><td class="name">AI Orchestrator</td><td>0.5.0 <span style="font-size:11px;font-weight:500;padding:1px 6px;border-radius:4px;background:#fef3c7;color:#92400e;">differs</span></td><td class="mono">v0.5.0 <span style="font-size:11px;font-weight:500;padding:1px 6px;border-radius:4px;background:#fef3c7;color:#92400e;">differs</span></td><td>2026-09-15 09:12 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr><td class="name">Auth</td><td>0.6.0</td><td class="mono">v0.6.0</td><td>2026-10-01 14:05 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr data-anno="3" data-anno-pin="r" data-anno-arrow data-anno-color="blue"><td class="name">Cabling</td><td style="color:var(--gray-400)">-</td><td style="color:var(--gray-400)">-</td><td style="color:var(--gray-400)">-</td><td><span style="font-size:12px;font-weight:500;color:#dc2626;">unreachable</span></td></tr>
+                    <tr><td class="name">Config</td><td>0.6.0</td><td class="mono">v0.6.0</td><td>2026-10-01 14:05 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr><td class="name" style="color:var(--gray-400);">7 more rows</td><td></td><td></td><td></td><td></td></tr>
+                  </tbody>
+                </table>
+              </div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The About page.</b> One row per service; an amber row with a "differs" badge was not rebuilt with the rest.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>Refresh</b> asks every service again. Each service is queried on its own, so one that is down cannot blank the rest of the table.</li>
+      <li><b>A "differs" row.</b> The row turns amber and the badge sits on the version or the build that does not match the frontend's. A build of <code>dev</code> is never flagged. The backend's <code>0.6.0.dev0</code> and the frontend's <code>0.6.0-dev</code> count as the same version; so do <code>0.6.0rc1</code> and <code>0.6.0-rc.1</code>, while <code>0.6.0rc1</code> and <code>0.6.0-rc.2</code> do not. A build date reads like "2026-09-19 22:18 UTC".</li>
+      <li><b>Status</b> is one of <b>reachable</b>, <b>unreachable</b> (the service did not answer), or <b>invalid response</b> (it answered 200 with a body that is not a version record, such as a proxy's error page; the row shows dashes and no skew badge).</li>
+    </ol>
+
+    <p>After an upgrade, check this page before filing a bug. A "differs" row usually means that service was not rebuilt: <code>ai-orchestrator</code>, <code>notifications</code>, <code>acl</code>, and <code>user-profile</code> have no dev mount and need <code>docker compose up -d --build &lt;service&gt;</code>. <code>make version</code> on the host prints the build string a fresh build would carry. One limit: the build string names the commit an image was built from, not its bytes, so on a dirty working tree a match is weak evidence; on a clean tagged build it is strong.</p>
 
     <hr class="rule" />
     <p class="sectitle">That's the whole chain</p>

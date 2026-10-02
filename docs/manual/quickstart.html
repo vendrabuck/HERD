@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -69,7 +69,7 @@
             <div class="hd-login">
               <div class="hd-logincard">
                 <div class="tile"><span>H</span></div>
-                <h1>HERD</h1>
+                <h1>HERD <span style="font-size:12px;font-weight:400;color:var(--gray-400);vertical-align:baseline;">v0.6.0</span></h1>
                 <p class="tag">Hardware Environment Replication and Deployment</p>
                 <div class="hd-field"><label class="hd-label">Email</label><div class="hd-input" data-anno="2" data-anno-pin="r" data-anno-arrow>you@yourcompany.com</div></div>
                 <div class="hd-field"><label class="hd-label">Password</label><div class="hd-input" style="letter-spacing:3px;">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</div></div>
@@ -90,6 +90,7 @@
       <li><b>Sign in.</b> Already have an account? Type your details and click here. Done.</li>
       <li><b>Register.</b> No account yet? Click here first. (Unless it's greyed out &mdash; see below.)</li>
     </ol>
+    <p>The small grey <code>v0.6.0</code> beside the title is the version of HERD this deployment runs. The same version shows beside the HERD wordmark in the header once you are in; the build and build date are on the admin <a href="admin-setup.html#about">About page</a>.</p>
 
     <h2 class="sec" id="signin">Getting in</h2>
     <p class="sectitle">Signing in</p>
@@ -167,7 +168,7 @@
         <div class="shot-stage">
           <div class="hd">
             <div class="hd-top" style="height:52px;">
-              <span class="brand" data-anno="1" data-anno-pin="b" data-anno-arrow data-anno-color="blue">HERD</span>
+              <span class="brand" style="white-space:nowrap;" data-anno="1" data-anno-pin="b" data-anno-arrow data-anno-color="blue">HERD <span style="font-size:11px;font-weight:400;color:var(--chrome-fg-muted);white-space:nowrap;">v0.6.0</span></span>
               <span class="nav">
                 <a class="active" data-anno="2" data-anno-pin="b" data-anno-arrow>Inventory</a>
                 <a>Templates</a>
@@ -177,7 +178,7 @@
                 <a>Administration</a>
               </span>
               <span class="grow"></span>
-              <span class="right"><span class="bell" data-anno="6" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span class="dot">3</span></span><a>Settings</a><span class="u">you</span><a>Logout</a></span>
+              <span class="right"><span class="bell" style="position:static;" data-anno="7" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg></span><span class="bell" data-anno="6" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span class="dot">3</span></span><a>Settings</a><span class="u">you</span><a>Logout</a></span>
             </div>
           </div>
         </div>
@@ -186,12 +187,13 @@
     </figure>
 
     <ol class="legend blue">
-      <li><b>HERD wordmark</b> &mdash; click it any time to get back to home base. Lost? Start here.</li>
+      <li><b>HERD wordmark</b> &mdash; click it any time to get back to home base. Lost? Start here. The small grey <code>v0.6.0</code> beside it is the version this deployment runs.</li>
       <li><b>Inventory</b> &mdash; the catalogue of equipment you're allowed to see. Browse and search here.</li>
       <li><b>Topology</b> &mdash; the drag-and-drop canvas where you draw how devices are wired together.</li>
       <li><b>Reservations</b> &mdash; your bookings, and the calendar of everyone's bookings. This is where you claim gear.</li>
       <li><b>Reporting</b> <span class="badge admin-only">admin only</span> &mdash; utilization numbers for leadership. The tab is visible to everyone, but opening it as a non-admin gets you redirected away (that's fine).</li>
       <li><b>The bell</b> &mdash; notifications about your reservations. The number is your unread count.</li>
+      <li><b>The help icon</b> (a question mark in a circle, accessible name "Help"), left of the bell. It opens this manual at <a href="https://vendrabuck.github.io/HERD/manual/">vendrabuck.github.io/HERD/manual/</a> in a new tab.</li>
     </ol>
 
     <h2 class="sec" id="next">Keep going</h2>

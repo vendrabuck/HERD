@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -271,7 +271,7 @@
 
     <p>A network element is a reachability and documentation hub only in this release: attaching a port to one records no driver call, no VLAN, no route, no ledger row. Two device ports attached to the same element validate as reachable to each other by definition, since that is what attaching them to a shared segment asserts, but the element itself is never routed through and never becomes part of what a reservation actually provisions. Elements are also topology-local, not a shared catalog: two topologies that both need "the same" VLAN segment each carry their own independent element node, same as they would for node positions or labels.</p>
 
-    <p>CSV export doesn't carry attachment lines; export as JSON if you need a byte-for-byte copy of a topology that includes elements.</p>
+    <p>CSV export doesn't carry attachment lines; export as JSON if you need a complete copy of a topology that includes elements. Device nodes in an export carry only a fixed set of fields (id, name, topology type, connection type, status, template name, template icon, and the topology-template role); a device's <code>field_data</code> is never stored on a canvas or returned from one.</p>
 
     <h2 class="sec" id="connect">Wiring it up</h2>
     <p class="sectitle">Drawing connections</p>

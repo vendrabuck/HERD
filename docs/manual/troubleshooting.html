@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html" class="active">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -122,11 +122,17 @@
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">My device configs came back "admin required"</span></summary>
       <div class="acc-body"><p>Pushing configs to devices is admin-only. Your topology and reservation were still created fine &mdash; only the config step failed. Either <strong>untick "Apply device configs"</strong> at commit, or have an admin apply them separately.</p></div></details>
 
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Generate failed with a toast listing role pairs</span></summary>
+      <div class="acc-body"><p>The generator could not find devices that can be wired for every proposed link. The toast shows a sentence, for example "The lab has no cabled path for 1 proposed connection; the topology cannot be built from the devices currently available.", then one "source role to target role" line per pair. Nothing is saved. The cause is that no cable is recorded between available devices of those two kinds. Either an admin records the cabling (Administration, Connections; see <a href="admin-equipment.html#cabling">Cabling things up</a>), or you ask again with different devices. The generator already re-asks the model up to two times (<code>AI_GENERATE_MAX_REPAIRS</code>, default 2) before this appears.</p></div></details>
+
+    <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">"Commit failed: cannot wire this topology"</span></summary>
+      <div class="acc-body"><p>After <b>Accept</b>, the commit checks the saved topology against cabling before it creates the reservation. The toast lists one line per problem link, "&lt;source role&gt; to &lt;target role&gt;: &lt;reason&gt;", with the reason in plain words: "no cable path", "device not found", "cannot connect two elements directly", or "element has no available port". The just-created topology is deleted and no reservation exists. Fix the cabling, or reject and regenerate. If cabling itself cannot answer, the commit fails with an ordinary error toast instead.</p></div></details>
+
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">There's no "AI Assistant" tab on my reservation</span></summary>
       <div class="acc-body"><p>Two reasons it hides: AI isn't configured on this deployment (same switch as the <b>Use AI</b> button), or <strong>you don't own that reservation</strong> &mdash; the assistant only runs against reservations that are yours.</p></div></details>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The assistant timed out or says it can't see a device</span></summary>
-      <div class="acc-body"><p><b>Timed out:</b> a heavy question fanned out into too many lookups &mdash; ask something narrower or split it in two. <b>"Can't see that device":</b> it's bounded by <em>your</em> visibility on purpose; if you can't see the device in inventory, neither can the assistant. Same permissions fix as <a href="#empty">an empty inventory</a>.</p></div></details>
+      <div class="acc-body"><p><b>Timed out:</b> a heavy question fanned out into too many lookups &mdash; ask something narrower or split it in two. If the assistant had already run tools before the timeout, the turn is kept and ends with "The steps above ran, but the assistant could not finish this reply. Review the results before continuing."; read the tool panel before asking again, since something may already have changed. <b>"Can't see that device":</b> it's bounded by <em>your</em> visibility on purpose; if you can't see the device in inventory, neither can the assistant. Same permissions fix as <a href="#empty">an empty inventory</a>.</p></div></details>
 
     <h2 class="sec" id="health">Health &amp; config</h2>
     <p class="sectitle">Polling &amp; config pushes</p>

@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -50,7 +50,7 @@
   <main class="main">
     <span class="kicker admin">Admin track · Setup C</span>
     <h1 class="title">Device health &amp; configuration</h1>
-    <p class="dek">Two things HERD does once your devices exist: it can <b>poll them</b> to tell you which ones are actually reachable, and it <b>versions every config it pushes</b> so you can see, diff, and roll back what changed. Neither is on by default &mdash; this page turns them on and explains what you'll see.</p>
+    <p class="dek">Two things HERD does once your devices exist: it can <b>poll them</b> to tell you which ones are actually reachable, and it <b>versions every config it pushes</b> so you can see, diff, and restore what changed. Neither is on by default &mdash; this page turns them on and explains what you'll see.</p>
 
     <div class="callout calm">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
@@ -150,13 +150,13 @@
           </div>
         </div>
       </div>
-      <p class="shotcap"><b>Configuration history.</b> Each apply is a version you can inspect, diff, or roll back to.</p>
+      <p class="shotcap"><b>Configuration history.</b> Each apply is a version you can inspect, diff, or restore as a new draft.</p>
     </figure>
 
     <ol class="legend">
       <li><b>Current.</b> The version live on the device right now.</li>
       <li><b>Diff.</b> Opens a unified diff between any version and the current one.</li>
-      <li><b>Restore.</b> Re-applies an older version as a new apply. Guarded like topology restore (issue #337): if the device is held by an active reservation (ACTIVE, PENDING_PROVISION, or PENDING) that belongs to someone else, the restore is blocked with a 409. A reservation you own does not block your own restore, and if the reservations service cannot be reached the restore fails closed with a 503 rather than proceeding.</li>
+      <li><b>Restore.</b> Creates a new config version copied from the older one and marked as restored from it. The new version is a draft: nothing is applied to the device until you apply it. Guarded like topology restore (issue #337): if the device is held by an active reservation (ACTIVE, PENDING_PROVISION, or PENDING) that belongs to someone else, the restore is blocked with a 409. A reservation you own does not block your own restore, and if the reservations service cannot be reached the restore fails closed with a 503 rather than proceeding.</li>
     </ol>
 
     <h2 class="sec" id="diff">What changed</h2>
@@ -193,6 +193,8 @@
       <li><b>Authority is re-checked when it fires.</b> A scheduled apply confirms, at fire time, that its creator still has manage rights or an active reservation on the device; if not, the job resolves as skipped with the error "creator no longer authorized for this device" instead of applying.</li>
       <li><b>30 days out, at most.</b> <code>scheduled_for</code> may be at most 30 days in the future (<code>APPLY_JOB_MAX_HORIZON_DAYS</code>); a later time is refused when you schedule.</li>
     </ul>
+    <p>Apply is gated on what the device's driver can do. Applying or scheduling a config on a device whose driver connection type does not include <code>configure</code> is refused with 409 <code>driver_cannot_configure</code>, naming the connection type and the driver, before any job is created. Today only the Management connection type can configure. The scheduled-apply loop checks again when a job fires, against the device's current driver. Creating, listing, reading, and restoring config versions are not gated on any connection type: a Layer 2 or Layer 3 version stores intent. A configure on a device with no driver at all is refused by the execution service with 409 <code>device_has_no_driver</code>, before any run is recorded.</p>
+    <p>Driver error text is sanitized. When a driver raises, the stored error on a run or an apply job is only <code>driver raised &lt;ExceptionClassName&gt;</code>; a driver that cannot be loaded stores <code>driver load failed: &lt;ExceptionClassName&gt;</code>; a driver process that dies with no structured error stores <code>driver process exited with status N</code>. The full text goes to the execution service log, tagged with the run id. A driver that returns its own failure (<code>success</code> false) keeps its own message.</p>
 
     <div class="callout tip">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13l2 2 4-4"/></svg></span>

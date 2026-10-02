@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Release 0.6.0</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+<style>
+  /* release-page only: the version identity strip */
+  .relmeta{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--gray-200);border:1px solid var(--gray-200);border-radius:var(--radius-lg);overflow:hidden;margin:26px 0 8px;}
+  .relmeta div{background:#fff;padding:14px 16px;}
+  .relmeta .k{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--gray-500);margin:0 0 4px;}
+  .relmeta .v{font-family:var(--font-mono);font-size:15px;color:var(--gray-900);margin:0;font-variant-numeric:tabular-nums;}
+  @media(max-width:680px){.relmeta{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="release-0-6-0.html" class="active">Release 0.6.0</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#what">What 0.6.0 is</a></li>
+      <li><a href="#highlights">What shipped</a></li>
+      <li><a href="#quality">Quality bar</a></li>
+      <li><a href="#boundaries">Known boundaries</a></li>
+      <li><a href="#manual">Reading the manual against this release</a></li>
+    </ul>
+    <p class="eyebrow">Shared reference</p>
+    <ul>
+      <li><a href="troubleshooting.html">Troubleshooting</a></li>
+      <li><a href="glossary.html">Glossary</a></li>
+      <li><a href="release-0-6-0.html" class="active">Release 0.6.0</a></li>
+      <li><a href="release-0-5-0.html">Release 0.5.0</a></li>
+      <li><a href="release-0-4-0.html">Release 0.4.0</a></li>
+      <li><a href="release-0-3-0.html">Release 0.3.0</a></li>
+      <li><a href="release-0-2-0.html">Release 0.2.0</a></li>
+      <li><a href="release-0-1-0.html">Release 0.1.0</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker shared">Shared reference</span>
+    <h1 class="title">Release 0.6.0</h1>
+    <p class="dek">The version this manual documents. 0.6.0 makes the two screens you live in do more: the reservations list sorts, cancels a booking before it is active, and runs Cancel and Release over a ticked set of rows; the Inventory page filters by status, template, and topology; an admin can classify one reservation's purpose with Classify now. Underneath, every reservation status write is race-safe, a device cannot be deleted while wiring still depends on it, AI generation only picks devices the lab can actually wire, and every part of the stack now says what version it is running.</p>
+
+    <div class="relmeta">
+      <div><p class="k">Version</p><p class="v">v0.6.0</p></div>
+      <div><p class="k">Released</p><p class="v">2026-10-01</p></div>
+      <div><p class="k">Tagged commit</p><p class="v">3216868f</p></div>
+    </div>
+    <p class="shotcap">Source of record: the <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.6.0">v0.6.0 release notes</a> and <a href="https://github.com/vendrabuck/HERD/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg> Read this before you file a bug</div>
+      <p>Some of the things you might expect to find are not missing by accident. The <a href="#boundaries">Known boundaries</a> section below lists what 0.6.0 deliberately does not do yet. Check it first.</p>
+    </div>
+
+    <h2 class="sec" id="what">The short version</h2>
+    <p class="sectitle">What 0.6.0 is</p>
+    <p>0.5.0 taught HERD Layer 3. 0.6.0 is about the screens and the writes behind them. On the Reservations page the Owner, Status, Period, and Purpose headings sort, a booking can be cancelled while it is still PENDING, and ticking rows gives you Cancel selected and Release selected with one confirmation that says what will be skipped and why. On the Inventory page three selects beside the search narrow the list by status, template (shown with vendor and model), and topology, and an expanded row stays open when the list refreshes under it. An admin can ask for a purpose suggestion on one finished reservation with Classify now, from its detail modal.</p>
+    <p>Under the floor, every reservation status transition is now a compare-and-swap, so a cancel that lands mid-create can no longer leave a reservation ACTIVE and never wired, and a future PENDING booking holds no device. Deleting a device is refused while a live reservation's wiring runs through it or while any cable still names it. AI generation asks cabling which candidate devices are connected before it proposes anything, and commit checks again before a reservation is created. The version shows on the login page and in the header, and an admin About page lists the version and build of the frontend and all twelve services.</p>
+
+    <h2 class="sec" id="highlights">The contents</h2>
+    <p class="sectitle">What shipped</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <div class="gcard" style="cursor:default;"><span class="num">01</span><h3>A reservations list that works at scale</h3><p>The <b>Owner</b>, <b>Status</b>, <b>Period</b>, and <b>Purpose</b> headings sort; a third click returns to the default order, and the choice persists. A booking can be cancelled before it is active. Tick rows and use <b>Cancel selected</b> or <b>Release selected</b>: one confirmation says how many will run and what will be skipped and why. An admin can cancel another user's reservation; only the owner can release. <a href="user-reservations.html#list">The list &rarr;</a> <a href="user-reservations.html#status">Status and who moves it &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">02</span><h3>Reservation status writes are race-safe</h3><p>A cancel that lands while a reservation is being created can no longer leave it ACTIVE and never wired. A future PENDING booking no longer touches device status. Back-to-back bookings of one exclusive device no longer leave it AVAILABLE under a live booking. A dynamic instance that teardown retired is never brought back by a late create. <a href="user-reservations.html#status">Reading the status badges &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">03</span><h3>Inventory page filters</h3><p><b>Status</b>, <b>Template</b> (shown with vendor and model), and <b>Topology</b> selects sit beside the name search, with a <b>Clear filters</b> control. The choices persist between visits, and an expanded device row stays open when the list refreshes under it. <a href="admin-equipment.html#inspect">The Inventory page &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">04</span><h3>Device delete refuses while wiring depends on it</h3><p>A device cannot be deleted while it is a transit hop on a live reservation's wiring, or while any cable still names it. There is no force option. The device page keeps the refusal on screen with a link to Connections. <a href="troubleshooting.html#admin">Can't delete a device &rarr;</a> <a href="admin-equipment.html#inspect">Deleting a device &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">05</span><h3>AI generation picks devices that can be wired</h3><p>Generation asks cabling which candidate devices are connected and searches for an assignment that satisfies every proposed link; commit checks wireability again before the reservation is created. Separately, a reservation assistant turn whose tools already ran is kept when the model returns no text, times out, or the provider fails, so the record of what it did survives. <a href="user-ai.html#commit">Accept and commit &rarr;</a> <a href="troubleshooting.html#ai">AI generation problems &rarr;</a> <a href="user-assistant.html#write">What the assistant can change &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">06</span><h3>Version and build visibility</h3><p>The version shows on the login page and beside the HERD wordmark in the header. An admin <b>About</b> page lists the version, build, and build date of the frontend and all twelve services and flags skew. The header help icon opens this manual. <a href="quickstart.html#nav">The top navigation &rarr;</a> <a href="admin-setup.html#about">Check versions &rarr;</a></p></div>
+    </div>
+
+    <p class="sectitle" style="margin-top:34px;">Also in this release</p>
+    <ul class="list">
+      <li>An admin can classify one reservation's purpose from its detail modal with <b>Classify now</b>. <a href="user-reservations.html#detail">The detail modal &rarr;</a></li>
+      <li>Hardened: the auth service authorizes on the lower of the token's role claim and the account's current role; the database and message-broker host ports bind to loopback only; a device node on a topology canvas keeps a fixed set of fields and never <code>field_data</code>; the execution service checks each reservation lifecycle event with the reservations service before acting; every device-scoped inventory read and the topology import follow device-group visibility; every CSV export neutralizes spreadsheet formulas. Three of these were published as <a href="https://github.com/vendrabuck/HERD/security/advisories">security advisories</a> with this release; a deployment on 0.5.0 or older should upgrade, run <code>make migrate-cabling</code> so stored canvases are scrubbed, and rotate any device password that was saved on a topology canvas by an admin.</li>
+      <li>Config apply is refused on a driver whose connection type cannot configure, and a driver's raw exception text no longer reaches a stored error. <a href="admin-health-config.html#schedule">Scheduled apply &rarr;</a></li>
+      <li>Outbound webhooks (the <code>/api/v1</code> facade) can subscribe to <code>device.health_transition</code>.</li>
+      <li>Message-bus consumers retry on an explicit delay schedule and keep a message alive while its handler runs, so a slow webhook receiver is not handed the same event twice.</li>
+      <li>A streamed assistant answer always ends in a done or an error frame.</li>
+      <li>A new task-oriented guide to the simulated-hardware tiers: <a href="https://github.com/vendrabuck/HERD/blob/main/docs/SIMULATED_LAB_GUIDE.md">docs/SIMULATED_LAB_GUIDE.md</a>.</li>
+      <li>Developer facing: the frontend toolchain floor (npm 11.11.0) is pinned, an opt-in AI generation evaluation harness exists, the JSON log formatter emits every extra field with key-name redaction, and the unused <code>HEALTH_POLL_MINIMUM_INTERVAL_SECONDS</code> setting was removed.</li>
+    </ul>
+
+    <p>The architecture is unchanged from 0.1.0: twelve FastAPI services behind Traefik, one PostgreSQL schema and migration chain per service, NATS JetStream with transactional outboxes for events. The <a href="release-0-1-0.html#architecture">0.1.0 architecture section</a> still describes it.</p>
+
+    <h2 class="sec" id="quality">What it was tested against</h2>
+    <p class="sectitle">Quality bar</p>
+    <p>Measured at the tagged commit by the full <code>make everything</code> run on 2026-10-01:</p>
+    <ul class="list">
+      <li>6,169 backend unit tests across the 13 suites plus the repo-root suite; backend line coverage 96.7% with every service at 95% or higher.</li>
+      <li>1,636 frontend tests via vitest, 91.0% line coverage.</li>
+      <li>12 OpenAPI contract snapshot suites.</li>
+      <li>230 cross-service integration tests: 221 run in the main pass, the 6 LDAP-mode tests run in their own phase against the gate stack, and 3 are gated on an AI provider or other stack configuration.</li>
+      <li>178 end-to-end browser tests, run twice: 130 on the unseeded stack (48 device-gated skips) and 174 again on the seeded stack with no unexpected skip allowed (4 exempt).</li>
+      <li>41 live-LDAP tests against the checked-in <code>infra/ldap-test</code> directory, hard-required in the gate.</li>
+      <li>28 driver tests against real FRRouting and Nokia SR Linux nodes in the checked-in lab, run on every pull request and inside the gate.</li>
+      <li>Nine Postgres-live suites against the gate database, hard-required: the seven from 0.5.0 plus two new this release, the reservation status compare-and-swap race (issue #899) and the sort-by-status ordering (issue #902).</li>
+      <li>Load: 20 simulated users for one minute, 655 requests, 0 failures, median 13 ms, p95 250 ms.</li>
+    </ul>
+    <p>New in CI this release: the frontend job reruns <code>npm install</code> and fails on any <code>package-lock.json</code> diff (issue #885). The release gate is unchanged: a clean full validation run (lint, format check, every unit suite with coverage, frontend build, contract snapshots, integration, end-to-end, and load, against a rebuilt ephemeral stack) at the tagged commit, plus the same branch-protection ruleset on <code>main</code> described on the <a href="release-0-1-0.html#quality">0.1.0 page</a>. The ruleset also covers <code>release/*</code> branches.</p>
+
+    <h2 class="sec" id="boundaries">The honest part</h2>
+    <p class="sectitle">Known boundaries</p>
+    <p>These are limits of 0.6.0, not bugs. If you hit one, the answer is "not yet", not "file a ticket". One of 0.5.0's, Classify now for a single reservation being an API call only, closed in 0.6.0: see <a href="user-reservations.html#detail">the detail modal</a>.</p>
+    <ul class="list">
+      <li><b>Network element provisioning (anchored VLANs) is a later phase.</b> Elements are canvas objects today: they attach, save, validate, and diff, but nothing is provisioned from them.</li>
+      <li><b>Manual wiring retry is not exposed through the external API.</b> The <code>/api/v1</code> wiring-status passthrough is deliberately read-only; retrying a failed connection is an interactive, owner-gated action.</li>
+      <li><b>A failed VLAN removal is logged, not blocked on.</b> If <code>delete_vlan</code> fails on last-free, the allocation is already released and the empty definition lingers on the switch until an operator removes it. Bounded lingering is the accepted trade.</li>
+      <li><b>AI recipe authoring is dark by default.</b> Unchanged from 0.1.0: it stays behind <code>AI_RECIPE_AUTHORING_ENABLED</code>.</li>
+      <li><b>Driver packages are trusted code.</b> Unchanged from 0.1.0: POSIX <code>setrlimit</code> caps and a subprocess boundary are resource bounding, not OS-level isolation.</li>
+      <li><b>Purpose classification is off by default.</b> It needs a configured AI provider and <code>AI_PURPOSE_CLASSIFICATION_ENABLED</code>. A suggestion never writes the confirmed category by itself; an owner or an admin does.</li>
+      <li><b>Config-version history for a device outside your groups answers "Device not found".</b> The same answer as the device page gives. That is the visibility rule catching up, not a missing device.</li>
+      <li><b>A route that names a virtual router needs a driver that declares it.</b> Only a driver declaring <code>supports_vrf</code> drives one; on any other driver the route is refused as <code>l3_vrf_unsupported</code> and stays visible in the Wiring tab until the intent or the driver changes. The shipped <code>frr_l3</code> driver declares it.</li>
+      <li><b>The assistant's web sources are off by default.</b> They stay behind <code>AI_DOCS_WEB_ENABLED</code> and are limited to operator-allowlisted https prefixes; the built-in manual and any configured folders are on.</li>
+      <li><b>A delete right after a cancel can still precede teardown.</b> Execution tears down a cancelled reservation's wiring asynchronously, so a device delete issued in that window can still be refused as in use for a moment. The delete guard answers 503 when cabling or reservations cannot be asked.</li>
+      <li><b>Webhook delivery is at-least-once.</b> A crash while a POST is in flight can still deliver the same event again. Receivers should treat an event id they have already seen as a repeat.</li>
+      <li><b>Classify now can show on a finished reservation that is not yet eligible.</b> A reservation that ended before classification existed and was never swept or backfilled shows the button and answers "This reservation is not ready to be classified." Run <b>Classify history</b> first.</li>
+      <li><b>The Period column sorts by start time.</b> There is no heading that sorts by end time in the UI; the API accepts <code>sort_by=end_time</code>.</li>
+      <li><b>The About page's skew check is strong evidence on a clean tagged build and weak on a dirty one.</b> The build string names the commit an image was built from, not its bytes, so two images built from the same dirty tree read as identical.</li>
+    </ul>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><p>Some manual pages describe screens that only appear when a feature is configured, for example the <b>AI Assistant</b> tab, the <b>Use AI</b> button, the <b>LDAP Sync</b> page's actions, the <b>Purpose Review</b> queue, and the <b>Classify now</b> button. On an install where the feature is off, those surfaces are hidden or inactive. That is the feature gate, not a broken deployment.</p></div>
+    </div>
+
+    <h2 class="sec" id="manual">Version and docs</h2>
+    <p class="sectitle">Reading the manual against this release</p>
+    <p>This manual is published from the repository and now documents <b>0.6.0</b>. The <a href="release-0-5-0.html">0.5.0 page</a> remains as the record of the previous release, and links the 0.4.0 and earlier records in turn. If a screen in front of you does not match a page here, check your deployed version before assuming the page is wrong: it shows beside the HERD wordmark in the header and on the sign-in card.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Full release notes, the tag, and the changelog live in the repository: <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.6.0">github.com/vendrabuck/HERD releases/tag/v0.6.0</a>.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Release 0.6.0</p>
+      <div class="pagenav">
+        <a href="release-0-5-0.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Release 0.5.0</a>
+        <a href="index.html">Home <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+</body>
+</html>

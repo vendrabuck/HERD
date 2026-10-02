@@ -20,7 +20,7 @@
     <a href="admin-setup.html" class="active">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -100,7 +100,7 @@
 
     <h2 class="sec" id="inspect">Step three</h2>
     <p class="sectitle">See ports right in the table</p>
-    <p>Back in Inventory, click the chevron on a row to expand it. You get audit info, group membership, and the device's ports &mdash; each with a <b>Connected To</b> link if it's cabled.</p>
+    <p>Back in Inventory, click the chevron on a row to expand it. You get audit info, group membership, and the device's ports &mdash; each with a <b>Connected To</b> link if it's cabled. An expanded row stays open when the list changes under it (a search finishing, a filter change): only rows that left the list close. The selection for bulk delete is still cleared on any list change.</p>
 
     <figure class="shot">
       <div class="shot-frame">
@@ -110,6 +110,13 @@
             <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a class="active">Inventory</a><a>Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
             <div class="hd-body">
               <div class="hd-h1">All Devices <span class="count">(10)</span></div>
+              <div class="hd-filters" style="align-items:flex-end;" data-anno="4" data-anno-pin="b" data-anno-arrow data-anno-color="blue">
+                <div class="hd-search" style="color:var(--gray-400);padding:9px 12px;max-width:260px;">Search devices by name...</div>
+                <div style="display:flex;flex-direction:column;gap:4px;"><span style="font-size:11px;font-weight:500;color:var(--gray-500);">Status</span><div class="hd-select" style="min-width:120px;">All</div></div>
+                <div style="display:flex;flex-direction:column;gap:4px;"><span style="font-size:11px;font-weight:500;color:var(--gray-500);">Template</span><div class="hd-select" style="min-width:150px;">All</div></div>
+                <div style="display:flex;flex-direction:column;gap:4px;"><span style="font-size:11px;font-weight:500;color:var(--gray-500);">Topology</span><div class="hd-select" style="min-width:120px;">PHYSICAL</div></div>
+                <span class="hd-btn secondary" style="border-color:transparent;">Clear filters</span>
+              </div>
               <div class="hd-card">
                 <table class="hd-table">
                   <thead><tr><th></th><th>Name</th><th>Template</th><th>Topology</th><th>Status</th></tr></thead>
@@ -128,16 +135,20 @@
           </div>
         </div>
       </div>
-      <p class="shotcap"><b>An expanded device row</b> showing its ports and what each is cabled to.</p>
+      <p class="shotcap"><b>An expanded device row</b> showing its ports and what each is cabled to, under the filter row.</p>
     </figure>
 
     <ol class="legend">
       <li><b>The chevron</b> expands and collapses the row's detail.</li>
       <li><b>Connected To.</b> A cabled port shows the device and port on the other end &mdash; click through to it.</li>
       <li><b>"not cabled".</b> This port has no physical connection recorded. Edges that try to use it go red with "uncabled port".</li>
+      <li><b>The filter row.</b> The name search ("Search devices by name...") and three labelled selects: <b>Status</b> (All, AVAILABLE, RESERVED, OFFLINE, MAINTENANCE), <b>Template</b> (All, then every device template shown as its name followed by vendor and model in parentheses, which is how you filter by vendor or model), and <b>Topology</b> (All, PHYSICAL, CLOUD). They combine with each other and with the search; any change returns to page one, and the count beside <b>All Devices</b> is the matching total. A <b>Clear filters</b> button appears whenever a filter or the search is active and resets all of them. When nothing matches, the table says "No devices match the current filters." with a Clear filters link instead of the plain "No devices found". Your choices are remembered between visits; a remembered status, topology, or template that no longer exists falls back to All.</li>
     </ol>
 
     <p>The table pages rather than scrolls. A <b>Rows per page</b> selector at the bottom of the table offers 25, 50, 100, or 200 rows and is remembered across sessions, next to the <b>Page X of Y</b> indicator and its <b>Prev</b> and <b>Next</b> buttons.</p>
+
+    <p class="sectitle">Deleting a device</p>
+    <p>An admin deletes a device from its device page with <b>Delete</b> (the confirm dialog is titled <b>Delete Device</b>), or from the Inventory page by ticking rows and using <b>Delete Selected</b> (confirm dialog <b>Delete devices</b>). HERD refuses the delete while a live reservation holds the device or carries its wiring as a transit hop (<code>device_in_use</code>), and while any cable still names it (<code>device_cabled</code>). The device page keeps the refusal on screen with an <b>Open Connections</b> link, for example "Device is still cabled (2 connections) and cannot be deleted. Remove its cables first."; a bulk delete reports "Deleted 1, failed 2. 2 still cabled: remove their cables first". There is no force option, and the delete also refuses when HERD cannot ask cabling or reservations. Both refusals are explained in <a href="troubleshooting.html#admin">Troubleshooting</a>.</p>
 
     <h2 class="sec" id="cabling">The important part</h2>
     <p class="sectitle">Cabling things up</p>
@@ -242,6 +253,7 @@
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
       <div><p>Devices and templates are admin-only to import. Topologies can be exported and imported by any signed-in user. Reservations, permissions, and users are deliberately <em>not</em> bulk-importable &mdash; those are created in HERD, not migrated in a spreadsheet.</p></div>
     </div>
+    <p>Two things to know about the files themselves. First, every CSV HERD writes puts a single leading quote on a free-text cell whose first character (ignoring leading spaces) is <code>=</code>, <code>+</code>, <code>-</code>, <code>@</code>, a tab, or a carriage return, so a spreadsheet shows literal text instead of running it. That covers the free-text columns of the topology export (topology, device, and port names), the device and template exports, and the utilization report's CSV (owner and fleet device names); fixed enumerations, numbers, and the JSON <code>field_data</code> and <code>sections</code> columns are left alone. The three importers (topologies, devices, templates) strip that one quote again, only when a trigger character follows it, so an exported <code>=1+1</code> round-trips unchanged and a name that starts with an apostrophe for its own reasons is never touched. Second, a non-admin importing topologies sees a device outside their groups the same way as one that does not exist: the row is rejected with <code>unresolved device names: &lt;names&gt;</code>, in a dry run and a real run alike, and nothing is stored for it. An admin is unfiltered. If HERD cannot check visibility, the import fails with a 503 and processes nothing.</p>
 
     <div class="foot">
       <p>HERD User Manual &middot; Equipment &amp; cabling (admin)</p>

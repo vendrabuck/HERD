@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-5-0.html">Release 0.5.0</a>
+    <a href="release-0-6-0.html">Release 0.6.0</a>
   </nav>
 </header>
 
@@ -239,7 +239,8 @@
         <ul class="list">
           <li><b>No AI Assistant tab at all:</b> AI isn't configured on this deployment (same switch as the <a href="user-ai.html#have">Use AI</a> button); ask your admin; or you're looking at a reservation you don't own.</li>
           <li><b>&ldquo;Not configured&rdquo; / it refuses:</b> the AI provider isn't set up. Admin task, not yours.</li>
-          <li><b>It timed out:</b> a heavy question that fanned out into many lookups can hit the deadline. Ask something narrower, or break it into two questions.</li>
+          <li><b>It timed out:</b> a heavy question that fanned out into many lookups can hit the deadline. Ask something narrower, or break it into two questions. If no tool had run yet, the turn is an error and nothing from it is saved. If tools had already run, the turn is kept instead (next item).</li>
+          <li><b>It answered with a fixed sentence instead of a summary:</b> the assistant ran tools, so something may already have changed, and then could not write its reply. If the model returned no text you get "I ran the steps above but did not produce a summary. Check the tool results for what was done, or ask me again." If it timed out, the provider failed, or the tool budget ran out after the tools ran, you get "The steps above ran, but the assistant could not finish this reply. Review the results before continuing." In both cases the turn is kept, the tool panel shows what ran, and a config version the assistant proposed is kept too. Read the panel before asking again.</li>
           <li><b>It says it can't see a device:</b> that device isn't in your visibility. Same permissions fix as <a href="quickstart.html#empty">first boot</a>; the assistant is bounded by your access on purpose.</li>
         </ul>
       </div>
