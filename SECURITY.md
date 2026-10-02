@@ -6,8 +6,7 @@ HERD is developed on `main` and tagged for release (the latest is v0.6.0, with a
 
 | Version | Supported |
 | ------- | --------- |
-| main (latest commit, 0.7.0.dev0) | yes |
-| 0.6.0 (latest release) | yes |
+| main (latest commit) | yes |
 | older | no |
 
 If you are operating an older checkout, upgrade to the latest release or pull `main` before filing a security report so we're both working from the same code.
