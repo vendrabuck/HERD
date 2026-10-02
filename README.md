@@ -127,7 +127,7 @@ and instructions for creating the superadmin account.
 
 - Docker + Docker Compose
 - `uv` (Python package manager)
-- Node.js 22+ (for local frontend development)
+- Node.js 22.22.2+ and npm 11.11.0+ (for local frontend development; `frontend/.npmrc` sets `engine-strict`, so an older host is refused by `npm ci`, see [FRESH_SETUP.md](FRESH_SETUP.md))
 
 ### Run the full stack
 
@@ -204,7 +204,7 @@ make test-e2e        # Run E2E browser tests (Selenium + Playwright, requires ru
 make coverage        # Run all backend tests with coverage report
 make lint            # ruff check + eslint
 make format          # ruff format + ruff check --fix
-make master          # Full validation: lint + unit + frontend + build + live LDAP + ephemeral stack + integration + e2e + LDAP-mode stack tests + Postgres-live LDAP sync tests (no coverage)
+make master          # Full validation: lint + unit + frontend + build + live LDAP + ephemeral stack + integration + e2e + LDAP-mode stack tests + the nine Postgres-live suites (no coverage)
 make master-clean    # Same as master, but wipes herd-* images first and forces a no-cache rebuild
 make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, the NOS lab dialect tests, seed, headless locust load; on success the seeded gate stack is left running (make gate-down to stop)
 make migrate         # Run Alembic migrations
@@ -224,11 +224,11 @@ make frontend-dev    # Run frontend dev server
 ### Device ports
 - Ports are children of devices, typed by port templates
 - Full CRUD including bulk creation
-- Deleting a device cascades to its ports
+- Deleting a device cascades to its ports; an admin delete is refused with 409 while a live reservation's wiring depends on the device (`device_in_use`) or a cable still names it (`device_cabled`)
 
 ### Exclusive vs non-exclusive reservations
 - Templates have an `exclusive` flag (default: true)
-- Exclusive devices: single reservation at a time, conflict detection enforced, status toggled on reserve/release
+- Exclusive devices: single reservation at a time, conflict detection enforced, status is RESERVED while a PENDING_PROVISION or ACTIVE reservation holds it, AVAILABLE again on release
 - Non-exclusive devices (shared infrastructure): skip conflict detection, multiple concurrent reservations allowed, status unchanged
 
 ### Driver packages
@@ -265,7 +265,7 @@ make frontend-dev    # Run frontend dev server
 ### Reservation calendar
 - Gantt-style timeline with day, week, and month views
 - Cross-user visibility with status filters
-- Click-to-view reservation details with cancel/release actions
+- Click-to-view reservation details with cancel/release actions; the Reservations list sorts by Owner, Status, Period, and Purpose and offers a bulk Cancel and Release on selected rows
 
 ### Pathfinding
 - On-demand BFS shortest-path computation through L1 switch infrastructure (uniform-weight graph, so breadth-first yields a minimum-hop path)
@@ -483,9 +483,9 @@ at the point of use via secrets' internal, `X-Internal-Token`-gated endpoint.
 
 ## Testing
 
-Over 5,400 backend unit tests across the 13 services, over 1,400 frontend tests via vitest, and 221 cross-service integration tests (a handful self-skip: AI-config-dependent cases when no provider is configured, NATS-dependent cases when JetStream isn't reachable, and LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). That last gate is not merely theoretical: `make master`, `make everything`, and the nightly workflow all run a `_gate-ldap-stack-tests` phase after e2e that switches the ephemeral stack's auth service to LDAP mode, so `tests/integration/test_ldap_auth.py` (login) and `test_ldap_sync_admin.py` (directory-group mapping, sync-now, run polling, group-membership reconcile, concurrent-sync-now contention) actually execute rather than self-skipping, then restores auth to local mode before any later phase runs. A sibling `_gate-pg-live-tests` phase runs the Postgres-live advisory-lock and cross-replica sync-lock coverage against the gate stack's own Postgres. Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). 164 E2E browser tests, 120 via Selenium and 44 via Playwright (most active, a few conditional skips). Locust load tests at `tests/load/` (6 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against the checked-in `osixia/openldap` test directory (`infra/ldap-test/`, started with `make ldap-up`); `make master` and `make everything` run these hard-required, so they cannot silently skip in a gate (see `docs/ENV_VARS.md` LDAP section for runtime LDAP config).
+Over 6,100 backend unit tests across the 13 services and the repo-root suite, over 1,600 frontend tests via vitest, and 230 cross-service integration tests (a handful self-skip: AI-config-dependent cases when no provider is configured, NATS-dependent cases when JetStream isn't reachable, and LDAP-integration cases gated by `HERD_INTEGRATION_LDAP=1`). That last gate is not merely theoretical: `make master`, `make everything`, and the nightly workflow all run a `_gate-ldap-stack-tests` phase after e2e that switches the ephemeral stack's auth service to LDAP mode, so `tests/integration/test_ldap_auth.py` (login) and `test_ldap_sync_admin.py` (directory-group mapping, sync-now, run polling, group-membership reconcile, concurrent-sync-now contention) actually execute rather than self-skipping, then restores auth to local mode before any later phase runs. A sibling `_gate-pg-live-tests` phase runs the nine Postgres-live suites (`services/*/tests/*_live_pg.py`: advisory locks and the LDAP sync lock, the fork restore and port-claim races, the L3 route-key width, the wiring retry claim race, the outbox wake path, and the reservation status compare-and-swap and status sort) against the gate stack's own Postgres. Contract tests under `tests/contract/` (OpenAPI shape-signature snapshots that fail when a public-API field is added, removed, or retyped; wired into `make master` and `make everything`). 178 E2E browser tests across Selenium and Playwright (a few conditional skips on an unseeded stack). Locust load tests at `tests/load/` (7 user classes, headless run for 1 minute at 20 VU, zero failures). A separate `make test-auth-ldap` target runs the live-LDAP auth tests against the checked-in `osixia/openldap` test directory (`infra/ldap-test/`, started with `make ldap-up`); `make master` and `make everything` run these hard-required, so they cannot silently skip in a gate (see `docs/ENV_VARS.md` LDAP section for runtime LDAP config).
 
-Coverage targets 85%+ per backend service; run `make coverage` for the current per-service report (or `make coverage-<svc>` for one service with an HTML report). Outstanding test gaps are tracked in [docs/GAPS.md](docs/GAPS.md).
+Coverage targets 85%+ per backend service (the v0.6.0 release gate measured 96.7% overall backend line coverage with every service at 95% or higher, and 91.0% frontend line coverage); run `make coverage` for the current per-service report (or `make coverage-<svc>` for one service with an HTML report). Outstanding test gaps are tracked in [docs/GAPS.md](docs/GAPS.md).
 
 ```bash
 # Backend unit tests (SQLite in-memory via aiosqlite)

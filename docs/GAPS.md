@@ -67,7 +67,8 @@ unsaved-routing-changes warning). `TopologyEditorPage.tsx` itself is now at 96.7
   file). Calendar rendering, month navigation, and reservation-click handling are
   all untested.
 
-Measured frontend coverage on main is 90.46% lines (1,375 tests, 138 test files).
+Measured frontend coverage at the v0.6.0 release gate is 91.0% lines (89.65% statements, 82.09% branches, 89.14% functions; 1,636 tests, 148 test files).
+The per-file percentages below date from the 2026-09-09 refresh and were not re-measured for v0.6.0.
 The files below 85% lines, all predating v0.2.0, grouped by area with a note on
 what a test would still need to cover:
 
@@ -133,7 +134,7 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 ## E2E
 
-`tests/e2e/` has 56 files and 164 tests (120 Selenium, 44 Playwright; see README.md's Testing section for the source gate run). Remaining UI gaps:
+`tests/e2e/` has 58 test files and 178 tests across Selenium and Playwright (the v0.6.0 release gate: 130 passed and 48 skipped unseeded, 174 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
@@ -154,7 +155,8 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 `tests/load/locustfile.py` covers auth login, reservations, inventory list/detail,
 templates list, ACL check, bulk export (devices/templates/topologies, JSON and CSV,
-plus a dry-run import), and notifications (unread-count, list, preferences write).
+plus a dry-run import), notifications (unread-count, list, preferences write), a
+routed-topology validation task, and bulk connection creation (`POST /connections/bulk`).
 Missing coverage:
 
 - [MEDIUM] Topology write endpoints (create, update, canvas save, versions) beyond

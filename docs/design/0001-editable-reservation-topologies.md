@@ -11,7 +11,7 @@ Context verified against the live HERD-public tree on 2026-06-09.
 ## Context
 
 HERD is 12 FastAPI microservices under `services/`, with no cross-schema FKs or
-JOINs: services reference each other by UUID over HTTP (see `CLAUDE.md`,
+JOINs: services reference each other by UUID over HTTP (see
 `docs/ARCHITECTURE.md`). Issue #25 is the fork-on-reserve model: an immutable
 parent topology, an editable per-reservation child fork created at activation, a
 release-before-build reconcile on save, and a retained immutable as-built record

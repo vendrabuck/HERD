@@ -5,6 +5,7 @@ Status: Accepted 2026-09-08 (all six decisions made by Lane on 2026-09-08:
 strict fail-closed variant; see Decision). No code in this doc. Context verified against the
 live HERD-public tree on 2026-09-08 (main at 4ea94541). Symbols are the
 stable reference; line numbers are as of that commit.
+Delivered: all four phases (issue #34) shipped; see the phase amendments below and FEATURES.md.
 
 ## Context
 

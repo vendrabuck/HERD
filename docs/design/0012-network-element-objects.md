@@ -5,6 +5,7 @@ day; see Decision). No code in this doc. Context verified against the live
 HERD-public tree on 2026-08-29 (main at 16fe4b28). Line-number citations in
 this document are as of main 16fe4b28 unless a later amendment says
 otherwise; symbols are the stable reference.
+Delivered: network element objects (issue #22) shipped, with AI generation of elements delivered via issue #632; see FEATURES.md.
 
 ## Context
 
