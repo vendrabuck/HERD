@@ -4,6 +4,7 @@ Status: Accepted 2026-07-07. The three product-level decision points below
 were resolved with the owner on 2026-07-07 and the engineering defaults were
 accepted in review. No code in this doc. Context verified against the live
 tree on 2026-07-07 (main at the fleet-utilization merge).
+Delivered: AI recipe authoring (issue #28) shipped, dark by default behind `AI_RECIPE_AUTHORING_ENABLED`; see FEATURES.md and `docs/AI_RECIPES.md`.
 
 ## Context
 

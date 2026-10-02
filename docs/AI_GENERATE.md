@@ -132,7 +132,7 @@ Before creating the reservation, the orchestrator calls cabling's own `POST /top
 
 - The execute endpoint requires either admin or a device `manage` grant. If you are not an admin and lack a `manage` grant on a device, that device comes back with `status: failed` and an error of `Admin access or device manage grant required` (or `Admin access required` for a non-`configure` action). The topology and reservation are still created; only the config step fails.
 - Per-device failures are recorded in the response as `config_results` but are not persisted in the UI after you navigate away. If you need to see them later, check execution-runs in the execution service's `/runs` endpoint.
-- L1/L2 fabric wiring and L3 static routes are provisioned by the NATS flow automatically on reservation lifecycle events (L3 routes come from the switch's latest config version; see [DRIVERS.md](DRIVERS.md)); `configure` on Management devices is the only thing the `apply_configs` commit step triggers directly.
+- L1/L2 fabric wiring and L3 static routes are provisioned by the NATS flow automatically on reservation lifecycle events (L3 routes come from the fork's Layer 3 routing intent when the topology carries it, otherwise from the switch's latest config version; see [DRIVERS.md](DRIVERS.md)); `configure` on Management devices is the only thing the `apply_configs` commit step triggers directly.
 
 ## Rollback behavior
 

@@ -4,6 +4,7 @@ Status: Accepted 2026-09-04 (eleven decision points resolved by Lane the same
 day, recorded on issue #646; see Decision). No code in this doc. Context
 verified against the live HERD-public tree on 2026-09-04 (main at af83bdb3).
 Symbols are the stable reference; line numbers are as of that commit.
+Delivered: all three phases (issue #646) shipped; see FEATURES.md and `docs/AI_PURPOSE_CLASSIFICATION.md`.
 
 ## Context
 

@@ -184,3 +184,11 @@ driver upload/delete (integration + e2e), port-conflict 409s
 (integration; two-user UI flow tracked as a proposed e2e case), DLQ and
 redelivery behavior (integration with mock drivers), config precedence
 ladder (unit + integration).
+Since v0.6.0 the Reservations bulk Cancel and Release
+(`test_reservations_bulk_playwright.py`), the Reservations sort
+(`test_reservations_sort_playwright.py`), the Inventory Status, Template, and
+Topology filters (`test_inventory_filters_playwright.py`), the expanded inventory
+row surviving a refetch (`test_inventory_expanded_playwright.py`), the admin
+Classify now action (`test_purpose_classify_playwright.py`), and a slow webhook
+receiver getting exactly one POST (`test_webhook_slow_receiver_live.py`,
+integration) are automated too.

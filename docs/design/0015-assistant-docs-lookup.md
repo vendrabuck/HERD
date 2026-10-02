@@ -3,6 +3,7 @@
 Status: Accepted 2026-09-13 (three decisions made by Lane on 2026-09-13: sources are a
 local corpus first with allowlisted web fetch behind a separate flag; HERD's own manual is
 a built-in corpus source; the tool surface is `search_docs` plus `read_doc`). Issue #31.
+Delivered: the `search_docs` and `read_doc` tools (issue #31) shipped; see FEATURES.md.
 
 ## Context
 

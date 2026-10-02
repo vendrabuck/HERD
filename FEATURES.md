@@ -55,12 +55,21 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   vendor and model), and Topology filters beside the name search, each with an All
   option, composing with the search and pagination, saved per user and restored on the
   next visit, with a Clear filters control and a filtered-empty state.
+- **Device delete guards** (Shipped, issues #900 and #940): an admin cannot delete a
+  device while a live reservation's wiring depends on it, either as a booked member or
+  as a transit hop on a non-archived fork (409 `device_in_use`, with
+  `reservation_ids` and `transit_reservation_ids`), or while any cable still names it
+  (409 `device_cabled`, with `connection_count` and `connection_ids`). An unreachable
+  upstream refuses with 503, and there is no force flag.
 - **Exclusive vs non-exclusive flag** (Shipped): exclusive devices get conflict
   detection; shared infrastructure (such as switches) can take concurrent
   reservations.
 - **Bulk import and export** (Shipped): CSV and JSON import-export for devices,
   templates, and topologies, with a dry-run preview, per-row error reporting, and
-  cross-instance reference resolution by name. Targets migration between HERD
+  cross-instance reference resolution by name. Every CSV writer neutralizes
+  spreadsheet formulas (a text cell starting with `=`, `+`, `-`, `@`, a tab, or a
+  carriage return gets a leading quote) and the importers undo exactly that, so an
+  exported value round-trips (issue #910). Targets migration between HERD
   instances and bulk onboarding of existing inventory. Reservations, ACL grants,
   and users are out of scope.
 
@@ -171,6 +180,14 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Conflict detection** (Shipped): time-window conflict checks for exclusive devices.
 - **Automatic expiration** (Shipped): pending reservations activate and active
   reservations complete on schedule.
+- **Reservations list sorting** (Shipped, issues #844 and #902): the Owner, Status,
+  Period (start time), and Purpose headings sort the Reservations list server-side
+  (ascending, then descending, then back to the default newest-first order), and the
+  choice is saved per user. Status sorts alphabetically by status name.
+- **Cancel before activation** (Shipped, issue #841): Cancel is offered on PENDING,
+  PENDING_PROVISION, and ACTIVE reservations, matching the backend rule; Release stays
+  ACTIVE-only. The reservation status writes behind it are compare-and-swap, so a
+  cancel racing an activation leaves exactly one winner (issues #897 to #899).
 - **Bulk cancel and release** (Shipped, issue #843): the Reservations list has a
   checkbox per row and a select-all for the current page. Cancel selected and
   Release selected fan out over the per-id endpoints behind one confirmation that
@@ -286,6 +303,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   network elements (VLAN segment, subnet, external cloud, patch trunk) and
   attach devices to them, with the committer choosing the actual device port
   on commit (issue #632).
+- **AI generation evaluation harness** (Shipped, issue #826): an opt-in, scored
+  measurement (`make ai-eval`, skipped unless `HERD_AI_EVAL=1`) of how often a generated
+  proposal resolves to a wireable set of devices on a seeded stack with a configured
+  provider. It is in no gate and no CI job.
 - **Reservation assistant** (Shipped): a multi-turn tool-use loop lets the
   reservation owner ask read-only questions about a running reservation
   (device state, config history, paths, recent executions) and, when
@@ -401,6 +422,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   own row, and a service whose version or build differs from the frontend's is flagged,
   which is how a partly rebuilt stack becomes visible. The build string is derived from
   the release tags (`git describe`), so it needs no counter to maintain. (Issue #846.)
+- **In-app help link** (Shipped, issue #960): the `?` icon in the header, beside the
+  notification bell, opens the published user manual at
+  <https://vendrabuck.github.io/HERD/manual/> in a new tab.
 - **Config service** (Shipped): zero-database web UI for configuring HERD on first
   start. Values saved through the UI take precedence over `.env`; an auto-bootstrapped
   config file stays subordinate, so pure-`.env` setups behave unchanged.

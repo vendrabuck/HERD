@@ -224,5 +224,4 @@ The per-conversation budget above is separate from the optional per-user daily q
 
 ## Future iterations
 
-- Streaming responses (current responses are returned as a single completed turn).
 - Optional cross-reservation conversation memory for users who own multiple related reservations.

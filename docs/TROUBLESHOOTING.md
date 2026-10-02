@@ -54,6 +54,14 @@ Happens to non-admin users. Three possibilities, in order of likelihood:
 
 To tell (1) from (2): an admin should see the same devices you cannot; if the admin also gets 503 on the helper endpoints, it's (2).
 
+### Deleting a device is refused with `409 device_in_use`, `409 device_cabled`, or `503`
+
+Inventory refuses an admin device delete while wiring still depends on the device (issues #900 and #940). There is no force flag.
+
+- `409` with `"error": "device_in_use"`: a live reservation (PENDING, PENDING_PROVISION, or ACTIVE) holds the device as a booked member, or a non-archived reservation fork routes through it as a transit hop. `reservation_ids` is the union of both; `transit_reservation_ids` is the subset that holds it only as a transit hop. Cancel those reservations or let them end, then retry. A delete just after a cancel can still precede execution's asynchronous teardown, so wait a moment.
+- `409` with `"error": "device_cabled"` (checked after the one above): a cabling connection still names the device on either end. `connection_count` is the true total and `connection_ids` a sample of up to 10. Delete the cables first (Administration, then Connections), then delete the device.
+- `503` "Could not verify device is not in use": the reservations or cabling service could not be asked, or cabling answered without the connection fields (an older cabling image). The delete fails closed; check both services' health, and after an upgrade confirm cabling was rebuilt.
+
 ### Palette is empty but Inventory list has devices
 
 The equipment palette only shows DUTs (`Management` connection type) that aren't already on the canvas. If your inventory is all infrastructure switches, nothing appears in the palette by design.
@@ -71,6 +79,8 @@ Diagnose:
 - Check that `INTERNAL_API_TOKEN` is set consistently across services (a mismatch here is the most common cause).
 
 Recover: create a new reservation for the same devices and window. Keep the `FAILED` row for audit or cancel it to hide it.
+
+A second cause (issue #898): a `PENDING` reservation whose whole window had already elapsed when the expiration sweep reached it (the sweep was down, or the window was very short) is moved to `FAILED` without any inventory or fork call, and the reservations log carries `action=reservation_window_elapsed`. Nothing was provisioned; book a new window.
 
 ### `503 Failed to reserve devices in inventory after retries`
 
@@ -141,6 +151,14 @@ unverified route land.
 ### `409 Inventory shifted during generation`
 
 Between the LLM's proposal and the device resolver's fetch, a device the LLM wanted became unavailable (reserved, status changed, or missing). Regenerate.
+
+### `422 topology_unconnectable` during AI generation
+
+After the repair budget (`AI_GENERATE_MAX_REPAIRS`, default 2) the proposal still names role pairs that no available devices can connect (issue #828). The body lists each pair by role and template. The lab's cabling has no path between any available device of the two templates: add the missing cables or devices, free a reserved device, or regenerate with a prompt that steers the model to other templates. See [AI_GENERATE.md](AI_GENERATE.md).
+
+### `422 topology_unwireable` or `503` during AI commit
+
+Commit re-validates the saved canvas against cabling before the reservation is created (issue #827). A `422 topology_unwireable` names each bad edge by role; the new topology is deleted, so nothing is left behind. A `503` means cabling could not answer, and the commit fails closed; check cabling's health and retry. See [AI_GENERATE.md](AI_GENERATE.md#commit-time-wireability-check).
 
 ### `422` during AI commit with a config-validation error
 

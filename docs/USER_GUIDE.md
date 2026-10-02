@@ -61,6 +61,8 @@ Transitions you can trigger:
 
 The same rule applies to the buttons on a row, the detail modal, and the bulk actions below: the owner or an admin may cancel a reservation, and only the owner may release one. To cancel or release several reservations at once, tick the checkbox on each row of the Reservations list (the box in the header selects every row on the current page) and use **Cancel selected** or **Release selected** in the bar that appears. Changing the page, the sort order, or the "All reservations" view clears the selection. Each action asks for one confirmation that says how many selected reservations it will act on and how many it will skip and why: a reservation that has already finished, one that is not `ACTIVE` (Release only), or one you may not act on (for Release, any you do not own, even as an admin; for Cancel, any you neither own nor can cancel as an admin) is skipped, never acted on. If none of the selected reservations qualifies, the action is disabled and says why. Cancelling cannot be undone. The page then reports the result, for example "Cancelled 2, failed 1: <reason>" when every failure has the same reason, or just the counts when they differ. Reservations that succeeded leave the selection; reservations that failed stay selected so you can see which ones to retry.
 
+The Reservations list sorts from its column headings (issue #844): **Owner**, **Status**, **Period** (sorts by start time), and **Purpose** (the purpose category). Click a heading once for ascending, again for descending, and a third time to return to the default order (newest created first). **Status** sorts alphabetically by status name. ID, Topo ID, Topology, and Devices are plain headings. Your choice is saved and restored the next time you open the page.
+
 Transitions the system runs automatically:
 
 - **Activate** (`PENDING -> ACTIVE`): at your reservation's start time.
@@ -228,6 +230,7 @@ Forgotten passwords: contact an admin. There is no self-serve reset flow today.
 - Badge you don't understand: see [Reservation lifecycle](#reservation-lifecycle) above.
 - Empty device list or error toast: see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 - Question about the API: every backend service has live OpenAPI docs at `https://<your-host>/api/<service>/docs` (you must be logged in as an admin to hit most endpoints directly).
+- Help: the **?** icon in the header, beside the notification bell, opens the published [user manual](https://vendrabuck.github.io/HERD/manual/) in a new tab.
 - Feature reference: the [README.md](../README.md) has the full feature list and architecture overview.
 
 For admins, the next stop is [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md).

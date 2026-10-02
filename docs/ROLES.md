@@ -1664,7 +1664,7 @@ Authorization: Bearer <admin-token>
 | `/api/reservations/{id}` | GET | yes (owner only) | yes (owner only) | yes (owner only) |
 | `/api/reservations/{id}` | PATCH | yes (owner only) | yes (owner only) | yes (owner only) |
 | `/api/reservations/{id}` | DELETE | yes (owner only) | any reservation | any reservation |
-| `/api/reservations/{id}/release` | PUT | yes | yes | yes |
+| `/api/reservations/{id}/release` | PUT | yes (owner only) | yes (owner only) | yes (owner only) |
 | `/api/reservations/{id}/fork` | GET | owner only | owner or admin | owner or admin |
 | `/api/reservations/{id}/fork/canvas` | PUT | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
 | `/api/reservations/{id}/fork/save` | POST | owner only, ACTIVE only | owner or admin, ACTIVE only | owner or admin, ACTIVE only |
@@ -1742,6 +1742,16 @@ reservation, not just their own; a non-admin cancelling a reservation they do no
 still gets 404. An admin cancelling a reservation they do not own is recorded in the
 reservation's `cancelled_by` field (an owner self-cancel leaves it null), and emits the
 same `reservation.cancelled` event as an owner self-cancel.
+`PUT /api/reservations/{id}/release` is owner-only for every role: it passes only the
+caller's id, so an admin who does not own the reservation gets 404 (issue #843 mirrors
+this in the UI through `canReleaseAs`).
+
+The integration service also registers a test-only webhook sink, `POST /webhooks/echo`
+(accepts a `delay_ms` query parameter, clamped to 10 seconds) and
+`GET /webhooks/echo/hits?event_id=...` (how many POSTs carried that payload `event_id`).
+Both are unauthenticated and excluded from the OpenAPI document, and they exist only
+when `WEBHOOK_TEST_SINK_ENABLED=true`, which only `docker-compose.override.yml` sets;
+`make prod` never registers them (`services/integration/app/routers/webhooks.py`).
 
 ---
 

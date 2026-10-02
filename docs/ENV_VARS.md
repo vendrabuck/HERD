@@ -47,6 +47,7 @@ These must be set before the stack will run. The config service first-run flow w
 | `POSTGRES_USER` | `herd` | postgres, all backend services | Database owner. |
 | `POSTGRES_PASSWORD` | strong password | postgres, all backend services | Database password. |
 | `POSTGRES_DB` | `herd` | postgres, all backend services | Database name. |
+| `POSTGRES_PORT` | `5433` | docker-compose host binding | Host port Postgres is published on, bound to `127.0.0.1` only (`docker-compose.yml` line 122, issue #708). Not read by any service; they reach Postgres on the compose network at `postgres:5432`. |
 
 ## Superadmin seed (first-run only)
 

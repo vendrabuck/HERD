@@ -3,6 +3,7 @@
 Status: Accepted 2026-07-03; all six decision points below were resolved to
 their recommended defaults. No code in this doc. Context verified against
 the live HERD-public tree on 2026-07-03 (main at the secrets-service merge).
+Delivered: the dynamic-resources epic (issue #32) shipped end to end; see FEATURES.md and CHANGELOG.md.
 
 ## Context
 
