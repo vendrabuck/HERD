@@ -106,6 +106,10 @@ and the methods login, logout, create_instance, destroy_instance, status.
 instance_ref is the hypervisor-side identity; field_data carries instance \
 attributes (management address, etc.) for the materialized device. Make \
 creation idempotent keyed on context["HERD_request_id"] where the API allows.
+- create_instance and destroy_instance MUST return an explicit "success": True \
+on success (a result without a "success" key counts as a failure), and a \
+successful create_instance MUST return a non-empty string instance_ref, also \
+under dry-run.
 - create_instance MUST name the hypervisor-side instance from \
 context["HERD_request_id"] (for example "herd-" + request id) and reuse an \
 instance that already has that name, because a create can be retried or \

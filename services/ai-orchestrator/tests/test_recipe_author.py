@@ -220,6 +220,11 @@ def test_prompt_states_the_keyed_destroy_requirement():
         RECIPE_SYSTEM_PROMPT
     )
     assert f'"{_KEYED_STEP}"' in RECIPE_SYSTEM_PROMPT
+    # The validator judges create/destroy by the consumer's rule (#937 review).
+    assert 'MUST return an explicit "success": True' in RECIPE_SYSTEM_PROMPT
+    assert "MUST return a non-empty string instance_ref, also under dry-run" in (
+        RECIPE_SYSTEM_PROMPT
+    )
 
 
 def test_prompt_names_the_validator_step_label_execution_reports():
@@ -262,7 +267,9 @@ def test_reference_recipe_names_create_and_keyed_destroy_alike():
     request_id = str(uuid.uuid4())
     driver = _reference_driver_cls()({"HERD_request_id": request_id, "dry_run": True})
     assert driver._instance_name() == "herd-" + request_id
-    assert driver.create_instance()["instance_ref"] == "sim-herd-" + request_id
+    created = driver.create_instance()
+    assert created["success"] is True
+    assert created["instance_ref"] == "sim-herd-" + request_id
     assert driver.destroy_instance(instance_ref=None)["keyed"] is True
     assert driver.destroy_instance(instance_ref="sim-x")["keyed"] is False
 

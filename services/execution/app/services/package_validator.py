@@ -33,6 +33,7 @@ from app.services.driver_loader import (
     read_driver_metadata,
 )
 from app.services.driver_sandbox import execute_driver_method, extract_config_schema
+from app.services.recipe_result import created_instance_ref, recipe_reported_success
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,10 @@ SUPPORTED_CONNECTION_TYPES = frozenset({"Hypervisor"})
 # the recipe must find the instance by the name it derived from HERD_request_id
 # (or report success when none exists). The validator runs it as its own step
 # after the by-ref destroy, so a recipe that raises or fails without an
-# instance_ref fails validation. It reports under this label rather than a
+# instance_ref fails validation. Under dry-run a compliant recipe returns before
+# any lookup, so the step proves the recipe tolerates the call and answers with
+# the right shape; it cannot prove the recipe really resolves the instance by
+# name. It reports under this label rather than a
 # second "destroy_instance" entry, so every report entry keeps a unique action
 # (the drivers-page panel keys its rows on it) and the repair feedback names
 # exactly which call failed.
@@ -315,6 +319,36 @@ def _method_passed(result: dict) -> bool:
     return True
 
 
+# What the consumer requires of the two instance methods, worded for the
+# report (and so for the recipe-authoring repair prompt).
+_CREATE_RULE = (
+    'create_instance must return "success": true and a non-empty string '
+    '"instance_ref"; the execution consumer treats anything else as a failed create'
+)
+_DESTROY_RULE = (
+    'destroy_instance must return "success": true; the execution consumer treats '
+    "a missing or false success as a failed destroy"
+)
+
+
+def _step_verdict(action: str, result: dict) -> tuple[bool, str | None]:
+    """Judge one dry-run step by the rule the consumer applies at runtime.
+
+    create_instance and destroy_instance go through the consumer's own
+    predicates (app.services.recipe_result), so a recipe that validates green
+    cannot fail every real provision on a missing success key or a missing
+    instance_ref (issue #937). The other methods keep _method_passed. Returns
+    (passed, rule text to report when the step failed on the rule alone).
+    """
+    if action == "create_instance":
+        ok = recipe_reported_success(result) and created_instance_ref(result) is not None
+        return ok, None if ok else _CREATE_RULE
+    if action == "destroy_instance":
+        ok = recipe_reported_success(result)
+        return ok, None if ok else _DESTROY_RULE
+    return _method_passed(result), None
+
+
 def _validation_error_text(result: dict) -> str | None:
     """The error text a validation report carries for one sandbox result.
 
@@ -360,20 +394,21 @@ def _run_dry_run_lifecycle(package_dir: Path) -> dict:
             driver_metadata=metadata,
             password_keys=password_keys,
         )
-        ok = _method_passed(result)
+        ok, rule = _step_verdict(action, result)
         passed = passed and ok
         output = result.get("output")
-        if action == "create_instance" and isinstance(output, dict):
-            ref = output.get("instance_ref")
-            if isinstance(ref, str) and ref:
-                instance_ref = ref
+        if action == "create_instance":
+            instance_ref = created_instance_ref(result)
+        error = _validation_error_text(result)
+        if error is None and rule is not None:
+            error = rule
         methods.append(
             {
                 "action": label,
                 "passed": ok,
                 "success": bool(result.get("success")),
                 "output": output,
-                "error": _validation_error_text(result),
+                "error": error,
                 "duration_ms": result.get("duration_ms"),
                 "transcript": result.get("transcript") or [],
             }

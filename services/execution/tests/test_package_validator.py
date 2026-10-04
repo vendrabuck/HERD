@@ -335,7 +335,11 @@ def _with_destroy(body: str) -> str:
     "destroy_body, expected_error",
     [
         (_LEGACY_DESTROY_RAISES, "AttributeError: 'NoneType' object has no attribute 'upper'"),
-        (_LEGACY_DESTROY_REQUIRED_ARG, None),
+        (
+            _LEGACY_DESTROY_REQUIRED_ARG,
+            'destroy_instance must return "success": true; the execution consumer '
+            "treats a missing or false success as a failed destroy",
+        ),
     ],
 )
 def test_recipe_that_cannot_destroy_without_instance_ref_fails_validation(
@@ -347,6 +351,69 @@ def test_recipe_that_cannot_destroy_without_instance_ref_fails_validation(
     assert by_action[KEYED_DESTROY_STEP]["passed"] is False
     assert by_action[KEYED_DESTROY_STEP]["error"] == expected_error
     assert report["dry_run"]["passed"] is False
+    assert report["valid"] is False
+
+
+# --- the validator judges by the consumer's rule (issue #937 review) ---
+
+
+def test_validator_shares_the_consumer_predicates():
+    """One rule, not a copy: the validator and the consumer import the same
+    functions, so they cannot drift."""
+    from app.services import nats_consumer, package_validator
+
+    assert package_validator.recipe_reported_success is nats_consumer._recipe_reported_success
+    assert package_validator.created_instance_ref is nats_consumer._created_instance_ref
+
+
+_CREATE_RULE_TEXT = (
+    'create_instance must return "success": true and a non-empty string "instance_ref"; '
+    "the execution consumer treats anything else as a failed create"
+)
+
+
+@pytest.mark.parametrize(
+    "create_return",
+    [
+        # No success key: _method_passed used to call this a pass.
+        '{"instance_ref": "sim-1", "field_data": {}}',
+        # Success without a usable handle.
+        '{"success": True, "field_data": {}}',
+        '{"success": True, "instance_ref": "", "field_data": {}}',
+        '{"success": True, "instance_ref": 4711, "field_data": {}}',
+    ],
+)
+def test_create_that_the_consumer_would_reject_fails_validation(create_return):
+    original = """        return {
+            "success": True,
+            "instance_ref": ref,
+            "field_data": {"management_ip": "192.0.2.10"},
+        }"""
+    assert original in GOOD_DRIVER
+    driver = GOOD_DRIVER.replace(original, f"        return {create_return}")
+    report = run(good_package_b64(**{"driver.py": driver}))
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert by_action["create_instance"]["passed"] is False
+    assert by_action["create_instance"]["error"] == _CREATE_RULE_TEXT
+    assert report["valid"] is False
+
+
+def test_destroy_without_a_success_key_fails_validation():
+    report = run(
+        good_package_b64(
+            **{
+                "driver.py": _with_destroy(
+                    """
+    def destroy_instance(self, instance_ref=None, **_):
+        return {"received_ref": instance_ref}
+"""
+                )
+            }
+        )
+    )
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert by_action["destroy_instance"]["passed"] is False
+    assert by_action[KEYED_DESTROY_STEP]["passed"] is False
     assert report["valid"] is False
 
 
