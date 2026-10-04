@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Docs: specifications under `docs/specs/`, one per feature area, each rule tied to the code that enforces it and the test that pins it. The first is `docs/specs/reservations.md`; `tests/unit/test_spec_references.py` fails when a specification names a path, symbol, test, link, or section that no longer exists.
 - Fixed: ending a reservation no longer leaks a dynamic instance whose create failed,
   timed out, or lost its process after touching the hypervisor. Teardown used to treat a
   ledger row with no `instance_ref` as "nothing was created" and mark it `DESTROYED`
