@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Fixed: on the Inventory page, a saved search could be lost when the user changed the
+  Status, Template, or Topology filter within about 300 ms of the saved preferences
+  arriving after a page load. The filter change saved an empty search in place of the
+  saved one. A saved search now applies to the device list as soon as it loads, without
+  waiting for the search debounce, and every later save carries it. Only typed text
+  still goes through the debounce. The Topologies page already worked this way and now
+  has tests that pin it (#982).
 - Security: the e2e Selenium container now publishes its WebDriver endpoint (4444) and
   its noVNC browser view (7900) on 127.0.0.1 only. Neither port authenticates, and both
   used to listen on every host interface while the container was up (during

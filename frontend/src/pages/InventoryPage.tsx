@@ -235,7 +235,13 @@ export function InventoryPage() {
   const [skip, setSkip] = useState(0);
   const [userSearch, setUserSearch] = useState<string | null>(null);
   const searchInput = userSearch ?? storedSearch;
-  const [debouncedSearch, setDebouncedSearch] = useState(storedSearch);
+  // The applied search: the saved value until the user types, then the
+  // debounced typed value (issue #982, the #959 shape). The saved value applies
+  // at once, never through the debounce, so a saved search that loads after
+  // mount is already in effect, and carried by every persisted write, before
+  // any other control can be changed.
+  const [debouncedUserSearch, setDebouncedUserSearch] = useState<string | null>(null);
+  const debouncedSearch = debouncedUserSearch ?? storedSearch;
 
   // Column filters: null means the user has not touched the control, so the
   // saved value shows; "" is an explicit All. Saved values are validated on read
@@ -280,28 +286,25 @@ export function InventoryPage() {
   };
 
   useEffect(() => {
-    // Skip entirely when the input already matches what is applied: this is
-    // true on every mount (debouncedSearch is seeded from storedSearch, and
-    // searchInput starts equal to it too), so without this guard the effect
-    // would still arm a 300ms timer that calls setSkip(0) unconditionally.
-    // That stray timer raced a same-page Next click in e2e (a click just
-    // after mount landed setSkip(50), then the leftover mount-timer fired
-    // setSkip(0) a moment later and silently reverted it); see nightly run
-    // 33300868733, test_inventory_pagination_next_advances_page.
-    if (searchInput === debouncedSearch) return;
+    // Only typing arms the timer, and only when the text differs from what is
+    // applied. A loaded saved search never arms it: a stray timer once raced a
+    // same-page Next click in e2e (the timer's setSkip(0) reverted a Next click
+    // made just after mount; nightly run 33300868733,
+    // test_inventory_pagination_next_advances_page), and a timer armed by a
+    // late preference load let a filter change persist an empty search
+    // (issue #982).
+    if (userSearch === null || userSearch === debouncedSearch) return;
     const timer = setTimeout(() => {
-      setDebouncedSearch(searchInput);
+      setDebouncedUserSearch(userSearch);
       setSkip(0);
-      if (userSearch !== null) {
-        persistFilters({ search: userSearch });
-      }
+      persistFilters({ search: userSearch });
     }, 300);
     return () => clearTimeout(timer);
     // debouncedSearch is intentionally excluded below: including it would
     // re-run this effect (and re-arm the timer) every time the timer itself
-    // fires, since the timer's own setDebouncedSearch call changes it.
+    // fires, since the timer's own setDebouncedUserSearch call changes it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchInput, userSearch, setSavedFilter]);
+  }, [userSearch, setSavedFilter]);
 
   const activeFilters: DeviceFilters = {};
   if (debouncedSearch) activeFilters.search = debouncedSearch;
@@ -333,7 +336,7 @@ export function InventoryPage() {
   };
   const clearFilters = () => {
     setUserSearch("");
-    setDebouncedSearch("");
+    setDebouncedUserSearch("");
     setUserStatus("");
     setUserTemplate("");
     setUserTopology("");

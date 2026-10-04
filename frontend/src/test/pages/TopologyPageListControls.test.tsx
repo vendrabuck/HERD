@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -254,6 +254,50 @@ describe("search and Owner filter (issue #958)", () => {
     expect(last(seen).get("owner")).toBe("mine");
     expect(screen.getByLabelText("Search topologies")).toHaveValue("edge");
     expect(screen.getByLabelText("Owner")).toHaveValue("mine");
+  });
+
+  // Issue #982: the preferences arrive after the first list request, as on a
+  // full page reload. This page already has the #959 shape; these pin it.
+  it("a saved search that loads after mount applies at once and survives an Owner change", async () => {
+    const seen = serveList([topo(1)]);
+    renderPage();
+    await screen.findByText("Topo 1");
+    act(() => {
+      usePreferencesStore.setState({ savedFilters: { topologies: { search: "late" } } });
+    });
+    // Changed at once, before any 300 ms debounce could run.
+    fireEvent.change(screen.getByLabelText("Owner"), { target: { value: "mine" } });
+    await waitFor(() => expect(last(seen).get("owner")).toBe("mine"));
+    expect(last(seen).get("search")).toBe("late");
+    expect(usePreferencesStore.getState().savedFilters.topologies).toEqual({
+      search: "late",
+      owner: "mine",
+    });
+    expect(screen.getByLabelText("Search topologies")).toHaveValue("late");
+  });
+
+  it("a saved search that loads after mount survives a sort click and Clear filters clears it", async () => {
+    const seen = serveList([topo(1)]);
+    renderPage();
+    await screen.findByText("Topo 1");
+    act(() => {
+      usePreferencesStore.setState({ savedFilters: { topologies: { search: "late" } } });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Name" }));
+    await waitFor(() => expect(last(seen).get("sort_by")).toBe("name"));
+    expect(last(seen).get("search")).toBe("late");
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 450));
+    });
+    expect(usePreferencesStore.getState().savedFilters.topologies).toEqual({ search: "late" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => expect(last(seen).get("search")).toBeNull());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 450));
+    });
+    expect(usePreferencesStore.getState().savedFilters.topologies).toEqual({ search: "" });
+    expect(last(seen).get("search")).toBeNull();
   });
 
   it("a stale saved owner falls back to All and is never sent", async () => {
