@@ -25,6 +25,8 @@ import httpx
 import nats
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 NATS_URL_HOST = os.getenv("NATS_URL_HOST", "nats://localhost:4222")
@@ -402,7 +404,7 @@ async def test_redelivery_does_not_rerun_succeeded_add_to_vlan(
         for reservation in reservations:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         for topology_id in topology_ids:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

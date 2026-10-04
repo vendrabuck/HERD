@@ -1,5 +1,5 @@
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base, get_db
@@ -51,6 +51,16 @@ async def _override_get_db() -> AsyncSession:
 def _noop_reservation_guard():
     """Default: no active reservations, so restore proceeds."""
     with patch("app.routes.versions.find_blocking_reservations", return_value=[]) as m:
+        yield m
+
+
+@pytest.fixture
+def _no_live_reservations_for_delete():
+    """Issue #977: the topology DELETE asks reservations first; answer none."""
+    with patch(
+        "app.services.reservation_guard.find_blocking_reservations_strict",
+        AsyncMock(return_value=[]),
+    ) as m:
         yield m
 
 
@@ -286,7 +296,7 @@ async def test_admin_can_restore(user_client):
 
 
 @pytest.mark.asyncio
-async def test_delete_topology_cascades_versions(user_client):
+async def test_delete_topology_cascades_versions(user_client, _no_live_reservations_for_delete):
     topology_id = await _make_topology(user_client)
     await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n1"}], "edges": []})
     await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n2"}], "edges": []})

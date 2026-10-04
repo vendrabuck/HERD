@@ -29,6 +29,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -288,7 +290,7 @@ async def test_transit_switch_on_live_fork_blocks_delete_until_cancel(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         if not switch_deleted:

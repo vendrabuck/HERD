@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -174,6 +176,6 @@ async def test_activation_fork_resolves_two_port_distinct_edges_to_two_connectio
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for connection_id in connection_ids:
             await admin_client.delete(f"/cabling/connections/{connection_id}")

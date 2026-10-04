@@ -21,6 +21,7 @@ from ._device_teardown import delete_device_checked
 from ._l3_helpers import create_connection as _create_connection
 from ._l3_helpers import create_device as _create_device
 from ._l3_helpers import create_l3_driver, create_l3_template
+from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
 
@@ -169,7 +170,7 @@ async def test_validate_valid_l3_intent(admin_client, l3_switch, fresh_device):
         assert body["invalid_routes"] == []
     finally:
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
 
@@ -196,7 +197,7 @@ async def test_validate_bad_destination_reports_reason(admin_client, l3_switch, 
         assert body["invalid_routes"][0]["device_id"] == l3_switch["id"]
     finally:
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
 
@@ -251,6 +252,6 @@ async def test_commit_reservation_reads_l3_routes_back_and_survives_cancel_archi
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")

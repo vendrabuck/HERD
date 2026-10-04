@@ -196,6 +196,39 @@ describe("topology mutation error toasts (#135)", () => {
     expect(toastError).toHaveBeenCalledWith("Failed to delete topology");
   });
 
+  it("useDeleteTopology toasts the in-use reason for the structured 409 (#977)", async () => {
+    server.use(
+      http.delete("/api/cabling/topologies/t1", () =>
+        HttpResponse.json(
+          { detail: { error: "topology_in_use", reservation_ids: ["r-1", "r-2"] } },
+          { status: 409 },
+        ),
+      ),
+    );
+    const { result } = renderHook(() => useDeleteTopology(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync("t1").catch(() => {});
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toastError).toHaveBeenCalledWith(
+      "Topology not deleted. In use by 2 reservations. Cancel them or wait for them to end, then delete again.",
+    );
+  });
+
+  it("useDeleteTopology toasts the plain-string 503 detail (#977)", async () => {
+    server.use(
+      http.delete("/api/cabling/topologies/t1", () =>
+        HttpResponse.json({ detail: "Could not verify topology is not in use" }, { status: 503 }),
+      ),
+    );
+    const { result } = renderHook(() => useDeleteTopology(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync("t1").catch(() => {});
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(toastError).toHaveBeenCalledWith("Could not verify topology is not in use");
+  });
+
   it("useCloneTopology toasts on failure", async () => {
     server.use(
       http.post("/api/cabling/topologies/t1/clone", () =>

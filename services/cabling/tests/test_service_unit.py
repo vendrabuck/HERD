@@ -4,6 +4,7 @@ Bypasses ASGITransport to ensure pytest-cov tracks coverage of handler bodies.
 """
 
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.database import Base
@@ -439,11 +440,16 @@ async def test_topology_delete_direct():
             payload={"sub": str(USER_ID), "username": "testuser"},
             db=db,
         )
-        await delete_topology(
-            topology_id=created.id,
-            payload={"sub": str(USER_ID), "role": "admin"},
-            db=db,
-        )
+        # Issue #977: no live reservation references it, so the delete proceeds.
+        with patch(
+            "app.services.reservation_guard.find_blocking_reservations_strict",
+            AsyncMock(return_value=[]),
+        ):
+            await delete_topology(
+                topology_id=created.id,
+                payload={"sub": str(USER_ID), "role": "admin"},
+                db=db,
+            )
 
 
 @pytest.mark.asyncio

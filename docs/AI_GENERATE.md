@@ -140,7 +140,10 @@ If anything during the commit fails after the topology is created:
 
 - Canvas save fails: topology deleted, error surfaced.
 - Wireability check fails (an unwireable edge, or cabling could not answer): topology deleted, error surfaced.
-- Reservation create fails: topology deleted, error surfaced.
+- Reservation create fails: topology deleted, error surfaced. If the reservation was in fact
+  created (for example the response was lost to a timeout), cabling refuses the delete with
+  409 `topology_in_use` (#977); the topology is kept for that reservation and the refusal is
+  logged as `rollback_topology_delete_refused`.
 - Config apply fails (per-device): **no rollback**; the topology and reservation persist, the failure is recorded in the response.
 
 If the initial topology creation fails, nothing is rolled back because there is nothing to undo.

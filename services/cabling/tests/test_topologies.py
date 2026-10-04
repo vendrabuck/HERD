@@ -76,6 +76,25 @@ def unfiltered_visibility():
         yield
 
 
+# Issue #977: DELETE /topologies/{id} asks reservations whether a live
+# reservation references the topology. These patch the strict lookup itself,
+# so the guard's own 409 logic still runs.
+_STRICT_LOOKUP = "app.services.reservation_guard.find_blocking_reservations_strict"
+
+
+@pytest.fixture
+def no_live_reservations():
+    with patch(_STRICT_LOOKUP, AsyncMock(return_value=[])) as m:
+        yield m
+
+
+@pytest.fixture
+def reservations_must_not_be_asked():
+    """The 404 and the 403 come first: the lookup must never run for them."""
+    with patch(_STRICT_LOOKUP, AsyncMock(side_effect=AssertionError("guard consulted"))) as m:
+        yield m
+
+
 @pytest.fixture
 async def admin_client():
     app.dependency_overrides[get_current_user_payload] = _override_admin
@@ -194,7 +213,7 @@ async def test_update_topology_forbidden_for_other_user(user_client):
 
 
 @pytest.mark.asyncio
-async def test_delete_topology(user_client):
+async def test_delete_topology(user_client, no_live_reservations):
     create_resp = await user_client.post("/topologies", json={"name": "My Lab"})
     topology_id = create_resp.json()["id"]
     resp = await user_client.delete(f"/topologies/{topology_id}")
@@ -205,14 +224,16 @@ async def test_delete_topology(user_client):
 
 
 @pytest.mark.asyncio
-async def test_delete_topology_not_found(user_client):
+async def test_delete_topology_not_found(user_client, reservations_must_not_be_asked):
     fake_id = str(uuid.uuid4())
     resp = await user_client.delete(f"/topologies/{fake_id}")
     assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_delete_topology_forbidden_for_other_user(user_client):
+async def test_delete_topology_forbidden_for_other_user(
+    user_client, reservations_must_not_be_asked
+):
     create_resp = await user_client.post("/topologies", json={"name": "My Lab"})
     topology_id = create_resp.json()["id"]
     # Switch to other user
@@ -222,6 +243,7 @@ async def test_delete_topology_forbidden_for_other_user(user_client):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         resp = await ac.delete(f"/topologies/{topology_id}")
     assert resp.status_code == 403
+    reservations_must_not_be_asked.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -428,7 +450,7 @@ async def test_update_topology_not_found(user_client):
 
 
 @pytest.mark.asyncio
-async def test_delete_topology_by_admin(user_client, admin_client):
+async def test_delete_topology_by_admin(user_client, admin_client, no_live_reservations):
     """Admin deletes another user's topology."""
     create_resp = await user_client.post("/topologies", json={"name": "To Delete"})
     topology_id = create_resp.json()["id"]
@@ -523,7 +545,7 @@ async def test_owner_name_preserved_on_update(user_client):
 
 
 @pytest.mark.asyncio
-async def test_delete_topology_by_superadmin(user_client, superadmin_client):
+async def test_delete_topology_by_superadmin(user_client, superadmin_client, no_live_reservations):
     """Superadmin can delete another user's topology."""
     create_resp = await user_client.post("/topologies", json={"name": "To Delete"})
     topology_id = create_resp.json()["id"]

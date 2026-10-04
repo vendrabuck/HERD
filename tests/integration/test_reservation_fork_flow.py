@@ -33,6 +33,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 INTERNAL_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
@@ -161,7 +163,7 @@ async def test_fork_lifecycle_read_edit_save_archive(admin_client, fresh_devices
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)
         await admin_client.delete(f"/cabling/connections/{connection_id}")
 
 
@@ -477,7 +479,7 @@ async def test_fork_restore_to_draft_is_canvas_only_then_save_reconciles(
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)
         await admin_client.delete(f"/cabling/connections/{connection_ab}")
         await admin_client.delete(f"/cabling/connections/{connection_ac}")
 

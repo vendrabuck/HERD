@@ -48,6 +48,8 @@ import httpx
 import nats
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 NATS_URL_HOST = os.getenv("NATS_URL_HOST", "nats://localhost:4222")
@@ -396,7 +398,7 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
         for res in reservations:
             await admin_client.delete(f"/reservations/{res['id']}")
         for topology_id in topology_ids:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -472,7 +474,7 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{sw_ok['id']}")
@@ -549,7 +551,7 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

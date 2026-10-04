@@ -20,6 +20,8 @@ import uuid
 
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 # A marker used in place of a real credential: never a real password, just a
 # distinctive string this test can grep the serialized response for.
 _PASSWORD_MARKER = f"herd-int-test-marker-{uuid.uuid4().hex[:12]}"
@@ -100,4 +102,4 @@ async def test_field_data_never_survives_a_topology_save(admin_client, fresh_dev
         assert csv_export.status_code == 200
         _assert_clean(csv_export.text)
     finally:
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)

@@ -13,7 +13,7 @@ import {
 import type { TopologyListQuery } from "@/api/topologies";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
-import { errorDetail } from "@/lib/errors";
+import { topologyDeleteErrorText } from "@/lib/errors";
 import { applySettled } from "@/lib/reservationBulk";
 import {
   BULK_DELETE_KEEP_LABEL,
@@ -310,7 +310,9 @@ export function TopologyPage() {
     } catch {
       results = [];
     }
-    const outcome = applySettled(selectedIds, ids, results, (err) => errorDetail(err, "") || null);
+    const outcome = applySettled(selectedIds, ids, results, (err) =>
+      topologyDeleteErrorText(err, "") || null,
+    );
     setSelection({
       key: viewKey,
       ids: outcome.remaining,

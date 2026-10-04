@@ -20,7 +20,7 @@ from app.schemas.topology import (
     TopologyValidationResponse,
 )
 from app.services.canvas_nodes import redact_invisible_device_nodes, strip_device_nodes
-from app.services.reservation_guard import find_blocking_reservations
+from app.services.reservation_guard import assert_topology_deletable, find_blocking_reservations
 from app.services.topology_validation import run_full_topology_validation
 from app.services.version_service import commit_with_new_version
 from app.services.visible_devices import resolve_caller_visibility
@@ -394,6 +394,11 @@ async def delete_topology(
     user_role = payload.get("role", "user")
     if str(topology.created_by) != payload["sub"] and user_role not in ("admin", "superadmin"):
         raise HTTPException(status_code=403, detail="Not authorized to delete this topology")
+
+    # Issue #977: refuse while a live reservation references the topology (409
+    # topology_in_use; 503 when reservations cannot answer). Runs after the 404
+    # and the 403 so an unauthorized caller learns nothing about reservations.
+    await assert_topology_deletable(topology_id)
 
     await db.delete(topology)
     await db.commit()

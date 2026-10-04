@@ -12,6 +12,8 @@ import uuid
 
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -530,7 +532,7 @@ async def test_hidden_device_is_not_a_validate_or_pathfind_oracle(
         # Best-effort, admin-owned teardown in reverse dependency order; the two
         # DUTs belong to the fresh_devices fixture.
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for connection_id in connection_ids:
             await admin_client.delete(f"/cabling/connections/{connection_id}")
         if switch_id:

@@ -304,6 +304,38 @@ async def test_delete_topology_swallows_exception(caplog):
     assert any(r.message == "rollback_topology_delete_failed" for r in caplog.records)
 
 
+async def test_delete_topology_logs_a_refused_rollback(caplog):
+    """Issue #977: a 409 topology_in_use rollback is logged, never raised."""
+    import logging
+
+    async with httpx.AsyncClient() as client:
+        with respx.mock as mock:
+            mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").mock(
+                return_value=httpx.Response(
+                    409,
+                    json={"detail": {"error": "topology_in_use", "reservation_ids": ["r1"]}},
+                )
+            )
+            with caplog.at_level(logging.WARNING):
+                await _delete_topology(client, {"Authorization": "Bearer t"}, TOPOLOGY_ID)
+    refused = [r for r in caplog.records if r.message == "rollback_topology_delete_refused"]
+    assert len(refused) == 1
+    assert refused[0].status == 409
+
+
+async def test_delete_topology_success_logs_nothing(caplog):
+    import logging
+
+    async with httpx.AsyncClient() as client:
+        with respx.mock as mock:
+            mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").mock(
+                return_value=httpx.Response(204)
+            )
+            with caplog.at_level(logging.WARNING):
+                await _delete_topology(client, {"Authorization": "Bearer t"}, TOPOLOGY_ID)
+    assert not [r for r in caplog.records if r.message.startswith("rollback_topology")]
+
+
 # --- _apply_configs: per-device failure branches (182-191, 204-205) ---
 
 

@@ -33,6 +33,7 @@ import httpx
 import pytest
 
 from ._nats_helpers import probe_nats
+from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
 
@@ -294,7 +295,7 @@ async def test_l3_routes_provision_on_gained_adjacency_and_release_on_lost(
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -355,7 +356,7 @@ async def test_l3_shared_adjacency_keeps_routes_until_last_hop_leaves(
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -408,7 +409,7 @@ async def test_l3_failed_provision_surfaces_and_manual_retry_recovers(
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

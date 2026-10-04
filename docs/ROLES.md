@@ -954,7 +954,8 @@ Authorization: Bearer <admin-token> (PUT, DELETE) or <any-authenticated-token> (
 
 Topology canvases (node positions, edges, metadata) are stored in the cabling service.
 Any authenticated user can view and create saved topologies. Updating or deleting a
-topology requires being its creator, or an admin or superadmin.
+topology requires being its creator, or an admin or superadmin. A topology that a live
+reservation still references cannot be deleted (see Delete a topology below).
 
 ### List topologies
 
@@ -1060,6 +1061,21 @@ Content-Type: application/json
 DELETE /api/cabling/topologies/{topology_id}
 Authorization: Bearer <token>   # creator or admin
 ```
+
+Issue #977: the delete is refused with HTTP 409
+`{"error": "topology_in_use", "reservation_ids": [...]}` (sorted) while any reservation
+in a non-terminal status (`PENDING`, `PENDING_PROVISION`, `ACTIVE`) references the
+topology, whoever holds it. `COMPLETED`, `CANCELLED`, and `FAILED` reservations do not
+block: their forks are archived and self-contained. The check runs AFTER the 404 and the
+403, so a caller who may not delete the topology learns nothing about its reservations.
+It calls reservations' internal `/internal/by-topology/{topology_id}` lookup (every
+reservation on the topology, all statuses, no pagination) and fails CLOSED: reservations
+unreachable, a non-200, or a body not in the expected shape (including a status it does not
+recognize) returns HTTP 503 ("Could not verify topology is not in use") and nothing is
+deleted. There is no force flag and no cascade; cancel the reservations or let them end
+first. The canvas edit lock on a reserved topology uses the same lookup but keeps failing
+open. Known limit: a reservation created between the check and the delete's commit can
+still reference a deleted topology.
 
 ---
 

@@ -32,6 +32,7 @@ import pytest
 from ._l3_helpers import create_connection as _create_connection
 from ._l3_helpers import create_device as _create_device
 from ._l3_helpers import create_l3_driver, create_l3_template
+from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
 
@@ -225,7 +226,7 @@ async def test_routes_configured_on_reservation_create_with_l3_switch(
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -267,7 +268,7 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
         assert _as_kwarg_set(remove_runs) == _expected_set(ROUTES)
     finally:
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -321,7 +322,7 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
         )
     finally:
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -364,7 +365,7 @@ async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_templa
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

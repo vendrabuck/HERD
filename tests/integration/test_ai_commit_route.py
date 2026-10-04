@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -248,7 +250,7 @@ async def test_commit_with_element_attachment_produces_valid_topology(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         # The port must go before the template that defines it, or the
         # template delete 409s ("ports still reference it"); the device
         # itself (and this port, cascading) is cleaned up separately by the

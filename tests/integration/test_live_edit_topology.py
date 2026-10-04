@@ -27,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -136,7 +138,7 @@ async def test_owner_can_edit_canvas_of_reserved_topology(admin_client, fresh_de
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)
         await admin_client.delete(f"/cabling/connections/{connection_id}")
 
 
@@ -178,7 +180,7 @@ async def test_non_owner_canvas_edit_of_reserved_topology_is_blocked_409(
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await user_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(user_client, topology_id)
         await admin_client.delete(f"/cabling/connections/{connection_id}")
 
 
@@ -217,7 +219,7 @@ async def test_non_owner_name_only_edit_of_reserved_topology_is_allowed(
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await user_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(user_client, topology_id)
         await admin_client.delete(f"/cabling/connections/{connection_id}")
 
 
@@ -256,7 +258,7 @@ async def test_patch_device_set_revalidates_topology_and_succeeds_when_connected
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)
         await admin_client.delete(f"/cabling/connections/{connection_id}")
 
 
@@ -307,6 +309,6 @@ async def test_patch_device_set_rejected_when_topology_edge_unreachable(
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)
         if connection_id:
             await admin_client.delete(f"/cabling/connections/{connection_id}")
