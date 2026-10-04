@@ -158,11 +158,14 @@ port over ssh (`ssh -L 7900:127.0.0.1:7900 <host>`) and open
 ## M8. Toast timing and stacking under rapid actions
 
 - Why manual: assertions on transient overlapping toasts are inherently
-  flaky in WebDriver (the e2e suite asserts single toasts only).
+  flaky in WebDriver. Placement is automated:
+  `tests/e2e/test_toast_placement_playwright.py` pins that no toast, single
+  or three deep, covers a control on the topology editor or the inventory
+  list (issue #942). Timing and ghost toasts stay manual.
 - Cadence: per release, brief.
 - Steps: perform several quick mutations in a row (e.g. save preferences,
   cancel a reservation, trigger a validation error) and watch the toast
-  region.
+  region at the bottom centre of the window.
 - Expected: toasts stack without overlap or orphaned "ghost" toasts; each
   dismisses on its own timer; an error toast is not hidden behind a
   success toast.

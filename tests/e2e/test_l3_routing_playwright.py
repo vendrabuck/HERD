@@ -246,25 +246,27 @@ def l3_switch_setup(pw_page):
     run_cleanup()
 
 
-# A point well clear of the top-right toaster (react-hot-toast, `App.tsx`).
-_OFF_TOASTER = (640, 600)
+# A point at the left edge, horizontally clear of the bottom-centre toaster
+# (react-hot-toast, `App.tsx`, issue #942): a toast is at most 350 px wide and
+# centred, so x = 5 is outside every toast at any e2e viewport.
+_OFF_TOASTER = (5, 400)
 
 
 def _click_save(page) -> None:
-    """Click the topology editor's Save without a lingering toast in the way.
+    """Click the topology editor's Save once every earlier toast is gone.
 
-    react-hot-toast pauses a toast's dismissal timer while the pointer is over
-    it, and the top-right toast stack sits over the toolbar's Save button
-    (issue #938). A click leaves the pointer on Save, the next toast appears
-    under it and then never expires, so the following Save click is
-    intercepted for the full 30 s timeout. So: move the pointer off the toaster
-    and wait for every earlier toast to be gone before clicking, then move the
-    pointer away again so this click's own toast can expire.
+    Since issue #942 toasts sit at the bottom centre, so a toast no longer
+    covers Save and the pointer resting on Save no longer pauses one. The wait
+    stays for attribution: a second save that fails the same way raises the
+    same "Routing intent has 1 problem" text, and with the earlier toast still
+    up the caller's assertion would match the stale toast (or two elements).
+    The pointer is parked off the toaster first because react-hot-toast pauses
+    a toast's timer while the pointer is over it, wherever the last action
+    left it.
     """
     page.mouse.move(*_OFF_TOASTER)
     expect(page.locator("[data-rht-toaster] [role='status']")).to_have_count(0, timeout=10_000)
     page.get_by_role("button", name="Save", exact=True).click()
-    page.mouse.move(*_OFF_TOASTER)
 
 
 def _canvas_with_switch_and_dut(dut_id: str, switch_id: str) -> dict:

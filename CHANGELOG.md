@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Changed: toasts appear at the bottom centre of the window instead of the top right. At the
+  top right a toast covered the topology editor's Save button and the header controls, and
+  because a toast waits while the pointer rests on it, the pointer left on Save after a click
+  kept the toast up and Save unclickable. Hovering a toast still holds it open; durations and
+  styles are unchanged. A new Playwright test measures that no toast, single or three deep,
+  covers a control on the topology editor or the inventory list at 1280x720 and 1920x1080
+  (#942).
 - Fixed: a topology can no longer be deleted while a reservation still uses it.
   `DELETE /cabling/topologies/{id}` is refused with 409
   `{"error": "topology_in_use", "reservation_ids": [...]}` (sorted) while any reservation

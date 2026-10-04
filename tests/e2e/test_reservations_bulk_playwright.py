@@ -97,7 +97,9 @@ def _check(page, reservation: dict) -> None:
 
 def _park_pointer(page) -> None:
     # react-hot-toast pauses a toast's timer while the pointer is over the
-    # toaster; keep the pointer well away from the top-right stack.
+    # toaster. A centred dialog's confirm button can sit where the
+    # bottom-centre stack (issue #942) appears once the dialog closes, so park
+    # at the left edge, horizontally clear of any toast.
     page.mouse.move(5, 400)
 
 
