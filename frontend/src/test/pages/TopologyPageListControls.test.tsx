@@ -537,6 +537,46 @@ describe("delete gate and bulk delete (issue #958)", () => {
     expect(screen.getByText("Not deleted: another reason")).toBeInTheDocument();
   });
 
+  it("a topology in use by a live reservation stays selected with the in-use reason (#977)", async () => {
+    serveList([topo(1), topo(2)]);
+    server.use(
+      http.delete("/api/cabling/topologies/:id", ({ params }) =>
+        params.id === "topo-1"
+          ? HttpResponse.json(
+              { detail: { error: "topology_in_use", reservation_ids: ["r-1"] } },
+              { status: 409 },
+            )
+          : new HttpResponse(null, { status: 204 }),
+      ),
+    );
+    renderPage();
+    await screen.findByText("Topo 1");
+    fireEvent.click(selectAllBox());
+    fireEvent.click(screen.getByRole("button", { name: "Delete selected" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete 2 topologies" }));
+    const reason = "In use by 1 reservation. Cancel it or wait for it to end, then delete again.";
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(`Deleted 1, failed 1: ${reason}`));
+    expect(rowBox(1)).toBeChecked();
+    expect(rowBox(2)).not.toBeChecked();
+    expect(screen.getByText(`Not deleted: ${reason}`)).toBeInTheDocument();
+  });
+
+  it("a structured 409 out of shape falls back to a reasonless note (#977)", async () => {
+    serveList([topo(1)]);
+    server.use(
+      http.delete("/api/cabling/topologies/:id", () =>
+        HttpResponse.json({ detail: { error: "topology_in_use" } }, { status: 409 }),
+      ),
+    );
+    renderPage();
+    await screen.findByText("Topo 1");
+    fireEvent.click(rowBox(1));
+    fireEvent.click(screen.getByRole("button", { name: "Delete selected" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete 1 topology" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Deleted 0, failed 1"));
+    expect(screen.getByText("Not deleted")).toBeInTheDocument();
+  });
+
   it("disables the bulk buttons while the fan-out is in flight", async () => {
     serveList([topo(1)]);
     let release: () => void = () => {};

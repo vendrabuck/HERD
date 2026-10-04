@@ -1,5 +1,8 @@
 import {
+  formatTopologyInUse,
   formatUnconnectableDetail,
+  topologyDeleteErrorText,
+  topologyInUseDetail,
   topologyUnconnectableDetail,
   type TopologyUnconnectableDetail,
 } from "@/lib/errors";
@@ -74,5 +77,67 @@ describe("formatUnconnectableDetail", () => {
 
   it("returns the message alone when there are no pairs", () => {
     expect(formatUnconnectableDetail({ ...DETAIL, pairs: [] })).toBe(DETAIL.message);
+  });
+});
+
+describe("topologyInUseDetail (#977)", () => {
+  const IN_USE = { error: "topology_in_use", reservation_ids: ["r-1", "r-2"] };
+
+  it("narrows the structured 409 body", () => {
+    expect(topologyInUseDetail(axiosLike(409, IN_USE))).toEqual(IN_USE);
+  });
+
+  it("narrows an empty id list (the shape still matches)", () => {
+    const empty = { error: "topology_in_use", reservation_ids: [] };
+    expect(topologyInUseDetail(axiosLike(409, empty))).toEqual(empty);
+  });
+
+  it.each([
+    ["a different status", axiosLike(503, IN_USE)],
+    ["a plain-string 409", axiosLike(409, "Conflict")],
+    ["another structured 409", axiosLike(409, { error: "device_in_use", reservation_ids: [] })],
+    ["reservation_ids missing", axiosLike(409, { error: "topology_in_use" })],
+    ["reservation_ids not a list", axiosLike(409, { error: "topology_in_use", reservation_ids: "r" })],
+    ["a non-string id", axiosLike(409, { error: "topology_in_use", reservation_ids: [1] })],
+    ["a non-axios error", new Error("boom")],
+  ])("returns null for %s", (_label, err) => {
+    expect(topologyInUseDetail(err)).toBeNull();
+  });
+});
+
+describe("formatTopologyInUse (#977)", () => {
+  it("uses the singular for one reservation", () => {
+    expect(formatTopologyInUse({ error: "topology_in_use", reservation_ids: ["r-1"] })).toBe(
+      "In use by 1 reservation. Cancel it or wait for it to end, then delete again.",
+    );
+  });
+
+  it("uses the plural for several", () => {
+    expect(
+      formatTopologyInUse({ error: "topology_in_use", reservation_ids: ["r-1", "r-2", "r-3"] }),
+    ).toBe("In use by 3 reservations. Cancel them or wait for them to end, then delete again.");
+  });
+});
+
+describe("topologyDeleteErrorText (#977)", () => {
+  it("gives the in-use wording for the structured 409", () => {
+    expect(
+      topologyDeleteErrorText(
+        axiosLike(409, { error: "topology_in_use", reservation_ids: ["r-1"] }),
+        "fallback",
+      ),
+    ).toBe("In use by 1 reservation. Cancel it or wait for it to end, then delete again.");
+  });
+
+  it("passes a plain-string detail through (the fail-closed 503)", () => {
+    expect(
+      topologyDeleteErrorText(axiosLike(503, "Could not verify topology is not in use"), "fb"),
+    ).toBe("Could not verify topology is not in use");
+  });
+
+  it("falls back when the 409 detail is not in shape", () => {
+    expect(
+      topologyDeleteErrorText(axiosLike(409, { error: "topology_in_use" }), "fallback"),
+    ).toBe("fallback");
   });
 });

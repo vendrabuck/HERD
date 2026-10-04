@@ -13,7 +13,7 @@ import type {
 import type { PaginatedResponse } from "@/types/pagination.types";
 import type { TopologyOwnerFilter, TopologySortField } from "@/lib/topologyFilters";
 import apiClient from "./client";
-import { errorDetail } from "@/lib/errors";
+import { errorDetail, formatTopologyInUse, topologyInUseDetail } from "@/lib/errors";
 
 // The list controls the Topologies page sends (issue #958). Every field is
 // optional and only a set field becomes a query parameter, so an unset one
@@ -146,7 +146,14 @@ export function useDeleteTopology() {
   return useMutation({
     mutationFn: deleteTopology,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["topologies"] }),
-    onError: (err) => toast.error(errorDetail(err, "Failed to delete topology")),
+    onError: (err) => {
+      const inUse = topologyInUseDetail(err);
+      toast.error(
+        inUse
+          ? `Topology not deleted. ${formatTopologyInUse(inUse)}`
+          : errorDetail(err, "Failed to delete topology"),
+      );
+    },
   });
 }
 

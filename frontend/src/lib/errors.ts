@@ -137,3 +137,44 @@ export function purposeClassifyRefusal(err: unknown): PurposeClassifyRefusal | n
   }
   return null;
 }
+
+/**
+ * Cabling's topology DELETE refusal (issue #977): 409 `topology_in_use` while
+ * a PENDING, PENDING_PROVISION, or ACTIVE reservation references the topology.
+ * `reservation_ids` is sorted and never empty on a real refusal.
+ */
+export interface TopologyInUseDetail {
+  error: "topology_in_use";
+  reservation_ids: string[];
+}
+
+/** Narrows a topology delete error to the structured 409; null for any other shape. */
+export function topologyInUseDetail(err: unknown): TopologyInUseDetail | null {
+  return structuredDetail<TopologyInUseDetail>(
+    err,
+    409,
+    (d) =>
+      d.error === "topology_in_use" &&
+      Array.isArray(d.reservation_ids) &&
+      d.reservation_ids.every((id) => typeof id === "string"),
+  );
+}
+
+/** "In use by 2 reservations. Cancel them or wait for them to end, then delete again." */
+export function formatTopologyInUse(detail: TopologyInUseDetail): string {
+  const n = detail.reservation_ids.length;
+  const noun = n === 1 ? "reservation" : "reservations";
+  const them = n === 1 ? "it" : "them";
+  return `In use by ${n} ${noun}. Cancel ${them} or wait for ${them} to end, then delete again.`;
+}
+
+/**
+ * The text for a failed topology delete, shared by the row's Delete and the
+ * bulk Delete selected: the in-use wording for the structured 409, else the
+ * server's plain-string detail (a 403, a 404, the fail-closed 503), else the
+ * caller's fallback.
+ */
+export function topologyDeleteErrorText(err: unknown, fallback: string): string {
+  const inUse = topologyInUseDetail(err);
+  return inUse ? formatTopologyInUse(inUse) : errorDetail(err, fallback);
+}
