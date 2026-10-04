@@ -159,9 +159,15 @@ services:
     environment:
       - SE_NODE_MAX_SESSIONS=3
       - SE_SESSION_REQUEST_TIMEOUT=300
+    # Loopback only (issue #964): 4444 is the Grid's WebDriver endpoint and
+    # 7900 the noVNC view of the browser, and neither authenticates. The e2e
+    # suite reaches the Grid from the host at localhost:4444. To watch a run
+    # from another machine, forward the port over ssh
+    # (`ssh -L 7900:127.0.0.1:7900 <host>`, then open http://localhost:7900).
+    # tests/unit/test_compose_ports.py pins every port this file publishes.
     ports:
-      - "4444:4444"
-      - "7900:7900"
+      - "127.0.0.1:4444:4444"
+      - "127.0.0.1:7900:7900"
     shm_size: 2g
     # The image's own Grid readiness probe; `make test-e2e` recreates this
     # service with --wait so pytest starts only once the Grid answers.
