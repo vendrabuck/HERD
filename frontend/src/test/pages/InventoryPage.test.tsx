@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -1117,6 +1117,114 @@ describe("InventoryPage", () => {
       const inRow = within(screen.getByText(/No devices match/).closest("td") as HTMLElement);
       fireEvent.click(inRow.getByRole("button", { name: "Clear filters" }));
       await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+    });
+
+    // Issue #982: the preferences arrive after the first list request, as on a
+    // full page reload. A saved search that loads then must apply at once (no
+    // 300 ms debounce), and no control touched inside what used to be the
+    // debounce window may persist a search the user did not type.
+    describe("a saved search that loads after mount (issue #982)", () => {
+      const searchBox = () =>
+        screen.getByPlaceholderText("Search devices by name...") as HTMLInputElement;
+      const saved = () => usePreferencesStore.getState().savedFilters.inventory;
+      const loadLate = (inventory: Record<string, unknown>) =>
+        act(() => {
+          usePreferencesStore.setState({ savedFilters: { inventory } });
+        });
+
+      it("a saved search that loads after mount applies at once and survives a filter change", async () => {
+        const requests = setup();
+        await ready();
+        expect(last(requests).has("search")).toBe(false);
+        loadLate({ search: "late" });
+        // Changed at once, before any 300 ms debounce could run.
+        pick("Status", "RESERVED");
+        await waitFor(() => expect(last(requests).get("status")).toBe("RESERVED"));
+        expect(last(requests).get("search")).toBe("late");
+        expect(saved()).toEqual({ search: "late", status: "RESERVED" });
+        expect(searchBox().value).toBe("late");
+      });
+
+      it.each([
+        ["Template", tmplA, { template_id: tmplA }, "template_id"],
+        ["Topology", "CLOUD", { topology_type: "CLOUD" }, "topology_type"],
+      ])(
+        "survives a %s change made at once",
+        async (label, value, savedField, param) => {
+          const requests = setup();
+          await ready();
+          loadLate({ search: "late" });
+          pick(label, value);
+          await waitFor(() => expect(last(requests).get(param)).toBe(value));
+          expect(last(requests).get("search")).toBe("late");
+          expect(saved()).toEqual({ search: "late", ...savedField });
+          expect(searchBox().value).toBe("late");
+        },
+      );
+
+      it("is sent with the very next list request, before any debounce could fire", async () => {
+        const requests = setup();
+        await ready();
+        const before = requests.length;
+        loadLate({ search: "late" });
+        // Well under the 300 ms debounce: only an immediate apply can pass this.
+        await waitFor(() => expect(requests.length).toBeGreaterThan(before), { timeout: 150 });
+        expect(requests[before].get("search")).toBe("late");
+      });
+
+      it("writes nothing by itself: no debounce timer is armed on load", async () => {
+        setup();
+        await ready();
+        loadLate({ search: "late", status: "RESERVED" });
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 450));
+        });
+        expect(saved()).toEqual({ search: "late", status: "RESERVED" });
+        expect(patchPreferencesMock).not.toHaveBeenCalled();
+      });
+
+      it("Clear filters at once clears it, and nothing restores it afterwards", async () => {
+        const requests = setup();
+        await ready();
+        loadLate({ search: "late", status: "RESERVED" });
+        fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+        await waitFor(() => expect(last(requests).has("status")).toBe(false));
+        expect(last(requests).has("search")).toBe(false);
+        expect(saved()).toEqual({ search: "" });
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 450));
+        });
+        expect(saved()).toEqual({ search: "" });
+        expect(last(requests).has("search")).toBe(false);
+        expect(searchBox().value).toBe("");
+      });
+
+      it("typing after the load still debounces, then applies and persists the typed value", async () => {
+        const requests = setup();
+        await ready();
+        loadLate({ search: "late", status: "RESERVED" });
+        await waitFor(() => expect(last(requests).get("search")).toBe("late"));
+        const count = requests.length;
+        fireEvent.change(searchBox(), { target: { value: "typed" } });
+        // Nothing is sent or saved for the keystroke itself.
+        expect(requests.length).toBe(count);
+        expect(saved()).toEqual({ search: "late", status: "RESERVED" });
+        await waitFor(() => expect(last(requests).get("search")).toBe("typed"));
+        expect(last(requests).get("status")).toBe("RESERVED");
+        expect(saved()).toEqual({ search: "typed", status: "RESERVED" });
+      });
+
+      it("a saved search equal to empty sends no search and persists empty with a filter change", async () => {
+        const requests = setup();
+        await ready();
+        loadLate({ search: "", topology_type: "PHYSICAL" });
+        pick("Status", "OFFLINE");
+        await waitFor(() => expect(last(requests).get("status")).toBe("OFFLINE"));
+        expect(last(requests).has("search")).toBe(false);
+        expect(last(requests).get("topology_type")).toBe("PHYSICAL");
+        expect(saved()).toEqual({ search: "", status: "OFFLINE", topology_type: "PHYSICAL" });
+        expect(searchBox().value).toBe("");
+      });
     });
 
     it("prunes expansion and clears selection when a filter changes the list", async () => {
