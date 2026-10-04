@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, useId, Fragment } from "react";
+import { useState, useRef, useEffect, useMemo, Fragment } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
@@ -26,6 +26,7 @@ import {
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
+import { FilterSelect, ListFilterLayout, ListFilterPanel } from "@/components/ui/ListFilterPanel";
 import { DeviceInfoPanel } from "@/components/inventory/DeviceInfoPanel";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { TopoBadge } from "@/components/ui/TopoBadge";
@@ -213,37 +214,6 @@ function DeviceRow({ device, isAdmin, onCopy, onClick, selected, onToggle, showC
 function templateOptionLabel(t: { name: string; vendor?: string | null; model?: string | null }) {
   const detail = [t.vendor, t.model].filter(Boolean).join(" ");
   return detail ? `${t.name} (${detail})` : t.name;
-}
-
-function FilterSelect({
-  label,
-  value,
-  onChange,
-  children,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  children: React.ReactNode;
-}) {
-  // An explicit htmlFor/id pair, not a wrapping label: a wrapping label's
-  // accessible name would include the selected option's text.
-  const id = useId();
-  return (
-    <div className="flex flex-col gap-1">
-      <label htmlFor={id} className="text-xs font-medium text-gray-500">
-        {label}
-      </label>
-      <select
-        id={id}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="max-w-[16rem] text-sm font-normal text-gray-900 border border-gray-300 rounded-lg px-2 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-      >
-        {children}
-      </select>
-    </div>
-  );
 }
 
 export function InventoryPage() {
@@ -508,150 +478,145 @@ export function InventoryPage() {
               />
             )}
           </div>
-          <div className="mb-3 flex flex-wrap items-end gap-3">
-            <input
-              type="text"
-              aria-label="Search devices"
-              placeholder="Search devices by name..."
-              value={searchInput}
-              onChange={(e) => setUserSearch(e.target.value)}
-              className="w-full max-w-sm px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-            />
-            <FilterSelect label="Status" value={status} onChange={changeStatus}>
-              <option value="">All</option>
-              {DEVICE_STATUSES.map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </FilterSelect>
-            <FilterSelect label="Template" value={templateId} onChange={changeTemplate}>
-              <option value="">All</option>
-              {templates?.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {templateOptionLabel(t)}
-                </option>
-              ))}
-            </FilterSelect>
-            <FilterSelect label="Topology" value={topologyType} onChange={changeTopology}>
-              <option value="">All</option>
-              {TOPOLOGY_TYPES.map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </FilterSelect>
-            {showClear && (
-              <button
-                type="button"
-                onClick={clearFilters}
-                className="px-3 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+          <ListFilterLayout
+            panel={
+              <ListFilterPanel
+                searchLabel="Search devices"
+                searchPlaceholder="Search devices by name..."
+                searchValue={searchInput}
+                onSearchChange={setUserSearch}
+                showClear={showClear}
+                onClear={clearFilters}
               >
-                Clear filters
-              </button>
-            )}
-          </div>
-          {isAdmin && selected.size > 0 && (
-            <div className="flex items-center gap-3 mb-3 px-1">
-              <span className="text-sm text-gray-700 font-medium">{selected.size} selected</span>
-              <button
-                onClick={() => setShowDeleteConfirm(true)}
-                className="px-3 py-1.5 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors"
-              >
-                Delete Selected
-              </button>
-              <button
-                onClick={() => setSelected(new Set())}
-                className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
-              >
-                Clear
-              </button>
-            </div>
-          )}
-          <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-            {listLoading && (
-              <div role="status" aria-live="polite">
-                <SkeletonRows rows={5} />
+                <FilterSelect label="Status" value={status} onChange={changeStatus}>
+                  <option value="">All</option>
+                  {DEVICE_STATUSES.map((v) => (
+                    <option key={v} value={v}>
+                      {v}
+                    </option>
+                  ))}
+                </FilterSelect>
+                <FilterSelect label="Template" value={templateId} onChange={changeTemplate}>
+                  <option value="">All</option>
+                  {templates?.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {templateOptionLabel(t)}
+                    </option>
+                  ))}
+                </FilterSelect>
+                <FilterSelect label="Topology" value={topologyType} onChange={changeTopology}>
+                  <option value="">All</option>
+                  {TOPOLOGY_TYPES.map((v) => (
+                    <option key={v} value={v}>
+                      {v}
+                    </option>
+                  ))}
+                </FilterSelect>
+              </ListFilterPanel>
+            }
+          >
+            {isAdmin && selected.size > 0 && (
+              <div className="flex items-center gap-3 mb-3 px-1">
+                <span className="text-sm text-gray-700 font-medium">{selected.size} selected</span>
+                <button
+                  onClick={() => setShowDeleteConfirm(true)}
+                  className="px-3 py-1.5 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors"
+                >
+                  Delete Selected
+                </button>
+                <button
+                  onClick={() => setSelected(new Set())}
+                  className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+                >
+                  Clear
+                </button>
               </div>
             )}
-            {isError && (
-              <p className="text-sm text-red-500 text-center py-8">Failed to load devices</p>
-            )}
-            {!isLoading && !isError && devices && (
-              <div className="overflow-x-auto">
-              {/* Vertical scroll lives on the outer page wrapper (h-full overflow-y-auto);
-                  sticky header cells resolve against that scroll parent. */}
-              <table className="w-full min-w-[800px]">
-                <thead>
-                  <tr>
-                    <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 w-10 px-2 py-2" />
-                    {isAdmin && (
-                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2">
-                        <SelectAllCheckbox
-                          checked={devices.length > 0 && devices.every((d) => selected.has(d.id))}
-                          indeterminate={selected.size > 0 && !devices.every((d) => selected.has(d.id))}
-                          onChange={toggleAll}
-                        />
-                      </th>
-                    )}
-                    <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Name</th>
-                    <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Template</th>
-                    <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topology</th>
-                    <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Status</th>
-                    <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
-                    {isAdmin && (
-                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Actions</th>
-                    )}
-                  </tr>
-                </thead>
-                <tbody>
-                  {devices.length === 0 ? (
-                    <EmptyRow colSpan={isAdmin ? 8 : 6}>
-                      {filtersApplied ? (
-                        <span>
-                          No devices match the current filters.{" "}
-                          <button
-                            type="button"
-                            onClick={clearFilters}
-                            className="text-blue-600 hover:underline"
-                          >
-                            Clear filters
-                          </button>
-                        </span>
-                      ) : (
-                        "No devices found"
+            <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+              {listLoading && (
+                <div role="status" aria-live="polite">
+                  <SkeletonRows rows={5} />
+                </div>
+              )}
+              {isError && (
+                <p className="text-sm text-red-500 text-center py-8">Failed to load devices</p>
+              )}
+              {!isLoading && !isError && devices && (
+                <div className="overflow-x-auto">
+                {/* Vertical scroll lives on the outer page wrapper (h-full overflow-y-auto);
+                    sticky header cells resolve against that scroll parent. */}
+                <table className="w-full min-w-[800px]">
+                  <thead>
+                    <tr>
+                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 w-10 px-2 py-2" />
+                      {isAdmin && (
+                        <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2">
+                          <SelectAllCheckbox
+                            checked={devices.length > 0 && devices.every((d) => selected.has(d.id))}
+                            indeterminate={selected.size > 0 && !devices.every((d) => selected.has(d.id))}
+                            onChange={toggleAll}
+                          />
+                        </th>
                       )}
-                    </EmptyRow>
-                  ) : (
-                    devices.map((device) => {
-                      const expanded = expandedIds.has(device.id);
-                      return (
-                        <Fragment key={device.id}>
-                          <DeviceRow device={device} isAdmin={isAdmin} onCopy={handleCopy} onClick={() => navigate(`/inventory/${device.id}`)} selected={selected.has(device.id)} onToggle={() => toggleOne(device.id)} showCheckbox={isAdmin} expanded={expanded} onToggleExpand={() => toggleExpand(device.id)} />
-                          {expanded && (
-                            <ExpandedPortsRow
-                              device={device}
-                              deviceNameMap={deviceNameMap}
-                              colSpan={isAdmin ? 8 : 6}
-                            />
-                          )}
-                        </Fragment>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-              </div>
-            )}
-            <Pagination
-              total={total}
-              skip={skip}
-              limit={limit}
-              onPageChange={setSkip}
-              pageSizeOptions={PAGE_SIZE_OPTIONS}
-              onPageSizeChange={handlePageSizeChange}
-            />
-          </div>
+                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Name</th>
+                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Template</th>
+                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topology</th>
+                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Status</th>
+                      <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
+                      {isAdmin && (
+                        <th className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Actions</th>
+                      )}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {devices.length === 0 ? (
+                      <EmptyRow colSpan={isAdmin ? 8 : 6}>
+                        {filtersApplied ? (
+                          <span>
+                            No devices match the current filters.{" "}
+                            <button
+                              type="button"
+                              onClick={clearFilters}
+                              className="text-blue-600 hover:underline"
+                            >
+                              Clear filters
+                            </button>
+                          </span>
+                        ) : (
+                          "No devices found"
+                        )}
+                      </EmptyRow>
+                    ) : (
+                      devices.map((device) => {
+                        const expanded = expandedIds.has(device.id);
+                        return (
+                          <Fragment key={device.id}>
+                            <DeviceRow device={device} isAdmin={isAdmin} onCopy={handleCopy} onClick={() => navigate(`/inventory/${device.id}`)} selected={selected.has(device.id)} onToggle={() => toggleOne(device.id)} showCheckbox={isAdmin} expanded={expanded} onToggleExpand={() => toggleExpand(device.id)} />
+                            {expanded && (
+                              <ExpandedPortsRow
+                                device={device}
+                                deviceNameMap={deviceNameMap}
+                                colSpan={isAdmin ? 8 : 6}
+                              />
+                            )}
+                          </Fragment>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+                </div>
+              )}
+              <Pagination
+                total={total}
+                skip={skip}
+                limit={limit}
+                onPageChange={setSkip}
+                pageSizeOptions={PAGE_SIZE_OPTIONS}
+                onPageSizeChange={handlePageSizeChange}
+              />
+            </div>
+          </ListFilterLayout>
         </section>
       </div>
       <ConfirmDialog

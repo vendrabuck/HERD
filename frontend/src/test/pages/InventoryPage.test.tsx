@@ -902,6 +902,19 @@ describe("InventoryPage", () => {
     const pick = (label: string, value: string) =>
       fireEvent.change(screen.getByLabelText(label), { target: { value } });
 
+    it("holds the search and the three filters in the Filters region, ahead of the table (issue #957)", async () => {
+      setup();
+      await ready();
+      const region = screen.getByRole("region", { name: "Filters" });
+      const panel = within(region);
+      expect(panel.getByRole("textbox", { name: "Search devices" })).toBeInTheDocument();
+      expect(panel.getByRole("combobox", { name: "Status" })).toBeInTheDocument();
+      expect(panel.getByRole("combobox", { name: "Template" })).toBeInTheDocument();
+      expect(panel.getByRole("combobox", { name: "Topology" })).toBeInTheDocument();
+      const table = screen.getByRole("table");
+      expect(region.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
     it("sends no filter parameter at All, and labels templates with vendor and model", async () => {
       const requests = setup();
       await ready();
