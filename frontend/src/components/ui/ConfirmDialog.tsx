@@ -53,7 +53,7 @@ export function ConfirmDialog({
   return (
     <dialog
       ref={dialogRef}
-      className="rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 max-w-sm w-full"
+      className="m-auto rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 max-w-sm w-full"
       aria-labelledby="confirm-dialog-title"
       aria-describedby="confirm-dialog-desc"
     >

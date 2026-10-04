@@ -44,7 +44,7 @@ export function Modal({ open, onClose, title, children, className, bodyClassName
   return (
     <dialog
       ref={dialogRef}
-      className={`rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 w-full ${className ?? "max-w-lg"}`}
+      className={`m-auto rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 w-full ${className ?? "max-w-lg"}`}
       aria-labelledby="modal-title"
     >
       <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">

@@ -106,7 +106,7 @@ export function BulkImportExport({
 
       <dialog
         ref={dialogRef}
-        className="rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 max-w-2xl w-full"
+        className="m-auto rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 max-w-2xl w-full"
         aria-labelledby="bulk-import-title"
         onClose={close}
       >

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Fixed: modal dialogs now open centred instead of pinned to the top-left corner of the
+  window. Tailwind 4's base styles set every element's margin to zero, which removed the
+  browser's own centring for native dialogs; the three dialog components (`Modal`,
+  `ConfirmDialog`, and the bulk import dialog) now set it explicitly. Every release
+  through 0.6.0 was affected. A dialog taller than the window still scrolls inside itself,
+  so no control moves out of reach (#979).
 - The Reservations page can be searched and filtered from the left filter panel: a search
   on purpose (case-insensitive; 8 or more hex digits also match a reservation id prefix),
   Status, Category (a configured purpose category or Unclassified), and Period (Upcoming,
