@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -139,7 +139,7 @@ describe("ReservationsPage filters (issue #959)", () => {
     const seen = serve();
     renderPage();
     await waitForCategories();
-    const select = panel().getByLabelText("Purpose category");
+    const select = panel().getByLabelText("Category");
     fireEvent.change(select, { target: { value: "training" } });
     await waitFor(() => expect(last(seen).get("purpose_category")).toBe("training"));
     fireEvent.change(select, { target: { value: "none" } });
@@ -224,7 +224,7 @@ describe("ReservationsPage filters (issue #959)", () => {
     for (const [label, value] of [
       ["Status", "ACTIVE"],
       ["Period", "past"],
-      ["Purpose category", "none"],
+      ["Category", "none"],
     ] as const) {
       fireEvent.click(screen.getByText("Next"));
       await waitFor(() => expect(last(seen).get("skip")).toBe("50"));
@@ -243,7 +243,7 @@ describe("ReservationsPage filters (issue #959)", () => {
     for (const [label, value] of [
       ["Status", "ACTIVE"],
       ["Period", "upcoming"],
-      ["Purpose category", "none"],
+      ["Category", "none"],
       ["Search reservations", "purpose"],
     ] as const) {
       fireEvent.click(await screen.findByRole("checkbox", { name: /Select reservation/ }));
@@ -260,7 +260,7 @@ describe("ReservationsPage filters (issue #959)", () => {
     renderPage();
     await waitForCategories();
     fireEvent.change(panel().getByLabelText("Status"), { target: { value: "PENDING" } });
-    fireEvent.change(panel().getByLabelText("Purpose category"), {
+    fireEvent.change(panel().getByLabelText("Category"), {
       target: { value: "qa_regression" },
     });
     fireEvent.change(panel().getByLabelText("Period"), { target: { value: "current" } });
@@ -299,6 +299,25 @@ describe("ReservationsPage filters (issue #959)", () => {
     expect(panel().getByLabelText("Search reservations")).toHaveValue("saved");
   });
 
+  it("a saved search that loads after mount applies at once and survives a filter change", async () => {
+    const seen = serve();
+    renderPage();
+    await screen.findByText("purpose 1");
+    // The preferences arrive after the first list request, as on a page reload.
+    act(() => {
+      usePreferencesStore.setState({ savedFilters: { reservations: { search: "late" } } });
+    });
+    // Changed at once, before any 300 ms debounce could run: the saved search must
+    // already be applied and must persist with the new status.
+    fireEvent.change(panel().getByLabelText("Status"), { target: { value: "ACTIVE" } });
+    await waitFor(() => expect(last(seen).getAll("status")).toEqual(["ACTIVE"]));
+    expect(last(seen).get("search")).toBe("late");
+    await waitFor(() =>
+      expect(lastSavedFilter()).toEqual({ search: "late", status: "ACTIVE" }),
+    );
+    expect(panel().getByLabelText("Search reservations")).toHaveValue("late");
+  });
+
   it("never sends a stale saved value", async () => {
     usePreferencesStore.setState({
       savedFilters: {
@@ -322,7 +341,7 @@ describe("ReservationsPage filters (issue #959)", () => {
       );
     }
     expect(panel().getByLabelText("Status")).toHaveValue("");
-    expect(panel().getByLabelText("Purpose category")).toHaveValue("");
+    expect(panel().getByLabelText("Category")).toHaveValue("");
     expect(panel().getByLabelText("Period")).toHaveValue("");
   });
 

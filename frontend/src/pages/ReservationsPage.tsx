@@ -259,7 +259,12 @@ export function ReservationsPage() {
   const setSavedFilter = usePreferencesStore((s) => s.setSavedFilter);
   const [userSearch, setUserSearch] = useState<string | null>(null);
   const searchInput = userSearch ?? stored.search;
-  const [debouncedSearch, setDebouncedSearch] = useState(stored.search);
+  // The applied search: the saved value until the user types, then the
+  // debounced typed value. The saved value applies at once (no debounce), so a
+  // saved search that loads after mount is already in effect, and persisted
+  // with every other field, before any other control can be changed.
+  const [debouncedUserSearch, setDebouncedUserSearch] = useState<string | null>(null);
+  const debouncedSearch = debouncedUserSearch ?? stored.search;
   const [userStatus, setUserStatus] = useState<ReservationStatus | "" | null>(null);
   const [userCategory, setUserCategory] = useState<string | null>(null);
   const [userPeriod, setUserPeriod] = useState<ReservationPeriod | "" | null>(null);
@@ -299,18 +304,18 @@ export function ReservationsPage() {
   };
 
   useEffect(() => {
-    // Nothing to do when the input already matches what is applied (true on
-    // mount), so no stray timer can reset a page change (see InventoryPage).
-    if (searchInput === debouncedSearch) return;
+    // Only typing arms the timer, and only when the text differs from what is
+    // applied, so no stray timer can reset a page change (see InventoryPage).
+    if (userSearch === null || userSearch === debouncedSearch) return;
     const timer = setTimeout(() => {
-      setDebouncedSearch(searchInput);
+      setDebouncedUserSearch(userSearch);
       restartView();
-      if (userSearch !== null) persistFilters({ search: userSearch });
+      persistFilters({ search: userSearch });
     }, 300);
     return () => clearTimeout(timer);
     // debouncedSearch is excluded on purpose, as in InventoryPage.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchInput, userSearch, setSavedFilter]);
+  }, [userSearch, setSavedFilter]);
 
   const changeStatus = (value: string) => {
     const next = RESERVATION_STATUSES.find((v) => v === value) ?? "";
@@ -331,7 +336,7 @@ export function ReservationsPage() {
   };
   const clearFilters = () => {
     setUserSearch("");
-    setDebouncedSearch("");
+    setDebouncedUserSearch("");
     setUserStatus("");
     setUserCategory("");
     setUserPeriod("");
@@ -465,11 +470,9 @@ export function ReservationsPage() {
                   </option>
                 ))}
               </FilterSelect>
-              <FilterSelect
-                label="Purpose category"
-                value={purposeCategory}
-                onChange={changeCategory}
-              >
+              {/* "Category", not "Purpose category": the detail modal already
+                  uses that text and label, and tests find it by it. */}
+              <FilterSelect label="Category" value={purposeCategory} onChange={changeCategory}>
                 <option value="">All</option>
                 <option value={PURPOSE_CATEGORY_NONE}>Unclassified</option>
                 {categories?.map((c) => (
