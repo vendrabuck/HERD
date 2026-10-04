@@ -61,22 +61,30 @@ class Driver:
             return {"success": True, "simulated": True}
         return {"success": True}
 
+    def _instance_name(self):
+        # The ONE name derivation: create_instance and the keyed destroy share it.
+        return "herd-" + str(self.context.get("HERD_request_id", ""))
+
     def create_instance(self, **_):
-        request_id = str(self.context.get("HERD_request_id", ""))
+        name = self._instance_name()
         if self.dry_run:
             return {
                 "success": True,
-                "instance_ref": "sim-" + request_id[:8],
+                "instance_ref": "sim-" + name,
                 "field_data": {},
                 "simulated": True,
             }
-        # ... create the instance, idempotent on request_id ...
+        # ... find an instance already named `name` (a retried or killed
+        # create) or create one with that name; return its hypervisor id ...
         return {"success": True, "instance_ref": "vm-1234", "field_data": {}}
 
     def destroy_instance(self, instance_ref=None, **_):
+        # instance_ref None is the keyed destroy: find the instance by name.
+        name = None if instance_ref else self._instance_name()
         if self.dry_run:
-            return {"success": True, "simulated": True}
-        # ... destroying an already-absent instance must return success ...
+            return {"success": True, "keyed": name is not None, "simulated": True}
+        # ... look the instance up by instance_ref, or by `name` when keyed,
+        # and destroy it; an already-absent instance must return success ...
         return {"success": True}
 
     def status(self):
@@ -98,8 +106,19 @@ and the methods login, logout, create_instance, destroy_instance, status.
 instance_ref is the hypervisor-side identity; field_data carries instance \
 attributes (management address, etc.) for the materialized device. Make \
 creation idempotent keyed on context["HERD_request_id"] where the API allows.
+- create_instance MUST name the hypervisor-side instance from \
+context["HERD_request_id"] (for example "herd-" + request id) and reuse an \
+instance that already has that name, because a create can be retried or \
+killed at any point and must never leave a second instance.
 - destroy_instance(self, instance_ref=None, **_) must be idempotent: \
 destroying an already-absent instance returns success.
+- destroy_instance is also called with instance_ref=None (a keyed destroy, \
+when a create failed or timed out before it reported its instance_ref). It \
+MUST then find the instance by the same request-id-derived name \
+create_instance uses and destroy it, and return success when no such \
+instance exists. Never raise or fail just because instance_ref is None; the \
+validator runs this call as its own dry-run step, \
+"destroy_instance (no instance_ref)".
 - Every method that would touch the network MUST honor context["dry_run"]: \
 when true, simulate, mark results simulated, and perform no I/O at all. \
 Dry-run is how your draft is validated, so a draft that skips it fails.
