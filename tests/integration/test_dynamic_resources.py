@@ -46,7 +46,8 @@ from _nats_helpers import (
     probe_nats,
     publish_raw,
 )
-from conftest import _psql
+
+from .conftest import _psql
 
 pytestmark = pytest.mark.asyncio
 
