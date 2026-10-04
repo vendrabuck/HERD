@@ -129,7 +129,26 @@ reservations list (`/reservations`) is scoped to your own reservations by defaul
 every role. Admins and superadmins get an "All reservations" toggle on that page that
 switches the list to every user's reservations; it is wired to the admin-only
 `GET /reservations/?all=true` query param (issue #340). A non-admin who passes
-`all=true` is rejected with 403 `Only admins can list all reservations`.
+`all=true` is rejected with 403 `Only admins can list all reservations`. The toggle sits
+in the page's left filter panel (issue #959), and the search and filters there apply
+inside whichever view is on.
+
+`GET /reservations/` takes these optional filters (issue #959), each combined with the
+others and with `sort_by`, `sort_dir`, `skip`, and `limit`; `total` is the filtered
+total:
+
+| Parameter | Meaning | Bad value |
+|---|---|---|
+| `search` | Case-insensitive substring of `purpose`. A term of 8 or more hex digits (hyphens ignored) also matches an id prefix. At most 200 characters. | 422 when too long |
+| `status` | One status; repeat the parameter for several (`status=PENDING&status=ACTIVE`). | 422 |
+| `purpose_category` | One configured category, or `none` for reservations with no category. | 422 for a category not in the configured list, including one since removed from it |
+| `starts_after`, `starts_before` | `start_time` at or after, or strictly before, a timezone-aware ISO 8601 instant. | 422, including a timestamp with no offset |
+| `ends_after`, `ends_before` | The same bounds on `end_time`. | 422 |
+
+The bounds are half-open, so for one instant `now` the page's three periods partition
+the rows: Upcoming is `starts_after=now`, Current is `starts_before=now&ends_after=now`,
+and Past is `ends_before=now`. The `/api/v1/reservations` facade does not take these
+parameters; it still forwards only `skip` and `limit`.
 
 ### Cancelling someone else's reservation
 

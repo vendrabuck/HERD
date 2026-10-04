@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- The Reservations page can be searched and filtered from the left filter panel: a search
+  on purpose (case-insensitive; 8 or more hex digits also match a reservation id prefix),
+  Status, Category (a configured purpose category or Unclassified), and Period (Upcoming,
+  Current, Past), with the admin "All reservations" toggle moved into the panel. The list
+  endpoint `GET /reservations/` gained `search`, a repeatable `status`,
+  `purpose_category` (`none` for unset), and half-open `starts_after`, `starts_before`,
+  `ends_after`, and `ends_before` bounds; every filter applies inside the rows the caller
+  may already see, `total` is the filtered total, `all=true` stays admin-only, and a bad
+  value (including an unknown category or a timestamp without an offset) is a 422. The
+  choices are saved in `savedFilters.reservations`, a stale saved value falls back to All
+  and is never sent, any filter change returns to page one and clears the bulk selection,
+  and a filtered-empty state offers Clear filters. The `/api/v1` facade is unchanged and
+  still forwards only `skip` and `limit` (#959).
 - The Topologies page gets search, an Owner filter (All, Mine), sortable Name, Owner,
   Created, and Updated headings, and multi-select delete. `GET /cabling/topologies`
   gains `search` (case-insensitive name substring), `owner` (`mine` or `all`), `sort_by`,
