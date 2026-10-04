@@ -194,6 +194,61 @@ The driver method took longer than the configured timeout (`execution_timeout_se
 
 The driver package validation failed. Confirm `driver.py` exists in the package root and defines a class named `Driver` with the required methods for its connection type. See [DRIVERS.md](DRIVERS.md).
 
+### Log action `dynamic_instance_keyed_destroy_failed`
+
+Meaning: a reservation with a dynamic instance ended, and the instance's ledger row had
+no `instance_ref` (its `create_instance` failed, timed out, or lost its process before it
+reported one, so the create may still have left a VM behind). Teardown ran the KEYED
+destroy, `destroy_instance(instance_ref=None)` with `HERD_request_id` in the context, and
+it did not succeed. The ledger row stays `CREATING` (or `ACTIVE`) as a "may still exist"
+record instead of being retired, and the event is acknowledged. The log line carries
+`request_id`, `reservation_id`, `ledger_status`, and a fixed `reason`:
+
+- `destroy_failed`: the recipe returned `{"success": false}` or raised. Most often a
+  recipe written before issue #937 that requires an `instance_ref`; the destroy
+  ExecutionRun row for the reservation (`GET /api/execution/runs?reservation_id=...`)
+  shows the exception class, e.g. `driver raised AttributeError`, and records
+  `method_kwargs` `{"instance_ref": null}`.
+- `login_failed`: the recipe could not log in to the hypervisor.
+- `recipe_load_failed`: the recipe package would not load.
+- `recipe_config_missing`: the template, hypervisor, or secret is gone (404).
+
+Find the affected rows and log lines:
+
+```bash
+docker compose logs execution | grep dynamic_instance_keyed_destroy_failed
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "SELECT request_id, reservation_id, status, hypervisor_id, created_at
+     FROM execution.dynamic_instances
+    WHERE instance_ref IS NULL AND status <> 'DESTROYED';"
+```
+
+Find the instance: the Hypervisor contract requires `create_instance` to name the
+instance from `HERD_request_id` (see [DRIVERS.md](DRIVERS.md), Determinism contract), so
+search the hypervisor named by `hypervisor_id` for the name the recipe derives from the
+row's `request_id` (the recipe source shows the derivation; the checked-in mock uses
+`mock-vm-<request_id>`). Delete it by hand if it exists.
+
+Then fix the cause (upgrade the recipe so it accepts `instance_ref=None` and resolves the
+instance by its derived name, or restore the missing config) and retry the teardown by
+re-publishing the reservation's terminal event verbatim. The original payload stays in
+the reservations outbox for 7 days after publish; re-publishing it unchanged keeps its
+`event_id`, so notifications and webhooks deduplicate it while execution runs teardown
+again:
+
+```bash
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c \
+  "SELECT subject, payload FROM reservations.outbox
+    WHERE payload->>'reservation_id' = '<reservation_id>'
+      AND subject IN ('herd.reservations.cancelled', 'herd.reservations.completed',
+                      'herd.reservations.failed');"
+docker compose exec nats nats pub '<subject>' '<payload>'
+```
+
+A row the keyed destroy retires shows `status = 'DESTROYED'`. Nothing retries a failed
+keyed destroy on a timer: only a redelivery of the terminal event (the consumer NAKed it
+for a transient error) or such a re-publish runs teardown again.
+
 ## NATS and inter-service events
 
 ### Reservation created but L1/L2 operations didn't run

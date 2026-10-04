@@ -112,7 +112,8 @@ each contributing a section to the report:
    imports, metadata fields, dry-run declaration).
 4. Schema extraction via the existing `__config_schema__` sentinel.
 5. Sandboxed dry-run: execute `login`, `create_instance`,
-   `destroy_instance`, `status`, `logout` with `dry_run: true` and a
+   `destroy_instance`, `status`, `logout` (since issue #937 also a keyed
+   `destroy_instance` with `instance_ref=None`) with `dry_run: true` and a
    synthetic context (fake endpoint, fake credentials under
    `password_keys`, representative `HERD_<field>` parameters), capturing
    per-method results and transcripts. Refusal or crash is a validation

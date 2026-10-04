@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+- Fixed: ending a reservation no longer leaks a dynamic instance whose create failed,
+  timed out, or lost its process after touching the hypervisor. Teardown used to treat a
+  ledger row with no `instance_ref` as "nothing was created" and mark it `DESTROYED`
+  without calling the recipe. It now runs a keyed destroy, `destroy_instance` with
+  `instance_ref=None` and `HERD_request_id` in the context, and retires the row only when
+  that destroy succeeds; a failed or raising keyed destroy leaves the row `CREATING`,
+  acknowledges the event, and logs `dynamic_instance_keyed_destroy_failed` with the
+  request and reservation ids (see `docs/TROUBLESHOOTING.md` for finding the instance and
+  retrying). The same keyed destroy now covers the #896 compensation path. A
+  `create_instance` that reports success without an `instance_ref` is a failed create
+  (log action `dynamic_instance_create_missing_ref`) instead of an `ACTIVE` row nothing
+  could destroy. The execution consumer now corroborates `reservation.provision_requested`
+  like the other lifecycle events: it runs only while the reservation is
+  `PENDING_PROVISION`, so a late redelivery cannot create an instance for an ended
+  reservation. AI-drafted recipes are validated against a new dry-run step,
+  `destroy_instance (no instance_ref)`, and the drafting prompt states the requirement
+  (#937).
+  UPGRADE NOTE for authors of existing Hypervisor recipes: `destroy_instance` is now
+  called as `destroy_instance(instance_ref=None)` for an instance whose create never
+  reported a handle. Accept `instance_ref=None`, find the instance by the name
+  `create_instance` derives from `HERD_request_id`, destroy it, and return
+  `{"success": True}` when no such instance exists; never raise or fail just because the
+  ref is missing. Also make sure `create_instance` always derives that name and returns a
+  non-empty `instance_ref` on success. A recipe that requires a ref leaves such rows
+  `CREATING` with the log action above on every teardown. Watch for the opposite trap too:
+  a recipe that passes `None` into its hypervisor API and reads the "not found" as an
+  already-absent success would let HERD retire a row whose instance still exists. There
+  is no capability flag; the keyed destroy is part of the Hypervisor contract
+  (`docs/DRIVERS.md`).
 - Changed: toasts appear at the bottom centre of the window instead of the top right. At the
   top right a toast covered the topology editor's Save button and the header controls, and
   because a toast waits while the pointer rests on it, the pointer left on Save after a click
