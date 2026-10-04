@@ -423,9 +423,19 @@ async def _delete_topology(
 ) -> None:
     url = f"{settings.cabling_service_url.rstrip('/')}/topologies/{topology_id}"
     try:
-        await client.delete(url, headers=headers)
+        resp = await client.delete(url, headers=headers)
     except Exception:
         logger.exception("rollback_topology_delete_failed", extra={"topology_id": topology_id})
+        return
+    if resp.status_code >= 300:
+        # Issue #977: cabling refuses (409 topology_in_use) while a live
+        # reservation references the topology, which here means the reservation
+        # create landed even though this call saw a failure. Keeping the
+        # topology is then correct; log it so the leftover is not silent.
+        logger.warning(
+            "rollback_topology_delete_refused",
+            extra={"topology_id": topology_id, "status": resp.status_code},
+        )
 
 
 async def _create_reservation(
