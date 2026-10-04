@@ -14,6 +14,7 @@ import logging
 import os
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -22,7 +23,7 @@ from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.pagination import paginate
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import String, and_, cast, exists, false, select, update
+from sqlalchemy import String, and_, cast, exists, false, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -2133,6 +2134,82 @@ def _reservation_order_by(sort_by: str, sort_dir: str):
     return primary, Reservation.id
 
 
+# The purpose_category filter value that selects rows with NO category (issue #959).
+# A configured category literally named "none" would be shadowed by this sentinel;
+# the default taxonomy has no such entry.
+PURPOSE_CATEGORY_NONE = "none"
+
+# A search term is also tried as a reservation id prefix (issue #959) when, with any
+# hyphens removed, it is at least this many hex digits: the 8-character short form the
+# list shows, or any longer prefix up to the full id. Shorter hex-looking words ("bad",
+# "face") stay purpose-only so a plain word search does not pull in random ids.
+ID_PREFIX_MIN_HEX = 8
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+@dataclass(frozen=True)
+class ReservationListFilters:
+    """Optional narrowing for the reservations list (issue #959).
+
+    Every field is ANDed onto the statement AFTER the caller's visibility clause
+    (the owner filter, or none for the admin all-view), so a filter can only shrink
+    the row set the caller may already see. Time bounds are half-open: an `*_after`
+    bound is inclusive (>=) and a `*_before` bound is exclusive (<), so the three
+    period views upcoming, current, and past partition the rows at one instant.
+    """
+
+    search: str | None = None
+    statuses: tuple[ReservationStatus, ...] = ()
+    purpose_category: str | None = None
+    starts_after: datetime | None = None
+    starts_before: datetime | None = None
+    ends_after: datetime | None = None
+    ends_before: datetime | None = None
+
+
+def _id_prefix_term(term: str) -> str | None:
+    """Return the hyphen-free lowercase hex prefix `term` names, else None."""
+    compact = term.replace("-", "").lower()
+    if len(compact) < ID_PREFIX_MIN_HEX or len(compact) > 32:
+        return None
+    if not set(compact) <= _HEX_DIGITS:
+        return None
+    return compact
+
+
+def _apply_list_filters(stmt, filters: ReservationListFilters | None):
+    if filters is None:
+        return stmt
+    term = (filters.search or "").strip()
+    if term:
+        # icontains renders ILIKE on Postgres and lower(x) LIKE lower(y) on SQLite;
+        # autoescape makes % and _ in the term literal on both.
+        clause = Reservation.purpose.icontains(term, autoescape=True)
+        prefix = _id_prefix_term(term)
+        if prefix is not None:
+            # The id column is a native uuid on Postgres (text form hyphenated) and a
+            # 32-char hex string on SQLite; stripping hyphens gives the same text on
+            # both, and the prefix is pure hex so it carries no LIKE metacharacter.
+            id_text = func.replace(cast(Reservation.id, String), "-", "")
+            clause = or_(clause, id_text.like(prefix + "%"))
+        stmt = stmt.where(clause)
+    if filters.statuses:
+        stmt = stmt.where(Reservation.status.in_(filters.statuses))
+    if filters.purpose_category == PURPOSE_CATEGORY_NONE:
+        stmt = stmt.where(Reservation.purpose_category.is_(None))
+    elif filters.purpose_category is not None:
+        stmt = stmt.where(Reservation.purpose_category == filters.purpose_category)
+    if filters.starts_after is not None:
+        stmt = stmt.where(Reservation.start_time >= filters.starts_after)
+    if filters.starts_before is not None:
+        stmt = stmt.where(Reservation.start_time < filters.starts_before)
+    if filters.ends_after is not None:
+        stmt = stmt.where(Reservation.end_time >= filters.ends_after)
+    if filters.ends_before is not None:
+        stmt = stmt.where(Reservation.end_time < filters.ends_before)
+    return stmt
+
+
 async def list_user_reservations(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -2140,12 +2217,10 @@ async def list_user_reservations(
     limit: int = 50,
     sort_by: str = DEFAULT_RESERVATION_SORT_BY,
     sort_dir: str = DEFAULT_RESERVATION_SORT_DIR,
+    filters: ReservationListFilters | None = None,
 ) -> tuple[list[Reservation], int]:
-    stmt = (
-        select(Reservation)
-        .where(Reservation.user_id == user_id)
-        .order_by(*_reservation_order_by(sort_by, sort_dir))
-    )
+    stmt = select(Reservation).where(Reservation.user_id == user_id)
+    stmt = _apply_list_filters(stmt, filters).order_by(*_reservation_order_by(sort_by, sort_dir))
     return await paginate(db, stmt, skip=skip, limit=limit)
 
 
@@ -2155,6 +2230,7 @@ async def list_all_reservations(
     limit: int = 50,
     sort_by: str = DEFAULT_RESERVATION_SORT_BY,
     sort_dir: str = DEFAULT_RESERVATION_SORT_DIR,
+    filters: ReservationListFilters | None = None,
 ) -> tuple[list[Reservation], int]:
     """Return every reservation across all users, paginated (issue #340).
 
@@ -2163,7 +2239,8 @@ async def list_all_reservations(
     Ordering mirrors list_user_reservations (same default, same allowlist, same
     id tiebreak) so the admin and self views paginate identically.
     """
-    stmt = select(Reservation).order_by(*_reservation_order_by(sort_by, sort_dir))
+    stmt = _apply_list_filters(select(Reservation), filters)
+    stmt = stmt.order_by(*_reservation_order_by(sort_by, sort_dir))
     return await paginate(db, stmt, skip=skip, limit=limit)
 
 

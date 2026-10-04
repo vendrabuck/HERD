@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import { Link } from "react-router-dom";
 import { ChevronUp, ChevronDown } from "lucide-react";
@@ -7,6 +7,7 @@ import {
   useCancelReservation,
   useReleaseReservation,
   usePaginatedReservations,
+  usePurposeCategories,
 } from "@/api/reservations";
 import type { ReservationSort } from "@/api/reservations";
 import { useAllDeviceNames } from "@/api/inventory";
@@ -27,14 +28,33 @@ import {
   summarizeOutcome,
 } from "@/lib/reservationBulk";
 import type { BulkAction } from "@/lib/reservationBulk";
+import {
+  EMPTY_RESERVATION_FILTER,
+  PERIOD_LABELS,
+  PURPOSE_CATEGORY_NONE,
+  RESERVATION_PERIODS,
+  RESERVATION_STATUSES,
+  STATUS_LABELS,
+  effectivePurposeCategory,
+  parseSavedReservationFilter,
+  reservationListFilters,
+  serializeReservationFilter,
+} from "@/lib/reservationFilters";
+import type { ReservationFilterState, ReservationPeriod } from "@/lib/reservationFilters";
+import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import { Pagination } from "@/components/ui/Pagination";
+import { FilterSelect, ListFilterLayout, ListFilterPanel } from "@/components/ui/ListFilterPanel";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
 import { CreateReservationModal } from "@/components/reservations/CreateReservationModal";
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { EmptyState } from "@/components/ui/EmptyState";
-import type { Reservation, ReservationSortField } from "@/types/reservation.types";
+import type {
+  Reservation,
+  ReservationSortField,
+  ReservationStatus,
+} from "@/types/reservation.types";
 
 // The sortable columns on this page (issue #844): each maps a visible column
 // heading to one backend-allowlisted field. Period shows both start and end
@@ -50,6 +70,8 @@ const SORTABLE_COLUMN_FIELDS: ReservationSortField[] = [
 ];
 
 const SORT_PAGE_KEY = "reservations";
+// savedFilters key for the search and filters (issue #959).
+const FILTER_PAGE_KEY = "reservations";
 
 // Today's default ordering (created_at desc, see reservation_service.py); used
 // both as the query sent when nothing is persisted and as what a third click
@@ -74,7 +96,7 @@ function SortableHeader({ label, field, active, direction, onSort }: SortableHea
     <th
       scope="col"
       aria-sort={active ? (direction === "asc" ? "ascending" : "descending") : "none"}
-      className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"
+      className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"
     >
       <button
         type="button"
@@ -122,7 +144,7 @@ function ReservationRow({
       className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${selected ? "bg-blue-50" : ""}`}
       onClick={onClick}
     >
-      <td className="px-4 py-3 w-8" onClick={(e) => e.stopPropagation()}>
+      <td className="px-2.5 py-3 w-8" onClick={(e) => e.stopPropagation()}>
         <input
           type="checkbox"
           checked={selected}
@@ -131,30 +153,43 @@ function ReservationRow({
           className="h-4 w-4 rounded border-gray-300"
         />
       </td>
-      <td className="px-4 py-3 text-sm font-mono text-gray-500">{shortId}</td>
-      <td className="px-4 py-3 text-sm text-gray-500">{reservation.owner_name || reservation.user_id.slice(0, 8)}</td>
-      <td className="px-4 py-3 text-sm">
+      <td className="px-2.5 py-3 text-sm font-mono text-gray-500">{shortId}</td>
+      <td
+        className="px-2.5 py-3 text-sm text-gray-500 max-w-20 truncate"
+        title={reservation.owner_name || reservation.user_id}
+      >
+        {reservation.owner_name || reservation.user_id.slice(0, 8)}
+      </td>
+      <td className="px-2.5 py-3 text-sm">
         <StatusBadge status={reservation.status} />
       </td>
-      <td className="px-4 py-3 text-sm font-mono text-gray-500 tabular-nums">
+      <td className="px-2.5 py-3 text-sm font-mono text-gray-500 tabular-nums">
         {reservation.topology_id ? reservation.topology_id.slice(0, 8) : "-"}
       </td>
-      <td className="px-4 py-3 text-sm">
+      <td className="px-2.5 py-3 text-sm">
         <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">
           {reservation.topology_type}
         </span>
       </td>
-      <td className="px-4 py-3 text-sm text-gray-600 tabular-nums">
+      <td className="px-2.5 py-3 text-sm text-gray-600 tabular-nums">
         {reservation.device_ids.length} device{reservation.device_ids.length !== 1 ? "s" : ""}
       </td>
-      <td className="px-4 py-3 text-sm text-gray-500 tabular-nums">{start} to {end}</td>
-      <td className="px-4 py-3 text-sm text-gray-500">
-        <div className="flex items-center gap-2">
-          <span>{reservation.purpose ?? "-"}</span>
+      <td className="px-2.5 py-3 text-sm text-gray-500 tabular-nums">{start} to {end}</td>
+      {/* Purpose is the flexible column: it takes the leftover width and clamps
+          to two lines (full text in the title), so a long purpose never pushes
+          the row actions out of the card beside the filter panel (issue #959). */}
+      <td className="px-2.5 py-3 text-sm text-gray-500 w-full">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span
+            className="min-w-0 line-clamp-2 [overflow-wrap:anywhere]"
+            title={reservation.purpose ?? undefined}
+          >
+            {reservation.purpose ?? "-"}
+          </span>
           <PurposeCategoryTag category={reservation.purpose_category} />
         </div>
       </td>
-      <td className="px-4 py-3 text-sm" onClick={(e) => e.stopPropagation()}>
+      <td className="px-2.5 py-3 text-sm whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
         {(mayRelease || mayCancel) && (
           <div className="flex gap-1">
             {mayRelease && (
@@ -228,6 +263,107 @@ export function ReservationsPage() {
     ? { sortBy: explicitSort.sortBy as ReservationSortField, sortDir: explicitSort.sortDir }
     : undefined;
 
+  // Search and filters (issue #959), persisted in savedFilters.reservations and
+  // read only through parseSavedReservationFilter, so a stale saved status or
+  // period falls back to All. A null user value means the control is untouched
+  // and the saved value shows; "" is an explicit All.
+  const savedRaw = usePreferencesStore((s) => s.savedFilters[FILTER_PAGE_KEY]);
+  const stored = useMemo(() => parseSavedReservationFilter(savedRaw), [savedRaw]);
+  const setSavedFilter = usePreferencesStore((s) => s.setSavedFilter);
+  const [userSearch, setUserSearch] = useState<string | null>(null);
+  const searchInput = userSearch ?? stored.search;
+  // The applied search: the saved value until the user types, then the
+  // debounced typed value. The saved value applies at once (no debounce), so a
+  // saved search that loads after mount is already in effect, and persisted
+  // with every other field, before any other control can be changed.
+  const [debouncedUserSearch, setDebouncedUserSearch] = useState<string | null>(null);
+  const debouncedSearch = debouncedUserSearch ?? stored.search;
+  const [userStatus, setUserStatus] = useState<ReservationStatus | "" | null>(null);
+  const [userCategory, setUserCategory] = useState<string | null>(null);
+  const [userPeriod, setUserPeriod] = useState<ReservationPeriod | "" | null>(null);
+  const status = userStatus ?? stored.status;
+  const period = userPeriod ?? stored.period;
+  const rawCategory = userCategory ?? stored.purposeCategory;
+  // A saved category is checked against the server's current list; the list
+  // query is held while it loads so a stale category is never sent.
+  const { data: categoryData, isLoading: categoriesLoading } = usePurposeCategories();
+  const categories = categoryData?.categories;
+  const purposeCategory = effectivePurposeCategory(rawCategory, categories);
+  const categoryPending =
+    rawCategory !== "" && rawCategory !== PURPOSE_CATEGORY_NONE && categoriesLoading;
+
+  // The period anchor: one instant per view, refreshed when a filter changes,
+  // never per request, so paging through one view stays consistent.
+  const [periodNow, setPeriodNow] = useState(() => new Date().toISOString());
+
+  // Every write carries the WHOLE object, so the last write holds all fields.
+  const latestRef = useRef<ReservationFilterState>({
+    search: debouncedSearch,
+    status,
+    purposeCategory,
+    period,
+  });
+  useEffect(() => {
+    latestRef.current = { search: debouncedSearch, status, purposeCategory, period };
+  }, [debouncedSearch, status, purposeCategory, period]);
+  const persistFilters = (patch: Partial<ReservationFilterState>) => {
+    latestRef.current = { ...latestRef.current, ...patch };
+    setSavedFilter(FILTER_PAGE_KEY, serializeReservationFilter(latestRef.current));
+  };
+  // Any filter change returns to page one under a fresh period anchor.
+  const restartView = () => {
+    setSkip(0);
+    setPeriodNow(new Date().toISOString());
+  };
+
+  useEffect(() => {
+    // Only typing arms the timer, and only when the text differs from what is
+    // applied, so no stray timer can reset a page change (see InventoryPage).
+    if (userSearch === null || userSearch === debouncedSearch) return;
+    const timer = setTimeout(() => {
+      setDebouncedUserSearch(userSearch);
+      restartView();
+      persistFilters({ search: userSearch });
+    }, 300);
+    return () => clearTimeout(timer);
+    // debouncedSearch is excluded on purpose, as in InventoryPage.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userSearch, setSavedFilter]);
+
+  const changeStatus = (value: string) => {
+    const next = RESERVATION_STATUSES.find((v) => v === value) ?? "";
+    setUserStatus(next);
+    restartView();
+    persistFilters({ status: next });
+  };
+  const changeCategory = (value: string) => {
+    setUserCategory(value);
+    restartView();
+    persistFilters({ purposeCategory: value });
+  };
+  const changePeriod = (value: string) => {
+    const next = RESERVATION_PERIODS.find((v) => v === value) ?? "";
+    setUserPeriod(next);
+    restartView();
+    persistFilters({ period: next });
+  };
+  const clearFilters = () => {
+    setUserSearch("");
+    setDebouncedUserSearch("");
+    setUserStatus("");
+    setUserCategory("");
+    setUserPeriod("");
+    restartView();
+    persistFilters({ ...EMPTY_RESERVATION_FILTER });
+  };
+
+  const filters = reservationListFilters(
+    { search: debouncedSearch, status, purposeCategory, period },
+    periodNow,
+  );
+  const filtersApplied = Object.keys(filters).length > 0;
+  const showClear = filtersApplied || searchInput !== "";
+
   const handleSort = (field: ReservationSortField) => {
     setSkip(0);
     if (sortState.sortBy !== field) {
@@ -240,16 +376,25 @@ export function ReservationsPage() {
     }
   };
 
-  const { data, isLoading, isError } = usePaginatedReservations(skip, limit, allReservations, sort);
+  const { data, isLoading, isError } = usePaginatedReservations(
+    skip,
+    limit,
+    allReservations,
+    sort,
+    filtersApplied ? filters : undefined,
+    { enabled: !categoryPending },
+  );
   const { data: deviceNames } = useAllDeviceNames();
   const reservations = data?.items;
   const total = data?.total ?? 0;
+  const listLoading = isLoading || (categoryPending && !data);
 
   // Multi-select (issue #843). The selection is tagged with the view it was
-  // made in (page, sort, and the all-reservations toggle) and is dropped under
-  // any other view, so it can never hold a row the user cannot see, even when
-  // the sort changes from a late-loading preference rather than a click.
-  const viewKey = `${skip}|${allReservations}|${sort?.sortBy ?? ""}|${sort?.sortDir ?? ""}`;
+  // made in (page, sort, the all-reservations toggle, and every filter with its
+  // period anchor, issue #959) and is dropped under any other view, so it can
+  // never hold a row the user cannot see, even when the view changes from a
+  // late-loading preference rather than a click.
+  const viewKey = JSON.stringify([skip, allReservations, sort ?? null, filters]);
   const [selection, setSelection] = useState<{ key: string; ids: ReadonlySet<string> }>({
     key: viewKey,
     ids: NO_SELECTION,
@@ -312,20 +457,6 @@ export function ReservationsPage() {
           {data && (
             <span className="text-sm text-gray-400">({total})</span>
           )}
-          {isAdmin && (
-            <label className="flex items-center gap-1.5 text-sm text-gray-600 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={showAll}
-                onChange={(e) => {
-                  setShowAll(e.target.checked);
-                  setSkip(0);
-                }}
-                className="h-4 w-4 rounded border-gray-300"
-              />
-              All reservations
-            </label>
-          )}
           <button
             onClick={() => setCreateOpen(true)}
             className="ml-auto px-3 py-1.5 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
@@ -334,6 +465,60 @@ export function ReservationsPage() {
           </button>
         </div>
 
+        <ListFilterLayout
+          panel={
+            <ListFilterPanel
+              searchLabel="Search reservations"
+              searchPlaceholder="Purpose or reservation ID..."
+              searchValue={searchInput}
+              onSearchChange={setUserSearch}
+              showClear={showClear}
+              onClear={clearFilters}
+            >
+              <FilterSelect label="Status" value={status} onChange={changeStatus}>
+                <option value="">All</option>
+                {RESERVATION_STATUSES.map((v) => (
+                  <option key={v} value={v}>
+                    {STATUS_LABELS[v]}
+                  </option>
+                ))}
+              </FilterSelect>
+              {/* "Category", not "Purpose category": the detail modal already
+                  uses that text and label, and tests find it by it. */}
+              <FilterSelect label="Category" value={purposeCategory} onChange={changeCategory}>
+                <option value="">All</option>
+                <option value={PURPOSE_CATEGORY_NONE}>Unclassified</option>
+                {categories?.map((c) => (
+                  <option key={c} value={c}>
+                    {purposeCategoryLabel(c)}
+                  </option>
+                ))}
+              </FilterSelect>
+              <FilterSelect label="Period" value={period} onChange={changePeriod}>
+                <option value="">All</option>
+                {RESERVATION_PERIODS.map((v) => (
+                  <option key={v} value={v}>
+                    {PERIOD_LABELS[v]}
+                  </option>
+                ))}
+              </FilterSelect>
+              {isAdmin && (
+                <label className="flex items-center gap-1.5 text-sm text-gray-600 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={showAll}
+                    onChange={(e) => {
+                      setShowAll(e.target.checked);
+                      setSkip(0);
+                    }}
+                    className="h-4 w-4 rounded border-gray-300"
+                  />
+                  All reservations
+                </label>
+              )}
+            </ListFilterPanel>
+          }
+        >
         <div role="status" aria-label="Selection" aria-live="polite">
           {selectedRows.length > 0 && (
             <div className="mb-3 flex flex-wrap items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-sm">
@@ -377,7 +562,7 @@ export function ReservationsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading && (
+          {listLoading && (
             <p role="status" aria-live="polite" className="text-sm text-gray-400 text-center py-8">
               Loading reservations...
             </p>
@@ -386,14 +571,27 @@ export function ReservationsPage() {
             <p className="text-sm text-red-500 text-center py-8">Failed to load reservations</p>
           )}
           {reservations && reservations.length === 0 && (
-            <EmptyState>No reservations yet</EmptyState>
+            filtersApplied ? (
+              <EmptyState>
+                No reservations match the current filters.{" "}
+                <button
+                  type="button"
+                  onClick={clearFilters}
+                  className="text-blue-600 hover:underline"
+                >
+                  Clear filters
+                </button>
+              </EmptyState>
+            ) : (
+              <EmptyState>No reservations yet</EmptyState>
+            )
           )}
           {reservations && reservations.length > 0 && (
             <div className="overflow-x-auto">
-            <table className="w-full min-w-[940px]">
+            <table className="w-full min-w-[940px] lg:min-w-0">
               <thead>
                 <tr className="border-b border-gray-200">
-                  <th scope="col" className="sticky top-0 z-10 bg-gray-50 px-4 py-2 w-8">
+                  <th scope="col" className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 w-8">
                     <input
                       type="checkbox"
                       checked={allSelected}
@@ -405,7 +603,7 @@ export function ReservationsPage() {
                       className="h-4 w-4 rounded border-gray-300"
                     />
                   </th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
                   <SortableHeader
                     label="Owner"
                     field="user_id"
@@ -420,9 +618,9 @@ export function ReservationsPage() {
                     direction={sortState.sortDir}
                     onSort={handleSort}
                   />
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topo ID</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topology</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Devices</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topo ID</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topology</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Devices</th>
                   <SortableHeader
                     label="Period"
                     field="start_time"
@@ -437,7 +635,7 @@ export function ReservationsPage() {
                     direction={sortState.sortDir}
                     onSort={handleSort}
                   />
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"></th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"></th>
                 </tr>
               </thead>
               <tbody>
@@ -456,6 +654,7 @@ export function ReservationsPage() {
           )}
           <Pagination total={total} skip={skip} limit={limit} onPageChange={setSkip} />
         </div>
+        </ListFilterLayout>
 
         <ReservationDetailModal
           reservation={selectedReservation}

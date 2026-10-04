@@ -1748,7 +1748,11 @@ a reservation the caller owns (404 otherwise), with no admin bypass.
 `GET /api/reservations/` defaults to the caller's own reservations. Admins and
 superadmins may pass `all=true` to list every user's reservations; a non-admin who
 passes `all=true` is rejected with 403 `Only admins can list all reservations` (issue
-#340). `DELETE /api/reservations/{id}` lets an admin or superadmin cancel any
+#340). The search and filter parameters (`search`, `status`, `purpose_category`,
+`starts_after`, `starts_before`, `ends_after`, `ends_before`, issue #959) only narrow the
+row set the caller may already see: they apply inside the own-reservations scope, or
+inside the admin `all=true` view, never around it, and `all=true` stays admin-only with
+any combination of them. `DELETE /api/reservations/{id}` lets an admin or superadmin cancel any
 reservation, not just their own; a non-admin cancelling a reservation they do not own
 still gets 404. An admin cancelling a reservation they do not own is recorded in the
 reservation's `cancelled_by` field (an owner self-cancel leaves it null), and emits the
