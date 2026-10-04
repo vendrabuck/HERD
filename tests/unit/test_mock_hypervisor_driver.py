@@ -5,8 +5,8 @@ the Driver class directly. Guards the recipe contract the execution consumer
 depends on (the Hypervisor method set, the create_instance
 {success, instance_ref, field_data} shape its instance-ref extraction reads,
 the HERD_request_id determinism the redelivery-idempotency story relies on,
-destroy idempotency, and the failure-injection knobs the dynamic-resources
-integration tests use) without needing Docker.
+destroy idempotency, the keyed destroy (issue #937), and the failure-injection
+knobs the dynamic-resources integration tests use) without needing Docker.
 """
 
 import importlib.util
@@ -168,3 +168,63 @@ def test_status_reports_reachable_and_never_raises(driver_cls):
     assert fail["reachable"] is False
     # Raise injection is ignored on status; it must always answer.
     assert driver_cls(_context(HERD_mock_raise_actions="status")).status()["reachable"] is True
+
+
+# --- keyed destroy (issue #937) ------------------------------------------------
+
+
+def _capture_transcript(driver_cls, monkeypatch):
+    """Swap the module's record_command for a recorder; return the lines."""
+    lines = []
+    monkeypatch.setitem(
+        driver_cls.destroy_instance.__globals__,
+        "record_command",
+        lambda command, **kwargs: lines.append((command, kwargs)),
+    )
+    return lines
+
+
+@pytest.mark.parametrize("call", [{}, {"instance_ref": None}, {"instance_ref": ""}])
+def test_keyed_destroy_derives_the_create_name_from_request_id(driver_cls, monkeypatch, call):
+    """With no usable instance_ref the destroy is keyed: it names the instance
+    exactly as create_instance did, says so in its result, and records the
+    keyed path in the transcript (what the live integration test reads)."""
+    lines = _capture_transcript(driver_cls, monkeypatch)
+    d = driver_cls(_context())
+    created = d.create_instance()["instance_ref"]
+
+    res = d.destroy_instance(**call)
+
+    assert res == {"success": True, "instance_ref": created, "keyed": True}
+    assert lines[-1][0] == f"destroy instance {created} (keyed by HERD_request_id)"
+
+
+def test_destroy_by_ref_is_not_flagged_keyed(driver_cls, monkeypatch):
+    lines = _capture_transcript(driver_cls, monkeypatch)
+    res = driver_cls(_context()).destroy_instance(instance_ref="mock-vm-x")
+    assert res == {"success": True, "instance_ref": "mock-vm-x"}
+    assert "keyed" not in res
+    assert lines[-1][0] == "destroy instance mock-vm-x"
+
+
+def test_keyed_destroy_without_request_id_reports_failure(driver_cls):
+    """A keyed destroy with nothing to derive a name from must not claim
+    success: the consumer would retire a row that may still have an instance."""
+    res = driver_cls(_context(HERD_request_id=None)).destroy_instance(instance_ref=None)
+    assert res["success"] is False
+    assert "HERD_request_id" in res["error"]
+
+
+def test_keyed_destroy_honors_dry_run_and_fail_injection(driver_cls):
+    res = driver_cls(_context(dry_run=True)).destroy_instance(instance_ref=None)
+    assert res["simulated"] is True and res["keyed"] is True
+    fail = driver_cls(_context(HERD_mock_fail_actions="destroy_instance"))
+    assert fail.destroy_instance(instance_ref=None)["success"] is False
+    boom = driver_cls(_context(HERD_mock_raise_actions="destroy_instance"))
+    with pytest.raises(RuntimeError, match="injected raise on destroy_instance"):
+        boom.destroy_instance(instance_ref=None)
+
+
+def test_metadata_notes_describe_the_keyed_destroy():
+    meta = json.loads((_DRIVER_DIR / "driver_metadata.json").read_text())
+    assert "keyed destroy" in meta["notes"]
