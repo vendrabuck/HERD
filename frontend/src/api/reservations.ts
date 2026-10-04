@@ -29,6 +29,8 @@ import type { CanvasData } from "@/types/topology.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
 import { errorDetail, structuredDetail } from "@/lib/errors";
+import { appendReservationListFilters } from "@/lib/reservationFilters";
+import type { ReservationListFilters } from "@/lib/reservationFilters";
 
 export interface ReservationSort {
   sortBy: ReservationSortField;
@@ -40,20 +42,23 @@ async function fetchPaginatedReservations(
   limit = 50,
   all = false,
   sort?: ReservationSort,
+  filters?: ReservationListFilters,
 ): Promise<PaginatedResponse<Reservation>> {
   // `all=true` is admin-only (the backend returns 403 for non-admins); it lists
   // every user's reservations instead of just the caller's own (issue #340).
   // sort_by/sort_dir are omitted entirely when no sort is chosen, so the
   // backend's own default (today's ordering) applies rather than this client
-  // re-stating it (issue #844).
-  const resp = await apiClient.get<PaginatedResponse<Reservation>>("/reservations/", {
-    params: {
-      skip,
-      limit,
-      ...(all ? { all: true } : {}),
-      ...(sort ? { sort_by: sort.sortBy, sort_dir: sort.sortDir } : {}),
-    },
-  });
+  // re-stating it (issue #844). Filters (issue #959) are sent only when set, and
+  // `status` repeats, so the params are built as URLSearchParams rather than
+  // left to axios's default array form (`status[]=`).
+  const params = new URLSearchParams({ skip: String(skip), limit: String(limit) });
+  if (all) params.set("all", "true");
+  if (sort) {
+    params.set("sort_by", sort.sortBy);
+    params.set("sort_dir", sort.sortDir);
+  }
+  if (filters) appendReservationListFilters(params, filters);
+  const resp = await apiClient.get<PaginatedResponse<Reservation>>("/reservations/", { params });
   return resp.data;
 }
 
@@ -130,11 +135,23 @@ export function usePaginatedReservations(
   limit = 50,
   all = false,
   sort?: ReservationSort,
+  filters?: ReservationListFilters,
+  options?: { enabled?: boolean },
 ) {
   return useQuery({
-    queryKey: ["reservations", "paginated", skip, limit, all, sort?.sortBy, sort?.sortDir],
-    queryFn: () => fetchPaginatedReservations(skip, limit, all, sort),
+    queryKey: [
+      "reservations",
+      "paginated",
+      skip,
+      limit,
+      all,
+      sort?.sortBy,
+      sort?.sortDir,
+      filters ?? null,
+    ],
+    queryFn: () => fetchPaginatedReservations(skip, limit, all, sort, filters),
     placeholderData: keepPreviousData,
+    enabled: options?.enabled ?? true,
   });
 }
 
