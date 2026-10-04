@@ -303,15 +303,22 @@ def test_search_and_status_filters_and_bulk_on_a_filtered_list(pw_page, filter_t
             empty.get_by_role("button", name="Clear filters", exact=True).click()
         expect(status).to_have_value("")
         expect(search).to_have_value("")
-        # The unfiltered view may come from the query cache without a request, so
-        # read the unfiltered first page back directly and compare the table to it.
-        unfiltered = pw_api(page, "GET", "/reservations/?skip=0&limit=50").json()
+        # The unfiltered view may come from the query cache without a request, and
+        # the unfiltered total moves whenever anything else on the stack creates a
+        # reservation, so a separate API read can disagree with the page. Reload and
+        # compare the table to the body of the list response the page itself got.
+        with page.expect_response(lambda r: _is_list_request(r, {}), timeout=WAIT_MS) as listed:
+            page.reload()
+        unfiltered = listed.value.json()
         expect(page.locator("table tbody tr")).to_have_count(
             len(unfiltered["items"]), timeout=WAIT_MS
         )
+        assert _rendered_ids(page) == [item["id"][:8] for item in unfiltered["items"]]
         expect(page.get_by_text(f"({unfiltered['total']})", exact=True)).to_be_visible(
             timeout=WAIT_MS
         )
+        expect(status).to_have_value("")
+        expect(search).to_have_value("")
         assert (_read_prefs(page).get("saved_filters") or {}).get(FILTER_PREF_KEY) == {"search": ""}
     finally:
         _set_prefs(page, baseline_filter, baseline_sort)
