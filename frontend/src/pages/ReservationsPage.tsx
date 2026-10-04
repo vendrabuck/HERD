@@ -96,7 +96,7 @@ function SortableHeader({ label, field, active, direction, onSort }: SortableHea
     <th
       scope="col"
       aria-sort={active ? (direction === "asc" ? "ascending" : "descending") : "none"}
-      className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"
+      className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"
     >
       <button
         type="button"
@@ -144,7 +144,7 @@ function ReservationRow({
       className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${selected ? "bg-blue-50" : ""}`}
       onClick={onClick}
     >
-      <td className="px-4 py-3 w-8" onClick={(e) => e.stopPropagation()}>
+      <td className="px-2.5 py-3 w-8" onClick={(e) => e.stopPropagation()}>
         <input
           type="checkbox"
           checked={selected}
@@ -153,30 +153,43 @@ function ReservationRow({
           className="h-4 w-4 rounded border-gray-300"
         />
       </td>
-      <td className="px-4 py-3 text-sm font-mono text-gray-500">{shortId}</td>
-      <td className="px-4 py-3 text-sm text-gray-500">{reservation.owner_name || reservation.user_id.slice(0, 8)}</td>
-      <td className="px-4 py-3 text-sm">
+      <td className="px-2.5 py-3 text-sm font-mono text-gray-500">{shortId}</td>
+      <td
+        className="px-2.5 py-3 text-sm text-gray-500 max-w-20 truncate"
+        title={reservation.owner_name || reservation.user_id}
+      >
+        {reservation.owner_name || reservation.user_id.slice(0, 8)}
+      </td>
+      <td className="px-2.5 py-3 text-sm">
         <StatusBadge status={reservation.status} />
       </td>
-      <td className="px-4 py-3 text-sm font-mono text-gray-500 tabular-nums">
+      <td className="px-2.5 py-3 text-sm font-mono text-gray-500 tabular-nums">
         {reservation.topology_id ? reservation.topology_id.slice(0, 8) : "-"}
       </td>
-      <td className="px-4 py-3 text-sm">
+      <td className="px-2.5 py-3 text-sm">
         <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">
           {reservation.topology_type}
         </span>
       </td>
-      <td className="px-4 py-3 text-sm text-gray-600 tabular-nums">
+      <td className="px-2.5 py-3 text-sm text-gray-600 tabular-nums">
         {reservation.device_ids.length} device{reservation.device_ids.length !== 1 ? "s" : ""}
       </td>
-      <td className="px-4 py-3 text-sm text-gray-500 tabular-nums">{start} to {end}</td>
-      <td className="px-4 py-3 text-sm text-gray-500">
-        <div className="flex items-center gap-2">
-          <span>{reservation.purpose ?? "-"}</span>
+      <td className="px-2.5 py-3 text-sm text-gray-500 tabular-nums">{start} to {end}</td>
+      {/* Purpose is the flexible column: it takes the leftover width and clamps
+          to two lines (full text in the title), so a long purpose never pushes
+          the row actions out of the card beside the filter panel (issue #959). */}
+      <td className="px-2.5 py-3 text-sm text-gray-500 w-full">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span
+            className="min-w-0 line-clamp-2 [overflow-wrap:anywhere]"
+            title={reservation.purpose ?? undefined}
+          >
+            {reservation.purpose ?? "-"}
+          </span>
           <PurposeCategoryTag category={reservation.purpose_category} />
         </div>
       </td>
-      <td className="px-4 py-3 text-sm" onClick={(e) => e.stopPropagation()}>
+      <td className="px-2.5 py-3 text-sm whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
         {(mayRelease || mayCancel) && (
           <div className="flex gap-1">
             {mayRelease && (
@@ -575,10 +588,10 @@ export function ReservationsPage() {
           )}
           {reservations && reservations.length > 0 && (
             <div className="overflow-x-auto">
-            <table className="w-full min-w-[940px]">
+            <table className="w-full min-w-[940px] lg:min-w-0">
               <thead>
                 <tr className="border-b border-gray-200">
-                  <th scope="col" className="sticky top-0 z-10 bg-gray-50 px-4 py-2 w-8">
+                  <th scope="col" className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 w-8">
                     <input
                       type="checkbox"
                       checked={allSelected}
@@ -590,7 +603,7 @@ export function ReservationsPage() {
                       className="h-4 w-4 rounded border-gray-300"
                     />
                   </th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">ID</th>
                   <SortableHeader
                     label="Owner"
                     field="user_id"
@@ -605,9 +618,9 @@ export function ReservationsPage() {
                     direction={sortState.sortDir}
                     onSort={handleSort}
                   />
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topo ID</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topology</th>
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Devices</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topo ID</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Topology</th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide">Devices</th>
                   <SortableHeader
                     label="Period"
                     field="start_time"
@@ -622,7 +635,7 @@ export function ReservationsPage() {
                     direction={sortState.sortDir}
                     onSort={handleSort}
                   />
-                  <th className="sticky top-0 z-10 bg-gray-50 px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"></th>
+                  <th className="sticky top-0 z-10 bg-gray-50 px-2.5 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide"></th>
                 </tr>
               </thead>
               <tbody>

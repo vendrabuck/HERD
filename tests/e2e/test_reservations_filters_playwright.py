@@ -94,6 +94,33 @@ def _assert_matches_api(page, response) -> dict:
     return readback
 
 
+_ACTIONS_LAYOUT = """() => {
+  const table = document.querySelector('table');
+  const scroller = table.parentElement;
+  const card = scroller.closest('.rounded-lg.border');
+  // Rendered buttons only: the cell also holds a closed confirm <dialog>.
+  const buttons = [
+    ...table.querySelectorAll('tbody tr:first-child td:last-child button'),
+  ].filter((b) => b.offsetParent !== null);
+  const last = buttons[buttons.length - 1];
+  return {
+    cardRight: card.getBoundingClientRect().right,
+    buttonRight: last ? last.getBoundingClientRect().right : null,
+    scrollWidth: scroller.scrollWidth,
+    clientWidth: scroller.clientWidth,
+  };
+}"""
+
+
+def _assert_actions_inside_card(page) -> None:
+    """At 1280x720, with the filter panel beside the table, the first row's last action
+    button sits inside the table card and the table does not scroll sideways."""
+    m = page.evaluate(_ACTIONS_LAYOUT)
+    assert m["buttonRight"] is not None and m["buttonRight"] > 0, m
+    assert m["buttonRight"] <= m["cardRight"], m
+    assert m["scrollWidth"] <= m["clientWidth"], m
+
+
 def _status(page, reservation: dict) -> str:
     return pw_api(page, "GET", f"/reservations/{reservation['id']}").json()["status"]
 
@@ -166,6 +193,7 @@ def test_search_and_status_filters_and_bulk_on_a_filtered_list(pw_page, filter_t
     baseline_sort = (prefs.get("extras") or {}).get(SORT_PREF_KEY)
     _set_prefs(page, {"search": ""}, None)
     try:
+        page.set_viewport_size({"width": 1280, "height": 720})
         page.goto(f"{HOST_BASE_URL}/reservations")
         panel = page.get_by_role("region", name="Filters")
         search = panel.get_by_label("Search reservations", exact=True)
@@ -184,6 +212,7 @@ def test_search_and_status_filters_and_bulk_on_a_filtered_list(pw_page, filter_t
                 search.fill(token)
         readback = _assert_matches_api(page, listed.value)
         assert {i["id"] for i in readback["items"]} == {keep["id"], drop_one["id"], drop_two["id"]}
+        _assert_actions_inside_card(page)
 
         # The Upcoming period composes with the search: all three start 250+ days out.
         with page.expect_response(
