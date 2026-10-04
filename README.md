@@ -554,6 +554,7 @@ Four jobs run on push/PR to main, plus a scheduled nightly workflow:
 
 - [docs/DRIVERS.md](docs/DRIVERS.md): Driver developer guide, interface contracts, packaging quickstart, AI-config allowlist.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Public architecture overview: services, inter-service auth contract, event-driven flows, reservation state machine, frontend patterns.
+- [docs/specs/](docs/specs/README.md): Feature and functional specifications, one per area: what each feature does and the exact rules it follows, with the code that enforces each rule and the test that pins it. Reservations is the first.
 - [docs/MANUAL_TESTING.md](docs/MANUAL_TESTING.md): Manual test plan for cases deliberately excluded from automation, with the reason, preconditions, steps, and expected results per case.
 
 ### First install
