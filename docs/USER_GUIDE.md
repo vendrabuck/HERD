@@ -182,7 +182,9 @@ With rows selected, a bar above the table shows the count, **Delete selected**, 
 **Clear selection**. You can delete a topology you created; an admin or superadmin can
 delete any topology. The confirmation says how many will be deleted and how many are
 skipped as not yours, and deleting is permanent. A row that the server refuses stays
-selected with the reason under its name. Changing the page, the sort, the search, or the
+selected with the reason under its name. A topology that a pending or active reservation
+still uses cannot be deleted, from the row or in bulk: the reason reads "In use by N
+reservations"; cancel those reservations or wait for them to end, then delete again. Changing the page, the sort, the search, or the
 owner filter clears the selection.
 
 ## Topology editor

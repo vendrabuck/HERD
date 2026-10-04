@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- Fixed: a topology can no longer be deleted while a reservation still uses it.
+  `DELETE /cabling/topologies/{id}` is refused with 409
+  `{"error": "topology_in_use", "reservation_ids": [...]}` (sorted) while any reservation
+  in PENDING, PENDING_PROVISION, or ACTIVE references the topology; COMPLETED, CANCELLED,
+  and FAILED reservations do not block. Before this, deleting the topology behind a future
+  booking made that booking activate later with an empty canvas and no wiring, and nothing
+  reported it. The check asks reservations' internal by-topology lookup and fails closed: if
+  reservations cannot answer, or answers in an unexpected shape, the delete is a 503 and
+  nothing is deleted. It runs after the existing 404 and 403, so a caller who may not
+  delete the topology learns nothing about its bookings. There is no force flag and no
+  cascade; cancel the reservations or let them end first. The Topologies page explains the
+  refusal on the row and in the toast ("In use by N reservations. Cancel them or wait for
+  them to end, then delete again."). The edit lock on a reserved topology keeps its
+  fail-open behavior. Known limit: a reservation created in the instant between the check
+  and the delete can still land on a deleted topology (#977).
 - Fixed: on the Inventory page, a saved search could be lost when the user changed the
   Status, Template, or Topology filter within about 300 ms of the saved preferences
   arriving after a page load. The filter change saved an empty search in place of the
