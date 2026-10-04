@@ -205,6 +205,52 @@ async def test_list_maps_to_v1_paginated(monkeypatch):
     }
 
 
+async def test_list_does_not_pass_through_internal_filters(monkeypatch):
+    """Issue #959 added search, status, purpose_category, and a time window to the
+    internal list. The published v1 contract is unchanged by decision: the facade
+    forwards only skip and limit, and an external caller's extra query parameters are
+    ignored rather than relayed."""
+    items = [_sample_internal()]
+
+    def handler(method, url, headers, json, params):
+        return httpx.Response(200, json={"items": items, "total": 1, "skip": 5, "limit": 10})
+
+    _install_handler(monkeypatch, handler)
+    async with _client() as c:
+        resp = await c.get(
+            "/reservations",
+            params={
+                "skip": 5,
+                "limit": 10,
+                "search": "lab",
+                "status": "ACTIVE",
+                "purpose_category": "none",
+                "starts_after": "2030-01-01T00:00:00Z",
+                "all": "true",
+                "sort_by": "status",
+            },
+            headers=_auth(_token()),
+        )
+
+    assert resp.status_code == 200
+    assert CAPTURED["params"] == {"skip": 5, "limit": 10}
+    v1_keys = (
+        "id",
+        "status",
+        "device_ids",
+        "topology_id",
+        "start_time",
+        "end_time",
+        "created_at",
+        "purpose_category",
+    )
+    data = resp.json()
+    assert set(data) == {"items", "total", "skip", "limit"}
+    assert (data["total"], data["skip"], data["limit"]) == (1, 5, 10)
+    assert [set(item) for item in data["items"]] == [set(v1_keys)]
+    assert data["items"][0]["id"] == items[0]["id"]
+
+
 async def test_get_status_maps(monkeypatch):
     internal = _sample_internal()
 

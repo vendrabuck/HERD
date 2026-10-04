@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.internal_auth import internal_token_matches
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel
 from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +29,7 @@ from app.schemas.reservation import (
     ReservationUpdate,
     UtilizationReport,
 )
+from app.services.purpose_service import validate_purpose_category
 from app.services.reporting_service import (
     TransitGearUnavailable,
     build_utilization_report,
@@ -40,6 +41,8 @@ from app.services.reporting_service import (
 )
 from app.services.reservation_service import (
     _FORK_SAVE_TIMEOUT_SECONDS,
+    PURPOSE_CATEGORY_NONE,
+    ReservationListFilters,
     TopologyDeviceNotMember,
     TopologyRoutingIntentInvalid,
     _cabling_fork_call,
@@ -79,6 +82,16 @@ ReservationSortField = Literal[
     "start_time", "end_time", "status", "purpose_category", "user_id", "created_at"
 ]
 ReservationSortDir = Literal["asc", "desc"]
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Normalize a timezone-aware filter bound to UTC (issue #959).
+
+    Postgres compares timestamptz by instant, but SQLite compares the stored text, so
+    an offset like +05:00 must be converted before it reaches the query for both
+    dialects to agree.
+    """
+    return value.astimezone(timezone.utc) if value is not None else None
 
 
 @router.post("/", response_model=ReservationResponse, status_code=status.HTTP_201_CREATED)
@@ -150,16 +163,68 @@ async def get_my_reservations(
         "desc",
         description="Sort direction. Defaults to desc (today's ordering: newest first).",
     ),
+    search: str | None = Query(
+        None,
+        max_length=200,
+        description=(
+            "Case-insensitive substring match on purpose. A term of 8 or more hex "
+            "digits (hyphens ignored) also matches reservations whose id starts with it."
+        ),
+    ),
+    status_filter: list[ReservationStatus] | None = Query(
+        None,
+        alias="status",
+        description="Only these statuses. Repeat the parameter for more than one.",
+    ),
+    purpose_category: str | None = Query(
+        None,
+        max_length=200,
+        description=(
+            "Only this configured purpose category, or 'none' for reservations with "
+            "no category. An unknown category is a 422."
+        ),
+    ),
+    starts_after: AwareDatetime | None = Query(
+        None, description="Only reservations whose start_time is at or after this instant."
+    ),
+    starts_before: AwareDatetime | None = Query(
+        None, description="Only reservations whose start_time is before this instant."
+    ),
+    ends_after: AwareDatetime | None = Query(
+        None, description="Only reservations whose end_time is at or after this instant."
+    ),
+    ends_before: AwareDatetime | None = Query(
+        None, description="Only reservations whose end_time is before this instant."
+    ),
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
 ):
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")
+    # Issue #959: purpose_category is a configured string list, not an enum, so it is
+    # checked here; an unknown value is a 422 (the same message the PATCH gives), never
+    # a silently empty page. "none" selects rows with no category.
+    if purpose_category is not None and purpose_category != PURPOSE_CATEGORY_NONE:
+        try:
+            validate_purpose_category(purpose_category)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    filters = ReservationListFilters(
+        search=search,
+        statuses=tuple(status_filter or ()),
+        purpose_category=purpose_category,
+        starts_after=_as_utc(starts_after),
+        starts_before=_as_utc(starts_before),
+        ends_after=_as_utc(ends_after),
+        ends_before=_as_utc(ends_before),
+    )
     # Visibility is resolved before ordering: the `all` gate below decides which
     # ROW SET the caller can see at all, and each branch's own query (the owner
     # filter in list_user_reservations, no filter in list_all_reservations) applies
     # that row set before ORDER BY / OFFSET / LIMIT ever run. A caller can therefore
     # never use sort_by/sort_dir to learn anything about a row outside that set.
+    # The #959 filters are ANDed onto that same visibility-scoped query, so they too
+    # can only narrow it, and `total` is the filtered total.
     if all:
         if role not in ("admin", "superadmin"):
             raise HTTPException(
@@ -167,11 +232,17 @@ async def get_my_reservations(
                 detail="Only admins can list all reservations",
             )
         reservations, total = await list_all_reservations(
-            db, skip=skip, limit=limit, sort_by=sort_by, sort_dir=sort_dir
+            db, skip=skip, limit=limit, sort_by=sort_by, sort_dir=sort_dir, filters=filters
         )
     else:
         reservations, total = await list_user_reservations(
-            db, user_id, skip=skip, limit=limit, sort_by=sort_by, sort_dir=sort_dir
+            db,
+            user_id,
+            skip=skip,
+            limit=limit,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            filters=filters,
         )
     return PaginatedReservationResponse(
         items=reservations,
