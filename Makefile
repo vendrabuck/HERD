@@ -407,7 +407,7 @@ prod:  ## Start the stack without dev overrides (no reload)
 # not enabled is neither an active service nor an orphan, so a plain `down` (even
 # with --remove-orphans) leaves the e2e Selenium container running. Left behind
 # by the dev project it holds host port 4444 and the gate's e2e phase then fails
-# at Selenium recreate ("Bind for 0.0.0.0:4444 failed") before any test runs.
+# at Selenium recreate ("Bind for 127.0.0.1:4444 failed") before any test runs.
 down:  ## Stop the stack (including the e2e Selenium container if it is up)
 	docker compose --profile e2e down
 

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- Security: the e2e Selenium container now publishes its WebDriver endpoint (4444) and
+  its noVNC browser view (7900) on 127.0.0.1 only. Neither port authenticates, and both
+  used to listen on every host interface while the container was up (during
+  `make test-e2e` and the gate runs), so anything that could reach the host could start
+  a browser session inside the stack's network or watch the one a test was driving. The
+  e2e suite connects from the host on localhost and is unaffected; to watch a run from
+  another machine, forward 7900 over ssh. A unit test now holds every port the dev
+  override publishes to the same loopback rule as the base compose file (#964).
 - Fixed: modal dialogs now open centred instead of pinned to the top-left corner of the
   window. Tailwind 4's base styles set every element's margin to zero, which removed the
   browser's own centring for native dialogs; the three dialog components (`Modal`,

@@ -23,6 +23,11 @@ step `make test-e2e` and `make test-e2e-seeded` already run at the start of
 every invocation, so a fresh `make test-e2e*` run is unaffected; the risk is
 mid-run exhaustion within a single long invocation.
 
+The container publishes the Grid (4444) and its noVNC browser view (7900) on
+127.0.0.1 only (issue #964); to watch a run from another machine, forward the
+port over ssh (`ssh -L 7900:127.0.0.1:7900 <host>`) and open
+`http://localhost:7900` there.
+
 ## M1. FRR live-config apply (real router path)
 
 - Why manual: needs the external network-simulator lab; netmiko over real
