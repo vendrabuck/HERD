@@ -10,6 +10,10 @@ Invariants under test:
   PermanentEventError that dead-letters and fires the failure callback.
 - Teardown mirrors the L3 discipline: a driver-result failure ACKs and leaves
   the row ACTIVE (may-still-exist); a transient upstream error NAKs.
+- A row becomes DESTROYED only after the driver destroyed the instance or
+  confirmed none exists (issue #937): a row with no instance_ref gets a keyed
+  destroy (instance_ref=None, HERD_request_id in the context), and a failed or
+  raising keyed destroy leaves the row live with a pinned log action.
 - Secret values reach the recipe only through the context file, never the child
   environment (the password_keys plumbing).
 """
@@ -22,6 +26,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from app.database import Base
 from app.models.dynamic_instance import DynamicInstance
@@ -78,6 +83,36 @@ async def setup_db():
     yield
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+class _ReservationsStatusClient:
+    """Stands in for reservations' GET /internal/{id}, reporting state["status"]."""
+
+    def __init__(self, state):
+        self._state = state
+
+    async def get(self, url, **kwargs):
+        return httpx.Response(200, json={"status": self._state["status"]})
+
+
+@pytest.fixture(autouse=True)
+def reservation_status():
+    """Run the REAL corroboration gate against a stubbed reservations answer.
+
+    reservation.provision_requested is gated since issue #937, so every test
+    that drives process_reservation_message would otherwise make a real HTTP
+    call and NAK on its transport error. Defaults to PENDING_PROVISION, the
+    status a legitimate provision_requested is staged under; a test sets
+    reservation_status["status"] to model a reservation that has since ended.
+    """
+    state = {"status": "PENDING_PROVISION"}
+    real_verify = nats_consumer._verify_reservation_event
+
+    async def _verify(event_data, client):
+        return await real_verify(event_data, _ReservationsStatusClient(state))
+
+    with patch("app.services.nats_consumer._verify_reservation_event", new=_verify):
+        yield state
 
 
 def _db_session_factory():
@@ -958,20 +993,35 @@ async def test_teardown_transient_delete_raises():
     assert rows[0].status == "ACTIVE"
 
 
-async def test_teardown_creating_without_instance_ref_marks_destroyed():
+async def test_teardown_creating_without_instance_ref_runs_keyed_destroy():
+    """Issue #937 (replaces the old "no instance_ref means nothing to destroy"
+    test, which retired the row with no driver call): a CREATING row with no
+    instance_ref may have a real instance behind it, so teardown drives
+    destroy_instance with instance_ref=None and HERD_request_id in the
+    context, and the row becomes DESTROYED only because that destroy reported
+    success."""
     async with TestSessionLocal() as db:
         await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
-    calls, execute = _recipe_execute({})
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    delete = AsyncMock(return_value=True)
     client = AsyncMock()
     with ExitStack() as stack:
-        for p in _teardown_patches(execute):
+        for p in _teardown_patches(execute, delete=delete):
             stack.enter_context(p)
         await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), client)
 
-    # Nothing hypervisor-side to destroy: no recipe method ran.
-    assert calls == []
+    assert [c[0] for c in calls] == ["login", "destroy_instance", "logout"]
+    destroy_call = next(c for c in calls if c[0] == "destroy_instance")
+    assert destroy_call[1] == {"instance_ref": None}
+    assert destroy_call[2]["HERD_request_id"] == REQUEST_ID
+    # No device was ever materialized, so there is nothing to delete.
+    delete.assert_not_awaited()
     rows = await _rows()
     assert rows[0].status == "DESTROYED"
+    # The run row records the keyed call shape, which is what an operator (and
+    # the live integration test) reads to tell a keyed destroy apart.
+    destroy_runs = [r for r in await _runs() if r.action == "destroy_instance"]
+    assert destroy_runs[0].input_params["method_kwargs"] == {"instance_ref": None}
 
 
 async def test_teardown_destroyed_row_is_noop():
@@ -1463,8 +1513,10 @@ async def test_teardown_between_create_and_instance_ref_destroys_created_instanc
             stack.enter_context(p)
         await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
 
+    # Teardown's keyed destroy (no instance_ref yet, issue #937), then the
+    # compensating destroy with the instance_ref create just returned.
     destroys = [c for c in calls if c[0] == "destroy_instance"]
-    assert [c[1] for c in destroys] == [{"instance_ref": "vm-100"}]
+    assert [c[1] for c in destroys] == [{"instance_ref": None}, {"instance_ref": "vm-100"}]
     create_dev.assert_not_awaited()
     callback.assert_not_awaited()
     assert (await _rows())[0].status == "DESTROYED"
@@ -1545,3 +1597,490 @@ async def test_failed_compensating_destroy_is_logged_not_raised(caplog):
         "dynamic_provision_abandoned",
     ]
     assert (await _rows())[0].status == "DESTROYED"
+
+
+# --- keyed destroy (issue #937) -----------------------------------------------
+#
+# Invariant: a ledger row becomes DESTROYED only after the driver destroyed the
+# instance or confirmed that none exists for its HERD_request_id. A row whose
+# create outcome is unknown (no instance_ref, whatever its status) gets a keyed
+# destroy, never a silent retirement.
+
+
+def _formatted(caplog, action):
+    """The JSONFormatter rendering of every record carrying `action`.
+
+    Pinned through the real formatter (CLAUDE.md, LOG EXTRAS), not caplog text,
+    so the test sees exactly the keys an operator's log search sees.
+    """
+    from herd_common.logging import JSONFormatter
+
+    formatter = JSONFormatter("execution")
+    return [
+        json.loads(formatter.format(rec))
+        for rec in caplog.records
+        if getattr(rec, "action", None) == action
+    ]
+
+
+async def _seed_creating():
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+
+
+async def test_keyed_destroy_driver_failure_leaves_row_creating_and_logs(caplog):
+    """A keyed destroy that returns a driver-result failure: the row stays
+    CREATING (not DESTROYED), teardown does not raise (the message ACKs), and
+    the pinned operator action carries the request and reservation ids but no
+    driver text."""
+    await _seed_creating()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_DRIVER_FAIL})
+    delete = AsyncMock(return_value=True)
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute, delete=delete):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert [c[1] for c in calls if c[0] == "destroy_instance"] == [{"instance_ref": None}]
+    delete.assert_not_awaited()
+    rows = await _rows()
+    assert rows[0].status == "CREATING"
+    assert rows[0].instance_ref is None
+
+    [record] = _formatted(caplog, "dynamic_instance_keyed_destroy_failed")
+    assert record["level"] == "ERROR"
+    assert record["request_id"] == REQUEST_ID
+    assert record["reservation_id"] == RES_ID
+    assert record["ledger_status"] == "CREATING"
+    assert record["reason"] == "destroy_failed"
+    # The driver's own error text never reaches the log extras.
+    assert "still running" not in json.dumps(record)
+
+
+async def test_keyed_destroy_on_active_row_without_ref_destroys_and_deletes_device():
+    """Variant 2 as already-stored data: an ACTIVE row with a device and a NULL
+    instance_ref (written before issue #937 made a ref-less create a failure).
+    The no-ref branch keys on the missing ref, not on CREATING, so teardown
+    runs the keyed destroy, then deletes the device, then retires the row."""
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+        await mark_active(db, REQUEST_ID, DEVICE_ID, None)
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    delete = AsyncMock(return_value=True)
+    with ExitStack() as stack:
+        for p in _teardown_patches(execute, delete=delete):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert [c[1] for c in calls if c[0] == "destroy_instance"] == [{"instance_ref": None}]
+    delete.assert_awaited_once()
+    assert delete.await_args.args[1] == DEVICE_ID
+    assert (await _rows())[0].status == "DESTROYED"
+
+
+@pytest.mark.parametrize(
+    "seed_patch, reason",
+    [
+        (
+            patch("app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=None)),
+            "recipe_config_missing",
+        ),
+        (
+            patch(
+                "app.services.driver_loader.load_driver",
+                new=AsyncMock(side_effect=DriverPackageError("broken")),
+            ),
+            "recipe_load_failed",
+        ),
+    ],
+)
+async def test_keyed_destroy_that_cannot_run_leaves_row_creating(seed_patch, reason, caplog):
+    """A no-ref row whose recipe cannot even be driven (config gone, package
+    will not load) used to be retired as "nothing to destroy"; it now stays
+    CREATING with the pinned action and the fixed reason word."""
+    await _seed_creating()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute):
+            stack.enter_context(p)
+        stack.enter_context(seed_patch)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert calls == []
+    assert (await _rows())[0].status == "CREATING"
+    [record] = _formatted(caplog, "dynamic_instance_keyed_destroy_failed")
+    assert record["reason"] == reason
+
+
+async def test_keyed_destroy_login_failure_leaves_row_creating(caplog):
+    await _seed_creating()
+    login_fail = {"success": False, "output": None, "error": "denied", "duration_ms": 1}
+    calls, execute = _recipe_execute({"login": login_fail})
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert [c[0] for c in calls] == ["login"]
+    assert (await _rows())[0].status == "CREATING"
+    [record] = _formatted(caplog, "dynamic_instance_keyed_destroy_failed")
+    assert record["reason"] == "login_failed"
+
+
+async def test_by_ref_destroy_failure_does_not_emit_the_keyed_action(caplog):
+    """The pinned action is specific to the keyed case; the existing by-ref
+    failure path keeps its own log line."""
+    await _seed_active()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_DRIVER_FAIL})
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute, delete=AsyncMock(return_value=True)):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert (await _rows())[0].status == "ACTIVE"
+    assert _formatted(caplog, "dynamic_instance_keyed_destroy_failed") == []
+
+
+# --- create that succeeds without an instance_ref (variant 2) -----------------
+
+
+@pytest.mark.parametrize("bad_ref", [None, "", "   ", 4711])
+async def test_create_success_without_instance_ref_is_a_failed_create(bad_ref, caplog):
+    """A create_instance that reports success with a missing, empty, or
+    non-string instance_ref never reaches set_instance_ref or mark_active: the
+    create raises (NAK), the row stays CREATING with no ref, no device is
+    created, and no success callback is posted."""
+    output = {"success": True, "field_data": {"mgmt_ip": "10.0.0.9"}}
+    if bad_ref is not None:
+        output["instance_ref"] = bad_ref
+    create_no_ref = {"success": True, "output": output, "error": None, "duration_ms": 5}
+    calls, execute = _recipe_execute({"create_instance": create_no_ref})
+    create_dev = AsyncMock(return_value={"id": DEVICE_ID})
+    callback = AsyncMock()
+    set_ref = AsyncMock(return_value=True)
+    activate = AsyncMock(return_value=True)
+    patches = _create_patches(execute)
+    patches[-1] = patch("app.services.nats_consumer._create_dynamic_device", new=create_dev)
+    patches += [
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback),
+        patch.object(dynamic_instance_service_module, "set_instance_ref", new=set_ref),
+        patch.object(dynamic_instance_service_module, "mark_active", new=activate),
+    ]
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        with pytest.raises(RuntimeError, match="no instance_ref"):
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    set_ref.assert_not_awaited()
+    activate.assert_not_awaited()
+    create_dev.assert_not_awaited()
+    callback.assert_not_awaited()
+    row = (await _rows())[0]
+    assert (row.status, row.instance_ref, row.device_id) == ("CREATING", None, None)
+    [record] = _formatted(caplog, "dynamic_instance_create_missing_ref")
+    assert record["request_id"] == REQUEST_ID
+    assert record["reservation_id"] == RES_ID
+
+
+# --- compensation with no instance_ref (_destroy_orphaned_instance) -----------
+
+
+async def _compensate(execute, instance_ref):
+    from app.services.nats_consumer import _destroy_orphaned_instance
+
+    with patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute):
+        async with TestSessionLocal() as db:
+            await _destroy_orphaned_instance(
+                db,
+                uuid.UUID(HYPERVISOR_ID),
+                uuid.UUID(DRIVER_ID),
+                "sha256abc",
+                uuid.UUID(USER_ID),
+                {},
+                uuid.UUID(RES_ID),
+                "/tmp/recipe",
+                {"HERD_request_id": REQUEST_ID},
+                set(),
+                REQUEST_ID,
+                instance_ref,
+            )
+
+
+@pytest.mark.parametrize("instance_ref", [None, ""])
+async def test_compensation_without_instance_ref_runs_keyed_destroy(instance_ref, caplog):
+    """The #896 compensation's no-ref branch used to log and give up; it now
+    issues the keyed destroy like teardown does."""
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    with caplog.at_level("INFO"):
+        await _compensate(execute, instance_ref)
+
+    assert [c[0] for c in calls] == ["login", "destroy_instance", "logout"]
+    destroy_call = next(c for c in calls if c[0] == "destroy_instance")
+    assert destroy_call[1] == {"instance_ref": None}
+    assert destroy_call[2]["HERD_request_id"] == REQUEST_ID
+    assert _actions(caplog) == ["dynamic_instance_compensated"]
+
+
+async def test_compensation_keyed_destroy_failure_is_logged_not_raised(caplog):
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_DRIVER_FAIL})
+    with caplog.at_level("INFO"):
+        await _compensate(execute, None)
+
+    assert [c[1] for c in calls if c[0] == "destroy_instance"] == [{"instance_ref": None}]
+    assert _actions(caplog) == ["dynamic_instance_compensation_failed"]
+
+
+# --- stateful driver double, real sandbox (variants 1 and 2) ------------------
+#
+# The checked-in mock hypervisor is stateless, so it acknowledges any destroy
+# and cannot show that an instance was really found and removed. This double
+# keeps its "hypervisor" in a JSON file named by a template field default, runs
+# as a real subprocess through the sandbox, and derives the instance name from
+# HERD_request_id in create and in the keyed destroy, as the contract requires.
+
+_STATEFUL_RECIPE = """
+import json
+from pathlib import Path
+
+
+class Driver:
+    def __init__(self, context):
+        self.context = context
+        self.state = Path(context["HERD_state_file"])
+        self.mode = context.get("HERD_double_mode") or ""
+
+    def _load(self):
+        return json.loads(self.state.read_text()) if self.state.exists() else {}
+
+    def _save(self, vms):
+        self.state.write_text(json.dumps(vms))
+
+    def _name(self):
+        return "vm-" + self.context["HERD_request_id"]
+
+    def login(self):
+        return {"success": True}
+
+    def logout(self):
+        return {"success": True}
+
+    def status(self):
+        return {"reachable": True}
+
+    def create_instance(self, **_):
+        vms = self._load()
+        vms[self._name()] = "id-" + self._name()
+        self._save(vms)
+        if self.mode == "fail_after_create":
+            return {"success": False, "error": "power-on failed after the VM was created"}
+        if self.mode == "no_ref":
+            return {"success": True, "field_data": {}}
+        return {"success": True, "instance_ref": vms[self._name()], "field_data": {}}
+
+    def destroy_instance(self, instance_ref=None, **_):
+        vms = self._load()
+        if self.mode == "legacy":
+            # A recipe written to the pre-#937 contract: it assumes a ref.
+            name = instance_ref.removeprefix("id-")
+        elif instance_ref is None:
+            name = self._name()
+        else:
+            name = instance_ref.removeprefix("id-")
+        vms.pop(name, None)
+        self._save(vms)
+        return {"success": True}
+"""
+
+
+def _stateful_template(state_file, mode):
+    return {
+        **TEMPLATE_DATA,
+        "sections": [
+            {
+                "name": "Double",
+                "fields": [
+                    {"key": "state_file", "type": "string", "default": str(state_file)},
+                    {"key": "double_mode", "type": "string", "default": mode},
+                ],
+            }
+        ],
+    }
+
+
+def _stateful_patches(recipe_dir, template, *, delete=None):
+    """Every external seam except the sandbox, which runs the double for real."""
+    return [
+        patch("app.services.nats_consumer._fetch_template", new=AsyncMock(return_value=template)),
+        patch(
+            "app.services.nats_consumer._fetch_hypervisor",
+            new=AsyncMock(return_value=HYPERVISOR_DATA),
+        ),
+        patch(
+            "app.services.nats_consumer._fetch_secret_value",
+            new=AsyncMock(return_value=SECRET_DATA),
+        ),
+        patch(
+            "app.services.driver_loader.load_driver", new=AsyncMock(return_value=str(recipe_dir))
+        ),
+        patch(
+            "app.services.nats_consumer._create_dynamic_device",
+            new=AsyncMock(return_value={"id": DEVICE_ID}),
+        ),
+        patch(
+            "app.services.nats_consumer._delete_dynamic_device",
+            new=delete or AsyncMock(return_value=True),
+        ),
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=AsyncMock()),
+    ]
+
+
+def _write_double(tmp_path):
+    recipe_dir = tmp_path / "recipe"
+    recipe_dir.mkdir()
+    (recipe_dir / "driver.py").write_text(_STATEFUL_RECIPE)
+    return recipe_dir, tmp_path / "hypervisor.json"
+
+
+def _hypervisor_vms(state_file):
+    return json.loads(state_file.read_text()) if state_file.exists() else {}
+
+
+@pytest.mark.parametrize("mode", ["fail_after_create", "no_ref"])
+async def test_create_side_effect_then_failure_is_destroyed_by_teardown(tmp_path, mode):
+    """Variant 1 (create fails after the VM exists) and variant 2 (create
+    succeeds but returns no instance_ref), end to end through the real sandbox:
+    the create NAKs with the row CREATING and no ref, the reservation goes
+    terminal, and teardown's keyed destroy removes the VM the double really
+    holds. Under the pre-#937 code the VM survived and the row was DESTROYED."""
+    recipe_dir, state_file = _write_double(tmp_path)
+    template = _stateful_template(state_file, mode)
+
+    with ExitStack() as stack:
+        for p in _stateful_patches(recipe_dir, template):
+            stack.enter_context(p)
+        with pytest.raises(RuntimeError):
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+        # The side effect is real: the hypervisor holds the instance.
+        assert _hypervisor_vms(state_file) == {f"vm-{REQUEST_ID}": f"id-vm-{REQUEST_ID}"}
+        row = (await _rows())[0]
+        assert (row.status, row.instance_ref) == ("CREATING", None)
+
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert _hypervisor_vms(state_file) == {}
+    assert (await _rows())[0].status == "DESTROYED"
+
+
+async def test_legacy_recipe_keyed_destroy_raises_row_stays_creating(tmp_path, caplog):
+    """A recipe written to the old contract raises when instance_ref is None.
+    Policy: the row stays CREATING as a may-still-exist record (the VM really
+    does still exist), teardown does not raise (ACK), the run row stores only
+    the exception class, and the pinned action names the request."""
+    recipe_dir, state_file = _write_double(tmp_path)
+    template = _stateful_template(state_file, "legacy")
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+    state_file.write_text(json.dumps({f"vm-{REQUEST_ID}": f"id-vm-{REQUEST_ID}"}))
+
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _stateful_patches(recipe_dir, template):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert _hypervisor_vms(state_file) == {f"vm-{REQUEST_ID}": f"id-vm-{REQUEST_ID}"}
+    assert (await _rows())[0].status == "CREATING"
+    destroy_run = next(r for r in await _runs() if r.action == "destroy_instance")
+    assert destroy_run.error == "driver raised AttributeError"
+    assert destroy_run.input_params["method_kwargs"] == {"instance_ref": None}
+    [record] = _formatted(caplog, "dynamic_instance_keyed_destroy_failed")
+    assert record["request_id"] == REQUEST_ID
+    assert record["reason"] == "destroy_failed"
+    assert "removeprefix" not in json.dumps(record)
+
+
+async def test_teardown_rerun_retries_a_failed_keyed_destroy(tmp_path):
+    """A row left CREATING by a failed keyed destroy is still a teardown
+    candidate, so a later teardown run (a redelivered or replayed terminal
+    event, after the recipe was fixed) retries the keyed destroy and only then
+    retires the row."""
+    recipe_dir, state_file = _write_double(tmp_path)
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+    state_file.write_text(json.dumps({f"vm-{REQUEST_ID}": f"id-vm-{REQUEST_ID}"}))
+
+    with ExitStack() as stack:
+        for p in _stateful_patches(recipe_dir, _stateful_template(state_file, "legacy")):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+    assert (await _rows())[0].status == "CREATING"
+
+    with ExitStack() as stack:
+        for p in _stateful_patches(recipe_dir, _stateful_template(state_file, "")):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+    assert _hypervisor_vms(state_file) == {}
+    assert (await _rows())[0].status == "DESTROYED"
+
+
+# --- no resurrection after a failed keyed destroy -------------------------------
+
+
+@pytest.mark.parametrize("status", ["CANCELLED", "COMPLETED", "FAILED", "ACTIVE", "PENDING"])
+async def test_provision_redelivery_after_reservation_left_pending_provision_creates_nothing(
+    tmp_path, reservation_status, status, caplog
+):
+    """A failed keyed destroy leaves the row CREATING, which the #896
+    DESTROYED refusal does not cover. A provision_requested that arrives after
+    the reservation left PENDING_PROVISION (a NAK-backoff redelivery behind a
+    cancel) is refused by the corroboration gate: ACK, no recipe call, row
+    unchanged."""
+    await _seed_creating()
+    reservation_status["status"] = status
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    js = MagicMock()
+    js.publish = AsyncMock()
+    msg = MagicMock()
+    msg.data = json.dumps(_event()).encode()
+    msg.metadata = SimpleNamespace(num_delivered=2)
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
+
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _create_patches(execute):
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "ack"
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()
+    assert calls == []
+    row = (await _rows())[0]
+    assert (row.status, row.instance_ref) == ("CREATING", None)
+    [record] = _formatted(caplog, "nats_event_unverified")
+    assert record["event"] == "reservation.provision_requested"
+    assert record["reported_status"] == status
+
+
+async def test_provision_requested_under_pending_provision_still_runs(reservation_status):
+    """The gate's positive case: the status reservations stages the event under."""
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    msg = MagicMock()
+    msg.data = json.dumps(_event()).encode()
+    msg.metadata = SimpleNamespace(num_delivered=1)
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
+    patches = _create_patches(execute)
+    patches.append(patch("app.services.nats_consumer._post_provision_result_best_effort"))
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            msg, MagicMock(), handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "ack"
+    assert [c[0] for c in calls] == ["login", "create_instance", "logout"]
+    assert (await _rows())[0].status == "ACTIVE"

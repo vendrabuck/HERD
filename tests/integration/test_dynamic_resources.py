@@ -46,6 +46,7 @@ from _nats_helpers import (
     probe_nats,
     publish_raw,
 )
+from conftest import _psql
 
 pytestmark = pytest.mark.asyncio
 
@@ -219,6 +220,34 @@ async def failing_dynamic_template(base_url, admin_token, hv_driver, hypervisor)
 
 
 @pytest.fixture(scope="session")
+async def failing_destroy_dynamic_template(base_url, admin_token, hv_driver, hypervisor):
+    """A dynamic template whose create AND destroy fail (issue #937).
+
+    The create failure leaves the ledger row with no instance_ref, so teardown
+    runs the keyed destroy, which this template also fails: the stand-in for a
+    recipe written before the keyed-destroy contract.
+    """
+    async with _admin_session_client(base_url, admin_token) as client:
+        payload = _dynamic_template_payload(
+            hv_driver["id"],
+            hypervisor["id"],
+            [
+                {
+                    "key": "mock_fail_actions",
+                    "label": "Mock fail actions",
+                    "type": "string",
+                    "default": "create_instance,destroy_instance",
+                },
+            ],
+        )
+        resp = await client.post("/inventory/templates", json=payload)
+        resp.raise_for_status()
+        template = resp.json()
+        yield template
+        await client.delete(f"/inventory/templates/{template['id']}")
+
+
+@pytest.fixture(scope="session")
 async def broken_recipe_driver(base_url, admin_token):
     """Upload a structurally broken Hypervisor recipe (no Driver class).
 
@@ -325,6 +354,42 @@ async def _devices_with_prefix(client, prefix: str) -> list[dict]:
     resp = await client.get("/inventory/devices", params={"search": prefix, "limit": 200})
     resp.raise_for_status()
     return [d for d in resp.json().get("items", []) if d["name"].startswith(prefix)]
+
+
+def _ledger_row(request_id: str) -> tuple[str, str] | None:
+    """(status, instance_ref) of execution's dynamic_instances row, read in Postgres.
+
+    The ledger has no API; this is the same `docker compose exec postgres psql`
+    helper the LDAP suites use, so COMPOSE_PROJECT_NAME picks the stack.
+    """
+    uuid.UUID(request_id)  # only ever interpolate a well-formed uuid
+    result = _psql(
+        "SELECT status, coalesce(instance_ref, '') FROM execution.dynamic_instances "
+        f"WHERE request_id = '{request_id}'",
+        tuples_only=True,
+    )
+    assert result.returncode == 0, result.stderr
+    line = result.stdout.strip()
+    if not line:
+        return None
+    status, _, ref = line.partition("|")
+    return status, ref
+
+
+async def _poll_keyed_destroys(client, reservation_id: str, *, timeout: float = 60.0) -> list:
+    """Poll until a keyed destroy_instance run (method_kwargs instance_ref None) exists."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        runs = await _runs(client, reservation_id, "destroy_instance")
+        keyed = [
+            r
+            for r in runs
+            if (r.get("input_params") or {}).get("method_kwargs") == {"instance_ref": None}
+        ]
+        if keyed:
+            return keyed
+        await asyncio.sleep(1.0)
+    return []
 
 
 def _dynamic_device_id(reservation: dict, physical_id: str) -> str:
@@ -480,6 +545,79 @@ async def test_create_failure_lands_failed_with_no_orphans(
             "exhausted provision_requested was not retained on herd.reservations.dlq.execution"
         )
         assert json.loads(retained)["event"] == "reservation.provision_requested"
+
+
+@pytest.mark.timeout(300)
+async def test_failed_create_is_destroyed_by_keyed_teardown(
+    admin_client, failing_dynamic_template, fresh_device
+):
+    """Issue #937, live: create_instance fails on every delivery, so the ledger
+    row never learns an instance_ref. When the reservation lands in FAILED,
+    teardown must still drive the recipe: a keyed destroy_instance with
+    instance_ref None, which the mock resolves to the name its create derives
+    from the request id, and only then is the row DESTROYED. Before #937 the
+    row was retired with no driver call at all."""
+    reservation = await _reserve_dynamic(
+        admin_client, fresh_device["id"], failing_dynamic_template["id"]
+    )
+    request_id = reservation["dynamic_requests"][0]["id"]
+    failed = await _poll_reservation_status(
+        admin_client, reservation["id"], "FAILED", timeout=240.0, interval=2.0
+    )
+    assert failed is not None, "reservation never landed in FAILED after create failures"
+
+    keyed = await _poll_keyed_destroys(admin_client, reservation["id"])
+    assert len(keyed) == 1, f"expected one keyed destroy_instance run, got {keyed}"
+    output = json.loads(keyed[0]["output"])
+    assert output == {
+        "success": True,
+        "instance_ref": f"mock-vm-{request_id}",
+        "keyed": True,
+    }
+
+    deadline = asyncio.get_event_loop().time() + 30.0
+    row = _ledger_row(request_id)
+    while row != ("DESTROYED", "") and asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(1.0)
+        row = _ledger_row(request_id)
+    assert row == ("DESTROYED", ""), f"ledger row after keyed destroy: {row}"
+
+
+@pytest.mark.timeout(300)
+async def test_failed_keyed_destroy_leaves_ledger_row_creating(
+    admin_client, failing_destroy_dynamic_template, fresh_device
+):
+    """Issue #937 failure policy, live: the keyed destroy itself fails (the
+    stand-in for a recipe written before the contract), so the row must NOT be
+    retired: it stays CREATING with no instance_ref as a may-still-exist
+    record, and the reservation still ends FAILED (the event was ACKed, not
+    looped)."""
+    reservation = await _reserve_dynamic(
+        admin_client, fresh_device["id"], failing_destroy_dynamic_template["id"]
+    )
+    request_id = reservation["dynamic_requests"][0]["id"]
+    try:
+        failed = await _poll_reservation_status(
+            admin_client, reservation["id"], "FAILED", timeout=240.0, interval=2.0
+        )
+        assert failed is not None, "reservation never landed in FAILED after create failures"
+
+        keyed = await _poll_keyed_destroys(admin_client, reservation["id"])
+        assert len(keyed) == 1, f"expected one keyed destroy_instance run, got {keyed}"
+        output = json.loads(keyed[0]["output"])
+        assert output["success"] is False
+
+        # Teardown has finished with this row (the keyed run is recorded before
+        # the ledger decision); give it a moment, then the row must still be live.
+        await asyncio.sleep(3.0)
+        assert _ledger_row(request_id) == ("CREATING", "")
+        # The physical device is released regardless.
+        status = await _poll_device_status(admin_client, fresh_device["id"], "AVAILABLE")
+        assert status == "AVAILABLE", f"physical device stuck in {status} after FAILED"
+    finally:
+        # Test garbage on a shared stack: the mock created nothing, so the
+        # may-still-exist row is known to be empty here and can go.
+        _psql(f"DELETE FROM execution.dynamic_instances WHERE request_id = '{request_id}'")
 
 
 @pytest.mark.timeout(120)

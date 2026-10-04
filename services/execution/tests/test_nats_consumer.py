@@ -447,6 +447,12 @@ async def test_process_message_permanent_error_sanitizes_provision_failure_reaso
     posted = AsyncMock()
     with (
         patch("app.services.nats_consumer._post_provision_result", new=posted),
+        # provision_requested is corroborated since issue #937; this test is
+        # about the DLQ branch, so let the gate pass without an HTTP call.
+        patch(
+            "app.services.nats_consumer._verify_reservation_event",
+            new=AsyncMock(return_value=None),
+        ),
         caplog.at_level(logging.ERROR),
     ):
         result = await process_reservation_message(
@@ -486,6 +492,12 @@ async def test_process_message_max_deliver_sanitizes_provision_failure_reason(ca
     posted = AsyncMock()
     with (
         patch("app.services.nats_consumer._post_provision_result", new=posted),
+        # provision_requested is corroborated since issue #937; this test is
+        # about the DLQ branch, so let the gate pass without an HTTP call.
+        patch(
+            "app.services.nats_consumer._verify_reservation_event",
+            new=AsyncMock(return_value=None),
+        ),
         caplog.at_level(logging.ERROR),
     ):
         result = await process_reservation_message(

@@ -11,7 +11,10 @@ materialized) to DESTROYED (destroy_instance plus device delete done). A row
 stuck in CREATING is retried idempotently; the unique request_id makes a
 concurrent insert lose to IntegrityError and re-read the winner. The lifecycle
 only moves forward: set_instance_ref and mark_active are compare-and-swap
-updates that never touch a DESTROYED row (issue #896).
+updates that never touch a DESTROYED row (issue #896). A row becomes DESTROYED
+only after the recipe's destroy_instance reported success, by instance_ref or,
+for a row with none, keyed by HERD_request_id (issue #937); a row whose create
+outcome is unknown is never retired as "nothing to destroy".
 """
 
 import logging
@@ -126,7 +129,12 @@ async def mark_active(db: AsyncSession, request_id, device_id, instance_ref: str
 
 
 async def mark_destroyed(db: AsyncSession, request_id) -> None:
-    """Flip a row to DESTROYED after destroy_instance and the device delete."""
+    """Flip a row to DESTROYED after destroy_instance and the device delete.
+
+    The caller must hold a successful destroy_instance result for this row (by
+    instance_ref, or keyed by request id when the row has none): DESTROYED means
+    the driver destroyed the instance or confirmed none exists (issue #937).
+    """
     row = await get_by_request_id(db, request_id)
     if row is None:
         return
