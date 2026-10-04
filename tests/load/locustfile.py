@@ -2,7 +2,7 @@
 
 Seven user classes simulating different usage patterns:
 - ReservationUser: creates, lists, queries calendar, releases reservations
-- InventoryBrowser: browses devices and templates
+- InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
 - ACLChecker: batch checks permissions
 - RoutedTopologyValidator: repeatedly validates one topology carrying Layer 3
@@ -202,6 +202,27 @@ class InventoryBrowser(HerdUser):
     @task(2)
     def list_templates(self):
         self._auth_get("/api/inventory/templates")
+
+    @task(2)
+    def list_topologies(self):
+        # The Topologies page is the landing page after login; its default view.
+        self._auth_get("/api/cabling/topologies", params={"limit": 50})
+
+    @task(1)
+    def search_topologies(self):
+        # The list controls (issue #958): a filtered, counted, text-sorted query.
+        self._auth_get(
+            "/api/cabling/topologies",
+            params={
+                "search": random.choice(["lab", "demo", "topo", "x"]),
+                "owner": random.choice(["all", "mine"]),
+                "sort_by": random.choice(["name", "owner_name", "created_at", "updated_at"]),
+                "sort_dir": random.choice(["asc", "desc"]),
+                "limit": 50,
+            },
+            # One stats row for every parameter combination.
+            name="/api/cabling/topologies [search, owner, sort]",
+        )
 
 
 class BulkExporter(HerdUser):

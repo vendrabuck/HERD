@@ -27,13 +27,15 @@ Exercises the reservation flow as an admin.
 
 ### `InventoryBrowser` (weight 5)
 
-Simulates read-heavy inventory browsing.
+Simulates read-heavy inventory and topology-list browsing.
 
 - `on_start`: logs in as admin, caches all device IDs.
 - Tasks:
   - `list_devices` (weight 5): `GET /api/inventory/devices`
   - `get_device_detail` (weight 3): `GET /api/inventory/devices/{id}`
   - `list_templates` (weight 2): `GET /api/inventory/templates`
+  - `list_topologies` (weight 2): `GET /api/cabling/topologies` (the Topologies page's default view)
+  - `search_topologies` (weight 1): `GET /api/cabling/topologies` with a random `search`, `owner`, `sort_by`, and `sort_dir` (issue #958)
 - Think time: 1 to 2 seconds.
 
 ### `ACLChecker` (weight 2)

@@ -11,12 +11,40 @@ import type {
   RestoreRequest,
 } from "@/types/topology.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
+import type { TopologyOwnerFilter, TopologySortField } from "@/lib/topologyFilters";
 import apiClient from "./client";
 import { errorDetail } from "@/lib/errors";
 
-async function fetchPaginatedTopologies(skip = 0, limit = 50): Promise<PaginatedResponse<Topology>> {
+// The list controls the Topologies page sends (issue #958). Every field is
+// optional and only a set field becomes a query parameter, so an unset one
+// leaves the backend default in force (owner all, updated_at desc).
+export interface TopologyListQuery {
+  search?: string;
+  owner?: TopologyOwnerFilter;
+  sortBy?: TopologySortField;
+  sortDir?: "asc" | "desc";
+}
+
+export function topologyListParams(
+  skip: number,
+  limit: number,
+  query?: TopologyListQuery,
+): Record<string, string | number> {
+  const params: Record<string, string | number> = { skip, limit };
+  if (query?.search) params.search = query.search;
+  if (query?.owner) params.owner = query.owner;
+  if (query?.sortBy) params.sort_by = query.sortBy;
+  if (query?.sortDir) params.sort_dir = query.sortDir;
+  return params;
+}
+
+async function fetchPaginatedTopologies(
+  skip = 0,
+  limit = 50,
+  query?: TopologyListQuery,
+): Promise<PaginatedResponse<Topology>> {
   const resp = await apiClient.get<PaginatedResponse<Topology>>("/cabling/topologies", {
-    params: { skip, limit },
+    params: topologyListParams(skip, limit, query),
   });
   return resp.data;
 }
@@ -72,10 +100,14 @@ export function useTopologies() {
   });
 }
 
-export function usePaginatedTopologies(skip = 0, limit = 50) {
+export function usePaginatedTopologies(
+  skip = 0,
+  limit = 50,
+  query?: TopologyListQuery,
+) {
   return useQuery({
-    queryKey: ["topologies", "paginated", skip, limit],
-    queryFn: () => fetchPaginatedTopologies(skip, limit),
+    queryKey: ["topologies", "paginated", skip, limit, query ?? null],
+    queryFn: () => fetchPaginatedTopologies(skip, limit, query),
     placeholderData: keepPreviousData,
   });
 }
@@ -115,6 +147,17 @@ export function useDeleteTopology() {
     mutationFn: deleteTopology,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["topologies"] }),
     onError: (err) => toast.error(errorDetail(err, "Failed to delete topology")),
+  });
+}
+
+// Multi-select delete (issue #958). There is no bulk endpoint: one DELETE per
+// id, settled independently, so one refusal never sinks the rest. No toast per
+// row here; the page summarizes the settled results once.
+export function useBulkDeleteTopologies() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (ids: string[]) => Promise.allSettled(ids.map((id) => deleteTopology(id))),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["topologies"] }),
   });
 }
 
