@@ -85,7 +85,13 @@ not finished.
   in the same pull request, the same way it updates `CHANGELOG.md`.
 - `tests/unit/test_spec_references.py` fails when a specification names a repository
   path that does not exist, so a rename or a deleted test cannot leave a dangling
-  reference unnoticed.
+  reference unnoticed. It also fails when an "Enforced in" or "Pinned by" symbol no
+  longer appears in the file it names, when a rule identifier repeats or a rule lacks
+  either line, when a relative link does not resolve, or when a template section is
+  missing. Its module docstring defines exactly what counts as a path, a reference
+  line, and a rule. Write references as `` `path` (`symbol`, `symbol`) `` groups
+  separated by `;`, and `Pinned by: none` for an unpinned rule. A withdrawn rule says
+  "withdrawn" in its text and needs no references.
 - The header's "Verified at" line names the commit the document was last checked
   against in full. A partial update leaves that line alone.
 
