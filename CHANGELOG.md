@@ -16,7 +16,17 @@
   could destroy. The execution consumer now corroborates `reservation.provision_requested`
   like the other lifecycle events: it runs only while the reservation is
   `PENDING_PROVISION`, so a late redelivery cannot create an instance for an ended
-  reservation. AI-drafted recipes are validated against a new dry-run step,
+  reservation; this makes provisioning depend on reservations being reachable, and an
+  outage that outlasts the NAK schedule dead-letters the event so the provision timeout
+  fails the reservation with no create attempted (`docs/TROUBLESHOOTING.md`). Teardown
+  retires a row only by a compare-and-swap on the state it actually destroyed, so a create
+  that lands on another replica mid-teardown is torn down too instead of being leaked
+  (log action `dynamic_instance_teardown_contended` if that keeps happening), and a
+  create that fails after teardown retired its row runs a keyed compensating destroy. A
+  `create_instance` success without an `instance_ref` now dead-letters on its first
+  delivery. The package validator judges `create_instance` and `destroy_instance` by the
+  consumer's own rule (an explicit `"success": true`, and a non-empty `instance_ref` from
+  create). AI-drafted recipes are validated against a new dry-run step,
   `destroy_instance (no instance_ref)`, and the drafting prompt states the requirement
   (#937).
   UPGRADE NOTE for authors of existing Hypervisor recipes: `destroy_instance` is now

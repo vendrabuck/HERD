@@ -353,8 +353,11 @@ nothing exists hypervisor-side (a create can fail, time out, or lose its process
 touching the hypervisor), so it gets the keyed destroy, `destroy_instance(instance_ref=None)`
 with `HERD_request_id` in the context, and is marked `DESTROYED` only when that succeeds;
 a failed keyed destroy leaves the row `CREATING` and logs
-`dynamic_instance_keyed_destroy_failed` (issue #937). A `create_instance` that reports
-success without an `instance_ref` counts as a failed create.
+`dynamic_instance_keyed_destroy_failed` (issue #937). The `DESTROYED` write is a
+compare-and-swap on the `instance_ref` and `device_id` teardown read, so a create that
+lands on another replica mid-teardown is re-read and torn down rather than overwritten. A
+`create_instance` that reports success without an `instance_ref` is a recipe defect and
+dead-letters on its first delivery.
 
 See [docs/design/0004-dynamic-resources.md](design/0004-dynamic-resources.md) for the
 accepted design and [DRIVERS.md](DRIVERS.md) for the Hypervisor driver contract.

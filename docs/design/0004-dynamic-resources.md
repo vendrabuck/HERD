@@ -174,7 +174,11 @@ applied-state ledger teardown drives from, the direct peer of
 re-activated, and create updates are compare-and-swap (issue #896). A row
 becomes DESTROYED only after the driver destroyed the instance or confirmed
 that none exists for its `request_id` (issue #937); a row whose create outcome
-is unknown is never retired as "nothing to destroy". Because a failed keyed
+is unknown is never retired as "nothing to destroy". The DESTROYED write is a
+compare-and-swap on the `instance_ref` and `device_id` teardown read, so a
+create landing on another replica during teardown makes it lose, re-read the
+row, and destroy what the row now holds; a create that fails after teardown
+retired its row runs a keyed compensating destroy. Because a failed keyed
 destroy now leaves such a row CREATING, the execution consumer's
 event-corroboration gate refuses a `provision_requested` whose reservation is
 no longer `PENDING_PROVISION`, so a late redelivery cannot create an instance

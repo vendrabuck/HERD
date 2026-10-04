@@ -1392,8 +1392,12 @@ found" as an already-absent success would let HERD retire a row whose instance s
 exists. Upgrade such a recipe before relying on dynamic teardown.
 
 There is no capability flag for this: the keyed destroy is part of the Hypervisor contract
-for every recipe, and AI-drafted recipes are validated against it (the dry-run step
-`destroy_instance (no instance_ref)`).
+for every recipe. AI-drafted recipes get a dry-run step for it,
+`destroy_instance (no instance_ref)`, but understand what that step proves: under dry-run
+a compliant recipe returns before any hypervisor lookup, so the step shows the recipe
+accepts `instance_ref=None` without raising and answers with an explicit
+`"success": true`. It cannot show that the recipe really finds the instance by its
+derived name; that part is for the reviewing admin to read in the code.
 
 ### Timeout
 
@@ -1409,8 +1413,8 @@ waiting on a remote hypervisor API is wall-clock time, not CPU time.
 |---|---|
 | login | `{"success": bool}` |
 | logout | `{"success": bool}` |
-| create_instance | `{"success": bool, "instance_ref": str, "field_data": dict}`; `instance_ref` must be a non-empty string when `success` is true, else the create counts as failed |
-| destroy_instance | `{"success": bool}`; with `instance_ref=None`, success means the request-id-named instance was destroyed or does not exist |
+| create_instance | `{"success": bool, "instance_ref": str, "field_data": dict}`; `success` must be present and true (a missing key is a failure here, unlike the physical contracts), and `instance_ref` must be a non-empty string, else the create counts as failed |
+| destroy_instance | `{"success": bool}`; `success` must be present and true, as for create; with `instance_ref=None`, success means the request-id-named instance was destroyed or does not exist |
 | status | `{"reachable": bool}` |
 
 `drivers/mock_hypervisor/` is the checked-in reference for this contract: a
@@ -1435,6 +1439,12 @@ draft is ever shown for review:
   `destroy_instance (no instance_ref)`, and `logout`) in the sandbox with
   `dry_run` set and a synthetic context, so a recipe that skips simulation, or
   raises or fails when called without an `instance_ref`, fails validation.
+  `create_instance` and `destroy_instance` are judged by the execution
+  consumer's own rule (the shared `app.services.recipe_result` predicates): an
+  explicit `"success": true`, plus a non-empty string `instance_ref` from
+  create, so a draft that validates green cannot fail every real provision on
+  either. The keyed step proves signature tolerance and result shape only, not
+  that the recipe resolves the instance by name (see Determinism contract).
 - Standard-library imports only: no `_deps/` vendoring, no
   `requirements.txt`. Package-local modules and the sandbox-provided
   `driver_transcript` helper are allowed (and `record_command` is

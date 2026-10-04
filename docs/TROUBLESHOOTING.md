@@ -231,23 +231,62 @@ row's `request_id` (the recipe source shows the derivation; the checked-in mock 
 
 Then fix the cause (upgrade the recipe so it accepts `instance_ref=None` and resolves the
 instance by its derived name, or restore the missing config) and retry the teardown by
-re-publishing the reservation's terminal event verbatim. The original payload stays in
-the reservations outbox for 7 days after publish; re-publishing it unchanged keeps its
-`event_id`, so notifications and webhooks deduplicate it while execution runs teardown
-again:
+re-publishing the reservation's terminal event. The original payload stays in the
+reservations outbox for 7 days after publish. Two ids matter, and they are handled
+differently:
+
+- Keep the payload's `event_id` unchanged. Notifications and integration's webhook
+  consumer key their dedupe on it, so the replay adds no second bell entry and no second
+  webhook delivery. Execution does not skip a terminal event it has seen before (its
+  dedupe key only skips driver actions that already succeeded, and the dynamic teardown
+  records none for a failed destroy), so it runs teardown, and the keyed destroy, again.
+  This is the opposite of the issue #611 advice for test publishes, which want a fresh
+  `event_id` precisely so the consumers do NOT dedupe them.
+- Give the message a FRESH `Nats-Msg-Id` header. JetStream drops a publish whose
+  `Nats-Msg-Id` it saw within the stream's duplicate window (the default 2 minutes; HERD
+  sets none), and the outbox relay used the `event_id` as the original message id, so
+  reusing it can be swallowed by the broker. The `{{ID}}` template below generates a
+  unique id per publish.
+
+The `nats:2.10-alpine` service image ships only `nats-server`, no `nats` CLI, so publish
+from a one-off `natsio/nats-box` container on the stack's network
+(`<compose project>_herd-net`, for example `herd-public_herd-net`):
 
 ```bash
-docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c \
-  "SELECT subject, payload FROM reservations.outbox
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c \
+  "SELECT subject FROM reservations.outbox
     WHERE payload->>'reservation_id' = '<reservation_id>'
       AND subject IN ('herd.reservations.cancelled', 'herd.reservations.completed',
-                      'herd.reservations.failed');"
-docker compose exec nats nats pub '<subject>' '<payload>'
+                      'herd.reservations.failed')
+    ORDER BY created_at DESC LIMIT 1;"
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c \
+  "SELECT payload::text FROM reservations.outbox
+    WHERE payload->>'reservation_id' = '<reservation_id>' AND subject = '<subject>'
+    ORDER BY created_at DESC LIMIT 1;" > event.json
+docker run -i --rm --network <compose project>_herd-net natsio/nats-box:0.14.5 \
+  nats --server nats://nats:4222 pub -H 'Nats-Msg-Id:{{ID}}' '<subject>' --force-stdin \
+  < event.json
 ```
 
-A row the keyed destroy retires shows `status = 'DESTROYED'`. Nothing retries a failed
-keyed destroy on a timer: only a redelivery of the terminal event (the consumer NAKed it
-for a transient error) or such a re-publish runs teardown again.
+If the outbox row has been pruned, there is no faithful payload to replay; delete the
+instance by hand as above and leave the row as the record that it existed. A row the keyed
+destroy retires shows `status = 'DESTROYED'`. Nothing retries a failed keyed destroy on a
+timer: only a redelivery of the terminal event (the consumer NAKed it for a transient
+error) or such a re-publish runs teardown again.
+
+### Dynamic reservations fail without any `create_instance` run during a reservations outage
+
+Since issue #937 the execution consumer corroborates `reservation.provision_requested`
+against reservations (`GET /internal/{id}` must report `PENDING_PROVISION`) before it
+creates anything. While reservations is unreachable or answering 5xx, that check NAKs the
+event on the `NATS_NAK_BACKOFF_SECONDS` schedule; an outage that outlasts the five
+deliveries (`max_deliver`; the four delays in between total about 81 seconds at the
+default `1,5,15,60,120`) dead-letters the event on `herd.reservations.dlq.execution`, and
+the best-effort failure callback is lost with reservations still down. The reservation
+then sits in `PENDING_PROVISION` until the provision timeout (`PROVISION_TIMEOUT_SECONDS`,
+default 900) fails it. No ledger row and
+no instance exist, so there is nothing to tear down. Rebook after reservations recovers,
+or replay the dead-lettered event before the timeout fires (`DLQ has messages` below).
 
 ## NATS and inter-service events
 
