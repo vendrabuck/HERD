@@ -41,9 +41,28 @@ logger = logging.getLogger(__name__)
 # need their own sequence before this restriction can lift.
 SUPPORTED_CONNECTION_TYPES = frozenset({"Hypervisor"})
 
-# The order mirrors a real provisioning cycle so the transcript an admin
-# reviews reads like the consumer's actual call sequence (ADR 0004).
-LIFECYCLE_SEQUENCE = ("login", "create_instance", "status", "destroy_instance", "logout")
+# The keyed destroy (issue #937): teardown calls destroy_instance with
+# instance_ref=None for a ledger row whose create never reported a handle, and
+# the recipe must find the instance by the name it derived from HERD_request_id
+# (or report success when none exists). The validator runs it as its own step
+# after the by-ref destroy, so a recipe that raises or fails without an
+# instance_ref fails validation. It reports under this label rather than a
+# second "destroy_instance" entry, so every report entry keeps a unique action
+# (the drivers-page panel keys its rows on it) and the repair feedback names
+# exactly which call failed.
+KEYED_DESTROY_STEP = "destroy_instance (no instance_ref)"
+
+# (report label, driver method). The order mirrors a real provisioning cycle so
+# the transcript an admin reviews reads like the consumer's actual call
+# sequence (ADR 0004).
+_DRY_RUN_STEPS = (
+    ("login", "login"),
+    ("create_instance", "create_instance"),
+    ("status", "status"),
+    ("destroy_instance", "destroy_instance"),
+    (KEYED_DESTROY_STEP, "destroy_instance"),
+    ("logout", "logout"),
+)
 
 # Identifier fragments that mark an inline-credential assignment. Matched
 # case-insensitively as substrings of the assigned name or dict key; only a
@@ -324,15 +343,18 @@ def _run_dry_run_lifecycle(package_dir: Path) -> dict:
     passed = True
     instance_ref: str | None = None
 
-    for action in LIFECYCLE_SEQUENCE:
-        method_kwargs: dict = {}
-        if action == "destroy_instance" and instance_ref is not None:
-            method_kwargs["instance_ref"] = instance_ref
+    for label, action in _DRY_RUN_STEPS:
+        method_kwargs: dict | None = None
+        if label == "destroy_instance":
+            # The consumer's one call shape: instance_ref always passed.
+            method_kwargs = {"instance_ref": instance_ref}
+        elif label == KEYED_DESTROY_STEP:
+            method_kwargs = {"instance_ref": None}
         result = execute_driver_method(
             str(package_dir),
             action=action,
             context=context,
-            method_kwargs=method_kwargs or None,
+            method_kwargs=method_kwargs,
             timeout=settings.validate_dry_run_timeout_seconds,
             dry_run=True,
             driver_metadata=metadata,
@@ -347,7 +369,7 @@ def _run_dry_run_lifecycle(package_dir: Path) -> dict:
                 instance_ref = ref
         methods.append(
             {
-                "action": action,
+                "action": label,
                 "passed": ok,
                 "success": bool(result.get("success")),
                 "output": output,
