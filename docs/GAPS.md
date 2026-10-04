@@ -75,9 +75,10 @@ what a test would still need to cover:
 - [MEDIUM] `frontend/src/pages/ConfigPage.tsx` (30.6%): has a suite covering
   initial render, but the save-and-restart flow (compose-project self-check plus
   restart confirmation) is untested.
-- [LOW] `frontend/src/App.tsx` (0%): no test imports it; router wiring,
-  `ErrorBoundary`, and the `Toaster` mount are exercised only indirectly through
-  page tests that render individual routed components.
+- [LOW] `frontend/src/App.tsx`: `src/test/App.test.tsx` (issue #942) now mounts it
+  and pins the `Toaster` placement; router wiring and the `ErrorBoundary` are still
+  exercised only indirectly through page tests that render individual routed
+  components.
 - [MEDIUM] Device-config panels: `frontend/src/components/device-config/ApplyJobsPanel.tsx`
   (6.7%, exercised only indirectly through `DeviceConfigSection.test.tsx`) and
   `frontend/src/components/device-config/DeviceConfigSection.tsx` (49.4%, has its
