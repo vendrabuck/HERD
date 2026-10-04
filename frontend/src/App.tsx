@@ -6,7 +6,7 @@ import { appRouteElements } from "@/routes";
 export default function App() {
   return (
     <BrowserRouter>
-      <Toaster position="top-right" />
+      <Toaster position="bottom-center" />
       <ErrorBoundary>
         <Routes>{appRouteElements}</Routes>
       </ErrorBoundary>
