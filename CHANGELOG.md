@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- List pages get a shared left filter panel (`ListFilterPanel` in
+  `frontend/src/components/ui/`): a labeled `Filters` region beside the table that holds
+  the search box, the page's filter controls, and a Clear filters control shown only when
+  a filter is active, stacking above the table on a narrow viewport. The panel owns
+  layout and labels only. The Inventory page's search and its Status, Template, and
+  Topology filters moved into it with no behavior change: the same query parameters,
+  saved filter, stale-value fallback, and row expansion and selection rules (#957).
+
 ## [0.6.0] - 2026-10-01
 
 - Reservation status writes are race-safe. Every status transition is a compare-and-swap
