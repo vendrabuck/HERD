@@ -33,6 +33,7 @@ import httpx
 import pytest
 
 from ._nats_helpers import probe_nats
+from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
 
@@ -332,7 +333,7 @@ async def test_cancel_releases_all_three_ledgers(
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         for sw in switches:
@@ -396,7 +397,7 @@ async def test_cancel_teardown_failure_converges_on_terminal_retry(
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{l2_sw['id']}")

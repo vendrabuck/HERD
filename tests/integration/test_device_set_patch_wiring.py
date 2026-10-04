@@ -32,6 +32,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 _MOCK_L1_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l1"
@@ -295,7 +297,7 @@ async def test_patch_add_wires_nothing_until_fork_save_and_remove_releases(
         for reservation in reservations:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         for topology_id in topology_ids:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

@@ -49,6 +49,7 @@ import httpx
 import pytest
 
 from ._nats_helpers import fetch_events_for_reservation, probe_nats, publish_raw
+from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
 
@@ -439,7 +440,7 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -535,7 +536,7 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
             # Already CANCELLED; a second cancel is a terminal-status no-op.
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -698,7 +699,7 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -751,7 +752,7 @@ async def test_fork_save_release_drives_disconnect(admin_client, l1_template, fr
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -828,7 +829,7 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -893,7 +894,7 @@ async def test_wiring_changed_stale_replay_no_double_apply(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -1033,7 +1034,7 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
             if final.status_code == 200:
                 assert final.json()["status"] in ("CANCELLED", "COMPLETED", "FAILED")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -1080,7 +1081,7 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

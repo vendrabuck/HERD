@@ -16,6 +16,8 @@ import uuid
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 
 @pytest.mark.asyncio
 async def test_devices_export_json_carries_template_name(admin_client, fresh_device):
@@ -219,4 +221,4 @@ async def test_topology_export_roundtrips_isolated_node(admin_client, fresh_devi
         assert len(dupes) == 1, "re-import must update the original, not duplicate it"
         assert dupes[0]["id"] == tid
     finally:
-        await admin_client.delete(f"/cabling/topologies/{tid}")
+        await delete_topology_checked(admin_client, tid)

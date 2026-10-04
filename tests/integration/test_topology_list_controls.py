@@ -12,6 +12,8 @@ import uuid
 
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -70,7 +72,7 @@ async def test_search_owner_sort_and_total_on_the_stack(admin_client, user_clien
         assert paged["total"] == 3
     finally:
         for client, tid in created:
-            await client.delete(f"/cabling/topologies/{tid}")
+            await delete_topology_checked(client, tid)
 
 
 @pytest.mark.parametrize(

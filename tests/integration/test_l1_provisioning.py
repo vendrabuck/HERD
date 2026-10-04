@@ -28,6 +28,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 _MOCK_L1_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l1"
@@ -250,7 +252,7 @@ async def test_l1_ports_connected_on_reservation_create(admin_client, l1_templat
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -466,7 +468,7 @@ async def test_l1_two_port_distinct_edges_drive_two_distinct_connect_calls(
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -502,7 +504,7 @@ async def test_l1_ports_disconnected_on_reservation_cancel(
         assert _ports_of(runs[0]) == {"p1", "p2"}
     finally:
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

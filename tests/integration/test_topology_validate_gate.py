@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -79,7 +81,7 @@ async def test_reservation_rejected_when_topology_has_unreachable_edges(
             f"422 detail must explain the connectivity gate, got: {detail!r}"
         )
     finally:
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)
 
 
 async def test_reservation_succeeds_when_topology_edges_are_reachable(admin_client, fresh_devices):
@@ -112,5 +114,5 @@ async def test_reservation_succeeds_when_topology_edges_are_reachable(admin_clie
     finally:
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
-        await admin_client.delete(f"/cabling/topologies/{topology_id}")
+        await delete_topology_checked(admin_client, topology_id)
         await admin_client.delete(f"/cabling/connections/{connection_id}")

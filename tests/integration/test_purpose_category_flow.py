@@ -16,6 +16,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -356,7 +358,7 @@ async def test_transit_gear_switch_appears_in_by_device_purpose(
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

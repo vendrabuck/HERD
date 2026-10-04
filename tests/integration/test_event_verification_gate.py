@@ -28,6 +28,8 @@ from pathlib import Path
 import nats
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 NATS_URL_HOST = os.getenv("NATS_URL_HOST", "nats://localhost:4222")
@@ -294,7 +296,7 @@ async def test_forged_cancelled_event_for_an_active_reservation_is_ignored(
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")

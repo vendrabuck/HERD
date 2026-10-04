@@ -36,6 +36,7 @@ import pytest
 
 from ._l3_helpers import create_device as _create_device
 from ._l3_helpers import create_l3_driver, create_l3_template
+from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
 
@@ -126,5 +127,5 @@ async def test_ai_commit_apply_configs_refuses_l3_device_via_execution_gate(
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         await admin_client.delete(f"/inventory/devices/{device['id']}")

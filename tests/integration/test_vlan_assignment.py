@@ -40,6 +40,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._topology_teardown import delete_topology_checked
+
 pytestmark = pytest.mark.asyncio
 
 _MOCK_L2_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l2"
@@ -282,7 +284,7 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -337,7 +339,7 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
-            await admin_client.delete(f"/cabling/topologies/{topology_id}")
+            await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
@@ -388,7 +390,7 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
         for res in reservations:
             await admin_client.delete(f"/reservations/{res['id']}")
         for tid in topology_ids:
-            await admin_client.delete(f"/cabling/topologies/{tid}")
+            await delete_topology_checked(admin_client, tid)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
