@@ -1,5 +1,6 @@
 import copy
 import uuid
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from herd_common.internal_auth import internal_token_matches
@@ -27,18 +28,96 @@ from app.services.visible_devices import resolve_caller_visibility
 router = APIRouter(prefix="/topologies", tags=["topologies"])
 
 
+# Topologies list controls (issue #958), the same shape as the reservations
+# list's sort_by/sort_dir (issue #844): module-level Literal allowlists, so an
+# unrecognized value is a 422 from FastAPI's validation instead of a silent
+# no-op, and the OpenAPI schema carries each set as an enum.
+TopologySortField = Literal["name", "owner_name", "created_at", "updated_at"]
+TopologySortDir = Literal["asc", "desc"]
+TopologyOwnerFilter = Literal["mine", "all"]
+
+_SORTABLE_COLUMNS = {
+    "name": Topology.name,
+    "owner_name": Topology.owner_name,
+    "created_at": Topology.created_at,
+    "updated_at": Topology.updated_at,
+}
+_TEXT_SORT_FIELDS = frozenset({"name", "owner_name"})
+
+
+def _topology_order_by(sort_by: str, sort_dir: str, dialect_name: str):
+    """Build the ORDER BY for the topologies list, identical on every dialect.
+
+    Text fields sort case-insensitively by ``lower(coalesce(column, ''))``:
+    - coalesce, because owner_name is nullable and the two dialects place a NULL
+      at opposite ends (Postgres treats it as the largest value, SQLite as the
+      smallest); an empty owner then sorts first ascending on both.
+    - lower plus the byte-order "C" collation on Postgres, because the database
+      default collation decides text order there and differs per deployment
+      (the gate stack's en_US.utf8 orders "B" before "a"); SQLite's default
+      BINARY collation is already byte order. Pinned on a real Postgres by
+      tests/test_topology_list_order_live_pg.py.
+    Every ordering ends with an id tiebreak (ascending, whatever the primary
+    direction), so rows that tie on the primary key keep one stable order across
+    pages.
+    """
+    column = _SORTABLE_COLUMNS[sort_by]
+    if sort_by in _TEXT_SORT_FIELDS:
+        column = func.lower(func.coalesce(column, ""))
+        if dialect_name == "postgresql":
+            column = column.collate("C")
+    primary = column.asc() if sort_dir == "asc" else column.desc()
+    return primary, Topology.id
+
+
 @router.get("", response_model=PaginatedTopologyResponse)
 async def list_topologies(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    search: Annotated[
+        str | None,
+        Query(
+            max_length=255,
+            description=(
+                "Case-insensitive substring match on the topology name. Blank means no filter."
+            ),
+        ),
+    ] = None,
+    owner: Annotated[
+        TopologyOwnerFilter,
+        Query(description="mine: only topologies the caller created. all (default): every one."),
+    ] = "all",
+    sort_by: Annotated[
+        TopologySortField,
+        Query(
+            description=(
+                "Field to sort by. Defaults to updated_at, the previous fixed ordering. "
+                "Text fields sort case-insensitively. Tiebroken by id for stable pagination."
+            ),
+        ),
+    ] = "updated_at",
+    sort_dir: Annotated[
+        TopologySortDir,
+        Query(description="Sort direction. Defaults to desc (most recently updated first)."),
+    ] = "desc",
     payload: dict = Depends(get_current_user_payload),
     db: AsyncSession = Depends(get_db),
 ):
-    count_query = select(func.count()).select_from(Topology)
+    # Every role reads every topology (docs/ROLES.md), so the filters narrow the
+    # list and never widen it; total is counted over the same filtered set.
+    conditions = []
+    term = (search or "").strip()
+    if term:
+        conditions.append(Topology.name.icontains(term, autoescape=True))
+    if owner == "mine":
+        conditions.append(Topology.created_by == uuid.UUID(payload["sub"]))
+
+    count_query = select(func.count()).select_from(Topology).where(*conditions)
     total = (await db.execute(count_query)).scalar() or 0
 
+    order_by = _topology_order_by(sort_by, sort_dir, db.get_bind().dialect.name)
     result = await db.execute(
-        select(Topology).order_by(Topology.updated_at.desc()).offset(skip).limit(limit)
+        select(Topology).where(*conditions).order_by(*order_by).offset(skip).limit(limit)
     )
     topologies = result.scalars().all()
     return PaginatedTopologyResponse(

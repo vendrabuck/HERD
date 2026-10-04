@@ -963,6 +963,17 @@ GET /api/cabling/topologies
 Authorization: Bearer <any-authenticated-token>
 ```
 
+Query parameters (issue #958), all optional: `skip`, `limit` (1 to 500, default 50),
+`search` (case-insensitive substring on the name, at most 255 characters, surrounding
+whitespace ignored, blank means no filter), `owner` (`all` default, or `mine` for the
+caller's own topologies, by the JWT `sub`), `sort_by` (`name`, `owner_name`,
+`created_at`, `updated_at`; default `updated_at`) and `sort_dir` (`asc`, `desc`; default
+`desc`). An unknown `owner`, `sort_by`, or `sort_dir` is a 422. `total` counts the
+filtered set. Text fields sort case-insensitively in byte order with a missing owner
+name treated as empty, the same on SQLite and Postgres, and every order ends with an id
+tiebreak so pages never overlap. The filters only narrow the list: every role still
+reads every topology.
+
 ### Get a topology
 
 ```

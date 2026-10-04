@@ -24,6 +24,14 @@ vi.mock("@/stores/authStore", () => ({
     selector({ user: mockUser }),
 }));
 
+// The list controls (issue #958) persist through usePreferencesStore, which
+// best-effort PATCHes the backend; mock that transport.
+vi.mock("@/api/userProfile", () => ({
+  getPreferences: vi.fn(),
+  patchPreferences: vi.fn().mockResolvedValue({}),
+  resetPreferences: vi.fn(),
+}));
+
 // Mock topology hooks
 const mockUsePaginatedTopologies = vi.fn();
 const mockCreateTopology = { mutateAsync: vi.fn(), isPending: false };
@@ -35,6 +43,7 @@ vi.mock("@/api/topologies", () => ({
   useCreateTopology: () => mockCreateTopology,
   useDeleteTopology: () => mockDeleteTopology,
   useCloneTopology: () => mockCloneTopology,
+  useBulkDeleteTopologies: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 
 import { TopologyPage } from "@/pages/TopologyPage";
@@ -94,7 +103,7 @@ describe("TopologyPage loading/error/empty states", () => {
   it("shows the loading status text while fetching", () => {
     mockUsePaginatedTopologies.mockReturnValue({ data: undefined, isLoading: true, isError: false });
     renderPage();
-    expect(screen.getByRole("status")).toHaveTextContent("Loading topologies...");
+    expect(screen.getByText("Loading topologies...")).toHaveAttribute("role", "status");
   });
 
   it("shows the exact error text on a failed fetch", () => {

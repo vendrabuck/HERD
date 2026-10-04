@@ -166,6 +166,23 @@ A **Rows per page** selector on the pagination bar (25, 50, 100, or 200) sets ho
 devices the table shows at once; your choice persists across sessions the same way your
 saved filters do, per the Settings note below.
 
+## Topologies list
+
+The Topologies page has a filter panel on the left (issue #958): a **Search topologies**
+box (matches anywhere in the name, ignoring case) and an **Owner** filter (**All** or
+**Mine**). The **Name**, **Owner**, **Created**, and **Updated** headings sort the list:
+click once for ascending, again for descending, and a third time to return to the
+default order (most recently updated first). Your search, owner filter, and sort are
+saved and restored the next time you open the page.
+
+Each row has a checkbox, and the heading checkbox selects every row on the current page.
+With rows selected, a bar above the table shows the count, **Delete selected**, and
+**Clear selection**. You can delete a topology you created; an admin or superadmin can
+delete any topology. The confirmation says how many will be deleted and how many are
+skipped as not yours, and deleting is permanent. A row that the server refuses stays
+selected with the reason under its name. Changing the page, the sort, the search, or the
+owner filter clears the selection.
+
 ## Topology editor
 
 See [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md) for the full walkthrough. In short:

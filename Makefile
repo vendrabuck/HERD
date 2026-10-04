@@ -887,6 +887,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_fork_port_claim_race_live_pg.py -v) && \
 	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_l3_route_key_width_live_pg.py -v) && \
+	(cd services/cabling && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_topology_list_order_live_pg.py -v) && \
 	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_wiring_retry_claim_race_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \

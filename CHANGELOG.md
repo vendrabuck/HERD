@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- The Topologies page gets search, an Owner filter (All, Mine), sortable Name, Owner,
+  Created, and Updated headings, and multi-select delete. `GET /cabling/topologies`
+  gains `search` (case-insensitive name substring), `owner` (`mine` or `all`), `sort_by`,
+  and `sort_dir`, validated as enums (a bad value is a 422), with `total` counting the
+  filtered set and an id tiebreak; text sorts case-insensitively and identically on
+  SQLite and Postgres. The filters and sort persist per user (`savedFilters.topologies`,
+  `extras["sort:topologies"]`) and a stale saved value falls back to the default. Delete
+  is gated by one predicate matching the backend rule (creator, admin, or superadmin),
+  shared by the row button and the bulk action; the bulk action skips rows that are not
+  yours, says so in the confirmation, and keeps refused rows selected with the server's
+  reason (#958).
 - List pages get a shared left filter panel (`ListFilterPanel` in
   `frontend/src/components/ui/`): a labeled `Filters` region beside the table that holds
   the search box, the page's filter controls, and a Clear filters control shown only when
